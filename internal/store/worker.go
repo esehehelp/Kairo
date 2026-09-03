@@ -131,7 +131,7 @@ func (s *Store) AckCommandV1(ctx context.Context, attemptID, leaseID string, epo
 		return err
 	}
 	advance := commandStateRank(state) > commandStateRank(current) && current != "completed" && current != "rejected"
-	if state == "rejected" && commandStateRank(current) > commandStateRank("accepted") {
+	if state == "rejected" && commandStateRank(current) >= commandStateRank("checkpointed") {
 		advance = false
 	}
 	if advance {
@@ -144,6 +144,9 @@ func (s *Store) AckCommandV1(ctx context.Context, attemptID, leaseID string, epo
 			return err
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='active',releasing_at=NULL WHERE id=? AND state='releasing'`, leaseID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE task_revisions SET scheduling_state='running' WHERE task_id=(SELECT task_id FROM attempts WHERE id=?) AND revision=(SELECT task_revision FROM attempts WHERE id=?) AND scheduling_state='preempting'`, attemptID, attemptID); err != nil {
 			return err
 		}
 	}
@@ -190,13 +193,19 @@ func (s *Store) TerminalV1(ctx context.Context, attemptID, leaseID string, epoch
 	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',releasing_at=COALESCE(releasing_at,?),released_at=? WHERE id=? AND state IN('prepared','active','releasing')`, t, t, leaseID); err != nil {
 		return err
 	}
-	var commandID sql.NullString
-	_ = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=? AND kind='suspend' AND state!='rejected' ORDER BY created_at DESC LIMIT 1`, attemptID).Scan(&commandID)
+	var suspendCommandID, cancelCommandID sql.NullString
+	_ = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=? AND kind='suspend' AND state!='rejected' ORDER BY created_at DESC LIMIT 1`, attemptID).Scan(&suspendCommandID)
+	_ = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=? AND kind='cancel' AND state!='rejected' ORDER BY created_at DESC LIMIT 1`, attemptID).Scan(&cancelCommandID)
 	next := "failed"
-	preempted := commandID.Valid && checkpointed.Valid
-	if preempted {
+	preempted := suspendCommandID.Valid && checkpointed.Valid && !cancelCommandID.Valid
+	if cancelCommandID.Valid {
+		next = "cancelled"
+		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state='completed',updated_at=?,completed_at=? WHERE attempt_id=? AND state NOT IN('completed','rejected')`, t, t, attemptID); err != nil {
+			return err
+		}
+	} else if preempted {
 		next = "pending"
-		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state='completed',updated_at=?,completed_at=? WHERE id=?`, t, t, commandID.String); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state='completed',updated_at=?,completed_at=? WHERE id=?`, t, t, suspendCommandID.String); err != nil {
 			return err
 		}
 	} else if exitCode == 0 {

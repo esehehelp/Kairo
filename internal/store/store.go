@@ -18,6 +18,9 @@ import (
 //go:embed schema.sql
 var schema string
 
+//go:embed migration_v2.sql
+var migrationV2 string
+
 var (
 	ErrNotFound         = errors.New("not found")
 	ErrSpecConflict     = errors.New("workload idempotency key already has a different spec")
@@ -72,7 +75,14 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, err
 		}
-		if version != 1 {
+		if version == 1 {
+			if _, err := db.Exec(migrationV2); err != nil {
+				db.Close()
+				return nil, fmt.Errorf("migrate schema to version 2: %w", err)
+			}
+			version = 2
+		}
+		if version != 2 {
 			db.Close()
 			return nil, fmt.Errorf("unsupported schema version %d", version)
 		}

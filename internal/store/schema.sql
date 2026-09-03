@@ -2,6 +2,7 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
 INSERT INTO schema_migrations VALUES(1, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
+INSERT INTO schema_migrations VALUES(2, strftime('%Y-%m-%dT%H:%M:%fZ','now'));
 
 -- Inventory: only administrative state is persisted here.
 CREATE TABLE nodes(
@@ -41,7 +42,7 @@ CREATE TABLE queues(
 CREATE TABLE queue_revisions(
  queue_id TEXT NOT NULL REFERENCES queues(id), revision INTEGER NOT NULL, digest TEXT NOT NULL,
  normalized_json TEXT NOT NULL, source_text TEXT NOT NULL, actor TEXT NOT NULL, request_id TEXT NOT NULL,
- created_at TEXT NOT NULL, PRIMARY KEY(queue_id,revision), UNIQUE(queue_id,digest), UNIQUE(queue_id,request_id));
+ created_at TEXT NOT NULL, PRIMARY KEY(queue_id,revision), UNIQUE(queue_id,request_id));
 CREATE TABLE tasks(
  id TEXT PRIMARY KEY, queue_id TEXT NOT NULL REFERENCES queues(id), task_key TEXT NOT NULL,
  current_revision INTEGER NOT NULL DEFAULT 0, desired_state TEXT NOT NULL DEFAULT 'active'
@@ -99,9 +100,9 @@ CREATE TABLE lease_items(
  quantity INTEGER NOT NULL DEFAULT 1, filesystem TEXT NOT NULL DEFAULT '', prepared INTEGER NOT NULL DEFAULT 0 CHECK(prepared IN(0,1)),
  PRIMARY KEY(lease_id,kind,resource_id,filesystem));
 CREATE TRIGGER exclusive_resource_lease_guard BEFORE INSERT ON lease_items
-WHEN NEW.resource_id IS NOT NULL AND EXISTS(
+WHEN NEW.resource_id IS NOT NULL AND NEW.kind='gpu' AND EXISTS(
  SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id
- WHERE li.resource_id=NEW.resource_id AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested'))
+ WHERE li.resource_id=NEW.resource_id AND li.kind='gpu' AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested'))
 BEGIN SELECT RAISE(ABORT,'resource already leased'); END;
 CREATE TABLE launch_authorizations(
  id TEXT PRIMARY KEY, lease_id TEXT NOT NULL UNIQUE REFERENCES leases(id), attempt_id TEXT NOT NULL UNIQUE REFERENCES attempts(id),

@@ -109,7 +109,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		}
 		if claim.ClaimKind == "external_process" && claim.ProcessIdentity != nil {
 			var registered int
-			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes ap JOIN attempts a ON a.id=ap.attempt_id WHERE ap.process_identity=? AND ap.exited_at IS NULL AND a.state IN('running','suspend_requested')`, *claim.ProcessIdentity).Scan(&registered); err != nil {
+			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes ap JOIN attempts a ON a.id=ap.attempt_id JOIN leases l ON l.attempt_id=a.id JOIN lease_items li ON li.lease_id=l.id WHERE ap.process_identity=? AND ap.exited_at IS NULL AND a.state IN('running','suspend_requested') AND l.state IN('active','releasing') AND li.resource_id=?`, *claim.ProcessIdentity, claim.ResourceID).Scan(&registered); err != nil {
 				return err
 			}
 			if registered > 0 {

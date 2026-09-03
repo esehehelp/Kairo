@@ -432,3 +432,243 @@ func TestManifestRevisionWaitsForOldAttemptAndDoesNotInheritContinuation(t *test
 		t.Fatalf("continuation leaked across immutable revisions: %q", *current.ContinuationRef)
 	}
 }
+
+func TestManagedIdentityOnlySuppressesClaimsOnItsLease(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0", "gpu1")
+	applyManifest(t, st, pilotLowManifest, 0, true, "claim-scope-1")
+	launch := prepareAndActivateV1(t, st)
+	identity := fmt.Sprintf("pid:%d:start:test", 1000+launch.Attempt.Ordinal)
+	stamp := time.Now().UTC()
+	total, free := int64(24_000), int64(20_000)
+	if err := st.ApplyObservationBatch(ctx, "gpu-provider", nil,
+		[]Observation{{ResourceID: "gpu1", ObservedAt: stamp.Format(time.RFC3339Nano), ValidUntil: stamp.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &free}},
+		[]ExternalClaim{{ID: "wrong-gpu", ResourceID: "gpu1", ClaimKind: "external_process", ProcessIdentity: &identity}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	claims, err := st.ListClaims(ctx)
+	if err != nil || len(claims) != 1 || claims[0].ResourceID != "gpu1" {
+		t.Fatalf("managed identity suppressed activity outside its lease: %+v %v", claims, err)
+	}
+}
+
+func TestCancelDoesNotSatisfyDependencies(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0")
+	manifest := `schema_version=1
+project="pilot"
+queue="cancel"
+[[tasks]]
+key="first"
+argv=["first"]
+cwd="."
+priority=10
+checkpointable=true
+[[tasks.exclusive]]
+kind="gpu"
+count=1
+[[tasks]]
+key="dependent"
+argv=["dependent"]
+cwd="."
+depends_on=["first"]
+[[tasks.exclusive]]
+kind="gpu"
+count=1
+`
+	result := applyManifest(t, st, manifest, 0, true, "cancel-1")
+	launch := prepareAndActivateV1(t, st)
+	commandID, err := st.SetTaskState(ctx, launch.Task.ID, "cancel")
+	if err != nil || commandID == "" {
+		t.Fatalf("cancel: %q %v", commandID, err)
+	}
+	if err = st.TerminalV1(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if reservation, err := st.ReserveNext(ctx, "e"); err != nil || reservation != nil {
+		t.Fatalf("cancelled dependency unlocked downstream work: %+v %v", reservation, err)
+	}
+	tasks, err := st.ListTasks(ctx, result.Queue.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range tasks {
+		if task.Key == "first" && task.SchedulingState != "cancelled" {
+			t.Fatalf("cancelled task summary is %s", task.SchedulingState)
+		}
+	}
+	var revisionState, commandState string
+	if err = st.db.QueryRowContext(ctx, `SELECT scheduling_state FROM task_revisions WHERE task_id=? AND revision=?`, launch.Task.ID, launch.TaskRevision).Scan(&revisionState); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.db.QueryRowContext(ctx, `SELECT state FROM commands WHERE id=?`, commandID).Scan(&commandState); err != nil {
+		t.Fatal(err)
+	}
+	if revisionState != "cancelled" || commandState != "completed" {
+		t.Fatalf("cancel terminal states: revision=%s command=%s", revisionState, commandState)
+	}
+}
+
+func TestHistoricalManifestAppliesAsNewRevision(t *testing.T) {
+	st := openTestStore(t)
+	first := `schema_version=1
+project="pilot"
+queue="history"
+[[tasks]]
+key="a"
+argv=["a"]
+cwd="."
+[[tasks]]
+key="b"
+argv=["b"]
+cwd="."
+`
+	second := `schema_version=1
+project="pilot"
+queue="history"
+[[tasks]]
+key="b"
+argv=["b"]
+cwd="."
+`
+	r1 := applyManifest(t, st, first, 0, true, "history-1")
+	r2 := applyManifest(t, st, second, r1.Revision, false, "history-2")
+	r3 := applyManifest(t, st, first, r2.Revision, false, "history-3")
+	if r3.Idempotent || r3.Revision != 3 || r3.Queue.CurrentRevision != 3 {
+		t.Fatalf("historical desired state was not applied as a new revision: %+v", r3)
+	}
+	var desired, revisionDesired string
+	if err := st.db.QueryRow(`SELECT desired_state FROM tasks WHERE queue_id=? AND task_key='a'`, r3.Queue.ID).Scan(&desired); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.db.QueryRow(`SELECT tr.desired_state FROM task_revisions tr JOIN tasks t ON t.id=tr.task_id WHERE t.queue_id=? AND t.task_key='a' AND tr.revision=t.current_revision`, r3.Queue.ID).Scan(&revisionDesired); err != nil {
+		t.Fatal(err)
+	}
+	if desired != "active" || revisionDesired != "active" {
+		t.Fatalf("re-added task was not reactivated: task=%s revision=%s", desired, revisionDesired)
+	}
+}
+
+func TestCheckpointFailureRejectRestoresActiveOwnership(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0")
+	applyManifest(t, st, pilotLowManifest, 0, true, "reject-1")
+	launch := prepareAndActivateV1(t, st)
+	commandID, err := st.EnqueueCommandV1(ctx, launch.Attempt.ID, "suspend", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.AckCommandV1(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, commandID, "checkpointing", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.AckCommandV1(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, commandID, "rejected", json.RawMessage(`{"reason":"rank failed"}`)); err != nil {
+		t.Fatal(err)
+	}
+	status, err := st.Status(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.Attempts[0].State != "running" || status.Leases[0].State != "active" {
+		t.Fatalf("checkpoint rejection left ownership stuck: attempt=%s lease=%s", status.Attempts[0].State, status.Leases[0].State)
+	}
+	var commandState, revisionState string
+	if err = st.db.QueryRowContext(ctx, `SELECT state FROM commands WHERE id=?`, commandID).Scan(&commandState); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.db.QueryRowContext(ctx, `SELECT scheduling_state FROM task_revisions WHERE task_id=? AND revision=?`, launch.Task.ID, launch.TaskRevision).Scan(&revisionState); err != nil {
+		t.Fatal(err)
+	}
+	if commandState != "rejected" || revisionState != "running" {
+		t.Fatalf("checkpoint rejection states: command=%s revision=%s", commandState, revisionState)
+	}
+}
+
+func TestImpossibleGangDoesNotPreemptUsefulWork(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0")
+	lowManifest := strings.Replace(pilotLowManifest, "priority=10", "priority=1", 1)
+	r1 := applyManifest(t, st, lowManifest, 0, true, "feasible-1")
+	launch := prepareAndActivateV1(t, st)
+	impossible := lowManifest + strings.Replace(pilotHighTask, "count=1", "count=2", 1)
+	applyManifest(t, st, impossible, r1.Revision, false, "feasible-2")
+	commands, err := st.EnsureV1Preemption(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(commands) != 0 {
+		t.Fatalf("impossible gang request preempted useful work: %+v", commands)
+	}
+	status, err := st.Status(ctx)
+	if err != nil || len(status.Attempts) != 1 || status.Attempts[0].ID != launch.Attempt.ID || status.Attempts[0].State != "running" {
+		t.Fatalf("useful work did not remain running: %+v %v", status.Attempts, err)
+	}
+}
+
+func TestTaskControlTargetsLiveSupersededAttempt(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0", "gpu1")
+	r1 := applyManifest(t, st, pilotLowManifest, 0, true, "control-1")
+	launch := prepareAndActivateV1(t, st)
+	changed := strings.Replace(pilotLowManifest, `argv=["train"]`, `argv=["train","v2"]`, 1)
+	applyManifest(t, st, changed, r1.Revision, false, "control-2")
+	commandID, err := st.SetTaskState(ctx, launch.Task.ID, "cancel")
+	if err != nil || commandID == "" {
+		t.Fatalf("could not control live superseded attempt: %q %v", commandID, err)
+	}
+	var commandAttempt string
+	if err = st.db.QueryRowContext(ctx, `SELECT attempt_id FROM commands WHERE id=?`, commandID).Scan(&commandAttempt); err != nil {
+		t.Fatal(err)
+	}
+	if commandAttempt != launch.Attempt.ID {
+		t.Fatalf("control targeted %s, want %s", commandAttempt, launch.Attempt.ID)
+	}
+}
+
+func TestCapacityOnlyStaleLeaseCanBeReconciled(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	if err := st.UpsertNode(ctx, Node{ID: "n", Name: "n", OS: "windows", Architecture: "amd64", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertExecutor(ctx, Executor{ID: "e", NodeID: "n", Kind: "windows", Attributes: json.RawMessage(`{}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertProvider(ctx, "host", "n", "host", nil); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().UTC()
+	total, free := int64(16_000), int64(16_000)
+	if err := st.ApplyObservationBatch(ctx, "host",
+		[]ResourceInstance{{ID: "n-cpu", NodeID: "n", ProviderID: "host", Kind: "cpu", StableIdentity: "logical-cpu", AdminState: "enabled"}},
+		[]Observation{{ResourceID: "n-cpu", ObservedAt: stamp.Format(time.RFC3339Nano), ValidUntil: stamp.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &free}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `schema_version=1
+project="pilot"
+queue="capacity"
+[[tasks]]
+key="cpu-only"
+argv=["run"]
+cwd="."
+[tasks.capacity]
+cpu_millis=1000
+`
+	applyManifest(t, st, manifest, 0, true, "capacity-1")
+	_ = prepareAndActivateV1(t, st)
+	if n, err := st.MarkExecutorUnknown(ctx, "e"); err != nil || n != 1 {
+		t.Fatalf("mark unknown: %d %v", n, err)
+	}
+	if err := st.ReconcileResource(ctx, "n-cpu", true); err != nil {
+		t.Fatalf("capacity-only reconcile: %v", err)
+	}
+	status, err := st.Status(ctx)
+	if err != nil || status.Leases[0].State != "released" || status.Attempts[0].State != "quiesced" {
+		t.Fatalf("capacity-only reconciliation incomplete: %+v %v", status, err)
+	}
+}

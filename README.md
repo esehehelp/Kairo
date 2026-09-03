@@ -14,9 +14,10 @@ go run ./cmd/kairo plan apply --create --expected-revision 0 examples/queue.toml
 go run ./cmd/kairo resource status --json
 ```
 
-Every later apply supplies the current revision. Reapplying the same normalized
-digest is idempotent. A different manifest with a stale expected revision gets
-HTTP 409.
+Every later apply supplies the current revision. Retrying the same request ID
+with the same digest, or reapplying the current normalized digest, is
+idempotent. Applying a historical digest with a new request ID creates a new
+revision. A different manifest with a stale expected revision gets HTTP 409.
 
 `observe_only = true` inventories resources, observations, and external claims
 without reserving or launching work. This is the recommended first deployment

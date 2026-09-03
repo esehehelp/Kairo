@@ -165,7 +165,7 @@ func reserveCandidate(ctx context.Context, tx *sql.Tx, executorID, nodeID string
 	rows.Close()
 	var resources []ResourceInstance
 	type item struct {
-		resource         *ResourceInstance
+		resourceID       *string
 		kind, filesystem string
 		quantity         int64
 	}
@@ -194,17 +194,18 @@ func reserveCandidate(ctx context.Context, tx *sql.Tx, executorID, nodeID string
 			}
 			for i := range selected {
 				resources = append(resources, selected[i])
-				items = append(items, item{resource: &resources[len(resources)-1], kind: r.Kind, quantity: 1})
+				resourceID := selected[i].ID
+				items = append(items, item{resourceID: &resourceID, kind: r.Kind, quantity: 1})
 			}
 		} else {
-			ok, err := capacityAvailable(ctx, tx, nodeID, r)
+			resourceID, ok, err := capacityAvailable(ctx, tx, nodeID, r)
 			if err != nil {
 				return nil, false, err
 			}
 			if !ok {
 				return nil, false, nil
 			}
-			items = append(items, item{kind: r.Kind, filesystem: r.Filesystem, quantity: r.Quantity})
+			items = append(items, item{resourceID: &resourceID, kind: r.Kind, filesystem: r.Filesystem, quantity: r.Quantity})
 		}
 	}
 	epoch := int64(1)
@@ -220,8 +221,8 @@ func reserveCandidate(ctx context.Context, tx *sql.Tx, executorID, nodeID string
 	}
 	for _, x := range items {
 		var resourceID any
-		if x.resource != nil {
-			resourceID = x.resource.ID
+		if x.resourceID != nil {
+			resourceID = *x.resourceID
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO lease_items(lease_id,resource_id,kind,quantity,filesystem) VALUES(?,?,?,?,?)`, leaseID, resourceID, x.kind, x.quantity, x.filesystem); err != nil {
 			return nil, false, err
@@ -304,37 +305,38 @@ func selectExclusive(ctx context.Context, tx *sql.Tx, nodeID string, r requestRo
 	return nil, "insufficient_" + r.Kind, false, nil
 }
 
-func capacityAvailable(ctx context.Context, tx *sql.Tx, nodeID string, r requestRow) (bool, error) {
+func capacityAvailable(ctx context.Context, tx *sql.Tx, nodeID string, r requestRow) (string, bool, error) {
 	kind := r.Kind
 	identity := ""
 	if kind == "disk" {
 		identity = r.Filesystem
 	}
+	var resourceID string
 	var total, free sql.NullInt64
-	err := tx.QueryRowContext(ctx, `SELECT o.total_bytes,o.free_bytes FROM resource_instances ri JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY observed_at DESC LIMIT 1) WHERE ri.node_id=? AND ri.kind=? AND ri.admin_state='enabled' AND (?='' OR ri.stable_identity=?) AND o.valid_until>? LIMIT 1`, nodeID, kind, identity, identity, now()).Scan(&total, &free)
+	err := tx.QueryRowContext(ctx, `SELECT ri.id,o.total_bytes,o.free_bytes FROM resource_instances ri JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY observed_at DESC LIMIT 1) WHERE ri.node_id=? AND ri.kind=? AND ri.admin_state='enabled' AND (?='' OR ri.stable_identity=?) AND o.valid_until>? ORDER BY ri.id LIMIT 1`, nodeID, kind, identity, identity, now()).Scan(&resourceID, &total, &free)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return "", false, nil
 	}
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	var reserved int64
 	err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(li.quantity),0) FROM lease_items li JOIN leases l ON l.id=li.lease_id JOIN executors e ON e.id=l.executor_id WHERE e.node_id=? AND li.kind=? AND li.filesystem=? AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, nodeID, kind, r.Filesystem).Scan(&reserved)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
 	if kind == "cpu" {
-		return total.Valid && total.Int64-reserved >= r.Quantity, nil
+		return resourceID, total.Valid && total.Int64-reserved >= r.Quantity, nil
 	}
 	if !free.Valid || free.Int64-reserved-r.Quantity < 0 {
-		return false, nil
+		return "", false, nil
 	}
 	if kind == "disk" {
 		var c map[string]int64
 		_ = json.Unmarshal([]byte(r.Constraints), &c)
-		return free.Int64-reserved-r.Quantity >= c["min_free_after_bytes"], nil
+		return resourceID, free.Int64-reserved-r.Quantity >= c["min_free_after_bytes"], nil
 	}
-	return true, nil
+	return resourceID, true, nil
 }
 
 func (s *Store) MarkLeasePrepared(ctx context.Context, leaseID string, epoch int64) error {
@@ -581,6 +583,13 @@ func (s *Store) EnsureV1Preemption(ctx context.Context) ([]string, error) {
 		victims = append(victims, v)
 	}
 	rows.Close()
+	potential := free
+	for _, v := range victims {
+		potential += int64(v.gpus)
+	}
+	if potential < needed {
+		return nil, nil
+	}
 	released := free
 	var commands []string
 	for _, v := range victims {

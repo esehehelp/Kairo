@@ -159,7 +159,8 @@ func (s *Store) SetTaskState(ctx context.Context, taskID, action string) (string
 	}
 	if (action == "pause" || action == "cancel") && (state == "running" || state == "preempting") {
 		var attemptID string
-		if err = tx.QueryRowContext(ctx, `SELECT id FROM attempts WHERE task_id=? AND task_revision=? AND state IN('running','suspend_requested') ORDER BY ordinal DESC LIMIT 1`, taskID, rev).Scan(&attemptID); err != nil {
+		var attemptRevision int
+		if err = tx.QueryRowContext(ctx, `SELECT id,task_revision FROM attempts WHERE task_id=? AND state IN('running','suspend_requested') ORDER BY authorized_at DESC LIMIT 1`, taskID).Scan(&attemptID, &attemptRevision); err != nil {
 			return "", err
 		}
 		newDesired := "paused"
@@ -169,7 +170,7 @@ func (s *Store) SetTaskState(ctx context.Context, taskID, action string) (string
 		if _, err = tx.ExecContext(ctx, `UPDATE tasks SET desired_state=?,updated_at=? WHERE id=?`, newDesired, now(), taskID); err != nil {
 			return "", err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE task_revisions SET desired_state=? WHERE task_id=? AND revision=?`, newDesired, taskID, rev); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE task_revisions SET desired_state=? WHERE task_id=? AND revision IN(?,?)`, newDesired, taskID, rev, attemptRevision); err != nil {
 			return "", err
 		}
 		if err = tx.Commit(); err != nil {

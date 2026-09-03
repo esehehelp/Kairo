@@ -47,16 +47,22 @@ func (s *Store) ApplyPlan(ctx context.Context, validated plan.Validated, options
 		return ApplyResult{}, fmt.Errorf("%w: queue already exists", ErrRevisionConflict)
 	}
 
-	var sameRevision int
-	if err := tx.QueryRowContext(ctx, `SELECT revision FROM queue_revisions WHERE queue_id=? AND digest=?`, queue.ID, validated.Digest).Scan(&sameRevision); err == nil {
-		return ApplyResult{Queue: queue, Revision: sameRevision, Idempotent: true}, nil
+	var requestRevision int
+	var requestDigest string
+	if err := tx.QueryRowContext(ctx, `SELECT revision,digest FROM queue_revisions WHERE queue_id=? AND request_id=?`, queue.ID, options.RequestID).Scan(&requestRevision, &requestDigest); err == nil {
+		if requestDigest != validated.Digest {
+			return ApplyResult{}, fmt.Errorf("%w: request ID was already used for another manifest", ErrRevisionConflict)
+		}
+		return ApplyResult{Queue: queue, Revision: requestRevision, Idempotent: true}, nil
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return ApplyResult{}, err
 	}
-	var requestDigest string
-	if err := tx.QueryRowContext(ctx, `SELECT digest FROM queue_revisions WHERE queue_id=? AND request_id=?`, queue.ID, options.RequestID).Scan(&requestDigest); err == nil {
-		return ApplyResult{}, fmt.Errorf("%w: request ID was already used for another manifest", ErrRevisionConflict)
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	var currentDigest string
+	err = tx.QueryRowContext(ctx, `SELECT digest FROM queue_revisions WHERE queue_id=? AND revision=?`, queue.ID, queue.CurrentRevision).Scan(&currentDigest)
+	if err == nil && currentDigest == validated.Digest {
+		return ApplyResult{Queue: queue, Revision: queue.CurrentRevision, Idempotent: true}, nil
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return ApplyResult{}, err
 	}
 	if queue.CurrentRevision != options.ExpectedRevision {
@@ -131,6 +137,16 @@ func (s *Store) ApplyPlan(ctx context.Context, validated plan.Validated, options
 			}
 		}
 		if !needRevision {
+			if task.DesiredState != "active" {
+				if _, err = tx.ExecContext(ctx, `UPDATE task_revisions SET desired_state='active',scheduling_state=CASE WHEN scheduling_state IN('paused','cancelled') THEN 'pending' ELSE scheduling_state END,became_runnable_at=CASE WHEN scheduling_state IN('paused','cancelled') THEN NULL ELSE became_runnable_at END WHERE task_id=? AND revision=?`, task.ID, task.CurrentRevision); err != nil {
+					return ApplyResult{}, err
+				}
+				if task.SchedulingState == "paused" || task.SchedulingState == "cancelled" {
+					if _, err = tx.ExecContext(ctx, `UPDATE tasks SET scheduling_state='pending',became_runnable_at=NULL WHERE id=?`, task.ID); err != nil {
+						return ApplyResult{}, err
+					}
+				}
+			}
 			refs[key] = revisionRef{task.ID, task.CurrentRevision, false}
 			continue
 		}
