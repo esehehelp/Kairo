@@ -48,7 +48,6 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 	snap := Snapshot{}
 	byIndex := map[string]struct{ uuid, resource string }{}
 	used := map[string]int64{}
-	utils := map[string]float64{}
 	for _, row := range records {
 		if len(row) != 6 {
 			return Snapshot{}, errors.New("unexpected nvidia-smi GPU row")
@@ -71,7 +70,6 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		resourceID := "gpu-" + strings.ToLower(strings.ReplaceAll(row[0], "GPU-", ""))
 		byIndex[row[1]] = struct{ uuid, resource string }{row[0], resourceID}
 		used[row[0]] = total - free
-		utils[row[0]] = util
 		binding, _ := json.Marshal(map[string]string{"cuda_index": row[1], "uuid": row[0]})
 		attrs, _ := json.Marshal(map[string]any{"uuid": row[0]})
 		snap.Resources = append(snap.Resources, store.ResourceInstance{ID: resourceID, NodeID: p.NodeID, ProviderID: p.ProviderID, Kind: "gpu", StableIdentity: row[0], Binding: binding, Attributes: attrs, AdminState: "enabled"})
@@ -117,7 +115,10 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		}
 	}
 	for uuid, bytes := range used {
-		if bytes > 1024*1024*1024 && utils[uuid] >= 10 && !seenProcess[uuid] {
+		// Exclusive scheduling must fail closed even while a compute process is
+		// between kernels (and therefore reports 0% utilization). Operators can
+		// explicitly allow unattributed activity in the manifest when desired.
+		if bytes > 1024*1024*1024 && !seenProcess[uuid] {
 			resourceID := ""
 			for _, entry := range byIndex {
 				if entry.uuid == uuid {
@@ -125,7 +126,7 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 					break
 				}
 			}
-			evidence, _ := json.Marshal(map[string]any{"used_memory_bytes": bytes, "gpu_uuid": uuid})
+			evidence, _ := json.Marshal(map[string]any{"used_memory_bytes": bytes, "gpu_uuid": uuid, "reason": "significant_vram_without_attributed_process"})
 			snap.Claims = append(snap.Claims, store.ExternalClaim{ID: "claim-" + resourceID + "-unattributed", ResourceID: resourceID, ClaimKind: "unattributed_activity", Evidence: evidence})
 		}
 	}

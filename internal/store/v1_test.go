@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -155,5 +157,278 @@ func TestGangReservationAuthorizationAndEpochFence(t *testing.T) {
 	tasks, err := st.ListTasks(ctx, result.Queue.ID)
 	if err != nil || tasks[0].SchedulingState != "succeeded" {
 		t.Fatalf("terminal: %+v %v", tasks, err)
+	}
+}
+
+func seedV1GPUs(t *testing.T, st *Store, ids ...string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := st.UpsertNode(ctx, Node{ID: "n", Name: "n", OS: "windows", Architecture: "amd64", Attributes: json.RawMessage(`{}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertExecutor(ctx, Executor{ID: "e", NodeID: "n", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertProvider(ctx, "gpu-provider", "n", "nvidia", nil); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().UTC()
+	total, free := int64(24_000), int64(23_000)
+	resources := make([]ResourceInstance, 0, len(ids))
+	observations := make([]Observation, 0, len(ids))
+	for i, resourceID := range ids {
+		resources = append(resources, ResourceInstance{ID: resourceID, NodeID: "n", ProviderID: "gpu-provider", Kind: "gpu", StableIdentity: fmt.Sprintf("GPU-%d", i), Binding: json.RawMessage(fmt.Sprintf(`{"cuda_index":"%d"}`, i)), AdminState: "enabled"})
+		observations = append(observations, Observation{ResourceID: resourceID, ObservedAt: stamp.Format(time.RFC3339Nano), ValidUntil: stamp.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &free})
+	}
+	if err := st.ApplyObservationBatch(ctx, "gpu-provider", resources, observations, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+const pilotLowManifest = `schema_version=1
+project="pilot"
+queue="acceptance"
+[[tasks]]
+key="pretrain"
+argv=["train"]
+cwd="."
+priority=10
+checkpointable=true
+[tasks.retry]
+max_failure_attempts=2
+retry_on=["lost_after_reconcile"]
+initial_backoff_seconds=1
+max_backoff_seconds=1
+[[tasks.exclusive]]
+kind="gpu"
+count=1
+`
+
+const pilotHighTask = `
+[[tasks]]
+key="short"
+argv=["evaluate"]
+cwd="."
+priority=100
+checkpointable=false
+[[tasks.exclusive]]
+kind="gpu"
+count=1
+`
+
+func prepareAndActivateV1(t *testing.T, st *Store) *V1Launch {
+	t.Helper()
+	ctx := context.Background()
+	reservation, err := st.ReserveNext(ctx, "e")
+	if err != nil || reservation == nil {
+		t.Fatalf("reserve: %+v %v", reservation, err)
+	}
+	if err = st.ValidateReservation(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := st.AuthorizeLaunch(ctx, reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid := 1000 + launch.Attempt.Ordinal
+	if err = st.ActivateLaunch(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, pid, fmt.Sprintf("pid:%d:start:test", pid)); err != nil {
+		t.Fatal(err)
+	}
+	return launch
+}
+
+func TestPilotPreemptionCheckpointExitReleaseAndResume(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0")
+	firstApply := applyManifest(t, st, pilotLowManifest, 0, true, "pilot-1")
+	low := prepareAndActivateV1(t, st)
+	applyManifest(t, st, pilotLowManifest+pilotHighTask, firstApply.Revision, false, "pilot-2")
+
+	if reservation, err := st.ReserveNext(ctx, "e"); err != nil || reservation != nil {
+		t.Fatalf("high-priority work bypassed the active lease: %+v %v", reservation, err)
+	}
+	commands, err := st.EnsureV1Preemption(ctx)
+	if err != nil || len(commands) != 1 {
+		t.Fatalf("preemption: %+v %v", commands, err)
+	}
+	commandID := commands[0]
+	for delivery := 1; delivery <= 2; delivery++ {
+		polled, pollErr := st.PollCommandsV1(ctx, low.Attempt.ID, low.Lease.ID, low.Lease.CoordinationEpoch)
+		if pollErr != nil || len(polled) != 1 || polled[0].ID != commandID || polled[0].DeliveryCount != delivery {
+			t.Fatalf("delivery %d: %+v %v", delivery, polled, pollErr)
+		}
+	}
+	for _, phase := range []string{"accepted", "checkpointing"} {
+		if err = st.AckCommandV1(ctx, low.Attempt.ID, low.Lease.ID, low.Lease.CoordinationEpoch, commandID, phase, nil); err != nil {
+			t.Fatalf("ack %s: %v", phase, err)
+		}
+	}
+	payload := json.RawMessage(`{"continuation_ref":"checkpoint://step-12345","step":12345}`)
+	if err = st.AckCommandV1(ctx, low.Attempt.ID, low.Lease.ID, low.Lease.CoordinationEpoch, commandID, "checkpointed", payload); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.AckCommandV1(ctx, low.Attempt.ID, low.Lease.ID, low.Lease.CoordinationEpoch, commandID, "checkpointed", payload); err != nil {
+		t.Fatalf("idempotent checkpoint ACK failed: %v", err)
+	}
+	if err = st.AckCommandV1(ctx, low.Attempt.ID, low.Lease.ID, low.Lease.CoordinationEpoch, commandID, "checkpointed", json.RawMessage(`{"continuation_ref":"checkpoint://wrong"}`)); err == nil {
+		t.Fatal("conflicting duplicate checkpoint ACK overwrote the continuation")
+	}
+	if err = st.TerminalV1(ctx, low.Attempt.ID, low.Lease.ID, low.Lease.CoordinationEpoch, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	high := prepareAndActivateV1(t, st)
+	if high.Task.Key != "short" {
+		t.Fatalf("high-priority task was not scheduled first: %s", high.Task.Key)
+	}
+	if err = st.TerminalV1(ctx, high.Attempt.ID, high.Lease.ID, high.Lease.CoordinationEpoch, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	resumed := prepareAndActivateV1(t, st)
+	if resumed.Task.Key != "pretrain" || resumed.ContinuationRef == nil || *resumed.ContinuationRef != "checkpoint://step-12345" {
+		t.Fatalf("pretrain did not resume from the published continuation: %+v", resumed)
+	}
+}
+
+func TestCheckpointedAckRequiresOpaqueContinuation(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0")
+	applyManifest(t, st, pilotLowManifest, 0, true, "continuation-1")
+	launch := prepareAndActivateV1(t, st)
+	commandID, err := st.EnqueueCommandV1(ctx, launch.Attempt.ID, "suspend", "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.AckCommandV1(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, commandID, "checkpointed", json.RawMessage(`{}`)); err == nil {
+		t.Fatal("checkpointed ACK without continuation_ref was accepted")
+	}
+}
+
+func TestGangReservationIsAllOrNothingAroundExternalClaims(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0", "gpu1")
+	manifest := strings.Replace(pilotLowManifest, "count=1", "count=2", 1)
+	applyManifest(t, st, manifest, 0, true, "gang-1")
+	if err := st.ObserveClaim(ctx, ExternalClaim{ID: "external", ResourceID: "gpu1", ClaimKind: "external_process"}); err != nil {
+		t.Fatal(err)
+	}
+	if reservation, err := st.ReserveNext(ctx, "e"); err != nil || reservation != nil {
+		t.Fatalf("partial gang reservation escaped: %+v %v", reservation, err)
+	}
+	status, err := st.Status(ctx)
+	if err != nil || len(status.Leases) != 0 {
+		t.Fatalf("failed gang left a lease behind: %+v %v", status.Leases, err)
+	}
+	if err = st.ClearClaim(ctx, "external"); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := st.ReserveNext(ctx, "e")
+	if err != nil || reservation == nil || len(reservation.Resources) != 2 {
+		t.Fatalf("two-GPU gang was not reserved atomically: %+v %v", reservation, err)
+	}
+}
+
+func TestExecutorCrashFencesOldWorkerAndKeepsLeaseStale(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0")
+	applyManifest(t, st, pilotLowManifest, 0, true, "crash-1")
+	launch := prepareAndActivateV1(t, st)
+	commandID, err := st.EnqueueCommandV1(ctx, launch.Attempt.ID, "suspend", "crash_test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.AckCommandV1(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, commandID, "checkpointed", json.RawMessage(`{"continuation_ref":"checkpoint://durable-before-crash"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := st.MarkExecutorUnknown(ctx, "e"); err != nil || n != 1 {
+		t.Fatalf("mark unknown: %d %v", n, err)
+	}
+	if err := st.HeartbeatV1(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, nil); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("old worker crossed epoch fence: %v", err)
+	}
+	if reservation, err := st.ReserveNext(ctx, "e"); err != nil || reservation != nil {
+		t.Fatalf("stale lease allowed double allocation: %+v %v", reservation, err)
+	}
+	status, err := st.Status(ctx)
+	if err != nil || len(status.Leases) != 1 || status.Leases[0].State != "stale" {
+		t.Fatalf("lease was not retained as stale: %+v %v", status.Leases, err)
+	}
+	if err = st.ReconcileResource(ctx, "gpu0"); err == nil {
+		t.Fatal("registered process was reconciled without explicit absence confirmation")
+	}
+	if err = st.ReconcileResource(ctx, "gpu0", true); err != nil {
+		t.Fatal(err)
+	}
+	status, err = st.Status(ctx)
+	if err != nil || len(status.Attempts) != 1 || status.Attempts[0].ContinuationRef == nil || *status.Attempts[0].ContinuationRef != "checkpoint://durable-before-crash" {
+		t.Fatalf("acknowledged continuation was lost during reconciliation: %+v %v", status.Attempts, err)
+	}
+}
+
+func TestObservationBatchRollsBackAsOneRealitySnapshot(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	if err := st.UpsertNode(ctx, Node{ID: "n", Name: "n", OS: "windows", Architecture: "amd64", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.UpsertProvider(ctx, "p", "n", "nvidia", nil); err != nil {
+		t.Fatal(err)
+	}
+	stamp := time.Now().UTC()
+	total, free := int64(100), int64(90)
+	err := st.ApplyObservationBatch(ctx, "p",
+		[]ResourceInstance{{ID: "gpu0", NodeID: "n", ProviderID: "p", Kind: "gpu", StableIdentity: "GPU-0", AdminState: "enabled"}},
+		[]Observation{{ResourceID: "gpu0", ObservedAt: stamp.Format(time.RFC3339Nano), ValidUntil: stamp.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &free}},
+		[]ExternalClaim{{ID: "bad-claim", ResourceID: "missing", ClaimKind: "external_process"}},
+	)
+	if err == nil {
+		t.Fatal("invalid claim unexpectedly committed")
+	}
+	status, statusErr := st.Status(ctx)
+	if statusErr != nil {
+		t.Fatal(statusErr)
+	}
+	if len(status.Resources) != 0 || len(status.Claims) != 0 {
+		t.Fatalf("partial observation batch became visible: resources=%+v claims=%+v", status.Resources, status.Claims)
+	}
+}
+
+func TestManifestRevisionWaitsForOldAttemptAndDoesNotInheritContinuation(t *testing.T) {
+	ctx := context.Background()
+	st := openTestStore(t)
+	seedV1GPUs(t, st, "gpu0", "gpu1")
+	firstApply := applyManifest(t, st, pilotLowManifest, 0, true, "revision-1")
+	old := prepareAndActivateV1(t, st)
+	changed := strings.Replace(pilotLowManifest, `argv=["train"]`, `argv=["train","v2"]`, 1)
+	applyManifest(t, st, changed, firstApply.Revision, false, "revision-2")
+
+	// A second GPU is free, but one logical task must not run two revisions at once.
+	if reservation, err := st.ReserveNext(ctx, "e"); err != nil || reservation != nil {
+		t.Fatalf("new revision ran concurrently with old attempt: %+v %v", reservation, err)
+	}
+	commandID, err := st.EnqueueCommandV1(ctx, old.Attempt.ID, "suspend", "revision_update")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = st.AckCommandV1(ctx, old.Attempt.ID, old.Lease.ID, old.Lease.CoordinationEpoch, commandID, "checkpointed", json.RawMessage(`{"continuation_ref":"checkpoint://revision-1"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.TerminalV1(ctx, old.Attempt.ID, old.Lease.ID, old.Lease.CoordinationEpoch, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	current := prepareAndActivateV1(t, st)
+	if current.TaskRevision != 2 || len(current.Argv) != 2 || current.Argv[1] != "v2" {
+		t.Fatalf("current revision was not launched: %+v", current)
+	}
+	if current.ContinuationRef != nil {
+		t.Fatalf("continuation leaked across immutable revisions: %q", *current.ContinuationRef)
 	}
 }

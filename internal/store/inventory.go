@@ -69,27 +69,62 @@ func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 // ApplyObservationBatch persists one provider poll and only clears a known
 // claim when the same fresh poll observed that resource without that claim.
 func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, resources []ResourceInstance, observations []Observation, claims []ExternalClaim) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	t := now()
 	for _, resource := range resources {
-		if err := s.UpsertResourceInstance(ctx, resource); err != nil {
+		if resource.ID == "" || resource.NodeID == "" || resource.ProviderID == "" || resource.Kind == "" || resource.StableIdentity == "" {
+			return errors.New("resource identity fields are required")
+		}
+		if resource.ProviderID != providerID {
+			return fmt.Errorf("resource %s belongs to provider %s, not observation provider %s", resource.ID, resource.ProviderID, providerID)
+		}
+		if resource.AdminState == "" {
+			resource.AdminState = "enabled"
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO resource_instances(id,node_id,provider_id,kind,stable_identity,binding_json,attributes_json,admin_state,quarantine_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET node_id=excluded.node_id,provider_id=excluded.provider_id,kind=excluded.kind,stable_identity=excluded.stable_identity,binding_json=excluded.binding_json,attributes_json=excluded.attributes_json,updated_at=excluded.updated_at`, resource.ID, resource.NodeID, resource.ProviderID, resource.Kind, resource.StableIdentity, validJSON(resource.Binding), validJSON(resource.Attributes), resource.AdminState, resource.QuarantineReason, t, t)
+		if err != nil {
 			return err
 		}
 	}
 	for _, observation := range observations {
-		if err := s.RecordObservation(ctx, observation); err != nil {
+		if observation.ResourceID == "" || observation.ObservedAt == "" || observation.ValidUntil == "" {
+			return errors.New("resource_id, observed_at, and valid_until are required")
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES(?,?,?,?,?,?,?,?)`, observation.ResourceID, observation.ObservedAt, observation.ValidUntil, observation.TotalBytes, observation.FreeBytes, observation.Utilization, observation.TemperatureC, validJSON(observation.Evidence))
+		if err != nil {
 			return err
 		}
 	}
 	seen := map[string]bool{}
 	for _, claim := range claims {
+		if claim.ID == "" {
+			claim.ID = id.New("clm")
+		}
+		if claim.ResourceID == "" || claim.ClaimKind == "" {
+			return errors.New("claim resource and kind are required")
+		}
 		if claim.ClaimKind == "external_process" && claim.ProcessIdentity != nil {
 			var registered int
-			_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes ap JOIN attempts a ON a.id=ap.attempt_id WHERE ap.process_identity=? AND ap.exited_at IS NULL AND a.state IN('running','suspend_requested')`, *claim.ProcessIdentity).Scan(&registered)
+			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes ap JOIN attempts a ON a.id=ap.attempt_id WHERE ap.process_identity=? AND ap.exited_at IS NULL AND a.state IN('running','suspend_requested')`, *claim.ProcessIdentity).Scan(&registered); err != nil {
+				return err
+			}
 			if registered > 0 {
 				continue
 			}
 		}
 		seen[claim.ID] = true
-		if err := s.ObserveClaim(ctx, claim); err != nil {
+		if claim.FirstObservedAt == "" {
+			claim.FirstObservedAt = t
+		}
+		if claim.LastObservedAt == "" {
+			claim.LastObservedAt = t
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,cleared_at=NULL`, claim.ID, claim.ResourceID, claim.ClaimKind, claim.ProcessIdentity, validJSON(claim.Evidence), claim.FirstObservedAt, claim.LastObservedAt)
+		if err != nil {
 			return err
 		}
 	}
@@ -97,7 +132,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 	for _, o := range observations {
 		observed[o.ResourceID] = true
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT c.id,c.resource_id FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id WHERE r.provider_id=? AND c.cleared_at IS NULL`, providerID)
+	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.resource_id FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id WHERE r.provider_id=? AND c.cleared_at IS NULL`, providerID)
 	if err != nil {
 		return err
 	}
@@ -114,12 +149,12 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 	rows.Close()
 	for _, claim := range activeClaims {
 		if observed[claim.resource] && !seen[claim.id] {
-			if err := s.ClearClaim(ctx, claim.id); err != nil && !errors.Is(err, ErrNotFound) {
+			if _, err := tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=? WHERE id=? AND cleared_at IS NULL`, t, claim.id); err != nil {
 				return err
 			}
 		}
 	}
-	return nil
+	return tx.Commit()
 }
 func (s *Store) ObserveClaim(ctx context.Context, c ExternalClaim) error {
 	if c.ID == "" {
@@ -232,16 +267,16 @@ func (s *Store) ListClaims(ctx context.Context) ([]ExternalClaim, error) {
 }
 
 func validateEpochTx(ctx context.Context, tx *sql.Tx, attemptID, leaseID string, epoch int64) error {
-	var actual int64
-	var actualLease sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT a.coordination_epoch,(SELECT id FROM leases WHERE attempt_id=a.id) FROM attempts a WHERE a.id=?`, attemptID).Scan(&actual, &actualLease)
+	var attemptEpoch, leaseEpoch int64
+	var actualLease string
+	err := tx.QueryRowContext(ctx, `SELECT a.coordination_epoch,l.id,l.coordination_epoch FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=?`, attemptID).Scan(&attemptEpoch, &actualLease, &leaseEpoch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
 	if err != nil {
 		return err
 	}
-	if actual != epoch || !actualLease.Valid || actualLease.String != leaseID {
+	if attemptEpoch != epoch || leaseEpoch != epoch || actualLease != leaseID {
 		return fmt.Errorf("%w: attempt/lease epoch does not match", ErrStaleEpoch)
 	}
 	return nil

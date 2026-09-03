@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"kairo/internal/id"
@@ -91,6 +92,19 @@ func (s *Store) AckCommandV1(ctx context.Context, attemptID, leaseID string, epo
 	if !json.Valid(payload) {
 		return errors.New("ack payload must be valid JSON")
 	}
+	var continuationRef string
+	if phase == "checkpointed" {
+		var body struct {
+			ContinuationRef string `json:"continuation_ref"`
+		}
+		if err := json.Unmarshal(payload, &body); err != nil {
+			return err
+		}
+		continuationRef = strings.TrimSpace(body.ContinuationRef)
+		if continuationRef == "" {
+			return errors.New("checkpointed acknowledgement requires continuation_ref")
+		}
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -99,17 +113,24 @@ func (s *Store) AckCommandV1(ctx context.Context, attemptID, leaseID string, epo
 	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
 		return err
 	}
-	var current string
-	if err = tx.QueryRowContext(ctx, `SELECT state FROM commands WHERE id=? AND attempt_id=? AND coordination_epoch=?`, commandID, attemptID, epoch).Scan(&current); errors.Is(err, sql.ErrNoRows) {
+	var current, attemptState, leaseState string
+	var published sql.NullString
+	if err = tx.QueryRowContext(ctx, `SELECT c.state,a.state,l.state,a.continuation_ref FROM commands c JOIN attempts a ON a.id=c.attempt_id JOIN leases l ON l.id=c.lease_id WHERE c.id=? AND c.attempt_id=? AND c.coordination_epoch=?`, commandID, attemptID, epoch).Scan(&current, &attemptState, &leaseState, &published); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
+	}
+	if (attemptState != "running" && attemptState != "suspend_requested") || (leaseState != "active" && leaseState != "releasing") {
+		return errors.New("attempt is no longer active")
+	}
+	if phase == "checkpointed" && commandStateRank(current) >= commandStateRank("checkpointed") && published.Valid && published.String != continuationRef {
+		return fmt.Errorf("checkpoint continuation is already published as %q", published.String)
 	}
 	t := now()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO command_acks(command_id,attempt_id,coordination_epoch,phase,payload_json,created_at) VALUES(?,?,?,?,?,?)`, commandID, attemptID, epoch, phase, string(payload), t); err != nil {
 		return err
 	}
-	advance := commandStateRank(state) >= commandStateRank(current) && current != "completed" && current != "rejected"
+	advance := commandStateRank(state) > commandStateRank(current) && current != "completed" && current != "rejected"
 	if state == "rejected" && commandStateRank(current) > commandStateRank("accepted") {
 		advance = false
 	}
@@ -126,12 +147,8 @@ func (s *Store) AckCommandV1(ctx context.Context, attemptID, leaseID string, epo
 			return err
 		}
 	}
-	if phase == "checkpointed" && current != "rejected" {
-		var body struct {
-			ContinuationRef string `json:"continuation_ref"`
-		}
-		_ = json.Unmarshal(payload, &body)
-		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET checkpointed_at=?,continuation_ref=? WHERE id=?`, t, nullable(body.ContinuationRef), attemptID); err != nil {
+	if phase == "checkpointed" && advance {
+		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET checkpointed_at=?,continuation_ref=? WHERE id=?`, t, continuationRef, attemptID); err != nil {
 			return err
 		}
 	}

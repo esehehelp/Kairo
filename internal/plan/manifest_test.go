@@ -1,6 +1,9 @@
 package plan
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseDefaultsAndRejectsCycle(t *testing.T) {
 	source := []byte(`schema_version=1
@@ -41,5 +44,23 @@ depends_on=["a"]
 `))
 	if err == nil {
 		t.Fatal("cycle was accepted")
+	}
+}
+
+func TestManifestRejectsWorkflowEngineFields(t *testing.T) {
+	for _, field := range []string{"condition", "gate", "artifact_dependency", "dynamic_fan_out", "cleanup_policy"} {
+		source := `schema_version=1
+project="p"
+queue="q"
+[[tasks]]
+key="a"
+argv=["run"]
+cwd="."
+` + field + `="project-owned"
+`
+		_, err := Parse([]byte(source))
+		if err == nil || !strings.Contains(err.Error(), "unknown manifest field") {
+			t.Fatalf("workflow field %q was not rejected: %v", field, err)
+		}
 	}
 }

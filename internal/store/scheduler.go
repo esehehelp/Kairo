@@ -30,7 +30,7 @@ type requestRow struct {
 }
 
 func (s *Store) refreshRunnableTx(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, `SELECT tr.task_id,tr.revision FROM task_revisions tr JOIN tasks t ON t.id=tr.task_id JOIN queues q ON q.id=t.queue_id WHERE tr.desired_state='active' AND tr.scheduling_state='pending' AND q.desired_state='active' AND NOT EXISTS(SELECT 1 FROM admission_blocks b WHERE b.task_id=tr.task_id AND b.task_revision=tr.revision AND b.cleared_at IS NULL) AND NOT EXISTS(SELECT 1 FROM task_dependencies d JOIN task_revisions dep ON dep.task_id=d.dependency_task_id AND dep.revision=d.dependency_revision WHERE d.task_id=tr.task_id AND d.task_revision=tr.revision AND dep.scheduling_state!='succeeded')`)
+	rows, err := tx.QueryContext(ctx, `SELECT tr.task_id,tr.revision FROM task_revisions tr JOIN tasks t ON t.id=tr.task_id JOIN queues q ON q.id=t.queue_id WHERE tr.revision=t.current_revision AND tr.desired_state='active' AND tr.scheduling_state='pending' AND q.desired_state='active' AND NOT EXISTS(SELECT 1 FROM admission_blocks b WHERE b.task_id=tr.task_id AND b.task_revision=tr.revision AND b.cleared_at IS NULL) AND NOT EXISTS(SELECT 1 FROM task_dependencies d JOIN task_revisions dep ON dep.task_id=d.dependency_task_id AND dep.revision=d.dependency_revision WHERE d.task_id=tr.task_id AND d.task_revision=tr.revision AND dep.scheduling_state!='succeeded')`)
 	if err != nil {
 		return err
 	}
@@ -81,7 +81,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	if !executorEnabled {
 		return nil, nil
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT t.id,t.queue_id,t.task_key,t.current_revision,t.desired_state,t.scheduling_state,t.effective_priority,t.became_runnable_at,tr.revision,tr.argv_json,tr.cwd,tr.executor_selector_json FROM tasks t JOIN queues q ON q.id=t.queue_id JOIN task_revisions tr ON tr.task_id=t.id WHERE q.desired_state='active' AND t.desired_state='active' AND tr.desired_state='active' AND tr.scheduling_state='pending' AND tr.became_runnable_at IS NOT NULL AND (tr.next_retry_at IS NULL OR tr.next_retry_at<=?) AND NOT EXISTS(SELECT 1 FROM admission_blocks b WHERE b.task_id=tr.task_id AND b.task_revision=tr.revision AND b.cleared_at IS NULL) ORDER BY t.effective_priority DESC,tr.became_runnable_at ASC,t.task_key ASC,tr.revision ASC`, now())
+	rows, err := tx.QueryContext(ctx, `SELECT t.id,t.queue_id,t.task_key,t.current_revision,t.desired_state,t.scheduling_state,t.effective_priority,t.became_runnable_at,tr.revision,tr.argv_json,tr.cwd,tr.executor_selector_json FROM tasks t JOIN queues q ON q.id=t.queue_id JOIN task_revisions tr ON tr.task_id=t.id AND tr.revision=t.current_revision WHERE q.desired_state='active' AND t.desired_state='active' AND tr.desired_state='active' AND tr.scheduling_state='pending' AND tr.became_runnable_at IS NOT NULL AND (tr.next_retry_at IS NULL OR tr.next_retry_at<=?) AND NOT EXISTS(SELECT 1 FROM admission_blocks b WHERE b.task_id=tr.task_id AND b.task_revision=tr.revision AND b.cleared_at IS NULL) AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.task_id=t.id AND a.state IN('authorized','running','suspend_requested')) ORDER BY t.effective_priority DESC,tr.became_runnable_at ASC,t.task_key ASC,tr.revision ASC`, now())
 	if err != nil {
 		return nil, err
 	}
@@ -473,7 +473,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		return nil, err
 	}
 	var continuation sql.NullString
-	_ = tx.QueryRowContext(ctx, `SELECT continuation_ref FROM attempts WHERE task_id=? AND continuation_ref IS NOT NULL AND id!=? ORDER BY ordinal DESC LIMIT 1`, reservation.Task.ID, attemptID).Scan(&continuation)
+	_ = tx.QueryRowContext(ctx, `SELECT continuation_ref FROM attempts WHERE task_id=? AND task_revision=? AND continuation_ref IS NOT NULL AND id!=? ORDER BY ordinal DESC LIMIT 1`, reservation.Task.ID, reservation.TaskRevision, attemptID).Scan(&continuation)
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -548,7 +548,7 @@ func sortResources(resources []ResourceInstance) {
 func (s *Store) EnsureV1Preemption(ctx context.Context) ([]string, error) {
 	var highPriority int
 	var needed int64
-	err := s.db.QueryRowContext(ctx, `SELECT t.effective_priority,rr.quantity FROM tasks t JOIN task_revisions tr ON tr.task_id=t.id JOIN resource_requests rr ON rr.task_id=tr.task_id AND rr.task_revision=tr.revision AND rr.request_type='exclusive' AND rr.kind='gpu' WHERE t.desired_state='active' AND tr.desired_state='active' AND tr.scheduling_state='pending' AND tr.became_runnable_at IS NOT NULL ORDER BY t.effective_priority DESC,tr.became_runnable_at,t.task_key LIMIT 1`).Scan(&highPriority, &needed)
+	err := s.db.QueryRowContext(ctx, `SELECT t.effective_priority,rr.quantity FROM tasks t JOIN task_revisions tr ON tr.task_id=t.id AND tr.revision=t.current_revision JOIN resource_requests rr ON rr.task_id=tr.task_id AND rr.task_revision=tr.revision AND rr.request_type='exclusive' AND rr.kind='gpu' WHERE t.desired_state='active' AND tr.desired_state='active' AND tr.scheduling_state='pending' AND tr.became_runnable_at IS NOT NULL AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.task_id=t.id AND a.state IN('authorized','running','suspend_requested')) ORDER BY t.effective_priority DESC,tr.became_runnable_at,t.task_key LIMIT 1`).Scan(&highPriority, &needed)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

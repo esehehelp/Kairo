@@ -27,6 +27,36 @@ system limits. GPU exclusion is a coordination guarantee among Kairo
 participants; external processes are detected and excluded but cannot be
 physically fenced.
 
+## Scope boundary
+
+Kairo is a pilot coordination layer for cooperative ML jobs on one Windows
+host, not a general workflow engine. The manifest may express static execution
+dependencies, but project code owns the reason a task should run. Conditions,
+gates, artifact semantics, dynamic fan-out, and cleanup policy intentionally
+remain outside the manifest and are rejected as unknown fields.
+
+Multi-node execution, cloud provisioning, RBAC/TLS, service supervision,
+cron/fair-share scheduling, and hard CPU/RAM enforcement are also outside the
+pilot contract.
+
+## Pilot acceptance contract
+
+The pilot is considered proven only after these scenarios pass with real
+workloads:
+
+1. Observe-only inventory of an existing LLM pretrain never creates a lease.
+2. A one-GPU job completes checkpoint request, publication, process exit,
+   quiescence, lease release, and continuation resume in that order.
+3. Daemon/process failure at each transition never permits duplicate GPU
+   ownership or loses an acknowledged continuation.
+4. A short high-priority job preempts a long job and the long job resumes.
+5. Redelivery of one command cannot change its published continuation.
+6. A two-GPU DDP job receives an all-or-nothing gang lease and quiesces all
+   registered ranks before reconciliation releases it.
+
+The store and provider tests cover the deterministic portions of this contract;
+real NVIDIA, fpmvslm, process-kill, and DDP runs remain pilot integration tests.
+
 ## Worker SDK
 
 ```python
