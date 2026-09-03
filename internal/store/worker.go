@@ -55,12 +55,11 @@ func (s *Store) PollCommandsV1(ctx context.Context, attemptID, leaseID string, e
 	var commands []Command
 	for rows.Next() {
 		var c Command
-		var taskID, payload string
-		if err := rows.Scan(&c.ID, &taskID, &c.AttemptID, &c.Kind, &c.Reason, &c.State, &c.DeliveryCount, &c.CreatedAt, &payload); err != nil {
+		var payload string
+		if err := rows.Scan(&c.ID, &c.TaskID, &c.AttemptID, &c.Kind, &c.Reason, &c.State, &c.DeliveryCount, &c.CreatedAt, &payload); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		c.WorkloadID = taskID
 		c.Payload = json.RawMessage(payload)
 		c.DeliveryCount++
 		commands = append(commands, c)

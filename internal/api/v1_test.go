@@ -44,3 +44,54 @@ func TestPlanApplyAPIRequiresOptimisticRevision(t *testing.T) {
 		t.Fatalf("revision conflict: %d", status)
 	}
 }
+
+func TestLegacyLifecycleRoutesAreNotRegistered(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	server := httptest.NewServer((&Server{Store: st}).Handler())
+	defer server.Close()
+
+	for _, path := range []string{
+		"/v1/state",
+		"/v1/resources",
+		"/v1/resources/gpu0/ready",
+		"/v1/workloads",
+		"/v1/workloads/wrk0",
+		"/v1/attempts/att0/heartbeat",
+	} {
+		request, err := http.NewRequest(http.MethodPost, server.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != http.StatusNotFound {
+			t.Fatalf("legacy route %s returned %d", path, response.StatusCode)
+		}
+	}
+}
+
+func TestWorkerAPIRequiresLeaseAndEpoch(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	server := httptest.NewServer((&Server{Store: st}).Handler())
+	defer server.Close()
+
+	response, err := http.Post(server.URL+"/v1/worker/attempts/att0/heartbeat", "application/json", bytes.NewBufferString(`{"progress":{}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("missing worker fencing headers returned %d", response.StatusCode)
+	}
+}

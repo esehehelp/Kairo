@@ -1,9 +1,10 @@
 # Kairo
 
-Kairo coordinates revisioned ML task queues on one Windows host. SQLite is the
-source of truth for plans, leases, attempts, authorizations, commands, epochs,
-and the append-only event log. Provider observations remain the source of truth
-for physical GPU, memory, CPU, disk, and process state.
+Kairo coordinates revisioned ML task queues on one Windows host. The V1
+queue/task/resource/worker model is the only runtime state machine. SQLite is
+the source of truth for plans, leases, attempts, authorizations, commands,
+epochs, and the append-only event log. Provider observations remain the source
+of truth for physical GPU, memory, CPU, disk, and process state.
 
 ## Start
 
@@ -76,13 +77,19 @@ The context manager sends rank-0 heartbeats in the background every ten
 seconds. Safe points handle at-least-once commands separately. The PyTorch
 `DistributedAdapter` lazily imports PyTorch, broadcasts commands from rank 0,
 and acknowledges a checkpoint only after every rank's callback and barrier.
+Managed attempts require `KAIRO_ATTEMPT_ID`, `KAIRO_LEASE_ID`, and
+`KAIRO_COORDINATION_EPOCH` together with `KAIRO_API_URL`; the legacy
+`KAIRO_WORKLOAD_ID` environment variable remains a task-ID alias. An
+unmanaged process may continue to use local STOP files without an API URL.
 
 ## Verification
 
 ```powershell
 go test ./...
 go test -race ./...
+go vet ./...
 uv run --project sdk/python pytest -q
+git diff --check
 ```
 
 Actual NVIDIA and WSL launches are intentionally outside normal tests and

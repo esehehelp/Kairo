@@ -112,7 +112,7 @@ class DistributedAdapter:
                 try:
                     response = self.session._request(
                         "GET",
-                        f"{self.session._worker_prefix}/attempts/"
+                        "/v1/worker/attempts/"
                         f"{self.session.attempt_id}/commands",
                         None,
                     )

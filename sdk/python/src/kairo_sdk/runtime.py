@@ -74,11 +74,12 @@ class AttemptSession:
         heartbeat_interval_seconds: float = 10.0,
         timeout_seconds: float = 10.0,
     ) -> None:
-        if (api_url is None) != (attempt_id is None):
-            raise ValueError("api_url and attempt_id must be provided together")
-        if (lease_id is None) != (coordination_epoch is None):
-            raise ValueError("lease_id and coordination_epoch must be provided together")
         self.api_url = api_url.rstrip("/") if api_url else None
+        if self.api_url is None:
+            if attempt_id is not None or lease_id is not None or coordination_epoch is not None:
+                raise ValueError("unmanaged attempts cannot provide Kairo attempt or lease context")
+        elif not attempt_id or not lease_id or coordination_epoch is None:
+            raise ValueError("managed Kairo attempts require attempt, lease, and coordination epoch")
         self.attempt_id = attempt_id
         self.workload_id = workload_id
         self.lease_id = lease_id
@@ -112,10 +113,11 @@ class AttemptSession:
         workload_id = os.environ.get("KAIRO_WORKLOAD_ID")
         lease_id = os.environ.get("KAIRO_LEASE_ID")
         epoch_text = os.environ.get("KAIRO_COORDINATION_EPOCH")
-        if bool(api_url) != bool(attempt_id):
-            raise RuntimeError("incomplete Kairo context: API URL and attempt ID must be set together")
-        if api_url and (not lease_id or not epoch_text):
-            raise RuntimeError("managed Kairo context requires lease ID and coordination epoch")
+        if api_url:
+            if not attempt_id or not lease_id or not epoch_text:
+                raise RuntimeError("managed Kairo context requires attempt ID, lease ID, and coordination epoch")
+        elif attempt_id or lease_id or epoch_text:
+            raise RuntimeError("unmanaged Kairo context cannot provide attempt or lease context")
         try:
             epoch = int(epoch_text) if epoch_text else None
         except ValueError as error:
@@ -136,10 +138,6 @@ class AttemptSession:
     @property
     def managed(self) -> bool:
         return self.api_url is not None
-
-    @property
-    def _worker_prefix(self) -> str:
-        return "/v1/worker" if self.lease_id is not None else "/v1"
 
     @property
     def resource_ids(self) -> tuple[str, ...]:
@@ -192,17 +190,17 @@ class AttemptSession:
             return
         if progress is not None:
             self.set_progress(progress)
-        if self.lease_id is not None and not self._process_registered:
+        if not self._process_registered:
             self.register_process()
         self._request(
             "POST",
-            f"{self._worker_prefix}/attempts/{self.attempt_id}/heartbeat",
+            f"/v1/worker/attempts/{self.attempt_id}/heartbeat",
             {"progress": self._progress},
         )
         self._last_heartbeat = time.monotonic()
 
     def register_process(self, *, rank: int = 0, pid: int | None = None, process_identity: str | None = None) -> None:
-        if not self.managed or self.lease_id is None:
+        if not self.managed:
             return
         self._request(
             "POST",
@@ -233,14 +231,12 @@ class AttemptSession:
             context = CommandContext(_stop_file_command_id(stop_path), self.attempt_id, "suspend", "stop_file", 1)
             checkpoint(context)
             stop_path.unlink(missing_ok=True)
-            if self.managed and self.lease_id is None:
-                self.report_disposition("hold", {"reason": "stop_file"})
             self.suspend_handled = True
             return True
         if not self.managed or now - self._last_poll < self.poll_interval_seconds:
             return False
         self._last_poll = now
-        response = self._request("GET", f"{self._worker_prefix}/attempts/{self.attempt_id}/commands", None)
+        response = self._request("GET", f"/v1/worker/attempts/{self.attempt_id}/commands", None)
         for raw in response.get("commands", []):
             context = CommandContext(str(raw["id"]), self.attempt_id, str(raw["kind"]), str(raw.get("reason") or ""), int(raw.get("delivery_count") or 0))
             self._ack(context.command_id, "accepted")
@@ -251,36 +247,24 @@ class AttemptSession:
                 if result.continuation_ref is not None:
                     payload["continuation_ref"] = result.continuation_ref
                 self._ack(context.command_id, "checkpointed", payload)
-            elif context.kind == "cancel" and self.lease_id is None:
-                self.report_disposition("close", {"reason": "cancelled"})
             self.suspend_handled = True
             return True
         return False
 
     def complete(self, payload: Mapping[str, Any] | None = None) -> None:
-        # The v1 executor reports process exit; SDK completion must not release
-        # a lease while ranks or child processes may still exist.
-        if self.lease_id is None:
-            self.report_disposition("close", payload)
-
-    def report_disposition(self, disposition: str, payload: Mapping[str, Any] | None = None) -> None:
-        if not self.managed:
-            return
-        if self.lease_id is not None:
-            raise RuntimeError("v1 terminal state is reported by the executor after process exit")
-        self._request("POST", f"/v1/attempts/{self.attempt_id}/disposition", {"disposition": disposition, "payload": dict(payload or {})})
+        # The V1 executor records terminal state after process exit.
+        return
 
     def _ack(self, command_id: str, phase: str, payload: Mapping[str, Any] | None = None) -> None:
-        self._request("POST", f"{self._worker_prefix}/attempts/{self.attempt_id}/commands/{command_id}/acks", {"phase": phase, "payload": dict(payload or {})})
+        self._request("POST", f"/v1/worker/attempts/{self.attempt_id}/commands/{command_id}/acks", {"phase": phase, "payload": dict(payload or {})})
 
     def _request(self, method: str, path: str, body: Any) -> dict[str, Any]:
         if self.api_url is None:
             raise RuntimeError("attempt is not managed by Kairo")
         data = None
         headers = {"Accept": "application/json"}
-        if self.lease_id is not None:
-            headers["Kairo-Lease-ID"] = self.lease_id
-            headers["Kairo-Coordination-Epoch"] = str(self.coordination_epoch)
+        headers["Kairo-Lease-ID"] = self.lease_id
+        headers["Kairo-Coordination-Epoch"] = str(self.coordination_epoch)
         if body is not None:
             data = json.dumps(body, separators=(",", ":")).encode("utf-8")
             headers["Content-Type"] = "application/json"

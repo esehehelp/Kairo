@@ -1,7 +1,7 @@
 [project]
 name = "kairo-sdk"
 version = "0.1.0"
-description = "Runtime mechanics for Kairo-managed workloads"
+description = "Runtime mechanics for Kairo-managed tasks"
 requires-python = ">=3.12"
 dependencies = []
 

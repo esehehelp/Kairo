@@ -27,7 +27,6 @@ type Local struct {
 	NodeID              string
 	Kind                string
 	Attributes          map[string]string
-	V1                  bool
 	ObserveOnly         bool
 	ObservationInterval time.Duration
 	Providers           map[string]provider.Provider
@@ -68,31 +67,6 @@ func (e *Local) Run(ctx context.Context) error {
 }
 
 func (e *Local) tick(ctx context.Context) error {
-	if e.V1 {
-		return e.tickV1(ctx)
-	}
-	if commandID, created, err := e.Store.EnsurePreemption(ctx); err != nil {
-		return err
-	} else if created {
-		e.Logger.Info("requested cooperative preemption", "command_id", commandID)
-	}
-	for {
-		launch, err := e.Store.AllocateNext(ctx, e.ID)
-		if err != nil {
-			return err
-		}
-		if launch == nil {
-			return nil
-		}
-		if err := e.start(launch); err != nil {
-			e.Logger.Error("attempt launch failed", "attempt_id", launch.Attempt.ID, "error", err)
-			_ = e.Store.ReportDisposition(context.Background(), launch.Attempt.ID, "hold", nil)
-			_ = e.Store.MarkAttemptExited(context.Background(), launch.Attempt.ID, -1)
-		}
-	}
-}
-
-func (e *Local) tickV1(ctx context.Context) error {
 	if e.ObservationInterval == 0 {
 		e.ObservationInterval = 5 * time.Second
 	}
@@ -175,7 +149,7 @@ func (e *Local) tickV1(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err = e.startV1(launch); err != nil {
+		if err = e.start(launch); err != nil {
 			e.Logger.Error("attempt launch failed", "attempt_id", launch.Attempt.ID, "error", err)
 			_ = e.Store.TerminalV1(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, -1, "launch_error")
 		}
@@ -198,7 +172,7 @@ func resourceBinding(resource store.ResourceInstance) string {
 	return resource.StableIdentity
 }
 
-func (e *Local) startV1(launch *store.V1Launch) error {
+func (e *Local) start(launch *store.V1Launch) error {
 	bindings := make([]string, 0, len(launch.Resources))
 	resourceIDs := make([]string, 0, len(launch.Resources))
 	for _, resource := range launch.Resources {
@@ -275,79 +249,6 @@ func (e *Local) startV1(launch *store.V1Launch) error {
 		}
 		if err := e.Store.TerminalV1(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, exit, failure); err != nil {
 			e.Logger.Error("could not record v1 attempt exit", "attempt_id", launch.Attempt.ID, "error", err)
-		}
-		e.mu.Lock()
-		delete(e.running, launch.Attempt.ID)
-		e.mu.Unlock()
-	}()
-	return nil
-}
-
-func (e *Local) start(launch *store.Launch) error {
-	w := launch.Workload
-	cmd := exec.Command(w.Argv[0], w.Argv[1:]...)
-	cmd.Dir = w.CWD
-	bindings := make([]string, 0, len(launch.Resources))
-	resourceIDs := make([]string, 0, len(launch.Resources))
-	for _, resource := range launch.Resources {
-		bindings = append(bindings, resource.Binding)
-		resourceIDs = append(resourceIDs, resource.ID)
-	}
-	cmd.Env = append(os.Environ(),
-		"KAIRO_WORKLOAD_ID="+w.ID,
-		"KAIRO_ATTEMPT_ID="+launch.Attempt.ID,
-		"KAIRO_LEASE_ID="+launch.LeaseID,
-		"KAIRO_RESOURCE_IDS="+strings.Join(resourceIDs, ","),
-		"KAIRO_RESOURCE_BINDINGS="+strings.Join(bindings, ","),
-		"KAIRO_API_URL="+e.APIURL,
-	)
-	if launch.ContinuationRef != nil {
-		cmd.Env = append(cmd.Env, "KAIRO_CONTINUATION_REF="+*launch.ContinuationRef)
-	}
-	if w.ResourceKind == "gpu" {
-		cmd.Env = append(cmd.Env, "CUDA_VISIBLE_DEVICES="+strings.Join(bindings, ","))
-	}
-	outPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stdout.log")
-	errPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stderr.log")
-	stdout, err := os.OpenFile(outPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		return err
-	}
-	stderr, err := os.OpenFile(errPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
-	if err != nil {
-		stdout.Close()
-		return err
-	}
-	cmd.Stdout, cmd.Stderr = stdout, stderr
-	if err := cmd.Start(); err != nil {
-		stdout.Close()
-		stderr.Close()
-		return fmt.Errorf("start %q: %w", w.Argv[0], err)
-	}
-	if err := e.Store.MarkAttemptRunning(context.Background(), launch.Attempt.ID, cmd.Process.Pid); err != nil {
-		_ = cmd.Process.Kill()
-		stdout.Close()
-		stderr.Close()
-		return err
-	}
-	e.mu.Lock()
-	e.running[launch.Attempt.ID] = cmd
-	e.mu.Unlock()
-	e.Logger.Info("attempt started",
-		"workload_id", w.ID, "attempt_id", launch.Attempt.ID,
-		"pid", cmd.Process.Pid, "resources", resourceIDs)
-	go func() {
-		err := cmd.Wait()
-		stdout.Close()
-		stderr.Close()
-		exitCode := cmd.ProcessState.ExitCode()
-		if err != nil {
-			e.Logger.Warn("attempt exited", "attempt_id", launch.Attempt.ID, "exit_code", exitCode, "error", err)
-		} else {
-			e.Logger.Info("attempt exited", "attempt_id", launch.Attempt.ID, "exit_code", exitCode)
-		}
-		if markErr := e.Store.MarkAttemptExited(context.Background(), launch.Attempt.ID, exitCode); markErr != nil {
-			e.Logger.Error("could not record attempt exit", "attempt_id", launch.Attempt.ID, "error", markErr)
 		}
 		e.mu.Lock()
 		delete(e.running, launch.Attempt.ID)

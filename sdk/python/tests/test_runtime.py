@@ -64,6 +64,8 @@ def test_same_command_may_execute_callback_more_than_once(tmp_path: Path):
             api_url=f"http://127.0.0.1:{server.server_port}",
             attempt_id="att_test",
             workload_id="wrk_test",
+            lease_id="lease_test",
+            coordination_epoch=1,
             poll_interval_seconds=0,
             heartbeat_interval_seconds=10_000,
         )
@@ -101,6 +103,15 @@ def test_attempt_context_exposes_continuation(monkeypatch):
     monkeypatch.setenv("KAIRO_CONTINUATION_REF", "checkpoint://step-12345")
     session = AttemptSession(api_url=None, attempt_id=None, workload_id=None)
     assert session.continuation_ref == "checkpoint://step-12345"
+
+
+def test_managed_attempt_requires_lease_fencing_context():
+    with pytest.raises(ValueError, match="attempt, lease, and coordination epoch"):
+        AttemptSession(
+            api_url="http://127.0.0.1:7474",
+            attempt_id="att_unfenced",
+            workload_id="task_unfenced",
+        )
 
 
 def test_stop_file_compatibility_uses_stable_context(tmp_path: Path):

@@ -173,6 +173,10 @@ func (s *Server) resourceStatus(w http.ResponseWriter, r *http.Request) {
 }
 func (s *Server) resourceAction(w http.ResponseWriter, r *http.Request) {
 	action := r.PathValue("action")
+	if action == "ready" {
+		http.NotFound(w, r)
+		return
+	}
 	state, reason := "", ""
 	switch action {
 	case "enable":

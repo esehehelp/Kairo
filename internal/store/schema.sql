@@ -125,18 +125,8 @@ CREATE TABLE coordination_events(
  sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, aggregate_type TEXT NOT NULL,
  aggregate_id TEXT NOT NULL, coordination_epoch INTEGER, payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL);
 
--- Prototype compatibility, isolated from v1 plan and inventory truth.
-CREATE TABLE resources(id TEXT PRIMARY KEY, kind TEXT NOT NULL, binding TEXT NOT NULL,
- state TEXT NOT NULL CHECK(state IN('ready','quarantined')), quarantine_reason TEXT, created_at TEXT NOT NULL);
-CREATE TABLE workloads(id TEXT PRIMARY KEY, project TEXT NOT NULL, external_key TEXT NOT NULL, priority INTEGER NOT NULL,
- argv_json TEXT NOT NULL, cwd TEXT NOT NULL, resource_kind TEXT NOT NULL, resource_count INTEGER NOT NULL CHECK(resource_count>0),
- cooperative_suspend INTEGER NOT NULL CHECK(cooperative_suspend IN(0,1)), desired_state TEXT NOT NULL CHECK(desired_state IN('active','paused','cancelled')),
- scheduling_state TEXT NOT NULL CHECK(scheduling_state IN('queued','running','preempting','paused','closed','held')),
- created_at TEXT NOT NULL, updated_at TEXT NOT NULL, UNIQUE(project,external_key));
-
 CREATE INDEX tasks_schedule_idx ON tasks(desired_state,scheduling_state,became_runnable_at);
 CREATE INDEX observations_latest_idx ON resource_observations(resource_id,observed_at DESC);
 CREATE INDEX claims_active_idx ON external_claims(resource_id,cleared_at);
 CREATE INDEX attempts_task_idx ON attempts(task_id,task_revision,ordinal DESC);
-CREATE INDEX attempts_workload_idx ON attempts(workload_id,ordinal DESC);
 CREATE INDEX commands_attempt_idx ON commands(attempt_id,state,created_at);

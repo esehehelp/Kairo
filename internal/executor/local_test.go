@@ -27,7 +27,7 @@ func (p *observationProvider) Prepare(context.Context, store.ResourceInstance) e
 }
 func (p *observationProvider) Release(context.Context, store.ResourceInstance) error { return nil }
 
-func TestObserveOnlyRecordsUnmanagedWorkloadWithoutAllocating(t *testing.T) {
+func TestObserveOnlyRecordsExternalActivityWithoutAllocating(t *testing.T) {
 	ctx := context.Background()
 	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
 	if err != nil {
@@ -70,14 +70,13 @@ count=1
 		Claims:       []store.ExternalClaim{{ID: "unmanaged-pretrain", ResourceID: "gpu0", ClaimKind: "external_process", ProcessIdentity: &identity}},
 	}}
 	executor := NewLocal("e", st, t.TempDir(), nil)
-	executor.V1 = true
 	executor.NodeID = "n"
 	executor.Kind = "windows"
 	executor.Attributes = map[string]string{"environment": "windows"}
 	executor.ObserveOnly = true
 	executor.Providers = map[string]provider.Provider{"gpu-provider": p}
 
-	if err = executor.tickV1(ctx); err != nil {
+	if err = executor.tick(ctx); err != nil {
 		t.Fatal(err)
 	}
 	status, err := st.Status(ctx)
