@@ -1,0 +1,40 @@
+schema_version = 1
+project = "fpmvslm"
+queue = "training"
+
+[[tasks]]
+key = "pilot"
+argv = ["uv", "run", "python", "train.py"]
+cwd = "D:/Dev/fpmvslm"
+priority = 10
+depends_on = []
+checkpointable = true
+
+[tasks.executor]
+labels = { environment = "windows" }
+
+[tasks.retry]
+max_failure_attempts = 2
+retry_on = ["launch_error", "exit_nonzero"]
+initial_backoff_seconds = 30
+max_backoff_seconds = 600
+
+[[tasks.exclusive]]
+kind = "gpu"
+count = 1
+same_node = true
+min_total_memory_bytes = 12000000000
+min_observed_free_memory_bytes = 10000000000
+on_external_claim = "wait"
+on_unattributed_activity = "wait"
+on_stale_observation = "wait"
+
+[tasks.capacity]
+cpu_millis = 8000
+ram_bytes = 12884901888
+strength = "admitted"
+
+[[tasks.capacity.disks]]
+filesystem = "D:"
+reserve_bytes = 10737418240
+min_free_after_bytes = 10737418240

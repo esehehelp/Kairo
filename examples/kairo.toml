@@ -1,0 +1,39 @@
+database_path = "local/kairo.db"
+listen = "127.0.0.1:7474"
+advertise_url = "http://127.0.0.1:7474"
+log_directory = "local/attempts"
+observe_only = true
+observation_interval_seconds = 5
+
+[node]
+id = "windows-host-1"
+name = "windows-host-1"
+os = "windows"
+architecture = "amd64"
+labels = { site = "local" }
+
+[[executors]]
+id = "windows-local"
+kind = "windows"
+labels = { environment = "windows" }
+
+[[executors]]
+id = "ubuntu-wsl"
+kind = "wsl2"
+labels = { environment = "wsl2", distro = "Ubuntu", nccl = "true" }
+
+[[providers]]
+id = "nvidia-local"
+kind = "nvidia"
+observation_ttl_seconds = 15
+
+[[providers]]
+id = "host-local"
+kind = "host"
+observation_ttl_seconds = 15
+
+[[providers]]
+id = "filesystem-local"
+kind = "filesystem"
+filesystems = ["D:"]
+observation_ttl_seconds = 15

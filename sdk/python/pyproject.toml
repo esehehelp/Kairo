@@ -1,0 +1,20 @@
+[project]
+name = "kairo-sdk"
+version = "0.1.0"
+description = "Runtime mechanics for Kairo-managed workloads"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kairo_sdk"]
+
+[dependency-groups]
+dev = ["pytest>=9.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
