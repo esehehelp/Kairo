@@ -8,11 +8,16 @@ import (
 )
 
 func startPreemptionVictim(t *testing.T, store *Store, executorID string, preemptible bool, priority int) (*ExecutionRequest, *Launch) {
+	return startPreemptionVictimWithUnattributedPolicy(t, store, executorID, preemptible, priority, "wait")
+}
+
+func startPreemptionVictimWithUnattributedPolicy(t *testing.T, store *Store, executorID string, preemptible bool, priority int, unattributedPolicy string) (*ExecutionRequest, *Launch) {
 	t.Helper()
 	ctx := context.Background()
 	spec := schedulerExecutionSpec("preemption-victim")
 	spec.Priority = priority
 	spec.Preemptible = preemptible
+	spec.Exclusive[0].OnUnattributedActivity = unattributedPolicy
 	execution, _, err := store.SubmitExecution(ctx, spec)
 	if err != nil {
 		t.Fatal(err)
@@ -165,22 +170,168 @@ func TestPriorityPreemptionRejectsUnsafeGPUEvidence(t *testing.T) {
 	}
 }
 
-func TestPriorityPreemptionDoesNotCrossExecutors(t *testing.T) {
+func TestPriorityPreemptionCrossesExecutorsOnTheSamePhysicalNode(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)
-	if err := store.UpsertExecutor(context.Background(), Executor{ID: "executor-2", NodeID: "node", Kind: "local", Attributes: json.RawMessage(`{"environment":"wsl2"}`), Enabled: true}); err != nil {
+	if err := store.UpsertExecutor(context.Background(), Executor{ID: "ubuntu-wsl", NodeID: "node", Kind: "wsl2", Attributes: json.RawMessage(`{"environment":"wsl2"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	_, launch := startPreemptionVictim(t, store, "executor-2", true, 10)
-	submitPreemptionWaiter(t, store, 100)
-	commands, err := store.EnsurePriorityPreemption(context.Background(), "executor")
-	if err != nil || len(commands) != 0 {
+	if err := store.UpsertExecutor(context.Background(), Executor{ID: "windows-local", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	_, launch := startPreemptionVictimWithUnattributedPolicy(t, store, "ubuntu-wsl", true, 10, "allow")
+	if err := store.ObserveClaim(context.Background(), ExternalClaim{ID: "wsl-gpu-activity", ResourceID: "gpu-0", ClaimKind: "unattributed_activity"}); err != nil {
+		t.Fatal(err)
+	}
+	waitingSpec := schedulerExecutionSpec("windows-preemption-waiter")
+	waitingSpec.Priority = 100
+	waitingSpec.ExecutorSelector = json.RawMessage(`{"labels":{"environment":"windows"}}`)
+	if _, _, err := store.SubmitExecution(context.Background(), waitingSpec); err != nil {
+		t.Fatal(err)
+	}
+	commands, err := store.EnsurePriorityPreemption(context.Background(), "windows-local")
+	if err != nil || len(commands) != 1 {
 		t.Fatalf("cross-executor preemption commands=%v err=%v", commands, err)
 	}
-	var count int
-	_ = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&count)
-	if count != 0 {
-		t.Fatalf("created %d cross-executor suspend commands", count)
+	delivered, err := store.PollCommands(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch)
+	if err != nil || len(delivered) != 1 || delivered[0].ID != commands[0] {
+		t.Fatalf("victim executor did not receive cross-executor suspend: commands=%+v err=%v", delivered, err)
+	}
+}
+
+func TestPriorityPreemptionHonorsVictimUnattributedPolicy(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		policy     string
+		wantLength int
+	}{
+		{name: "wait remains unsafe", policy: "wait", wantLength: 0},
+		{name: "allow permits suspend", policy: "allow", wantLength: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := openCoordinationStore(t)
+			setupSchedulerInventory(t, store)
+			_, launch := startPreemptionVictimWithUnattributedPolicy(t, store, "executor", true, 10, test.policy)
+			submitPreemptionWaiter(t, store, 100)
+			if err := store.ObserveClaim(context.Background(), ExternalClaim{ID: "unattributed", ResourceID: "gpu-0", ClaimKind: "unattributed_activity"}); err != nil {
+				t.Fatal(err)
+			}
+			commands, err := store.EnsurePriorityPreemption(context.Background(), "executor")
+			if err != nil || len(commands) != test.wantLength {
+				t.Fatalf("policy=%s commands=%v err=%v", test.policy, commands, err)
+			}
+			var count int
+			if err = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&count); err != nil || count != test.wantLength {
+				t.Fatalf("policy=%s command count=%d err=%v", test.policy, count, err)
+			}
+		})
+	}
+}
+
+func TestPriorityPreemptionProjectsVictimRAMAsReclaimable(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	if err := store.UpsertProvider(ctx, "host-provider", "node", "host", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertResourceInstance(ctx, ResourceInstance{ID: "host-ram", NodeID: "node", ProviderID: "host-provider", Kind: "ram", StableIdentity: "host-memory", AdminState: "enabled"}); err != nil {
+		t.Fatal(err)
+	}
+	total, initiallyFree := int64(16<<30), int64(15<<30)
+	observed := time.Now().UTC()
+	if err := store.RecordObservation(ctx, Observation{ResourceID: "host-ram", ObservedAt: observed.Format(time.RFC3339Nano), ValidUntil: observed.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &initiallyFree}); err != nil {
+		t.Fatal(err)
+	}
+	victimSpec := schedulerExecutionSpec("ram-preemption-victim")
+	victimSpec.Capacity = CapacityRequest{RAMBytes: 8 << 30, Strength: "admitted"}
+	victim, _, err := store.SubmitExecution(ctx, victimSpec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := store.ReserveNext(ctx, "executor")
+	if err != nil || reservation == nil || reservation.Execution.ID != victim.ID {
+		t.Fatalf("reserve victim: %+v %v", reservation, err)
+	}
+	if err = store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := store.AuthorizeLaunch(ctx, reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ActivateLaunch(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, 4321, "win:4321:start:1"); err != nil {
+		t.Fatal(err)
+	}
+
+	// The running victim has driven observed free RAM below the waiter's
+	// request. Its admitted RAM is enough to make the waiter viable after
+	// quiescence, so current usage must not suppress the suspend command.
+	lowFree := int64(2 << 30)
+	observed = time.Now().UTC()
+	if err = store.RecordObservation(ctx, Observation{ResourceID: "host-ram", ObservedAt: observed.Format(time.RFC3339Nano), ValidUntil: observed.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &lowFree}); err != nil {
+		t.Fatal(err)
+	}
+	waiterSpec := schedulerExecutionSpec("ram-preemption-waiter")
+	waiterSpec.Priority = 100
+	waiterSpec.Capacity = CapacityRequest{RAMBytes: 8 << 30, Strength: "admitted"}
+	if _, _, err = store.SubmitExecution(ctx, waiterSpec); err != nil {
+		t.Fatal(err)
+	}
+	commands, err := store.EnsurePriorityPreemption(ctx, "executor")
+	if err != nil || len(commands) != 1 {
+		t.Fatalf("RAM-reclaiming preemption commands=%v err=%v", commands, err)
+	}
+}
+
+func TestPriorityPreemptionRejectsRAMRequestAbovePhysicalTotal(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	if err := store.UpsertProvider(ctx, "host-provider", "node", "host", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertResourceInstance(ctx, ResourceInstance{ID: "host-ram", NodeID: "node", ProviderID: "host-provider", Kind: "ram", StableIdentity: "host-memory", AdminState: "enabled"}); err != nil {
+		t.Fatal(err)
+	}
+	total, initiallyFree := int64(16<<30), int64(15<<30)
+	observed := time.Now().UTC()
+	if err := store.RecordObservation(ctx, Observation{ResourceID: "host-ram", ObservedAt: observed.Format(time.RFC3339Nano), ValidUntil: observed.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &initiallyFree}); err != nil {
+		t.Fatal(err)
+	}
+	victimSpec := schedulerExecutionSpec("impossible-ram-victim")
+	victimSpec.Capacity = CapacityRequest{RAMBytes: 8 << 30, Strength: "admitted"}
+	if _, _, err := store.SubmitExecution(ctx, victimSpec); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := store.ReserveNext(ctx, "executor")
+	if err != nil || reservation == nil {
+		t.Fatalf("reserve victim: %+v %v", reservation, err)
+	}
+	if err = store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := store.AuthorizeLaunch(ctx, reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ActivateLaunch(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, 4321, "win:4321:start:1"); err != nil {
+		t.Fatal(err)
+	}
+	widestFree := total
+	observed = time.Now().UTC()
+	if err = store.RecordObservation(ctx, Observation{ResourceID: "host-ram", ObservedAt: observed.Format(time.RFC3339Nano), ValidUntil: observed.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &widestFree}); err != nil {
+		t.Fatal(err)
+	}
+	waiterSpec := schedulerExecutionSpec("impossible-ram-waiter")
+	waiterSpec.Priority = 100
+	waiterSpec.Capacity = CapacityRequest{RAMBytes: 20 << 30, Strength: "admitted"}
+	if _, _, err = store.SubmitExecution(ctx, waiterSpec); err != nil {
+		t.Fatal(err)
+	}
+	commands, err := store.EnsurePriorityPreemption(ctx, "executor")
+	if err != nil || len(commands) != 0 {
+		t.Fatalf("physically impossible RAM request triggered preemption: commands=%v err=%v", commands, err)
 	}
 }
 

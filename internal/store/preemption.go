@@ -13,7 +13,9 @@ import (
 
 // EnsurePriorityPreemption asks lower-priority cooperative executions to
 // suspend when, and only when, their active GPU leases are the remaining
-// obstacle to the highest-priority waiting execution on executorID.
+// obstacle to the highest-priority waiting execution on the physical node
+// hosting executorID. The victim may belong to another executor on that node;
+// its own executor receives the attempt-scoped command through normal polling.
 //
 // It returns the priority-preemption command IDs selected for delivery. A
 // repeated call returns the same live command IDs; it never creates a second
@@ -45,7 +47,7 @@ func (s *Store) EnsurePriorityPreemption(ctx context.Context, executorID string)
 		if candidate.execution.Priority != highestPriority {
 			break
 		}
-		victims, viable, planErr := preemptionPlanTx(ctx, tx, executorID, nodeID, candidate)
+		victims, viable, planErr := preemptionPlanTx(ctx, tx, nodeID, candidate)
 		if planErr != nil {
 			return nil, planErr
 		}
@@ -92,12 +94,13 @@ func preemptionCandidatesTx(ctx context.Context, tx *sql.Tx, executorAttributes 
 }
 
 type preemptionVictim struct {
-	executionID string
-	projectID   string
-	attemptID   string
-	leaseID     string
-	epoch       int64
-	priority    int
+	executionID        string
+	projectID          string
+	attemptID          string
+	leaseID            string
+	epoch              int64
+	priority           int
+	allowsUnattributed bool
 }
 
 type preemptionGPU struct {
@@ -110,7 +113,7 @@ type preemptionGPU struct {
 	victim       *preemptionVictim
 }
 
-func preemptionPlanTx(ctx context.Context, tx *sql.Tx, executorID, nodeID string, candidate executionCandidate) (map[string]preemptionVictim, bool, error) {
+func preemptionPlanTx(ctx context.Context, tx *sql.Tx, nodeID string, candidate executionCandidate) (map[string]preemptionVictim, bool, error) {
 	requests, err := loadResourceRequestsTx(ctx, tx, candidate.execution.ID)
 	if err != nil {
 		return nil, false, err
@@ -131,7 +134,7 @@ func preemptionPlanTx(ctx context.Context, tx *sql.Tx, executorID, nodeID string
 		return nil, false, nil
 	}
 
-	gpus, err := preemptionGPUsTx(ctx, tx, executorID, nodeID, candidate.execution.Priority)
+	gpus, err := preemptionGPUsTx(ctx, tx, nodeID, candidate.execution.Priority)
 	if err != nil {
 		return nil, false, err
 	}
@@ -185,14 +188,14 @@ func preemptionPlanTx(ctx context.Context, tx *sql.Tx, executorID, nodeID string
 }
 
 func preemptionGPUPhysicallyEligible(gpu preemptionGPU, constraints gpuConstraints, stamp time.Time) bool {
-	if gpu.external || gpu.unattributed || !gpu.total.Valid || gpu.total.Int64 < constraints.MinTotal || !gpu.validUntil.Valid {
+	if gpu.external || gpu.unattributed && (gpu.victim == nil || !gpu.victim.allowsUnattributed) || !gpu.total.Valid || gpu.total.Int64 < constraints.MinTotal || !gpu.validUntil.Valid {
 		return false
 	}
 	deadline, err := time.Parse(time.RFC3339Nano, gpu.validUntil.String)
 	return err == nil && deadline.After(stamp)
 }
 
-func preemptionGPUsTx(ctx context.Context, tx *sql.Tx, executorID, nodeID string, waitingPriority int) ([]preemptionGPU, error) {
+func preemptionGPUsTx(ctx context.Context, tx *sql.Tx, nodeID string, waitingPriority int) ([]preemptionGPU, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT ri.id,o.valid_until,o.total_bytes,o.free_bytes,
 		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
 		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity')
@@ -218,23 +221,26 @@ func preemptionGPUsTx(ctx context.Context, tx *sql.Tx, executorID, nodeID string
 	for index := range gpus {
 		var victim preemptionVictim
 		var attemptID sql.NullString
-		var leaseState, attemptState, leaseExecutor, executionState string
-		var checkpointable, preemptible bool
-		err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,a.id,l.id,l.coordination_epoch,e.priority,e.checkpointable,e.preemptible,l.state,COALESCE(a.state,''),l.executor_id,e.state
+		var leaseState, attemptState, leaseExecutorNode, executionState string
+		var checkpointable, preemptible, leaseExecutorEnabled bool
+		err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,a.id,l.id,l.coordination_epoch,e.priority,e.checkpointable,e.preemptible,l.state,COALESCE(a.state,''),xe.node_id,xe.enabled,e.state,
+			COALESCE((SELECT MIN(CASE WHEN COALESCE(json_extract(rr.policy_json,'$.on_unattributed_activity'),'wait')='allow' THEN 1 ELSE 0 END)
+				FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='exclusive' AND rr.kind='gpu'),0)
 			FROM lease_items li
 			JOIN leases l ON l.id=li.lease_id
 			JOIN execution_requests e ON e.id=l.execution_id
+			JOIN executors xe ON xe.id=l.executor_id
 			LEFT JOIN attempts a ON a.id=l.attempt_id
 			WHERE li.resource_id=? AND li.kind='gpu'
 			AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')
-			LIMIT 1`, gpus[index].id).Scan(&victim.executionID, &victim.projectID, &attemptID, &victim.leaseID, &victim.epoch, &victim.priority, &checkpointable, &preemptible, &leaseState, &attemptState, &leaseExecutor, &executionState)
+			LIMIT 1`, gpus[index].id).Scan(&victim.executionID, &victim.projectID, &attemptID, &victim.leaseID, &victim.epoch, &victim.priority, &checkpointable, &preemptible, &leaseState, &attemptState, &leaseExecutorNode, &leaseExecutorEnabled, &executionState, &victim.allowsUnattributed)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
-		if attemptID.Valid && leaseState == "active" && attemptState == "running" && executionState == "started" && checkpointable && preemptible && victim.priority < waitingPriority && leaseExecutor == executorID {
+		if attemptID.Valid && leaseState == "active" && attemptState == "running" && executionState == "started" && checkpointable && preemptible && victim.priority < waitingPriority && leaseExecutorEnabled && leaseExecutorNode == nodeID {
 			victim.attemptID = attemptID.String
 			gpus[index].victim = &victim
 		} else {
@@ -248,8 +254,13 @@ func preemptionGPUsTx(ctx context.Context, tx *sql.Tx, executorID, nodeID string
 
 func preemptionVictimLeaseSafeTx(ctx context.Context, tx *sql.Tx, leaseID, nodeID string, stamp time.Time) (bool, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT ri.node_id,ri.admin_state,o.valid_until,
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL)
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL AND
+			(c.claim_kind='external_process' OR c.claim_kind='unattributed_activity' AND COALESCE(
+				(SELECT MIN(CASE WHEN COALESCE(json_extract(rr.policy_json,'$.on_unattributed_activity'),'wait')='allow' THEN 1 ELSE 0 END)
+				 FROM resource_requests rr WHERE rr.execution_id=l.execution_id AND rr.request_type='exclusive' AND rr.kind=li.kind),
+				0)=0))
 		FROM lease_items li
+		JOIN leases l ON l.id=li.lease_id
 		JOIN resource_instances ri ON ri.id=li.resource_id
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY id DESC LIMIT 1)
 		WHERE li.lease_id=? AND li.kind='gpu' AND li.resource_id IS NOT NULL`, leaseID)
@@ -302,6 +313,7 @@ func preemptionCapacityAvailableTx(ctx context.Context, tx *sql.Tx, nodeID strin
 		return false, err
 	}
 	var reserved int64
+	var reclaimable int64
 	for rows.Next() {
 		var leaseID string
 		var quantity int64
@@ -309,7 +321,11 @@ func preemptionCapacityAvailableTx(ctx context.Context, tx *sql.Tx, nodeID strin
 			rows.Close()
 			return false, err
 		}
-		if !victimLeases[leaseID] {
+		if victimLeases[leaseID] {
+			if request.Kind == "ram" {
+				reclaimable += quantity
+			}
+		} else {
 			reserved += quantity
 		}
 	}
@@ -318,6 +334,22 @@ func preemptionCapacityAvailableTx(ctx context.Context, tx *sql.Tx, nodeID strin
 	}
 	if request.Kind == "cpu" {
 		return total.Valid && total.Int64-reserved >= request.Quantity, nil
+	}
+	// Current free RAM includes the running victims' physical usage. Project
+	// their admitted RAM capacity as reclaimable for preemption planning; the
+	// normal reservation/prepare path still requires a fresh observation after
+	// the victims have quiesced, so this cannot authorize an unsafe launch.
+	if request.Kind == "ram" {
+		if !total.Valid || !free.Valid || total.Int64 < request.Quantity {
+			return false, nil
+		}
+		projectedFree := free.Int64
+		if reclaimable >= total.Int64-projectedFree {
+			projectedFree = total.Int64
+		} else {
+			projectedFree += reclaimable
+		}
+		return projectedFree-reserved >= request.Quantity, nil
 	}
 	if !free.Valid || free.Int64-reserved-request.Quantity < 0 {
 		return false, nil
