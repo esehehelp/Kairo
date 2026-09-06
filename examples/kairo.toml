@@ -1,7 +1,7 @@
-database_path = "local/kairo.db"
+database_path = "local/kairo-v3.db"
 listen = "127.0.0.1:7474"
 advertise_url = "http://127.0.0.1:7474"
-log_directory = "local/attempts"
+log_directory = "local/attempts-v3"
 observe_only = true
 observation_interval_seconds = 5
 

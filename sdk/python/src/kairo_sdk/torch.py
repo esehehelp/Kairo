@@ -112,7 +112,7 @@ class DistributedAdapter:
                 try:
                     response = self.session._request(
                         "GET",
-                        "/v1/worker/attempts/"
+                        "/v2/worker/attempts/"
                         f"{self.session.attempt_id}/commands",
                         None,
                     )
@@ -136,18 +136,12 @@ class DistributedAdapter:
         if raw is None:
             return False
 
-        context = CommandContext(attempt_id=self.session.attempt_id, **raw)
-        accepted = self._try_ack(context.command_id, "accepted") if rank == 0 else False
-        result = None
-        local_error: str | None = None
-        if context.kind == "suspend":
-            if rank == 0:
-                self._try_ack(context.command_id, "checkpointing")
-            try:
-                result = _normalize_suspend_result(checkpoint(context))
-            except BaseException as exc:
-                local_error = f"rank {rank} checkpoint failed: {exc}"
-        elif context.kind != "cancel":
+        context = CommandContext(
+            execution_id=self.session.execution_id,
+            attempt_id=self.session.attempt_id,
+            **raw,
+        )
+        if context.kind != "suspend":
             if rank == 0:
                 self._try_ack(
                     context.command_id,
@@ -155,6 +149,16 @@ class DistributedAdapter:
                     {"reason": f"unsupported command kind {context.kind!r}"},
                 )
             return False
+
+        accepted = self._try_ack(context.command_id, "accepted") if rank == 0 else False
+        result = None
+        local_error: str | None = None
+        if rank == 0:
+            self._try_ack(context.command_id, "checkpointing")
+        try:
+            result = _normalize_suspend_result(checkpoint(context))
+        except BaseException as exc:
+            local_error = f"rank {rank} checkpoint failed: {exc}"
 
         errors: list[Any] = [None] * (dist.get_world_size() if distributed else 1)
         if distributed:
@@ -171,17 +175,17 @@ class DistributedAdapter:
                 )
             raise RuntimeError("; ".join(failures))
 
-        if context.kind == "suspend" and distributed:
+        if distributed:
             dist.barrier()
-        completed = accepted
-        if rank == 0 and context.kind == "suspend":
+        checkpointed = accepted
+        if rank == 0:
             payload = dict(result.payload)
             if result.continuation_ref is not None:
                 payload["continuation_ref"] = result.continuation_ref
-            completed = self._try_ack(context.command_id, "checkpointed", payload)
-        completion = [completed]
+            checkpointed = self._try_ack(context.command_id, "checkpointed", payload)
+        acknowledgement = [checkpointed]
         if distributed:
-            dist.broadcast_object_list(completion, src=0)
-        if completion[0]:
+            dist.broadcast_object_list(acknowledgement, src=0)
+        if acknowledgement[0]:
             self.session.suspend_handled = True
-        return bool(completion[0])
+        return bool(acknowledgement[0])

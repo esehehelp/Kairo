@@ -16,6 +16,7 @@ from typing import Any
 @dataclass(frozen=True)
 class CommandContext:
     command_id: str
+    execution_id: str | None
     attempt_id: str | None
     kind: str
     reason: str
@@ -63,8 +64,8 @@ class AttemptSession:
         self,
         *,
         api_url: str | None,
+        execution_id: str | None,
         attempt_id: str | None,
-        workload_id: str | None,
         lease_id: str | None = None,
         coordination_epoch: int | None = None,
         node_id: str | None = None,
@@ -75,18 +76,29 @@ class AttemptSession:
         timeout_seconds: float = 10.0,
     ) -> None:
         self.api_url = api_url.rstrip("/") if api_url else None
+        self.stop_paths = tuple(Path(path) for path in stop_paths)
         if self.api_url is None:
-            if attempt_id is not None or lease_id is not None or coordination_epoch is not None:
-                raise ValueError("unmanaged attempts cannot provide Kairo attempt or lease context")
-        elif not attempt_id or not lease_id or coordination_epoch is None:
-            raise ValueError("managed Kairo attempts require attempt, lease, and coordination epoch")
+            if (
+                execution_id is not None
+                or attempt_id is not None
+                or lease_id is not None
+                or coordination_epoch is not None
+            ):
+                raise ValueError(
+                    "unmanaged sessions cannot provide Kairo execution, attempt, or lease context"
+                )
+        elif not execution_id or not attempt_id or not lease_id or coordination_epoch is None:
+            raise ValueError(
+                "managed Kairo sessions require execution, attempt, lease, and coordination epoch"
+            )
+        elif self.stop_paths:
+            raise ValueError("managed Kairo sessions cannot use stop_paths; pause the coordination scope")
+        self.execution_id = execution_id
         self.attempt_id = attempt_id
-        self.workload_id = workload_id
         self.lease_id = lease_id
         self.coordination_epoch = coordination_epoch
         self.node_id = node_id
         self.executor_id = executor_id
-        self.stop_paths = tuple(Path(path) for path in stop_paths)
         self.poll_interval_seconds = poll_interval_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.timeout_seconds = timeout_seconds
@@ -109,23 +121,28 @@ class AttemptSession:
         heartbeat_interval_seconds: float = 10.0,
     ) -> AttemptSession:
         api_url = os.environ.get("KAIRO_API_URL")
+        execution_id = os.environ.get("KAIRO_EXECUTION_ID")
         attempt_id = os.environ.get("KAIRO_ATTEMPT_ID")
-        workload_id = os.environ.get("KAIRO_WORKLOAD_ID")
         lease_id = os.environ.get("KAIRO_LEASE_ID")
         epoch_text = os.environ.get("KAIRO_COORDINATION_EPOCH")
         if api_url:
-            if not attempt_id or not lease_id or not epoch_text:
-                raise RuntimeError("managed Kairo context requires attempt ID, lease ID, and coordination epoch")
-        elif attempt_id or lease_id or epoch_text:
-            raise RuntimeError("unmanaged Kairo context cannot provide attempt or lease context")
+            if not execution_id or not attempt_id or not lease_id or not epoch_text:
+                raise RuntimeError(
+                    "managed Kairo context requires execution ID, attempt ID, lease ID, "
+                    "and coordination epoch"
+                )
+        elif execution_id or attempt_id or lease_id or epoch_text:
+            raise RuntimeError(
+                "unmanaged Kairo context cannot provide execution, attempt, or lease context"
+            )
         try:
             epoch = int(epoch_text) if epoch_text else None
         except ValueError as error:
             raise RuntimeError("KAIRO_COORDINATION_EPOCH must be an integer") from error
         return cls(
             api_url=api_url,
+            execution_id=execution_id,
             attempt_id=attempt_id,
-            workload_id=workload_id,
             lease_id=lease_id,
             coordination_epoch=epoch,
             node_id=os.environ.get("KAIRO_NODE_ID"),
@@ -148,8 +165,9 @@ class AttemptSession:
         return _csv_environment("KAIRO_RESOURCE_BINDINGS")
 
     @property
-    def continuation_ref(self) -> str | None:
-        return os.environ.get("KAIRO_CONTINUATION_REF") or None
+    def input_continuation_ref(self) -> str | None:
+        """Return the project-provided continuation without interpreting it."""
+        return os.environ.get("KAIRO_CONTINUATION_REF")
 
     def __enter__(self) -> AttemptSession:
         self.start()
@@ -194,7 +212,7 @@ class AttemptSession:
             self.register_process()
         self._request(
             "POST",
-            f"/v1/worker/attempts/{self.attempt_id}/heartbeat",
+            f"/v2/worker/attempts/{self.attempt_id}/heartbeat",
             {"progress": self._progress},
         )
         self._last_heartbeat = time.monotonic()
@@ -204,7 +222,7 @@ class AttemptSession:
             return
         self._request(
             "POST",
-            f"/v1/worker/attempts/{self.attempt_id}/processes",
+            f"/v2/worker/attempts/{self.attempt_id}/processes",
             {
                 "rank": rank,
                 "pid": os.getpid() if pid is None else pid,
@@ -228,7 +246,14 @@ class AttemptSession:
             self.heartbeat()
         stop_path = next((path for path in self.stop_paths if path.exists()), None)
         if stop_path is not None:
-            context = CommandContext(_stop_file_command_id(stop_path), self.attempt_id, "suspend", "stop_file", 1)
+            context = CommandContext(
+                command_id=_stop_file_command_id(stop_path),
+                execution_id=None,
+                attempt_id=None,
+                kind="suspend",
+                reason="stop_file",
+                delivery_count=1,
+            )
             checkpoint(context)
             stop_path.unlink(missing_ok=True)
             self.suspend_handled = True
@@ -236,27 +261,36 @@ class AttemptSession:
         if not self.managed or now - self._last_poll < self.poll_interval_seconds:
             return False
         self._last_poll = now
-        response = self._request("GET", f"/v1/worker/attempts/{self.attempt_id}/commands", None)
+        response = self._request("GET", f"/v2/worker/attempts/{self.attempt_id}/commands", None)
         for raw in response.get("commands", []):
-            context = CommandContext(str(raw["id"]), self.attempt_id, str(raw["kind"]), str(raw.get("reason") or ""), int(raw.get("delivery_count") or 0))
+            context = CommandContext(
+                command_id=str(raw["id"]),
+                execution_id=self.execution_id,
+                attempt_id=self.attempt_id,
+                kind=str(raw["kind"]),
+                reason=str(raw.get("reason") or ""),
+                delivery_count=int(raw.get("delivery_count") or 0),
+            )
+            if context.kind != "suspend":
+                self._ack(
+                    context.command_id,
+                    "rejected",
+                    {"reason": f"unsupported command kind {context.kind!r}"},
+                )
+                continue
             self._ack(context.command_id, "accepted")
-            if context.kind == "suspend":
-                self._ack(context.command_id, "checkpointing")
-                result = _normalize_suspend_result(checkpoint(context))
-                payload = dict(result.payload)
-                if result.continuation_ref is not None:
-                    payload["continuation_ref"] = result.continuation_ref
-                self._ack(context.command_id, "checkpointed", payload)
+            self._ack(context.command_id, "checkpointing")
+            result = _normalize_suspend_result(checkpoint(context))
+            payload = dict(result.payload)
+            if result.continuation_ref is not None:
+                payload["continuation_ref"] = result.continuation_ref
+            self._ack(context.command_id, "checkpointed", payload)
             self.suspend_handled = True
             return True
         return False
 
-    def complete(self, payload: Mapping[str, Any] | None = None) -> None:
-        # The V1 executor records terminal state after process exit.
-        return
-
     def _ack(self, command_id: str, phase: str, payload: Mapping[str, Any] | None = None) -> None:
-        self._request("POST", f"/v1/worker/attempts/{self.attempt_id}/commands/{command_id}/acks", {"phase": phase, "payload": dict(payload or {})})
+        self._request("POST", f"/v2/worker/attempts/{self.attempt_id}/commands/{command_id}/acks", {"phase": phase, "payload": dict(payload or {})})
 
     def _request(self, method: str, path: str, body: Any) -> dict[str, Any]:
         if self.api_url is None:
@@ -307,10 +341,11 @@ def _current_process_identity() -> str:
     pid = os.getpid()
     if os.name != "nt":
         try:
-            started = Path(f"/proc/{pid}").stat().st_mtime_ns
-        except OSError:
-            started = time.time_ns()
-        return f"pid:{pid}:start:{started}"
+            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            started = _parse_proc_stat_starttime(stat_text)
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"cannot establish process identity for pid {pid}") from error
+        return f"proc:{pid}:starttime:{started}"
     import ctypes
     from ctypes import wintypes
 
@@ -342,3 +377,17 @@ def _current_process_identity() -> str:
     # Match Go's windows.Filetime.Nanoseconds(), which is Unix-relative.
     unix_epoch_ticks = 116_444_736_000_000_000
     return f"pid:{pid}:start:{(ticks - unix_epoch_ticks) * 100}"
+
+
+def _parse_proc_stat_starttime(stat_text: str) -> int:
+    """Read Linux /proc/PID/stat field 22 without splitting the comm field."""
+    closing_paren = stat_text.rfind(")")
+    if closing_paren < 0:
+        raise ValueError("process stat has no comm terminator")
+    fields_from_state = stat_text[closing_paren + 1 :].split()
+    if len(fields_from_state) < 20:
+        raise ValueError("process stat has no starttime field")
+    starttime = int(fields_from_state[19])
+    if starttime <= 0:
+        raise ValueError("process stat starttime must be positive")
+    return starttime

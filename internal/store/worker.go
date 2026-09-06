@@ -6,40 +6,76 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
-	"strings"
-	"time"
 
 	"kairo/internal/id"
 )
 
-func (s *Store) HeartbeatV1(ctx context.Context, attemptID, leaseID string, epoch int64, progress json.RawMessage) error {
+func (s *Store) Heartbeat(ctx context.Context, attemptID, leaseID string, epoch int64, progress json.RawMessage) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
+		return err
+	}
 	if len(progress) == 0 {
 		progress = json.RawMessage(`{}`)
 	}
 	if !json.Valid(progress) {
 		return errors.New("progress must be valid JSON")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	t := now()
+	res, err := tx.ExecContext(ctx, `UPDATE attempts SET last_heartbeat_at=?,progress_json=? WHERE id=? AND state IN('running','quiescing')`, t, string(progress), attemptID)
 	if err != nil {
 		return err
 	}
-	defer tx.Rollback()
-	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
-		return err
-	}
-	res, err := tx.ExecContext(ctx, `UPDATE attempts SET last_heartbeat_at=?,progress_json=? WHERE id=? AND state IN('running','suspend_requested')`, now(), string(progress), attemptID)
-	if err != nil {
-		return err
-	}
-	n, _ := res.RowsAffected()
-	if n != 1 {
-		return errors.New("attempt is not running")
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrStaleEpoch
 	}
 	return tx.Commit()
 }
 
-func (s *Store) PollCommandsV1(ctx context.Context, attemptID, leaseID string, epoch int64) ([]Command, error) {
+func (s *Store) RegisterProcess(ctx context.Context, attemptID, leaseID string, epoch int64, rank, pid int, identity string) error {
+	if rank < 0 || pid <= 0 || identity == "" {
+		return errors.New("worker rank, PID, and process identity are required")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
+		return err
+	}
+	var attemptState, leaseState string
+	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=? AND l.attempt_id=a.id WHERE a.id=?`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
+		return err
+	}
+	if (attemptState != "running" && attemptState != "quiescing") || (leaseState != "active" && leaseState != "releasing") {
+		return ErrStaleEpoch
+	}
+	var registeredPID int
+	var registeredIdentity string
+	var registeredExited sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT pid,process_identity,exited_at FROM attempt_processes WHERE attempt_id=? AND role='worker' AND rank=?`, attemptID, rank).Scan(&registeredPID, &registeredIdentity, &registeredExited)
+	if err == nil && (registeredPID != pid || registeredIdentity != identity || registeredExited.Valid) {
+		return errors.New("worker rank is already bound to a different or exited process identity")
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	t := now()
+	_, err = tx.ExecContext(ctx, `INSERT INTO attempt_processes(attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at)
+	 VALUES(?,'worker','executor',?,?,?,?,?)
+	 ON CONFLICT(attempt_id,role,rank) DO UPDATE SET last_seen_at=excluded.last_seen_at`, attemptID, rank, pid, identity, t, t)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) PollCommands(ctx context.Context, attemptID, leaseID string, epoch int64) ([]Command, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -48,61 +84,54 @@ func (s *Store) PollCommandsV1(ctx context.Context, attemptID, leaseID string, e
 	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,COALESCE(task_id,''),attempt_id,kind,reason,state,delivery_count,created_at,payload_json FROM commands WHERE attempt_id=? AND coordination_epoch=? AND state NOT IN('completed','rejected') ORDER BY created_at`, attemptID, epoch)
+	var attemptState, leaseState string
+	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=? AND l.attempt_id=a.id WHERE a.id=?`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
+		return nil, err
+	}
+	if (attemptState != "running" && attemptState != "quiescing") || (leaseState != "active" && leaseState != "releasing") {
+		return nil, ErrStaleEpoch
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id,execution_id,attempt_id,kind,origin,reason,state,delivery_count,created_at,payload_json
+	 FROM commands WHERE attempt_id=? AND state IN('pending','accepted','checkpointing') ORDER BY created_at,id`, attemptID)
 	if err != nil {
 		return nil, err
 	}
 	var commands []Command
 	for rows.Next() {
-		var c Command
+		var command Command
 		var payload string
-		if err := rows.Scan(&c.ID, &c.TaskID, &c.AttemptID, &c.Kind, &c.Reason, &c.State, &c.DeliveryCount, &c.CreatedAt, &payload); err != nil {
+		if err = rows.Scan(&command.ID, &command.ExecutionID, &command.AttemptID, &command.Kind, &command.Origin, &command.Reason, &command.State, &command.DeliveryCount, &command.CreatedAt, &payload); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		c.Payload = json.RawMessage(payload)
-		c.DeliveryCount++
-		commands = append(commands, c)
+		command.Payload = json.RawMessage(payload)
+		commands = append(commands, command)
 	}
-	rows.Close()
-	t := now()
-	for _, c := range commands {
-		if _, err = tx.ExecContext(ctx, `UPDATE commands SET delivery_count=delivery_count+1,updated_at=? WHERE id=?`, t, c.ID); err != nil {
-			return nil, err
-		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO command_deliveries(command_id,attempt_id,coordination_epoch,delivered_at) VALUES(?,?,?,?)`, c.ID, attemptID, epoch, t); err != nil {
-			return nil, err
-		}
-	}
-	if err = tx.Commit(); err != nil {
+	if err = rows.Close(); err != nil {
 		return nil, err
 	}
-	return commands, nil
+	t := now()
+	for i := range commands {
+		commands[i].DeliveryCount++
+		if _, err = tx.ExecContext(ctx, `UPDATE commands SET delivery_count=delivery_count+1,updated_at=? WHERE id=?`, t, commands[i].ID); err != nil {
+			return nil, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO command_deliveries(command_id,attempt_id,coordination_epoch,delivered_at) VALUES(?,?,?,?)`, commands[i].ID, attemptID, epoch, t); err != nil {
+			return nil, err
+		}
+	}
+	return commands, tx.Commit()
 }
 
-func (s *Store) AckCommandV1(ctx context.Context, attemptID, leaseID string, epoch int64, commandID, phase string, payload json.RawMessage) error {
-	state, ok := ackState(phase)
-	if !ok {
-		return fmt.Errorf("unsupported acknowledgement phase %q", phase)
+func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch int64, commandID, phase string, payload json.RawMessage) error {
+	if _, ok := ackState(phase); !ok {
+		return errors.New("invalid command acknowledgement phase")
 	}
 	if len(payload) == 0 {
 		payload = json.RawMessage(`{}`)
 	}
 	if !json.Valid(payload) {
-		return errors.New("ack payload must be valid JSON")
-	}
-	var continuationRef string
-	if phase == "checkpointed" {
-		var body struct {
-			ContinuationRef string `json:"continuation_ref"`
-		}
-		if err := json.Unmarshal(payload, &body); err != nil {
-			return err
-		}
-		continuationRef = strings.TrimSpace(body.ContinuationRef)
-		if continuationRef == "" {
-			return errors.New("checkpointed acknowledgement requires continuation_ref")
-		}
+		return errors.New("command acknowledgement payload must be valid JSON")
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -112,52 +141,131 @@ func (s *Store) AckCommandV1(ctx context.Context, attemptID, leaseID string, epo
 	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
 		return err
 	}
-	var current, attemptState, leaseState string
-	var published sql.NullString
-	if err = tx.QueryRowContext(ctx, `SELECT c.state,a.state,l.state,a.continuation_ref FROM commands c JOIN attempts a ON a.id=c.attempt_id JOIN leases l ON l.id=c.lease_id WHERE c.id=? AND c.attempt_id=? AND c.coordination_epoch=?`, commandID, attemptID, epoch).Scan(&current, &attemptState, &leaseState, &published); errors.Is(err, sql.ErrNoRows) {
+	var executionID, state string
+	if err = tx.QueryRowContext(ctx, `SELECT execution_id,state FROM commands WHERE id=? AND attempt_id=? AND lease_id=? AND coordination_epoch=? AND kind='suspend'`, commandID, attemptID, leaseID, epoch).Scan(&executionID, &state); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
-	}
-	if (attemptState != "running" && attemptState != "suspend_requested") || (leaseState != "active" && leaseState != "releasing") {
-		return errors.New("attempt is no longer active")
-	}
-	if phase == "checkpointed" && commandStateRank(current) >= commandStateRank("checkpointed") && published.Valid && published.String != continuationRef {
-		return fmt.Errorf("checkpoint continuation is already published as %q", published.String)
 	}
 	t := now()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO command_acks(command_id,attempt_id,coordination_epoch,phase,payload_json,created_at) VALUES(?,?,?,?,?,?)`, commandID, attemptID, epoch, phase, string(payload), t); err != nil {
 		return err
 	}
-	advance := commandStateRank(state) > commandStateRank(current) && current != "completed" && current != "rejected"
-	if state == "rejected" && commandStateRank(current) >= commandStateRank("checkpointed") {
-		advance = false
+	advance := false
+	if state != "rejected" {
+		if phase == "rejected" {
+			advance = state != "checkpointed"
+		} else {
+			advance = commandStateRank(phase) > commandStateRank(state)
+		}
 	}
 	if advance {
-		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state=?,updated_at=? WHERE id=?`, state, t, commandID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state=?,payload_json=?,updated_at=? WHERE id=?`, phase, string(payload), t, commandID); err != nil {
 			return err
 		}
 	}
 	if phase == "rejected" && advance {
-		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='running' WHERE id=? AND state='suspend_requested'`, attemptID); err != nil {
+		result, updateErr := tx.ExecContext(ctx, `UPDATE attempts SET state='running' WHERE id=? AND state='quiescing'`, attemptID)
+		if updateErr != nil {
+			return updateErr
+		}
+		restored, _ := result.RowsAffected()
+		if restored == 1 {
+			if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='active',releasing_at=NULL WHERE id=? AND state='releasing'`, leaseID); err != nil {
+				return err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='blocked',blocker_reason='checkpoint_rejected',updated_at=? WHERE command_id=? AND state!='quiesced'`, t, commandID); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='active',releasing_at=NULL WHERE id=? AND state='releasing'`, leaseID); err != nil {
+	}
+	if (phase == "accepted" || phase == "checkpointing") && state != "checkpointed" && state != "rejected" {
+		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiescing' WHERE id=? AND state='running'`, attemptID); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE task_revisions SET scheduling_state='running' WHERE task_id=(SELECT task_id FROM attempts WHERE id=?) AND revision=(SELECT task_revision FROM attempts WHERE id=?) AND scheduling_state='preempting'`, attemptID, attemptID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,?) WHERE id=? AND state='active'`, t, leaseID); err != nil {
 			return err
 		}
 	}
 	if phase == "checkpointed" && advance {
-		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET checkpointed_at=?,continuation_ref=? WHERE id=?`, t, continuationRef, attemptID); err != nil {
+		var body struct {
+			ContinuationRef string `json:"continuation_ref"`
+		}
+		if err = json.Unmarshal(payload, &body); err != nil || body.ContinuationRef == "" {
+			return errors.New("checkpointed acknowledgement requires continuation_ref")
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state=CASE WHEN state IN('running','quiescing') THEN 'quiescing' ELSE state END,checkpointed_at=?,continuation_ref=? WHERE id=?`, t, body.ContinuationRef, attemptID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,?) WHERE id=? AND state='active'`, t, leaseID); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiescing',updated_at=? WHERE command_id=? AND state!='quiesced'`, t, commandID); err != nil {
+			return err
+		}
+		projectID, projectErr := executionProjectIDTx(ctx, tx, executionID)
+		if projectErr != nil {
+			return projectErr
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "checkpoint_published", &projectID, "attempt", attemptID, &epoch, map[string]any{"execution_id": executionID, "command_id": commandID, "continuation_ref": body.ContinuationRef}); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
 }
 
-func (s *Store) TerminalV1(ctx context.Context, attemptID, leaseID string, epoch int64, exitCode int, failureClass string) error {
+func (s *Store) EnqueueSuspend(ctx context.Context, attemptID, origin, reason string) (string, error) {
+	if origin != "scope_pause" && origin != "priority_preemption" {
+		return "", errors.New("invalid suspend origin")
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var executionID, leaseID, attemptState, leaseState string
+	var epoch int64
+	if err = tx.QueryRowContext(ctx, `SELECT a.execution_id,l.id,a.coordination_epoch,a.state,l.state FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=?`, attemptID).Scan(&executionID, &leaseID, &epoch, &attemptState, &leaseState); errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	} else if err != nil {
+		return "", err
+	}
+	if attemptState != "running" && attemptState != "quiescing" {
+		return "", fmt.Errorf("attempt is not suspendable from state %s", attemptState)
+	}
+	if leaseState != "active" && leaseState != "releasing" {
+		return "", fmt.Errorf("lease is not suspendable from state %s", leaseState)
+	}
+	var existing string
+	if err = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=? AND state!='rejected' LIMIT 1`, attemptID).Scan(&existing); err == nil {
+		return existing, tx.Commit()
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	commandID, t := id.New("cmd"), now()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at) VALUES(?,?,?,?,?,'suspend',?,?,'pending',?,?)`, commandID, executionID, attemptID, leaseID, epoch, origin, reason, t, t); err != nil {
+		return "", err
+	}
+	projectID, err := executionProjectIDTx(ctx, tx, executionID)
+	if err != nil {
+		return "", err
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "suspend_requested", &projectID, "command", commandID, &epoch, map[string]any{"execution_id": executionID, "attempt_id": attemptID, "origin": origin, "reason": reason}); err != nil {
+		return "", err
+	}
+	return commandID, tx.Commit()
+}
+
+func executionProjectIDTx(ctx context.Context, tx *sql.Tx, executionID string) (string, error) {
+	var projectID string
+	err := tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=?`, executionID).Scan(&projectID)
+	return projectID, err
+}
+
+// RecordTerminal stores raw process termination and deliberately does not
+// classify success, failure, or retryability. Process absence is finalized
+// separately by FinalizeQuiescence.
+func (s *Store) RecordTerminal(ctx context.Context, attemptID, leaseID string, epoch int64, exitCode int, exitSignal string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -166,168 +274,37 @@ func (s *Store) TerminalV1(ctx context.Context, attemptID, leaseID string, epoch
 	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
 		return err
 	}
-	var taskID string
-	var revision int
-	var state string
-	var checkpointed, continuation sql.NullString
-	if err = tx.QueryRowContext(ctx, `SELECT task_id,task_revision,state,checkpointed_at,continuation_ref FROM attempts WHERE id=?`, attemptID).Scan(&taskID, &revision, &state, &checkpointed, &continuation); err != nil {
+	var executionID, state string
+	if err = tx.QueryRowContext(ctx, `SELECT execution_id,state FROM attempts WHERE id=?`, attemptID).Scan(&executionID, &state); err != nil {
 		return err
 	}
-	if state == "quiesced" {
+	if state == "quiesced" || state == "exited" {
 		return tx.Commit()
 	}
 	if state == "lost" {
-		return fmt.Errorf("attempt is lost and requires reconciliation")
-	}
-	if failureClass == "" && exitCode != 0 {
-		failureClass = "exit_nonzero"
+		return errors.New("lost attempt requires reconciliation")
 	}
 	t := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',exit_code=?,failure_class=?,exited_at=?,quiesced_at=? WHERE id=?`, exitCode, nullable(failureClass), t, t, attemptID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='exited',exit_code=?,exit_signal=?,exited_at=? WHERE id=?`, exitCode, nullable(exitSignal), t, attemptID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=?,last_seen_at=? WHERE attempt_id=? AND exited_at IS NULL`, t, t, attemptID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=?,last_seen_at=? WHERE attempt_id=? AND role='launcher' AND exited_at IS NULL`, t, t, attemptID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',releasing_at=COALESCE(releasing_at,?),released_at=? WHERE id=? AND state IN('prepared','active','releasing')`, t, t, leaseID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,?) WHERE id=? AND state IN('prepared','active')`, t, leaseID); err != nil {
 		return err
 	}
-	var suspendCommandID, cancelCommandID sql.NullString
-	_ = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=? AND kind='suspend' AND state!='rejected' ORDER BY created_at DESC LIMIT 1`, attemptID).Scan(&suspendCommandID)
-	_ = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=? AND kind='cancel' AND state!='rejected' ORDER BY created_at DESC LIMIT 1`, attemptID).Scan(&cancelCommandID)
-	next := "failed"
-	preempted := suspendCommandID.Valid && checkpointed.Valid && !cancelCommandID.Valid
-	if cancelCommandID.Valid {
-		next = "cancelled"
-		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state='completed',updated_at=?,completed_at=? WHERE attempt_id=? AND state NOT IN('completed','rejected')`, t, t, attemptID); err != nil {
-			return err
-		}
-	} else if preempted {
-		next = "pending"
-		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state='completed',updated_at=?,completed_at=? WHERE id=?`, t, t, suspendCommandID.String); err != nil {
-			return err
-		}
-	} else if exitCode == 0 {
-		next = "succeeded"
-	} else {
-		retry, delay, err := retryDecision(ctx, tx, taskID, revision, failureClass)
-		if err != nil {
-			return err
-		}
-		if retry {
-			next = "backoff"
-			nextAt := time.Now().UTC().Add(delay).Format(time.RFC3339Nano)
-			if _, err = tx.ExecContext(ctx, `UPDATE task_revisions SET next_retry_at=? WHERE task_id=? AND revision=?`, nextAt, taskID, revision); err != nil {
-				return err
-			}
-		}
-		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET failure_counted=1 WHERE id=?`, attemptID); err != nil {
-			return err
-		}
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE task_revisions SET scheduling_state=? WHERE task_id=? AND revision=?`, next, taskID, revision); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='process_exit',terminal_at=? WHERE id=? AND state IN('authorized','started')`, t, executionID); err != nil {
 		return err
 	}
-	var current int
-	var desired string
-	if err = tx.QueryRowContext(ctx, `SELECT current_revision,desired_state FROM tasks WHERE id=?`, taskID).Scan(&current, &desired); err != nil {
+	projectID, err := executionProjectIDTx(ctx, tx, executionID)
+	if err != nil {
 		return err
 	}
-	if current == revision {
-		summary := next
-		if desired == "cancelled" {
-			summary = "cancelled"
-		}
-		if _, err = tx.ExecContext(ctx, `UPDATE tasks SET scheduling_state=?,updated_at=? WHERE id=?`, summary, t, taskID); err != nil {
-			return err
-		}
-	}
-	if err = appendEvent(ctx, tx, "attempt_terminal", "attempt", attemptID, &epoch, map[string]any{"exit_code": exitCode, "failure_class": failureClass, "preempted": preempted}); err != nil {
+	if err = appendCoordinationEventTx(ctx, tx, "execution_terminal", &projectID, "execution", executionID, &epoch, map[string]any{"attempt_id": attemptID, "exit_code": exitCode, "exit_signal": exitSignal}); err != nil {
 		return err
 	}
 	return tx.Commit()
-}
-
-func retryDecision(ctx context.Context, tx *sql.Tx, taskID string, revision int, class string) (bool, time.Duration, error) {
-	var retryJSON string
-	if err := tx.QueryRowContext(ctx, `SELECT effective_retry_json FROM tasks WHERE id=?`, taskID).Scan(&retryJSON); err != nil {
-		return false, 0, err
-	}
-	var p struct {
-		Max     int      `json:"max_failure_attempts"`
-		On      []string `json:"retry_on"`
-		Initial int      `json:"initial_backoff_seconds"`
-		Maximum int      `json:"max_backoff_seconds"`
-	}
-	if err := json.Unmarshal([]byte(retryJSON), &p); err != nil {
-		return false, 0, err
-	}
-	allowed := false
-	for _, v := range p.On {
-		if v == class {
-			allowed = true
-		}
-	}
-	var failures int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempts WHERE task_id=? AND task_revision=? AND failure_counted=1`, taskID, revision).Scan(&failures); err != nil {
-		return false, 0, err
-	}
-	failures++ // current attempt is counted in the same transaction after this decision.
-	if !allowed || failures >= p.Max {
-		return false, 0, nil
-	}
-	seconds := float64(p.Initial) * math.Pow(2, float64(failures-1))
-	if seconds > float64(p.Maximum) {
-		seconds = float64(p.Maximum)
-	}
-	return true, time.Duration(seconds) * time.Second, nil
-}
-
-func (s *Store) WakeRetries(ctx context.Context) error {
-	t := now()
-	_, err := s.db.ExecContext(ctx, `UPDATE task_revisions SET scheduling_state='pending',became_runnable_at=?,next_retry_at=NULL WHERE scheduling_state='backoff' AND next_retry_at<=?`, t, t)
-	return err
-}
-
-func (s *Store) EnqueueCommandV1(ctx context.Context, attemptID, kind, reason string) (string, error) {
-	if kind != "suspend" && kind != "cancel" {
-		return "", errors.New("unsupported command")
-	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return "", err
-	}
-	defer tx.Rollback()
-	var taskID, leaseID string
-	var epoch int64
-	if err = tx.QueryRowContext(ctx, `SELECT a.task_id,l.id,a.coordination_epoch FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=? AND a.state IN('running','suspend_requested')`, attemptID).Scan(&taskID, &leaseID, &epoch); errors.Is(err, sql.ErrNoRows) {
-		return "", ErrNotFound
-	} else if err != nil {
-		return "", err
-	}
-	var existing string
-	if err = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=? AND kind=? AND state NOT IN('completed','rejected') LIMIT 1`, attemptID, kind).Scan(&existing); err == nil {
-		return existing, tx.Commit()
-	} else if !errors.Is(err, sql.ErrNoRows) {
-		return "", err
-	}
-	commandID, t := id.New("cmd"), now()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO commands(id,task_id,attempt_id,lease_id,coordination_epoch,kind,reason,state,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'pending',?,?)`, commandID, taskID, attemptID, leaseID, epoch, kind, reason, t, t); err != nil {
-		return "", err
-	}
-	if kind == "suspend" {
-		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='suspend_requested' WHERE id=?`, attemptID); err != nil {
-			return "", err
-		}
-		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=? WHERE id=? AND state='active'`, t, leaseID); err != nil {
-			return "", err
-		}
-		_, _ = tx.ExecContext(ctx, `UPDATE task_revisions SET scheduling_state='preempting' WHERE task_id=? AND revision=(SELECT task_revision FROM attempts WHERE id=?)`, taskID, attemptID)
-	}
-	if err = tx.Commit(); err != nil {
-		return "", err
-	}
-	return commandID, nil
 }
 
 func (s *Store) SetAttemptLogPaths(ctx context.Context, attemptID string, epoch int64, stdoutPath, stderrPath string) error {
@@ -335,35 +312,259 @@ func (s *Store) SetAttemptLogPaths(ctx context.Context, attemptID string, epoch 
 	if err != nil {
 		return err
 	}
-	n, _ := res.RowsAffected()
-	if n != 1 {
+	if n, _ := res.RowsAffected(); n != 1 {
 		return ErrStaleEpoch
 	}
 	return nil
 }
 
-// MarkExecutorUnknown converts restart uncertainty into a coordination fence.
-// The stale lease continues to exclude its resources until reconciliation.
+type QuiescenceCandidate struct {
+	Attempt   Attempt
+	Lease     Lease
+	Processes []AttemptProcess
+	Resources []ResourceInstance
+}
+
+func (s *Store) ListQuiescenceCandidates(ctx context.Context, executorID string) ([]QuiescenceCandidate, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.execution_id,a.state,a.executor_id,a.coordination_epoch,a.pid,a.process_identity,a.exit_code,a.exit_signal,a.continuation_ref,a.progress_json,a.started_at,a.last_heartbeat_at,a.checkpointed_at,a.exited_at,a.quiesced_at,
+	 l.id,l.execution_id,l.attempt_id,l.executor_id,l.coordination_epoch,l.state,l.created_at,l.expires_at
+	 FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=? AND a.state='exited' AND l.state='releasing' ORDER BY a.exited_at`, executorID)
+	if err != nil {
+		return nil, err
+	}
+	var out []QuiescenceCandidate
+	for rows.Next() {
+		var c QuiescenceCandidate
+		var progress sql.NullString
+		if err = rows.Scan(&c.Attempt.ID, &c.Attempt.ExecutionID, &c.Attempt.State, &c.Attempt.ExecutorID, &c.Attempt.CoordinationEpoch, &c.Attempt.PID, &c.Attempt.ProcessIdentity, &c.Attempt.ExitCode, &c.Attempt.ExitSignal, &c.Attempt.ContinuationRef, &progress, &c.Attempt.StartedAt, &c.Attempt.LastHeartbeatAt, &c.Attempt.CheckpointedAt, &c.Attempt.ExitedAt, &c.Attempt.QuiescedAt,
+			&c.Lease.ID, &c.Lease.ExecutionID, &c.Lease.AttemptID, &c.Lease.ExecutorID, &c.Lease.CoordinationEpoch, &c.Lease.State, &c.Lease.CreatedAt, &c.Lease.ExpiresAt); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if progress.Valid {
+			c.Attempt.Progress = json.RawMessage(progress.String)
+		}
+		out = append(out, c)
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Processes, err = s.ListAttemptProcesses(ctx, out[i].Attempt.ID, true)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Resources, err = s.listLeaseResources(ctx, out[i].Lease.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+func (s *Store) ListAttemptProcesses(ctx context.Context, attemptID string, liveOnly bool) ([]AttemptProcess, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at,exited_at FROM attempt_processes WHERE attempt_id=? AND (?=0 OR exited_at IS NULL) ORDER BY role,rank`, attemptID, liveOnly)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []AttemptProcess
+	for rows.Next() {
+		var process AttemptProcess
+		if err = rows.Scan(&process.AttemptID, &process.Role, &process.Namespace, &process.Rank, &process.PID, &process.ProcessIdentity, &process.RegisteredAt, &process.LastSeenAt, &process.ExitedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, process)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) MarkAttemptProcessExited(ctx context.Context, attemptID, role string, rank int, identity string) error {
+	res, err := s.db.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=?,last_seen_at=? WHERE attempt_id=? AND role=? AND rank=? AND process_identity=? AND exited_at IS NULL`, now(), now(), attemptID, role, rank, identity)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		var exited sql.NullString
+		if scanErr := s.db.QueryRowContext(ctx, `SELECT exited_at FROM attempt_processes WHERE attempt_id=? AND role=? AND rank=? AND process_identity=?`, attemptID, role, rank, identity).Scan(&exited); scanErr != nil || !exited.Valid {
+			return ErrNotFound
+		}
+	}
+	return nil
+}
+
+func (s *Store) listLeaseResources(ctx context.Context, leaseID string) ([]ResourceInstance, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT r.id,r.node_id,r.provider_id,r.kind,r.stable_identity,r.binding_json,r.attributes_json,r.admin_state,r.quarantine_reason
+	 FROM lease_items li JOIN resource_instances r ON r.id=li.resource_id WHERE li.lease_id=? AND li.resource_id IS NOT NULL ORDER BY r.id`, leaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ResourceInstance
+	for rows.Next() {
+		var resource ResourceInstance
+		var binding, attributes string
+		if err = rows.Scan(&resource.ID, &resource.NodeID, &resource.ProviderID, &resource.Kind, &resource.StableIdentity, &binding, &attributes, &resource.AdminState, &resource.QuarantineReason); err != nil {
+			return nil, err
+		}
+		resource.Binding = json.RawMessage(binding)
+		resource.Attributes = json.RawMessage(attributes)
+		out = append(out, resource)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID string, epoch int64) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
+		return err
+	}
+	var executionID, attemptState, leaseState string
+	if err = tx.QueryRowContext(ctx, `SELECT a.execution_id,a.state,l.state FROM attempts a JOIN leases l ON l.id=? AND l.attempt_id=a.id WHERE a.id=?`, leaseID, attemptID).Scan(&executionID, &attemptState, &leaseState); err != nil {
+		return err
+	}
+	if attemptState == "quiesced" && leaseState == "released" {
+		return tx.Commit()
+	}
+	if attemptState != "exited" || leaseState != "releasing" {
+		return fmt.Errorf("attempt/lease not ready for quiescence: %s/%s", attemptState, leaseState)
+	}
+	var live int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes WHERE attempt_id=? AND exited_at IS NULL`, attemptID).Scan(&live); err != nil {
+		return err
+	}
+	if live != 0 {
+		return fmt.Errorf("attempt still has %d live registered processes", live)
+	}
+	// Exclusive GPU ownership is not released back to scheduling while reality
+	// is stale or another process still claims the resource.
+	var unsafe int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li
+	 LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
+	 WHERE li.lease_id=? AND li.kind='gpu' AND li.resource_id IS NOT NULL AND
+	 (o.id IS NULL OR julianday(o.valid_until)<=julianday(?)
+	 OR julianday(o.observed_at)<=julianday((SELECT exited_at FROM attempts WHERE id=?))
+	 OR EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=? AND julianday(o.observed_at)<=julianday(ap.exited_at))
+	 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL))`, leaseID, now(), attemptID, attemptID).Scan(&unsafe); err != nil {
+		return err
+	}
+	if unsafe != 0 {
+		return errors.New("leased GPU still lacks fresh unclaimed observation")
+	}
+	t := now()
+	if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',quiesced_at=? WHERE id=? AND state='exited'`, t, attemptID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=? WHERE id=? AND state='releasing'`, t, leaseID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',updated_at=? WHERE execution_id=? AND attempt_id=?`, t, executionID, attemptID); err != nil {
+		return err
+	}
+	projectID, err := executionProjectIDTx(ctx, tx, executionID)
+	if err != nil {
+		return err
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "attempt_quiesced", &projectID, "attempt", attemptID, &epoch, map[string]any{"execution_id": executionID, "lease_id": leaseID}); err != nil {
+		return err
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "lease_released", &projectID, "lease", leaseID, &epoch, map[string]any{"execution_id": executionID, "attempt_id": attemptID}); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (s *Store) MarkExecutorUnknown(ctx context.Context, executorID string) (int, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	t := now()
-	res, err := tx.ExecContext(ctx, `UPDATE leases SET state='stale',stale_at=?,coordination_epoch=coordination_epoch+1 WHERE executor_id=? AND state IN('reserved','prepared','active','releasing')`, t, executorID)
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.execution_id,a.coordination_epoch,l.id FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=? AND a.state IN('authorized','running','quiescing') AND l.state IN('prepared','active','releasing','revocation_requested')`, executorID)
 	if err != nil {
 		return 0, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='lost',failure_class='lost_after_reconcile',coordination_epoch=coordination_epoch+1 WHERE executor_id=? AND state IN('authorized','running','suspend_requested')`, executorID); err != nil {
+	type lost struct {
+		attempt, execution, lease string
+		epoch                     int64
+	}
+	var values []lost
+	for rows.Next() {
+		var value lost
+		if err = rows.Scan(&value.attempt, &value.execution, &value.epoch, &value.lease); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		values = append(values, value)
+	}
+	if err = rows.Close(); err != nil {
 		return 0, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE task_revisions SET scheduling_state='blocked' WHERE (task_id,revision) IN(SELECT task_id,task_revision FROM attempts WHERE executor_id=? AND state='lost')`, executorID); err != nil {
+	// A daemon can die after reserving or physically preparing resources but
+	// before it creates an attempt. Those leases are equally in-doubt and must
+	// block allocation until provider/OS reconciliation proves them free.
+	orphanRows, err := tx.QueryContext(ctx, `SELECT l.id,l.execution_id,l.coordination_epoch
+		FROM leases l WHERE l.executor_id=? AND l.attempt_id IS NULL
+		AND l.state IN('reserved','prepared','revocation_requested')`, executorID)
+	if err != nil {
 		return 0, err
+	}
+	type orphan struct {
+		lease, execution string
+		epoch            int64
+	}
+	var orphans []orphan
+	for orphanRows.Next() {
+		var value orphan
+		if err = orphanRows.Scan(&value.lease, &value.execution, &value.epoch); err != nil {
+			orphanRows.Close()
+			return 0, err
+		}
+		orphans = append(orphans, value)
+	}
+	if err = orphanRows.Close(); err != nil {
+		return 0, err
+	}
+	t := now()
+	for _, value := range values {
+		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='lost',coordination_epoch=coordination_epoch+1 WHERE id=?`, value.attempt); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='stale',stale_at=?,coordination_epoch=coordination_epoch+1 WHERE id=?`, t, value.lease); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=? WHERE attempt_id=? AND state='issued'`, t, value.attempt); err != nil {
+			return 0, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='executor_identity_lost',terminal_at=? WHERE id=? AND state!='terminal'`, t, value.execution); err != nil {
+			return 0, err
+		}
+		projectID, projectErr := executionProjectIDTx(ctx, tx, value.execution)
+		if projectErr != nil {
+			return 0, projectErr
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "attempt_lost", &projectID, "attempt", value.attempt, &value.epoch, map[string]any{"execution_id": value.execution, "lease_id": value.lease}); err != nil {
+			return 0, err
+		}
+	}
+	for _, value := range orphans {
+		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='stale',stale_at=?,coordination_epoch=coordination_epoch+1 WHERE id=?`, t, value.lease); err != nil {
+			return 0, err
+		}
+		projectID, projectErr := executionProjectIDTx(ctx, tx, value.execution)
+		if projectErr != nil {
+			return 0, projectErr
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "lease_stale", &projectID, "lease", value.lease, &value.epoch, map[string]any{"execution_id": value.execution, "cause": "executor_identity_lost_before_authorization"}); err != nil {
+			return 0, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return 0, err
 	}
-	n, _ := res.RowsAffected()
-	return int(n), nil
+	return len(values) + len(orphans), nil
 }

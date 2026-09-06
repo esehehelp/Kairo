@@ -7,7 +7,6 @@ import (
 	"testing"
 	"time"
 
-	"kairo/internal/plan"
 	"kairo/internal/provider"
 	"kairo/internal/store"
 )
@@ -43,21 +42,13 @@ func TestObserveOnlyRecordsExternalActivityWithoutAllocating(t *testing.T) {
 	if err = st.UpsertProvider(ctx, "gpu-provider", "n", "nvidia", nil); err != nil {
 		t.Fatal(err)
 	}
-	manifest, err := plan.Parse([]byte(`schema_version=1
-project="pilot"
-queue="observe-only"
-[[tasks]]
-key="waiting"
-argv=["train"]
-cwd="."
-[[tasks.exclusive]]
-kind="gpu"
-count=1
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = st.ApplyPlan(ctx, manifest, store.ApplyOptions{ExpectedRevision: 0, Create: true, Actor: "test", RequestID: "observe-only"}); err != nil {
+	if _, _, err = st.SubmitExecution(ctx, store.ExecutionSpec{
+		ClientRequestID: "observe-only",
+		Scope:           store.ScopePath{Project: "pilot", Queue: "observe-only", Task: "waiting"},
+		Argv:            []string{"train"},
+		CWD:             ".",
+		Exclusive:       []store.ExclusiveRequest{{Kind: "gpu", Count: 1}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -79,14 +70,22 @@ count=1
 	if err = executor.tick(ctx); err != nil {
 		t.Fatal(err)
 	}
-	status, err := st.Status(ctx)
+	status, err := st.ListResourceStatus(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(status.Resources) != 1 || status.Resources[0].DerivedState != "conflicted" || len(status.Claims) != 1 {
-		t.Fatalf("unmanaged workload observation was not retained: %+v", status)
+	claims, err := st.ListClaims(ctx)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if len(status.Leases) != 0 || len(status.Attempts) != 0 || p.prepareCalls != 0 {
-		t.Fatalf("observe-only mode allocated work: leases=%+v attempts=%+v prepares=%d", status.Leases, status.Attempts, p.prepareCalls)
+	if len(status) != 1 || status[0].DerivedState != "conflicted" || len(claims) != 1 {
+		t.Fatalf("unmanaged execution observation was not retained: resources=%+v claims=%+v", status, claims)
+	}
+	executions, err := st.ListExecutions(ctx, store.ExecutionFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(executions) != 1 || executions[0].State != "waiting" || p.prepareCalls != 0 {
+		t.Fatalf("observe-only mode allocated execution: executions=%+v prepares=%d", executions, p.prepareCalls)
 	}
 }

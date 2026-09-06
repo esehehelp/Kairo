@@ -86,7 +86,7 @@ func (e *Local) tick(ctx context.Context) error {
 	if e.ObserveOnly {
 		return nil
 	}
-	if err := e.Store.WakeRetries(ctx); err != nil {
+	if err := e.reconcileQuiescence(ctx); err != nil {
 		return err
 	}
 	for {
@@ -95,12 +95,12 @@ func (e *Local) tick(ctx context.Context) error {
 			return err
 		}
 		if reservation == nil {
-			commands, preemptErr := e.Store.EnsureV1Preemption(ctx)
+			commands, preemptErr := e.Store.EnsurePriorityPreemption(ctx, e.ID)
 			if preemptErr != nil {
 				return preemptErr
 			}
-			if len(commands) > 0 {
-				e.Logger.Info("requested cooperative gang preemption", "commands", commands)
+			if len(commands) != 0 {
+				e.Logger.Info("requested cooperative priority preemption", "commands", commands)
 			}
 			return nil
 		}
@@ -125,35 +125,131 @@ func (e *Local) tick(ctx context.Context) error {
 				}
 				refreshed[resource.ProviderID] = true
 			}
+			// Release must be safe even when Prepare returns after a partial
+			// provider-side change, so include the resource before invoking it.
+			prepared = append(prepared, resource)
 			if err := p.Prepare(ctx, resource); err != nil {
 				prepareErr = err
 				break
 			}
-			prepared = append(prepared, resource)
 		}
 		if prepareErr == nil {
 			prepareErr = e.Store.ValidateReservation(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch)
 		}
 		if prepareErr != nil {
-			for i := len(prepared) - 1; i >= 0; i-- {
-				_ = e.Providers[prepared[i].ProviderID].Release(context.Background(), prepared[i])
+			if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, prepareErr.Error()); cleanupErr != nil {
+				e.Logger.Error("reservation cleanup failed", "lease_id", reservation.Lease.ID, "error", cleanupErr)
 			}
-			_ = e.Store.ReleaseReservation(context.Background(), reservation.Lease.ID, reservation.Lease.CoordinationEpoch, prepareErr.Error())
 			e.Logger.Warn("lease prepare failed", "lease_id", reservation.Lease.ID, "error", prepareErr)
 			return nil
 		}
 		if err := e.Store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
-			return err
+			if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, err.Error()); cleanupErr != nil {
+				return fmt.Errorf("mark lease prepared: %v; cleanup: %w", err, cleanupErr)
+			}
+			return nil
 		}
 		launch, err := e.Store.AuthorizeLaunch(ctx, reservation)
 		if err != nil {
-			return err
+			if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, err.Error()); cleanupErr != nil {
+				return fmt.Errorf("authorize launch: %v; cleanup: %w", err, cleanupErr)
+			}
+			return nil
 		}
 		if err = e.start(launch); err != nil {
 			e.Logger.Error("attempt launch failed", "attempt_id", launch.Attempt.ID, "error", err)
-			_ = e.Store.TerminalV1(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, -1, "launch_error")
+			if cleanupErr := e.cleanupReservation(context.Background(), launch.Lease, launch.Resources, "launch failed before activation: "+err.Error()); cleanupErr != nil {
+				return cleanupErr
+			}
 		}
 	}
+}
+
+// cleanupReservation returns provider-side preparation before releasing the
+// database lease. If physical cleanup or its confirming observation fails,
+// the lease remains non-released and therefore cannot be allocated again.
+func (e *Local) cleanupReservation(ctx context.Context, lease store.Lease, resources []store.ResourceInstance, reason string) error {
+	providers := make(map[string]provider.Provider)
+	for i := len(resources) - 1; i >= 0; i-- {
+		resource := resources[i]
+		p := e.Providers[resource.ProviderID]
+		if p == nil {
+			return fmt.Errorf("provider %s is unavailable during reservation cleanup", resource.ProviderID)
+		}
+		if err := p.Release(ctx, resource); err != nil {
+			return fmt.Errorf("release resource %s: %w", resource.ID, err)
+		}
+		providers[resource.ProviderID] = p
+	}
+	for providerID, p := range providers {
+		snapshot, err := p.Observe(ctx)
+		if err != nil {
+			return fmt.Errorf("observe provider %s after reservation cleanup: %w", providerID, err)
+		}
+		if err = e.Store.ApplyObservationBatch(ctx, providerID, snapshot.Resources, snapshot.Observations, snapshot.Claims); err != nil {
+			return err
+		}
+	}
+	return e.Store.ReleaseReservation(ctx, lease.ID, lease.CoordinationEpoch, reason)
+}
+
+// reconcileQuiescence proves process absence before returning physical
+// resources and releasing the coordination lease. A process exit notification
+// alone is never treated as proof that a distributed execution has stopped.
+func (e *Local) reconcileQuiescence(ctx context.Context) error {
+	candidates, err := e.Store.ListQuiescenceCandidates(ctx, e.ID)
+	if err != nil {
+		return err
+	}
+	for _, candidate := range candidates {
+		allAbsent := true
+		for _, process := range candidate.Processes {
+			liveness, livenessErr := processidentity.HostProcessLiveness(process.PID, process.ProcessIdentity)
+			if process.Namespace == "executor" && (e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2") {
+				liveness, livenessErr = processidentity.WSLProcessLiveness(ctx, e.Attributes["distro"], process.PID, process.ProcessIdentity)
+			}
+			if livenessErr != nil || liveness == processidentity.LivenessUnknown {
+				allAbsent = false
+				e.Logger.Warn("process liveness is unknown; retaining lease", "attempt_id", candidate.Attempt.ID, "pid", process.PID, "namespace", process.Namespace, "error", livenessErr)
+				continue
+			}
+			if liveness == processidentity.LivenessAlive {
+				allAbsent = false
+				continue
+			}
+			if err := e.Store.MarkAttemptProcessExited(ctx, candidate.Attempt.ID, process.Role, process.Rank, process.ProcessIdentity); err != nil && err != store.ErrNotFound {
+				return err
+			}
+		}
+		if !allAbsent {
+			continue
+		}
+		refreshed := make(map[string]bool)
+		for _, resource := range candidate.Resources {
+			p := e.Providers[resource.ProviderID]
+			if p == nil {
+				return fmt.Errorf("provider %s is unavailable during release", resource.ProviderID)
+			}
+			if err := p.Release(ctx, resource); err != nil {
+				return fmt.Errorf("release resource %s: %w", resource.ID, err)
+			}
+			refreshed[resource.ProviderID] = false
+		}
+		for providerID := range refreshed {
+			p := e.Providers[providerID]
+			snapshot, observeErr := p.Observe(ctx)
+			if observeErr != nil {
+				return fmt.Errorf("observe provider %s after release: %w", providerID, observeErr)
+			}
+			if applyErr := e.Store.ApplyObservationBatch(ctx, providerID, snapshot.Resources, snapshot.Observations, snapshot.Claims); applyErr != nil {
+				return applyErr
+			}
+		}
+		if err := e.Store.FinalizeQuiescence(ctx, candidate.Attempt.ID, candidate.Lease.ID, candidate.Lease.CoordinationEpoch); err != nil {
+			e.Logger.Warn("quiescence not yet proven", "attempt_id", candidate.Attempt.ID, "lease_id", candidate.Lease.ID, "error", err)
+		}
+	}
+	return nil
 }
 
 func resourceBinding(resource store.ResourceInstance) string {
@@ -172,16 +268,16 @@ func resourceBinding(resource store.ResourceInstance) string {
 	return resource.StableIdentity
 }
 
-func (e *Local) start(launch *store.V1Launch) error {
+func (e *Local) start(launch *store.Launch) error {
 	bindings := make([]string, 0, len(launch.Resources))
 	resourceIDs := make([]string, 0, len(launch.Resources))
 	for _, resource := range launch.Resources {
 		bindings = append(bindings, resourceBinding(resource))
 		resourceIDs = append(resourceIDs, resource.ID)
 	}
-	launchEnv := []string{"KAIRO_NODE_ID=" + e.NodeID, "KAIRO_EXECUTOR_ID=" + e.ID, "KAIRO_WORKLOAD_ID=" + launch.Task.ID, "KAIRO_ATTEMPT_ID=" + launch.Attempt.ID, "KAIRO_LEASE_ID=" + launch.Lease.ID, fmt.Sprintf("KAIRO_COORDINATION_EPOCH=%d", launch.Lease.CoordinationEpoch), "KAIRO_RESOURCE_IDS=" + strings.Join(resourceIDs, ","), "KAIRO_RESOURCE_BINDINGS=" + strings.Join(bindings, ","), "KAIRO_API_URL=" + e.APIURL}
-	if launch.ContinuationRef != nil {
-		launchEnv = append(launchEnv, "KAIRO_CONTINUATION_REF="+*launch.ContinuationRef)
+	launchEnv := []string{"KAIRO_NODE_ID=" + e.NodeID, "KAIRO_EXECUTOR_ID=" + e.ID, "KAIRO_EXECUTION_ID=" + launch.Execution.ID, "KAIRO_ATTEMPT_ID=" + launch.Attempt.ID, "KAIRO_LEASE_ID=" + launch.Lease.ID, fmt.Sprintf("KAIRO_COORDINATION_EPOCH=%d", launch.Lease.CoordinationEpoch), "KAIRO_RESOURCE_IDS=" + strings.Join(resourceIDs, ","), "KAIRO_RESOURCE_BINDINGS=" + strings.Join(bindings, ","), "KAIRO_API_URL=" + e.APIURL}
+	if launch.InputContinuationRef != nil {
+		launchEnv = append(launchEnv, "KAIRO_CONTINUATION_REF="+*launch.InputContinuationRef)
 	}
 	if len(bindings) > 0 {
 		launchEnv = append(launchEnv, "CUDA_VISIBLE_DEVICES="+strings.Join(bindings, ","))
@@ -224,12 +320,14 @@ func (e *Local) start(launch *store.V1Launch) error {
 	identity, identityErr := processidentity.ForPID(cmd.Process.Pid)
 	if identityErr != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		stdout.Close()
 		stderr.Close()
 		return fmt.Errorf("read process creation identity: %w", identityErr)
 	}
 	if err = e.Store.ActivateLaunch(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, cmd.Process.Pid, identity); err != nil {
 		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
 		stdout.Close()
 		stderr.Close()
 		return err
@@ -243,12 +341,8 @@ func (e *Local) start(launch *store.V1Launch) error {
 		stdout.Close()
 		stderr.Close()
 		exit := cmd.ProcessState.ExitCode()
-		failure := ""
-		if waitErr != nil {
-			failure = "exit_nonzero"
-		}
-		if err := e.Store.TerminalV1(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, exit, failure); err != nil {
-			e.Logger.Error("could not record v1 attempt exit", "attempt_id", launch.Attempt.ID, "error", err)
+		if err := e.Store.RecordTerminal(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, exit, ""); err != nil {
+			e.Logger.Error("could not record attempt exit", "attempt_id", launch.Attempt.ID, "wait_error", waitErr, "error", err)
 		}
 		e.mu.Lock()
 		delete(e.running, launch.Attempt.ID)

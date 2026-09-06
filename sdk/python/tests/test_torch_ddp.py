@@ -63,8 +63,8 @@ def _ddp_worker(
     try:
         session = AttemptSession(
             api_url=api_url,
+            execution_id="ex_ddp",
             attempt_id="att_ddp",
-            workload_id="task_ddp",
             lease_id="lease_ddp",
             coordination_epoch=3,
             poll_interval_seconds=0,

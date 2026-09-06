@@ -13,14 +13,13 @@ import (
 //go:embed schema.sql
 var schema string
 
-//go:embed migration_v2.sql
-var migrationV2 string
-
 var (
-	ErrNotFound         = errors.New("not found")
-	ErrRevisionConflict = errors.New("queue revision conflict")
-	ErrStaleEpoch       = errors.New("stale coordination epoch")
-	ErrLegacySchema     = errors.New("legacy Kairo database detected; back up the database and recreate it")
+	ErrNotFound            = errors.New("not found")
+	ErrIdempotencyConflict = errors.New("idempotency key was already used for different content")
+	ErrGateClosed          = errors.New("coordination admission gate is closed")
+	ErrExecutionStarted    = errors.New("execution has already started")
+	ErrStaleEpoch          = errors.New("stale coordination epoch")
+	ErrLegacySchema        = errors.New("legacy Kairo database detected; archive it and create a fresh V3 coordination database")
 )
 
 type Store struct {
@@ -69,14 +68,11 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, err
 		}
-		if version == 1 {
-			if _, err := db.Exec(migrationV2); err != nil {
-				db.Close()
-				return nil, fmt.Errorf("migrate schema to version 2: %w", err)
-			}
-			version = 2
+		if version == 1 || version == 2 {
+			db.Close()
+			return nil, ErrLegacySchema
 		}
-		if version != 2 {
+		if version != 3 {
 			db.Close()
 			return nil, fmt.Errorf("unsupported schema version %d", version)
 		}

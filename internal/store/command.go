@@ -19,7 +19,7 @@ func commandStateRank(state string) int {
 		return 2
 	case "checkpointed":
 		return 3
-	case "completed", "rejected":
+	case "rejected":
 		return 4
 	default:
 		return -1

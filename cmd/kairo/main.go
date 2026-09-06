@@ -38,8 +38,10 @@ func run(args []string) error {
 	switch args[0] {
 	case "serve":
 		return serve(args[1:])
-	case "plan":
-		return planCommand(args[1:])
+	case "execution":
+		return executionCommand(args[1:])
+	case "project":
+		return projectCommand(args[1:])
 	case "queue":
 		return queueCommand(args[1:])
 	case "task":
@@ -54,7 +56,7 @@ func run(args []string) error {
 }
 
 func usage() error {
-	return errors.New("usage: kairo <serve|plan|queue|task|resource|doctor>")
+	return errors.New("usage: kairo <serve|execution|project|queue|task|resource|doctor>")
 }
 
 func serve(args []string) error {
@@ -122,7 +124,7 @@ func serve(args []string) error {
 	defer stop()
 	server := &http.Server{
 		Addr:              daemonConfig.Listen,
-		Handler:           (&api.Server{Store: st, Logger: logger}).Handler(),
+		Handler:           (&api.Server{Store: st, Logger: logger, ObserveOnly: daemonConfig.ObserveOnly}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errCh := make(chan error, 1+len(daemonConfig.Executors))
@@ -130,6 +132,23 @@ func serve(args []string) error {
 		logger.Info("control plane listening", "address", daemonConfig.Listen, "database", daemonConfig.DatabasePath)
 		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
+		}
+	}()
+	// Scope control is reconciled independently from process execution. This
+	// keeps a durable pause progressing even when no executor is currently able
+	// to reserve work; observe-only mode records explicit actuation blockers.
+	go func() {
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			if err := st.ReconcilePauseOperations(ctx, !daemonConfig.ObserveOnly); err != nil && ctx.Err() == nil {
+				logger.Error("pause reconciliation failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
 		}
 	}()
 	for _, configured := range daemonConfig.Executors {

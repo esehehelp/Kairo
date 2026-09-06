@@ -63,7 +63,7 @@ func Load(path string) (Config, error) {
 }
 func defaults(c *Config) {
 	if c.DatabasePath == "" {
-		c.DatabasePath = "local/kairo.db"
+		c.DatabasePath = "local/kairo-v3.db"
 	}
 	if c.Listen == "" {
 		c.Listen = "127.0.0.1:7474"
@@ -72,7 +72,7 @@ func defaults(c *Config) {
 		c.AdvertiseURL = "http://127.0.0.1:7474"
 	}
 	if c.LogDirectory == "" {
-		c.LogDirectory = "local/attempts"
+		c.LogDirectory = "local/attempts-v3"
 	}
 	if c.ObservationIntervalSeconds == 0 {
 		c.ObservationIntervalSeconds = 5

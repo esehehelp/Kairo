@@ -109,7 +109,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		}
 		if claim.ClaimKind == "external_process" && claim.ProcessIdentity != nil {
 			var registered int
-			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes ap JOIN attempts a ON a.id=ap.attempt_id JOIN leases l ON l.attempt_id=a.id JOIN lease_items li ON li.lease_id=l.id WHERE ap.process_identity=? AND ap.exited_at IS NULL AND a.state IN('running','suspend_requested') AND l.state IN('active','releasing') AND li.resource_id=?`, *claim.ProcessIdentity, claim.ResourceID).Scan(&registered); err != nil {
+			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes ap JOIN attempts a ON a.id=ap.attempt_id JOIN leases l ON l.attempt_id=a.id JOIN lease_items li ON li.lease_id=l.id WHERE ap.process_identity=? AND ap.exited_at IS NULL AND a.state IN('running','quiescing') AND l.state IN('active','releasing') AND li.resource_id=?`, *claim.ProcessIdentity, claim.ResourceID).Scan(&registered); err != nil {
 				return err
 			}
 			if registered > 0 {
@@ -201,8 +201,8 @@ func (s *Store) SetResourceAdminState(ctx context.Context, resourceID, state, re
 
 func (s *Store) ListResourceStatus(ctx context.Context) ([]ResourceInstance, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT r.id,r.node_id,r.provider_id,r.kind,r.stable_identity,r.binding_json,r.attributes_json,r.admin_state,r.quarantine_reason,
-	 (SELECT observed_at FROM resource_observations o WHERE o.resource_id=r.id ORDER BY observed_at DESC LIMIT 1),
-	 (SELECT valid_until FROM resource_observations o WHERE o.resource_id=r.id ORDER BY observed_at DESC LIMIT 1),
+	 (SELECT observed_at FROM resource_observations o WHERE o.resource_id=r.id ORDER BY id DESC LIMIT 1),
+	 (SELECT valid_until FROM resource_observations o WHERE o.resource_id=r.id ORDER BY id DESC LIMIT 1),
 	 EXISTS(SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=r.id AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')),
 	 EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=r.id AND c.cleared_at IS NULL)
 	 FROM resource_instances r ORDER BY r.node_id,r.kind,r.id`)
@@ -316,21 +316,21 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 	t := now()
 	for _, x := range leases {
 		var unsafe int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY observed_at DESC LIMIT 1) WHERE li.lease_id=? AND li.resource_id IS NOT NULL AND (o.id IS NULL OR o.valid_until<=? OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL))`, x.lease, t).Scan(&unsafe); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1) WHERE li.lease_id=? AND li.resource_id IS NOT NULL AND (o.id IS NULL OR julianday(o.valid_until)<=julianday(?) OR julianday(o.observed_at)<=julianday(l.stale_at) OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL))`, x.lease, t).Scan(&unsafe); err != nil {
 			return err
 		}
 		if unsafe > 0 {
 			return fmt.Errorf("stale lease %s still lacks fresh unclaimed observations", x.lease)
 		}
 		if x.attempt.Valid {
+			if len(confirmProcessAbsent) == 0 || !confirmProcessAbsent[0] {
+				return fmt.Errorf("stale attempt %s requires explicit process-absence confirmation", x.attempt.String)
+			}
 			var processes int
 			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes WHERE attempt_id=? AND exited_at IS NULL`, x.attempt.String).Scan(&processes); err != nil {
 				return err
 			}
 			if processes > 0 {
-				if len(confirmProcessAbsent) == 0 || !confirmProcessAbsent[0] {
-					return fmt.Errorf("stale attempt %s still has registered processes; explicit absence confirmation is required", x.attempt.String)
-				}
 				if _, err = tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=?,last_seen_at=? WHERE attempt_id=? AND exited_at IS NULL`, t, t, x.attempt.String); err != nil {
 					return err
 				}
@@ -339,38 +339,24 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=? WHERE id=? AND state='stale'`, t, x.lease); err != nil {
 			return err
 		}
+		var executionID, projectID string
 		if x.attempt.Valid {
 			if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',quiesced_at=?,exited_at=COALESCE(exited_at,?) WHERE id=? AND state='lost'`, t, t, x.attempt.String); err != nil {
 				return err
 			}
-			var taskID sql.NullString
-			var revision sql.NullInt64
-			if err = tx.QueryRowContext(ctx, `SELECT task_id,task_revision FROM attempts WHERE id=?`, x.attempt.String).Scan(&taskID, &revision); err != nil {
+			if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM attempts WHERE id=?`, x.attempt.String).Scan(&executionID); err != nil {
 				return err
 			}
-			if taskID.Valid && revision.Valid {
-				retry, delay, err := retryDecision(ctx, tx, taskID.String, int(revision.Int64), "lost_after_reconcile")
-				if err != nil {
-					return err
-				}
-				state := "failed"
-				var next any
-				if retry {
-					state = "backoff"
-					next = time.Now().UTC().Add(delay).Format(time.RFC3339Nano)
-				}
-				if _, err = tx.ExecContext(ctx, `UPDATE task_revisions SET scheduling_state=?,next_retry_at=? WHERE task_id=? AND revision=?`, state, next, taskID.String, revision.Int64); err != nil {
-					return err
-				}
-				if _, err = tx.ExecContext(ctx, `UPDATE tasks SET scheduling_state=?,updated_at=? WHERE id=? AND current_revision=?`, state, t, taskID.String, revision.Int64); err != nil {
-					return err
-				}
-			}
-			if _, err = tx.ExecContext(ctx, `UPDATE attempts SET failure_counted=1 WHERE id=?`, x.attempt.String); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',blocker_reason=NULL,updated_at=? WHERE execution_id=? AND attempt_id=?`, t, executionID, x.attempt.String); err != nil {
 				return err
 			}
+		} else if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM leases WHERE id=?`, x.lease).Scan(&executionID); err != nil {
+			return err
 		}
-		if err = appendEvent(ctx, tx, "stale_lease_reconciled", "lease", x.lease, &x.epoch, map[string]string{"resource_id": resourceID}); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=?`, executionID).Scan(&projectID); err != nil {
+			return err
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "stale_lease_reconciled", &projectID, "lease", x.lease, &x.epoch, map[string]string{"resource_id": resourceID, "execution_id": executionID}); err != nil {
 			return err
 		}
 	}

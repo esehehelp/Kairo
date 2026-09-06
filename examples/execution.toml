@@ -1,0 +1,28 @@
+schema_version = 2
+client_request_id = "example-001"
+project = "llm-develop"
+queue = "training"
+task = "pretrain"
+argv = ["python", "train.py"]
+cwd = "D:/Dev/llm-develop"
+priority = 0
+checkpointable = true
+preemptible = true
+
+[executor]
+labels = { environment = "wsl2" }
+
+[[exclusive]]
+kind = "gpu"
+count = 1
+same_node = true
+min_total_memory_bytes = 0
+min_observed_free_memory_bytes = 0
+on_external_claim = "wait"
+on_unattributed_activity = "wait"
+on_stale_observation = "wait"
+
+[capacity]
+cpu_millis = 4000
+ram_bytes = 17179869184
+strength = "admitted"
