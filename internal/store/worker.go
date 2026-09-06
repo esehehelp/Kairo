@@ -441,7 +441,9 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 		return fmt.Errorf("attempt still has %d live registered processes", live)
 	}
 	// Exclusive GPU ownership is not released back to scheduling while reality
-	// is stale or another process still claims the resource.
+	// is stale or a claim forbidden by the execution's admission policy remains.
+	// In particular, an unattributed claim that was explicitly allowed at
+	// admission must not make lease release impossible on a desktop GPU.
 	var unsafe int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li
 	 LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
@@ -449,11 +451,17 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 	 (o.id IS NULL OR julianday(o.valid_until)<=julianday(?)
 	 OR julianday(o.observed_at)<=julianday((SELECT exited_at FROM attempts WHERE id=?))
 	 OR EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=? AND julianday(o.observed_at)<=julianday(ap.exited_at))
-	 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL))`, leaseID, now(), attemptID, attemptID).Scan(&unsafe); err != nil {
+	 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL
+	   AND (c.claim_kind='external_process' OR c.claim_kind='unattributed_activity' AND COALESCE(
+	     (SELECT json_extract(rr.policy_json,'$.on_unattributed_activity') FROM resource_requests rr
+	      JOIN leases policy_lease ON policy_lease.execution_id=rr.execution_id
+	      WHERE policy_lease.id=li.lease_id AND rr.request_type='exclusive' AND rr.kind=li.kind LIMIT 1),
+	     'wait')!='allow'))
+	 )`, leaseID, now(), attemptID, attemptID).Scan(&unsafe); err != nil {
 		return err
 	}
 	if unsafe != 0 {
-		return errors.New("leased GPU still lacks fresh unclaimed observation")
+		return errors.New("leased GPU still lacks a fresh observation allowed by its conflict policy")
 	}
 	t := now()
 	if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',quiesced_at=? WHERE id=? AND state='exited'`, t, attemptID); err != nil {

@@ -584,11 +584,17 @@ func (s *Store) ReleaseReservation(ctx context.Context, leaseID string, epoch in
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
 		WHERE li.lease_id=? AND li.kind='gpu' AND li.resource_id IS NOT NULL AND
-		(o.id IS NULL OR julianday(o.valid_until)<=julianday(?) OR julianday(o.observed_at)<=julianday((SELECT created_at FROM leases WHERE id=?)) OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL))`, leaseID, stamp, leaseID).Scan(&unsafeExclusive); err != nil {
+		(o.id IS NULL OR julianday(o.valid_until)<=julianday(?) OR julianday(o.observed_at)<=julianday((SELECT created_at FROM leases WHERE id=?))
+		 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL
+		   AND (c.claim_kind='external_process' OR c.claim_kind='unattributed_activity' AND COALESCE(
+		     (SELECT json_extract(rr.policy_json,'$.on_unattributed_activity') FROM resource_requests rr
+		      JOIN leases policy_lease ON policy_lease.execution_id=rr.execution_id
+		      WHERE policy_lease.id=li.lease_id AND rr.request_type='exclusive' AND rr.kind=li.kind LIMIT 1),
+		     'wait')!='allow')))`, leaseID, stamp, leaseID).Scan(&unsafeExclusive); err != nil {
 		return err
 	}
 	if unsafeExclusive != 0 {
-		return errors.New("reservation cleanup lacks fresh unclaimed GPU observation")
+		return errors.New("reservation cleanup lacks a fresh GPU observation allowed by its conflict policy")
 	}
 	revokedByPause := state == "revocation_requested"
 	if attemptID.Valid {

@@ -104,6 +104,58 @@ func TestSuspendCheckpointExitAndQuiescenceAreDistinctFacts(t *testing.T) {
 	}
 }
 
+func TestFinalizeQuiescenceHonorsUnattributedActivityPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		policy    string
+		wantError bool
+	}{
+		{name: "allowed", policy: "allow"},
+		{name: "waiting", policy: "wait", wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openCoordinationStore(t)
+			setupSchedulerInventory(t, store)
+			ctx := context.Background()
+			spec := schedulerExecutionSpec("release-with-unattributed-" + tc.name)
+			spec.Exclusive[0].OnUnattributedActivity = tc.policy
+			_, _, err := store.SubmitExecution(ctx, spec)
+			if err != nil {
+				t.Fatal(err)
+			}
+			reservation, err := store.ReserveNext(ctx, "executor")
+			if err != nil || reservation == nil {
+				t.Fatalf("reserve: %+v %v", reservation, err)
+			}
+			if err = store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+				t.Fatal(err)
+			}
+			launch, err := store.AuthorizeLaunch(ctx, reservation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			epoch := launch.Lease.CoordinationEpoch
+			if err = store.ActivateLaunch(ctx, launch.Attempt.ID, launch.Lease.ID, epoch, launch.AuthorizationToken, 100, "launcher:100"); err != nil {
+				t.Fatal(err)
+			}
+			if err = store.RecordTerminal(ctx, launch.Attempt.ID, launch.Lease.ID, epoch, 1, ""); err != nil {
+				t.Fatal(err)
+			}
+			refreshSchedulerGPU(t, store)
+			if err = store.ObserveClaim(ctx, ExternalClaim{ID: "desktop", ResourceID: "gpu-0", ClaimKind: "unattributed_activity"}); err != nil {
+				t.Fatal(err)
+			}
+			err = store.FinalizeQuiescence(ctx, launch.Attempt.ID, launch.Lease.ID, epoch)
+			if tc.wantError && err == nil {
+				t.Fatal("forbidden unattributed activity released lease")
+			}
+			if !tc.wantError && err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
 func TestExitCodesRemainUnclassifiedAndNeverResubmit(t *testing.T) {
 	for _, exitCode := range []int{0, 1, 75} {
 		store, execution, launch := startCooperativeExecution(t, "exit-code-"+string(rune('a'+exitCode%26)))

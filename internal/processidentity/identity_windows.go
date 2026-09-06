@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
-	"strconv"
 	"strings"
 
 	"golang.org/x/sys/windows"
@@ -51,28 +50,51 @@ func HostProcessLiveness(pid int, expected string) (Liveness, error) {
 }
 
 // WSLProcessLiveness checks the Linux /proc start-time tick recorded by the
-// Python SDK. The PID is passed as a positional shell argument rather than
-// interpolated into the script, and WSL command failures remain unknown.
+// Python SDK. It invokes cat and test directly so wsl.exe does not have to
+// preserve a quoted shell program across the Windows/Linux command boundary.
 func WSLProcessLiveness(ctx context.Context, distro string, pid int, expected string) (Liveness, error) {
-	args := make([]string, 0, 8)
-	if distro != "" {
-		args = append(args, "-d", distro)
-	}
-	script := `pid=$1; [ -d /proc/self ] || exit 2; if [ ! -d "/proc/$pid" ]; then printf absent; exit 0; fi; [ -r "/proc/$pid/stat" ] || exit 2; line=$(cat "/proc/$pid/stat") || exit 2; rest=${line##*) }; set -- $rest; [ -n "${20}" ] || exit 2; printf 'proc:%s:starttime:%s' "$pid" "${20}"`
-	args = append(args, "--", "sh", "-c", script, "sh", strconv.Itoa(pid))
-	out, err := exec.CommandContext(ctx, "wsl.exe", args...).Output()
+	path := fmt.Sprintf("/proc/%d/stat", pid)
+	out, err := exec.CommandContext(ctx, "wsl.exe", wslArgs(distro, "cat", path)...).CombinedOutput()
 	if err != nil {
-		return LivenessUnknown, fmt.Errorf("query WSL process identity: %w", err)
+		absentOut, absentErr := exec.CommandContext(ctx, "wsl.exe", wslArgs(distro, "test", "!", "-e", path)...).CombinedOutput()
+		if absentErr == nil {
+			return LivenessAbsent, nil
+		}
+		return LivenessUnknown, fmt.Errorf(
+			"query WSL process identity: %w: %s (absence check: %v: %s)",
+			err, strings.TrimSpace(string(out)), absentErr, strings.TrimSpace(string(absentOut)),
+		)
 	}
-	actual := strings.TrimSpace(string(out))
-	if actual == "absent" {
-		return LivenessAbsent, nil
+	actual, err := linuxIdentityFromStat(pid, string(out))
+	if err != nil {
+		return LivenessUnknown, err
 	}
 	if actual == expected {
 		return LivenessAlive, nil
 	}
-	if strings.HasPrefix(actual, fmt.Sprintf("proc:%d:starttime:", pid)) {
-		return LivenessAbsent, nil
+	return LivenessAbsent, nil
+}
+
+func wslArgs(distro string, command ...string) []string {
+	args := make([]string, 0, len(command)+3)
+	if distro != "" {
+		args = append(args, "-d", distro)
 	}
-	return LivenessUnknown, fmt.Errorf("unexpected WSL process identity response %q", actual)
+	// --exec bypasses WSL's command-line mode and preserves argv boundaries.
+	// This matters for test's "!" argument and paths or distro-independent
+	// commands that contain shell metacharacters.
+	args = append(args, "--exec")
+	return append(args, command...)
+}
+
+func linuxIdentityFromStat(pid int, body string) (string, error) {
+	end := strings.LastIndexByte(body, ')')
+	if end < 0 {
+		return "", fmt.Errorf("malformed WSL %s", fmt.Sprintf("/proc/%d/stat", pid))
+	}
+	fields := strings.Fields(body[end+1:])
+	if len(fields) <= 19 {
+		return "", fmt.Errorf("malformed WSL %s", fmt.Sprintf("/proc/%d/stat", pid))
+	}
+	return fmt.Sprintf("proc:%d:starttime:%s", pid, fields[19]), nil
 }
