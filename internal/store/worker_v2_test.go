@@ -60,6 +60,19 @@ func TestSuspendCheckpointExitAndQuiescenceAreDistinctFacts(t *testing.T) {
 	if err = store.AckCommand(ctx, launch.Attempt.ID, launch.Lease.ID, epoch, commandID, "checkpointed", json.RawMessage(`{"continuation_ref":"checkpoint://first"}`)); err != nil {
 		t.Fatal(err)
 	}
+	for _, eventType := range []string{"suspend_requested", "checkpoint_published"} {
+		var payloadJSON string
+		if err = store.db.QueryRow(`SELECT payload_json FROM coordination_events WHERE event_type=? AND aggregate_id=?`, eventType, map[string]string{"suspend_requested": commandID, "checkpoint_published": launch.Attempt.ID}[eventType]).Scan(&payloadJSON); err != nil {
+			t.Fatal(err)
+		}
+		var payload map[string]any
+		if err = json.Unmarshal([]byte(payloadJSON), &payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload["execution_id"] != execution.ID || payload["attempt_id"] != launch.Attempt.ID || payload["lease_id"] != launch.Lease.ID {
+			t.Fatalf("%s event lacks exact execution chain: %s", eventType, payloadJSON)
+		}
+	}
 	if commands, pollErr := store.PollCommands(ctx, launch.Attempt.ID, launch.Lease.ID, epoch); pollErr != nil || len(commands) != 0 {
 		t.Fatalf("checkpointed command was redelivered: %+v %v", commands, pollErr)
 	}

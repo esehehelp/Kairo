@@ -49,8 +49,11 @@ retired task
 Exit code, signal, checkpoint reference, timestamps, and process absence are
 facts. Their meaning belongs to the project controller.
 
-Kairo never automatically retries a process which started, never propagates a
-downstream revision, and never automatically resubmits a quiesced execution.
+Kairo Server never automatically retries a process which started, never
+propagates a downstream revision, and never decides to resubmit a quiesced
+execution. A project may explicitly delegate a versioned policy to the
+project-owned SDK controller; the SDK then journals and executes that declared
+decision without transferring semantic authority to the server.
 
 ## Coordination scopes and admission gates
 
@@ -490,8 +493,8 @@ The redesign is incomplete until all of these hold:
 
 1. No live schema, API, or Go/Python type exposes task success, failure,
    backoff, retry, dependency, retired, or workflow completion state.
-2. Exit codes 0, 1, and 75 all produce raw terminal facts and never cause an
-   automatic retry or next execution.
+2. Exit codes 0, 1, and 75 all produce raw terminal facts and never cause a
+   server-owned retry or next execution.
 3. A terminal or quiesced execution request can never start a second process.
 4. A project controller can consume a checkpoint event and idempotently submit
    a new execution with that opaque continuation.
@@ -508,8 +511,9 @@ The redesign is incomplete until all of these hold:
     stale lease, and observe-only mode prevent a false quiesced result.
 11. Launcher exit does not mark registered child ranks absent.
 12. Managed STOP files are rejected; unmanaged STOP compatibility remains.
-13. Priority preemption produces a quiesced terminal fact and never auto-resumes
-    the victim.
+13. Priority preemption produces a quiesced terminal fact. The server never
+    auto-resumes the victim; a project-selected SDK policy may idempotently
+    submit its successor from the formally acknowledged continuation.
 14. Migration creates no live request from a legacy pending/retry/task state.
 15. A real two-GPU DDP execution completes project pause, checkpoint
     publication, all-rank exit, quiescence, and lease release; only an explicit
@@ -517,7 +521,10 @@ The redesign is incomplete until all of these hold:
 
 ## Non-goals
 
-Kairo does not add a project controller, workflow engine, model-specific retry
-policy, artifact semantics, metric gates, dynamic fan-out, or general hard-kill
-facility. Multi-node execution, cloud provisioning, RBAC/TLS, service
-supervision, and hard CPU/RAM enforcement also remain outside this redesign.
+Kairo Server does not add a project controller, workflow engine, model-specific
+retry policy, artifact semantics, metric gates, dynamic fan-out, or general
+hard-kill facility. The Python SDK may provide reusable project-controller
+mechanics and opt-in policy implementations, but the project owns their journal
+and selects their meaning. Multi-node execution, cloud provisioning, RBAC/TLS,
+service supervision, and hard CPU/RAM enforcement also remain outside this
+redesign.

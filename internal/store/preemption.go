@@ -387,7 +387,7 @@ func enqueuePrioritySuspendsTx(ctx context.Context, tx *sql.Tx, waiting Executio
 		if _, err = tx.ExecContext(ctx, `INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at) VALUES(?,?,?,?,?,'suspend','priority_preemption',?,'pending',?,?)`, commandID, victim.executionID, victim.attemptID, victim.leaseID, victim.epoch, reason, stamp, stamp); err != nil {
 			return nil, err
 		}
-		if err = appendCoordinationEventTx(ctx, tx, "suspend_requested", &victim.projectID, "command", commandID, &victim.epoch, map[string]any{"execution_id": victim.executionID, "attempt_id": victim.attemptID, "origin": "priority_preemption", "reason": reason, "waiting_execution_id": waiting.ID}); err != nil {
+		if err = appendCoordinationEventTx(ctx, tx, "suspend_requested", &victim.projectID, "command", commandID, &victim.epoch, map[string]any{"execution_id": victim.executionID, "attempt_id": victim.attemptID, "lease_id": victim.leaseID, "origin": "priority_preemption", "reason": reason, "waiting_execution_id": waiting.ID}); err != nil {
 			return nil, err
 		}
 		commandIDs = append(commandIDs, commandID)

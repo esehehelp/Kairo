@@ -207,7 +207,7 @@ func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch
 		if projectErr != nil {
 			return projectErr
 		}
-		if err = appendCoordinationEventTx(ctx, tx, "checkpoint_published", &projectID, "attempt", attemptID, &epoch, map[string]any{"execution_id": executionID, "command_id": commandID, "continuation_ref": body.ContinuationRef}); err != nil {
+		if err = appendCoordinationEventTx(ctx, tx, "checkpoint_published", &projectID, "attempt", attemptID, &epoch, map[string]any{"execution_id": executionID, "attempt_id": attemptID, "lease_id": leaseID, "command_id": commandID, "continuation_ref": body.ContinuationRef}); err != nil {
 			return err
 		}
 	}
@@ -250,7 +250,7 @@ func (s *Store) EnqueueSuspend(ctx context.Context, attemptID, origin, reason st
 	if err != nil {
 		return "", err
 	}
-	if err = appendCoordinationEventTx(ctx, tx, "suspend_requested", &projectID, "command", commandID, &epoch, map[string]any{"execution_id": executionID, "attempt_id": attemptID, "origin": origin, "reason": reason}); err != nil {
+	if err = appendCoordinationEventTx(ctx, tx, "suspend_requested", &projectID, "command", commandID, &epoch, map[string]any{"execution_id": executionID, "attempt_id": attemptID, "lease_id": leaseID, "origin": origin, "reason": reason}); err != nil {
 		return "", err
 	}
 	return commandID, tx.Commit()

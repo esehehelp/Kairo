@@ -71,6 +71,17 @@ func TestPriorityPreemptionEnqueuesOneIdempotentSuspendWithoutWorkflowTransition
 	if origin != "priority_preemption" || attemptID != launch.Attempt.ID || reason == "" {
 		t.Fatalf("wrong suspend command: origin=%q attempt=%q reason=%q", origin, attemptID, reason)
 	}
+	var eventPayloadJSON string
+	if err = store.db.QueryRow(`SELECT payload_json FROM coordination_events WHERE event_type='suspend_requested' AND aggregate_id=?`, commandIDs[0]).Scan(&eventPayloadJSON); err != nil {
+		t.Fatal(err)
+	}
+	var eventPayload map[string]any
+	if err = json.Unmarshal([]byte(eventPayloadJSON), &eventPayload); err != nil {
+		t.Fatal(err)
+	}
+	if eventPayload["execution_id"] != victim.ID || eventPayload["attempt_id"] != launch.Attempt.ID || eventPayload["lease_id"] != launch.Lease.ID || eventPayload["origin"] != "priority_preemption" {
+		t.Fatalf("priority suspend event lacks exact execution chain: %s", eventPayloadJSON)
+	}
 	var commandCount int
 	if err = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&commandCount); err != nil || commandCount != 1 {
 		t.Fatalf("command count=%d err=%v", commandCount, err)

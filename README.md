@@ -9,12 +9,14 @@ they are not Kairo workflow objects. SQLite records coordination facts,
 providers observe physical reality, executors own process lifecycle, and the
 Python SDK implements the cooperative suspend protocol.
 
-Kairo deliberately has no task success/failure model, retry policy, DAG,
-workflow condition, metric gate, artifact dependency, dynamic fan-out,
+Kairo Server deliberately has no task success/failure model, retry policy,
+DAG, workflow condition, metric gate, artifact dependency, dynamic fan-out,
 cleanup policy, or automatic resume. A terminal execution reports raw facts
 such as exit code, signal, checkpoint reference, and quiescence. Project code
 interprets those facts and explicitly submits any next execution with the
-desired opaque input continuation.
+desired opaque input continuation. The SDK may execute a policy that a project
+explicitly selects; that reusable mechanism does not transfer semantic
+authority to the server.
 
 ## Start
 
@@ -84,16 +86,51 @@ runs every rank's callback, and only publishes the continuation after the
 distributed barrier. Commands may be redelivered, so checkpoint publication
 must remain idempotent by command ID.
 
+### Project-owned controller policy
+
+Projects that want the standard preemption behavior can opt into
+`ResumeAfterKairoPreemption`. The policy snapshot and canonical submission are
+written to the project's controller journal before the initial API call:
+
+```python
+from kairo_sdk import ControllerJournal, KairoControllerClient, ProjectController
+
+controller = ProjectController(
+    KairoControllerClient("http://127.0.0.1:7474"),
+    ControllerJournal("local/llm-controller.db"),
+)
+execution_id = controller.submit_with_resume_after_kairo_preemption(
+    activity_id="jalm-300m-v3",
+    project="llm-develop",
+    submission=execution_request,
+)
+controller.run_forever()
+```
+
+Use one controller journal per project; activity IDs are local to that
+project-owned journal.
+
+Only a `priority_preemption` command with an acknowledged continuation for
+that exact command, a quiesced attempt, and a released lease can trigger the
+policy. The controller journals a deterministic decision before submitting
+the successor. API retries reuse the same client request ID, so controller
+crashes and complete event replay cannot create another successor. Event
+cursors are therefore only an optimization; the durable decision is the
+correctness boundary. Delegation validity comes from the immutable policy
+snapshot attached to the logical activity's current execution, not from a
+server-owned workflow state or semantic default.
+
 ## Pilot acceptance contract
 
 1. Observe-only inspection of an existing LLM pretrain creates no lease.
 2. A one-GPU job passes `run -> suspend -> checkpointed -> process exit ->
-   quiesced -> lease release`; the project then explicitly submits a resumed
-   execution.
+   quiesced -> lease release`; the project or its explicitly selected SDK
+   policy then submits a resumed execution.
 3. Daemon/process failure at every transition causes neither duplicate GPU
    ownership nor loss of an acknowledged continuation.
 4. A project-selected short high-priority execution can trigger cooperative
-   preemption; the project decides whether and how to resume the old work.
+   preemption; the project decides whether and how to resume the old work and
+   may delegate that decision to a versioned SDK policy.
 5. Redelivery of one command cannot corrupt checkpoint publication.
 6. A two-GPU DDP execution receives an all-or-nothing gang lease and all ranks
    quiesce before release.
