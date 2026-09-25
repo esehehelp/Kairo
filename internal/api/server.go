@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 
 	"kairo/internal/store"
 )
@@ -14,6 +15,12 @@ type Server struct {
 	Store       *store.Store
 	Logger      *slog.Logger
 	ObserveOnly bool
+	// AgentToken enables the node agent API (/v3/agent/*) when non-empty.
+	AgentToken string
+	// LogDirectory receives attempt logs shipped by node agents.
+	LogDirectory string
+
+	logMu sync.Mutex
 }
 
 var errObserveOnly = errors.New("operation is disabled in observe-only mode")
@@ -39,6 +46,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /v2/worker/attempts/{id}/commands/{command}/acks", s.workerAck)
 	mux.HandleFunc("POST /v2/worker/attempts/{id}/heartbeat", s.workerHeartbeat)
 	mux.HandleFunc("POST /v2/worker/attempts/{id}/processes", s.workerProcess)
+	s.mountAgent(mux)
 	return s.logging(mux)
 }
 

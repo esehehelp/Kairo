@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,7 +20,7 @@ import (
 
 type Local struct {
 	ID                  string
-	Store               *store.Store
+	Store               Coordinator
 	LogDir              string
 	APIURL              string
 	Interval            time.Duration
@@ -36,7 +37,7 @@ type Local struct {
 	running map[string]*exec.Cmd
 }
 
-func NewLocal(id string, st *store.Store, logDir string, logger *slog.Logger) *Local {
+func NewLocal(id string, st Coordinator, logDir string, logger *slog.Logger) *Local {
 	return &Local{
 		ID: id, Store: st, LogDir: logDir, Interval: 250 * time.Millisecond,
 		Logger: logger, running: make(map[string]*exec.Cmd),
@@ -341,8 +342,19 @@ func (e *Local) start(launch *store.Launch) error {
 		stdout.Close()
 		stderr.Close()
 		exit := cmd.ProcessState.ExitCode()
-		if err := e.Store.RecordTerminal(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, exit, ""); err != nil {
+		// RecordTerminal is idempotent, so a transient failure (a remote
+		// agent losing its connection to the daemon) is retried rather than
+		// leaving the lease stuck in active.
+		for delay := time.Second; ; delay = min(2*delay, time.Minute) {
+			err := e.Store.RecordTerminal(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, exit, "")
+			if err == nil {
+				break
+			}
 			e.Logger.Error("could not record attempt exit", "attempt_id", launch.Attempt.ID, "wait_error", waitErr, "error", err)
+			if errors.Is(err, store.ErrStaleEpoch) || errors.Is(err, store.ErrNotFound) {
+				break
+			}
+			time.Sleep(delay)
 		}
 		e.mu.Lock()
 		delete(e.running, launch.Attempt.ID)

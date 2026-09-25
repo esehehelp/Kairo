@@ -38,6 +38,8 @@ func run(args []string) error {
 	switch args[0] {
 	case "serve":
 		return serve(args[1:])
+	case "agent":
+		return agentCommand(args[1:])
 	case "execution":
 		return executionCommand(args[1:])
 	case "project":
@@ -56,7 +58,7 @@ func run(args []string) error {
 }
 
 func usage() error {
-	return errors.New("usage: kairo <serve|execution|project|queue|task|resource|doctor>")
+	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|doctor>")
 }
 
 func serve(args []string) error {
@@ -122,9 +124,11 @@ func serve(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	handler := (&api.Server{Store: st, Logger: logger, ObserveOnly: daemonConfig.ObserveOnly,
+		AgentToken: daemonConfig.AgentToken, LogDirectory: daemonConfig.LogDirectory}).Handler()
 	server := &http.Server{
 		Addr:              daemonConfig.Listen,
-		Handler:           (&api.Server{Store: st, Logger: logger, ObserveOnly: daemonConfig.ObserveOnly}).Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 	errCh := make(chan error, 1+len(daemonConfig.Executors))
