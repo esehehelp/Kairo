@@ -2,8 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -83,5 +86,52 @@ func TestProjectResumeOnlyOpensGate(t *testing.T) {
 		if requests[i] != want[i] {
 			t.Fatalf("request sequence = %v, want %v", requests, want)
 		}
+	}
+}
+
+func TestProjectApplyUsesOrchestrationContract(t *testing.T) {
+	var gotMethod, gotPath string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Error(err)
+		}
+		var declaration map[string]any
+		if err := json.Unmarshal(body, &declaration); err != nil {
+			t.Error(err)
+		}
+		if declaration["schema_version"] != float64(1) {
+			t.Errorf("declaration=%v", declaration)
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte("{}\n"))
+	}))
+	defer server.Close()
+
+	path := filepath.Join(t.TempDir(), "project.toml")
+	source := `schema_version = 1
+[project]
+name = "p"
+[[tasks]]
+name = "t"
+queue = "q"
+depends_on = []
+policy = "RunToCompletion@v1"
+[tasks.execution]
+schema_version = 2
+argv = ["worker"]
+cwd = "/work"
+checkpointable = false
+preemptible = false
+`
+	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := projectCommand([]string{"apply", "--api", server.URL, path}); err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/orchestration/v1/project-specs" {
+		t.Fatalf("request=%s %s", gotMethod, gotPath)
 	}
 }

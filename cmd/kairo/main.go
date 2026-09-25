@@ -151,6 +151,25 @@ func serve(args []string) error {
 			}
 		}
 	}()
+	if !daemonConfig.ObserveOnly {
+		// Project declarations are reconciled above the V3 execution layer. The
+		// reconciler only emits immutable requests; executors and leases remain
+		// owned by the existing coordination machinery below it.
+		go func() {
+			ticker := time.NewTicker(250 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				if err := st.ReconcileProjectTasks(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("project orchestration reconciliation failed", "error", err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	for _, configured := range daemonConfig.Executors {
 		if configured.Enabled != nil && !*configured.Enabled {
 			continue

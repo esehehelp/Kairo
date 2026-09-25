@@ -21,6 +21,8 @@ var errObserveOnly = errors.New("operation is disabled in observe-only mode")
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /health", s.health)
+	mux.HandleFunc("POST /orchestration/v1/project-specs", s.applyProjectDeclaration)
+	mux.HandleFunc("GET /orchestration/v1/projects/{project}", s.getProjectOrchestrationStatus)
 	mux.HandleFunc("POST /v2/executions", s.submitExecution)
 	mux.HandleFunc("GET /v2/executions", s.listExecutions)
 	mux.HandleFunc("GET /v2/executions/{id}", s.getExecution)
@@ -56,7 +58,7 @@ func writeError(w http.ResponseWriter, err error) {
 	status := http.StatusBadRequest
 	if errors.Is(err, store.ErrNotFound) {
 		status = http.StatusNotFound
-	} else if errors.Is(err, store.ErrIdempotencyConflict) || errors.Is(err, store.ErrStaleEpoch) || errors.Is(err, store.ErrExecutionStarted) {
+	} else if errors.Is(err, store.ErrIdempotencyConflict) || errors.Is(err, store.ErrOrchestrationConflict) || errors.Is(err, store.ErrStaleEpoch) || errors.Is(err, store.ErrExecutionStarted) {
 		status = http.StatusConflict
 	} else if errors.Is(err, store.ErrGateClosed) {
 		status = http.StatusLocked

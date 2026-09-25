@@ -72,6 +72,9 @@ func executionCommand(args []string) error {
 }
 
 func projectCommand(args []string) error {
+	if len(args) > 0 && (args[0] == "validate" || args[0] == "apply" || args[0] == "status") {
+		return projectOrchestrationCommand(args)
+	}
 	return scopeCommand("project", args)
 }
 

@@ -1,0 +1,68 @@
+schema_version = 1
+
+[project]
+name = "example-project"
+
+[[tasks]]
+name = "train"
+queue = "training"
+depends_on = []
+policy = "RunToCompletion@v1"
+
+[tasks.execution]
+schema_version = 2
+argv = ["uv", "run", "project", "train", "--config", "configs/train/model-v1.toml"]
+cwd = "D:/Dev/example-project"
+priority = 10
+checkpointable = true
+preemptible = true
+
+[tasks.execution.executor]
+labels = { environment = "windows" }
+
+[[tasks.execution.exclusive]]
+kind = "gpu"
+count = 1
+same_node = true
+min_total_memory_bytes = 0
+min_observed_free_memory_bytes = 0
+on_external_claim = "wait"
+on_unattributed_activity = "wait"
+on_stale_observation = "wait"
+
+[tasks.execution.capacity]
+cpu_millis = 4000
+ram_bytes = 17179869184
+strength = "admitted"
+
+[[tasks]]
+name = "export"
+queue = "artifacts"
+depends_on = ["train"]
+policy = "RunToCompletion@v1"
+
+[tasks.execution]
+schema_version = 2
+argv = ["uv", "run", "project", "export", "--config", "configs/export/model-v1.toml"]
+cwd = "D:/Dev/example-project"
+priority = 10
+checkpointable = false
+preemptible = false
+
+[tasks.execution.executor]
+labels = { environment = "windows" }
+
+[[tasks.execution.exclusive]]
+kind = "gpu"
+count = 1
+same_node = true
+min_total_memory_bytes = 0
+min_observed_free_memory_bytes = 0
+on_external_claim = "wait"
+on_unattributed_activity = "wait"
+on_stale_observation = "wait"
+
+[tasks.execution.capacity]
+cpu_millis = 4000
+ram_bytes = 17179869184
+strength = "admitted"

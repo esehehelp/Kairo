@@ -13,13 +13,17 @@ import (
 //go:embed schema.sql
 var schema string
 
+//go:embed orchestration_schema.sql
+var orchestrationSchema string
+
 var (
-	ErrNotFound            = errors.New("not found")
-	ErrIdempotencyConflict = errors.New("idempotency key was already used for different content")
-	ErrGateClosed          = errors.New("coordination admission gate is closed")
-	ErrExecutionStarted    = errors.New("execution has already started")
-	ErrStaleEpoch          = errors.New("stale coordination epoch")
-	ErrLegacySchema        = errors.New("legacy Kairo database detected; archive it and create a fresh V3 coordination database")
+	ErrNotFound              = errors.New("not found")
+	ErrIdempotencyConflict   = errors.New("idempotency key was already used for different content")
+	ErrGateClosed            = errors.New("coordination admission gate is closed")
+	ErrExecutionStarted      = errors.New("execution has already started")
+	ErrStaleEpoch            = errors.New("stale coordination epoch")
+	ErrOrchestrationConflict = errors.New("logical task was already declared with different immutable content")
+	ErrLegacySchema          = errors.New("legacy Kairo database detected; archive it and create a fresh V3 coordination database")
 )
 
 type Store struct {
@@ -76,6 +80,26 @@ func Open(path string) (*Store, error) {
 			db.Close()
 			return nil, fmt.Errorf("unsupported schema version %d", version)
 		}
+	}
+	var orchestrationMigrated int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='orchestration_schema_migrations'`).Scan(&orchestrationMigrated); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if orchestrationMigrated != 0 {
+		var version int
+		if err := db.QueryRow(`SELECT COALESCE(MAX(version),0) FROM orchestration_schema_migrations`).Scan(&version); err != nil {
+			db.Close()
+			return nil, err
+		}
+		if version != 1 {
+			db.Close()
+			return nil, fmt.Errorf("unsupported orchestration schema version %d", version)
+		}
+	}
+	if _, err := db.Exec(orchestrationSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply orchestration schema: %w", err)
 	}
 	return &Store{db: db}, nil
 }

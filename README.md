@@ -1,22 +1,28 @@
 # Kairo
 
-> **Kairo coordinates executions; projects control workflows. Kairo never
-> owns or interprets project-specific state transitions.**
+> **Kairo owns generic Project/Task orchestration semantics, but never
+> interprets project-specific state.**
 
-Kairo is a single-Windows-host pilot for safely coordinating cooperative ML
-executions. Project, queue, and task names are opaque coordination scopes;
-they are not Kairo workflow objects. SQLite records coordination facts,
-providers observe physical reality, executors own process lifecycle, and the
-Python SDK implements the cooperative suspend protocol.
+Kairo is a single-Windows-host pilot for safely orchestrating cooperative ML
+work. It has two layers. A small declarative layer stores a ProjectSpec,
+reconciles a static Task DAG, and applies an explicitly selected generic task
+policy. The existing V3 coordination layer receives immutable Execution
+requests and continues to own Attempt, Lease, Command, provider, and executor
+mechanics.
 
-Kairo Server deliberately has no task success/failure model, retry policy,
-DAG, workflow condition, metric gate, artifact dependency, dynamic fan-out,
-cleanup policy, or automatic resume. A terminal execution reports raw facts
-such as exit code, signal, checkpoint reference, and quiescence. Project code
-interprets those facts and explicitly submits any next execution with the
-desired opaque input continuation. The SDK may execute a policy that a project
-explicitly selects; that reusable mechanism does not transfer semantic
-authority to the server.
+Task is a durable logical object and can have a sequence of immutable
+Executions. Execution, Attempt, and Lease remain distinct physical lifecycle
+objects. At the lower V3 boundary, project, queue, and task names are still
+opaque coordination scopes; the orchestration layer deliberately maps its
+logical Tasks onto those scopes.
+
+The orchestration layer understands only generic facts: dependencies are
+satisfied, an execution exited, a continuation is permitted by the selected
+policy, or a task succeeded, failed, or became blocked. It does not
+interpret metrics, model quality, artifact contents, datasets, or other
+domain-specific state. DAG topology is static: there is no dynamic fan-out,
+runtime DAG mutation, artifact-derived topology, metric gate, cron scheduling,
+or cleanup language.
 
 ## Start
 
@@ -25,6 +31,9 @@ database before starting this version; semantic workflow state is not migrated.
 
 ```powershell
 go run ./cmd/kairo serve --config examples/kairo.toml
+go run ./cmd/kairo project validate examples/project-spec.toml
+go run ./cmd/kairo project apply --api http://127.0.0.1:7474 examples/project-spec.toml
+go run ./cmd/kairo project status --api http://127.0.0.1:7474 example-project
 go run ./cmd/kairo execution submit examples/execution.toml
 go run ./cmd/kairo execution list --project llm-develop
 go run ./cmd/kairo project pause llm-develop
@@ -37,6 +46,20 @@ waits by default until all captured executions are quiesced and their leases
 are released. `--no-wait` returns after the durable pause operation is stored.
 Resume only reopens admission; it never recalls a suspend command or decides
 which execution should run next.
+
+`project apply` stores the declaration once; the daemon performs subsequent
+reconciliation. The ProjectSpec contract lives at `/orchestration/v1` and is
+versioned independently of `/v2/executions`, whose V3 coordination semantics
+are unchanged. Applying the same normalized declaration is idempotent. A
+declared Task is immutable; a later complete ProjectSpec may add Tasks but
+cannot mutate an existing Task, and omission does not cancel it.
+
+The initial `RunToCompletion@v1` policy waits for every dependency to succeed,
+submits the Task's initial Execution, and marks the Task successful only after
+a zero exit, Attempt quiescence, and Lease release. A checkpointed cooperative
+suspend with an opaque continuation creates the next immutable Execution.
+Lost Attempt identity blocks the Task, and an unsuccessful dependency blocks
+its dependants. See `examples/project-spec.toml` for the declaration format.
 
 `observe_only = true` inventories resources and external claims but never
 reserves, launches, suspends, or releases work. It is the recommended first
@@ -86,9 +109,9 @@ runs every rank's callback, and only publishes the continuation after the
 distributed barrier. Commands may be redelivered, so checkpoint publication
 must remain idempotent by command ID.
 
-### Project-owned controller policy
+### Low-level project-owned controller policy
 
-Projects that want the standard preemption behavior can opt into
+Projects submitting directly to the V3 execution API can still opt into
 `ResumeAfterKairoPreemption`. The policy snapshot and canonical submission are
 written to the project's controller journal before the initial API call:
 
@@ -124,15 +147,17 @@ server-owned workflow state or semantic default.
 
 1. Observe-only inspection of an existing LLM pretrain creates no lease.
 2. A one-GPU job passes `run -> suspend -> checkpointed -> process exit ->
-   quiesced -> lease release`; the project or its explicitly selected SDK
-   policy then submits a resumed execution.
+   quiesced -> lease release`; an explicitly selected task policy may then
+   submit a resumed immutable Execution.
 3. Daemon/process failure at every transition causes neither duplicate GPU
    ownership nor loss of an acknowledged continuation.
 4. A project-selected short high-priority execution can trigger cooperative
-   preemption; the project decides whether and how to resume the old work and
-   may delegate that decision to a versioned SDK policy.
+   preemption; a versioned Task policy decides whether to resume orchestrated
+   work, while direct V3 users retain the project-owned controller option.
 5. Redelivery of one command cannot corrupt checkpoint publication.
-6. A two-GPU DDP execution receives an all-or-nothing gang lease and all ranks
+6. A static Task DAG submits a node only after all dependencies succeed, and
+   replay cannot create a duplicate Execution for one policy decision.
+7. A two-GPU DDP execution receives an all-or-nothing gang lease and all ranks
    quiesce before release.
 
 Multi-node execution, cloud provisioning, RBAC/TLS, service supervision,
