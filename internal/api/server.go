@@ -34,6 +34,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v2/executions", s.listExecutions)
 	mux.HandleFunc("GET /v2/executions/{id}", s.getExecution)
 	mux.HandleFunc("POST /v2/executions/{id}/withdraw", s.withdrawExecution)
+	mux.HandleFunc("GET /v2/attempts", s.listAttempts)
 	mux.HandleFunc("GET /v2/scopes", s.listScopes)
 	mux.HandleFunc("GET /v2/scopes/{id}", s.getScope)
 	mux.HandleFunc("POST /v2/scopes/{id}/pause", s.pauseScope)

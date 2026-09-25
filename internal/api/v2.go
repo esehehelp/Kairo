@@ -102,6 +102,26 @@ func (s *Server) listExecutions(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"executions": values})
 }
 
+// listAttempts is the read side of attempt progress: ?project=, ?execution_id=,
+// ?state=, ?limit=. Newest attempts first.
+func (s *Server) listAttempts(w http.ResponseWriter, r *http.Request) {
+	filter := store.AttemptFilter{ExecutionID: r.URL.Query().Get("execution_id"), State: r.URL.Query().Get("state"), Limit: queryInt(r, "limit", 100)}
+	if project := r.URL.Query().Get("project"); project != "" {
+		scopes, err := s.Store.GetScopeByPath(r.Context(), store.ScopePath{Project: project})
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		filter.ProjectScopeID = scopes.Project.ID
+	}
+	values, err := s.Store.ListAttempts(r.Context(), filter)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"attempts": values})
+}
+
 func (s *Server) getExecution(w http.ResponseWriter, r *http.Request) {
 	value, err := s.Store.GetExecution(r.Context(), r.PathValue("id"))
 	if err != nil {
