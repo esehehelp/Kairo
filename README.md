@@ -60,6 +60,11 @@ a zero exit, Attempt quiescence, and Lease release. A checkpointed cooperative
 suspend with an opaque continuation creates the next immutable Execution.
 Lost Attempt identity blocks the Task, and an unsuccessful dependency blocks
 its dependants. See `examples/project-spec.toml` for the declaration format.
+A top-level `[defaults]` table (`queue`, `policy`, `execution`) is merged into
+every Task by the CLI before validation: the Task's own value wins, tables
+merge key by key, arrays and scalars are replaced, and an omitted `depends_on`
+becomes `[]`. Digests are those of the fully written Task, so `[defaults]`
+never changes what the daemon stores.
 
 `observe_only = true` inventories resources and external claims but never
 reserves, launches, suspends, or releases work. It is the recommended first
