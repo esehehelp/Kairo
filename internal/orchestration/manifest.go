@@ -82,9 +82,17 @@ type Validated struct {
 	TaskDigests map[string]string
 }
 
+// Parse reads a ProjectSpec TOML file. A top-level [defaults] table (queue,
+// policy, execution) is expanded into every Task before validation, so the
+// normalized spec, its digest and every Task digest are the same as for the
+// file written out in full; the daemon never sees [defaults].
 func Parse(source []byte) (Validated, error) {
+	expanded, err := expandDefaults(source)
+	if err != nil {
+		return Validated{}, err
+	}
 	var manifest Manifest
-	metadata, err := toml.Decode(string(source), &manifest)
+	metadata, err := toml.Decode(expanded, &manifest)
 	if err != nil {
 		return Validated{}, fmt.Errorf("parse TOML: %w", err)
 	}
@@ -167,6 +175,70 @@ func Normalize(manifest Manifest) (Validated, error) {
 		return Validated{}, err
 	}
 	return Validated{Manifest: manifest, Normalized: normalized, Digest: digest(normalized), TaskDigests: taskDigests}, nil
+}
+
+var defaultableTaskFields = map[string]bool{"queue": true, "policy": true, "execution": true}
+
+// expandDefaults merges [defaults] into each [[tasks]] entry: a Task's own value
+// wins, tables merge key by key (so a Task can override one capacity field or
+// add an executor label), arrays and scalars are replaced whole. With
+// [defaults] present, a Task that omits depends_on gets an empty list, the
+// same digest as writing `depends_on = []`. Without [defaults] the source is
+// returned unchanged.
+func expandDefaults(source []byte) (string, error) {
+	var raw map[string]any
+	if _, err := toml.Decode(string(source), &raw); err != nil {
+		return "", fmt.Errorf("parse TOML: %w", err)
+	}
+	value, ok := raw["defaults"]
+	if !ok {
+		return string(source), nil
+	}
+	defaults, ok := value.(map[string]any)
+	if !ok {
+		return "", errors.New("defaults must be a table")
+	}
+	for key := range defaults {
+		if !defaultableTaskFields[key] {
+			return "", fmt.Errorf("defaults.%s is not allowed (only queue, policy and execution)", key)
+		}
+	}
+	tasks, _ := raw["tasks"].([]map[string]any)
+	for i, task := range tasks {
+		merged := mergeTables(defaults, task)
+		if _, ok := merged["depends_on"]; !ok {
+			merged["depends_on"] = []any{}
+		}
+		tasks[i] = merged
+	}
+	delete(raw, "defaults")
+	var out strings.Builder
+	if err := toml.NewEncoder(&out).Encode(raw); err != nil {
+		return "", fmt.Errorf("expand defaults: %w", err)
+	}
+	return out.String(), nil
+}
+
+// mergeTables returns a new table with over's keys on top of base's; nested
+// tables are merged recursively and nothing in base or over is mutated.
+func mergeTables(base, over map[string]any) map[string]any {
+	out := make(map[string]any, len(base)+len(over))
+	for key, value := range base {
+		if table, ok := value.(map[string]any); ok {
+			value = mergeTables(table, nil)
+		}
+		out[key] = value
+	}
+	for key, value := range over {
+		if table, ok := value.(map[string]any); ok {
+			if baseTable, ok := out[key].(map[string]any); ok {
+				out[key] = mergeTables(baseTable, table)
+				continue
+			}
+		}
+		out[key] = value
+	}
+	return out
 }
 
 func normalizeExecution(value *Execution) error {
