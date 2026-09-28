@@ -253,6 +253,16 @@ func (s *Server) mountAgent(mux *http.ServeMux) {
 		terminations, err := s.Store.ListQuarantineTerminations(r.Context(), b.ExecutorID)
 		return map[string]any{"terminations": terminations}, err
 	})
+	route("quarantine-signalled", func(r *http.Request) (any, error) {
+		var b struct {
+			AttemptID string `json:"attempt_id"`
+		}
+		if err := decode(r, &b); err != nil {
+			return nil, err
+		}
+		signalledAt, err := s.Store.MarkQuarantineSignalled(r.Context(), b.AttemptID)
+		return map[string]string{"signalled_at": signalledAt}, err
+	})
 	route("quarantine-terminated", func(r *http.Request) (any, error) {
 		var b struct {
 			AttemptID string `json:"attempt_id"`

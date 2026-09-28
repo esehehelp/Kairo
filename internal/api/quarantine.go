@@ -1,17 +1,24 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 
 	"kairo/internal/store"
 )
 
-// nodeParam maps the path value "all" to the all-node quarantine.
-func nodeParam(r *http.Request) string {
-	if id := r.PathValue("id"); id != "all" {
-		return id
+// quarantineTarget is the node a quarantine route acts on: the {id} path value
+// taken literally, or every node on /v2/node-quarantines/all. The all-node
+// quarantine is only reachable through its own route, so no node id aliases it.
+func quarantineTarget(r *http.Request) (string, error) {
+	id := r.PathValue("id")
+	if id == "" {
+		return store.AllNodes, nil
 	}
-	return store.AllNodes
+	if id == store.AllNodes {
+		return "", errors.New("the all-node quarantine is /v2/node-quarantines/all")
+	}
+	return id, nil
 }
 
 func (s *Server) listNodeQuarantines(w http.ResponseWriter, r *http.Request) {
@@ -35,7 +42,12 @@ func (s *Server) quarantineNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	value, err := s.Store.QuarantineNode(r.Context(), nodeParam(r), body.Actor, body.Reason)
+	node, err := quarantineTarget(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	value, err := s.Store.QuarantineNode(r.Context(), node, body.Actor, body.Reason)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -51,7 +63,12 @@ func (s *Server) releaseNodeQuarantine(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.Store.ReleaseNodeQuarantine(r.Context(), nodeParam(r), body.Actor); err != nil {
+	node, err := quarantineTarget(r)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if err := s.Store.ReleaseNodeQuarantine(r.Context(), node, body.Actor); err != nil {
 		writeError(w, err)
 		return
 	}

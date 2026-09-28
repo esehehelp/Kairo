@@ -44,6 +44,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /v2/node-quarantines", s.listNodeQuarantines)
 	mux.HandleFunc("POST /v2/nodes/{id}/quarantine", s.quarantineNode)
 	mux.HandleFunc("DELETE /v2/nodes/{id}/quarantine", s.releaseNodeQuarantine)
+	mux.HandleFunc("POST /v2/node-quarantines/all", s.quarantineNode)
+	mux.HandleFunc("DELETE /v2/node-quarantines/all", s.releaseNodeQuarantine)
 	mux.HandleFunc("GET /v2/resources/status", s.resourceStatus)
 	mux.HandleFunc("POST /v2/resources/{id}/{action}", s.resourceAction)
 	mux.HandleFunc("GET /v2/worker/attempts/{id}/commands", s.workerPoll)

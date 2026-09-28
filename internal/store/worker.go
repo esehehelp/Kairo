@@ -231,10 +231,10 @@ func (s *Store) EnqueueSuspend(ctx context.Context, attemptID, origin, reason st
 		return "", err
 	}
 	if attemptState != "running" && attemptState != "quiescing" {
-		return "", fmt.Errorf("attempt is not suspendable from state %s", attemptState)
+		return "", notSuspendableError{"attempt", attemptState}
 	}
 	if leaseState != "active" && leaseState != "releasing" {
-		return "", fmt.Errorf("lease is not suspendable from state %s", leaseState)
+		return "", notSuspendableError{"lease", leaseState}
 	}
 	var existing string
 	if err = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=? AND state!='rejected' LIMIT 1`, attemptID).Scan(&existing); err == nil {
@@ -254,6 +254,14 @@ func (s *Store) EnqueueSuspend(ctx context.Context, attemptID, origin, reason st
 		return "", err
 	}
 	return commandID, tx.Commit()
+}
+
+// notSuspendableError is EnqueueSuspend's refusal for an attempt or lease that
+// has moved past the states a suspend applies to.
+type notSuspendableError struct{ what, state string }
+
+func (e notSuspendableError) Error() string {
+	return e.what + " is not suspendable from state " + e.state
 }
 
 func executionProjectIDTx(ctx context.Context, tx *sql.Tx, executionID string) (string, error) {
@@ -328,7 +336,8 @@ type QuiescenceCandidate struct {
 func (s *Store) ListQuiescenceCandidates(ctx context.Context, executorID string) ([]QuiescenceCandidate, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.execution_id,a.state,a.executor_id,a.coordination_epoch,a.pid,a.process_identity,a.exit_code,a.exit_signal,a.continuation_ref,a.progress_json,a.started_at,a.last_heartbeat_at,a.checkpointed_at,a.exited_at,a.quiesced_at,
 	 l.id,l.execution_id,l.attempt_id,l.executor_id,l.coordination_epoch,l.state,l.created_at,l.expires_at
-	 FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=? AND a.state='exited' AND l.state='releasing' ORDER BY a.exited_at`, executorID)
+	 FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=? AND a.state='exited' AND l.state='releasing'
+	 AND NOT EXISTS(SELECT 1 FROM quarantine_terminations q WHERE q.attempt_id=a.id AND q.state='pending') ORDER BY a.exited_at`, executorID)
 	if err != nil {
 		return nil, err
 	}
@@ -439,6 +448,14 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 	}
 	if live != 0 {
 		return fmt.Errorf("attempt still has %d live registered processes", live)
+	}
+	// A node quarantine termination is settled only once the executor has
+	// seen the whole process tree gone, not just the registered processes.
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations WHERE attempt_id=? AND state='pending'`, attemptID).Scan(&live); err != nil {
+		return err
+	}
+	if live != 0 {
+		return errors.New("attempt has a pending quarantine termination")
 	}
 	// Exclusive GPU ownership is not released back to scheduling while reality
 	// is stale or a claim forbidden by the execution's admission policy remains.

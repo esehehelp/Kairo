@@ -172,6 +172,14 @@ func (c *Client) ListQuarantineTerminations(ctx context.Context, executorID stri
 	return out.Terminations, err
 }
 
+func (c *Client) MarkQuarantineSignalled(ctx context.Context, attemptID string) (string, error) {
+	var out struct {
+		SignalledAt string `json:"signalled_at"`
+	}
+	err := c.call(ctx, "quarantine-signalled", map[string]string{"attempt_id": attemptID}, &out)
+	return out.SignalledAt, err
+}
+
 func (c *Client) MarkQuarantineTerminated(ctx context.Context, attemptID string) error {
 	return c.call(ctx, "quarantine-terminated", map[string]string{"attempt_id": attemptID}, nil)
 }

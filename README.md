@@ -96,19 +96,27 @@ stale; it is never made free based on time alone.
 ### Node quarantine
 
 `kairo node quarantine <NODE_ID|--all> --reason ...` stops all work on a node
-(or every node) until `kairo node release <NODE_ID|--all>`:
+(or every node) until `kairo node release <NODE_ID|--all>` (flags may come
+before or after `NODE_ID`; `--all` is the only way to name every node):
 
 - its executors reserve nothing and trigger no priority preemption;
 - a running checkpointable attempt gets a `suspend` command (origin
   `node_quarantine`) and later continues from its checkpoint;
-- any other running attempt is terminated by its executor, launcher and
-  descendants (Windows `taskkill /T /F`; Linux SIGTERM then SIGKILL to the
-  attempt's process group), and its task runs again from the start
-  (orchestration reason `quarantine_restart`) instead of failing.
+- any other running attempt, and one that rejects that suspend, is terminated
+  by its executor, launcher and descendants (Windows `taskkill /T /F`; Linux
+  SIGTERM then, after 10 s, SIGKILL to the attempt's process group; on a WSL2
+  executor also every distro process carrying the attempt's
+  `KAIRO_ATTEMPT_ID`). Its lease is released only once the whole tree is
+  gone, and its task runs again from the continuation it started with, or
+  from the start (orchestration reason `quarantine_restart`), instead of
+  failing, even if the launcher exits 0 on the signal.
 
+Releasing withdraws what has not reached an attempt yet (a termination not
+yet signalled, a suspend not yet delivered); what has, runs its course.
 `kairo node quarantine-status` shows each quarantine with the attempts still
 alive on it; the quarantine has taken full effect once that count is zero.
-Every step is recorded as a coordination event.
+Every step is recorded as a coordination event. Over the API a node is
+`/v2/nodes/{id}/quarantine` and every node is `/v2/node-quarantines/all`.
 
 ## Worker SDK
 

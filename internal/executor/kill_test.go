@@ -10,7 +10,7 @@ import (
 )
 
 // A node quarantine must stop the launcher and what it spawned (uv -> python).
-func TestKillProcessTreeStopsDescendants(t *testing.T) {
+func TestSignalProcessTreeStopsDescendants(t *testing.T) {
 	var cmd *exec.Cmd
 	if runtime.GOOS == "windows" {
 		cmd = exec.Command("cmd", "/c", "ping -n 60 127.0.0.1 >NUL")
@@ -30,7 +30,10 @@ func TestKillProcessTreeStopsDescendants(t *testing.T) {
 	if len(children) == 0 {
 		t.Fatal("test process has no child")
 	}
-	if err = killProcessTree(cmd.Process.Pid); err != nil {
+	if alive, err := processTreeAlive(cmd.Process.Pid, identity); err != nil || !alive {
+		t.Fatalf("running tree reported alive=%v err=%v", alive, err)
+	}
+	if err = signalProcessTree(cmd.Process.Pid, false); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan struct{})
@@ -51,5 +54,24 @@ func TestKillProcessTreeStopsDescendants(t *testing.T) {
 			}
 			time.Sleep(100 * time.Millisecond)
 		}
+	}
+	waitTreeGone(t, cmd.Process.Pid, identity)
+}
+
+func waitTreeGone(t *testing.T, pid int, identity string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		alive, err := processTreeAlive(pid, identity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !alive {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("tree still reported alive")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }

@@ -30,6 +30,9 @@ type QuarantineTermination struct {
 	ExecutionID     string  `json:"execution_id"`
 	PID             *int    `json:"pid"`
 	ProcessIdentity *string `json:"process_identity"`
+	// SignalledAt is when the executor first signalled the process tree
+	// (nil: not yet); a forced kill follows after a grace period.
+	SignalledAt *string `json:"signalled_at"`
 }
 
 // QuarantineNode stops all work on nodeID (AllNodes for every node) until
@@ -75,7 +78,11 @@ func (s *Store) QuarantineNode(ctx context.Context, nodeID, actor, reason string
 	return s.getNodeQuarantine(ctx, nodeID)
 }
 
-// ReleaseNodeQuarantine lets nodeID (AllNodes: the all-node quarantine) run work again.
+// ReleaseNodeQuarantine lets nodeID (AllNodes: the all-node quarantine) run work
+// again. What the quarantine requested and has not yet reached the attempt is
+// withdrawn for every node no longer covered by a quarantine: terminations not
+// yet signalled, and node_quarantine suspends not yet delivered. A termination
+// already signalled or a suspend already delivered runs its course.
 func (s *Store) ReleaseNodeQuarantine(ctx context.Context, nodeID, actor string) error {
 	if strings.TrimSpace(actor) == "" {
 		actor = "operator"
@@ -95,20 +102,67 @@ func (s *Store) ReleaseNodeQuarantine(ctx context.Context, nodeID, actor string)
 	if err = appendCoordinationEventTx(ctx, tx, "node_quarantine_released", nil, "node", nodeID, nil, map[string]any{"actor": actor}); err != nil {
 		return err
 	}
+	type withdrawn struct{ id, attemptID, executionID string }
+	collect := func(query string, args ...any) ([]withdrawn, error) {
+		rows, err := tx.QueryContext(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		var out []withdrawn
+		for rows.Next() {
+			var w withdrawn
+			if err := rows.Scan(&w.id, &w.attemptID, &w.executionID); err != nil {
+				return nil, err
+			}
+			out = append(out, w)
+		}
+		return out, rows.Err()
+	}
+	terminations, err := collect(`DELETE FROM quarantine_terminations WHERE state='pending' AND signalled_at IS NULL
+		AND NOT EXISTS(SELECT 1 FROM node_quarantines q WHERE q.node_id IN(quarantine_terminations.node_id,'*'))
+		RETURNING attempt_id,attempt_id,execution_id`)
+	if err != nil {
+		return err
+	}
+	t := now()
+	suspends, err := collect(`UPDATE commands SET state='rejected',payload_json=?,updated_at=?
+		WHERE origin='node_quarantine' AND state='pending' AND delivery_count=0
+		AND attempt_id IN(SELECT a.id FROM attempts a JOIN executors x ON x.id=a.executor_id
+			WHERE NOT EXISTS(SELECT 1 FROM node_quarantines q WHERE q.node_id IN(x.node_id,'*')))
+		RETURNING id,attempt_id,execution_id`, `{"withdrawn":"node quarantine released"}`, t)
+	if err != nil {
+		return err
+	}
+	for _, w := range terminations {
+		projectID, err := executionProjectIDTx(ctx, tx, w.executionID)
+		if err != nil {
+			return err
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "quarantine_termination_withdrawn", &projectID, "attempt", w.attemptID, nil, map[string]any{"execution_id": w.executionID, "actor": actor}); err != nil {
+			return err
+		}
+	}
+	for _, w := range suspends {
+		projectID, err := executionProjectIDTx(ctx, tx, w.executionID)
+		if err != nil {
+			return err
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "suspend_withdrawn", &projectID, "command", w.id, nil, map[string]any{"execution_id": w.executionID, "attempt_id": w.attemptID, "origin": "node_quarantine", "actor": actor}); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 
 func (s *Store) getNodeQuarantine(ctx context.Context, nodeID string) (NodeQuarantine, error) {
-	all, err := s.ListNodeQuarantines(ctx)
-	if err != nil {
+	q := NodeQuarantine{NodeID: nodeID}
+	if err := s.db.QueryRowContext(ctx, `SELECT actor,reason,created_at FROM node_quarantines WHERE node_id=?`, nodeID).Scan(&q.Actor, &q.Reason, &q.CreatedAt); errors.Is(err, sql.ErrNoRows) {
+		return NodeQuarantine{}, ErrNotFound
+	} else if err != nil {
 		return NodeQuarantine{}, err
 	}
-	for _, q := range all {
-		if q.NodeID == nodeID {
-			return q, nil
-		}
-	}
-	return NodeQuarantine{}, ErrNotFound
+	return q, s.countQuarantineWork(ctx, &q)
 }
 
 // ListNodeQuarantines returns the active quarantines and, for each, the
@@ -131,15 +185,20 @@ func (s *Store) ListNodeQuarantines(ctx context.Context) ([]NodeQuarantine, erro
 		return nil, err
 	}
 	for i := range out {
-		if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempts a JOIN executors x ON x.id=a.executor_id
-			WHERE a.state IN('authorized','running','quiescing','exited') AND (?='*' OR x.node_id=?)`, out[i].NodeID, out[i].NodeID).Scan(&out[i].LiveAttempts); err != nil {
-			return nil, err
-		}
-		if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations WHERE state='pending' AND (?='*' OR node_id=?)`, out[i].NodeID, out[i].NodeID).Scan(&out[i].PendingTerminations); err != nil {
+		if err = s.countQuarantineWork(ctx, &out[i]); err != nil {
 			return nil, err
 		}
 	}
 	return out, nil
+}
+
+// countQuarantineWork fills in what q is still waiting on.
+func (s *Store) countQuarantineWork(ctx context.Context, q *NodeQuarantine) error {
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempts a JOIN executors x ON x.id=a.executor_id
+		WHERE a.state IN('authorized','running','quiescing','exited') AND (?='*' OR x.node_id=?)`, q.NodeID, q.NodeID).Scan(&q.LiveAttempts); err != nil {
+		return err
+	}
+	return s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations WHERE state='pending' AND (?='*' OR node_id=?)`, q.NodeID, q.NodeID).Scan(&q.PendingTerminations)
 }
 
 func nodeQuarantinedTx(ctx context.Context, tx *sql.Tx, nodeID string) (bool, error) {
@@ -150,12 +209,16 @@ func nodeQuarantinedTx(ctx context.Context, tx *sql.Tx, nodeID string) (bool, er
 
 // ReconcileNodeQuarantines acts on the attempts running on quarantined nodes:
 // a checkpointable attempt gets a suspend command (origin node_quarantine) and
-// continues later from its checkpoint; any other attempt gets a termination
-// that its executor carries out, after which the task runs again from the
-// start (orchestration reason quarantine_restart). New work is kept off the
-// node by ReserveNext / EnsurePriorityPreemption.
+// continues later from its checkpoint; any other attempt, and a checkpointable
+// one that rejected its node_quarantine suspend, gets a termination that its
+// executor carries out, after which the task runs again from the continuation
+// it started with, if any (orchestration reason quarantine_restart). New work
+// is kept off the node by ReserveNext / EnsurePriorityPreemption. An attempt
+// that fails is reported and the others are still acted on.
 func (s *Store) ReconcileNodeQuarantines(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.execution_id,a.executor_id,x.node_id,e.checkpointable
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.execution_id,a.executor_id,x.node_id,e.checkpointable,
+		EXISTS(SELECT 1 FROM commands c JOIN command_acks k ON k.command_id=c.id
+			WHERE c.attempt_id=a.id AND c.origin='node_quarantine' AND k.phase='rejected')
 		FROM attempts a
 		JOIN executors x ON x.id=a.executor_id
 		JOIN execution_requests e ON e.id=a.execution_id
@@ -167,12 +230,12 @@ func (s *Store) ReconcileNodeQuarantines(ctx context.Context) error {
 	}
 	type target struct {
 		attemptID, executionID, executorID, nodeID string
-		checkpointable                             bool
+		checkpointable, rejected                   bool
 	}
 	var targets []target
 	for rows.Next() {
 		var t target
-		if err = rows.Scan(&t.attemptID, &t.executionID, &t.executorID, &t.nodeID, &t.checkpointable); err != nil {
+		if err = rows.Scan(&t.attemptID, &t.executionID, &t.executorID, &t.nodeID, &t.checkpointable, &t.rejected); err != nil {
 			rows.Close()
 			return err
 		}
@@ -181,18 +244,21 @@ func (s *Store) ReconcileNodeQuarantines(ctx context.Context) error {
 	if err = rows.Close(); err != nil {
 		return err
 	}
+	var errs []error
 	for _, t := range targets {
-		if t.checkpointable {
-			if _, err := s.EnqueueSuspend(ctx, t.attemptID, "node_quarantine", "node "+t.nodeID+" quarantined"); err != nil && !errors.Is(err, ErrNotFound) {
-				return fmt.Errorf("suspend %s: %w", t.attemptID, err)
+		if t.checkpointable && !t.rejected {
+			// The attempt may have moved on since the query: nothing to suspend.
+			var notSuspendable notSuspendableError
+			if _, err := s.EnqueueSuspend(ctx, t.attemptID, "node_quarantine", "node "+t.nodeID+" quarantined"); err != nil && !errors.Is(err, ErrNotFound) && !errors.As(err, &notSuspendable) {
+				errs = append(errs, fmt.Errorf("suspend %s: %w", t.attemptID, err))
 			}
 			continue
 		}
 		if err := s.requestQuarantineTermination(ctx, t.attemptID, t.executionID, t.executorID, t.nodeID); err != nil {
-			return fmt.Errorf("terminate %s: %w", t.attemptID, err)
+			errs = append(errs, fmt.Errorf("terminate %s: %w", t.attemptID, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (s *Store) requestQuarantineTermination(ctx context.Context, attemptID, executionID, executorID, nodeID string) error {
@@ -220,7 +286,7 @@ func (s *Store) requestQuarantineTermination(ctx context.Context, attemptID, exe
 // ListQuarantineTerminations returns the terminations executorID still has to
 // carry out, with the attempt's launcher process.
 func (s *Store) ListQuarantineTerminations(ctx context.Context, executorID string) ([]QuarantineTermination, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity FROM quarantine_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=? AND t.state='pending' ORDER BY t.requested_at`, executorID)
+	rows, err := s.db.QueryContext(ctx, `SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity,t.signalled_at FROM quarantine_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=? AND t.state='pending' ORDER BY t.requested_at`, executorID)
 	if err != nil {
 		return nil, err
 	}
@@ -229,8 +295,8 @@ func (s *Store) ListQuarantineTerminations(ctx context.Context, executorID strin
 	for rows.Next() {
 		var t QuarantineTermination
 		var pid sql.NullInt64
-		var identity sql.NullString
-		if err = rows.Scan(&t.AttemptID, &t.ExecutionID, &pid, &identity); err != nil {
+		var identity, signalled sql.NullString
+		if err = rows.Scan(&t.AttemptID, &t.ExecutionID, &pid, &identity, &signalled); err != nil {
 			return nil, err
 		}
 		if pid.Valid {
@@ -240,14 +306,52 @@ func (s *Store) ListQuarantineTerminations(ctx context.Context, executorID strin
 		if identity.Valid {
 			t.ProcessIdentity = &identity.String
 		}
+		if signalled.Valid {
+			t.SignalledAt = &signalled.String
+		}
 		out = append(out, t)
 	}
 	return out, rows.Err()
 }
 
-// MarkQuarantineTerminated records that the executor terminated the attempt's
-// processes (or found them already gone). Quiescence itself is still proven by
-// the executor's process-absence check before the lease is released.
+// MarkQuarantineSignalled records, before the executor sends its first signal,
+// that the termination is under way: from then on a release no longer
+// withdraws it. It returns when the tree was first signalled, and ErrNotFound
+// when the termination is no longer pending (withdrawn or already settled), in
+// which case the executor must not signal.
+func (s *Store) MarkQuarantineSignalled(ctx context.Context, attemptID string) (string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback()
+	var executionID string
+	var signalled sql.NullString
+	if err = tx.QueryRowContext(ctx, `SELECT execution_id,signalled_at FROM quarantine_terminations WHERE attempt_id=? AND state='pending'`, attemptID).Scan(&executionID, &signalled); errors.Is(err, sql.ErrNoRows) {
+		return "", ErrNotFound
+	} else if err != nil {
+		return "", err
+	}
+	if signalled.Valid {
+		return signalled.String, tx.Commit()
+	}
+	t := now()
+	if _, err = tx.ExecContext(ctx, `UPDATE quarantine_terminations SET signalled_at=? WHERE attempt_id=?`, t, attemptID); err != nil {
+		return "", err
+	}
+	projectID, err := executionProjectIDTx(ctx, tx, executionID)
+	if err != nil {
+		return "", err
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "quarantine_termination_signalled", &projectID, "attempt", attemptID, nil, map[string]any{"execution_id": executionID}); err != nil {
+		return "", err
+	}
+	return t, tx.Commit()
+}
+
+// MarkQuarantineTerminated records that the executor found the attempt's whole
+// process tree gone, whether it signalled it or the tree had already exited.
+// Until then the attempt's lease is not released (see FinalizeQuiescence).
 func (s *Store) MarkQuarantineTerminated(ctx context.Context, attemptID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -276,8 +380,13 @@ func (s *Store) MarkQuarantineTerminated(ctx context.Context, attemptID string) 
 	return tx.Commit()
 }
 
-func quarantineTerminatedTx(ctx context.Context, tx *sql.Tx, attemptID string) (bool, error) {
-	var n int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations WHERE attempt_id=? AND state='terminated'`, attemptID).Scan(&n)
-	return n > 0, err
+// quarantineTerminationTx reports whether a node quarantine settled a
+// termination of the attempt, and whether the executor had to signal it (as
+// opposed to finding it already exited).
+func quarantineTerminationTx(ctx context.Context, tx *sql.Tx, attemptID string) (terminated, signalled bool, err error) {
+	err = tx.QueryRowContext(ctx, `SELECT state='terminated',signalled_at IS NOT NULL FROM quarantine_terminations WHERE attempt_id=?`, attemptID).Scan(&terminated, &signalled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	return terminated, signalled, err
 }
