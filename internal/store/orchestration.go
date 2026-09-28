@@ -224,13 +224,19 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		if current.AttemptState == nil || *current.AttemptState != "quiesced" || current.LeaseState == nil || *current.LeaseState != "released" {
 			continue
 		}
-		// A node quarantine terminated this attempt (it could not checkpoint):
-		// run the task again from the start instead of failing it.
-		if terminated, err := quarantineTerminatedTx(ctx, tx, *current.AttemptID); err != nil {
+		// A node quarantine terminated this attempt (it could not or would not
+		// checkpoint): run it again from the continuation it started with
+		// instead of failing the task. An exit status the attempt reports after
+		// being signalled (a launcher may exit 0 on SIGTERM) is not a result.
+		if terminated, signalled, err := quarantineTerminationTx(ctx, tx, *current.AttemptID); err != nil {
 			return err
-		} else if terminated && !(current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "")) {
+		} else if terminated && (signalled || !(current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == ""))) {
+			var continuation *string
+			if err := tx.QueryRowContext(ctx, `SELECT input_continuation_ref FROM execution_requests WHERE id=?`, current.ExecutionID).Scan(&continuation); err != nil {
+				return err
+			}
 			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "node_quarantine"}
-			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, nil); err != nil {
+			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, continuation); err != nil {
 				return err
 			}
 			continue

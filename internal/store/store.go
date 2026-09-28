@@ -121,7 +121,27 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply quarantine schema: %w", err)
 	}
+	if err := addColumn(db, "quarantine_terminations", "signalled_at", "TEXT"); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// addColumn adds a nullable column to an existing table, for databases created
+// before the column existed.
+func addColumn(db *sql.DB, table, column, typ string) error {
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM pragma_table_info(?) WHERE name=?`, table, column).Scan(&n); err != nil {
+		return err
+	}
+	if n != 0 {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + typ); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
+	}
+	return nil
 }
 
 // widenCheck adds a value to a CHECK(... IN(...)) list of an existing table,
