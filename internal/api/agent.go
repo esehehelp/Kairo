@@ -245,6 +245,23 @@ func (s *Server) mountAgent(mux *http.ServeMux) {
 		}
 		return map[string]bool{"ok": true}, s.Store.FinalizeQuiescence(r.Context(), b.AttemptID, b.LeaseID, b.Epoch)
 	})
+	route("quarantine-terminations", func(r *http.Request) (any, error) {
+		var b agentExecutorRequest
+		if err := decode(r, &b); err != nil {
+			return nil, err
+		}
+		terminations, err := s.Store.ListQuarantineTerminations(r.Context(), b.ExecutorID)
+		return map[string]any{"terminations": terminations}, err
+	})
+	route("quarantine-terminated", func(r *http.Request) (any, error) {
+		var b struct {
+			AttemptID string `json:"attempt_id"`
+		}
+		if err := decode(r, &b); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, s.Store.MarkQuarantineTerminated(r.Context(), b.AttemptID)
+	})
 	mux.HandleFunc("POST /v3/agent/logs", s.agentAuth(s.agentLogAppend))
 }
 

@@ -24,6 +24,8 @@ type Coordinator interface {
 	ListQuiescenceCandidates(ctx context.Context, executorID string) ([]store.QuiescenceCandidate, error)
 	FinalizeQuiescence(ctx context.Context, attemptID, leaseID string, epoch int64) error
 	ReleaseReservation(ctx context.Context, leaseID string, epoch int64, reason string) error
+	ListQuarantineTerminations(ctx context.Context, executorID string) ([]store.QuarantineTermination, error)
+	MarkQuarantineTerminated(ctx context.Context, attemptID string) error
 }
 
 var _ Coordinator = (*store.Store)(nil)

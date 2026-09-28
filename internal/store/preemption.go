@@ -37,6 +37,10 @@ func (s *Store) EnsurePriorityPreemption(ctx context.Context, executorID string)
 	if err != nil {
 		return nil, err
 	}
+	// A quarantined node takes no work (ReconcileNodeQuarantines stops what runs).
+	if quarantined, err := nodeQuarantinedTx(ctx, tx, nodeID); err != nil || quarantined {
+		return nil, err
+	}
 
 	candidates, err := preemptionCandidatesTx(ctx, tx, executorAttributes)
 	if err != nil || len(candidates) == 0 {

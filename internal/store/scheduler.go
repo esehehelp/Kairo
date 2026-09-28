@@ -84,6 +84,10 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	if err != nil {
 		return nil, err
 	}
+	// A quarantined node takes no work (ReconcileNodeQuarantines stops what runs).
+	if quarantined, err := nodeQuarantinedTx(ctx, tx, nodeID); err != nil || quarantined {
+		return nil, err
+	}
 
 	rows, err := tx.QueryContext(ctx, `SELECT e.id,e.project_scope_id,e.queue_scope_id,e.task_scope_id,e.client_request_id,e.spec_digest,e.state,e.argv_json,e.cwd,e.executor_selector_json,e.priority,e.checkpointable,e.preemptible,e.input_continuation_ref,e.terminal_cause,e.submitted_at,e.authorized_at,e.started_at,e.terminal_at
 		FROM execution_requests e

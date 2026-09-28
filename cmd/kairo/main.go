@@ -50,6 +50,8 @@ func run(args []string) error {
 		return taskCommand(args[1:])
 	case "resource":
 		return resourceCommand(args[1:])
+	case "node":
+		return nodeCommand(args[1:])
 	case "doctor":
 		return doctorCommand(args[1:])
 	default:
@@ -58,7 +60,7 @@ func run(args []string) error {
 }
 
 func usage() error {
-	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|doctor>")
+	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|doctor>")
 }
 
 func serve(args []string) error {
@@ -155,6 +157,23 @@ func serve(args []string) error {
 			}
 		}
 	}()
+	if !daemonConfig.ObserveOnly {
+		// Node quarantine: suspend or terminate what runs on quarantined nodes.
+		go func() {
+			ticker := time.NewTicker(time.Second)
+			defer ticker.Stop()
+			for {
+				if err := st.ReconcileNodeQuarantines(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("node quarantine reconciliation failed", "error", err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	if !daemonConfig.ObserveOnly {
 		// Project declarations are reconciled above the V3 execution layer. The
 		// reconciler only emits immutable requests; executors and leases remain

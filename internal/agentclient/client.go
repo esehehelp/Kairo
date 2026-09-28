@@ -164,6 +164,18 @@ func (c *Client) FinalizeQuiescence(ctx context.Context, attemptID, leaseID stri
 	return c.call(ctx, "finalize-quiescence", map[string]any{"attempt_id": attemptID, "lease_id": leaseID, "epoch": epoch}, nil)
 }
 
+func (c *Client) ListQuarantineTerminations(ctx context.Context, executorID string) ([]store.QuarantineTermination, error) {
+	var out struct {
+		Terminations []store.QuarantineTermination `json:"terminations"`
+	}
+	err := c.call(ctx, "quarantine-terminations", map[string]string{"executor_id": executorID}, &out)
+	return out.Terminations, err
+}
+
+func (c *Client) MarkQuarantineTerminated(ctx context.Context, attemptID string) error {
+	return c.call(ctx, "quarantine-terminated", map[string]string{"attempt_id": attemptID}, nil)
+}
+
 // appendLog sends data found at offset of the node-side file and returns the
 // daemon-side size afterwards. A gap (the daemon has less than offset) is
 // reported as *GapError carrying the daemon's size to resume from.

@@ -90,6 +90,9 @@ func (e *Local) tick(ctx context.Context) error {
 	if err := e.reconcileQuiescence(ctx); err != nil {
 		return err
 	}
+	if err := e.carryOutQuarantineTerminations(ctx); err != nil {
+		return err
+	}
 	for {
 		reservation, err := e.Store.ReserveNext(ctx, e.ID)
 		if err != nil {
@@ -253,6 +256,51 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 	return nil
 }
 
+// carryOutQuarantineTerminations terminates the process trees of this
+// executor's attempts that a node quarantine stopped and that cannot
+// checkpoint. The launcher is found through this executor's own handle, or
+// else through the recorded pid when its creation identity still matches (an
+// executor restarted since the launch). Quiescence is proven afterwards by
+// reconcileQuiescence as for any exit.
+func (e *Local) carryOutQuarantineTerminations(ctx context.Context) error {
+	terminations, err := e.Store.ListQuarantineTerminations(ctx, e.ID)
+	if err != nil {
+		return err
+	}
+	for _, t := range terminations {
+		pid := 0
+		e.mu.Lock()
+		if cmd := e.running[t.AttemptID]; cmd != nil && cmd.Process != nil {
+			pid = cmd.Process.Pid
+		}
+		e.mu.Unlock()
+		if pid == 0 && t.PID != nil && t.ProcessIdentity != nil {
+			if liveness, _ := processidentity.HostProcessLiveness(*t.PID, *t.ProcessIdentity); liveness == processidentity.LivenessAlive {
+				pid = *t.PID
+			}
+		}
+		if pid != 0 {
+			if err := killProcessTree(pid); err != nil {
+				// taskkill / kill also fail when the process has just exited on its own.
+				gone := t.PID != nil && t.ProcessIdentity != nil
+				if gone {
+					liveness, _ := processidentity.HostProcessLiveness(*t.PID, *t.ProcessIdentity)
+					gone = liveness == processidentity.LivenessAbsent
+				}
+				if !gone {
+					e.Logger.Warn("quarantine termination failed; retrying", "attempt_id", t.AttemptID, "pid", pid, "error", err)
+					continue
+				}
+			}
+			e.Logger.Info("terminated attempt for node quarantine", "attempt_id", t.AttemptID, "pid", pid)
+		}
+		if err := e.Store.MarkQuarantineTerminated(ctx, t.AttemptID); err != nil && !errors.Is(err, store.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
 func resourceBinding(resource store.ResourceInstance) string {
 	var value map[string]string
 	if json.Unmarshal(resource.Binding, &value) == nil {
@@ -301,6 +349,7 @@ func (e *Local) start(launch *store.Launch) error {
 		cmd.Dir = launch.CWD
 		cmd.Env = append(os.Environ(), launchEnv...)
 	}
+	prepareProcessTree(cmd)
 	outPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stdout.log")
 	errPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stderr.log")
 	stdout, err := os.OpenFile(outPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)

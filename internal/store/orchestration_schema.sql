@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS orchestration_decisions(
  decision_key TEXT PRIMARY KEY,
  task_scope_id TEXT NOT NULL REFERENCES orchestration_tasks(task_scope_id),
  execution_ordinal INTEGER NOT NULL CHECK(execution_ordinal>=0),
- reason TEXT NOT NULL CHECK(reason IN('initial','continuation')),
+ reason TEXT NOT NULL CHECK(reason IN('initial','continuation','quarantine_restart')),
  trigger_json TEXT NOT NULL,
  execution_spec_json TEXT NOT NULL,
  state TEXT NOT NULL CHECK(state IN('planned','submitted')),

@@ -194,7 +194,7 @@ CREATE TABLE commands(
  lease_id TEXT NOT NULL REFERENCES leases(id),
  coordination_epoch INTEGER NOT NULL,
  kind TEXT NOT NULL DEFAULT 'suspend' CHECK(kind='suspend'),
- origin TEXT NOT NULL CHECK(origin IN('scope_pause','priority_preemption')),
+ origin TEXT NOT NULL CHECK(origin IN('scope_pause','priority_preemption','node_quarantine')),
  reason TEXT NOT NULL,
  payload_json TEXT NOT NULL DEFAULT '{}',
  state TEXT NOT NULL CHECK(state IN('pending','accepted','checkpointing','checkpointed','rejected')),

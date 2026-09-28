@@ -224,6 +224,17 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		if current.AttemptState == nil || *current.AttemptState != "quiesced" || current.LeaseState == nil || *current.LeaseState != "released" {
 			continue
 		}
+		// A node quarantine terminated this attempt (it could not checkpoint):
+		// run the task again from the start instead of failing it.
+		if terminated, err := quarantineTerminatedTx(ctx, tx, *current.AttemptID); err != nil {
+			return err
+		} else if terminated && !(current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "")) {
+			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "node_quarantine"}
+			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, nil); err != nil {
+				return err
+			}
+			continue
+		}
 		commandID, commandOrigin, commandState, err := latestAttemptCommand(ctx, tx, *current.AttemptID)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
