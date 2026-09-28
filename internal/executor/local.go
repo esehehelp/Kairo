@@ -35,6 +35,10 @@ type Local struct {
 
 	mu      sync.Mutex
 	running map[string]*exec.Cmd
+
+	// quarantineSignalled is when this executor, by its own clock, first saw
+	// each quarantine termination signalled (tick goroutine only).
+	quarantineSignalled map[string]time.Time
 }
 
 func NewLocal(id string, st Coordinator, logDir string, logger *slog.Logger) *Local {
@@ -256,49 +260,103 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 	return nil
 }
 
+// killGrace is how long a quarantined process tree gets between the first
+// signal and SIGKILL.
+const killGrace = 10 * time.Second
+
 // carryOutQuarantineTerminations terminates the process trees of this
 // executor's attempts that a node quarantine stopped and that cannot
-// checkpoint. The launcher is found through this executor's own handle, or
-// else through the recorded pid when its creation identity still matches (an
-// executor restarted since the launch). Quiescence is proven afterwards by
-// reconcileQuiescence as for any exit.
+// checkpoint. It works from the recorded launcher identity, so an executor
+// restarted since the launch carries on where the previous one stopped. The
+// first signal is recorded before it is sent (a release no longer withdraws
+// the termination after that), and a tree still alive killGrace later, timed
+// by this executor's clock from when it signalled or, after a restart, first
+// saw the termination signalled, is killed. A termination is marked done only
+// once the whole tree is seen gone; until then the attempt's lease is not
+// released. When liveness cannot be determined nothing is marked and it is
+// retried.
 func (e *Local) carryOutQuarantineTerminations(ctx context.Context) error {
 	terminations, err := e.Store.ListQuarantineTerminations(ctx, e.ID)
 	if err != nil {
 		return err
 	}
+	if e.quarantineSignalled == nil {
+		e.quarantineSignalled = make(map[string]time.Time)
+	}
+	listed := make(map[string]bool, len(terminations))
 	for _, t := range terminations {
-		pid := 0
-		e.mu.Lock()
-		if cmd := e.running[t.AttemptID]; cmd != nil && cmd.Process != nil {
-			pid = cmd.Process.Pid
-		}
-		e.mu.Unlock()
-		if pid == 0 && t.PID != nil && t.ProcessIdentity != nil {
-			if liveness, _ := processidentity.HostProcessLiveness(*t.PID, *t.ProcessIdentity); liveness == processidentity.LivenessAlive {
-				pid = *t.PID
-			}
-		}
-		if pid != 0 {
-			if err := killProcessTree(pid); err != nil {
-				// taskkill / kill also fail when the process has just exited on its own.
-				gone := t.PID != nil && t.ProcessIdentity != nil
-				if gone {
-					liveness, _ := processidentity.HostProcessLiveness(*t.PID, *t.ProcessIdentity)
-					gone = liveness == processidentity.LivenessAbsent
-				}
-				if !gone {
-					e.Logger.Warn("quarantine termination failed; retrying", "attempt_id", t.AttemptID, "pid", pid, "error", err)
-					continue
-				}
-			}
-			e.Logger.Info("terminated attempt for node quarantine", "attempt_id", t.AttemptID, "pid", pid)
-		}
-		if err := e.Store.MarkQuarantineTerminated(ctx, t.AttemptID); err != nil && !errors.Is(err, store.ErrNotFound) {
-			return err
+		listed[t.AttemptID] = true
+	}
+	for attemptID := range e.quarantineSignalled {
+		if !listed[attemptID] {
+			delete(e.quarantineSignalled, attemptID)
 		}
 	}
+	for _, t := range terminations {
+		host, wsl, err := e.quarantinedTreeAlive(ctx, t)
+		if err != nil {
+			e.Logger.Warn("quarantined attempt liveness is unknown; retrying", "attempt_id", t.AttemptID, "error", err)
+			continue
+		}
+		if !host && !wsl {
+			if err := e.Store.MarkQuarantineTerminated(ctx, t.AttemptID); err != nil && !errors.Is(err, store.ErrNotFound) {
+				return err
+			}
+			delete(e.quarantineSignalled, t.AttemptID)
+			e.Logger.Info("attempt stopped for node quarantine", "attempt_id", t.AttemptID)
+			continue
+		}
+		force := false
+		if t.SignalledAt == nil {
+			if _, err := e.Store.MarkQuarantineSignalled(ctx, t.AttemptID); errors.Is(err, store.ErrNotFound) {
+				continue // withdrawn by a release
+			} else if err != nil {
+				return err
+			}
+			e.quarantineSignalled[t.AttemptID] = time.Now()
+		} else if first, ok := e.quarantineSignalled[t.AttemptID]; !ok {
+			e.quarantineSignalled[t.AttemptID] = time.Now() // signalled before a restart
+		} else if time.Since(first) < killGrace {
+			continue
+		} else {
+			force = true
+		}
+		var errs []error
+		if host {
+			errs = append(errs, signalProcessTree(*t.PID, force))
+		}
+		if wsl {
+			sig := "TERM"
+			if force {
+				sig = "KILL"
+			}
+			_, err := wslSignalAttempt(ctx, e.Attributes["distro"], t.AttemptID, sig)
+			errs = append(errs, err)
+		}
+		if err := errors.Join(errs...); err != nil {
+			e.Logger.Warn("quarantine termination signal failed; retrying", "attempt_id", t.AttemptID, "force", force, "error", err)
+			continue
+		}
+		e.Logger.Info("signalled attempt for node quarantine", "attempt_id", t.AttemptID, "pid", *t.PID, "force", force)
+	}
 	return nil
+}
+
+// quarantinedTreeAlive reports whether the attempt's host process tree and,
+// on a WSL2 executor, its processes inside the distro are still running.
+func (e *Local) quarantinedTreeAlive(ctx context.Context, t store.QuarantineTermination) (host, wsl bool, err error) {
+	if t.PID == nil || t.ProcessIdentity == nil {
+		return false, false, errors.New("attempt has no recorded launcher")
+	}
+	if host, err = processTreeAlive(*t.PID, *t.ProcessIdentity); err != nil {
+		return false, false, err
+	}
+	if e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2" {
+		if wsl, err = wslSignalAttempt(ctx, e.Attributes["distro"], t.AttemptID, "0"); err != nil {
+			return false, false, err
+		}
+	}
+	return host, wsl, nil
 }
 
 func resourceBinding(resource store.ResourceInstance) string {

@@ -25,6 +25,7 @@ type Coordinator interface {
 	FinalizeQuiescence(ctx context.Context, attemptID, leaseID string, epoch int64) error
 	ReleaseReservation(ctx context.Context, leaseID string, epoch int64, reason string) error
 	ListQuarantineTerminations(ctx context.Context, executorID string) ([]store.QuarantineTermination, error)
+	MarkQuarantineSignalled(ctx context.Context, attemptID string) (string, error)
 	MarkQuarantineTerminated(ctx context.Context, attemptID string) error
 }
 
