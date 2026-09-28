@@ -93,6 +93,23 @@ registered process is absent and provider observations taken after that
 absence show resources unclaimed. An expired or executor-lost lease becomes
 stale; it is never made free based on time alone.
 
+### Node quarantine
+
+`kairo node quarantine <NODE_ID|--all> --reason ...` stops all work on a node
+(or every node) until `kairo node release <NODE_ID|--all>`:
+
+- its executors reserve nothing and trigger no priority preemption;
+- a running checkpointable attempt gets a `suspend` command (origin
+  `node_quarantine`) and later continues from its checkpoint;
+- any other running attempt is terminated by its executor, launcher and
+  descendants (Windows `taskkill /T /F`; Linux SIGTERM then SIGKILL to the
+  attempt's process group), and its task runs again from the start
+  (orchestration reason `quarantine_restart`) instead of failing.
+
+`kairo node quarantine-status` shows each quarantine with the attempts still
+alive on it; the quarantine has taken full effect once that count is zero.
+Every step is recorded as a coordination event.
+
 ## Worker SDK
 
 ```python
