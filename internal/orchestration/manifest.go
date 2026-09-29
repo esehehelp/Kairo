@@ -45,6 +45,24 @@ type Execution struct {
 	Executor       ExecutorSelector   `toml:"executor" json:"executor"`
 	Exclusive      []ExclusiveRequest `toml:"exclusive" json:"exclusive"`
 	Capacity       CapacityRequest    `toml:"capacity" json:"capacity"`
+	// Gang runs the task as Size ranks on distinct nodes (store/gang.go).
+	// Absent from the JSON when unset, so existing task digests do not change.
+	Gang *Gang `toml:"gang" json:"gang,omitempty"`
+}
+
+// Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
+// [[tasks.execution.gang.ranks]] overriding argv, cwd or executor labels of a rank.
+type Gang struct {
+	Size  int        `toml:"size" json:"size"`
+	Port  int        `toml:"port" json:"port,omitempty"`
+	Ranks []GangRank `toml:"ranks" json:"ranks,omitempty"`
+}
+
+type GangRank struct {
+	Rank     int               `toml:"rank" json:"rank"`
+	Argv     []string          `toml:"argv" json:"argv,omitempty"`
+	CWD      string            `toml:"cwd" json:"cwd,omitempty"`
+	Executor *ExecutorSelector `toml:"executor" json:"executor,omitempty"`
 }
 
 type ExecutorSelector struct {
@@ -301,6 +319,38 @@ func normalizeExecution(value *Execution) error {
 			return fmt.Errorf("disk request %d is invalid", i)
 		}
 	}
+	if value.Gang != nil {
+		return normalizeGang(value.Gang)
+	}
+	return nil
+}
+
+func normalizeGang(gang *Gang) error {
+	if gang.Size < 2 {
+		return errors.New("gang size must be at least 2")
+	}
+	if gang.Port != 0 && (gang.Port < 1024 || gang.Port > 65535) {
+		return errors.New("gang port must be 1024-65535 or 0")
+	}
+	seen := map[int]bool{}
+	for i := range gang.Ranks {
+		r := &gang.Ranks[i]
+		if r.Rank < 0 || r.Rank >= gang.Size {
+			return fmt.Errorf("gang rank override %d is outside 0..%d", r.Rank, gang.Size-1)
+		}
+		if seen[r.Rank] {
+			return fmt.Errorf("gang rank %d is overridden twice", r.Rank)
+		}
+		seen[r.Rank] = true
+		r.CWD = strings.TrimSpace(r.CWD)
+		if len(r.Argv) != 0 && strings.TrimSpace(r.Argv[0]) == "" {
+			return fmt.Errorf("gang rank %d has an empty argv", r.Rank)
+		}
+		if r.Executor != nil && r.Executor.Labels == nil {
+			r.Executor.Labels = map[string]string{}
+		}
+	}
+	sort.Slice(gang.Ranks, func(i, j int) bool { return gang.Ranks[i].Rank < gang.Ranks[j].Rank })
 	return nil
 }
 

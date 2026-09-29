@@ -89,3 +89,19 @@ func TestObserveOnlyRecordsExternalActivityWithoutAllocating(t *testing.T) {
 		t.Fatalf("observe-only mode allocated execution: executions=%+v prepares=%d", executions, p.prepareCalls)
 	}
 }
+
+func TestGangEnvTellsTheRankItsPlaceAndPinsTheInterconnect(t *testing.T) {
+	e := &Local{Attributes: map[string]string{"interconnect_ifname": "eth1"}}
+	if env := e.gangEnv(nil); env != nil {
+		t.Fatalf("non-gang env: %v", env)
+	}
+	env := e.gangEnv(&store.GangLaunch{GangID: "gng_1", Rank: 1, Size: 2, MasterAddr: "10.77.10.2", MasterPort: 29500})
+	want := map[string]bool{"RANK=1": true, "WORLD_SIZE=2": true, "MASTER_ADDR=10.77.10.2": true, "MASTER_PORT=29500": true,
+		"KAIRO_GANG_RANK=1": true, "NCCL_SOCKET_IFNAME=eth1": true, "GLOO_SOCKET_IFNAME=eth1": true}
+	for _, v := range env {
+		delete(want, v)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing %v in %v", want, env)
+	}
+}

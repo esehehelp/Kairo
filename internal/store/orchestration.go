@@ -203,6 +203,11 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
+		// A gang is read as a whole: terminal only when every rank is, and so on.
+		gang, err := gangAggregateTx(ctx, tx, &current)
+		if err != nil {
+			return err
+		}
 		if current.ExecutionState != "terminal" {
 			if err := updateTaskState(ctx, tx, task.taskScopeID, "running", nil); err != nil {
 				return err
@@ -224,11 +229,26 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		if current.AttemptState == nil || *current.AttemptState != "quiesced" || current.LeaseState == nil || *current.LeaseState != "released" {
 			continue
 		}
+		succeeded := current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "")
+		// A gang rank failed to launch after other ranks had started: the gang
+		// never ran as a whole, so run it again from the start.
+		if gang.gang && gang.launchAborted && !succeeded {
+			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "gang_launch"}
+			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "gang_restart", trigger, nil); err != nil {
+				return err
+			}
+			continue
+		}
 		// A node quarantine terminated this attempt (it could not checkpoint):
-		// run the task again from the start instead of failing it.
-		if terminated, err := quarantineTerminatedTx(ctx, tx, *current.AttemptID); err != nil {
-			return err
-		} else if terminated && !(current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "")) {
+		// run the task again from the start instead of failing it. For a gang,
+		// any rank terminated by a quarantine counts.
+		terminated := gang.quarantined
+		if !gang.gang {
+			if terminated, err = quarantineTerminatedTx(ctx, tx, *current.AttemptID); err != nil {
+				return err
+			}
+		}
+		if terminated && !succeeded {
 			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "node_quarantine"}
 			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, nil); err != nil {
 				return err
@@ -325,6 +345,19 @@ func planTaskExecution(ctx context.Context, tx *sql.Tx, task orchestrationTaskRo
 		InputContinuationRef: continuation,
 		Exclusive:            convertExclusive(template.Exclusive),
 		Capacity:             convertCapacity(template.Capacity),
+	}
+	if template.Gang != nil {
+		gang := GangSpec{Size: template.Gang.Size, Port: template.Gang.Port}
+		for _, r := range template.Gang.Ranks {
+			rank := GangRank{Rank: r.Rank, Argv: r.Argv, CWD: r.CWD}
+			if r.Executor != nil {
+				if rank.ExecutorSelector, err = json.Marshal(r.Executor); err != nil {
+					return err
+				}
+			}
+			gang.Ranks = append(gang.Ranks, rank)
+		}
+		spec.Gang = &gang
 	}
 	specBody, err := json.Marshal(spec)
 	if err != nil {

@@ -229,7 +229,7 @@ func TestOpenWidensChecksOfAnOlderDatabase(t *testing.T) {
 	}
 	for _, w := range []struct{ table, from, to string }{
 		{"commands", "origin IN('scope_pause','priority_preemption','node_quarantine')", "origin IN('scope_pause','priority_preemption')"},
-		{"orchestration_decisions", "reason IN('initial','continuation','quarantine_restart')", "reason IN('initial','continuation')"},
+		{"orchestration_decisions", "reason IN('initial','continuation','quarantine_restart','gang_restart')", "reason IN('initial','continuation')"},
 	} {
 		if err = widenCheck(db, w.table, w.from, w.to); err != nil { // same procedure, narrowing
 			t.Fatal(err)
@@ -248,6 +248,9 @@ func TestOpenWidensChecksOfAnOlderDatabase(t *testing.T) {
 		}
 		if want := map[string]string{"commands": "node_quarantine", "orchestration_decisions": "quarantine_restart"}[table]; !contains(ddl, want) {
 			t.Fatalf("%s not widened: %s", table, ddl)
+		}
+		if table == "orchestration_decisions" && !contains(ddl, "gang_restart") {
+			t.Fatalf("%s not widened for gangs: %s", table, ddl)
 		}
 	}
 	var indexes int

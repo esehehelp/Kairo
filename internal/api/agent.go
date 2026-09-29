@@ -110,6 +110,8 @@ var agentErrorCodes = []struct {
 	{"gate_closed", store.ErrGateClosed},
 	{"execution_started", store.ErrExecutionStarted},
 	{"idempotency_conflict", store.ErrIdempotencyConflict},
+	{"gang_not_ready", store.ErrGangNotReady},
+	{"gang_aborted", store.ErrGangAborted},
 }
 
 // AgentErrorForCode maps a wire code back to the store sentinel (nil if none).

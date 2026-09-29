@@ -110,6 +110,40 @@ stale; it is never made free based on time alone.
 alive on it; the quarantine has taken full effect once that count is zero.
 Every step is recorded as a coordination event.
 
+### Gang executions (multi-node)
+
+`[tasks.execution.gang]` runs a task as `size` ranks on distinct nodes (DDP
+training across hosts, a pipeline-parallel server). Every rank asks for the
+task's resources on its own node; `[[tasks.execution.gang.ranks]]` overrides
+`argv`, `cwd` or `executor` labels of single ranks:
+
+```toml
+[tasks.execution.gang]
+size = 2
+[[tasks.execution.gang.ranks]]
+rank = 1
+argv = ["/root/.local/bin/uv", "run", "train.py"]
+cwd = "/srv/project"
+executor = { labels = { environment = "linux" } }
+```
+
+- Each rank is an ordinary execution; rank 0 (the leader) is the one
+  orchestration tracks, and the task's outcome is read over every rank.
+- Placement is all or nothing: every rank gets a lease on a distinct node in
+  one transaction. Rank 0's node needs an `interconnect_addr` label.
+- No rank launches before every rank is prepared. A placement not prepared
+  within two minutes, or losing a lease before launch, is aborted and the ranks
+  wait again.
+- Every rank is launched with `RANK`, `WORLD_SIZE`, `MASTER_ADDR` (rank 0's
+  `interconnect_addr`), `MASTER_PORT` (29500-29999, free on that node) and
+  `KAIRO_GANG_*`; an executor labelled `interconnect_ifname` also sets
+  `NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME`.
+- One fate: a rank that stops other than by exit 0 or a checkpoint gets the
+  others terminated; a `suspend` to one rank (pause, preemption, quarantine)
+  is sent to every rank. A rank that failed to launch after others started
+  restarts the gang (orchestration reason `gang_restart`).
+- A waiting gang does not preempt; its running ranks can be preempted.
+
 ## Worker SDK
 
 ```python

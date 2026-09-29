@@ -79,6 +79,9 @@ func preemptionCandidatesTx(ctx context.Context, tx *sql.Tx, executorAttributes 
 			SELECT 1 FROM admission_gates g
 			WHERE g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) AND g.state!='open'
 		)
+		-- A gang needs resources on several nodes at once; it waits for them
+		-- instead of preempting on one node (its ranks can still be victims).
+		AND NOT EXISTS (SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id)
 		ORDER BY e.priority DESC,e.submitted_at,e.id`)
 	if err != nil {
 		return nil, err

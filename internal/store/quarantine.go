@@ -218,9 +218,12 @@ func (s *Store) requestQuarantineTermination(ctx context.Context, attemptID, exe
 }
 
 // ListQuarantineTerminations returns the terminations executorID still has to
-// carry out, with the attempt's launcher process.
+// carry out, with the attempt's launcher process: those of a node quarantine
+// and those of a gang one of whose ranks stopped (gang.go).
 func (s *Store) ListQuarantineTerminations(ctx context.Context, executorID string) ([]QuarantineTermination, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity FROM quarantine_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=? AND t.state='pending' ORDER BY t.requested_at`, executorID)
+	rows, err := s.db.QueryContext(ctx, `SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity,t.requested_at FROM quarantine_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=? AND t.state='pending'
+		UNION ALL SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity,t.requested_at FROM gang_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=? AND t.state='pending'
+		ORDER BY 5`, executorID, executorID)
 	if err != nil {
 		return nil, err
 	}
@@ -230,7 +233,8 @@ func (s *Store) ListQuarantineTerminations(ctx context.Context, executorID strin
 		var t QuarantineTermination
 		var pid sql.NullInt64
 		var identity sql.NullString
-		if err = rows.Scan(&t.AttemptID, &t.ExecutionID, &pid, &identity); err != nil {
+		var requested string
+		if err = rows.Scan(&t.AttemptID, &t.ExecutionID, &pid, &identity, &requested); err != nil {
 			return nil, err
 		}
 		if pid.Valid {
@@ -254,13 +258,19 @@ func (s *Store) MarkQuarantineTerminated(ctx context.Context, attemptID string) 
 		return err
 	}
 	defer tx.Rollback()
+	table, event := "quarantine_terminations", "quarantine_terminated"
 	var executionID string
-	if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM quarantine_terminations WHERE attempt_id=?`, attemptID).Scan(&executionID); errors.Is(err, sql.ErrNoRows) {
+	err = tx.QueryRowContext(ctx, `SELECT execution_id FROM quarantine_terminations WHERE attempt_id=?`, attemptID).Scan(&executionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		table, event = "gang_terminations", "gang_terminated"
+		err = tx.QueryRowContext(ctx, `SELECT execution_id FROM gang_terminations WHERE attempt_id=?`, attemptID).Scan(&executionID)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE quarantine_terminations SET state='terminated',terminated_at=? WHERE attempt_id=? AND state='pending'`, now(), attemptID)
+	res, err := tx.ExecContext(ctx, `UPDATE `+table+` SET state='terminated',terminated_at=? WHERE attempt_id=? AND state='pending'`, now(), attemptID)
 	if err != nil {
 		return err
 	}
@@ -269,7 +279,7 @@ func (s *Store) MarkQuarantineTerminated(ctx context.Context, attemptID string) 
 		if err != nil {
 			return err
 		}
-		if err = appendCoordinationEventTx(ctx, tx, "quarantine_terminated", &projectID, "attempt", attemptID, nil, map[string]any{"execution_id": executionID}); err != nil {
+		if err = appendCoordinationEventTx(ctx, tx, event, &projectID, "attempt", attemptID, nil, map[string]any{"execution_id": executionID}); err != nil {
 			return err
 		}
 	}

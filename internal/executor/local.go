@@ -35,6 +35,14 @@ type Local struct {
 
 	mu      sync.Mutex
 	running map[string]*exec.Cmd
+
+	// Prepared gang ranks waiting at the launch barrier, by lease ID.
+	pendingGang map[string]pendingGangRank
+}
+
+type pendingGangRank struct {
+	reservation *store.Reservation
+	prepared    []store.ResourceInstance
 }
 
 func NewLocal(id string, st Coordinator, logDir string, logger *slog.Logger) *Local {
@@ -91,6 +99,9 @@ func (e *Local) tick(ctx context.Context) error {
 		return err
 	}
 	if err := e.carryOutQuarantineTerminations(ctx); err != nil {
+		return err
+	}
+	if err := e.retryPendingGangRanks(ctx); err != nil {
 		return err
 	}
 	for {
@@ -154,19 +165,87 @@ func (e *Local) tick(ctx context.Context) error {
 			return nil
 		}
 		launch, err := e.Store.AuthorizeLaunch(ctx, reservation)
+		if errors.Is(err, store.ErrGangNotReady) {
+			// Hold the prepared rank at the barrier until every rank is prepared.
+			e.holdGangRank(reservation, prepared)
+			continue
+		}
 		if err != nil {
 			if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, err.Error()); cleanupErr != nil {
 				return fmt.Errorf("authorize launch: %v; cleanup: %w", err, cleanupErr)
 			}
 			return nil
 		}
-		if err = e.start(launch); err != nil {
-			e.Logger.Error("attempt launch failed", "attempt_id", launch.Attempt.ID, "error", err)
-			if cleanupErr := e.cleanupReservation(context.Background(), launch.Lease, launch.Resources, "launch failed before activation: "+err.Error()); cleanupErr != nil {
-				return cleanupErr
-			}
+		e.launchAuthorized(launch)
+	}
+}
+
+func (e *Local) launchAuthorized(launch *store.Launch) {
+	if err := e.start(launch); err != nil {
+		e.Logger.Error("attempt launch failed", "attempt_id", launch.Attempt.ID, "error", err)
+		if cleanupErr := e.cleanupReservation(context.Background(), launch.Lease, launch.Resources, "launch failed before activation: "+err.Error()); cleanupErr != nil {
+			e.Logger.Error("reservation cleanup failed", "lease_id", launch.Lease.ID, "error", cleanupErr)
 		}
 	}
+}
+
+func (e *Local) holdGangRank(reservation *store.Reservation, prepared []store.ResourceInstance) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pendingGang == nil {
+		e.pendingGang = map[string]pendingGangRank{}
+	}
+	e.pendingGang[reservation.Lease.ID] = pendingGangRank{reservation: reservation, prepared: prepared}
+	e.Logger.Info("gang rank prepared; waiting for the other ranks", "lease_id", reservation.Lease.ID, "gang", reservation.Gang)
+}
+
+// retryPendingGangRanks asks again for the launch of every gang rank held at
+// the barrier: it launches once all ranks are prepared, and is cleaned up and
+// released when the placement was aborted (or any other refusal).
+func (e *Local) retryPendingGangRanks(ctx context.Context) error {
+	e.mu.Lock()
+	pending := make([]pendingGangRank, 0, len(e.pendingGang))
+	for _, p := range e.pendingGang {
+		pending = append(pending, p)
+	}
+	e.mu.Unlock()
+	for _, p := range pending {
+		launch, err := e.Store.AuthorizeLaunch(ctx, p.reservation)
+		if errors.Is(err, store.ErrGangNotReady) {
+			continue
+		}
+		e.mu.Lock()
+		delete(e.pendingGang, p.reservation.Lease.ID)
+		e.mu.Unlock()
+		if err != nil {
+			e.Logger.Warn("gang rank not launched", "lease_id", p.reservation.Lease.ID, "error", err)
+			if cleanupErr := e.cleanupReservation(context.Background(), p.reservation.Lease, p.prepared, err.Error()); cleanupErr != nil {
+				return fmt.Errorf("gang rank cleanup: %w", cleanupErr)
+			}
+			continue
+		}
+		e.launchAuthorized(launch)
+	}
+	return nil
+}
+
+// gangEnv tells a gang rank where it stands: Kairo's names and the ones
+// torch.distributed reads; the interconnect interface (this executor's or
+// node's "interconnect_ifname" label) pins NCCL / gloo to the direct link.
+func (e *Local) gangEnv(gang *store.GangLaunch) []string {
+	if gang == nil {
+		return nil
+	}
+	env := []string{
+		"KAIRO_GANG_ID=" + gang.GangID, fmt.Sprintf("KAIRO_GANG_RANK=%d", gang.Rank), fmt.Sprintf("KAIRO_GANG_SIZE=%d", gang.Size),
+		"KAIRO_GANG_MASTER_ADDR=" + gang.MasterAddr, fmt.Sprintf("KAIRO_GANG_MASTER_PORT=%d", gang.MasterPort),
+		fmt.Sprintf("RANK=%d", gang.Rank), fmt.Sprintf("WORLD_SIZE=%d", gang.Size), "LOCAL_RANK=0", "LOCAL_WORLD_SIZE=1",
+		"MASTER_ADDR=" + gang.MasterAddr, fmt.Sprintf("MASTER_PORT=%d", gang.MasterPort),
+	}
+	if ifname := e.Attributes["interconnect_ifname"]; ifname != "" {
+		env = append(env, "NCCL_SOCKET_IFNAME="+ifname, "GLOO_SOCKET_IFNAME="+ifname)
+	}
+	return env
 }
 
 // cleanupReservation returns provider-side preparation before releasing the
@@ -328,6 +407,7 @@ func (e *Local) start(launch *store.Launch) error {
 	if launch.InputContinuationRef != nil {
 		launchEnv = append(launchEnv, "KAIRO_CONTINUATION_REF="+*launch.InputContinuationRef)
 	}
+	launchEnv = append(launchEnv, e.gangEnv(launch.Gang)...)
 	if len(bindings) > 0 {
 		launchEnv = append(launchEnv, "CUDA_VISIBLE_DEVICES="+strings.Join(bindings, ","))
 	}

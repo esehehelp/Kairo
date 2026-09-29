@@ -67,6 +67,39 @@ type ExecutionSpec struct {
 	InputContinuationRef *string            `json:"input_continuation_ref,omitempty"`
 	Exclusive            []ExclusiveRequest `json:"exclusive"`
 	Capacity             CapacityRequest    `json:"capacity"`
+	// Gang runs the execution as Size processes, one per node, started together
+	// (see gang.go). The submitted execution is rank 0 (the leader); ranks
+	// 1..Size-1 are member executions created with it.
+	Gang *GangSpec `json:"gang,omitempty"`
+}
+
+// GangSpec describes a multi-node execution. Every rank asks for the same
+// resources on its own node; Ranks overrides argv, cwd or the executor selector
+// of single ranks (a Windows/WSL rank and a Linux rank need different paths).
+type GangSpec struct {
+	Size int `json:"size"`
+	// Port is the rendezvous port on rank 0's interconnect address; 0 picks a
+	// free one in 29500-29999 on that node at placement.
+	Port  int        `json:"port,omitempty"`
+	Ranks []GangRank `json:"ranks,omitempty"`
+}
+
+type GangRank struct {
+	Rank             int             `json:"rank"`
+	Argv             []string        `json:"argv,omitempty"`
+	CWD              string          `json:"cwd,omitempty"`
+	ExecutorSelector json.RawMessage `json:"executor_selector,omitempty"`
+}
+
+// GangLaunch is what one rank of a placed gang is told at launch: its rank and
+// where rank 0 listens. It is read from the placement, never from the caller.
+type GangLaunch struct {
+	GangID      string `json:"gang_id"`
+	PlacementID string `json:"placement_id"`
+	Rank        int    `json:"rank"`
+	Size        int    `json:"size"`
+	MasterAddr  string `json:"master_addr"`
+	MasterPort  int    `json:"master_port"`
 }
 
 type ExecutionRequest struct {

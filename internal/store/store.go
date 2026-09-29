@@ -22,6 +22,9 @@ var orchestrationSchema string
 //go:embed quarantine_schema.sql
 var quarantineSchema string
 
+//go:embed gang_schema.sql
+var gangSchema string
+
 var (
 	ErrNotFound              = errors.New("not found")
 	ErrIdempotencyConflict   = errors.New("idempotency key was already used for different content")
@@ -30,6 +33,12 @@ var (
 	ErrStaleEpoch            = errors.New("stale coordination epoch")
 	ErrOrchestrationConflict = errors.New("logical task was already declared with different immutable content")
 	ErrLegacySchema          = errors.New("legacy Kairo database detected; archive it and create a fresh V3 coordination database")
+	// ErrGangNotReady: a gang rank is prepared but not every rank is yet; the
+	// executor keeps its prepared reservation and asks again.
+	ErrGangNotReady = errors.New("gang placement is not prepared on every rank yet")
+	// ErrGangAborted: the gang placement was given up; the executor must clean
+	// up and release its reservation.
+	ErrGangAborted = errors.New("gang placement was aborted")
 )
 
 type Store struct {
@@ -121,6 +130,15 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply quarantine schema: %w", err)
 	}
+	// Gangs add an orchestration reason: a gang stopped because one rank stopped.
+	if err := widenCheck(db, "orchestration_decisions", "reason IN('initial','continuation','quarantine_restart')", "reason IN('initial','continuation','quarantine_restart','gang_restart')"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(gangSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply gang schema: %w", err)
+	}
 	return &Store{db: db}, nil
 }
 
@@ -136,6 +154,21 @@ func widenCheck(db *sql.DB, table, oldList, newList string) error {
 		return err
 	}
 	if strings.Contains(ddl, newList) {
+		return nil
+	}
+	// A later widening of the same list has already added these values.
+	quoted := regexp.MustCompile(`'[^']*'`)
+	added := 0
+	for _, value := range quoted.FindAllString(newList, -1) {
+		if !strings.Contains(oldList, value) {
+			added++
+			if !strings.Contains(ddl, value) {
+				added = -1
+				break
+			}
+		}
+	}
+	if added > 0 {
 		return nil
 	}
 	if !strings.Contains(ddl, oldList) {

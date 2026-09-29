@@ -25,6 +25,9 @@ type Reservation struct {
 	CWD             string             `json:"cwd"`
 	Resources       []ResourceInstance `json:"resources"`
 	GateGenerations map[string]int64   `json:"gate_generations"`
+	// Gang is set for one rank of a placed gang (informational: AuthorizeLaunch
+	// reads the placement from the store).
+	Gang *GangLaunch `json:"gang,omitempty"`
 }
 
 // Launch is a single-use authorization. It contains coordination facts only;
@@ -39,6 +42,7 @@ type Launch struct {
 	CWD                  string             `json:"cwd"`
 	Resources            []ResourceInstance `json:"resources"`
 	InputContinuationRef *string            `json:"input_continuation_ref,omitempty"`
+	Gang                 *GangLaunch        `json:"gang,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -69,6 +73,10 @@ type executionCandidate struct {
 // chain is currently open. Priority orders coordination admission; it does not
 // imply retry or workflow semantics.
 func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservation, error) {
+	// A gang rank already placed on this executor is handed over first.
+	if reservation, err := s.deliverGangLease(ctx, executorID); reservation != nil || err != nil {
+		return reservation, err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -97,6 +105,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 			SELECT 1 FROM admission_gates g
 			WHERE g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) AND g.state!='open'
 		)
+		AND NOT EXISTS (SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id AND gm.rank>0)
 		ORDER BY e.priority DESC,e.submitted_at,e.id`)
 	if err != nil {
 		return nil, err
@@ -108,13 +117,34 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 			rows.Close()
 			return nil, err
 		}
-		if selectorMatches(c.selectorJSON, executorAttributes) {
-			candidates = append(candidates, c)
-		}
+		candidates = append(candidates, c)
 	}
 	if err = rows.Close(); err != nil {
 		return nil, err
 	}
+	// A gang leader stands for its whole gang: it is a candidate here when any
+	// of its ranks may run on this executor.
+	gangs := map[string]string{}
+	matching := candidates[:0]
+	for _, c := range candidates {
+		gangID, _, _, gangErr := gangOfExecutionTx(ctx, tx, c.execution.ID)
+		if gangErr != nil {
+			return nil, gangErr
+		}
+		match := false
+		if gangID != "" {
+			gangs[c.execution.ID] = gangID
+			if match, err = gangMatchesExecutor(ctx, tx, gangID, executorAttributes); err != nil {
+				return nil, err
+			}
+		} else {
+			match = selectorMatches(c.selectorJSON, executorAttributes)
+		}
+		if match {
+			matching = append(matching, c)
+		}
+	}
+	candidates = matching
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -125,6 +155,20 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	for _, candidate := range candidates {
 		if candidate.execution.Priority != highest {
 			break
+		}
+		if gangID := gangs[candidate.execution.ID]; gangID != "" {
+			placed, placeErr := placeGangTx(ctx, tx, gangID, executorID)
+			if placeErr != nil {
+				return nil, placeErr
+			}
+			if !placed {
+				continue
+			}
+			if err = tx.Commit(); err != nil {
+				return nil, err
+			}
+			// This executor's rank (if it got one) is handed over like any other.
+			return s.deliverGangLease(ctx, executorID)
 		}
 		reservation, terminalized, reserveErr := reserveExecutionTx(ctx, tx, executorID, nodeID, candidate)
 		if reserveErr != nil {
@@ -663,6 +707,11 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err = validateLeaseGatesTx(ctx, tx, reservation.Lease.ID); err != nil {
 		return nil, err
 	}
+	// Launch barrier: a gang rank launches only once every rank is prepared.
+	gang, err := gangLaunchGateTx(ctx, tx, reservation.Lease.ID)
+	if err != nil {
+		return nil, err
+	}
 	attemptID, stamp := id.New("att"), now()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at) VALUES(?,?,'authorized',?,?,?)`, attemptID, executionID, executorID, leaseEpoch, stamp); err != nil {
 		return nil, err
@@ -704,6 +753,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		CWD:                  reservation.CWD,
 		Resources:            append([]ResourceInstance(nil), reservation.Resources...),
 		InputContinuationRef: reservation.Execution.InputContinuationRef,
+		Gang:                 gang,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp

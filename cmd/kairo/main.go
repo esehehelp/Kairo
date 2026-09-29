@@ -166,6 +166,10 @@ func serve(args []string) error {
 				if err := st.ReconcileNodeQuarantines(ctx); err != nil && ctx.Err() == nil {
 					logger.Error("node quarantine reconciliation failed", "error", err)
 				}
+				// Gangs: abort placements not prepared in time, keep launched ranks to one fate.
+				if err := st.ReconcileGangs(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("gang reconciliation failed", "error", err)
+				}
 				select {
 				case <-ctx.Done():
 					return
