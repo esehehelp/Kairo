@@ -86,7 +86,72 @@ func queueCommand(args []string) error {
 }
 
 func taskCommand(args []string) error {
+	if len(args) == 0 {
+		return errors.New("usage: kairo task <pause|resume|cancel>")
+	}
+	if args[0] == "cancel" {
+		return taskCancel(args[1:])
+	}
 	return scopeCommand("task", args)
+}
+
+// taskCancel ends a paused (or never started) Task: it withdraws every execution
+// of the Task that has not started, every gang rank included. Once all of its
+// current executions are terminal before an attempt, the orchestrator marks the
+// Task failed ("execution terminal before attempt"), so it no longer shows as
+// running and `project prune` drops it. Checkpoints and other outputs are left
+// alone. It refuses while an execution is started and not terminal: pause the
+// Task first.
+func taskCancel(args []string) error {
+	fs := flag.NewFlagSet("task cancel", flag.ContinueOnError)
+	api := apiFlag(fs)
+	dryRun := fs.Bool("dry-run", false, "list the executions that would be withdrawn")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 3 {
+		return errors.New("task cancel requires PROJECT QUEUE TASK")
+	}
+	query := url.Values{"project": {fs.Arg(0)}, "queue": {fs.Arg(1)}, "task": {fs.Arg(2)}, "limit": {"1000"}}
+	payload, err := requestBytes(*api, http.MethodGet, withQuery("/v2/executions", query), nil)
+	if err != nil {
+		return err
+	}
+	var listed struct {
+		Executions []struct {
+			ID        string  `json:"id"`
+			State     string  `json:"state"`
+			StartedAt *string `json:"started_at"`
+		} `json:"executions"`
+	}
+	if err := json.Unmarshal(payload, &listed); err != nil {
+		return err
+	}
+	var todo []string
+	for _, e := range listed.Executions {
+		if e.State == "terminal" {
+			continue
+		}
+		if e.StartedAt != nil || e.State == "started" {
+			return fmt.Errorf("execution %s of %s/%s/%s is running (%s); pause the task first", e.ID, fs.Arg(0), fs.Arg(1), fs.Arg(2), e.State)
+		}
+		todo = append(todo, e.ID)
+	}
+	if len(todo) == 0 {
+		fmt.Println("nothing to withdraw")
+		return nil
+	}
+	for _, id := range todo {
+		if *dryRun {
+			fmt.Println("would withdraw", id)
+			continue
+		}
+		if _, err := requestBytes(*api, http.MethodPost, "/v2/executions/"+url.PathEscape(id)+"/withdraw", nil); err != nil {
+			return fmt.Errorf("withdraw %s: %w", id, err)
+		}
+		fmt.Println("withdrawn", id)
+	}
+	return nil
 }
 
 func scopeCommand(kind string, args []string) error {

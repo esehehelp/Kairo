@@ -135,3 +135,65 @@ preemptible = false
 		t.Fatalf("request=%s %s", gotMethod, gotPath)
 	}
 }
+
+func TestTaskCancelWithdrawsEveryExecutionNotStarted(t *testing.T) {
+	var mu sync.Mutex
+	var posts []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.Path == "/v2/executions":
+			if r.URL.Query().Get("task") != "t" || r.URL.Query().Get("queue") != "q" {
+				http.Error(w, "bad filter", http.StatusBadRequest)
+				return
+			}
+			started := "2026-01-01T00:00:00Z"
+			_ = json.NewEncoder(w).Encode(map[string]any{"executions": []map[string]any{
+				{"id": "exe_done", "state": "terminal", "started_at": started},
+				{"id": "exe_rank0", "state": "waiting"},
+				{"id": "exe_rank1", "state": "waiting"},
+			}})
+		case r.Method == http.MethodPost:
+			mu.Lock()
+			posts = append(posts, r.URL.Path)
+			mu.Unlock()
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	if err := taskCommand([]string{"cancel", "--api", server.URL, "p", "q", "t"}); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := []string{"/v2/executions/exe_rank0/withdraw", "/v2/executions/exe_rank1/withdraw"}
+	if len(posts) != len(want) || posts[0] != want[0] || posts[1] != want[1] {
+		t.Fatalf("withdraw posts = %v, want %v", posts, want)
+	}
+}
+
+func TestTaskCancelRefusesARunningExecution(t *testing.T) {
+	posted := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method == http.MethodPost {
+			posted = true
+		}
+		started := "2026-01-01T00:00:00Z"
+		_ = json.NewEncoder(w).Encode(map[string]any{"executions": []map[string]any{
+			{"id": "exe_waiting", "state": "waiting"},
+			{"id": "exe_live", "state": "started", "started_at": started},
+		}})
+	}))
+	defer server.Close()
+
+	if err := taskCommand([]string{"cancel", "--api", server.URL, "p", "q", "t"}); err == nil {
+		t.Fatal("task cancel withdrew around a running execution")
+	}
+	if posted {
+		t.Fatal("task cancel posted a withdraw while an execution was running")
+	}
+}
