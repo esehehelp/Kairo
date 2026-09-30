@@ -75,6 +75,9 @@ func projectCommand(args []string) error {
 	if len(args) > 0 && (args[0] == "validate" || args[0] == "apply" || args[0] == "status") {
 		return projectOrchestrationCommand(args)
 	}
+	if len(args) > 0 && args[0] == "prune" {
+		return projectPrune(args[1:])
+	}
 	return scopeCommand("project", args)
 }
 
