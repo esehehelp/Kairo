@@ -160,6 +160,8 @@ copy it to `<config dir>/kairo/ca.pem` (or point `KAIRO_CA_FILE` at it) for the
 CLI and controllers, set `ca_file` for a node agent, and start Node-based
 tools with `NODE_EXTRA_CA_CERTS=ca.pem`. Attempts receive the CA itself in
 `KAIRO_API_CA` (base64 DER), so native, WSL and remote attempts need no path.
+The certificates carry no revocation endpoint, so Windows `curl.exe`
+(Schannel) needs `--ssl-no-revoke` with `--cacert ca.pem`.
 
 Node agent configuration:
 
