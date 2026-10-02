@@ -39,13 +39,36 @@ func (s *Store) UpsertExecutor(ctx context.Context, e Executor) error {
 	if e.Enabled {
 		enabled = 1
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO executors(id,node_id,kind,attributes_json,enabled,last_seen_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET node_id=excluded.node_id,kind=excluded.kind,attributes_json=excluded.attributes_json,enabled=excluded.enabled,last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at`, e.ID, e.NodeID, e.Kind, validJSON(e.Attributes), enabled, e.LastSeenAt, t, t)
-	return err
+	// An executor never moves to another node: a node agent cannot take over
+	// another node's executor (and with it, that node's attempts).
+	result, err := s.db.ExecContext(ctx, `INSERT INTO executors(id,node_id,kind,attributes_json,enabled,last_seen_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,attributes_json=excluded.attributes_json,enabled=excluded.enabled,last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at WHERE executors.node_id=excluded.node_id`, e.ID, e.NodeID, e.Kind, validJSON(e.Attributes), enabled, e.LastSeenAt, t, t)
+	return ownedUpsert(result, err, "executor", e.ID)
 }
 func (s *Store) UpsertProvider(ctx context.Context, providerID, nodeID, kind string, config json.RawMessage) error {
 	t := now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO resource_providers(id,node_id,kind,config_json,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET node_id=excluded.node_id,kind=excluded.kind,config_json=excluded.config_json,updated_at=excluded.updated_at`, providerID, nodeID, kind, validJSON(config), t, t)
-	return err
+	result, err := s.db.ExecContext(ctx, `INSERT INTO resource_providers(id,node_id,kind,config_json,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,config_json=excluded.config_json,updated_at=excluded.updated_at WHERE resource_providers.node_id=excluded.node_id`, providerID, nodeID, kind, validJSON(config), t, t)
+	return ownedUpsert(result, err, "provider", providerID)
+}
+
+// upsertResourceTx inserts or refreshes a resource; a resource never moves to
+// another node or provider.
+func upsertResourceTx(ctx context.Context, q interface {
+	ExecContext(context.Context, string, ...any) (sql.Result, error)
+}, r ResourceInstance, t string) error {
+	result, err := q.ExecContext(ctx, `INSERT INTO resource_instances(id,node_id,provider_id,kind,stable_identity,binding_json,attributes_json,admin_state,quarantine_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,stable_identity=excluded.stable_identity,binding_json=excluded.binding_json,attributes_json=excluded.attributes_json,updated_at=excluded.updated_at WHERE resource_instances.node_id=excluded.node_id AND resource_instances.provider_id=excluded.provider_id`, r.ID, r.NodeID, r.ProviderID, r.Kind, r.StableIdentity, validJSON(r.Binding), validJSON(r.Attributes), r.AdminState, r.QuarantineReason, t, t)
+	return ownedUpsert(result, err, "resource", r.ID)
+}
+
+// ownedUpsert turns an upsert whose ownership guard matched nothing into
+// ErrOwnershipConflict.
+func ownedUpsert(result sql.Result, err error, kind, key string) error {
+	if err != nil {
+		return err
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: %s %s", ErrOwnershipConflict, kind, key)
+	}
+	return nil
 }
 func (s *Store) UpsertResourceInstance(ctx context.Context, r ResourceInstance) error {
 	if r.ID == "" || r.NodeID == "" || r.ProviderID == "" || r.Kind == "" || r.StableIdentity == "" {
@@ -54,9 +77,7 @@ func (s *Store) UpsertResourceInstance(ctx context.Context, r ResourceInstance) 
 	if r.AdminState == "" {
 		r.AdminState = "enabled"
 	}
-	t := now()
-	_, err := s.db.ExecContext(ctx, `INSERT INTO resource_instances(id,node_id,provider_id,kind,stable_identity,binding_json,attributes_json,admin_state,quarantine_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET node_id=excluded.node_id,provider_id=excluded.provider_id,kind=excluded.kind,stable_identity=excluded.stable_identity,binding_json=excluded.binding_json,attributes_json=excluded.attributes_json,updated_at=excluded.updated_at`, r.ID, r.NodeID, r.ProviderID, r.Kind, r.StableIdentity, validJSON(r.Binding), validJSON(r.Attributes), r.AdminState, r.QuarantineReason, t, t)
-	return err
+	return upsertResourceTx(ctx, s.db, r, now())
 }
 func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 	if o.ResourceID == "" || o.ObservedAt == "" || o.ValidUntil == "" {
@@ -68,12 +89,37 @@ func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 
 // ApplyObservationBatch persists one provider poll and only clears a known
 // claim when the same fresh poll observed that resource without that claim.
+// A provider only reports resources of its own node, and observations and
+// claims only for its own resources.
 func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, resources []ResourceInstance, observations []Observation, claims []ExternalClaim) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	var providerNode string
+	if err = tx.QueryRowContext(ctx, `SELECT node_id FROM resource_providers WHERE id=?`, providerID).Scan(&providerNode); errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: provider %s", ErrNotFound, providerID)
+	} else if err != nil {
+		return err
+	}
+	owned := map[string]bool{}
+	ownedByProvider := func(resourceID string) error {
+		if owned[resourceID] {
+			return nil
+		}
+		var provider string
+		if err := tx.QueryRowContext(ctx, `SELECT provider_id FROM resource_instances WHERE id=?`, resourceID).Scan(&provider); errors.Is(err, sql.ErrNoRows) {
+			return fmt.Errorf("%w: resource %s", ErrNotFound, resourceID)
+		} else if err != nil {
+			return err
+		}
+		if provider != providerID {
+			return fmt.Errorf("%w: resource %s belongs to provider %s", ErrOwnershipConflict, resourceID, provider)
+		}
+		owned[resourceID] = true
+		return nil
+	}
 	t := now()
 	for _, resource := range resources {
 		if resource.ID == "" || resource.NodeID == "" || resource.ProviderID == "" || resource.Kind == "" || resource.StableIdentity == "" {
@@ -82,17 +128,23 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		if resource.ProviderID != providerID {
 			return fmt.Errorf("resource %s belongs to provider %s, not observation provider %s", resource.ID, resource.ProviderID, providerID)
 		}
+		if resource.NodeID != providerNode {
+			return fmt.Errorf("%w: resource %s reported for node %s by a provider of node %s", ErrOwnershipConflict, resource.ID, resource.NodeID, providerNode)
+		}
 		if resource.AdminState == "" {
 			resource.AdminState = "enabled"
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO resource_instances(id,node_id,provider_id,kind,stable_identity,binding_json,attributes_json,admin_state,quarantine_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET node_id=excluded.node_id,provider_id=excluded.provider_id,kind=excluded.kind,stable_identity=excluded.stable_identity,binding_json=excluded.binding_json,attributes_json=excluded.attributes_json,updated_at=excluded.updated_at`, resource.ID, resource.NodeID, resource.ProviderID, resource.Kind, resource.StableIdentity, validJSON(resource.Binding), validJSON(resource.Attributes), resource.AdminState, resource.QuarantineReason, t, t)
-		if err != nil {
+		if err = upsertResourceTx(ctx, tx, resource, t); err != nil {
 			return err
 		}
+		owned[resource.ID] = true
 	}
 	for _, observation := range observations {
 		if observation.ResourceID == "" || observation.ObservedAt == "" || observation.ValidUntil == "" {
 			return errors.New("resource_id, observed_at, and valid_until are required")
+		}
+		if err = ownedByProvider(observation.ResourceID); err != nil {
+			return err
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES(?,?,?,?,?,?,?,?)`, observation.ResourceID, observation.ObservedAt, observation.ValidUntil, observation.TotalBytes, observation.FreeBytes, observation.Utilization, observation.TemperatureC, validJSON(observation.Evidence))
 		if err != nil {
@@ -106,6 +158,9 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		}
 		if claim.ResourceID == "" || claim.ClaimKind == "" {
 			return errors.New("claim resource and kind are required")
+		}
+		if err = ownedByProvider(claim.ResourceID); err != nil {
+			return err
 		}
 		if claim.ClaimKind == "external_process" && claim.ProcessIdentity != nil {
 			var registered int

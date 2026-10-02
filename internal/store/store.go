@@ -28,6 +28,9 @@ var gangSchema string
 //go:embed force_stop_schema.sql
 var forceStopSchema string
 
+//go:embed auth_schema.sql
+var authSchema string
+
 var (
 	ErrNotFound              = errors.New("not found")
 	ErrIdempotencyConflict   = errors.New("idempotency key was already used for different content")
@@ -150,6 +153,10 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(forceStopSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply force stop schema: %w", err)
+	}
+	if _, err := db.Exec(authSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply auth schema: %w", err)
 	}
 	return &Store{db: db}, nil
 }

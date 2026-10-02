@@ -33,11 +33,14 @@ type Reservation struct {
 // Launch is a single-use authorization. It contains coordination facts only;
 // it does not describe success, retry, or any project workflow transition.
 type Launch struct {
-	Execution            ExecutionRequest   `json:"execution"`
-	Attempt              Attempt            `json:"attempt"`
-	Lease                Lease              `json:"lease"`
-	AuthorizationID      string             `json:"authorization_id"`
-	AuthorizationToken   string             `json:"authorization_token"`
+	Execution          ExecutionRequest `json:"execution"`
+	Attempt            Attempt          `json:"attempt"`
+	Lease              Lease            `json:"lease"`
+	AuthorizationID    string           `json:"authorization_id"`
+	AuthorizationToken string           `json:"authorization_token"`
+	// WorkerToken is the credential handed to the attempt's processes
+	// (KAIRO_ATTEMPT_TOKEN); only its hash is stored.
+	WorkerToken          string             `json:"worker_token"`
 	Argv                 []string           `json:"argv"`
 	CWD                  string             `json:"cwd"`
 	Resources            []ResourceInstance `json:"resources"`
@@ -719,12 +722,19 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if _, err = tx.ExecContext(ctx, `UPDATE leases SET attempt_id=? WHERE id=? AND attempt_id IS NULL`, attemptID, reservation.Lease.ID); err != nil {
 		return nil, err
 	}
-	token, tokenHash, err := newLaunchToken()
+	token, tokenHash, err := newSecret("")
 	if err != nil {
 		return nil, err
 	}
 	authorizationID := id.New("auth")
 	if _, err = tx.ExecContext(ctx, `INSERT INTO launch_authorizations(id,lease_id,attempt_id,coordination_epoch,token_hash,state,issued_at) VALUES(?,?,?,?,?,'issued',?)`, authorizationID, reservation.Lease.ID, attemptID, leaseEpoch, tokenHash, stamp); err != nil {
+		return nil, err
+	}
+	workerToken, workerTokenHash, err := newSecret("kairo_worker_")
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO attempt_tokens(attempt_id,lease_id,coordination_epoch,token_hash,issued_at) VALUES(?,?,?,?,?)`, attemptID, reservation.Lease.ID, leaseEpoch, workerTokenHash, stamp); err != nil {
 		return nil, err
 	}
 	result, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='authorized',authorized_at=? WHERE id=? AND state='waiting'`, stamp, executionID)
@@ -749,6 +759,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		Lease:                reservation.Lease,
 		AuthorizationID:      authorizationID,
 		AuthorizationToken:   token,
+		WorkerToken:          workerToken,
 		Argv:                 append([]string(nil), reservation.Argv...),
 		CWD:                  reservation.CWD,
 		Resources:            append([]ResourceInstance(nil), reservation.Resources...),
@@ -823,12 +834,14 @@ func (s *Store) ActivateLaunch(ctx context.Context, attemptID, leaseID string, e
 	return tx.Commit()
 }
 
-func newLaunchToken() (string, string, error) {
+// newSecret returns prefix followed by 32 random bytes (base64url), and the
+// hash under which it is stored.
+func newSecret(prefix string) (string, string, error) {
 	value := make([]byte, 32)
 	if _, err := rand.Read(value); err != nil {
 		return "", "", err
 	}
-	token := base64.RawURLEncoding.EncodeToString(value)
+	token := prefix + base64.RawURLEncoding.EncodeToString(value)
 	return token, hashToken(token), nil
 }
 
