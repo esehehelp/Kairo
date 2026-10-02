@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -22,6 +23,7 @@ import (
 	"kairo/internal/executor"
 	"kairo/internal/provider"
 	"kairo/internal/store"
+	"kairo/internal/tlsutil"
 )
 
 func main() {
@@ -136,10 +138,32 @@ func serve(args []string) error {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
+	// With TLS the daemon's CA goes to every attempt (KAIRO_API_CA) so its
+	// processes can verify the daemon they report to.
+	apiCA := ""
+	if daemonConfig.TLS() {
+		cert, err := tls.LoadX509KeyPair(daemonConfig.TLSCertFile, daemonConfig.TLSKeyFile)
+		if err != nil {
+			return fmt.Errorf("load TLS certificate: %w", err)
+		}
+		server.TLSConfig = tlsutil.ServerConfig()
+		server.TLSConfig.Certificates = []tls.Certificate{cert}
+		caPEM, err := os.ReadFile(daemonConfig.TLSCAFile)
+		if err != nil {
+			return fmt.Errorf("read TLS CA: %w", err)
+		}
+		if apiCA, err = tlsutil.CAEnv(caPEM); err != nil {
+			return fmt.Errorf("TLS CA %s: %w", daemonConfig.TLSCAFile, err)
+		}
+	}
 	errCh := make(chan error, 1+len(daemonConfig.Executors))
 	go func() {
-		logger.Info("control plane listening", "address", daemonConfig.Listen, "database", daemonConfig.DatabasePath)
-		if err := server.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+		logger.Info("control plane listening", "address", daemonConfig.Listen, "tls", daemonConfig.TLS(), "database", daemonConfig.DatabasePath)
+		serve := server.ListenAndServe
+		if daemonConfig.TLS() {
+			serve = func() error { return server.ListenAndServeTLS("", "") }
+		}
+		if err := serve(); !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
@@ -207,6 +231,7 @@ func serve(args []string) error {
 		configured := configured
 		exec := executor.NewLocal(configured.ID, st, daemonConfig.LogDirectory, logger)
 		exec.APIURL = strings.TrimRight(daemonConfig.AdvertiseURL, "/")
+		exec.APICA = apiCA
 		exec.NodeID = daemonConfig.Node.ID
 		exec.Kind = configured.Kind
 		exec.Attributes = configured.Labels

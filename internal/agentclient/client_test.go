@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -20,13 +21,58 @@ import (
 	"kairo/internal/tlsutil"
 )
 
-// TestHelperProcess is the attempt launched by the end-to-end test.
+// TestHelperProcess is the attempt launched by the end-to-end test: it
+// reports progress with the attempt token it was launched with, verifying the
+// daemon with the CA it was handed. (Its switch is not a KAIRO_ variable: the
+// executor keeps the parent's KAIRO_* variables from attempts.)
 func TestHelperProcess(t *testing.T) {
-	if os.Getenv("KAIRO_AGENT_HELPER") != "1" {
+	if os.Getenv("AGENTCLIENT_TEST_HELPER") != "1" {
 		return
 	}
 	fmt.Fprintln(os.Stderr, "hello from remote attempt")
+	caPEM, err := tlsutil.CAFromEnv(os.Getenv("KAIRO_API_CA"))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "KAIRO_API_CA:", err)
+		os.Exit(3)
+	}
+	tlsConfig, _ := tlsutil.ClientConfig(caPEM)
+	client := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}}
+	req, _ := http.NewRequest(http.MethodPost, os.Getenv("KAIRO_API_URL")+"/api/worker/heartbeat", strings.NewReader(`{"progress":{"unit":"step","current":7}}`))
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("KAIRO_ATTEMPT_TOKEN"))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil || resp.StatusCode != http.StatusAccepted {
+		fmt.Fprintln(os.Stderr, "heartbeat:", resp, err)
+		os.Exit(4)
+	}
 	os.Exit(0)
+}
+
+// tlsDaemon serves the API over TLS with a fresh CA; it returns the server
+// and the CA certificate.
+func tlsDaemon(t *testing.T, st *store.Store, logDir string) (*httptest.Server, []byte) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := tlsutil.InitCA(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := tlsutil.IssueServer(dir, []string{"127.0.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.LoadX509KeyPair(filepath.Join(dir, tlsutil.ServerCertFile), filepath.Join(dir, tlsutil.ServerKeyFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewUnstartedServer((&api.Server{Store: st, LogDirectory: logDir}).Handler())
+	ts.TLS = tlsutil.ServerConfig()
+	ts.TLS.Certificates = []tls.Certificate{cert}
+	ts.StartTLS()
+	t.Cleanup(ts.Close)
+	caPEM, err := os.ReadFile(filepath.Join(dir, tlsutil.CACertFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ts, caPEM
 }
 
 type fakeGPU struct{ node string }
@@ -187,14 +233,24 @@ func TestLogAppendIsIdempotentAndReportsGaps(t *testing.T) {
 	}
 }
 
-// A remote executor driven only through the agent API reserves the GPU,
-// launches, exits, proves quiescence and releases the lease; its log reaches
-// the daemon's log directory.
+// A remote executor driven only through the agent API over TLS reserves the
+// GPU, launches, exits, proves quiescence and releases the lease; the attempt
+// reports progress with its own token, and its log reaches the daemon's log
+// directory.
 func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
-	st, ts, token, daemonLogs := newDaemon(t)
+	st, _, token, daemonLogs := newDaemon(t)
+	ts, caPEM := tlsDaemon(t, st, daemonLogs)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	c := New(ts.URL, token, nil)
+	tlsConfig, err := tlsutil.ClientConfig(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiCA, err := tlsutil.CAEnv(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := New(ts.URL, token, tlsConfig)
 	registerRemote(t, c)
 	selector, _ := json.Marshal(map[string]any{"labels": map[string]string{"environment": "remote-test"}})
 	if _, _, err := st.SubmitExecution(ctx, store.ExecutionSpec{
@@ -207,7 +263,7 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("KAIRO_AGENT_HELPER", "1")
+	t.Setenv("AGENTCLIENT_TEST_HELPER", "1")
 
 	nodeLogs := t.TempDir()
 	exec := executor.NewLocal("remote-exec", c, nodeLogs, nil)
@@ -215,6 +271,7 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 	exec.Kind = "linux"
 	exec.Attributes = map[string]string{"environment": "remote-test"}
 	exec.APIURL = ts.URL
+	exec.APICA = apiCA
 	exec.Interval = 50 * time.Millisecond
 	exec.ObservationInterval = 50 * time.Millisecond
 	exec.Providers = map[string]provider.Provider{"remote-gpu": &fakeGPU{node: "remote"}}
@@ -241,6 +298,10 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	stop()
+	attempts, err := st.ListAttempts(ctx, store.AttemptFilter{})
+	if err != nil || len(attempts) != 1 || attempts[0].ExitCode == nil || *attempts[0].ExitCode != 0 || !strings.Contains(string(attempts[0].Progress), `"current":7`) {
+		t.Fatalf("attempt did not report with its token: %+v %v", attempts, err)
+	}
 
 	shipper := &LogShipper{Client: c, Dir: nodeLogs}
 	shipper.Sweep(ctx)
@@ -348,26 +409,7 @@ func TestObserveOnlyDaemonGivesAgentsNothingToDo(t *testing.T) {
 // The client verifies the daemon's certificate against the configured CA.
 func TestClientTrustsOnlyTheDaemonCA(t *testing.T) {
 	st, _, token, _ := newDaemon(t)
-	dir := t.TempDir()
-	if err := tlsutil.InitCA(dir); err != nil {
-		t.Fatal(err)
-	}
-	if err := tlsutil.IssueServer(dir, []string{"127.0.0.1"}); err != nil {
-		t.Fatal(err)
-	}
-	cert, err := tls.LoadX509KeyPair(filepath.Join(dir, tlsutil.ServerCertFile), filepath.Join(dir, tlsutil.ServerKeyFile))
-	if err != nil {
-		t.Fatal(err)
-	}
-	ts := httptest.NewUnstartedServer((&api.Server{Store: st}).Handler())
-	ts.TLS = tlsutil.ServerConfig()
-	ts.TLS.Certificates = []tls.Certificate{cert}
-	ts.StartTLS()
-	defer ts.Close()
-	caPEM, err := os.ReadFile(filepath.Join(dir, tlsutil.CACertFile))
-	if err != nil {
-		t.Fatal(err)
-	}
+	ts, caPEM := tlsDaemon(t, st, "")
 	trusted, err := tlsutil.ClientConfig(caPEM)
 	if err != nil {
 		t.Fatal(err)

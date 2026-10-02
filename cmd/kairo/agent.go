@@ -17,6 +17,7 @@ import (
 	"kairo/internal/executor"
 	"kairo/internal/provider"
 	"kairo/internal/store"
+	"kairo/internal/tlsutil"
 )
 
 // agentCommand runs this host as a remote node: its providers observe local
@@ -41,7 +42,21 @@ func agentCommand(args []string) error {
 		return err
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	client := agentclient.New(cfg.ServerURL, cfg.Token, nil)
+	var caPEM []byte
+	apiCA := ""
+	if cfg.CAFile != "" {
+		if caPEM, err = os.ReadFile(cfg.CAFile); err != nil {
+			return fmt.Errorf("read ca_file: %w", err)
+		}
+		if apiCA, err = tlsutil.CAEnv(caPEM); err != nil {
+			return fmt.Errorf("ca_file %s: %w", cfg.CAFile, err)
+		}
+	}
+	tlsConfig, err := tlsutil.ClientConfig(caPEM)
+	if err != nil {
+		return err
+	}
+	client := agentclient.New(cfg.ServerURL, cfg.Token, tlsConfig)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -103,6 +118,7 @@ func agentCommand(args []string) error {
 		}
 		exec := executor.NewLocal(configured.ID, client, cfg.LogDirectory, logger)
 		exec.APIURL = cfg.AttemptAPIURL
+		exec.APICA = apiCA
 		exec.NodeID = cfg.Node.ID
 		exec.Kind = configured.Kind
 		exec.Attributes = configured.Labels

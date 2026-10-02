@@ -19,10 +19,13 @@ import (
 )
 
 type Local struct {
-	ID                  string
-	Store               Coordinator
-	LogDir              string
-	APIURL              string
+	ID     string
+	Store  Coordinator
+	LogDir string
+	APIURL string
+	// APICA is handed to attempts as KAIRO_API_CA: the daemon's CA
+	// certificate (base64 DER), empty when the daemon serves plain HTTP.
+	APICA               string
 	Interval            time.Duration
 	Logger              *slog.Logger
 	NodeID              string
@@ -406,39 +409,78 @@ func resourceBinding(resource store.ResourceInstance) string {
 	return resource.StableIdentity
 }
 
-func (e *Local) start(launch *store.Launch) error {
+// launchEnv is what an attempt is told: who it is (KAIRO_ATTEMPT_TOKEN is its
+// credential for the worker API), where the daemon is and which CA to trust,
+// and which resources it holds.
+func (e *Local) launchEnv(launch *store.Launch) []string {
 	bindings := make([]string, 0, len(launch.Resources))
 	resourceIDs := make([]string, 0, len(launch.Resources))
 	for _, resource := range launch.Resources {
 		bindings = append(bindings, resourceBinding(resource))
 		resourceIDs = append(resourceIDs, resource.ID)
 	}
-	launchEnv := []string{"KAIRO_NODE_ID=" + e.NodeID, "KAIRO_EXECUTOR_ID=" + e.ID, "KAIRO_EXECUTION_ID=" + launch.Execution.ID, "KAIRO_ATTEMPT_ID=" + launch.Attempt.ID, "KAIRO_LEASE_ID=" + launch.Lease.ID, fmt.Sprintf("KAIRO_COORDINATION_EPOCH=%d", launch.Lease.CoordinationEpoch), "KAIRO_RESOURCE_IDS=" + strings.Join(resourceIDs, ","), "KAIRO_RESOURCE_BINDINGS=" + strings.Join(bindings, ","), "KAIRO_API_URL=" + e.APIURL}
+	env := []string{"KAIRO_NODE_ID=" + e.NodeID, "KAIRO_EXECUTOR_ID=" + e.ID, "KAIRO_EXECUTION_ID=" + launch.Execution.ID, "KAIRO_ATTEMPT_ID=" + launch.Attempt.ID, "KAIRO_ATTEMPT_TOKEN=" + launch.WorkerToken, "KAIRO_RESOURCE_IDS=" + strings.Join(resourceIDs, ","), "KAIRO_RESOURCE_BINDINGS=" + strings.Join(bindings, ","), "KAIRO_API_URL=" + e.APIURL}
+	if e.APICA != "" {
+		env = append(env, "KAIRO_API_CA="+e.APICA)
+	}
 	if launch.InputContinuationRef != nil {
-		launchEnv = append(launchEnv, "KAIRO_CONTINUATION_REF="+*launch.InputContinuationRef)
+		env = append(env, "KAIRO_CONTINUATION_REF="+*launch.InputContinuationRef)
 	}
-	launchEnv = append(launchEnv, e.gangEnv(launch.Gang)...)
+	env = append(env, e.gangEnv(launch.Gang)...)
 	if len(bindings) > 0 {
-		launchEnv = append(launchEnv, "CUDA_VISIBLE_DEVICES="+strings.Join(bindings, ","))
+		env = append(env, "CUDA_VISIBLE_DEVICES="+strings.Join(bindings, ","))
 	}
-	var cmd *exec.Cmd
+	return env
+}
+
+// command builds the attempt's launcher. The parent's own KAIRO_* variables
+// (an operator's KAIRO_TOKEN, say) never reach the attempt. A WSL attempt gets
+// its variables through WSLENV rather than on the wsl.exe command line, which
+// other tools can read and log.
+func (e *Local) command(launch *store.Launch) *exec.Cmd {
+	launchEnv := e.launchEnv(launch)
+	parent := make([]string, 0, len(os.Environ()))
+	wslenv := ""
+	for _, kv := range os.Environ() {
+		name, value, _ := strings.Cut(kv, "=")
+		switch {
+		case strings.HasPrefix(strings.ToUpper(name), "KAIRO_"):
+		case strings.EqualFold(name, "WSLENV"):
+			wslenv = value
+		default:
+			parent = append(parent, kv)
+		}
+	}
 	if e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2" {
 		args := []string{}
 		if distro := e.Attributes["distro"]; distro != "" {
 			args = append(args, "-d", distro)
 		}
-		// WSL does not import arbitrary Windows environment variables unless
-		// WSLENV is configured. Pass attempt fencing data explicitly through
-		// /usr/bin/env so launch behavior is independent of the operator shell.
-		args = append(args, "--cd", launch.CWD, "--", "env")
-		args = append(args, launchEnv...)
+		args = append(args, "--cd", launch.CWD, "--")
 		args = append(args, launch.Argv...)
-		cmd = exec.Command("wsl.exe", args...)
-	} else {
-		cmd = exec.Command(launch.Argv[0], launch.Argv[1:]...)
-		cmd.Dir = launch.CWD
-		cmd.Env = append(os.Environ(), launchEnv...)
+		cmd := exec.Command("wsl.exe", args...)
+		shared := []string{}
+		if wslenv != "" {
+			shared = append(shared, wslenv)
+		}
+		for _, kv := range launchEnv {
+			name, _, _ := strings.Cut(kv, "=")
+			shared = append(shared, name+"/u")
+		}
+		cmd.Env = append(append(parent, launchEnv...), "WSLENV="+strings.Join(shared, ":"))
+		return cmd
 	}
+	cmd := exec.Command(launch.Argv[0], launch.Argv[1:]...)
+	cmd.Dir = launch.CWD
+	if wslenv != "" {
+		parent = append(parent, "WSLENV="+wslenv)
+	}
+	cmd.Env = append(parent, launchEnv...)
+	return cmd
+}
+
+func (e *Local) start(launch *store.Launch) error {
+	cmd := e.command(launch)
 	prepareProcessTree(cmd)
 	outPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stdout.log")
 	errPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stderr.log")

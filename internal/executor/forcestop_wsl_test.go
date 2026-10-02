@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 	"time"
 )
@@ -50,5 +51,48 @@ func TestWSLAttemptProcessesSignalsTheAttempt(t *testing.T) {
 			t.Fatalf("survived SIGTERM: %v", left)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// Host-specific: an attempt launched by command() receives its variables
+// through WSLENV, and a force stop still finds its processes by
+// KAIRO_ATTEMPT_ID.
+func TestWSLLaunchEnvironmentReachesTheAttempt(t *testing.T) {
+	if os.Getenv("KAIRO_TEST_WSL") != "1" {
+		t.Skip("set KAIRO_TEST_WSL=1 to run against WSL")
+	}
+	ctx := context.Background()
+	launch := testLaunch()
+	launch.Attempt.ID = "att_wsl_launch_env_test"
+	launch.CWD = "/tmp"
+	launch.Argv = []string{"sh", "-c", `echo "$KAIRO_ATTEMPT_TOKEN|$CUDA_VISIBLE_DEVICES|$RANK|${KAIRO_TOKEN:-none}"; sleep 120 & sleep 120; wait`}
+	t.Setenv("KAIRO_TOKEN", "kairo_admin_operator")
+	cmd := (&Local{ID: "wsl", Kind: "wsl2", Attributes: map[string]string{}}).command(launch)
+	var out strings.Builder
+	cmd.Stdout = &out
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		pids, err := wslAttemptProcesses(ctx, "", launch.Attempt.ID, "0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(pids) >= 3 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("attempt processes in WSL: %v", pids)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if _, err := wslAttemptProcesses(ctx, "", launch.Attempt.ID, "TERM"); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	if got := strings.TrimSpace(out.String()); got != "kairo_worker_secret|0,1|1|none" {
+		t.Fatalf("attempt saw %q", got)
 	}
 }
