@@ -176,6 +176,23 @@ func (c *Client) MarkQuarantineTerminated(ctx context.Context, attemptID string)
 	return c.call(ctx, "quarantine-terminated", map[string]string{"attempt_id": attemptID}, nil)
 }
 
+func (c *Client) ForceStopOrders(ctx context.Context, executorID string) ([]store.ForceStopOrder, error) {
+	var out struct {
+		Orders []store.ForceStopOrder `json:"orders"`
+	}
+	err := c.call(ctx, "force-stop-orders", map[string]string{"executor_id": executorID}, &out)
+	var e *Error
+	if errors.As(err, &e) && e.Status == http.StatusNotFound {
+		// A daemon predating force stop has no such route: it has no orders.
+		return nil, nil
+	}
+	return out.Orders, err
+}
+
+func (c *Client) AckForceStop(ctx context.Context, attemptID, phase string, detail json.RawMessage) error {
+	return c.call(ctx, "force-stop-ack", map[string]any{"attempt_id": attemptID, "phase": phase, "detail": detail}, nil)
+}
+
 // appendLog sends data found at offset of the node-side file and returns the
 // daemon-side size afterwards. A gap (the daemon has less than offset) is
 // reported as *GapError carrying the daemon's size to resume from.

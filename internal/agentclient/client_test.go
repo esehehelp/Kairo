@@ -222,3 +222,26 @@ func TestLogShipperRunShipsGrowingFile(t *testing.T) {
 	f.Close()
 	waitFor("first\nsecond\n")
 }
+
+func TestForceStopCallsRoundTrip(t *testing.T) {
+	_, ts, _ := newDaemon(t)
+	c := New(ts.URL, testToken)
+	ctx := context.Background()
+	if orders, err := c.ForceStopOrders(ctx, "exec"); err != nil || len(orders) != 0 {
+		t.Fatalf("orders: %+v %v", orders, err)
+	}
+	if err := c.AckForceStop(ctx, "att_missing", "signalled", nil); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("ack of an unknown force stop: %v", err)
+	}
+}
+
+// A daemon predating force stop has no route for it: the agent sees no
+// orders instead of failing every tick.
+func TestForceStopOrdersFromAnOlderDaemon(t *testing.T) {
+	old := httptest.NewServer(http.NotFoundHandler())
+	defer old.Close()
+	orders, err := New(old.URL, testToken).ForceStopOrders(context.Background(), "exec")
+	if err != nil || orders != nil {
+		t.Fatalf("orders=%v err=%v", orders, err)
+	}
+}

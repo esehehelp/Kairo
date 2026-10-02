@@ -209,6 +209,43 @@ type PauseOperation struct {
 	Detail          json.RawMessage `json:"detail"`
 	CreatedAt       string          `json:"created_at"`
 	UpdatedAt       string          `json:"updated_at"`
+	// Force is set for `pause --force`: the captured executions are ended
+	// (process trees terminated, unstarted ones withdrawn), not suspended.
+	Force *ForceStopSpec `json:"force,omitempty"`
+}
+
+// ForceStopSpec is how a forced pause stops what it captured: a graceful stop
+// (CTRL_BREAK / SIGTERM), then after GraceSeconds the whole tree is killed.
+type ForceStopSpec struct {
+	GraceSeconds int    `json:"grace_seconds"`
+	Reason       string `json:"reason"`
+}
+
+// ForceStop is the record of one execution ended by a forced pause.
+type ForceStop struct {
+	ExecutionID  string          `json:"execution_id"`
+	OperationID  string          `json:"operation_id"`
+	AttemptID    *string         `json:"attempt_id,omitempty"`
+	ExecutorID   *string         `json:"executor_id,omitempty"`
+	GraceSeconds int             `json:"grace_seconds"`
+	State        string          `json:"state"`
+	Detail       json.RawMessage `json:"detail"`
+	RequestedAt  string          `json:"requested_at"`
+	SignalledAt  *string         `json:"signalled_at,omitempty"`
+	TerminatedAt *string         `json:"terminated_at,omitempty"`
+}
+
+// ForceStopOrder is a force stop an executor has to carry out on one of its
+// attempts. KillAfterSeconds is the grace left (computed by the daemon, so
+// clocks of remote nodes do not matter); at 0 the tree is killed.
+type ForceStopOrder struct {
+	AttemptID        string  `json:"attempt_id"`
+	ExecutionID      string  `json:"execution_id"`
+	PID              *int    `json:"pid"`
+	ProcessIdentity  *string `json:"process_identity"`
+	State            string  `json:"state"`
+	GraceSeconds     int     `json:"grace_seconds"`
+	KillAfterSeconds float64 `json:"kill_after_seconds"`
 }
 
 type PauseTarget struct {

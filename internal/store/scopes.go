@@ -240,6 +240,30 @@ func projectScopeIDTx(ctx context.Context, tx *sql.Tx, scopeID string) (string, 
 }
 
 func (s *Store) PauseScope(ctx context.Context, scopeID, actor, requestID string) (PauseOperation, error) {
+	return s.pauseScope(ctx, scopeID, actor, requestID, nil)
+}
+
+// MaxForceStopGrace bounds the grace period of a forced pause, in seconds.
+const MaxForceStopGrace = 3600
+
+// ForcePauseScope is `pause --force`: like PauseScope it closes the scope's
+// admission gate and captures its executions, but it ends them instead of
+// suspending them. Started executions get their process trees terminated
+// (graceful stop, then a kill after force.GraceSeconds) and end with terminal
+// cause force_stopped; executions that have not started are withdrawn. Their
+// tasks end in state stopped (forcestop.go).
+func (s *Store) ForcePauseScope(ctx context.Context, scopeID, actor, requestID string, force ForceStopSpec) (PauseOperation, error) {
+	if force.GraceSeconds < 0 || force.GraceSeconds > MaxForceStopGrace {
+		return PauseOperation{}, fmt.Errorf("force stop grace must be between 0 and %d seconds", MaxForceStopGrace)
+	}
+	force.Reason = strings.TrimSpace(force.Reason)
+	if force.Reason == "" {
+		force.Reason = "operator request"
+	}
+	return s.pauseScope(ctx, scopeID, actor, requestID, &force)
+}
+
+func (s *Store) pauseScope(ctx context.Context, scopeID, actor, requestID string, force *ForceStopSpec) (PauseOperation, error) {
 	actor, requestID = strings.TrimSpace(actor), strings.TrimSpace(requestID)
 	if requestID == "" {
 		return PauseOperation{}, errors.New("request ID is required")
@@ -253,6 +277,9 @@ func (s *Store) PauseScope(ctx context.Context, scopeID, actor, requestID string
 	}
 	defer tx.Rollback()
 	if operation, err := getPauseOperationByRequestTx(ctx, tx, scopeID, requestID); err == nil {
+		if (operation.Force == nil) != (force == nil) || (force != nil && *operation.Force != *force) {
+			return PauseOperation{}, ErrIdempotencyConflict
+		}
 		return operation, tx.Commit()
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return PauseOperation{}, err
@@ -273,9 +300,14 @@ func (s *Store) PauseScope(ctx context.Context, scopeID, actor, requestID string
 			return PauseOperation{}, err
 		}
 	}
-	operation := PauseOperation{ID: id.New("pop"), ScopeID: scopeID, ScopeGeneration: gate.Generation, RequestID: requestID, Actor: actor, State: "requested", Detail: json.RawMessage(`{}`), CreatedAt: t, UpdatedAt: t}
+	operation := PauseOperation{ID: id.New("pop"), ScopeID: scopeID, ScopeGeneration: gate.Generation, RequestID: requestID, Actor: actor, State: "requested", Detail: json.RawMessage(`{}`), CreatedAt: t, UpdatedAt: t, Force: force}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO pause_operations(id,scope_id,scope_generation,request_id,actor,state,detail_json,created_at,updated_at) VALUES(?,?,?,?,?,'requested','{}',?,?)`, operation.ID, scopeID, gate.Generation, requestID, actor, t, t); err != nil {
 		return PauseOperation{}, err
+	}
+	if force != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO force_stop_operations(operation_id,grace_seconds,reason) VALUES(?,?,?)`, operation.ID, force.GraceSeconds, force.Reason); err != nil {
+			return PauseOperation{}, err
+		}
 	}
 	projectID, err := projectScopeIDTx(ctx, tx, scopeID)
 	if err != nil {
@@ -286,7 +318,11 @@ func (s *Store) PauseScope(ctx context.Context, scopeID, actor, requestID string
 			return PauseOperation{}, err
 		}
 	}
-	if err = appendCoordinationEventTx(ctx, tx, "pause_requested", &projectID, "pause_operation", operation.ID, nil, map[string]any{"scope_id": scopeID, "generation": gate.Generation, "actor": actor}); err != nil {
+	requested := map[string]any{"scope_id": scopeID, "generation": gate.Generation, "actor": actor}
+	if force != nil {
+		requested["force"] = force
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "pause_requested", &projectID, "pause_operation", operation.ID, nil, requested); err != nil {
 		return PauseOperation{}, err
 	}
 	if err = discoverPauseTargetsTx(ctx, tx, operation.ID, scopeID, t); err != nil {
@@ -372,35 +408,51 @@ func (s *Store) DiscoverPauseTargets(ctx context.Context, operationID string) ([
 	return s.ListPauseTargets(ctx, operationID)
 }
 
-func getPauseOperationByRequestTx(ctx context.Context, tx *sql.Tx, scopeID, requestID string) (PauseOperation, error) {
+// pauseOperationSelect reads a pause operation with its force stop options.
+const pauseOperationSelect = `SELECT p.id,p.scope_id,p.scope_generation,p.request_id,p.actor,p.state,p.detail_json,p.created_at,p.updated_at,f.grace_seconds,f.reason
+	FROM pause_operations p LEFT JOIN force_stop_operations f ON f.operation_id=p.id`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanPauseOperation(row rowScanner) (PauseOperation, error) {
 	var operation PauseOperation
 	var detail string
-	err := tx.QueryRowContext(ctx, `SELECT id,scope_id,scope_generation,request_id,actor,state,detail_json,created_at,updated_at FROM pause_operations WHERE scope_id=? AND request_id=?`, scopeID, requestID).Scan(&operation.ID, &operation.ScopeID, &operation.ScopeGeneration, &operation.RequestID, &operation.Actor, &operation.State, &detail, &operation.CreatedAt, &operation.UpdatedAt)
+	var grace sql.NullInt64
+	var reason sql.NullString
+	if err := row.Scan(&operation.ID, &operation.ScopeID, &operation.ScopeGeneration, &operation.RequestID, &operation.Actor, &operation.State, &detail, &operation.CreatedAt, &operation.UpdatedAt, &grace, &reason); err != nil {
+		return PauseOperation{}, err
+	}
 	operation.Detail = json.RawMessage(detail)
-	return operation, err
+	if grace.Valid {
+		operation.Force = &ForceStopSpec{GraceSeconds: int(grace.Int64), Reason: reason.String}
+	}
+	return operation, nil
+}
+
+func getPauseOperationByRequestTx(ctx context.Context, tx *sql.Tx, scopeID, requestID string) (PauseOperation, error) {
+	return scanPauseOperation(tx.QueryRowContext(ctx, pauseOperationSelect+` WHERE p.scope_id=? AND p.request_id=?`, scopeID, requestID))
 }
 
 func (s *Store) GetPauseOperation(ctx context.Context, operationID string) (PauseOperation, error) {
-	var operation PauseOperation
-	var detail string
-	err := s.db.QueryRowContext(ctx, `SELECT id,scope_id,scope_generation,request_id,actor,state,detail_json,created_at,updated_at FROM pause_operations WHERE id=?`, operationID).Scan(&operation.ID, &operation.ScopeID, &operation.ScopeGeneration, &operation.RequestID, &operation.Actor, &operation.State, &detail, &operation.CreatedAt, &operation.UpdatedAt)
+	operation, err := scanPauseOperation(s.db.QueryRowContext(ctx, pauseOperationSelect+` WHERE p.id=?`, operationID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return PauseOperation{}, ErrNotFound
 	}
-	operation.Detail = json.RawMessage(detail)
 	return operation, err
 }
 
 func (s *Store) ListPauseOperations(ctx context.Context, filter PauseOperationFilter) ([]PauseOperation, error) {
-	query := `SELECT id,scope_id,scope_generation,request_id,actor,state,detail_json,created_at,updated_at FROM pause_operations`
+	query := pauseOperationSelect
 	conditions := make([]string, 0, 2)
 	args := make([]any, 0, 3)
 	if filter.ScopeID != "" {
-		conditions = append(conditions, `scope_id=?`)
+		conditions = append(conditions, `p.scope_id=?`)
 		args = append(args, filter.ScopeID)
 	}
 	if filter.Unfinished {
-		conditions = append(conditions, `state IN('requested','quiescing','blocked')`)
+		conditions = append(conditions, `p.state IN('requested','quiescing','blocked')`)
 	}
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
@@ -412,7 +464,7 @@ func (s *Store) ListPauseOperations(ctx context.Context, filter PauseOperationFi
 	if limit > 1000 {
 		limit = 1000
 	}
-	query += ` ORDER BY created_at,id LIMIT ?`
+	query += ` ORDER BY p.created_at,p.id LIMIT ?`
 	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
@@ -421,12 +473,10 @@ func (s *Store) ListPauseOperations(ctx context.Context, filter PauseOperationFi
 	defer rows.Close()
 	out := make([]PauseOperation, 0)
 	for rows.Next() {
-		var operation PauseOperation
-		var detail string
-		if err := rows.Scan(&operation.ID, &operation.ScopeID, &operation.ScopeGeneration, &operation.RequestID, &operation.Actor, &operation.State, &detail, &operation.CreatedAt, &operation.UpdatedAt); err != nil {
+		operation, err := scanPauseOperation(rows)
+		if err != nil {
 			return nil, err
 		}
-		operation.Detail = json.RawMessage(detail)
 		out = append(out, operation)
 	}
 	return out, rows.Err()

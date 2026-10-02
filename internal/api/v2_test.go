@@ -225,3 +225,39 @@ func TestObserveOnlyRejectsActuatingEndpoints(t *testing.T) {
 		t.Fatalf("observe-only reconcile status=%d", response.StatusCode)
 	}
 }
+
+func TestForcedScopePause(t *testing.T) {
+	st, server := newTestServer(t)
+	scopes, err := st.EnsureScopePath(t.Context(), store.ScopePath{Project: "p", Queue: "q", Task: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := server.URL + "/v2/scopes/" + scopes.Task.ID + "/pause"
+	response, payload := callJSON(t, http.MethodPost, path, map[string]any{"actor": "test", "request_id": "plain", "grace_seconds": 5})
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("grace without force: %d %s", response.StatusCode, payload)
+	}
+	response, payload = callJSON(t, http.MethodPost, path, map[string]any{"actor": "test", "request_id": "forced", "force": true, "grace_seconds": 5, "reason": "superseded"})
+	var started struct {
+		OperationID string               `json:"operation_id"`
+		Operation   store.PauseOperation `json:"operation"`
+	}
+	if response.StatusCode != http.StatusAccepted || json.Unmarshal(payload, &started) != nil || started.Operation.Force == nil || started.Operation.Force.GraceSeconds != 5 || started.Operation.Force.Reason != "superseded" {
+		t.Fatalf("forced pause: %d %s", response.StatusCode, payload)
+	}
+	response, payload = callJSON(t, http.MethodGet, server.URL+"/v2/pause-operations/"+started.OperationID, nil)
+	if response.StatusCode != http.StatusOK || !bytes.Contains(payload, []byte(`"force_stops":[]`)) || !bytes.Contains(payload, []byte(`"grace_seconds":5`)) {
+		t.Fatalf("operation: %d %s", response.StatusCode, payload)
+	}
+	// default grace
+	response, payload = callJSON(t, http.MethodPost, path, map[string]any{"request_id": "forced-default", "force": true})
+	if response.StatusCode != http.StatusAccepted || !bytes.Contains(payload, []byte(`"grace_seconds":30`)) {
+		t.Fatalf("default grace: %d %s", response.StatusCode, payload)
+	}
+	observeOnly := httptest.NewServer((&Server{Store: st, ObserveOnly: true}).Handler())
+	defer observeOnly.Close()
+	response, payload = callJSON(t, http.MethodPost, observeOnly.URL+"/v2/scopes/"+scopes.Task.ID+"/pause", map[string]any{"request_id": "forced-observe", "force": true})
+	if response.StatusCode != http.StatusLocked {
+		t.Fatalf("observe-only forced pause: %d %s", response.StatusCode, payload)
+	}
+}

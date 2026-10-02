@@ -25,6 +25,9 @@ var quarantineSchema string
 //go:embed gang_schema.sql
 var gangSchema string
 
+//go:embed force_stop_schema.sql
+var forceStopSchema string
+
 var (
 	ErrNotFound              = errors.New("not found")
 	ErrIdempotencyConflict   = errors.New("idempotency key was already used for different content")
@@ -138,6 +141,15 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(gangSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply gang schema: %w", err)
+	}
+	// Force stop adds a terminal task state: the task was ended by `pause --force`.
+	if err := widenCheck(db, "orchestration_tasks", "state IN('pending','running','succeeded','failed','blocked')", "state IN('pending','running','succeeded','failed','blocked','stopped')"); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(forceStopSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply force stop schema: %w", err)
 	}
 	return &Store{db: db}, nil
 }

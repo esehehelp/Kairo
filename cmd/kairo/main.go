@@ -25,6 +25,8 @@ import (
 )
 
 func main() {
+	// A Windows force stop runs this binary as a short-lived CTRL_BREAK helper.
+	executor.RunHelper(os.Args)
 	if err := run(os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, "kairo:", err)
 		os.Exit(1)

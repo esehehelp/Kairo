@@ -36,6 +36,9 @@ type TaskExecution struct {
 	State       string  `json:"state"`
 	ExitCode    *int    `json:"exit_code,omitempty"`
 	ExitSignal  *string `json:"exit_signal,omitempty"`
+	// TerminalCause tells how a terminal execution ended: process_exit,
+	// force_stopped, withdrawn_before_start, executor_identity_lost, ...
+	TerminalCause *string `json:"terminal_cause,omitempty"`
 }
 
 type plannedOrchestrationDecision struct {
@@ -214,6 +217,21 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			}
 			continue
 		}
+		// A forced pause ended this execution (or a rank of its gang): the task
+		// is stopped once nothing of it holds resources. No continuation or
+		// restart is planned, whatever the exit or checkpoint.
+		stopped, err := forceStoppedTx(ctx, tx, current.ExecutionID)
+		if err != nil {
+			return err
+		}
+		if stopped != nil && (current.AttemptState == nil || *current.AttemptState != "lost") {
+			if (current.AttemptID == nil || (current.AttemptState != nil && *current.AttemptState == "quiesced")) && (current.LeaseState == nil || *current.LeaseState == "released") {
+				if err := updateTaskState(ctx, tx, task.taskScopeID, "stopped", stopped); err != nil {
+					return err
+				}
+			}
+			continue
+		}
 		if current.AttemptID == nil {
 			if err := updateTaskState(ctx, tx, task.taskScopeID, "failed", map[string]any{"reason": "execution terminal before attempt", "execution_id": current.ExecutionID, "terminal_cause": current.TerminalCause}); err != nil {
 				return err
@@ -297,7 +315,7 @@ func taskDependenciesReady(ctx context.Context, tx *sql.Tx, taskScopeID string) 
 		if err := rows.Scan(&state); err != nil {
 			return false, false, err
 		}
-		if state == "failed" || state == "blocked" {
+		if state == "failed" || state == "blocked" || state == "stopped" {
 			return false, true, nil
 		}
 		if state != "succeeded" {
@@ -514,7 +532,7 @@ func (s *Store) taskDependencyNames(ctx context.Context, taskScopeID string) ([]
 }
 
 func (s *Store) taskExecutionStatus(ctx context.Context, taskScopeID string) ([]TaskExecution, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT te.execution_ordinal,te.execution_id,te.reason,e.state,a.exit_code,a.exit_signal FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id WHERE te.task_scope_id=? ORDER BY te.execution_ordinal`, taskScopeID)
+	rows, err := s.db.QueryContext(ctx, `SELECT te.execution_ordinal,te.execution_id,te.reason,e.state,e.terminal_cause,a.exit_code,a.exit_signal FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id WHERE te.task_scope_id=? ORDER BY te.execution_ordinal`, taskScopeID)
 	if err != nil {
 		return nil, err
 	}
@@ -522,7 +540,7 @@ func (s *Store) taskExecutionStatus(ctx context.Context, taskScopeID string) ([]
 	values := []TaskExecution{}
 	for rows.Next() {
 		var value TaskExecution
-		if err := rows.Scan(&value.Ordinal, &value.ExecutionID, &value.Reason, &value.State, &value.ExitCode, &value.ExitSignal); err != nil {
+		if err := rows.Scan(&value.Ordinal, &value.ExecutionID, &value.Reason, &value.State, &value.TerminalCause, &value.ExitCode, &value.ExitSignal); err != nil {
 			return nil, err
 		}
 		values = append(values, value)

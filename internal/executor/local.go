@@ -38,6 +38,13 @@ type Local struct {
 
 	// Prepared gang ranks waiting at the launch barrier, by lease ID.
 	pendingGang map[string]pendingGangRank
+
+	// Force stop (forcestop.go): process tree handles of the attempts this
+	// instance launched, and the progress of force stops being carried out.
+	trees              map[string]*treeHandle
+	forceChecked       map[string]time.Time
+	forceKilled        map[string]bool
+	forceOrdersFailing bool
 }
 
 type pendingGangRank struct {
@@ -101,6 +108,7 @@ func (e *Local) tick(ctx context.Context) error {
 	if err := e.carryOutQuarantineTerminations(ctx); err != nil {
 		return err
 	}
+	e.carryOutForceStops(ctx)
 	if err := e.retryPendingGangRanks(ctx); err != nil {
 		return err
 	}
@@ -330,7 +338,9 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 		}
 		if err := e.Store.FinalizeQuiescence(ctx, candidate.Attempt.ID, candidate.Lease.ID, candidate.Lease.CoordinationEpoch); err != nil {
 			e.Logger.Warn("quiescence not yet proven", "attempt_id", candidate.Attempt.ID, "lease_id", candidate.Lease.ID, "error", err)
+			continue
 		}
+		e.releaseTree(candidate.Attempt.ID)
 	}
 	return nil
 }
@@ -447,10 +457,17 @@ func (e *Local) start(launch *store.Launch) error {
 		stderr.Close()
 		return err
 	}
+	// The tree handle (Windows: a job object) lets a force stop reach every
+	// descendant; without it the stop falls back to walking the tree.
+	tree, treeErr := attachTree(cmd)
+	if treeErr != nil {
+		e.Logger.Warn("attempt process tree not tracked", "attempt_id", launch.Attempt.ID, "error", treeErr)
+	}
 	identity, identityErr := processidentity.ForPID(cmd.Process.Pid)
 	if identityErr != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		tree.close()
 		stdout.Close()
 		stderr.Close()
 		return fmt.Errorf("read process creation identity: %w", identityErr)
@@ -458,6 +475,7 @@ func (e *Local) start(launch *store.Launch) error {
 	if err = e.Store.ActivateLaunch(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, cmd.Process.Pid, identity); err != nil {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
+		tree.close()
 		stdout.Close()
 		stderr.Close()
 		return err
@@ -465,6 +483,12 @@ func (e *Local) start(launch *store.Launch) error {
 	_ = e.Store.SetAttemptLogPaths(context.Background(), launch.Attempt.ID, launch.Lease.CoordinationEpoch, outPath, errPath)
 	e.mu.Lock()
 	e.running[launch.Attempt.ID] = cmd
+	if tree != nil {
+		if e.trees == nil {
+			e.trees = map[string]*treeHandle{}
+		}
+		e.trees[launch.Attempt.ID] = tree
+	}
 	e.mu.Unlock()
 	go func() {
 		waitErr := cmd.Wait()

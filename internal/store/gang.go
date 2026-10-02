@@ -498,7 +498,7 @@ func (s *Store) abortPlacement(ctx context.Context, placementID, reason string) 
 	if n, _ := res.RowsAffected(); n != 1 {
 		return tx.Commit()
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=? WHERE state='reserved' AND id IN(
+	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=? WHERE state IN('reserved','revocation_requested') AND id IN(
 		SELECT lease_id FROM gang_placement_leases WHERE placement_id=? AND delivered_at IS NULL)`, stamp, placementID); err != nil {
 		return err
 	}
@@ -601,7 +601,7 @@ func (s *Store) gangRankStates(ctx context.Context, placementID string) ([]gangR
 	rows, err := s.db.QueryContext(ctx, `SELECT gpl.rank,gpl.execution_id,gpl.executor_id,l.state,a.id,a.state,a.exit_code,e.checkpointable,
 		(SELECT c.origin FROM commands c WHERE c.attempt_id=a.id AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
 		(SELECT c.reason FROM commands c WHERE c.attempt_id=a.id AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
-		EXISTS(SELECT 1 FROM gang_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id)
+		EXISTS(SELECT 1 FROM gang_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM force_stops t WHERE t.attempt_id=a.id)
 		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id JOIN execution_requests e ON e.id=gpl.execution_id
 		LEFT JOIN attempts a ON a.id=l.attempt_id
 		WHERE gpl.placement_id=? ORDER BY gpl.rank`, placementID)

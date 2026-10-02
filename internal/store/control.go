@@ -48,6 +48,12 @@ func (s *Store) reconcilePauseOperation(ctx context.Context, operation PauseOper
 	}
 	var targets []PauseTarget
 	if scope.Admission == "closed" && scope.Generation == operation.ScopeGeneration {
+		// A forced pause also ends what has not started (forcestop.go).
+		if operation.Force != nil && actuate {
+			if err = s.forceSweepWithdrawals(ctx, operation); err != nil {
+				return err
+			}
+		}
 		targets, err = s.DiscoverPauseTargets(ctx, operation.ID)
 	} else {
 		targets, err = s.ListPauseTargets(ctx, operation.ID)
@@ -82,6 +88,18 @@ func (s *Store) reconcilePauseOperation(ctx context.Context, operation PauseOper
 			if state != "blocked" {
 				state = "quiescing"
 			}
+		}
+	}
+	// A forced pause is done once its executors have also confirmed that no
+	// process of the stopped trees is left (they report it right after the
+	// lease release, which only proves the registered processes gone).
+	if operation.Force != nil && state == "quiesced" {
+		var confirming int
+		if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM force_stops WHERE operation_id=? AND state='signalled'`, operation.ID).Scan(&confirming); err != nil {
+			return err
+		}
+		if confirming > 0 {
+			state = "quiescing"
 		}
 	}
 	detail, err := json.Marshal(map[string]any{
@@ -134,7 +152,8 @@ func (s *Store) reconcilePauseTarget(ctx context.Context, operation PauseOperati
 	// A project-side rejection is durable coordination evidence. Retrying the
 	// same suspend request automatically would reinterpret project policy and can
 	// produce an unbounded rejected-command loop.
-	if target.BlockerReason != nil && *target.BlockerReason == "checkpoint_rejected" {
+	// A forced pause does not need the checkpoint, so a rejection does not block it.
+	if operation.Force == nil && target.BlockerReason != nil && *target.BlockerReason == "checkpoint_rejected" {
 		update.State = "blocked"
 		update.BlockerReason = target.BlockerReason
 		return s.setPauseTargetIfChanged(ctx, target, update)
@@ -187,6 +206,11 @@ func (s *Store) reconcilePauseTarget(ctx context.Context, operation PauseOperati
 		}
 		return s.setPauseTargetIfChanged(ctx, target, update)
 	case "exited", "quiescing":
+		// Forced: a suspend in progress is not waited for, and processes an
+		// exited launcher left behind are killed too.
+		if operation.Force != nil && facts.liveProcesses > 0 {
+			return s.forceStopTarget(ctx, operation, target, facts, update)
+		}
 		update.State = "quiescing"
 		return s.setPauseTargetIfChanged(ctx, target, update)
 	case "authorized":
@@ -211,6 +235,9 @@ func (s *Store) reconcilePauseTarget(ctx context.Context, operation PauseOperati
 			update.BlockerReason = stringPointer("running_process_identity_missing")
 			return s.setPauseTargetIfChanged(ctx, target, update)
 		}
+		if operation.Force != nil {
+			return s.forceStopTarget(ctx, operation, target, facts, update)
+		}
 		if !facts.checkpointable {
 			update.State = "blocked"
 			update.BlockerReason = stringPointer("execution_not_checkpointable")
@@ -228,6 +255,25 @@ func (s *Store) reconcilePauseTarget(ctx context.Context, operation PauseOperati
 		update.BlockerReason = stringPointer("coordination_state_inconsistent")
 		return s.setPauseTargetIfChanged(ctx, target, update)
 	}
+}
+
+// forceStopTarget makes sure the target's attempt has a force stop and reports
+// the target quiescing until its lease is released, or blocked when no
+// executor picks the force stop up.
+func (s *Store) forceStopTarget(ctx context.Context, operation PauseOperation, target PauseTarget, facts pauseTargetFacts, update PauseTargetUpdate) error {
+	if err := s.requestForceStop(ctx, operation, target.ExecutionID, *facts.attemptID); err != nil {
+		return err
+	}
+	blocker, err := s.forceStopBlocker(ctx, target.ExecutionID)
+	if err != nil {
+		return err
+	}
+	update.State = "quiescing"
+	if blocker != nil {
+		update.State = "blocked"
+		update.BlockerReason = blocker
+	}
+	return s.setPauseTargetIfChanged(ctx, target, update)
 }
 
 func (s *Store) loadPauseTargetFacts(ctx context.Context, target PauseTarget) (pauseTargetFacts, error) {

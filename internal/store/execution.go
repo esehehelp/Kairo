@@ -428,36 +428,46 @@ func (s *Store) WithdrawExecution(ctx context.Context, executionID string) error
 		return err
 	}
 	defer tx.Rollback()
-	var state, projectID string
-	var startedAt, terminalCause sql.NullString
-	if err = tx.QueryRowContext(ctx, `SELECT state,project_scope_id,started_at,terminal_cause FROM execution_requests WHERE id=?`, executionID).Scan(&state, &projectID, &startedAt, &terminalCause); errors.Is(err, sql.ErrNoRows) {
-		return ErrNotFound
-	} else if err != nil {
-		return err
-	}
-	if startedAt.Valid || state == "started" {
-		return ErrExecutionStarted
-	}
-	if state == "terminal" {
-		if !terminalCause.Valid || terminalCause.String != "withdrawn_before_start" {
-			return ErrExecutionStarted
-		}
-		return tx.Commit()
-	}
-	t := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='withdrawn_before_start',terminal_at=? WHERE id=?`, t, executionID); err != nil {
-		return err
-	}
-	if state == "authorized" {
-		if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=? WHERE attempt_id=(SELECT id FROM attempts WHERE execution_id=?) AND state='issued'`, t, executionID); err != nil {
-			return err
-		}
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='revocation_requested',revocation_requested_at=? WHERE execution_id=? AND state IN('reserved','prepared')`, t, executionID); err != nil {
-		return err
-	}
-	if err = appendCoordinationEventTx(ctx, tx, "execution_withdrawn", &projectID, "execution", executionID, nil, map[string]string{"cause": "withdrawn_before_start"}); err != nil {
+	if _, err = withdrawExecutionTx(ctx, tx, executionID); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// withdrawExecutionTx ends an execution that has not started (terminal cause
+// withdrawn_before_start). It reports whether this call withdrew it; an
+// execution withdrawn earlier is not an error.
+func withdrawExecutionTx(ctx context.Context, tx *sql.Tx, executionID string) (bool, error) {
+	var state, projectID string
+	var startedAt, terminalCause sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT state,project_scope_id,started_at,terminal_cause FROM execution_requests WHERE id=?`, executionID).Scan(&state, &projectID, &startedAt, &terminalCause); errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	} else if err != nil {
+		return false, err
+	}
+	if startedAt.Valid || state == "started" {
+		return false, ErrExecutionStarted
+	}
+	if state == "terminal" {
+		if !terminalCause.Valid || terminalCause.String != "withdrawn_before_start" {
+			return false, ErrExecutionStarted
+		}
+		return false, nil
+	}
+	t := now()
+	if _, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='withdrawn_before_start',terminal_at=? WHERE id=?`, t, executionID); err != nil {
+		return false, err
+	}
+	if state == "authorized" {
+		if _, err := tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=? WHERE attempt_id=(SELECT id FROM attempts WHERE execution_id=?) AND state='issued'`, t, executionID); err != nil {
+			return false, err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE leases SET state='revocation_requested',revocation_requested_at=? WHERE execution_id=? AND state IN('reserved','prepared')`, t, executionID); err != nil {
+		return false, err
+	}
+	if err := appendCoordinationEventTx(ctx, tx, "execution_withdrawn", &projectID, "execution", executionID, nil, map[string]string{"cause": "withdrawn_before_start"}); err != nil {
+		return false, err
+	}
+	return true, nil
 }

@@ -4,6 +4,7 @@ package executor
 
 import (
 	"os"
+	"os/exec"
 	"strconv"
 	"strings"
 	"syscall"
@@ -45,3 +46,5 @@ func processAlive(pid int) bool {
 	fields := strings.Fields(s[strings.LastIndexByte(s, ')')+1:])
 	return len(fields) > 0 && fields[0] != "Z"
 }
+
+func hideTestConsole(*exec.Cmd) {}

@@ -264,6 +264,27 @@ func (s *Server) mountAgent(mux *http.ServeMux) {
 		}
 		return map[string]bool{"ok": true}, s.Store.MarkQuarantineTerminated(r.Context(), b.AttemptID)
 	})
+	// Force stops (pause --force). An agent predating them never asks; the
+	// daemon then reports the order as not picked up (store.forceStopBlocker).
+	route("force-stop-orders", func(r *http.Request) (any, error) {
+		var b agentExecutorRequest
+		if err := decode(r, &b); err != nil {
+			return nil, err
+		}
+		orders, err := s.Store.ForceStopOrders(r.Context(), b.ExecutorID)
+		return map[string]any{"orders": orders}, err
+	})
+	route("force-stop-ack", func(r *http.Request) (any, error) {
+		var b struct {
+			AttemptID string          `json:"attempt_id"`
+			Phase     string          `json:"phase"`
+			Detail    json.RawMessage `json:"detail,omitempty"`
+		}
+		if err := decode(r, &b); err != nil {
+			return nil, err
+		}
+		return map[string]bool{"ok": true}, s.Store.AckForceStop(r.Context(), b.AttemptID, b.Phase, b.Detail)
+	})
 	mux.HandleFunc("POST /v3/agent/logs", s.agentAuth(s.agentLogAppend))
 }
 

@@ -203,6 +203,12 @@ func (s *Server) pauseScope(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		RequestID string `json:"request_id"`
 		Actor     string `json:"actor"`
+		// Force ends the captured executions instead of suspending them:
+		// graceful stop, then the process trees are killed after GraceSeconds
+		// (default 30). A daemon predating force stop rejects these fields.
+		Force        bool   `json:"force,omitempty"`
+		GraceSeconds *int   `json:"grace_seconds,omitempty"`
+		Reason       string `json:"reason,omitempty"`
 	}
 	if err := decodeOptional(r, &body); err != nil {
 		writeError(w, err)
@@ -211,7 +217,25 @@ func (s *Server) pauseScope(w http.ResponseWriter, r *http.Request) {
 	if strings.TrimSpace(body.RequestID) == "" {
 		body.RequestID = id.New("api")
 	}
-	value, err := s.Store.PauseScope(r.Context(), r.PathValue("id"), body.Actor, body.RequestID)
+	if !body.Force && (body.GraceSeconds != nil || body.Reason != "") {
+		writeError(w, errors.New("grace_seconds and reason apply only to a forced pause"))
+		return
+	}
+	var value store.PauseOperation
+	var err error
+	if body.Force {
+		if s.ObserveOnly {
+			writeError(w, errObserveOnly)
+			return
+		}
+		grace := 30
+		if body.GraceSeconds != nil {
+			grace = *body.GraceSeconds
+		}
+		value, err = s.Store.ForcePauseScope(r.Context(), r.PathValue("id"), body.Actor, body.RequestID, store.ForceStopSpec{GraceSeconds: grace, Reason: body.Reason})
+	} else {
+		value, err = s.Store.PauseScope(r.Context(), r.PathValue("id"), body.Actor, body.RequestID)
+	}
 	if err != nil {
 		writeError(w, err)
 		return
@@ -249,7 +273,16 @@ func (s *Server) getPauseOperation(w http.ResponseWriter, r *http.Request) {
 	if targets == nil {
 		targets = []store.PauseTarget{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"operation": value, "targets": targets})
+	response := map[string]any{"operation": value, "targets": targets}
+	if value.Force != nil {
+		stops, err := s.Store.ListForceStops(r.Context(), value.ID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		response["force_stops"] = stops
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {

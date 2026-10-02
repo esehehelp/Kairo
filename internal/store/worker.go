@@ -294,14 +294,24 @@ func (s *Store) RecordTerminal(ctx context.Context, attemptID, leaseID string, e
 	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,?) WHERE id=? AND state IN('prepared','active')`, t, leaseID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='process_exit',terminal_at=? WHERE id=? AND state IN('authorized','started')`, t, executionID); err != nil {
+	// An exit recorded after a force stop was requested is that force stop's
+	// doing (or at least superseded by it): the execution ends force_stopped.
+	cause := "process_exit"
+	var forced int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM force_stops WHERE execution_id=? AND state IN('pending','signalled','terminated')`, executionID).Scan(&forced); err != nil {
+		return err
+	}
+	if forced > 0 {
+		cause = "force_stopped"
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause=?,terminal_at=? WHERE id=? AND state IN('authorized','started')`, cause, t, executionID); err != nil {
 		return err
 	}
 	projectID, err := executionProjectIDTx(ctx, tx, executionID)
 	if err != nil {
 		return err
 	}
-	if err = appendCoordinationEventTx(ctx, tx, "execution_terminal", &projectID, "execution", executionID, &epoch, map[string]any{"attempt_id": attemptID, "exit_code": exitCode, "exit_signal": exitSignal}); err != nil {
+	if err = appendCoordinationEventTx(ctx, tx, "execution_terminal", &projectID, "execution", executionID, &epoch, map[string]any{"attempt_id": attemptID, "exit_code": exitCode, "exit_signal": exitSignal, "terminal_cause": cause}); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -326,6 +336,11 @@ type QuiescenceCandidate struct {
 }
 
 func (s *Store) ListQuiescenceCandidates(ctx context.Context, executorID string) ([]QuiescenceCandidate, error) {
+	// Every executor (in-process or a node agent of any version) asks this on
+	// each tick, which makes it the liveness signal force stop reports use.
+	if err := s.touchExecutor(ctx, executorID); err != nil {
+		return nil, err
+	}
 	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.execution_id,a.state,a.executor_id,a.coordination_epoch,a.pid,a.process_identity,a.exit_code,a.exit_signal,a.continuation_ref,a.progress_json,a.started_at,a.last_heartbeat_at,a.checkpointed_at,a.exited_at,a.quiesced_at,
 	 l.id,l.execution_id,l.attempt_id,l.executor_id,l.coordination_epoch,l.state,l.created_at,l.expires_at
 	 FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=? AND a.state='exited' AND l.state='releasing' ORDER BY a.exited_at`, executorID)

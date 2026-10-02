@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -195,5 +196,85 @@ func TestTaskCancelRefusesARunningExecution(t *testing.T) {
 	}
 	if posted {
 		t.Fatal("task cancel posted a withdraw while an execution was running")
+	}
+}
+
+// pauseServer answers a task pause; the operation ends in finalState.
+func pauseServer(t *testing.T, bodies *[]map[string]any, operation map[string]any) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/v2/scopes":
+			_ = json.NewEncoder(w).Encode(map[string]any{"scopes": []map[string]string{{"id": "scp_task"}}})
+		case "/v2/scopes/scp_task/pause":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			mu.Lock()
+			*bodies = append(*bodies, body)
+			mu.Unlock()
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{"operation_id": "pop_one"})
+		case "/v2/pause-operations/pop_one":
+			_ = json.NewEncoder(w).Encode(operation)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+func TestTaskPauseForceSendsTheForceStop(t *testing.T) {
+	var bodies []map[string]any
+	server := pauseServer(t, &bodies, map[string]any{
+		"operation":   map[string]any{"state": "quiesced"},
+		"targets":     []any{},
+		"force_stops": []map[string]any{{"execution_id": "exe_1", "state": "terminated", "detail": map[string]any{"killed": true}}},
+	})
+	defer server.Close()
+	if err := taskCommand([]string{"pause", "--api", server.URL, "-f", "--grace", "90s", "--reason", "superseded", "--timeout", "1s", "p", "q", "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := taskCommand([]string{"pause", "--api", server.URL, "--timeout", "1s", "p", "q", "t"}); err != nil {
+		t.Fatal(err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("bodies: %v", bodies)
+	}
+	forced, plain := bodies[0], bodies[1]
+	if forced["force"] != true || forced["grace_seconds"] != float64(90) || forced["reason"] != "superseded" {
+		t.Fatalf("forced body: %v", forced)
+	}
+	// a plain pause must stay readable by a daemon predating force stop
+	for _, key := range []string{"force", "grace_seconds", "reason"} {
+		if _, ok := plain[key]; ok {
+			t.Fatalf("plain pause sent %s: %v", key, plain)
+		}
+	}
+}
+
+func TestTaskPauseForceFlagValidation(t *testing.T) {
+	for _, args := range [][]string{
+		{"pause", "--grace", "10s", "p", "q", "t"},
+		{"pause", "--reason", "x", "p", "q", "t"},
+		{"pause", "--force", "--grace", "2h", "p", "q", "t"},
+		{"resume", "--force", "p", "q", "t"},
+	} {
+		if err := taskCommand(append([]string{args[0], "--api", "http://127.0.0.1:1"}, args[1:]...)); err == nil || !strings.Contains(err.Error(), "--") {
+			t.Fatalf("%v: %v", args, err)
+		}
+	}
+}
+
+func TestBlockedPauseNamesTheBlocker(t *testing.T) {
+	var bodies []map[string]any
+	server := pauseServer(t, &bodies, map[string]any{
+		"operation": map[string]any{"state": "blocked"},
+		"targets":   []map[string]any{{"execution_id": "exe_1", "state": "blocked", "blocker_reason": "agent_lacks_force_stop"}},
+	})
+	defer server.Close()
+	err := taskCommand([]string{"pause", "--api", server.URL, "--force", "--timeout", "1s", "p", "q", "t"})
+	if err == nil || !strings.Contains(err.Error(), "exe_1: agent_lacks_force_stop") || !strings.Contains(err.Error(), "upgrade that agent") {
+		t.Fatalf("error = %v", err)
 	}
 }

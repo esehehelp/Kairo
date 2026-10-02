@@ -133,7 +133,7 @@ func taskCancel(args []string) error {
 			continue
 		}
 		if e.StartedAt != nil || e.State == "started" {
-			return fmt.Errorf("execution %s of %s/%s/%s is running (%s); pause the task first", e.ID, fs.Arg(0), fs.Arg(1), fs.Arg(2), e.State)
+			return fmt.Errorf("execution %s of %s/%s/%s is running (%s); pause the task first, or end it with `task pause --force`", e.ID, fs.Arg(0), fs.Arg(1), fs.Arg(2), e.State)
 		}
 		todo = append(todo, e.ID)
 	}
@@ -168,6 +168,11 @@ func scopeCommand(kind string, args []string) error {
 	waitTimeout := fs.Duration("timeout", 30*time.Minute, "maximum time to wait for pause convergence")
 	actor := fs.String("actor", os.Getenv("USERNAME"), "audit actor")
 	requestID := fs.String("request-id", id.New("cli"), "idempotency request ID")
+	// --force / -f: end the captured executions instead of suspending them.
+	force := fs.Bool("force", false, "force stop: terminate running process trees (graceful stop, then kill after --grace) and withdraw unstarted executions; the task ends stopped")
+	fs.BoolVar(force, "f", false, "shorthand for --force")
+	grace := fs.Duration("grace", 30*time.Second, "with --force: time between the graceful stop and the kill")
+	reason := fs.String("reason", "", "with --force: why the work is stopped (recorded)")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -177,6 +182,20 @@ func scopeCommand(kind string, args []string) error {
 	}
 	if action == "resume" && *noWait {
 		return errors.New("--no-wait applies only to pause")
+	}
+	graceSet, reasonSet := false, false
+	fs.Visit(func(f *flag.Flag) {
+		graceSet = graceSet || f.Name == "grace"
+		reasonSet = reasonSet || f.Name == "reason"
+	})
+	if !*force && (graceSet || reasonSet) {
+		return errors.New("--grace and --reason apply only to pause --force")
+	}
+	if action == "resume" && *force {
+		return errors.New("--force applies only to pause")
+	}
+	if *grace < 0 || *grace > time.Hour {
+		return errors.New("--grace must be between 0 and 1h")
 	}
 
 	query := url.Values{"project": {fs.Arg(0)}}
@@ -203,7 +222,12 @@ func scopeCommand(kind string, args []string) error {
 	}
 	path := "/v2/scopes/" + url.PathEscape(listed.Scopes[0].ID) + "/" + action
 	var body any
-	if action == "pause" {
+	if action == "pause" && *force {
+		// Only a forced pause sends these fields: a daemon predating force stop
+		// rejects them instead of pausing without force.
+		body = map[string]any{"actor": *actor, "request_id": *requestID, "force": true,
+			"grace_seconds": int((*grace + time.Second - 1) / time.Second), "reason": *reason}
+	} else if action == "pause" {
 		body = map[string]string{"actor": *actor, "request_id": *requestID}
 	} else {
 		body = map[string]string{"actor": *actor}
@@ -235,27 +259,93 @@ func waitForPause(apiURL, operationID string, timeout time.Duration) error {
 		if err != nil {
 			return err
 		}
-		var response struct {
-			Operation struct {
-				State string `json:"state"`
-			} `json:"operation"`
-		}
+		var response pauseOperationResponse
 		if err := json.Unmarshal(payload, &response); err != nil {
 			return fmt.Errorf("decode pause operation: %w", err)
 		}
 		switch response.Operation.State {
 		case "quiesced":
 			_, err = os.Stdout.Write(payload)
+			for _, line := range response.forceSummary() {
+				fmt.Fprintln(os.Stderr, line)
+			}
 			return err
 		case "blocked":
 			_, _ = os.Stdout.Write(payload)
-			return fmt.Errorf("pause operation %s", response.Operation.State)
+			return fmt.Errorf("pause operation %s%s", response.Operation.State, response.blockers())
 		}
 		if time.Now().After(deadline) {
 			return fmt.Errorf("timed out waiting for pause operation %s", operationID)
 		}
 		time.Sleep(time.Second)
 	}
+}
+
+type pauseOperationResponse struct {
+	Operation struct {
+		State string `json:"state"`
+	} `json:"operation"`
+	Targets []struct {
+		ExecutionID   string  `json:"execution_id"`
+		State         string  `json:"state"`
+		BlockerReason *string `json:"blocker_reason"`
+	} `json:"targets"`
+	ForceStops []struct {
+		ExecutionID string          `json:"execution_id"`
+		ExecutorID  *string         `json:"executor_id"`
+		State       string          `json:"state"`
+		Detail      json.RawMessage `json:"detail"`
+	} `json:"force_stops"`
+}
+
+// blockerHints explain the blocker reasons an operator can act on.
+var blockerHints = map[string]string{
+	"execution_not_checkpointable": "it cannot checkpoint; end it with pause --force",
+	"checkpoint_rejected":          "it rejected the checkpoint; end it with pause --force",
+	"agent_lacks_force_stop":       "its node agent is running but does not pick up force stops: upgrade that agent",
+	"executor_unreachable":         "its executor has not been seen recently: check that node's agent",
+}
+
+// blockers lists the blocked targets of an operation for an error message.
+func (r pauseOperationResponse) blockers() string {
+	var parts []string
+	for _, t := range r.Targets {
+		if t.State != "blocked" || t.BlockerReason == nil {
+			continue
+		}
+		part := t.ExecutionID + ": " + *t.BlockerReason
+		if hint := blockerHints[*t.BlockerReason]; hint != "" {
+			part += " (" + hint + ")"
+		}
+		parts = append(parts, part)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return ": " + strings.Join(parts, "; ")
+}
+
+// forceSummary says how each execution of a forced pause ended.
+func (r pauseOperationResponse) forceSummary() []string {
+	var lines []string
+	for _, f := range r.ForceStops {
+		var detail struct {
+			Killed      bool `json:"killed"`
+			AlreadyGone bool `json:"already_gone"`
+		}
+		_ = json.Unmarshal(f.Detail, &detail)
+		how := "stopped after the graceful stop"
+		switch {
+		case f.State == "withdrawn":
+			how = "withdrawn before it started"
+		case detail.AlreadyGone:
+			how = "had already exited"
+		case detail.Killed:
+			how = "killed"
+		}
+		lines = append(lines, fmt.Sprintf("force stop: %s %s", f.ExecutionID, how))
+	}
+	return lines
 }
 
 func scopeArguments(kind string) string {

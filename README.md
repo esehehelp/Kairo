@@ -110,6 +110,35 @@ stale; it is never made free based on time alone.
 alive on it; the quarantine has taken full effect once that count is zero.
 Every step is recorded as a coordination event.
 
+### Force stop
+
+`kairo task pause --force|-f [--grace 30s] [--reason ...] PROJECT QUEUE TASK`
+(also `queue` / `project pause --force`) is a pause operation that ends what
+it captures instead of suspending it, checkpointable or not:
+
+- a started execution's attempt gets a force stop that its executor (in the
+  daemon or a node agent) carries out on the whole process tree: a graceful
+  stop first (Windows: CTRL_BREAK to the launcher's process group; Linux and
+  WSL: SIGTERM to the process group and to every process carrying the
+  attempt's `KAIRO_ATTEMPT_ID`), then, after the grace period, a kill of
+  everything left (Windows: the attempt's job object and `taskkill /T /F`;
+  Linux/WSL: SIGKILL). The execution ends with terminal cause
+  `force_stopped`; a suspend in progress is not waited for.
+- an execution that has not started is withdrawn (`withdrawn_before_start`),
+  a reserved lease revoked as for any pause.
+- leases are released only through the ordinary quiescence proof, and the
+  operation is `quiesced` once the executors also confirm the trees are gone.
+- the task ends in state `stopped`: no continuation or restart is planned, and
+  its dependants are blocked as for a failed task. The task result records the
+  operation, actor and reason.
+
+Force stops are delivered like other executor work (`force-stop-orders` /
+`force-stop-ack` on the agent API, acknowledged `signalled` then
+`terminated`). One that no executor picks up within 30 s blocks its pause
+target with `agent_lacks_force_stop` (the node agent is polling but predates
+force stop: upgrade it) or `executor_unreachable` (it has not been seen). A
+daemon predating force stop rejects `--force` instead of pausing without it.
+
 ### Gang executions (multi-node)
 
 `[tasks.execution.gang]` runs a task as `size` ranks on distinct nodes (DDP

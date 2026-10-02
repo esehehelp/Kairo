@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"encoding/json"
 
 	"kairo/internal/store"
 )
@@ -26,6 +27,8 @@ type Coordinator interface {
 	ReleaseReservation(ctx context.Context, leaseID string, epoch int64, reason string) error
 	ListQuarantineTerminations(ctx context.Context, executorID string) ([]store.QuarantineTermination, error)
 	MarkQuarantineTerminated(ctx context.Context, attemptID string) error
+	ForceStopOrders(ctx context.Context, executorID string) ([]store.ForceStopOrder, error)
+	AckForceStop(ctx context.Context, attemptID, phase string, detail json.RawMessage) error
 }
 
 var _ Coordinator = (*store.Store)(nil)
