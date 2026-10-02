@@ -3,16 +3,17 @@
 > **Kairo owns generic Project/Task orchestration semantics, but never
 > interprets project-specific state.**
 
-Kairo is a single-Windows-host pilot for safely orchestrating cooperative ML
-work. It has two layers. A small declarative layer stores a ProjectSpec,
-reconciles a static Task DAG, and applies an explicitly selected generic task
-policy. The existing V3 coordination layer receives immutable Execution
-requests and continues to own Attempt, Lease, Command, provider, and executor
+Kairo safely orchestrates cooperative ML work on a few machines: one daemon
+(with its own executors, here on a Windows host with WSL) and node agents on
+other hosts. It has two layers. A small declarative orchestration layer stores
+a ProjectSpec, reconciles a static Task DAG, and applies an explicitly
+selected generic task policy. The coordination layer receives immutable
+Execution requests and owns Attempt, Lease, Command, provider, and executor
 mechanics.
 
 Task is a durable logical object and can have a sequence of immutable
 Executions. Execution, Attempt, and Lease remain distinct physical lifecycle
-objects. At the lower V3 boundary, project, queue, and task names are still
+objects. At the coordination boundary, project, queue, and task names are
 opaque coordination scopes; the orchestration layer deliberately maps its
 logical Tasks onto those scopes.
 
@@ -26,20 +27,29 @@ or cleanup language.
 
 ## Start
 
-The V3 coordination schema is intentionally fresh-only. Archive a V1/V2
-database before starting this version; semantic workflow state is not migrated.
-
 ```powershell
-go run ./cmd/kairo serve --config examples/kairo.toml
+# TLS material: a private CA and a server certificate for every address
+# clients use to reach the daemon (kairo tls issue re-issues it later).
+go run ./cmd/kairo tls init --dir local/tls --host 127.0.0.1 --host localhost --host 192.168.1.12
+go run ./cmd/kairo serve --config examples/kairo.toml     # creates the database
+# In another terminal: an operator token, saved where the CLI looks for it.
+go run ./cmd/kairo token create --config examples/kairo.toml --name operator --role admin --save
+go run ./cmd/kairo doctor
 go run ./cmd/kairo project validate examples/project-spec.toml
-go run ./cmd/kairo project apply --api http://127.0.0.1:7474 examples/project-spec.toml
-go run ./cmd/kairo project status --api http://127.0.0.1:7474 example-project
+go run ./cmd/kairo project apply examples/project-spec.toml
+go run ./cmd/kairo project status example-project
 go run ./cmd/kairo execution submit examples/execution.toml
 go run ./cmd/kairo execution list --project llm-develop
 go run ./cmd/kairo project pause llm-develop
 go run ./cmd/kairo project resume llm-develop
 go run ./cmd/kairo resource status
 ```
+
+The example configuration listens on loopback over plain HTTP (with
+`observe_only = true`), so its CLI needs `--api http://127.0.0.1:7474` or
+`KAIRO_API`; a daemon reachable from other hosts needs the TLS settings below.
+The CLI sends a token over plain HTTP only to a loopback address. Flags go
+before positional arguments.
 
 Pause closes the selected coordination scope, fences concurrent launches, and
 waits by default until all captured executions are quiesced and their leases
@@ -48,9 +58,7 @@ Resume only reopens admission; it never recalls a suspend command or decides
 which execution should run next.
 
 `project apply` stores the declaration once; the daemon performs subsequent
-reconciliation. The ProjectSpec contract lives at `/orchestration/v1` and is
-versioned independently of `/v2/executions`, whose V3 coordination semantics
-are unchanged. Applying the same normalized declaration is idempotent. A
+reconciliation. Applying the same normalized declaration is idempotent. A
 declared Task is immutable; a later complete ProjectSpec may add Tasks but
 cannot mutate an existing Task, and omission does not cancel it.
 
@@ -74,6 +82,122 @@ CPU, RAM, and disk reservations are admission accounting rather than hard OS
 limits. GPU exclusion is a coordination guarantee among Kairo participants;
 external processes are observed and excluded but cannot be physically fenced.
 
+## Authentication and TLS
+
+Every request needs `Authorization: Bearer <token>`, from loopback too; only
+`GET /health` is open. A missing, unknown or revoked token gets 401, a token
+whose role does not allow the route 403. Tokens are random 256-bit values
+stored only as SHA-256 hashes; revocation takes effect immediately.
+
+| Role | May call | Used by |
+|---|---|---|
+| `read` | every operator `GET` | dashboards |
+| `admin` | every operator route | the CLI, kairo-monitor, project controllers |
+| `node` | `/api/agent/*`, for one node | a node agent |
+| worker | `/api/worker/*`, for one attempt | the processes of an attempt |
+
+Operator and node tokens are managed on the daemon host by opening its
+database directly (local file access is the root of trust; the daemon may be
+running):
+
+```powershell
+kairo token create --config kairo.toml --name operator --role admin --save
+kairo token create --config kairo.toml --name dashboard --role read --out dashboard.token
+kairo token create --config kairo.toml --name pve0-neo-train --role node --node pve0-neo-train
+kairo token list --config kairo.toml
+kairo token revoke --config kairo.toml pve0-neo-train
+```
+
+The plaintext is shown once. `--save` writes it to the user's config
+directory (`%APPDATA%\kairo\token`, `~/.config/kairo/token`).
+
+The CLI and the SDK's `KairoControllerClient` find the daemon, token and CA the
+same way:
+
+- URL: `--api`, else `KAIRO_API`, else `https://127.0.0.1:7474`;
+- token: `KAIRO_TOKEN`, else the file named by `KAIRO_TOKEN_FILE`, else
+  `<config dir>/kairo/token`;
+- CA: `KAIRO_CA_FILE`, else `<config dir>/kairo/ca.pem` if present, else the
+  system roots.
+
+Control traffic never goes through `HTTP(S)_PROXY` and never follows a
+redirect.
+
+A node token is bound to its node: the agent may register only that node, and
+every operation is checked against the node owning the executor, lease,
+attempt, provider or log it names. An executor, provider or resource never
+moves to another node. Against an observe-only daemon an agent's polls find
+nothing to do and its actuating operations are refused (423).
+
+Each attempt gets its own worker token at launch authorization, in
+`KAIRO_ATTEMPT_TOKEN`. It identifies the attempt (and the lease and epoch it
+was issued under) to the worker API, and stops working once the attempt has
+quiesced or was fenced (for instance marked lost by a daemon restart). The
+executor never passes its own process's `KAIRO_*` variables to an attempt.
+
+### TLS
+
+`kairo tls init --dir DIR --host H...` writes `ca.pem`, `ca-key.pem`,
+`server.pem` and `server-key.pem` (ECDSA P-256; the server certificate covers
+every `--host`, IP or DNS name). `kairo tls issue --dir DIR --host H...`
+re-issues the server certificate from the same CA, for a new address. Keep
+`ca-key.pem` on the daemon host only.
+
+Daemon configuration:
+
+```toml
+listen = "0.0.0.0:7474"
+advertise_url = "https://192.168.1.12:7474"  # what attempts are told
+tls_cert_file = "local/tls/server.pem"
+tls_key_file = "local/tls/server-key.pem"
+tls_ca_file = "local/tls/ca.pem"             # handed to attempts
+```
+
+The daemon serves TLS 1.3 only. It refuses to listen on an address other hosts
+can reach without TLS unless `insecure_http = true`, and with TLS
+`advertise_url` must be https. Clients trust the daemon through `ca.pem`:
+copy it to `<config dir>/kairo/ca.pem` (or point `KAIRO_CA_FILE` at it) for the
+CLI and controllers, set `ca_file` for a node agent, and start Node-based
+tools with `NODE_EXTRA_CA_CERTS=ca.pem`. Attempts receive the CA itself in
+`KAIRO_API_CA` (base64 DER), so native, WSL and remote attempts need no path.
+
+Node agent configuration:
+
+```toml
+server_url = "https://192.168.1.12:7474"
+token = "kairo_node_..."
+ca_file = "/etc/kairo/ca.pem"
+# attempt_api_url = "https://192.168.1.12:7474"  # KAIRO_API_URL of this node's attempts
+```
+
+An agent refuses an `http://` URL unless `insecure_http = true`.
+
+## API
+
+| Method | Path | Role |
+|---|---|---|
+| GET | `/health` | none |
+| GET | `/api/whoami` | any token |
+| POST | `/api/projects` (apply a ProjectSpec) | admin |
+| GET | `/api/projects/{project}` | read |
+| POST, GET | `/api/executions` | admin, read |
+| GET | `/api/executions/{id}` | read |
+| POST | `/api/executions/{id}/withdraw` | admin |
+| GET | `/api/attempts`, `/api/events`, `/api/pause-operations/{id}` | read |
+| GET | `/api/scopes`, `/api/scopes/{id}` | read |
+| POST | `/api/scopes/{id}/pause`, `/api/scopes/{id}/resume` | admin |
+| GET | `/api/nodes/quarantines` | read |
+| POST, DELETE | `/api/nodes/{id}/quarantine` | admin |
+| GET | `/api/resources` | read |
+| POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
+| POST | `/api/agent/{operation}`, `/api/agent/logs` | node |
+| POST | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
+| GET | `/api/worker/commands` | worker |
+| POST | `/api/worker/commands/{command}/acks` | worker |
+
+Errors are `{"error": ..., "code": ...}`. An empty `actor` in a pause, resume
+or quarantine request is recorded as the token's name.
+
 ## Coordination model
 
 - Execution request: immutable and one-shot (`waiting`, `authorized`,
@@ -95,8 +219,8 @@ stale; it is never made free based on time alone.
 
 ### Node quarantine
 
-`kairo node quarantine <NODE_ID|--all> --reason ...` stops all work on a node
-(or every node) until `kairo node release <NODE_ID|--all>`:
+`kairo node quarantine --reason ... <NODE_ID>` (or `--all`) stops all work on a
+node (or every node) until `kairo node release <NODE_ID>` (or `--all`):
 
 - its executors reserve nothing and trigger no priority preemption;
 - a running checkpointable attempt gets a `suspend` command (origin
@@ -135,9 +259,9 @@ it captures instead of suspending it, checkpointable or not:
 Force stops are delivered like other executor work (`force-stop-orders` /
 `force-stop-ack` on the agent API, acknowledged `signalled` then
 `terminated`). One that no executor picks up within 30 s blocks its pause
-target with `agent_lacks_force_stop` (the node agent is polling but predates
-force stop: upgrade it) or `executor_unreachable` (it has not been seen). A
-daemon predating force stop rejects `--force` instead of pausing without it.
+target with `force_stop_not_picked_up` (the executor polls but has not picked
+it up: check that node's agent log) or `executor_unreachable` (it has not been
+seen).
 
 ### Gang executions (multi-node)
 
@@ -187,16 +311,20 @@ with AttemptSession.from_environment() as kairo:
             break
 ```
 
-Managed attempts require `KAIRO_EXECUTION_ID`, `KAIRO_ATTEMPT_ID`,
-`KAIRO_LEASE_ID`, `KAIRO_COORDINATION_EPOCH`, and `KAIRO_API_URL`. Rank zero
-polls and acknowledges commands; the PyTorch adapter broadcasts the command,
+Managed attempts receive `KAIRO_API_URL`, `KAIRO_EXECUTION_ID`,
+`KAIRO_ATTEMPT_ID`, `KAIRO_ATTEMPT_TOKEN` and, when the daemon serves TLS,
+`KAIRO_API_CA`; also `KAIRO_NODE_ID`, `KAIRO_EXECUTOR_ID`,
+`KAIRO_RESOURCE_IDS`, `KAIRO_RESOURCE_BINDINGS`, `CUDA_VISIBLE_DEVICES`,
+`KAIRO_CONTINUATION_REF` when resuming, and the gang variables for a gang
+rank. WSL attempts get them through `WSLENV`, never on the `wsl.exe` command
+line. Rank zero polls and acknowledges commands; the PyTorch adapter broadcasts the command,
 runs every rank's callback, and only publishes the continuation after the
 distributed barrier. Commands may be redelivered, so checkpoint publication
 must remain idempotent by command ID.
 
 ### Low-level project-owned controller policy
 
-Projects submitting directly to the V3 execution API can still opt into
+Projects submitting directly to the execution API can still opt into
 `ResumeAfterKairoPreemption`. The policy snapshot and canonical submission are
 written to the project's controller journal before the initial API call:
 
@@ -204,7 +332,7 @@ written to the project's controller journal before the initial API call:
 from kairo_sdk import ControllerJournal, KairoControllerClient, ProjectController
 
 controller = ProjectController(
-    KairoControllerClient("http://127.0.0.1:7474"),
+    KairoControllerClient(),  # KAIRO_API / KAIRO_TOKEN / KAIRO_CA_FILE, or the config dir
     ControllerJournal("local/llm-controller.db"),
 )
 execution_id = controller.submit_with_resume_after_kairo_preemption(
@@ -238,16 +366,29 @@ server-owned workflow state or semantic default.
    ownership nor loss of an acknowledged continuation.
 4. A project-selected short high-priority execution can trigger cooperative
    preemption; a versioned Task policy decides whether to resume orchestrated
-   work, while direct V3 users retain the project-owned controller option.
+   work, while direct execution API users retain the project-owned controller
+   option.
 5. Redelivery of one command cannot corrupt checkpoint publication.
 6. A static Task DAG submits a node only after all dependencies succeed, and
    replay cannot create a duplicate Execution for one policy decision.
 7. A two-GPU DDP execution receives an all-or-nothing gang lease and all ranks
    quiesce before release.
 
-Multi-node execution, cloud provisioning, RBAC/TLS, service supervision,
+Cloud provisioning, roles beyond the four above, service supervision,
 cron/fair-share scheduling, and hard CPU/RAM enforcement remain outside this
 pilot.
+
+## Upgrading a running installation
+
+A daemon (or node agent) that starts marks the attempts its executors had
+running as lost: it cannot vouch for processes a previous incarnation
+launched. Drain before replacing either binary: pause the projects, wait
+until no attempt is authorized, running or quiescing, then stop the agents
+and the daemon, back up the database (with its `-wal` and `-shm` files),
+replace the binaries and configurations, start the daemon, then the agents,
+check `kairo doctor` and `kairo resource status`, and resume. Code that queued
+executions will load (scripts, the editable SDK) must not change while they
+wait.
 
 ## Verification
 

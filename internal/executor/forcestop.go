@@ -32,8 +32,7 @@ const forceStopCheckInterval = time.Second
 // kill of everything left once the grace period the daemon reports is over.
 // It acknowledges 'signalled' after the graceful stop and 'terminated' once no
 // process of the tree is left. Quiescence and lease release still follow from
-// reconcileQuiescence. Failures are logged, never fatal to the tick: a daemon
-// predating force stop simply has no orders.
+// reconcileQuiescence. Failures are logged, never fatal to the tick.
 func (e *Local) carryOutForceStops(ctx context.Context) {
 	orders, err := e.Store.ForceStopOrders(ctx, e.ID)
 	if err != nil {
