@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"kairo/internal/config"
 	"kairo/internal/executor"
 	"kairo/internal/provider"
+	"kairo/internal/secfile"
 	"kairo/internal/store"
 	"kairo/internal/tlsutil"
 )
@@ -92,6 +94,11 @@ func serve(args []string) error {
 		return err
 	}
 	defer st.Close()
+	// Anyone who can write the database can mint tokens: keep it (and its
+	// WAL, which holds recent pages) to this user.
+	if err := secfile.RestrictExisting(daemonConfig.DatabasePath, daemonConfig.DatabasePath+"-wal", daemonConfig.DatabasePath+"-shm"); err != nil {
+		return fmt.Errorf("restrict database to its owner: %w", err)
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	providerSet := map[string]provider.Provider{}
 	attributes, _ := json.Marshal(daemonConfig.Node.Labels)
@@ -154,6 +161,16 @@ func serve(args []string) error {
 		}
 		if apiCA, err = tlsutil.CAEnv(caPEM); err != nil {
 			return fmt.Errorf("TLS CA %s: %w", daemonConfig.TLSCAFile, err)
+		}
+		// Attempts reach the daemon at advertise_url and trust only the CA:
+		// a certificate that does not chain to it or cover that host would
+		// leave the daemon healthy while every attempt fails.
+		advertised, err := url.Parse(daemonConfig.AdvertiseURL)
+		if err != nil {
+			return err
+		}
+		if err := tlsutil.VerifyServer(cert, caPEM, advertised.Hostname()); err != nil {
+			return fmt.Errorf("TLS certificate %s does not serve advertise_url %s with CA %s (kairo tls issue --host %s): %w", daemonConfig.TLSCertFile, daemonConfig.AdvertiseURL, daemonConfig.TLSCAFile, advertised.Hostname(), err)
 		}
 	}
 	errCh := make(chan error, 1+len(daemonConfig.Executors))

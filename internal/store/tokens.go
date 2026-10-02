@@ -91,7 +91,7 @@ func (s *Store) CreateAPIToken(ctx context.Context, name, role, nodeID string) (
 }
 
 func (s *Store) ListAPITokens(ctx context.Context) ([]APIToken, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,role,node_id,created_at,last_used_at,revoked_at FROM api_tokens ORDER BY created_at,id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,role,node_id,created_at,last_used_at,revoked_at FROM api_tokens ORDER BY created_at,rowid`)
 	if err != nil {
 		return nil, err
 	}

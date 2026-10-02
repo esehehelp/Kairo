@@ -141,7 +141,16 @@ executor never passes its own process's `KAIRO_*` variables to an attempt.
 `server.pem` and `server-key.pem` (ECDSA P-256; the server certificate covers
 every `--host`, IP or DNS name). `kairo tls issue --dir DIR --host H...`
 re-issues the server certificate from the same CA, for a new address. Keep
-`ca-key.pem` on the daemon host only.
+`ca-key.pem` on the daemon host only. Private keys and token files written by
+`kairo` are restricted to the current user, and the daemon restricts its
+database (and WAL) the same way at start: anyone who can write the database
+can mint tokens. On Windows, where file modes are ignored, this replaces the
+inherited ACL with one granting only the user and SYSTEM.
+
+The daemon refuses to start when its certificate does not chain to
+`tls_ca_file` or does not cover the `advertise_url` host. During a CA rotation
+`tls_ca_file` (and an agent's `ca_file`) may hold the old and the new CA;
+attempts receive every certificate in it.
 
 Daemon configuration:
 

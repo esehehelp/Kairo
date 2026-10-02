@@ -241,3 +241,58 @@ func TestCertificateExtensions(t *testing.T) {
 		t.Fatalf("leaf not signed by CA: %v", err)
 	}
 }
+
+// During a CA rotation the CA file holds several certificates; attempts get
+// all of them.
+func TestCAEnvCarriesEveryCertificate(t *testing.T) {
+	first, second := t.TempDir(), t.TempDir()
+	for _, dir := range []string{first, second} {
+		if err := InitCA(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a, _ := os.ReadFile(filepath.Join(first, CACertFile))
+	b, _ := os.ReadFile(filepath.Join(second, CACertFile))
+	env, err := CAEnv(append(append([]byte{}, a...), b...))
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := CAFromEnv(env)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(back, append(append([]byte{}, a...), b...)) {
+		t.Fatalf("round trip lost a certificate:\n%s", back)
+	}
+	if _, err := CAEnv([]byte("not a certificate")); err == nil {
+		t.Fatal("CAEnv accepted no certificate")
+	}
+}
+
+func TestVerifyServerChecksChainAndHost(t *testing.T) {
+	dir, other := t.TempDir(), t.TempDir()
+	if err := InitCA(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := InitCA(other); err != nil {
+		t.Fatal(err)
+	}
+	if err := IssueServer(dir, []string{"192.168.1.12", "localhost"}); err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.LoadX509KeyPair(filepath.Join(dir, ServerCertFile), filepath.Join(dir, ServerKeyFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ca, _ := os.ReadFile(filepath.Join(dir, CACertFile))
+	otherCA, _ := os.ReadFile(filepath.Join(other, CACertFile))
+	if err := VerifyServer(cert, ca, "192.168.1.12"); err != nil {
+		t.Fatalf("valid certificate: %v", err)
+	}
+	if err := VerifyServer(cert, ca, "192.168.1.13"); err == nil {
+		t.Fatal("certificate accepted for a host it does not cover")
+	}
+	if err := VerifyServer(cert, otherCA, "192.168.1.12"); err == nil {
+		t.Fatal("certificate accepted under another CA")
+	}
+}

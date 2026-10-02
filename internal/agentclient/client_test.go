@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -417,5 +418,56 @@ func TestClientTrustsOnlyTheDaemonCA(t *testing.T) {
 	registerRemote(t, New(ts.URL, token, trusted))
 	if _, err := New(ts.URL, token, nil).Register(context.Background(), store.Node{ID: "remote", Name: "remote", OS: "linux", Architecture: "amd64"}, nil, nil); err == nil {
 		t.Fatal("a client without the daemon CA must not connect")
+	}
+}
+
+// The node token never follows a redirect.
+func TestClientDoesNotFollowRedirects(t *testing.T) {
+	var leaked bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		leaked = r.Header.Get("Authorization") != ""
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer redirect.Close()
+	_, err := New(redirect.URL, "kairo_node_secret", nil).Register(context.Background(), store.Node{ID: "remote", Name: "remote"}, nil, nil)
+	if err == nil || leaked {
+		t.Fatalf("redirect followed: err=%v leaked=%v", err, leaked)
+	}
+}
+
+// A log the daemon refuses for good (no such attempt) is not read and sent
+// again on every sweep.
+func TestLogShipperGivesUpOnRefusedLogs(t *testing.T) {
+	_, ts, token, _ := newDaemon(t)
+	var appends int
+	counting := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/agent/logs" {
+			appends++
+		}
+		proxy, _ := http.NewRequest(r.Method, ts.URL+r.URL.Path, r.Body)
+		proxy.Header = r.Header
+		resp, err := http.DefaultClient.Do(proxy)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer resp.Body.Close()
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+	}))
+	defer counting.Close()
+	nodeLogs := t.TempDir()
+	if err := os.WriteFile(filepath.Join(nodeLogs, "att_orphan.stderr.log"), []byte("old run\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	shipper := &LogShipper{Client: New(counting.URL, token, nil), Dir: nodeLogs}
+	for range 3 {
+		shipper.Sweep(context.Background())
+	}
+	if appends != 1 {
+		t.Fatalf("orphan log sent %d times", appends)
 	}
 }

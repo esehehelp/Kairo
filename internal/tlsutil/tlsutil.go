@@ -28,6 +28,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"kairo/internal/secfile"
 )
 
 // File names written into the TLS directory.
@@ -204,15 +206,17 @@ func ServerConfig() *tls.Config {
 	return &tls.Config{MinVersion: tls.VersionTLS13}
 }
 
-// CAEnv encodes the first certificate in caPEM as single-line base64 DER,
-// safe to pass in an environment variable.
+// CAEnv encodes every certificate in caPEM (several during a CA rotation) as
+// single-line base64 of their concatenated DER, safe to pass in an
+// environment variable.
 func CAEnv(caPEM []byte) (string, error) {
+	var der []byte
 	rest := caPEM
 	for {
 		var block *pem.Block
 		block, rest = pem.Decode(rest)
 		if block == nil {
-			return "", errors.New("no CA certificate found in PEM data")
+			break
 		}
 		if block.Type != "CERTIFICATE" {
 			continue
@@ -220,8 +224,12 @@ func CAEnv(caPEM []byte) (string, error) {
 		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
 			return "", fmt.Errorf("parse CA certificate: %w", err)
 		}
-		return base64.StdEncoding.EncodeToString(block.Bytes), nil
+		der = append(der, block.Bytes...)
 	}
+	if len(der) == 0 {
+		return "", errors.New("no CA certificate found in PEM data")
+	}
+	return base64.StdEncoding.EncodeToString(der), nil
 }
 
 // CAFromEnv decodes a CAEnv value back into PEM.
@@ -230,10 +238,44 @@ func CAFromEnv(value string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("decode CA: %w", err)
 	}
-	if _, err := x509.ParseCertificate(der); err != nil {
+	certs, err := x509.ParseCertificates(der)
+	if err != nil {
 		return nil, fmt.Errorf("parse CA certificate: %w", err)
 	}
-	return encodeCert(der), nil
+	if len(certs) == 0 {
+		return nil, errors.New("no CA certificate in value")
+	}
+	var out []byte
+	for _, cert := range certs {
+		out = append(out, encodeCert(cert.Raw)...)
+	}
+	return out, nil
+}
+
+// VerifyServer checks that cert chains to a certificate of caPEM and covers
+// host, the address clients and attempts reach the daemon at.
+func VerifyServer(cert tls.Certificate, caPEM []byte, host string) error {
+	pool, err := LoadCertPool(caPEM)
+	if err != nil {
+		return err
+	}
+	leaf := cert.Leaf
+	if leaf == nil {
+		if len(cert.Certificate) == 0 {
+			return errors.New("no server certificate")
+		}
+		if leaf, err = x509.ParseCertificate(cert.Certificate[0]); err != nil {
+			return err
+		}
+	}
+	intermediates := x509.NewCertPool()
+	for _, der := range cert.Certificate[1:] {
+		if c, err := x509.ParseCertificate(der); err == nil {
+			intermediates.AddCert(c)
+		}
+	}
+	_, err = leaf.Verify(x509.VerifyOptions{Roots: pool, Intermediates: intermediates, DNSName: host, KeyUsages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}})
+	return err
 }
 
 func loadCA(dir string) (*x509.Certificate, crypto.Signer, error) {
@@ -322,6 +364,19 @@ func writeExclusive(path string, data []byte, mode os.FileMode) error {
 		_ = os.Remove(path)
 		return err
 	}
+	return restrictSecret(path, mode)
+}
+
+// restrictSecret makes an owner-only file owner-only on Windows too, where
+// the mode is ignored and the directory's entries are inherited.
+func restrictSecret(path string, mode os.FileMode) error {
+	if mode&0o077 != 0 {
+		return nil
+	}
+	if err := secfile.Restrict(path); err != nil {
+		_ = os.Remove(path)
+		return fmt.Errorf("restrict %s to its owner: %w", path, err)
+	}
 	return nil
 }
 
@@ -346,6 +401,12 @@ func writeReplace(path string, data []byte, mode os.FileMode) error {
 	if err := f.Close(); err != nil {
 		_ = os.Remove(tmp)
 		return err
+	}
+	if mode&0o077 == 0 {
+		if err := secfile.Restrict(tmp); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("restrict %s to its owner: %w", path, err)
+		}
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)

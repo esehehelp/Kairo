@@ -34,7 +34,11 @@ type Client struct {
 // never goes through an HTTP(S)_PROXY.
 func New(baseURL, token string, tlsConfig *tls.Config) *Client {
 	transport := &http.Transport{Proxy: nil, TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true, IdleConnTimeout: 90 * time.Second}
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: &http.Client{Timeout: 60 * time.Second, Transport: transport}}
+	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: &http.Client{
+		Timeout: 60 * time.Second, Transport: transport,
+		// A redirect would carry the node token elsewhere: never follow one.
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}
 }
 
 // Error is a non-sentinel failure reported by the daemon.
@@ -248,6 +252,9 @@ type LogShipper struct {
 
 	mu      sync.Mutex
 	shipped map[string]int64
+	// refused holds logs the daemon will never take (no such attempt, or
+	// another node's), so they are not read and re-sent every sweep.
+	refused map[string]bool
 }
 
 func (s *LogShipper) Run(ctx context.Context) error {
@@ -273,6 +280,7 @@ func (s *LogShipper) Sweep(ctx context.Context) {
 	defer s.mu.Unlock()
 	if s.shipped == nil {
 		s.shipped = map[string]int64{}
+		s.refused = map[string]bool{}
 	}
 	if s.Chunk <= 0 {
 		s.Chunk = 512 << 10
@@ -280,10 +288,16 @@ func (s *LogShipper) Sweep(ctx context.Context) {
 	matches, _ := filepath.Glob(filepath.Join(s.Dir, "*.log"))
 	for _, path := range matches {
 		name := filepath.Base(path)
-		if !strings.HasSuffix(name, ".stdout.log") && !strings.HasSuffix(name, ".stderr.log") {
+		if !strings.HasSuffix(name, ".stdout.log") && !strings.HasSuffix(name, ".stderr.log") || s.refused[name] {
 			continue
 		}
-		if err := s.shipFile(ctx, path, name); err != nil && ctx.Err() == nil {
+		err := s.shipFile(ctx, path, name)
+		if errors.Is(err, store.ErrNotFound) || errors.Is(err, api.ErrForbidden) {
+			s.refused[name] = true
+			fmt.Fprintf(os.Stderr, "kairo agent: not shipping %s: %v\n", name, err)
+			continue
+		}
+		if err != nil && ctx.Err() == nil {
 			fmt.Fprintf(os.Stderr, "kairo agent: ship %s: %v\n", name, err)
 		}
 	}

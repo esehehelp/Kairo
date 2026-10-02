@@ -11,6 +11,7 @@ import (
 	"text/tabwriter"
 
 	"kairo/internal/config"
+	"kairo/internal/secfile"
 	"kairo/internal/store"
 )
 
@@ -191,7 +192,11 @@ func writeSecretFile(path, content string, force bool) error {
 		f.Close()
 		return err
 	}
-	return f.Close()
+	if err := f.Close(); err != nil {
+		return err
+	}
+	// 0600 means nothing on Windows: replace the inherited DACL.
+	return secfile.Restrict(path)
 }
 
 func tokenList(ctx context.Context, st *store.Store) error {
