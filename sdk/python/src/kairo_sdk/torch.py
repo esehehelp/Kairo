@@ -110,13 +110,7 @@ class DistributedAdapter:
             if now - self.session._last_poll >= self.session.poll_interval_seconds:
                 self.session._last_poll = now
                 try:
-                    response = self.session._request(
-                        "GET",
-                        "/v2/worker/attempts/"
-                        f"{self.session.attempt_id}/commands",
-                        None,
-                    )
-                    commands = response.get("commands", [])
+                    commands = self.session.poll_commands()
                     if commands:
                         raw = commands[0]
                         envelope[0] = {

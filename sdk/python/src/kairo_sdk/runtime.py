@@ -1,16 +1,17 @@
 from __future__ import annotations
 
+import base64
 import hashlib
-import json
 import os
 import threading
 import time
-import urllib.error
-import urllib.request
+import urllib.parse
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
+from . import _http
 
 
 @dataclass(frozen=True)
@@ -66,8 +67,8 @@ class AttemptSession:
         api_url: str | None,
         execution_id: str | None,
         attempt_id: str | None,
-        lease_id: str | None = None,
-        coordination_epoch: int | None = None,
+        token: str | None = None,
+        ca_der: bytes | None = None,
         node_id: str | None = None,
         executor_id: str | None = None,
         stop_paths: Iterable[str | Path] = (),
@@ -81,22 +82,20 @@ class AttemptSession:
             if (
                 execution_id is not None
                 or attempt_id is not None
-                or lease_id is not None
-                or coordination_epoch is not None
+                or token is not None
+                or ca_der is not None
             ):
                 raise ValueError(
-                    "unmanaged sessions cannot provide Kairo execution, attempt, or lease context"
+                    "unmanaged sessions cannot provide Kairo execution, attempt, token, or CA context"
                 )
-        elif not execution_id or not attempt_id or not lease_id or coordination_epoch is None:
-            raise ValueError(
-                "managed Kairo sessions require execution, attempt, lease, and coordination epoch"
-            )
+        elif not execution_id or not attempt_id or not token:
+            raise ValueError("managed Kairo sessions require execution, attempt, and token")
         elif self.stop_paths:
             raise ValueError("managed Kairo sessions cannot use stop_paths; pause the coordination scope")
         self.execution_id = execution_id
         self.attempt_id = attempt_id
-        self.lease_id = lease_id
-        self.coordination_epoch = coordination_epoch
+        self._token = token
+        self._opener = _http.build_opener(ca_der=ca_der) if self.api_url is not None else None
         self.node_id = node_id
         self.executor_id = executor_id
         self.poll_interval_seconds = poll_interval_seconds
@@ -123,28 +122,27 @@ class AttemptSession:
         api_url = os.environ.get("KAIRO_API_URL")
         execution_id = os.environ.get("KAIRO_EXECUTION_ID")
         attempt_id = os.environ.get("KAIRO_ATTEMPT_ID")
-        lease_id = os.environ.get("KAIRO_LEASE_ID")
-        epoch_text = os.environ.get("KAIRO_COORDINATION_EPOCH")
+        token = os.environ.get("KAIRO_ATTEMPT_TOKEN")
+        ca_text = os.environ.get("KAIRO_API_CA")
         if api_url:
-            if not execution_id or not attempt_id or not lease_id or not epoch_text:
+            if not execution_id or not attempt_id or not token:
                 raise RuntimeError(
-                    "managed Kairo context requires execution ID, attempt ID, lease ID, "
-                    "and coordination epoch"
+                    "managed Kairo context requires execution ID, attempt ID, and attempt token"
                 )
-        elif execution_id or attempt_id or lease_id or epoch_text:
+        elif execution_id or attempt_id or token or ca_text:
             raise RuntimeError(
-                "unmanaged Kairo context cannot provide execution, attempt, or lease context"
+                "unmanaged Kairo context cannot provide execution, attempt, token, or CA context"
             )
         try:
-            epoch = int(epoch_text) if epoch_text else None
-        except ValueError as error:
-            raise RuntimeError("KAIRO_COORDINATION_EPOCH must be an integer") from error
+            ca_der = base64.b64decode(ca_text.strip(), validate=True) if ca_text else None
+        except ValueError as error:  # binascii.Error, or non-ASCII text
+            raise RuntimeError("KAIRO_API_CA must be a base64 DER certificate") from error
         return cls(
-            api_url=api_url,
-            execution_id=execution_id,
-            attempt_id=attempt_id,
-            lease_id=lease_id,
-            coordination_epoch=epoch,
+            api_url=api_url or None,
+            execution_id=execution_id or None,
+            attempt_id=attempt_id or None,
+            token=token or None,
+            ca_der=ca_der,
             node_id=os.environ.get("KAIRO_NODE_ID"),
             executor_id=os.environ.get("KAIRO_EXECUTOR_ID"),
             stop_paths=stop_paths,
@@ -210,11 +208,7 @@ class AttemptSession:
             self.set_progress(progress)
         if not self._process_registered:
             self.register_process()
-        self._request(
-            "POST",
-            f"/v2/worker/attempts/{self.attempt_id}/heartbeat",
-            {"progress": self._progress},
-        )
+        self._request("POST", "/api/worker/heartbeat", {"progress": self._progress})
         self._last_heartbeat = time.monotonic()
 
     def register_process(self, *, rank: int = 0, pid: int | None = None, process_identity: str | None = None) -> None:
@@ -222,7 +216,7 @@ class AttemptSession:
             return
         self._request(
             "POST",
-            f"/v2/worker/attempts/{self.attempt_id}/processes",
+            "/api/worker/processes",
             {
                 "rank": rank,
                 "pid": os.getpid() if pid is None else pid,
@@ -261,8 +255,7 @@ class AttemptSession:
         if not self.managed or now - self._last_poll < self.poll_interval_seconds:
             return False
         self._last_poll = now
-        response = self._request("GET", f"/v2/worker/attempts/{self.attempt_id}/commands", None)
-        for raw in response.get("commands", []):
+        for raw in self.poll_commands():
             context = CommandContext(
                 command_id=str(raw["id"]),
                 execution_id=self.execution_id,
@@ -289,32 +282,27 @@ class AttemptSession:
             return True
         return False
 
+    def poll_commands(self) -> list[dict[str, Any]]:
+        """Fetch this attempt's pending commands without acknowledging any."""
+        response = self._request("GET", "/api/worker/commands", None)
+        commands = response.get("commands") or []
+        if not isinstance(commands, list):
+            raise RuntimeError("Kairo commands response must contain an array")
+        return commands
+
     def _ack(self, command_id: str, phase: str, payload: Mapping[str, Any] | None = None) -> None:
-        self._request("POST", f"/v2/worker/attempts/{self.attempt_id}/commands/{command_id}/acks", {"phase": phase, "payload": dict(payload or {})})
+        self._request(
+            "POST",
+            f"/api/worker/commands/{urllib.parse.quote(command_id, safe='')}/acks",
+            {"phase": phase, "payload": dict(payload or {})},
+        )
 
     def _request(self, method: str, path: str, body: Any) -> dict[str, Any]:
-        if self.api_url is None:
+        if self.api_url is None or self._opener is None or self._token is None:
             raise RuntimeError("attempt is not managed by Kairo")
-        data = None
-        headers = {"Accept": "application/json"}
-        headers["Kairo-Lease-ID"] = self.lease_id
-        headers["Kairo-Coordination-Epoch"] = str(self.coordination_epoch)
-        if body is not None:
-            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(self.api_url + path, data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-                payload = response.read()
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"Kairo API returned HTTP {error.code}: {detail}") from error
-        if not payload:
-            return {}
-        decoded = json.loads(payload)
-        if not isinstance(decoded, dict):
-            raise RuntimeError("Kairo API response must be a JSON object")
-        return decoded
+        return _http.request_json(
+            self._opener, method, self.api_url + path, self._token, body, self.timeout_seconds
+        )
 
 
 def _normalize_suspend_result(value: SuspendResult | str | Path | None) -> SuspendResult:

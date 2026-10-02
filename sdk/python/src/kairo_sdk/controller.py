@@ -3,15 +3,20 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import sqlite3
+import sys
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
+
+from . import _http
+
+DEFAULT_API_URL = "https://127.0.0.1:7474"
 
 
 @dataclass(frozen=True)
@@ -50,11 +55,28 @@ class TransientControllerError(RuntimeError):
 
 
 class KairoControllerClient:
-    """Small project-controller client for Kairo's coordination API."""
+    """Small project-controller client for Kairo's coordination API.
 
-    def __init__(self, api_url: str, *, timeout_seconds: float = 10.0) -> None:
-        self.api_url = api_url.rstrip("/")
+    Unset arguments resolve the way the ``kairo`` CLI does: the API URL from
+    ``KAIRO_API``; the token from ``KAIRO_TOKEN``, ``KAIRO_TOKEN_FILE`` or
+    ``<user config dir>/kairo/token``; the CA from ``KAIRO_CA_FILE`` or
+    ``<user config dir>/kairo/ca.pem``, falling back to the system roots.
+    """
+
+    def __init__(
+        self,
+        api_url: str | None = None,
+        *,
+        token: str | None = None,
+        token_file: str | Path | None = None,
+        ca_file: str | Path | None = None,
+        timeout_seconds: float = 10.0,
+    ) -> None:
+        self.api_url = (api_url or os.environ.get("KAIRO_API") or DEFAULT_API_URL).rstrip("/")
         self.timeout_seconds = timeout_seconds
+        self._token = _resolve_token(token, token_file)
+        self.ca_file = _resolve_ca_file(ca_file)
+        self._opener = _http.build_opener(ca_file=self.ca_file)
 
     def list_events(self, project: str, after: int = 0) -> list[CoordinationEvent]:
         events: list[CoordinationEvent] = []
@@ -63,7 +85,7 @@ class KairoControllerClient:
             query = urllib.parse.urlencode(
                 {"project": project, "after": cursor, "limit": 1000}
             )
-            response = self._request("GET", f"/v2/events?{query}")
+            response = self._request("GET", f"/api/events?{query}")
             page = response.get("events") or []
             if not isinstance(page, list):
                 raise TypeError("Kairo events response must contain an array")
@@ -77,37 +99,83 @@ class KairoControllerClient:
             cursor = next_cursor
 
     def submit_execution(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
-        return self._request("POST", "/v2/executions", request)
+        # Journaled submissions may still carry the retired schema_version;
+        # the journal keeps them verbatim, but the API rejects unknown fields.
+        body = {key: value for key, value in request.items() if key != "schema_version"}
+        return self._request("POST", "/api/executions", body)
 
     def _request(
         self, method: str, path: str, body: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
-        data = None
-        headers = {"Accept": "application/json"}
-        if body is not None:
-            data = json.dumps(body, separators=(",", ":")).encode("utf-8")
-            headers["Content-Type"] = "application/json"
-        request = urllib.request.Request(
-            self.api_url + path, data=data, headers=headers, method=method
-        )
         try:
-            with urllib.request.urlopen(
-                request, timeout=self.timeout_seconds
-            ) as response:
-                payload = response.read()
-        except urllib.error.HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(
-                f"Kairo API returned HTTP {error.code}: {detail}"
-            ) from error
+            return _http.request_json(
+                self._opener,
+                method,
+                self.api_url + path,
+                self._token,
+                body,
+                self.timeout_seconds,
+            )
         except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
             raise TransientControllerError(
                 f"Kairo API transport failed: {error}"
             ) from error
-        decoded = json.loads(payload or b"{}")
-        if not isinstance(decoded, dict):
-            raise TypeError("Kairo API response must be a JSON object")
-        return decoded
+
+
+def _user_config_dir() -> Path | None:
+    """Mirror Go's os.UserConfigDir, where the ``kairo`` CLI keeps its files."""
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        return Path(appdata) if appdata else None
+    home = os.environ.get("HOME")
+    if sys.platform == "darwin":
+        return Path(home, "Library", "Application Support") if home else None
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        # Go rejects a relative XDG_CONFIG_HOME rather than falling back.
+        return Path(xdg) if os.path.isabs(xdg) else None
+    return Path(home, ".config") if home else None
+
+
+def _read_token_file(path: Path) -> str:
+    try:
+        token = path.read_text(encoding="utf-8").strip()
+    except OSError as error:
+        raise RuntimeError(f"cannot read Kairo token file {path}: {error}") from error
+    if not token:
+        raise RuntimeError(f"Kairo token file {path} is empty")
+    return token
+
+
+def _resolve_token(token: str | None, token_file: str | Path | None) -> str:
+    if token is not None:
+        if not token.strip():
+            raise ValueError("Kairo token must not be empty")
+        return token.strip()
+    if token_file is not None:
+        return _read_token_file(Path(token_file))
+    if environment_token := os.environ.get("KAIRO_TOKEN", "").strip():
+        return environment_token
+    if environment_file := os.environ.get("KAIRO_TOKEN_FILE"):
+        return _read_token_file(Path(environment_file))
+    config_dir = _user_config_dir()
+    if config_dir is not None and (config_dir / "kairo" / "token").is_file():
+        return _read_token_file(config_dir / "kairo" / "token")
+    raise RuntimeError(
+        "no Kairo API token: pass token or token_file, set KAIRO_TOKEN or "
+        "KAIRO_TOKEN_FILE, or provide <user config dir>/kairo/token"
+    )
+
+
+def _resolve_ca_file(ca_file: str | Path | None) -> Path | None:
+    if ca_file is not None:
+        return Path(ca_file)
+    if environment_file := os.environ.get("KAIRO_CA_FILE"):
+        return Path(environment_file)
+    config_dir = _user_config_dir()
+    if config_dir is not None and (config_dir / "kairo" / "ca.pem").is_file():
+        return config_dir / "kairo" / "ca.pem"
+    return None
 
 
 @dataclass(frozen=True)
@@ -798,8 +866,9 @@ def _normalize_submission_template(
     value: Mapping[str, Any], project: str
 ) -> dict[str, Any]:
     template = copy.deepcopy(dict(value))
-    if template.get("schema_version") != 2:
-        raise ValueError("submission template schema_version must be 2")
+    # schema_version is retired; older templates still carry it verbatim.
+    if template.get("schema_version", 2) != 2:
+        raise ValueError("submission template schema_version must be 2 when present")
     if template.get("project") != project:
         raise ValueError("submission template project does not match delegation")
     if not template.get("argv") or not template.get("cwd"):

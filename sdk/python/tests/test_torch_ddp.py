@@ -15,13 +15,18 @@ from kairo_sdk import AttemptSession, DistributedAdapter
 
 
 class _ControlHandler(BaseHTTPRequestHandler):
+    gets: list[str] = []
     posts: list[tuple[str, dict]] = []
+    authorizations: set[str] = set()
     lock = threading.Lock()
 
     def log_message(self, *_args) -> None:
         pass
 
     def do_GET(self) -> None:  # noqa: N802
+        with type(self).lock:
+            type(self).gets.append(self.path)
+            type(self).authorizations.add(self.headers.get("Authorization", ""))
         self._send(
             {
                 "commands": [
@@ -40,6 +45,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(size) or b"{}")
         with type(self).lock:
             type(self).posts.append((self.path, body))
+            type(self).authorizations.add(self.headers.get("Authorization", ""))
         self._send({"ok": True})
 
     def _send(self, body: dict) -> None:
@@ -65,8 +71,7 @@ def _ddp_worker(
             api_url=api_url,
             execution_id="ex_ddp",
             attempt_id="att_ddp",
-            lease_id="lease_ddp",
-            coordination_epoch=3,
+            token="tok_ddp",
             poll_interval_seconds=0,
             heartbeat_interval_seconds=10_000,
         )
@@ -93,7 +98,9 @@ def _ddp_worker(
 
 
 def test_two_rank_gloo_checkpoints_before_rank_zero_ack(tmp_path: Path):
+    _ControlHandler.gets = []
     _ControlHandler.posts = []
+    _ControlHandler.authorizations = set()
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ControlHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -114,10 +121,13 @@ def test_two_rank_gloo_checkpoints_before_rank_zero_ack(tmp_path: Path):
         assert json.loads((tmp_path / "rank-1.json").read_text())["stopped"]
         assert (tmp_path / "rank-0.checkpointed").is_file()
         assert (tmp_path / "rank-1.checkpointed").is_file()
+        # Only rank 0 talks to Kairo, and only over the token-scoped paths.
+        assert _ControlHandler.gets == ["/api/worker/commands"]
+        assert _ControlHandler.authorizations == {"Bearer tok_ddp"}
         registrations = [
             body
             for path, body in _ControlHandler.posts
-            if path.endswith("/processes")
+            if path == "/api/worker/processes"
         ]
         assert {item["rank"] for item in registrations} == {0, 1}
         checkpointed = [
