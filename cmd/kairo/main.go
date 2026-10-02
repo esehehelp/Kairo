@@ -54,6 +54,8 @@ func run(args []string) error {
 		return resourceCommand(args[1:])
 	case "node":
 		return nodeCommand(args[1:])
+	case "tls":
+		return tlsCommand(args[1:])
 	case "doctor":
 		return doctorCommand(args[1:])
 	default:
@@ -62,7 +64,7 @@ func run(args []string) error {
 }
 
 func usage() error {
-	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|doctor>")
+	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|tls|doctor>")
 }
 
 func serve(args []string) error {
