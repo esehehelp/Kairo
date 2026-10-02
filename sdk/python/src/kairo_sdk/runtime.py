@@ -92,6 +92,8 @@ class AttemptSession:
             raise ValueError("managed Kairo sessions require execution, attempt, and token")
         elif self.stop_paths:
             raise ValueError("managed Kairo sessions cannot use stop_paths; pause the coordination scope")
+        if self.api_url is not None:
+            _http.require_token_transport(self.api_url)
         self.execution_id = execution_id
         self.attempt_id = attempt_id
         self._token = token
@@ -136,7 +138,7 @@ class AttemptSession:
         try:
             ca_der = base64.b64decode(ca_text.strip(), validate=True) if ca_text else None
         except ValueError as error:  # binascii.Error, or non-ASCII text
-            raise RuntimeError("KAIRO_API_CA must be a base64 DER certificate") from error
+            raise RuntimeError("KAIRO_API_CA must be a base64 DER certificate, or several concatenated") from error
         return cls(
             api_url=api_url or None,
             execution_id=execution_id or None,

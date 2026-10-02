@@ -3,8 +3,10 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import logging
 import os
 import sqlite3
+import ssl
 import sys
 import time
 import urllib.error
@@ -17,6 +19,19 @@ from typing import Any, Protocol
 from . import _http
 
 DEFAULT_API_URL = "https://127.0.0.1:7474"
+
+_log = logging.getLogger("kairo_sdk.controller")
+
+# Connection-level TLS failures: the peer went away mid-handshake or mid-read,
+# which a daemon restart produces. Every other SSLError is a trust or protocol
+# mismatch that no retry can fix.
+_TRANSIENT_SSL_ERRORS = (
+    ssl.SSLEOFError,
+    ssl.SSLZeroReturnError,
+    ssl.SSLSyscallError,
+    ssl.SSLWantReadError,
+    ssl.SSLWantWriteError,
+)
 
 
 @dataclass(frozen=True)
@@ -54,6 +69,10 @@ class TransientControllerError(RuntimeError):
     """A transport failure that the controller loop may safely retry."""
 
 
+class ControllerConfigurationError(RuntimeError):
+    """A failure no retry can fix, such as a TLS handshake or verification failure."""
+
+
 class KairoControllerClient:
     """Small project-controller client for Kairo's coordination API.
 
@@ -73,6 +92,7 @@ class KairoControllerClient:
         timeout_seconds: float = 10.0,
     ) -> None:
         self.api_url = (api_url or os.environ.get("KAIRO_API") or DEFAULT_API_URL).rstrip("/")
+        _http.require_token_transport(self.api_url)
         self.timeout_seconds = timeout_seconds
         self._token = _resolve_token(token, token_file)
         self.ca_file = _resolve_ca_file(ca_file)
@@ -116,10 +136,21 @@ class KairoControllerClient:
                 body,
                 self.timeout_seconds,
             )
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
-            raise TransientControllerError(
-                f"Kairo API transport failed: {error}"
-            ) from error
+        except urllib.error.URLError as error:
+            raise self._transport_error(error.reason) from error
+        except (TimeoutError, ConnectionError, ssl.SSLError) as error:
+            raise self._transport_error(error) from error
+
+    def _transport_error(self, reason: object) -> RuntimeError:
+        if isinstance(reason, ssl.SSLError) and not isinstance(
+            reason, _TRANSIENT_SSL_ERRORS
+        ):
+            trust = f"CA file {self.ca_file}" if self.ca_file else "the system CA roots"
+            return ControllerConfigurationError(
+                f"TLS to the Kairo API at {self.api_url} failed, trusting {trust}: "
+                f"{reason}"
+            )
+        return TransientControllerError(f"Kairo API transport failed: {reason}")
 
 
 def _user_config_dir() -> Path | None:
@@ -854,7 +885,12 @@ class ProjectController:
         while True:
             try:
                 self.run_once()
-            except TransientControllerError:
+            except TransientControllerError as error:
+                _log.warning(
+                    "Kairo controller pass failed transiently; retrying in %.2fs: %s",
+                    backoff,
+                    error,
+                )
                 time.sleep(backoff)
                 backoff = min(max_backoff_seconds, backoff * 2)
                 continue

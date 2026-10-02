@@ -14,7 +14,11 @@ from pathlib import Path
 
 import pytest
 
-from kairo_sdk import AttemptSession, KairoControllerClient, TransientControllerError
+from kairo_sdk import (
+    AttemptSession,
+    ControllerConfigurationError,
+    KairoControllerClient,
+)
 from kairo_sdk import _http
 
 DATA = Path(__file__).parent / "data"
@@ -118,6 +122,20 @@ def test_unrelated_ca_is_rejected(trust):
     assert _Handler.requests == []
 
 
+@pytest.mark.parametrize(
+    "bundle",
+    [("ca-other.pem", "ca.pem"), ("ca.pem", "ca-other.pem")],
+    ids=["signer-second", "signer-first"],
+)
+def test_concatenated_der_cas_are_all_trusted(bundle):
+    # KAIRO_API_CA carries every certificate of the daemon's CA file, e.g. the
+    # old and new CA during a rotation, as one run of DER encodings.
+    opener = _http.build_opener(ca_der=b"".join(ca_der(name) for name in bundle))
+    with serve(tls=True) as url:
+        assert _http.request_json(opener, "GET", url + "/api/x", "tok", None, 5)["ok"]
+    assert [path for _method, path, _headers in _Handler.requests] == ["/api/x"]
+
+
 def test_tls_below_1_3_is_refused():
     opener = _http.build_opener(ca_der=ca_der())
     with serve(tls=True, maximum_version=ssl.TLSVersion.TLSv1_2) as url:
@@ -190,6 +208,16 @@ def test_attempt_session_trusts_the_launch_ca(monkeypatch):
     assert {headers["Authorization"] for *_rest, headers in _Handler.requests} == {"Bearer tok_tls"}
 
 
+def test_attempt_session_trusts_a_rotated_launch_ca(monkeypatch):
+    with serve(tls=True) as url:
+        _attempt_environment(monkeypatch, url, "ca.pem")
+        both = ca_der("ca-other.pem") + ca_der("ca.pem")  # the signer comes second
+        monkeypatch.setenv("KAIRO_API_CA", base64.b64encode(both).decode("ascii"))
+        session = AttemptSession.from_environment()
+        assert session.poll_commands() == []
+    assert [path for _method, path, _headers in _Handler.requests] == ["/api/worker/commands"]
+
+
 def test_attempt_session_rejects_a_server_outside_the_launch_ca(monkeypatch):
     with serve(tls=True) as url:
         _attempt_environment(monkeypatch, url, "ca-other.pem")
@@ -208,10 +236,108 @@ def test_controller_client_trusts_ca_file():
     assert headers["Authorization"] == "Bearer tok_controller"
 
 
-def test_controller_client_treats_untrusted_server_as_transient():
+def test_controller_client_treats_untrusted_server_as_misconfiguration():
     with serve(tls=True) as url:
         client = KairoControllerClient(url, token="tok", ca_file=DATA / "ca-other.pem")
-        with pytest.raises(TransientControllerError) as raised:
+        with pytest.raises(ControllerConfigurationError) as raised:
             client.list_events("llm-develop")
+    assert url in str(raised.value)
+    assert str(DATA / "ca-other.pem") in str(raised.value)
     assert isinstance(raised.value.__cause__, urllib.error.URLError)
     assert isinstance(raised.value.__cause__.reason, ssl.SSLCertVerificationError)
+    assert _Handler.requests == []
+
+
+def test_controller_client_treats_failed_handshake_as_misconfiguration():
+    with serve(tls=True, maximum_version=ssl.TLSVersion.TLSv1_2) as url:
+        client = KairoControllerClient(url, token="tok", ca_file=DATA / "ca.pem")
+        with pytest.raises(ControllerConfigurationError, match="TLS to the Kairo API"):
+            client.list_events("llm-develop")
+    assert _Handler.requests == []
+
+
+def test_controller_client_treats_direct_ssl_error_as_misconfiguration(monkeypatch):
+    def fail(*_args, **_kwargs):
+        raise ssl.SSLError(1, "[SSL] tlsv1 alert unknown ca")
+
+    monkeypatch.setattr(_http, "request_json", fail)
+    client = KairoControllerClient("https://kairo.example:7474", token="tok")
+    with pytest.raises(ControllerConfigurationError, match="system CA roots") as raised:
+        client.list_events("llm-develop")
+    assert "https://kairo.example:7474" in str(raised.value)
+
+
+LOOPBACK_URLS = [
+    "http://127.0.0.1:7474",
+    "http://127.8.9.10:7474",
+    "http://[::1]:7474",
+    "http://localhost:7474",
+    "http://LOCALHOST:7474",
+    "http://[::ffff:127.0.0.1]:7474",
+]
+TLS_URLS = ["https://192.168.1.12:7474", "https://127.0.0.1.nip.io:7474", "https://kairo.example"]
+REFUSED_URLS = [
+    "http://192.168.1.12:7474",
+    "http://127.0.0.1.nip.io:7474",
+    "http://localhost.example:7474",
+    "http://[fe80::1]:7474",
+    "http://0.0.0.0:7474",
+    "http://user:secret@10.0.0.5:7474",
+    "ftp://127.0.0.1:7474",
+]
+
+
+@pytest.mark.parametrize("url", LOOPBACK_URLS + TLS_URLS)
+def test_token_may_travel_over_tls_or_to_loopback(url):
+    _http.require_token_transport(url)
+    KairoControllerClient(url, token="tok")
+    AttemptSession(api_url=url, execution_id="ex", attempt_id="att", token="tok")
+
+
+@pytest.mark.parametrize("url", REFUSED_URLS)
+def test_token_never_travels_over_plain_http_off_loopback(url):
+    with pytest.raises(ValueError) as raised:
+        KairoControllerClient(url, token="tok")
+    assert "secret" not in str(raised.value)
+    with pytest.raises(ValueError):
+        AttemptSession(api_url=url, execution_id="ex", attempt_id="att", token="tok")
+    with pytest.raises(ValueError):
+        _http.request_json(_http.build_opener(), "GET", url + "/api/x", "tok", None, 5)
+
+
+def test_plain_http_refusal_names_the_host():
+    with pytest.raises(ValueError, match=r"plain http to 192\.168\.1\.12:7474: use https"):
+        KairoControllerClient("http://192.168.1.12:7474", token="tok")
+
+
+def test_controller_client_refuses_plain_http_from_the_environment(monkeypatch):
+    monkeypatch.setenv("KAIRO_API", "http://192.168.1.12:7474")
+    with pytest.raises(ValueError, match="plain http"):
+        KairoControllerClient(token="tok")
+
+
+def test_attempt_session_refuses_plain_http_from_the_environment(monkeypatch):
+    _attempt_environment(monkeypatch, "http://127.0.0.1.nip.io:7474", "ca.pem")
+    with pytest.raises(ValueError, match="plain http"):
+        AttemptSession.from_environment()
+
+
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("127.0.0.1", True),
+        ("127.255.255.254", True),
+        ("::1", True),
+        ("[::1]", True),
+        ("0:0:0:0:0:0:0:1", True),
+        ("localhost", True),
+        ("127.0.0.1.nip.io", False),
+        ("localhost.", False),
+        ("::1%lo", False),
+        ("192.168.1.12", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_loopback(host, expected):
+    assert _http.is_loopback(host) is expected

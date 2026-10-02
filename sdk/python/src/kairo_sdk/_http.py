@@ -2,14 +2,18 @@
 
 Control traffic carries a bearer token, so it never goes through an
 environment-configured proxy and never follows a redirect: either would hand
-the token to a host the operator did not name.
+the token to a host the operator did not name. For the same reason a token
+travels only over TLS, or over plain ``http://`` to a loopback host (the rule
+the ``kairo`` CLI applies).
 """
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import ssl
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -22,10 +26,50 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def is_loopback(host: str | None) -> bool:
+    """``localhost`` or a loopback IP literal; never a name that merely resolves to one."""
+    if not host:
+        return False
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if host.lower() == "localhost":
+        return True
+    if "%" in host:  # a zoned IPv6 literal, which Go's net.ParseIP rejects
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+        address = address.ipv4_mapped  # Go treats ::ffff:a.b.c.d as IPv4
+    return address.is_loopback
+
+
+def require_token_transport(url: str) -> None:
+    """Refuse a URL a bearer token must not travel to: plain http off loopback."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    if scheme == "https":
+        return
+    if scheme != "http":
+        raise ValueError(
+            f"Kairo API URL must use https (or http to loopback), not {scheme!r}"
+        )
+    if not is_loopback(parts.hostname):
+        host = parts.netloc.rpartition("@")[2]  # never echo userinfo
+        raise ValueError(
+            f"refusing to send a token over plain http to {host}: use https"
+        )
+
+
 def ssl_context(
     *, ca_der: bytes | None = None, ca_file: str | Path | None = None
 ) -> ssl.SSLContext:
-    """TLS 1.3 context trusting the given CA, or the system roots if none."""
+    """TLS 1.3 context trusting the given CA, or the system roots if none.
+
+    ``ca_der`` may hold several certificates as the concatenation of their DER
+    encodings (an old and a new CA during rotation); every one is trusted.
+    """
     if ca_der is not None and ca_file is not None:
         raise ValueError("pass ca_der or ca_file, not both")
     if ca_der is not None:
@@ -59,6 +103,7 @@ def request_json(
     timeout: float,
 ) -> dict[str, Any]:
     """Send one JSON request; transport errors (``URLError``) propagate."""
+    require_token_transport(url)
     data = None
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
     if body is not None:

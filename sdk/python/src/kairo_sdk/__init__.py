@@ -8,6 +8,7 @@ state is represented.
 from .atomic import atomic_publish
 from .controller import (
     ControllerAPI,
+    ControllerConfigurationError,
     ControllerDecision,
     ControllerJournal,
     ControllerPolicy,
@@ -24,6 +25,7 @@ __all__ = [
     "AttemptSession",
     "CommandContext",
     "ControllerAPI",
+    "ControllerConfigurationError",
     "ControllerDecision",
     "ControllerJournal",
     "ControllerPolicy",

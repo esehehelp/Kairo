@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import shutil
 import sqlite3
@@ -15,6 +16,7 @@ from typing import Any
 
 import pytest
 from kairo_sdk import (
+    ControllerConfigurationError,
     ControllerJournal,
     KairoControllerClient,
     ProjectController,
@@ -447,6 +449,51 @@ def test_run_forever_bounds_transient_backoff_and_leaves_invariants_fatal(
         )
 
     assert sleeps == [0.25, 0.5, 0.5]
+
+
+def test_run_forever_logs_each_transient_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+):
+    controller = ProjectController(FakeAPI([]), ControllerJournal(tmp_path / "db"))
+    outcomes: list[BaseException] = [
+        TransientControllerError("connection refused"),
+        TransientControllerError("timed out"),
+        RuntimeError("stop"),
+    ]
+
+    def run_once():
+        raise outcomes.pop(0)
+
+    monkeypatch.setattr(controller, "run_once", run_once)
+    monkeypatch.setattr("kairo_sdk.controller.time.sleep", lambda _seconds: None)
+
+    with caplog.at_level(logging.WARNING, logger="kairo_sdk.controller"):
+        with pytest.raises(RuntimeError, match="stop"):
+            controller.run_forever(initial_backoff_seconds=0.25)
+
+    records = [r for r in caplog.records if r.name == "kairo_sdk.controller"]
+    assert [r.levelno for r in records] == [logging.WARNING, logging.WARNING]
+    assert "connection refused" in records[0].getMessage()
+    assert "0.25s" in records[0].getMessage()
+    assert "timed out" in records[1].getMessage()
+    assert "0.50s" in records[1].getMessage()
+
+
+def test_run_forever_does_not_retry_configuration_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    controller = ProjectController(FakeAPI([]), ControllerJournal(tmp_path / "db"))
+
+    def run_once():
+        raise ControllerConfigurationError("TLS to the Kairo API failed")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(controller, "run_once", run_once)
+    monkeypatch.setattr("kairo_sdk.controller.time.sleep", sleeps.append)
+
+    with pytest.raises(ControllerConfigurationError):
+        controller.run_forever()
+    assert sleeps == []
 
 
 def test_templates_without_schema_version_are_accepted(tmp_path: Path):
