@@ -6,7 +6,8 @@ import (
 	"kairo/internal/orchestration"
 )
 
-func (s *Server) applyProjectDeclaration(w http.ResponseWriter, r *http.Request) {
+// applyProject stores a ProjectSpec declaration; the daemon reconciles it.
+func (s *Server) applyProject(w http.ResponseWriter, r *http.Request) {
 	var manifest orchestration.Manifest
 	if err := decode(r, &manifest); err != nil {
 		writeError(w, err)
@@ -38,7 +39,7 @@ func (s *Server) applyProjectDeclaration(w http.ResponseWriter, r *http.Request)
 	})
 }
 
-func (s *Server) getProjectOrchestrationStatus(w http.ResponseWriter, r *http.Request) {
+func (s *Server) getProject(w http.ResponseWriter, r *http.Request) {
 	status, err := s.Store.GetProjectStatus(r.Context(), r.PathValue("project"))
 	if err != nil {
 		writeError(w, err)

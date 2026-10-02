@@ -22,7 +22,7 @@ import (
 // agentCommand runs this host as a remote node: its providers observe local
 // GPUs/CPU/RAM/disk and its executors launch attempts here, while every
 // coordination decision (reservation, fencing, quiescence, release) is made by
-// the daemon's store through the /v3/agent API. Attempt logs are written
+// the daemon's store through its /api/agent operations. Attempt logs are written
 // locally and shipped into the daemon's log directory.
 func agentCommand(args []string) error {
 	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
@@ -41,7 +41,7 @@ func agentCommand(args []string) error {
 		return err
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	client := agentclient.New(cfg.ServerURL, cfg.Token)
+	client := agentclient.New(cfg.ServerURL, cfg.Token, nil)
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 

@@ -15,7 +15,6 @@ type Config struct {
 	LogDirectory               string     `toml:"log_directory"`
 	ObserveOnly                bool       `toml:"observe_only"`
 	ObservationIntervalSeconds int        `toml:"observation_interval_seconds"`
-	AgentToken                 string     `toml:"agent_token"` // enables the node agent API when set
 	Node                       Node       `toml:"node"`
 	Executors                  []Executor `toml:"executors"`
 	Providers                  []Provider `toml:"providers"`
@@ -92,10 +91,11 @@ func defaults(c *Config) {
 }
 
 // Agent configures `kairo agent`: a node on another host whose executors and
-// providers are driven through the daemon's /v3/agent API.
+// providers are driven through the daemon's /api/agent operations.
 type Agent struct {
 	// ServerURL is the daemon as reachable from this node (LAN address or an
-	// SSH tunnel endpoint); Token is the daemon's agent_token.
+	// SSH tunnel endpoint); Token is this node's token (kairo token create
+	// --role node --node NODE_ID).
 	ServerURL string `toml:"server_url"`
 	Token     string `toml:"token"`
 	// AttemptAPIURL is handed to attempts as KAIRO_API_URL; it defaults to

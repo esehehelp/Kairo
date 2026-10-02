@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,14 +10,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 
 	"kairo/internal/store"
 )
 
-// The agent API lets a node agent on another host drive the same coordination
-// operations the daemon's in-process executors call on the store. It is only
-// mounted when a shared bearer token is configured, and carries no TLS: it is
-// meant for a trusted LAN or an SSH tunnel.
+// The agent API lets a node agent on another host drive the coordination
+// operations the daemon's in-process executors call on the store. A node token
+// is bound to one node: every operation is checked against the node that owns
+// the executor, lease, attempt, provider or log it names.
 
 type agentRegisterRequest struct {
 	Node      store.Node       `json:"node"`
@@ -89,6 +89,16 @@ type agentAttemptLeaseRequest struct {
 	Epoch     int64  `json:"epoch"`
 }
 
+type agentAttemptRequest struct {
+	AttemptID string `json:"attempt_id"`
+}
+
+type agentForceStopAck struct {
+	AttemptID string          `json:"attempt_id"`
+	Phase     string          `json:"phase"`
+	Detail    json.RawMessage `json:"detail,omitempty"`
+}
+
 // AgentLogAppend ships a slice of an attempt log. Offset is the byte offset of
 // Data in the node-side file, which makes a retried append idempotent.
 type AgentLogAppend struct {
@@ -97,228 +107,176 @@ type AgentLogAppend struct {
 	Data   []byte `json:"data"`
 }
 
-var attemptLogName = regexp.MustCompile(`^[A-Za-z0-9_-]+\.(stdout|stderr)\.log$`)
+var attemptLogName = regexp.MustCompile(`^([A-Za-z0-9_-]+)\.(stdout|stderr)\.log$`)
 
-// Sentinel errors travel as stable codes so the agent client can return the
-// same error values the store would have returned in-process.
-var agentErrorCodes = []struct {
-	code string
-	err  error
-}{
-	{"not_found", store.ErrNotFound},
-	{"stale_epoch", store.ErrStaleEpoch},
-	{"gate_closed", store.ErrGateClosed},
-	{"execution_started", store.ErrExecutionStarted},
-	{"idempotency_conflict", store.ErrIdempotencyConflict},
-	{"gang_not_ready", store.ErrGangNotReady},
-	{"gang_aborted", store.ErrGangAborted},
+// How an operation behaves when the daemon is observe-only, mirroring an
+// in-process executor that only observes.
+const (
+	observeAllowed = iota // observation and facts about processes already running
+	observeEmpty          // polls answer with nothing to do
+	observeRefused        // actuation is refused (423)
+)
+
+type agentOp struct {
+	name    string
+	handler http.HandlerFunc
 }
 
-// AgentErrorForCode maps a wire code back to the store sentinel (nil if none).
-func AgentErrorForCode(code string) error {
-	for _, c := range agentErrorCodes {
-		if c.code == code {
-			return c.err
-		}
-	}
-	return nil
-}
-
-func writeAgentError(w http.ResponseWriter, err error) {
-	code := ""
-	for _, c := range agentErrorCodes {
-		if errors.Is(err, c.err) {
-			code = c.code
-			break
-		}
-	}
-	status := http.StatusBadRequest
-	if code != "" {
-		status = http.StatusConflict
-	}
-	writeJSON(w, status, map[string]string{"error": err.Error(), "code": code})
-}
-
-func (s *Server) mountAgent(mux *http.ServeMux) {
-	if s.AgentToken == "" {
-		return
-	}
-	route := func(name string, h func(*http.Request) (any, error)) {
-		mux.HandleFunc("POST /v3/agent/"+name, s.agentAuth(func(w http.ResponseWriter, r *http.Request) {
-			value, err := h(r)
-			if err != nil {
-				writeAgentError(w, err)
-				return
-			}
-			writeJSON(w, http.StatusOK, value)
-		}))
-	}
-	route("register", s.agentRegister)
-	route("observations", func(r *http.Request) (any, error) {
-		var b agentObservationRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, s.Store.ApplyObservationBatch(r.Context(), b.ProviderID, b.Resources, b.Observations, b.Claims)
-	})
-	route("reserve-next", func(r *http.Request) (any, error) {
-		var b agentExecutorRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		reservation, err := s.Store.ReserveNext(r.Context(), b.ExecutorID)
-		return map[string]any{"reservation": reservation}, err
-	})
-	route("ensure-preemption", func(r *http.Request) (any, error) {
-		var b agentExecutorRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		commands, err := s.Store.EnsurePriorityPreemption(r.Context(), b.ExecutorID)
-		return map[string]any{"commands": commands}, err
-	})
-	route("validate-reservation", s.agentLease(s.Store.ValidateReservation))
-	route("mark-lease-prepared", s.agentLease(s.Store.MarkLeasePrepared))
-	route("release-reservation", func(r *http.Request) (any, error) {
-		var b agentLeaseRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, s.Store.ReleaseReservation(r.Context(), b.LeaseID, b.Epoch, b.Reason)
-	})
-	route("authorize-launch", func(r *http.Request) (any, error) {
-		var b agentAuthorizeRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		launch, err := s.Store.AuthorizeLaunch(r.Context(), &b.Reservation)
-		return map[string]any{"launch": launch}, err
-	})
-	route("activate-launch", func(r *http.Request) (any, error) {
-		var b agentActivateRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, s.Store.ActivateLaunch(r.Context(), b.AttemptID, b.LeaseID, b.Epoch, b.Token, b.PID, b.ProcessIdentity)
-	})
-	route("set-log-paths", func(r *http.Request) (any, error) {
-		var b agentLogPathsRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		// Logs are shipped into the daemon's log directory under the same
-		// file names, so the recorded paths are the daemon-side copies.
-		stdout, err := s.agentLogPath(filepath.Base(filepath.ToSlash(b.StdoutPath)))
-		if err != nil {
-			return nil, err
-		}
-		stderr, err := s.agentLogPath(filepath.Base(filepath.ToSlash(b.StderrPath)))
-		if err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, s.Store.SetAttemptLogPaths(r.Context(), b.AttemptID, b.Epoch, stdout, stderr)
-	})
-	route("mark-process-exited", func(r *http.Request) (any, error) {
-		var b agentProcessExitedRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, s.Store.MarkAttemptProcessExited(r.Context(), b.AttemptID, b.Role, b.Rank, b.Identity)
-	})
-	route("record-terminal", func(r *http.Request) (any, error) {
-		var b agentTerminalRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, s.Store.RecordTerminal(r.Context(), b.AttemptID, b.LeaseID, b.Epoch, b.ExitCode, b.ExitSignal)
-	})
-	route("quiescence-candidates", func(r *http.Request) (any, error) {
-		var b agentExecutorRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		candidates, err := s.Store.ListQuiescenceCandidates(r.Context(), b.ExecutorID)
-		return map[string]any{"candidates": candidates}, err
-	})
-	route("finalize-quiescence", func(r *http.Request) (any, error) {
-		var b agentAttemptLeaseRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, s.Store.FinalizeQuiescence(r.Context(), b.AttemptID, b.LeaseID, b.Epoch)
-	})
-	route("quarantine-terminations", func(r *http.Request) (any, error) {
-		var b agentExecutorRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		terminations, err := s.Store.ListQuarantineTerminations(r.Context(), b.ExecutorID)
-		return map[string]any{"terminations": terminations}, err
-	})
-	route("quarantine-terminated", func(r *http.Request) (any, error) {
-		var b struct {
-			AttemptID string `json:"attempt_id"`
-		}
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, s.Store.MarkQuarantineTerminated(r.Context(), b.AttemptID)
-	})
-	// Force stops (pause --force). An agent predating them never asks; the
-	// daemon then reports the order as not picked up (store.forceStopBlocker).
-	route("force-stop-orders", func(r *http.Request) (any, error) {
-		var b agentExecutorRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		orders, err := s.Store.ForceStopOrders(r.Context(), b.ExecutorID)
-		return map[string]any{"orders": orders}, err
-	})
-	route("force-stop-ack", func(r *http.Request) (any, error) {
-		var b struct {
-			AttemptID string          `json:"attempt_id"`
-			Phase     string          `json:"phase"`
-			Detail    json.RawMessage `json:"detail,omitempty"`
-		}
-		if err := decode(r, &b); err != nil {
-			return nil, err
-		}
-		return map[string]bool{"ok": true}, s.Store.AckForceStop(r.Context(), b.AttemptID, b.Phase, b.Detail)
-	})
-	mux.HandleFunc("POST /v3/agent/logs", s.agentAuth(s.agentLogAppend))
-}
-
-func (s *Server) agentAuth(next http.HandlerFunc) http.HandlerFunc {
-	want := []byte("Bearer " + s.AgentToken)
-	return func(w http.ResponseWriter, r *http.Request) {
-		got := []byte(r.Header.Get("Authorization"))
-		if subtle.ConstantTimeCompare(got, want) != 1 {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent token required"})
+// newAgentOp decodes the request once, checks that the caller's node owns
+// the object it names (owner returns that node), applies the observe-only
+// rule, and runs the operation.
+func newAgentOp[T any](s *Server, name string, observe int, empty any, owner func(context.Context, T) (string, error), run func(context.Context, T) (any, error)) agentOp {
+	return agentOp{name: name, handler: func(w http.ResponseWriter, r *http.Request) {
+		var body T
+		if err := decode(r, &body); err != nil {
+			writeError(w, err)
 			return
 		}
-		next(w, r)
-	}
-}
-
-func (s *Server) agentLease(op func(ctx context.Context, leaseID string, epoch int64) error) func(*http.Request) (any, error) {
-	return func(r *http.Request) (any, error) {
-		var b agentLeaseRequest
-		if err := decode(r, &b); err != nil {
-			return nil, err
+		node, err := owner(r.Context(), body)
+		if err != nil {
+			writeError(w, err)
+			return
 		}
-		return map[string]bool{"ok": true}, op(r.Context(), b.LeaseID, b.Epoch)
+		if node != principalOf(r).NodeID {
+			writeError(w, fmt.Errorf("%w: belongs to node %s", ErrForbidden, node))
+			return
+		}
+		if s.ObserveOnly && observe == observeEmpty {
+			writeJSON(w, http.StatusOK, empty)
+			return
+		}
+		if s.ObserveOnly && observe == observeRefused {
+			writeError(w, errObserveOnly)
+			return
+		}
+		value, err := run(r.Context(), body)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, value)
+	}}
+}
+
+var okBody = map[string]bool{"ok": true}
+
+func (s *Server) agentOps() []agentOp {
+	byExecutor := func(ctx context.Context, b agentExecutorRequest) (string, error) {
+		return s.Store.ExecutorNode(ctx, b.ExecutorID)
+	}
+	byLease := func(ctx context.Context, b agentLeaseRequest) (string, error) {
+		return s.Store.LeaseNode(ctx, b.LeaseID)
+	}
+	return []agentOp{
+		newAgentOp(s, "register", observeAllowed, nil,
+			func(_ context.Context, b agentRegisterRequest) (string, error) { return b.Node.ID, nil },
+			s.agentRegister),
+		newAgentOp(s, "observations", observeAllowed, nil,
+			func(ctx context.Context, b agentObservationRequest) (string, error) {
+				return s.Store.ProviderNode(ctx, b.ProviderID)
+			},
+			func(ctx context.Context, b agentObservationRequest) (any, error) {
+				return okBody, s.Store.ApplyObservationBatch(ctx, b.ProviderID, b.Resources, b.Observations, b.Claims)
+			}),
+		newAgentOp(s, "reserve-next", observeEmpty, map[string]any{"reservation": nil}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				reservation, err := s.Store.ReserveNext(ctx, b.ExecutorID)
+				return map[string]any{"reservation": reservation}, err
+			}),
+		newAgentOp(s, "ensure-preemption", observeEmpty, map[string]any{"commands": []string{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				commands, err := s.Store.EnsurePriorityPreemption(ctx, b.ExecutorID)
+				return map[string]any{"commands": commands}, err
+			}),
+		newAgentOp(s, "validate-reservation", observeRefused, nil, byLease,
+			func(ctx context.Context, b agentLeaseRequest) (any, error) {
+				return okBody, s.Store.ValidateReservation(ctx, b.LeaseID, b.Epoch)
+			}),
+		newAgentOp(s, "mark-lease-prepared", observeRefused, nil, byLease,
+			func(ctx context.Context, b agentLeaseRequest) (any, error) {
+				return okBody, s.Store.MarkLeasePrepared(ctx, b.LeaseID, b.Epoch)
+			}),
+		newAgentOp(s, "release-reservation", observeRefused, nil, byLease,
+			func(ctx context.Context, b agentLeaseRequest) (any, error) {
+				return okBody, s.Store.ReleaseReservation(ctx, b.LeaseID, b.Epoch, b.Reason)
+			}),
+		newAgentOp(s, "authorize-launch", observeRefused, nil,
+			func(ctx context.Context, b agentAuthorizeRequest) (string, error) {
+				return s.Store.LeaseNode(ctx, b.Reservation.Lease.ID)
+			},
+			func(ctx context.Context, b agentAuthorizeRequest) (any, error) {
+				launch, err := s.Store.AuthorizeLaunch(ctx, &b.Reservation)
+				return map[string]any{"launch": launch}, err
+			}),
+		newAgentOp(s, "activate-launch", observeRefused, nil,
+			func(ctx context.Context, b agentActivateRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			func(ctx context.Context, b agentActivateRequest) (any, error) {
+				return okBody, s.Store.ActivateLaunch(ctx, b.AttemptID, b.LeaseID, b.Epoch, b.Token, b.PID, b.ProcessIdentity)
+			}),
+		newAgentOp(s, "set-log-paths", observeAllowed, nil,
+			func(ctx context.Context, b agentLogPathsRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			s.agentSetLogPaths),
+		newAgentOp(s, "mark-process-exited", observeAllowed, nil,
+			func(ctx context.Context, b agentProcessExitedRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			func(ctx context.Context, b agentProcessExitedRequest) (any, error) {
+				return okBody, s.Store.MarkAttemptProcessExited(ctx, b.AttemptID, b.Role, b.Rank, b.Identity)
+			}),
+		newAgentOp(s, "record-terminal", observeAllowed, nil,
+			func(ctx context.Context, b agentTerminalRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			func(ctx context.Context, b agentTerminalRequest) (any, error) {
+				return okBody, s.Store.RecordTerminal(ctx, b.AttemptID, b.LeaseID, b.Epoch, b.ExitCode, b.ExitSignal)
+			}),
+		newAgentOp(s, "quiescence-candidates", observeEmpty, map[string]any{"candidates": []store.QuiescenceCandidate{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				candidates, err := s.Store.ListQuiescenceCandidates(ctx, b.ExecutorID)
+				return map[string]any{"candidates": candidates}, err
+			}),
+		newAgentOp(s, "finalize-quiescence", observeRefused, nil,
+			func(ctx context.Context, b agentAttemptLeaseRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			func(ctx context.Context, b agentAttemptLeaseRequest) (any, error) {
+				return okBody, s.Store.FinalizeQuiescence(ctx, b.AttemptID, b.LeaseID, b.Epoch)
+			}),
+		newAgentOp(s, "quarantine-terminations", observeEmpty, map[string]any{"terminations": []store.QuarantineTermination{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				terminations, err := s.Store.ListQuarantineTerminations(ctx, b.ExecutorID)
+				return map[string]any{"terminations": terminations}, err
+			}),
+		newAgentOp(s, "quarantine-terminated", observeRefused, nil,
+			func(ctx context.Context, b agentAttemptRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			func(ctx context.Context, b agentAttemptRequest) (any, error) {
+				return okBody, s.Store.MarkQuarantineTerminated(ctx, b.AttemptID)
+			}),
+		newAgentOp(s, "force-stop-orders", observeEmpty, map[string]any{"orders": []store.ForceStopOrder{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				orders, err := s.Store.ForceStopOrders(ctx, b.ExecutorID)
+				return map[string]any{"orders": orders}, err
+			}),
+		newAgentOp(s, "force-stop-ack", observeRefused, nil,
+			func(ctx context.Context, b agentForceStopAck) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			func(ctx context.Context, b agentForceStopAck) (any, error) {
+				return okBody, s.Store.AckForceStop(ctx, b.AttemptID, b.Phase, b.Detail)
+			}),
 	}
 }
 
-func (s *Server) agentRegister(r *http.Request) (any, error) {
-	var b agentRegisterRequest
-	if err := decode(r, &b); err != nil {
-		return nil, err
-	}
+func (s *Server) agentRegister(ctx context.Context, b agentRegisterRequest) (any, error) {
 	if b.Node.ID == "" || b.Node.Name == "" {
 		return nil, errors.New("node.id and node.name are required")
 	}
-	ctx := r.Context()
 	b.Node.Enabled = true
 	if err := s.Store.UpsertNode(ctx, b.Node); err != nil {
 		return nil, err
@@ -353,8 +311,39 @@ func (s *Server) agentRegister(r *http.Request) (any, error) {
 	return map[string]any{"stale_leases": stale}, nil
 }
 
+// agentSetLogPaths records the daemon-side copies of an attempt's logs:
+// logs are shipped into the daemon's log directory under their own names,
+// which must be the attempt's.
+func (s *Server) agentSetLogPaths(ctx context.Context, b agentLogPathsRequest) (any, error) {
+	paths := make([]string, 0, 2)
+	for _, path := range []string{b.StdoutPath, b.StderrPath} {
+		name := filepath.Base(filepath.ToSlash(path))
+		if attempt, _ := logAttempt(name); attempt != b.AttemptID {
+			return nil, fmt.Errorf("log %q is not named after attempt %s", name, b.AttemptID)
+		}
+		local, err := s.agentLogPath(name)
+		if err != nil {
+			return nil, err
+		}
+		paths = append(paths, local)
+	}
+	if !strings.HasSuffix(paths[0], ".stdout.log") || !strings.HasSuffix(paths[1], ".stderr.log") {
+		return nil, errors.New("stdout_path and stderr_path must name the .stdout.log and .stderr.log files")
+	}
+	return okBody, s.Store.SetAttemptLogPaths(ctx, b.AttemptID, b.Epoch, paths[0], paths[1])
+}
+
+// logAttempt returns the attempt an attempt log file is named after.
+func logAttempt(name string) (string, bool) {
+	match := attemptLogName.FindStringSubmatch(name)
+	if match == nil {
+		return "", false
+	}
+	return match[1], true
+}
+
 func (s *Server) agentLogPath(name string) (string, error) {
-	if !attemptLogName.MatchString(name) {
+	if _, valid := logAttempt(name); !valid {
 		return "", fmt.Errorf("invalid attempt log name %q", name)
 	}
 	if s.LogDirectory == "" {
@@ -369,29 +358,39 @@ func (s *Server) agentLogAppend(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(io.LimitReader(r.Body, 8<<20))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&b); err != nil {
-		writeAgentError(w, err)
+		writeError(w, err)
 		return
 	}
 	path, err := s.agentLogPath(b.Name)
 	if err != nil {
-		writeAgentError(w, err)
+		writeError(w, err)
+		return
+	}
+	attempt, _ := logAttempt(b.Name)
+	node, err := s.Store.AttemptNode(r.Context(), attempt)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if node != principalOf(r).NodeID {
+		writeError(w, fmt.Errorf("%w: attempt %s runs on node %s", ErrForbidden, attempt, node))
 		return
 	}
 	s.logMu.Lock()
 	defer s.logMu.Unlock()
 	if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		writeAgentError(w, err)
+		writeError(w, err)
 		return
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		writeAgentError(w, err)
+		writeError(w, err)
 		return
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		writeAgentError(w, err)
+		writeError(w, err)
 		return
 	}
 	size := info.Size()
@@ -402,7 +401,7 @@ func (s *Server) agentLogAppend(w http.ResponseWriter, r *http.Request) {
 	}
 	if skip := size - b.Offset; skip < int64(len(b.Data)) {
 		if _, err = f.WriteAt(b.Data[skip:], size); err != nil {
-			writeAgentError(w, err)
+			writeError(w, err)
 			return
 		}
 		size += int64(len(b.Data)) - skip

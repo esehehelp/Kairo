@@ -1,11 +1,13 @@
-// Package agentclient is the node-agent side of the daemon's /v3/agent API:
-// an executor.Coordinator over HTTP, node registration, and attempt log
-// shipping into the daemon's log directory.
+// Package agentclient is the node-agent side of the daemon's /api/agent
+// operations: an executor.Coordinator over HTTP, node registration, and
+// attempt log shipping into the daemon's log directory. It authenticates with
+// the node's token and trusts the daemon's CA.
 package agentclient
 
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,8 +29,12 @@ type Client struct {
 	HTTP    *http.Client
 }
 
-func New(baseURL, token string) *Client {
-	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: &http.Client{Timeout: 60 * time.Second}}
+// New returns a client for the daemon at baseURL. tlsConfig carries the CA the
+// daemon's certificate is checked against (nil: system roots). Control traffic
+// never goes through an HTTP(S)_PROXY.
+func New(baseURL, token string, tlsConfig *tls.Config) *Client {
+	transport := &http.Transport{Proxy: nil, TLSClientConfig: tlsConfig, ForceAttemptHTTP2: true, IdleConnTimeout: 90 * time.Second}
+	return &Client{BaseURL: strings.TrimRight(baseURL, "/"), Token: token, HTTP: &http.Client{Timeout: 60 * time.Second, Transport: transport}}
 }
 
 // Error is a non-sentinel failure reported by the daemon.
@@ -44,7 +50,7 @@ func (c *Client) call(ctx context.Context, op string, body, out any) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v3/agent/"+op, bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/api/agent/"+op, bytes.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -65,7 +71,7 @@ func (c *Client) call(ctx context.Context, op string, body, out any) error {
 			Code  string `json:"code"`
 		}
 		_ = json.Unmarshal(raw, &e)
-		if sentinel := api.AgentErrorForCode(e.Code); sentinel != nil {
+		if sentinel := api.ErrorForCode(e.Code); sentinel != nil {
 			return sentinel
 		}
 		return &Error{Status: resp.StatusCode, Message: e.Error}
@@ -181,11 +187,6 @@ func (c *Client) ForceStopOrders(ctx context.Context, executorID string) ([]stor
 		Orders []store.ForceStopOrder `json:"orders"`
 	}
 	err := c.call(ctx, "force-stop-orders", map[string]string{"executor_id": executorID}, &out)
-	var e *Error
-	if errors.As(err, &e) && e.Status == http.StatusNotFound {
-		// A daemon predating force stop has no such route: it has no orders.
-		return nil, nil
-	}
 	return out.Orders, err
 }
 
@@ -201,7 +202,7 @@ func (c *Client) appendLog(ctx context.Context, name string, offset int64, data 
 	if err != nil {
 		return 0, err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/v3/agent/logs", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL+"/api/agent/logs", bytes.NewReader(payload))
 	if err != nil {
 		return 0, err
 	}
@@ -225,6 +226,8 @@ func (c *Client) appendLog(ctx context.Context, name string, offset int64, data 
 		return out.Size, nil
 	case out.Code == "log_gap":
 		return 0, &GapError{Size: out.Size}
+	case api.ErrorForCode(out.Code) != nil:
+		return 0, api.ErrorForCode(out.Code)
 	default:
 		return 0, &Error{Status: resp.StatusCode, Message: out.Error}
 	}

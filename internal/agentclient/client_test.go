@@ -2,10 +2,10 @@ package agentclient
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -17,9 +17,8 @@ import (
 	"kairo/internal/executor"
 	"kairo/internal/provider"
 	"kairo/internal/store"
+	"kairo/internal/tlsutil"
 )
-
-const testToken = "s3cret"
 
 // TestHelperProcess is the attempt launched by the end-to-end test.
 func TestHelperProcess(t *testing.T) {
@@ -45,73 +44,144 @@ func (p *fakeGPU) Observe(context.Context) (provider.Snapshot, error) {
 func (p *fakeGPU) Prepare(context.Context, store.ResourceInstance) error { return nil }
 func (p *fakeGPU) Release(context.Context, store.ResourceInstance) error { return nil }
 
-func newDaemon(t *testing.T) (*store.Store, *httptest.Server, string) {
+// newDaemon serves the API with a node token for node "remote".
+func newDaemon(t *testing.T) (*store.Store, *httptest.Server, string, string) {
 	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
+	_, token, err := st.CreateAPIToken(context.Background(), "remote-agent", store.RoleNode, "remote")
+	if err != nil {
+		t.Fatal(err)
+	}
 	logDir := t.TempDir()
-	ts := httptest.NewServer((&api.Server{Store: st, AgentToken: testToken, LogDirectory: logDir}).Handler())
+	ts := httptest.NewServer((&api.Server{Store: st, LogDirectory: logDir}).Handler())
 	t.Cleanup(ts.Close)
-	return st, ts, logDir
+	return st, ts, token, logDir
 }
 
-func TestAgentAPIRequiresToken(t *testing.T) {
-	_, ts, _ := newDaemon(t)
-	bad := New(ts.URL, "wrong")
-	_, err := bad.Register(context.Background(), store.Node{ID: "n", Name: "n"}, nil, nil)
-	var apiErr *Error
-	if !errors.As(err, &apiErr) || apiErr.Status != http.StatusUnauthorized {
-		t.Fatalf("expected 401, got %v", err)
+func registerRemote(t *testing.T, c *Client) {
+	t.Helper()
+	if _, err := c.Register(context.Background(), store.Node{ID: "remote", Name: "remote", OS: "linux", Architecture: "amd64"},
+		[]store.Executor{{ID: "remote-exec", Kind: "linux", Attributes: json.RawMessage(`{"environment":"remote-test"}`), Enabled: true}},
+		[]Provider{{ID: "remote-gpu", Kind: "nvidia"}}); err != nil {
+		t.Fatal(err)
 	}
+}
 
-	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
+// remoteAttempt authorizes one attempt on the remote executor and returns it.
+func remoteAttempt(t *testing.T, st *store.Store, c *Client) *store.Launch {
+	t.Helper()
+	ctx := context.Background()
+	registerRemote(t, c)
+	selector, _ := json.Marshal(map[string]any{"labels": map[string]string{"environment": "remote-test"}})
+	if _, _, err := st.SubmitExecution(ctx, store.ExecutionSpec{ClientRequestID: "remote-attempt", Scope: store.ScopePath{Project: "pilot"}, Argv: []string{"run"}, CWD: ".", ExecutorSelector: selector}); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := c.ReserveNext(ctx, "remote-exec")
+	if err != nil || reservation == nil {
+		t.Fatalf("reserve: %+v %v", reservation, err)
+	}
+	if err = c.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := c.AuthorizeLaunch(ctx, reservation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
-	closed := httptest.NewServer((&api.Server{Store: st}).Handler())
-	defer closed.Close()
-	resp, err := http.Post(closed.URL+"/v3/agent/register", "application/json", strings.NewReader(`{}`))
+	return launch
+}
+
+func forbidden(t *testing.T, name string, err error) {
+	t.Helper()
+	if !errors.Is(err, api.ErrForbidden) {
+		t.Fatalf("%s: expected forbidden, got %v", name, err)
+	}
+}
+
+func TestAgentAPIRequiresANodeToken(t *testing.T) {
+	st, ts, _, _ := newDaemon(t)
+	_, err := New(ts.URL, "kairo_node_wrong", nil).Register(context.Background(), store.Node{ID: "remote", Name: "remote"}, nil, nil)
+	if !errors.Is(err, store.ErrUnauthorized) {
+		t.Fatalf("expected unauthorized, got %v", err)
+	}
+	_, admin, err := st.CreateAPIToken(context.Background(), "operator", store.RoleAdmin, "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusNotFound {
-		t.Fatalf("agent API must not be mounted without a token, got %d", resp.StatusCode)
+	_, err = New(ts.URL, admin, nil).Register(context.Background(), store.Node{ID: "remote", Name: "remote"}, nil, nil)
+	forbidden(t, "operator token on the agent API", err)
+}
+
+// A node token only acts for its own node: it cannot register as another
+// node, nor touch another node's executors, leases, attempts or logs.
+func TestNodeTokenIsBoundToItsNode(t *testing.T) {
+	st, ts, token, _ := newDaemon(t)
+	ctx := context.Background()
+	c := New(ts.URL, token, nil)
+	launch := remoteAttempt(t, st, c)
+	_, otherToken, err := st.CreateAPIToken(ctx, "other-agent", store.RoleNode, "other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := New(ts.URL, otherToken, nil)
+	_, err = other.Register(ctx, store.Node{ID: "remote", Name: "remote", OS: "linux", Architecture: "amd64"}, nil, nil)
+	forbidden(t, "register as another node", err)
+	_, err = other.ReserveNext(ctx, "remote-exec")
+	forbidden(t, "reserve for another node's executor", err)
+	_, err = other.ForceStopOrders(ctx, "remote-exec")
+	forbidden(t, "read another node's force stops", err)
+	forbidden(t, "ack another node's attempt", other.AckForceStop(ctx, launch.Attempt.ID, "signalled", nil))
+	forbidden(t, "terminal for another node's attempt", other.RecordTerminal(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, 0, ""))
+	forbidden(t, "release another node's lease", other.ReleaseReservation(ctx, launch.Lease.ID, launch.Lease.CoordinationEpoch, "x"))
+	forbidden(t, "observe with another node's provider", other.ApplyObservationBatch(ctx, "remote-gpu", nil, nil, nil))
+	_, err = other.appendLog(ctx, launch.Attempt.ID+".stderr.log", 0, []byte("x"))
+	forbidden(t, "append to another node's log", err)
+	// Registering its own node with an executor id taken by another node is
+	// refused by the store.
+	if _, err = other.Register(ctx, store.Node{ID: "other", Name: "other", OS: "linux", Architecture: "amd64"},
+		[]store.Executor{{ID: "remote-exec", Kind: "linux", Enabled: true}}, nil); !errors.Is(err, store.ErrOwnershipConflict) {
+		t.Fatalf("executor takeover: %v", err)
+	}
+	if node, err := st.ExecutorNode(ctx, "remote-exec"); err != nil || node != "remote" {
+		t.Fatalf("executor moved to %q (%v)", node, err)
 	}
 }
 
 func TestSentinelErrorsRoundTrip(t *testing.T) {
-	_, ts, _ := newDaemon(t)
-	c := New(ts.URL, testToken)
-	err := c.SetAttemptLogPaths(context.Background(), "att_missing", 1, "x.stdout.log", "x.stderr.log")
-	if !errors.Is(err, store.ErrStaleEpoch) {
-		t.Fatalf("expected store.ErrStaleEpoch through the wire, got %v", err)
+	_, ts, token, _ := newDaemon(t)
+	c := New(ts.URL, token, nil)
+	err := c.SetAttemptLogPaths(context.Background(), "att_missing", 1, "att_missing.stdout.log", "att_missing.stderr.log")
+	if !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("expected store.ErrNotFound through the wire, got %v", err)
 	}
 }
 
 func TestLogAppendIsIdempotentAndReportsGaps(t *testing.T) {
-	_, ts, logDir := newDaemon(t)
-	c := New(ts.URL, testToken)
+	st, ts, token, logDir := newDaemon(t)
+	c := New(ts.URL, token, nil)
 	ctx := context.Background()
-	if size, err := c.appendLog(ctx, "att_x.stderr.log", 0, []byte("abc")); err != nil || size != 3 {
+	name := remoteAttempt(t, st, c).Attempt.ID + ".stderr.log"
+	if size, err := c.appendLog(ctx, name, 0, []byte("abc")); err != nil || size != 3 {
 		t.Fatalf("first append: size=%d err=%v", size, err)
 	}
 	// A retry that overlaps what the daemon already has only adds the tail.
-	if size, err := c.appendLog(ctx, "att_x.stderr.log", 0, []byte("abcdef")); err != nil || size != 6 {
+	if size, err := c.appendLog(ctx, name, 0, []byte("abcdef")); err != nil || size != 6 {
 		t.Fatalf("overlapping append: size=%d err=%v", size, err)
 	}
 	var gap *GapError
-	if _, err := c.appendLog(ctx, "att_x.stderr.log", 10, []byte("z")); !errors.As(err, &gap) || gap.Size != 6 {
+	if _, err := c.appendLog(ctx, name, 10, []byte("z")); !errors.As(err, &gap) || gap.Size != 6 {
 		t.Fatalf("expected gap at 6, got %v", err)
 	}
 	if _, err := c.appendLog(ctx, "../escape.stderr.log", 0, []byte("z")); err == nil {
 		t.Fatal("path traversal must be rejected")
 	}
-	body, _ := os.ReadFile(filepath.Join(logDir, "att_x.stderr.log"))
+	if _, err := c.appendLog(ctx, "att_unknown.stderr.log", 0, []byte("z")); err == nil {
+		t.Fatal("a log of an unknown attempt must be rejected")
+	}
+	body, _ := os.ReadFile(filepath.Join(logDir, name))
 	if string(body) != "abcdef" {
 		t.Fatalf("daemon log = %q", body)
 	}
@@ -121,15 +191,11 @@ func TestLogAppendIsIdempotentAndReportsGaps(t *testing.T) {
 // launches, exits, proves quiescence and releases the lease; its log reaches
 // the daemon's log directory.
 func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
-	st, ts, daemonLogs := newDaemon(t)
+	st, ts, token, daemonLogs := newDaemon(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	c := New(ts.URL, testToken)
-	if _, err := c.Register(ctx, store.Node{ID: "remote", Name: "remote", OS: "linux", Architecture: "amd64"},
-		[]store.Executor{{ID: "remote-exec", Kind: "linux", Attributes: json.RawMessage(`{"environment":"remote-test"}`), Enabled: true}},
-		[]Provider{{ID: "remote-gpu", Kind: "nvidia"}}); err != nil {
-		t.Fatal(err)
-	}
+	c := New(ts.URL, token, nil)
+	registerRemote(t, c)
 	selector, _ := json.Marshal(map[string]any{"labels": map[string]string{"environment": "remote-test"}})
 	if _, _, err := st.SubmitExecution(ctx, store.ExecutionSpec{
 		ClientRequestID:  "remote-1",
@@ -190,27 +256,29 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 
 // Run ships a log that appears and grows after the shipper started.
 func TestLogShipperRunShipsGrowingFile(t *testing.T) {
-	_, ts, daemonLogs := newDaemon(t)
+	st, ts, token, daemonLogs := newDaemon(t)
+	c := New(ts.URL, token, nil)
+	name := remoteAttempt(t, st, c).Attempt.ID + ".stderr.log"
 	nodeLogs := t.TempDir()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	shipper := &LogShipper{Client: New(ts.URL, testToken), Dir: nodeLogs, Interval: 50 * time.Millisecond}
+	shipper := &LogShipper{Client: c, Dir: nodeLogs, Interval: 50 * time.Millisecond}
 	go func() { _ = shipper.Run(ctx) }()
 	time.Sleep(120 * time.Millisecond)
-	path := filepath.Join(nodeLogs, "att_run.stderr.log")
+	path := filepath.Join(nodeLogs, name)
 	if err := os.WriteFile(path, []byte("first\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	waitFor := func(want string) {
 		deadline := time.Now().Add(3 * time.Second)
 		for time.Now().Before(deadline) {
-			body, _ := os.ReadFile(filepath.Join(daemonLogs, "att_run.stderr.log"))
+			body, _ := os.ReadFile(filepath.Join(daemonLogs, name))
 			if string(body) == want {
 				return
 			}
 			time.Sleep(20 * time.Millisecond)
 		}
-		body, _ := os.ReadFile(filepath.Join(daemonLogs, "att_run.stderr.log"))
+		body, _ := os.ReadFile(filepath.Join(daemonLogs, name))
 		t.Fatalf("daemon log = %q, want %q", body, want)
 	}
 	waitFor("first\n")
@@ -224,10 +292,11 @@ func TestLogShipperRunShipsGrowingFile(t *testing.T) {
 }
 
 func TestForceStopCallsRoundTrip(t *testing.T) {
-	_, ts, _ := newDaemon(t)
-	c := New(ts.URL, testToken)
+	_, ts, token, _ := newDaemon(t)
+	c := New(ts.URL, token, nil)
 	ctx := context.Background()
-	if orders, err := c.ForceStopOrders(ctx, "exec"); err != nil || len(orders) != 0 {
+	registerRemote(t, c)
+	if orders, err := c.ForceStopOrders(ctx, "remote-exec"); err != nil || len(orders) != 0 {
 		t.Fatalf("orders: %+v %v", orders, err)
 	}
 	if err := c.AckForceStop(ctx, "att_missing", "signalled", nil); !errors.Is(err, store.ErrNotFound) {
@@ -235,13 +304,76 @@ func TestForceStopCallsRoundTrip(t *testing.T) {
 	}
 }
 
-// A daemon predating force stop has no route for it: the agent sees no
-// orders instead of failing every tick.
-func TestForceStopOrdersFromAnOlderDaemon(t *testing.T) {
-	old := httptest.NewServer(http.NotFoundHandler())
-	defer old.Close()
-	orders, err := New(old.URL, testToken).ForceStopOrders(context.Background(), "exec")
-	if err != nil || orders != nil {
-		t.Fatalf("orders=%v err=%v", orders, err)
+// Against an observe-only daemon an agent's polls find nothing to do and
+// actuation is refused, as for an in-process executor that only observes.
+func TestObserveOnlyDaemonGivesAgentsNothingToDo(t *testing.T) {
+	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	_, token, err := st.CreateAPIToken(ctx, "remote-agent", store.RoleNode, "remote")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer((&api.Server{Store: st, ObserveOnly: true}).Handler())
+	defer ts.Close()
+	c := New(ts.URL, token, nil)
+	registerRemote(t, c)
+	selector, _ := json.Marshal(map[string]any{"labels": map[string]string{"environment": "remote-test"}})
+	if _, _, err = st.SubmitExecution(ctx, store.ExecutionSpec{ClientRequestID: "observe", Scope: store.ScopePath{Project: "pilot"}, Argv: []string{"run"}, CWD: ".", ExecutorSelector: selector}); err != nil {
+		t.Fatal(err)
+	}
+	if reservation, err := c.ReserveNext(ctx, "remote-exec"); err != nil || reservation != nil {
+		t.Fatalf("observe-only reserve: %+v %v", reservation, err)
+	}
+	if commands, err := c.EnsurePriorityPreemption(ctx, "remote-exec"); err != nil || len(commands) != 0 {
+		t.Fatalf("observe-only preemption: %v %v", commands, err)
+	}
+	snap, _ := (&fakeGPU{node: "remote"}).Observe(ctx)
+	if err := c.ApplyObservationBatch(ctx, "remote-gpu", snap.Resources, snap.Observations, snap.Claims); err != nil {
+		t.Fatalf("observe-only observation: %v", err)
+	}
+	executions, err := st.ListExecutions(ctx, store.ExecutionFilter{})
+	if err != nil || len(executions) != 1 || executions[0].State != "waiting" {
+		t.Fatalf("observe-only daemon changed an execution: %+v %v", executions, err)
+	}
+	var apiErr *Error
+	if err := c.MarkQuarantineTerminated(ctx, "att_missing"); !errors.Is(err, store.ErrNotFound) && !(errors.As(err, &apiErr) && apiErr.Status == 423) {
+		t.Fatalf("observe-only actuation: %v", err)
+	}
+}
+
+// The client verifies the daemon's certificate against the configured CA.
+func TestClientTrustsOnlyTheDaemonCA(t *testing.T) {
+	st, _, token, _ := newDaemon(t)
+	dir := t.TempDir()
+	if err := tlsutil.InitCA(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := tlsutil.IssueServer(dir, []string{"127.0.0.1"}); err != nil {
+		t.Fatal(err)
+	}
+	cert, err := tls.LoadX509KeyPair(filepath.Join(dir, tlsutil.ServerCertFile), filepath.Join(dir, tlsutil.ServerKeyFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewUnstartedServer((&api.Server{Store: st}).Handler())
+	ts.TLS = tlsutil.ServerConfig()
+	ts.TLS.Certificates = []tls.Certificate{cert}
+	ts.StartTLS()
+	defer ts.Close()
+	caPEM, err := os.ReadFile(filepath.Join(dir, tlsutil.CACertFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted, err := tlsutil.ClientConfig(caPEM)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registerRemote(t, New(ts.URL, token, trusted))
+	if _, err := New(ts.URL, token, nil).Register(context.Background(), store.Node{ID: "remote", Name: "remote", OS: "linux", Architecture: "amd64"}, nil, nil); err == nil {
+		t.Fatal("a client without the daemon CA must not connect")
 	}
 }

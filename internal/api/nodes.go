@@ -35,7 +35,7 @@ func (s *Server) quarantineNode(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	value, err := s.Store.QuarantineNode(r.Context(), nodeParam(r), body.Actor, body.Reason)
+	value, err := s.Store.QuarantineNode(r.Context(), nodeParam(r), actorOr(r, body.Actor), body.Reason)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -51,7 +51,7 @@ func (s *Server) releaseNodeQuarantine(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := s.Store.ReleaseNodeQuarantine(r.Context(), nodeParam(r), body.Actor); err != nil {
+	if err := s.Store.ReleaseNodeQuarantine(r.Context(), nodeParam(r), actorOr(r, body.Actor)); err != nil {
 		writeError(w, err)
 		return
 	}

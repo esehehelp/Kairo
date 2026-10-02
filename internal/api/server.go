@@ -4,60 +4,69 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log/slog"
 	"net/http"
+	"strconv"
 	"sync"
 
 	"kairo/internal/store"
 )
 
+// Server is the daemon's HTTP API: one /api surface for operators, node
+// agents and the processes of attempts, each authenticated by a bearer token
+// (see auth.go and routes.go).
 type Server struct {
 	Store       *store.Store
-	Logger      *slog.Logger
 	ObserveOnly bool
-	// AgentToken enables the node agent API (/v3/agent/*) when non-empty.
-	AgentToken string
 	// LogDirectory receives attempt logs shipped by node agents.
 	LogDirectory string
 
 	logMu sync.Mutex
 }
 
-var errObserveOnly = errors.New("operation is disabled in observe-only mode")
+var (
+	errObserveOnly = errors.New("operation is disabled in observe-only mode")
+	// ErrForbidden: the token is valid but its role or node does not allow this.
+	ErrForbidden = errors.New("token is not allowed to do this")
+)
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /health", s.health)
-	mux.HandleFunc("POST /orchestration/v1/project-specs", s.applyProjectDeclaration)
-	mux.HandleFunc("GET /orchestration/v1/projects/{project}", s.getProjectOrchestrationStatus)
-	mux.HandleFunc("POST /v2/executions", s.submitExecution)
-	mux.HandleFunc("GET /v2/executions", s.listExecutions)
-	mux.HandleFunc("GET /v2/executions/{id}", s.getExecution)
-	mux.HandleFunc("POST /v2/executions/{id}/withdraw", s.withdrawExecution)
-	mux.HandleFunc("GET /v2/attempts", s.listAttempts)
-	mux.HandleFunc("GET /v2/scopes", s.listScopes)
-	mux.HandleFunc("GET /v2/scopes/{id}", s.getScope)
-	mux.HandleFunc("POST /v2/scopes/{id}/pause", s.pauseScope)
-	mux.HandleFunc("POST /v2/scopes/{id}/resume", s.resumeScope)
-	mux.HandleFunc("GET /v2/pause-operations/{id}", s.getPauseOperation)
-	mux.HandleFunc("GET /v2/events", s.listEvents)
-	mux.HandleFunc("GET /v2/node-quarantines", s.listNodeQuarantines)
-	mux.HandleFunc("POST /v2/nodes/{id}/quarantine", s.quarantineNode)
-	mux.HandleFunc("DELETE /v2/nodes/{id}/quarantine", s.releaseNodeQuarantine)
-	mux.HandleFunc("GET /v2/resources/status", s.resourceStatus)
-	mux.HandleFunc("POST /v2/resources/{id}/{action}", s.resourceAction)
-	mux.HandleFunc("GET /v2/worker/attempts/{id}/commands", s.workerPoll)
-	mux.HandleFunc("POST /v2/worker/attempts/{id}/commands/{command}/acks", s.workerAck)
-	mux.HandleFunc("POST /v2/worker/attempts/{id}/heartbeat", s.workerHeartbeat)
-	mux.HandleFunc("POST /v2/worker/attempts/{id}/processes", s.workerProcess)
-	s.mountAgent(mux)
-	return s.logging(mux)
+	for _, rt := range s.routes() {
+		mux.HandleFunc(rt.method+" "+rt.pattern, s.authorize(rt.role, rt.handler))
+	}
+	return mux
 }
 
-func (s *Server) logging(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(w, r)
-	})
+// Errors travel as {"error": message, "code": code}; a code maps back to the
+// store sentinel on the client side (ErrorForCode), so the node agent sees the
+// same error values the store returns in-process.
+var errorCodes = []struct {
+	code   string
+	status int
+	err    error
+}{
+	{"unauthorized", http.StatusUnauthorized, store.ErrUnauthorized},
+	{"forbidden", http.StatusForbidden, ErrForbidden},
+	{"not_found", http.StatusNotFound, store.ErrNotFound},
+	{"stale_epoch", http.StatusConflict, store.ErrStaleEpoch},
+	{"execution_started", http.StatusConflict, store.ErrExecutionStarted},
+	{"idempotency_conflict", http.StatusConflict, store.ErrIdempotencyConflict},
+	{"orchestration_conflict", http.StatusConflict, store.ErrOrchestrationConflict},
+	{"ownership_conflict", http.StatusConflict, store.ErrOwnershipConflict},
+	{"gang_not_ready", http.StatusConflict, store.ErrGangNotReady},
+	{"gang_aborted", http.StatusConflict, store.ErrGangAborted},
+	{"gate_closed", http.StatusLocked, store.ErrGateClosed},
+	{"observe_only", http.StatusLocked, errObserveOnly},
+}
+
+// ErrorForCode maps a wire code back to the store sentinel (nil if none).
+func ErrorForCode(code string) error {
+	for _, c := range errorCodes {
+		if c.code == code {
+			return c.err
+		}
+	}
+	return nil
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -67,23 +76,51 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeError(w http.ResponseWriter, err error) {
-	status := http.StatusBadRequest
-	if errors.Is(err, store.ErrNotFound) {
-		status = http.StatusNotFound
-	} else if errors.Is(err, store.ErrIdempotencyConflict) || errors.Is(err, store.ErrOrchestrationConflict) || errors.Is(err, store.ErrStaleEpoch) || errors.Is(err, store.ErrExecutionStarted) {
-		status = http.StatusConflict
-	} else if errors.Is(err, store.ErrGateClosed) {
-		status = http.StatusLocked
-	} else if errors.Is(err, errObserveOnly) {
-		status = http.StatusLocked
+	status, code := http.StatusBadRequest, "bad_request"
+	for _, c := range errorCodes {
+		if errors.Is(err, c.err) {
+			status, code = c.status, c.code
+			break
+		}
 	}
-	writeJSON(w, status, map[string]string{"error": err.Error()})
+	writeJSON(w, status, map[string]string{"error": err.Error(), "code": code})
 }
 
 func decode(r *http.Request, target any) error {
 	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
 	dec.DisallowUnknownFields()
 	return dec.Decode(target)
+}
+
+func decodeOptional(r *http.Request, target any) error {
+	if r.Body == nil || r.ContentLength == 0 {
+		return nil
+	}
+	return decode(r, target)
+}
+
+func queryInt(r *http.Request, key string, fallback int) int {
+	raw := r.URL.Query().Get(key)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil || value < 0 {
+		return fallback
+	}
+	return value
+}
+
+func queryInt64(r *http.Request, key string, fallback int64) int64 {
+	raw := r.URL.Query().Get(key)
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || value < 0 {
+		return fallback
+	}
+	return value
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
