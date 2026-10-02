@@ -5,14 +5,12 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"kairo/internal/orchestration"
 )
@@ -136,7 +134,11 @@ func projectPrune(args []string) error {
 	if err != nil {
 		return err
 	}
-	states, err := projectTaskStates(*api, validated.Manifest.Project.Name)
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	states, err := projectTaskStates(client, validated.Manifest.Project.Name)
 	if err != nil {
 		return err
 	}
@@ -167,24 +169,18 @@ func projectPrune(args []string) error {
 	return nil
 }
 
-func projectTaskStates(apiURL, project string) (map[string]string, error) {
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(strings.TrimRight(apiURL, "/") + "/orchestration/v1/projects/" + url.PathEscape(project))
+func projectTaskStates(client *apiClient, project string) (map[string]string, error) {
+	status, body, err := client.do(http.MethodGet, "/api/projects/"+url.PathEscape(project), nil)
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode == http.StatusNotFound {
+	if status == http.StatusNotFound {
 		return map[string]string{}, nil // nothing applied yet: every task is undeclared
 	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("project status: HTTP %s", resp.Status)
+	if status < 200 || status >= 300 {
+		return nil, fmt.Errorf("project status: %w", httpError(status, body))
 	}
-	var status struct {
+	var parsed struct {
 		Project struct {
 			Tasks []struct {
 				Name  string `json:"name"`
@@ -192,11 +188,11 @@ func projectTaskStates(apiURL, project string) (map[string]string, error) {
 			} `json:"tasks"`
 		} `json:"project"`
 	}
-	if err := json.Unmarshal(body, &status); err != nil {
+	if err := json.Unmarshal(body, &parsed); err != nil {
 		return nil, fmt.Errorf("project status: %w", err)
 	}
 	states := map[string]string{}
-	for _, t := range status.Project.Tasks {
+	for _, t := range parsed.Project.Tasks {
 		states[t.Name] = t.State
 	}
 	return states, nil

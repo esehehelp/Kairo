@@ -16,18 +16,18 @@ import (
 func TestProjectPauseWaitsForDurableOperationByDefault(t *testing.T) {
 	var mu sync.Mutex
 	var requests []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		requests = append(requests, r.Method+" "+r.URL.Path)
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/v2/scopes":
+		case "/api/scopes":
 			_ = json.NewEncoder(w).Encode(map[string]any{"scopes": []map[string]string{{"id": "scp_project"}}})
-		case "/v2/scopes/scp_project/pause":
+		case "/api/scopes/scp_project/pause":
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{"operation_id": "pop_one"})
-		case "/v2/pause-operations/pop_one":
+		case "/api/pause-operations/pop_one":
 			_ = json.NewEncoder(w).Encode(map[string]any{"operation": map[string]string{"state": "quiesced"}, "targets": []any{}})
 		default:
 			http.NotFound(w, r)
@@ -41,9 +41,9 @@ func TestProjectPauseWaitsForDurableOperationByDefault(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	want := []string{
-		"GET /v2/scopes",
-		"POST /v2/scopes/scp_project/pause",
-		"GET /v2/pause-operations/pop_one",
+		"GET /api/scopes",
+		"POST /api/scopes/scp_project/pause",
+		"GET /api/pause-operations/pop_one",
 	}
 	if len(requests) != len(want) {
 		t.Fatalf("request sequence = %v, want %v", requests, want)
@@ -58,15 +58,15 @@ func TestProjectPauseWaitsForDurableOperationByDefault(t *testing.T) {
 func TestProjectResumeOnlyOpensGate(t *testing.T) {
 	var mu sync.Mutex
 	var requests []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		requests = append(requests, r.Method+" "+r.URL.Path)
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/v2/scopes":
+		case "/api/scopes":
 			_ = json.NewEncoder(w).Encode(map[string]any{"scopes": []map[string]string{{"id": "scp_project"}}})
-		case "/v2/scopes/scp_project/resume":
+		case "/api/scopes/scp_project/resume":
 			_ = json.NewEncoder(w).Encode(map[string]any{"gate": map[string]any{"state": "open", "generation": 3}})
 		default:
 			http.NotFound(w, r)
@@ -79,7 +79,7 @@ func TestProjectResumeOnlyOpensGate(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	want := []string{"GET /v2/scopes", "POST /v2/scopes/scp_project/resume"}
+	want := []string{"GET /api/scopes", "POST /api/scopes/scp_project/resume"}
 	if len(requests) != len(want) {
 		t.Fatalf("request sequence = %v, want %v", requests, want)
 	}
@@ -92,7 +92,7 @@ func TestProjectResumeOnlyOpensGate(t *testing.T) {
 
 func TestProjectApplyUsesOrchestrationContract(t *testing.T) {
 	var gotMethod, gotPath string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotMethod, gotPath = r.Method, r.URL.Path
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -132,7 +132,7 @@ preemptible = false
 	if err := projectCommand([]string{"apply", "--api", server.URL, path}); err != nil {
 		t.Fatal(err)
 	}
-	if gotMethod != http.MethodPost || gotPath != "/orchestration/v1/project-specs" {
+	if gotMethod != http.MethodPost || gotPath != "/api/projects" {
 		t.Fatalf("request=%s %s", gotMethod, gotPath)
 	}
 }
@@ -140,10 +140,10 @@ preemptible = false
 func TestTaskCancelWithdrawsEveryExecutionNotStarted(t *testing.T) {
 	var mu sync.Mutex
 	var posts []string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
-		case r.Method == http.MethodGet && r.URL.Path == "/v2/executions":
+		case r.Method == http.MethodGet && r.URL.Path == "/api/executions":
 			if r.URL.Query().Get("task") != "t" || r.URL.Query().Get("queue") != "q" {
 				http.Error(w, "bad filter", http.StatusBadRequest)
 				return
@@ -170,7 +170,7 @@ func TestTaskCancelWithdrawsEveryExecutionNotStarted(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	want := []string{"/v2/executions/exe_rank0/withdraw", "/v2/executions/exe_rank1/withdraw"}
+	want := []string{"/api/executions/exe_rank0/withdraw", "/api/executions/exe_rank1/withdraw"}
 	if len(posts) != len(want) || posts[0] != want[0] || posts[1] != want[1] {
 		t.Fatalf("withdraw posts = %v, want %v", posts, want)
 	}
@@ -178,7 +178,7 @@ func TestTaskCancelWithdrawsEveryExecutionNotStarted(t *testing.T) {
 
 func TestTaskCancelRefusesARunningExecution(t *testing.T) {
 	posted := false
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodPost {
 			posted = true
@@ -203,12 +203,12 @@ func TestTaskCancelRefusesARunningExecution(t *testing.T) {
 func pauseServer(t *testing.T, bodies *[]map[string]any, operation map[string]any) *httptest.Server {
 	t.Helper()
 	var mu sync.Mutex
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
-		case "/v2/scopes":
+		case "/api/scopes":
 			_ = json.NewEncoder(w).Encode(map[string]any{"scopes": []map[string]string{{"id": "scp_task"}}})
-		case "/v2/scopes/scp_task/pause":
+		case "/api/scopes/scp_task/pause":
 			var body map[string]any
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			mu.Lock()
@@ -216,7 +216,7 @@ func pauseServer(t *testing.T, bodies *[]map[string]any, operation map[string]an
 			mu.Unlock()
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{"operation_id": "pop_one"})
-		case "/v2/pause-operations/pop_one":
+		case "/api/pause-operations/pop_one":
 			_ = json.NewEncoder(w).Encode(operation)
 		default:
 			http.NotFound(w, r)
@@ -245,7 +245,7 @@ func TestTaskPauseForceSendsTheForceStop(t *testing.T) {
 	if forced["force"] != true || forced["grace_seconds"] != float64(90) || forced["reason"] != "superseded" {
 		t.Fatalf("forced body: %v", forced)
 	}
-	// a plain pause must stay readable by a daemon predating force stop
+	// a plain pause sends only the actor and request id
 	for _, key := range []string{"force", "grace_seconds", "reason"} {
 		if _, ok := plain[key]; ok {
 			t.Fatalf("plain pause sent %s: %v", key, plain)
@@ -270,11 +270,11 @@ func TestBlockedPauseNamesTheBlocker(t *testing.T) {
 	var bodies []map[string]any
 	server := pauseServer(t, &bodies, map[string]any{
 		"operation": map[string]any{"state": "blocked"},
-		"targets":   []map[string]any{{"execution_id": "exe_1", "state": "blocked", "blocker_reason": "agent_lacks_force_stop"}},
+		"targets":   []map[string]any{{"execution_id": "exe_1", "state": "blocked", "blocker_reason": "force_stop_not_picked_up"}},
 	})
 	defer server.Close()
 	err := taskCommand([]string{"pause", "--api", server.URL, "--force", "--timeout", "1s", "p", "q", "t"})
-	if err == nil || !strings.Contains(err.Error(), "exe_1: agent_lacks_force_stop") || !strings.Contains(err.Error(), "upgrade that agent") {
+	if err == nil || !strings.Contains(err.Error(), "exe_1: force_stop_not_picked_up") || !strings.Contains(err.Error(), "check that node's agent log") {
 		t.Fatalf("error = %v", err)
 	}
 }

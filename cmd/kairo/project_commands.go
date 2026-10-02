@@ -12,7 +12,8 @@ import (
 	"kairo/internal/orchestration"
 )
 
-func projectOrchestrationCommand(args []string) error {
+// projectSpecCommand: kairo project validate|apply FILE, kairo project status PROJECT.
+func projectSpecCommand(args []string) error {
 	action := args[0]
 	fs := flag.NewFlagSet("project "+action, flag.ContinueOnError)
 	api := apiFlag(fs)
@@ -23,7 +24,11 @@ func projectOrchestrationCommand(args []string) error {
 		if fs.NArg() != 1 {
 			return errors.New("project status requires PROJECT")
 		}
-		return request(*api, http.MethodGet, "/orchestration/v1/projects/"+url.PathEscape(fs.Arg(0)), nil)
+		client, err := newAPIClient(*api)
+		if err != nil {
+			return err
+		}
+		return client.print(http.MethodGet, "/api/projects/"+url.PathEscape(fs.Arg(0)), nil)
 	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("project %s requires a project TOML file", action)
@@ -50,5 +55,9 @@ func projectOrchestrationCommand(args []string) error {
 		_, err = os.Stdout.Write(body)
 		return err
 	}
-	return request(*api, http.MethodPost, "/orchestration/v1/project-specs", validated.Manifest)
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	return client.print(http.MethodPost, "/api/projects", validated.Manifest)
 }

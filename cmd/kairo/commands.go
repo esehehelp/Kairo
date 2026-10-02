@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -32,6 +30,13 @@ func executionCommand(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	if action != "submit" && action != "list" && action != "show" && action != "withdraw" {
+		return fmt.Errorf("unknown execution command %q", action)
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
 	switch action {
 	case "submit":
 		if fs.NArg() != 1 {
@@ -45,7 +50,11 @@ func executionCommand(args []string) error {
 		if err != nil {
 			return err
 		}
-		return request(*api, http.MethodPost, "/v2/executions", parsed.Manifest)
+		body, err := submitBody(parsed.Manifest)
+		if err != nil {
+			return err
+		}
+		return client.print(http.MethodPost, "/api/executions", body)
 	case "list":
 		if fs.NArg() != 0 {
 			return errors.New("execution list accepts only flags")
@@ -56,29 +65,51 @@ func executionCommand(args []string) error {
 		query.Set("task", *task)
 		query.Set("state", *state)
 		query.Set("limit", fmt.Sprint(*limit))
-		return request(*api, http.MethodGet, withQuery("/v2/executions", query), nil)
+		return client.print(http.MethodGet, withQuery("/api/executions", query), nil)
 	case "show", "withdraw":
 		if fs.NArg() != 1 {
 			return fmt.Errorf("execution %s requires EXECUTION_ID", action)
 		}
-		path := "/v2/executions/" + url.PathEscape(fs.Arg(0))
+		path := "/api/executions/" + url.PathEscape(fs.Arg(0))
 		if action == "withdraw" {
-			return request(*api, http.MethodPost, path+"/withdraw", nil)
+			return client.print(http.MethodPost, path+"/withdraw", nil)
 		}
-		return request(*api, http.MethodGet, path, nil)
-	default:
-		return fmt.Errorf("unknown execution command %q", action)
+		return client.print(http.MethodGet, path, nil)
 	}
+	return nil
 }
 
+// submitBody is the execution file as the API takes it: schema_version
+// checks the file format and is not part of the request.
+func submitBody(m manifest.Manifest) (map[string]any, error) {
+	encoded, err := json.Marshal(m)
+	if err != nil {
+		return nil, err
+	}
+	var body map[string]any
+	if err := json.Unmarshal(encoded, &body); err != nil {
+		return nil, err
+	}
+	delete(body, "schema_version")
+	return body, nil
+}
+
+const projectUsage = "usage: kairo project <validate|apply|status|prune|pause|resume>"
+
 func projectCommand(args []string) error {
-	if len(args) > 0 && (args[0] == "validate" || args[0] == "apply" || args[0] == "status") {
-		return projectOrchestrationCommand(args)
+	if len(args) == 0 {
+		return errors.New(projectUsage)
 	}
-	if len(args) > 0 && args[0] == "prune" {
+	switch args[0] {
+	case "validate", "apply", "status":
+		return projectSpecCommand(args)
+	case "prune":
 		return projectPrune(args[1:])
+	case "pause", "resume":
+		return scopeCommand("project", args)
+	default:
+		return fmt.Errorf("unknown project command %q; %s", args[0], projectUsage)
 	}
-	return scopeCommand("project", args)
 }
 
 func queueCommand(args []string) error {
@@ -112,8 +143,12 @@ func taskCancel(args []string) error {
 	if fs.NArg() != 3 {
 		return errors.New("task cancel requires PROJECT QUEUE TASK")
 	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
 	query := url.Values{"project": {fs.Arg(0)}, "queue": {fs.Arg(1)}, "task": {fs.Arg(2)}, "limit": {"1000"}}
-	payload, err := requestBytes(*api, http.MethodGet, withQuery("/v2/executions", query), nil)
+	payload, err := client.call(http.MethodGet, withQuery("/api/executions", query), nil)
 	if err != nil {
 		return err
 	}
@@ -146,7 +181,7 @@ func taskCancel(args []string) error {
 			fmt.Println("would withdraw", id)
 			continue
 		}
-		if _, err := requestBytes(*api, http.MethodPost, "/v2/executions/"+url.PathEscape(id)+"/withdraw", nil); err != nil {
+		if _, err := client.call(http.MethodPost, "/api/executions/"+url.PathEscape(id)+"/withdraw", nil); err != nil {
 			return fmt.Errorf("withdraw %s: %w", id, err)
 		}
 		fmt.Println("withdrawn", id)
@@ -198,6 +233,10 @@ func scopeCommand(kind string, args []string) error {
 		return errors.New("--grace must be between 0 and 1h")
 	}
 
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
 	query := url.Values{"project": {fs.Arg(0)}}
 	if want > 1 {
 		query.Set("queue", fs.Arg(1))
@@ -205,7 +244,7 @@ func scopeCommand(kind string, args []string) error {
 	if want > 2 {
 		query.Set("task", fs.Arg(2))
 	}
-	payload, err := requestBytes(*api, http.MethodGet, withQuery("/v2/scopes", query), nil)
+	payload, err := client.call(http.MethodGet, withQuery("/api/scopes", query), nil)
 	if err != nil {
 		return err
 	}
@@ -220,11 +259,10 @@ func scopeCommand(kind string, args []string) error {
 	if len(listed.Scopes) != 1 {
 		return fmt.Errorf("coordination scope not found or ambiguous (%d matches)", len(listed.Scopes))
 	}
-	path := "/v2/scopes/" + url.PathEscape(listed.Scopes[0].ID) + "/" + action
+	path := "/api/scopes/" + url.PathEscape(listed.Scopes[0].ID) + "/" + action
 	var body any
 	if action == "pause" && *force {
-		// Only a forced pause sends these fields: a daemon predating force stop
-		// rejects them instead of pausing without force.
+		// Only a forced pause sends these fields.
 		body = map[string]any{"actor": *actor, "request_id": *requestID, "force": true,
 			"grace_seconds": int((*grace + time.Second - 1) / time.Second), "reason": *reason}
 	} else if action == "pause" {
@@ -232,7 +270,7 @@ func scopeCommand(kind string, args []string) error {
 	} else {
 		body = map[string]string{"actor": *actor}
 	}
-	payload, err = requestBytes(*api, http.MethodPost, path, body)
+	payload, err = client.call(http.MethodPost, path, body)
 	if err != nil {
 		return err
 	}
@@ -249,13 +287,13 @@ func scopeCommand(kind string, args []string) error {
 	if started.OperationID == "" {
 		return errors.New("pause response did not include operation_id")
 	}
-	return waitForPause(*api, started.OperationID, *waitTimeout)
+	return waitForPause(client, started.OperationID, *waitTimeout)
 }
 
-func waitForPause(apiURL, operationID string, timeout time.Duration) error {
+func waitForPause(client *apiClient, operationID string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for {
-		payload, err := requestBytes(apiURL, http.MethodGet, "/v2/pause-operations/"+url.PathEscape(operationID), nil)
+		payload, err := client.call(http.MethodGet, "/api/pause-operations/"+url.PathEscape(operationID), nil)
 		if err != nil {
 			return err
 		}
@@ -302,7 +340,7 @@ type pauseOperationResponse struct {
 var blockerHints = map[string]string{
 	"execution_not_checkpointable": "it cannot checkpoint; end it with pause --force",
 	"checkpoint_rejected":          "it rejected the checkpoint; end it with pause --force",
-	"agent_lacks_force_stop":       "its node agent is running but does not pick up force stops: upgrade that agent",
+	"force_stop_not_picked_up":     "its executor is polling but has not picked up the force stop; check that node's agent log",
 	"executor_unreachable":         "its executor has not been seen recently: check that node's agent",
 }
 
@@ -375,7 +413,11 @@ func resourceCommand(args []string) error {
 		if fs.NArg() != 0 {
 			return errors.New("resource status accepts no arguments")
 		}
-		return request(*api, http.MethodGet, "/v2/resources/status", nil)
+		client, err := newAPIClient(*api)
+		if err != nil {
+			return err
+		}
+		return printResources(client)
 	}
 	if fs.NArg() != 1 {
 		return fmt.Errorf("resource %s requires RESOURCE_ID", action)
@@ -392,7 +434,15 @@ func resourceCommand(args []string) error {
 		}
 		body = map[string]bool{"confirm_process_absent": true}
 	}
-	return request(*api, http.MethodPost, "/v2/resources/"+url.PathEscape(fs.Arg(0))+"/"+action, body)
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	return client.print(http.MethodPost, "/api/resources/"+url.PathEscape(fs.Arg(0))+"/"+action, body)
+}
+
+func printResources(client *apiClient) error {
+	return client.print(http.MethodGet, "/api/resources", nil)
 }
 
 func doctorCommand(args []string) error {
@@ -404,7 +454,28 @@ func doctorCommand(args []string) error {
 	if fs.NArg() != 0 {
 		return errors.New("doctor accepts no arguments")
 	}
-	return request(*api, http.MethodGet, "/v2/resources/status", nil)
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	payload, err := client.call(http.MethodGet, "/api/whoami", nil)
+	if err != nil {
+		return fmt.Errorf("%s: %w", client.baseURL, err)
+	}
+	var who struct {
+		Name   string `json:"name"`
+		Role   string `json:"role"`
+		NodeID string `json:"node_id"`
+	}
+	if err := json.Unmarshal(payload, &who); err != nil {
+		return fmt.Errorf("decode whoami: %w", err)
+	}
+	line := fmt.Sprintf("authenticated as %s (%s)", who.Name, who.Role)
+	if who.NodeID != "" {
+		line += " for node " + who.NodeID
+	}
+	fmt.Println(line)
+	return printResources(client)
 }
 
 func withQuery(path string, values url.Values) string {
@@ -417,37 +488,4 @@ func withQuery(path string, values url.Values) string {
 		return path + "?" + encoded
 	}
 	return path
-}
-
-func requestBytes(apiURL, method, path string, body any) ([]byte, error) {
-	var reader io.Reader
-	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return nil, err
-		}
-		reader = bytes.NewReader(encoded)
-	}
-	req, err := http.NewRequest(method, strings.TrimRight(apiURL, "/")+path, reader)
-	if err != nil {
-		return nil, err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	payload, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		_, _ = os.Stdout.Write(payload)
-		return nil, fmt.Errorf("HTTP %s", resp.Status)
-	}
-	return payload, nil
 }

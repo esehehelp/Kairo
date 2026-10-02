@@ -1,14 +1,12 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -56,6 +54,8 @@ func run(args []string) error {
 		return resourceCommand(args[1:])
 	case "node":
 		return nodeCommand(args[1:])
+	case "token":
+		return tokenCommand(args[1:])
 	case "tls":
 		return tlsCommand(args[1:])
 	case "doctor":
@@ -66,7 +66,7 @@ func run(args []string) error {
 }
 
 func usage() error {
-	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|tls|doctor>")
+	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|token|tls|doctor>")
 }
 
 func serve(args []string) error {
@@ -252,41 +252,4 @@ func serve(args []string) error {
 	case err := <-errCh:
 		return err
 	}
-}
-
-func apiFlag(fs *flag.FlagSet) *string {
-	return fs.String("api", "http://127.0.0.1:7474", "Kairo API URL")
-}
-
-func request(apiURL, method, path string, body any) error {
-	var reader io.Reader
-	if body != nil {
-		encoded, err := json.Marshal(body)
-		if err != nil {
-			return err
-		}
-		reader = bytes.NewReader(encoded)
-	}
-	req, err := http.NewRequest(method, strings.TrimRight(apiURL, "/")+path, reader)
-	if err != nil {
-		return err
-	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	payload, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	_, _ = os.Stdout.Write(payload)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %s", resp.Status)
-	}
-	return nil
 }

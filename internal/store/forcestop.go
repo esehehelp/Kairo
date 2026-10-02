@@ -142,11 +142,12 @@ func (s *Store) forceStopBlocker(ctx context.Context, executionID string) (*stri
 	if err != nil || time.Since(requestedAt) < ForceStopPickupTimeout {
 		return nil, err
 	}
-	// Every executor version stamps last_seen_at while it polls for quiescence;
-	// one that is polling but never picks the order up predates force stop.
+	// An executor stamps last_seen_at while it polls; one that is polling but
+	// has not picked the order up within the timeout is stuck on it (its node
+	// agent's log says why).
 	if lastSeen.Valid {
 		if seen, err := time.Parse(time.RFC3339Nano, lastSeen.String); err == nil && time.Since(seen) < ForceStopPickupTimeout {
-			return stringPointer("agent_lacks_force_stop"), nil
+			return stringPointer("force_stop_not_picked_up"), nil
 		}
 	}
 	return stringPointer("executor_unreachable"), nil

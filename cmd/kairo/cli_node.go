@@ -23,11 +23,15 @@ func nodeCommand(args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	if action == "quarantine-status" {
-		return request(*api, http.MethodGet, "/v2/node-quarantines", nil)
-	}
-	if action != "quarantine" && action != "release" {
+	if action != "quarantine" && action != "release" && action != "quarantine-status" {
 		return fmt.Errorf("unknown node command %q", action)
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	if action == "quarantine-status" {
+		return client.print(http.MethodGet, "/api/nodes/quarantines", nil)
 	}
 	node := "all"
 	switch {
@@ -37,11 +41,11 @@ func nodeCommand(args []string) error {
 	default:
 		return fmt.Errorf("node %s takes exactly one of NODE_ID or --all", action)
 	}
-	path := "/v2/nodes/" + url.PathEscape(node) + "/quarantine"
+	path := "/api/nodes/" + url.PathEscape(node) + "/quarantine"
 	if action == "quarantine" {
-		return request(*api, http.MethodPost, path, map[string]string{"actor": *actor, "reason": *reason})
+		return client.print(http.MethodPost, path, map[string]string{"actor": *actor, "reason": *reason})
 	}
-	return request(*api, http.MethodDelete, path, map[string]string{"actor": *actor})
+	return client.print(http.MethodDelete, path, map[string]string{"actor": *actor})
 }
 
 func defaultActor() string {

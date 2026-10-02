@@ -329,11 +329,11 @@ func TestForceStopNotPickedUpIsReported(t *testing.T) {
 	if got := blocker(); got != "executor_unreachable/blocked" {
 		t.Fatalf("blocker = %s", got)
 	}
-	// an agent that polls for quiescence but never for force stops is too old
+	// an executor that polls but has not picked the force stop up
 	if _, err = store.ListQuiescenceCandidates(ctx, "executor"); err != nil {
 		t.Fatal(err)
 	}
-	if got := blocker(); got != "agent_lacks_force_stop/blocked" {
+	if got := blocker(); got != "force_stop_not_picked_up/blocked" {
 		t.Fatalf("blocker = %s", got)
 	}
 	// once an executor picks it up, the target converges again
