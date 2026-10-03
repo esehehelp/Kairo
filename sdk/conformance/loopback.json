@@ -1,0 +1,20 @@
+{
+  "$comment": "Is HOST a loopback address? A bearer token may travel over plain http only to these. HOST is the URL host with IPv6 brackets removed. 'localhost' matches case-insensitively; an IP literal matches when it is loopback (127.0.0.0/8, ::1, and IPv4-mapped ::ffff:127.x); nothing else matches (no DNS lookups, no zone suffixes).",
+  "cases": [
+    {"host": "localhost", "loopback": true},
+    {"host": "LOCALHOST", "loopback": true},
+    {"host": "127.0.0.1", "loopback": true},
+    {"host": "127.8.9.10", "loopback": true},
+    {"host": "::1", "loopback": true},
+    {"host": "::ffff:127.0.0.1", "loopback": true},
+    {"host": "localhost.", "loopback": false},
+    {"host": "localhost.example", "loopback": false},
+    {"host": "127.0.0.1.nip.io", "loopback": false},
+    {"host": "::1%lo", "loopback": false},
+    {"host": "::2", "loopback": false},
+    {"host": "0.0.0.0", "loopback": false},
+    {"host": "192.168.1.12", "loopback": false},
+    {"host": "fe80::1", "loopback": false},
+    {"host": "", "loopback": false}
+  ]
+}

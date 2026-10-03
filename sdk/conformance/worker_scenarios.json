@@ -1,0 +1,98 @@
+{
+  "$comment": "One safe point of a managed worker, after registration and with no heartbeat due (the harness starts the session with heartbeats disabled or just sent, and polling allowed). EXCHANGES is the exact sequence of requests the worker must send and the responses the fake daemon gives: method and path must match exactly, every request carries 'Authorization: Bearer <KAIRO_ATTEMPT_TOKEN>', and the expected body must be contained in the actual one (objects compared key by key, extra keys allowed; a missing body means no check). CALLBACK is what the checkpoint callback does when a suspend is handled: returns {continuation_ref, payload?} or raises. A suspend's command id is percent-encoded as one path segment. EXPECT: result (true: the worker must stop now, a continuation was published; false: carry on) or error (the class from classify.json, or 'callback' for the callback's own exception, or 'no_continuation'). After the last exchange the worker sends nothing more for this safe point.",
+  "scenarios": [
+    {
+      "name": "no command",
+      "callback": {"returns": {"continuation_ref": "unused"}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": []}}}
+      ],
+      "expect": {"result": false}
+    },
+    {
+      "name": "suspend checkpointed",
+      "callback": {"returns": {"continuation_ref": "ckpt://step-100", "payload": {"step": 100}}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd/1", "kind": "suspend", "origin": "scope_pause", "reason": "paused", "delivery_count": 1}]}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd%2F1/acks", "body": {"phase": "accepted"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd%2F1/acks", "body": {"phase": "checkpointing"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd%2F1/acks", "body": {"phase": "checkpointed", "payload": {"continuation_ref": "ckpt://step-100", "step": 100}}}, "response": {"status": 202, "body": {"ok": true}}}
+      ],
+      "expect": {"result": true}
+    },
+    {
+      "name": "redelivered suspend runs the callback again",
+      "callback": {"returns": {"continuation_ref": "ckpt://step-100"}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd_1", "kind": "suspend", "origin": "priority_preemption", "reason": "preempted", "delivery_count": 3}]}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "accepted"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "checkpointing"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "checkpointed", "payload": {"continuation_ref": "ckpt://step-100"}}}, "response": {"status": 202, "body": {"ok": true}}}
+      ],
+      "expect": {"result": true}
+    },
+    {
+      "name": "callback raises: rejected, then the error propagates",
+      "callback": {"raises": "disk full"},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd_1", "kind": "suspend", "origin": "scope_pause", "reason": "paused", "delivery_count": 1}]}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "accepted"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "checkpointing"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "rejected"}}, "response": {"status": 202, "body": {"ok": true}}}
+      ],
+      "expect": {"error": "callback"}
+    },
+    {
+      "name": "no continuation_ref: rejected instead of an invalid checkpointed ack",
+      "callback": {"returns": {}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd_1", "kind": "suspend", "origin": "scope_pause", "reason": "paused", "delivery_count": 1}]}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "accepted"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "checkpointing"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "rejected", "payload": {"reason": "no continuation_ref"}}}, "response": {"status": 202, "body": {"ok": true}}}
+      ],
+      "expect": {"error": "no_continuation"}
+    },
+    {
+      "name": "unknown command kind is skipped without an ack",
+      "callback": {"returns": {"continuation_ref": "unused"}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd_9", "kind": "drain", "origin": "future", "reason": "", "delivery_count": 1}]}}}
+      ],
+      "expect": {"result": false}
+    },
+    {
+      "name": "poll after the attempt quiesced",
+      "callback": {"returns": {"continuation_ref": "unused"}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 401, "body": {"error": "valid token required", "code": "unauthorized"}}}
+      ],
+      "expect": {"error": "retired"}
+    },
+    {
+      "name": "poll after the attempt was fenced",
+      "callback": {"returns": {"continuation_ref": "unused"}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 409, "body": {"error": "stale coordination epoch", "code": "stale_epoch"}}}
+      ],
+      "expect": {"error": "fenced"}
+    },
+    {
+      "name": "suspend withdrawn while acknowledging",
+      "callback": {"returns": {"continuation_ref": "unused"}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd_1", "kind": "suspend", "origin": "scope_pause", "reason": "paused", "delivery_count": 1}]}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "accepted"}}, "response": {"status": 404, "body": {"error": "not found", "code": "not_found"}}}
+      ],
+      "expect": {"result": false}
+    },
+    {
+      "name": "daemon briefly unavailable",
+      "callback": {"returns": {"continuation_ref": "unused"}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 503, "body": {"error": "database is locked", "code": "internal"}}}
+      ],
+      "expect": {"error": "transient"}
+    }
+  ]
+}

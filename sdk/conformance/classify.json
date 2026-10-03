@@ -1,0 +1,32 @@
+{
+  "$comment": "What a client does with a failed request. Errors are {\"error\": message, \"code\": code}. Classes: transient (retry with backoff), permanent (configuration or bug: report, do not retry), retired (worker credential no longer valid — expected once the attempt quiesced: stop heartbeating and polling, the process should exit), fenced (the attempt lost its lease or epoch: stop all writes, exit non-zero unless already checkpointed), gone (the command acknowledged no longer exists: continue), retry_later (an admission gate or observe-only daemon: try again later, no error). TRANSPORT names a failure below HTTP: refused, reset, timeout, dns (transient), tls_verify, tls_handshake (permanent).",
+  "cases": [
+    {"role": "worker", "status": 401, "code": "unauthorized", "class": "retired"},
+    {"role": "worker", "status": 409, "code": "stale_epoch", "class": "fenced"},
+    {"role": "worker", "status": 409, "code": "execution_started", "class": "fenced"},
+    {"role": "worker", "status": 404, "code": "not_found", "class": "gone"},
+    {"role": "worker", "status": 403, "code": "forbidden", "class": "permanent"},
+    {"role": "worker", "status": 400, "code": "bad_request", "class": "permanent"},
+    {"role": "worker", "status": 500, "code": "internal", "class": "transient"},
+    {"role": "worker", "status": 503, "code": "internal", "class": "transient"},
+    {"role": "worker", "status": 429, "code": "", "class": "transient"},
+    {"role": "worker", "status": 307, "code": "", "class": "permanent"},
+    {"role": "worker", "transport": "refused", "class": "transient"},
+    {"role": "worker", "transport": "reset", "class": "transient"},
+    {"role": "worker", "transport": "timeout", "class": "transient"},
+    {"role": "worker", "transport": "tls_verify", "class": "permanent"},
+    {"role": "worker", "transport": "tls_handshake", "class": "permanent"},
+    {"role": "operator", "status": 401, "code": "unauthorized", "class": "permanent"},
+    {"role": "operator", "status": 403, "code": "forbidden", "class": "permanent"},
+    {"role": "operator", "status": 404, "code": "not_found", "class": "permanent"},
+    {"role": "operator", "status": 409, "code": "idempotency_conflict", "class": "permanent"},
+    {"role": "operator", "status": 409, "code": "orchestration_conflict", "class": "permanent"},
+    {"role": "operator", "status": 423, "code": "gate_closed", "class": "retry_later"},
+    {"role": "operator", "status": 423, "code": "observe_only", "class": "retry_later"},
+    {"role": "operator", "status": 400, "code": "bad_request", "class": "permanent"},
+    {"role": "operator", "status": 500, "code": "internal", "class": "transient"},
+    {"role": "operator", "status": 502, "code": "", "class": "transient"},
+    {"role": "operator", "transport": "dns", "class": "transient"},
+    {"role": "operator", "transport": "tls_verify", "class": "permanent"}
+  ]
+}

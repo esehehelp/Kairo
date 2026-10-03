@@ -1,0 +1,18 @@
+{
+  "$comment": "How an operator client (CLI, controller, dashboard) finds the daemon, its token and its CA. ENV is the whole relevant environment (variables not listed are unset). FILES are written before the case: '{config}' is <user config dir>/kairo (Go os.UserConfigDir: %APPDATA% on Windows, ~/Library/Application Support on macOS, else an absolute $XDG_CONFIG_HOME or ~/.config) and '{tmp}' a scratch directory; '<CA>' is any certificate PEM. ARG holds explicit arguments (the CLI --api flag, constructor arguments) that win over the environment. EXPECT gives url (trailing '/' removed), token (surrounding whitespace removed; null when none was found — a request needing one then fails) and ca (the file trusted, null for the system roots), or error: a substring of the message. Resolution never touches the network.",
+  "cases": [
+    {"name": "defaults", "env": {}, "files": {}, "expect": {"url": "https://127.0.0.1:7474", "token": null, "ca": null}},
+    {"name": "config dir token and ca", "env": {}, "files": {"{config}/token": "kairo_admin_cfg\n", "{config}/ca.pem": "<CA>"}, "expect": {"url": "https://127.0.0.1:7474", "token": "kairo_admin_cfg", "ca": "{config}/ca.pem"}},
+    {"name": "env wins over config dir", "env": {"KAIRO_API": "https://192.168.1.12:7474/", "KAIRO_TOKEN": " kairo_admin_env ", "KAIRO_CA_FILE": "{tmp}/ca.pem"}, "files": {"{config}/token": "kairo_admin_cfg", "{config}/ca.pem": "<CA>", "{tmp}/ca.pem": "<CA>"}, "expect": {"url": "https://192.168.1.12:7474", "token": "kairo_admin_env", "ca": "{tmp}/ca.pem"}},
+    {"name": "argument wins over env", "arg": {"url": "https://10.0.0.1:7474"}, "env": {"KAIRO_API": "https://192.168.1.12:7474"}, "files": {}, "expect": {"url": "https://10.0.0.1:7474", "token": null, "ca": null}},
+    {"name": "token file", "env": {"KAIRO_TOKEN_FILE": "{tmp}/t"}, "files": {"{tmp}/t": "kairo_read_file\r\n", "{config}/token": "kairo_admin_cfg"}, "expect": {"url": "https://127.0.0.1:7474", "token": "kairo_read_file", "ca": null}},
+    {"name": "KAIRO_TOKEN wins over KAIRO_TOKEN_FILE", "env": {"KAIRO_TOKEN": "kairo_admin_env", "KAIRO_TOKEN_FILE": "{tmp}/missing"}, "files": {}, "expect": {"url": "https://127.0.0.1:7474", "token": "kairo_admin_env", "ca": null}},
+    {"name": "missing token file", "env": {"KAIRO_TOKEN_FILE": "{tmp}/missing"}, "files": {}, "expect": {"error": "KAIRO_TOKEN_FILE"}},
+    {"name": "empty token file", "env": {"KAIRO_TOKEN_FILE": "{tmp}/t"}, "files": {"{tmp}/t": "  \n"}, "expect": {"error": "empty"}},
+    {"name": "missing CA file", "env": {"KAIRO_CA_FILE": "{tmp}/missing.pem"}, "files": {}, "expect": {"error": "KAIRO_CA_FILE"}},
+    {"name": "attempt variables are not operator settings", "env": {"KAIRO_API_URL": "https://10.9.9.9:7474", "KAIRO_ATTEMPT_TOKEN": "kairo_worker_x"}, "files": {}, "expect": {"url": "https://127.0.0.1:7474", "token": null, "ca": null}},
+    {"name": "plain http with a token to a remote host", "env": {"KAIRO_API": "http://192.168.1.12:7474", "KAIRO_TOKEN": "kairo_admin_env"}, "files": {}, "expect": {"error": "plain http"}},
+    {"name": "plain http to loopback", "env": {"KAIRO_API": "http://127.0.0.1:7474", "KAIRO_TOKEN": "kairo_admin_env"}, "files": {}, "expect": {"url": "http://127.0.0.1:7474", "token": "kairo_admin_env", "ca": null}},
+    {"name": "not a URL", "env": {"KAIRO_API": "192.168.1.12:7474"}, "files": {}, "expect": {"error": "URL"}}
+  ]
+}

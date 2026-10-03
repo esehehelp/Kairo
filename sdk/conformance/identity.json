@@ -1,0 +1,12 @@
+{
+  "$comment": "Process identity strings; the daemon compares them byte for byte with what it reads itself (internal/processidentity). Linux and WSL: 'proc:PID:starttime:T', T being field 22 of /proc/PID/stat, i.e. index 19 of the whitespace-split text after the LAST ')' (the command name may contain spaces and parentheses); T must be a positive integer. Windows: 'pid:PID:start:NS', NS = (creation FILETIME - 116444736000000000) * 100, the creation time in Unix nanoseconds.",
+  "linux": [
+    {"pid": 1234, "stat": "1234 (python3) S 1 1234 1234 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 98765 1000000 200 18446744073709551615", "expect": "proc:1234:starttime:98765"},
+    {"pid": 42, "stat": "42 (my (odd) name) R 1 42 42 0 -1 4194304 0 0 0 0 0 0 0 0 20 0 4 0 7 0 0 0", "expect": "proc:42:starttime:7"},
+    {"pid": 7, "stat": "7 (zero) S 1 7 7 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 0 0 0 0", "expect": null}
+  ],
+  "windows": [
+    {"pid": 4242, "creation_filetime": 133700000000000000, "expect": "pid:4242:start:1725526400000000000"},
+    {"pid": 1, "creation_filetime": 116444736000000001, "expect": "pid:1:start:100"}
+  ]
+}

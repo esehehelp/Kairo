@@ -1,0 +1,16 @@
+{
+  "$comment": "May a client send a bearer token to URL? https always; http only to a loopback host (loopback.json); any other scheme, a missing host, or user:password in the URL is refused.",
+  "cases": [
+    {"url": "https://192.168.1.12:7474", "allowed": true},
+    {"url": "https://kairo.example:7474/", "allowed": true},
+    {"url": "http://127.0.0.1:7474", "allowed": true},
+    {"url": "http://localhost:7474", "allowed": true},
+    {"url": "http://[::1]:7474", "allowed": true},
+    {"url": "http://192.168.1.12:7474", "allowed": false},
+    {"url": "http://127.0.0.1.nip.io:7474", "allowed": false},
+    {"url": "http://user:pw@127.0.0.1:7474", "allowed": false},
+    {"url": "ftp://127.0.0.1", "allowed": false},
+    {"url": "127.0.0.1:7474", "allowed": false},
+    {"url": "https://", "allowed": false}
+  ]
+}
