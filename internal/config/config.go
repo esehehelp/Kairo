@@ -67,11 +67,11 @@ func Load(path string) (Config, error) {
 		return c, errors.New("unknown config field: " + undecoded[0].String())
 	}
 	defaults(&c)
+	// [node] names the control node itself. Executors and providers are
+	// optional: a control-only daemon runs no jobs, and every job host runs
+	// `kairo agent` instead.
 	if c.Node.ID == "" || c.Node.Name == "" {
 		return c, errors.New("node.id and node.name are required")
-	}
-	if len(c.Executors) == 0 {
-		return c, errors.New("at least one executor is required")
 	}
 	return c, validateTransport(c)
 }
