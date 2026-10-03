@@ -471,3 +471,19 @@ func TestLogShipperGivesUpOnRefusedLogs(t *testing.T) {
 		t.Fatalf("orphan log sent %d times", appends)
 	}
 }
+
+// A Windows agent reports its log paths with backslashes; a daemon on Linux
+// still records them (as its own copies).
+func TestLogPathsFromAWindowsAgent(t *testing.T) {
+	st, ts, token, logDir := newDaemon(t)
+	c := New(ts.URL, token, nil)
+	launch := remoteAttempt(t, st, c)
+	id := launch.Attempt.ID
+	if err := c.SetAttemptLogPaths(context.Background(), id, launch.Lease.CoordinationEpoch, `C:\Users\admin\kairo\attempts\`+id+`.stdout.log`, `C:\Users\admin\kairo\attempts\`+id+`.stderr.log`); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err := st.AttemptLogPaths(context.Background(), id)
+	if err != nil || stdout != filepath.Join(logDir, id+".stdout.log") || stderr != filepath.Join(logDir, id+".stderr.log") {
+		t.Fatalf("recorded %q %q (%v)", stdout, stderr, err)
+	}
+}

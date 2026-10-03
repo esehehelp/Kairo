@@ -522,7 +522,9 @@ func (e *Local) start(launch *store.Launch) error {
 		stderr.Close()
 		return err
 	}
-	_ = e.Store.SetAttemptLogPaths(context.Background(), launch.Attempt.ID, launch.Lease.CoordinationEpoch, outPath, errPath)
+	if err := e.Store.SetAttemptLogPaths(context.Background(), launch.Attempt.ID, launch.Lease.CoordinationEpoch, outPath, errPath); err != nil {
+		e.Logger.Warn("attempt log paths not recorded", "attempt_id", launch.Attempt.ID, "error", err)
+	}
 	e.mu.Lock()
 	e.running[launch.Attempt.ID] = cmd
 	if tree != nil {

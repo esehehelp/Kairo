@@ -72,7 +72,6 @@ func TestAttemptLogServesRecordedPaths(t *testing.T) {
 		path string
 		want int
 	}{
-		{"/api/attempts/" + id + "/log?stream=stdout", http.StatusNotFound},
 		{"/api/attempts/att_unknown/log", http.StatusNotFound},
 		{"/api/attempts/" + id + "/log?stream=journal", http.StatusBadRequest},
 		{"/api/attempts/" + id + "/log?offset=-1", http.StatusBadRequest},
@@ -81,6 +80,11 @@ func TestAttemptLogServesRecordedPaths(t *testing.T) {
 		if response, body := d.getLog(t, read, c.path); response.StatusCode != c.want {
 			t.Fatalf("%s: %d %s", c.path, response.StatusCode, body)
 		}
+	}
+	// A recorded log a node agent has not shipped yet reads as empty so far.
+	response, body := d.getLog(t, read, "/api/attempts/"+id+"/log?stream=stdout")
+	if response.StatusCode != http.StatusOK || len(body) != 0 || response.Header.Get("Kairo-Log-Size") != "0" {
+		t.Fatalf("unshipped log: %d %q size=%q", response.StatusCode, body, response.Header.Get("Kairo-Log-Size"))
 	}
 }
 

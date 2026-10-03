@@ -61,7 +61,12 @@ func (s *Server) attemptLog(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		writeError(w, fmt.Errorf("%w: attempt %s has no %s log", store.ErrNotFound, attemptID, stream))
+		// Recorded but not there yet: a node agent ships a log once it has
+		// bytes (and every couple of seconds). An empty log so far.
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("Kairo-Log-Size", "0")
+		w.Header().Set("Kairo-Log-Next-Offset", strconv.FormatInt(offset, 10))
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 	if err != nil {
