@@ -4,8 +4,10 @@
 > interprets project-specific state.**
 
 Kairo safely orchestrates cooperative ML work on a few machines: one daemon
-(with its own executors, here on a Windows host with WSL) and node agents on
-other hosts. It has two layers. A small declarative orchestration layer stores
+(optionally with its own executors) and node agents on other hosts. A
+control-only daemon, with no `[[executors]]` or `[[providers]]` (only its
+`[node]` identity), is valid: it serves the API and runs the reconcilers while
+every host that runs jobs runs `kairo agent`. It has two layers. A small declarative orchestration layer stores
 a ProjectSpec, reconciles a static Task DAG, and applies an explicitly
 selected generic task policy. The coordination layer receives immutable
 Execution requests and owns Attempt, Lease, Command, provider, and executor
@@ -198,6 +200,7 @@ An agent refuses an `http://` URL unless `insecure_http = true`.
 | GET | `/api/executions/{id}` | read |
 | POST | `/api/executions/{id}/withdraw` | admin |
 | GET | `/api/attempts`, `/api/events`, `/api/pause-operations/{id}` | read |
+| GET | `/api/attempts/{id}/log` | read |
 | GET | `/api/scopes`, `/api/scopes/{id}` | read |
 | POST | `/api/scopes/{id}/pause`, `/api/scopes/{id}/resume` | admin |
 | GET | `/api/nodes/quarantines` | read |
@@ -211,6 +214,16 @@ An agent refuses an `http://` URL unless `insecure_http = true`.
 
 Errors are `{"error": ..., "code": ...}`. An empty `actor` in a pause, resume
 or quarantine request is recorded as the token's name.
+
+`GET /api/attempts/{id}/log?stream=stdout|stderr&offset=N&limit=M` returns an
+attempt's log as the daemon holds it (written by its own executor or shipped
+by an agent), as raw bytes: `stream` defaults to `stderr`, `limit` to 1 MiB
+(at most 8 MiB). `Kairo-Log-Size` is the current size and
+`Kairo-Log-Next-Offset` where to continue; an offset past the end returns an
+empty body, and an unknown attempt or log is `not_found`. `kairo logs
+[--stream stdout|stderr] [--tail N] [--follow] ATTEMPT_ID` prints it (`--tail`
+the last N bytes, `--follow` polls every 2 s until Ctrl-C), and the Python
+SDK's `KairoClient.attempt_log` reads one slice.
 
 Clients follow the contract in `sdk/conformance` (how to find the daemon, when
 a token may be sent, how to classify each error); every SDK's tests replay it.

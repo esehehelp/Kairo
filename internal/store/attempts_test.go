@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -26,5 +27,29 @@ func TestListAttemptsCarriesProgressAndLogPaths(t *testing.T) {
 	none, err := store.ListAttempts(ctx, AttemptFilter{State: "exited"})
 	if err != nil || len(none) != 0 {
 		t.Fatalf("state filter: %+v %v", none, err)
+	}
+}
+
+func TestAttemptLogPaths(t *testing.T) {
+	store := openCoordinationStore(t)
+	ctx := context.Background()
+	execution, _, err := store.SubmitExecution(ctx, testExecutionSpec("train-1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at,started_at) VALUES('att-1',?,'running','executor',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, execution.ID); err != nil {
+		t.Fatal(err)
+	}
+	if stdout, stderr, err := store.AttemptLogPaths(ctx, "att-1"); err != nil || stdout != "" || stderr != "" {
+		t.Fatalf("unrecorded paths: %q %q %v", stdout, stderr, err)
+	}
+	if err = store.SetAttemptLogPaths(ctx, "att-1", 1, "/logs/att-1.stdout.log", "/logs/att-1.stderr.log"); err != nil {
+		t.Fatal(err)
+	}
+	if stdout, stderr, err := store.AttemptLogPaths(ctx, "att-1"); err != nil || stdout != "/logs/att-1.stdout.log" || stderr != "/logs/att-1.stderr.log" {
+		t.Fatalf("recorded paths: %q %q %v", stdout, stderr, err)
+	}
+	if _, _, err := store.AttemptLogPaths(ctx, "missing"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown attempt: %v", err)
 	}
 }

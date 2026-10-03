@@ -15,6 +15,14 @@ Route = Response | Callable[["Request"], Response]
 
 
 @dataclass
+class Raw:
+    """A non-JSON response body (attempt logs), with extra headers."""
+
+    body: bytes
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
 class Request:
     method: str
     path: str
@@ -71,9 +79,15 @@ def serve(daemon: FakeDaemon | None = None) -> Iterator[FakeDaemon]:
             status, response = daemon.answer(
                 Request(self.command, self.path, dict(self.headers), body)
             )
-            encoded = b"" if response is None else json.dumps(response).encode()
+            headers = {"Content-Type": "application/json"}
+            if isinstance(response, Raw):
+                encoded = response.body
+                headers = {"Content-Type": "text/plain; charset=utf-8", **response.headers}
+            else:
+                encoded = b"" if response is None else json.dumps(response).encode()
             self.send_response(status)
-            self.send_header("Content-Type", "application/json")
+            for name, value in headers.items():
+                self.send_header(name, value)
             self.send_header("Content-Length", str(len(encoded)))
             self.end_headers()
             self.wfile.write(encoded)

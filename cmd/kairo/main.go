@@ -52,6 +52,8 @@ func run(args []string) error {
 		return queueCommand(args[1:])
 	case "task":
 		return taskCommand(args[1:])
+	case "logs":
+		return logsCommand(args[1:])
 	case "resource":
 		return resourceCommand(args[1:])
 	case "node":
@@ -70,7 +72,7 @@ func run(args []string) error {
 }
 
 func usage() error {
-	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|token|tls|db|doctor>")
+	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|logs|resource|node|token|tls|db|doctor>")
 }
 
 func serve(args []string) error {
