@@ -9,10 +9,12 @@ use kairo_sdk::{Attempt, Options, SafePointError, SuspendResult};
 use serde_json::json;
 
 #[test]
-fn a_stop_request_checkpoints_once_without_polling() {
+fn a_stop_request_checkpoints_once_after_the_commands() {
     let daemon = FakeDaemon::scripted(vec![
         Exchange::register(),
         Exchange::heartbeat(Some(json!({}))),
+        // Pending commands come first; there are none, so the signal stops.
+        Exchange::new("GET", "/api/worker/commands", None, 200, json!({"commands": []})),
         Exchange::heartbeat(None), // the final one
     ]);
     let session = Attempt::from_vars(daemon.vars())

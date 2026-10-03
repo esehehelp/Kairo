@@ -214,7 +214,10 @@ def test_stop_signal_makes_safe_point_return_true(restore_signals, tmp_path: Pat
     assert stop_requested()
     calls = []
     assert session.safe_point(checkpoint=lambda c: calls.append(c)) is True
-    assert calls == []  # a signal runs no checkpoint callback
+    # A signal checkpoints once (so the work can be resumed by hand), then stops.
+    assert [(c.command_id, c.reason) for c in calls] == [("", "stop_signal")]
+    assert session.safe_point(checkpoint=lambda c: calls.append(c)) is True
+    assert len(calls) == 1
 
 
 def test_managed_safe_point_handles_commands_before_the_stop_signal():
@@ -443,3 +446,14 @@ def test_adapter_stops_every_rank_on_a_stop_signal(single_process):
         adapter = DistributedAdapter(session_for(daemon.url))
         assert adapter.safe_point(lambda _c: "x") is True
         adapter.close()
+
+
+def test_adapter_checkpoints_once_for_a_stop_signal(single_process):
+    runtime._on_stop_signal(signal.SIGTERM, None)
+    with serve(FakeDaemon(worker_routes())) as daemon:
+        adapter = DistributedAdapter(session_for(daemon.url))
+        calls = []
+        assert adapter.safe_point(lambda c: calls.append(c) or "ckpt://signal") is True
+        assert adapter.safe_point(lambda c: calls.append(c) or "ckpt://signal") is True
+        assert [(c.command_id, c.reason) for c in calls] == [("", "stop_signal")]
+        assert acks(daemon) == []

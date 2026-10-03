@@ -341,6 +341,30 @@ runs every rank's callback, and only publishes the continuation after the
 distributed barrier. Commands may be redelivered, so checkpoint publication
 must remain idempotent by command ID.
 
+A safe point acknowledges a `suspend` `accepted` and `checkpointing`, runs the
+checkpoint callback, and publishes its continuation with `checkpointed`. A
+callback that fails, or returns no continuation, is acknowledged `rejected`;
+unknown command kinds are skipped. After `install_stop_signals()` a SIGTERM /
+CTRL_BREAK (the graceful phase of a force stop) makes the next safe point run
+the callback once (reason `stop_signal`, no command id, nothing acknowledged)
+and return true, so the work can still be resumed by hand. A worker whose
+token is refused (the attempt quiesced: retired) or fenced stops reporting.
+Python also offers `ProgressReporter`, `GangContext`, `continuation_or`,
+`CommandJournal` (idempotent checkpoints by command id), `provenance.capture`
+and the operator `KairoClient`.
+
+The Rust crate `sdk/rust/kairo-sdk` (blocking, ureq + rustls) implements the
+same worker side: `Attempt::from_env`, a `Session` with one heartbeat thread
+and `safe_point`, the process-wide `reporter(unit)` / `phase` progress
+handles, and `kairo_sdk::Progress` compatible with neo-ime's former
+`kairo-progress`. Depend on it by git:
+
+```toml
+kairo-sdk = { git = "https://github.com/esehehelp/Kairo", rev = "<commit>" }
+```
+
+Every SDK replays `sdk/conformance/*.json` in its tests.
+
 ### Low-level project-owned controller policy
 
 Projects submitting directly to the execution API can still opt into

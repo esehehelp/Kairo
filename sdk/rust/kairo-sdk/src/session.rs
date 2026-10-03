@@ -371,12 +371,22 @@ impl Session {
         if let Some(e) = lock(&self.inner.state).terminal.clone() {
             return Err(SafePointError::Kairo(e));
         }
+        // Commands first: a suspend that is already pending publishes its
+        // continuation even when a stop signal arrived meanwhile.
+        let now = Instant::now();
+        if sp.last_poll.is_none_or(|last| now.duration_since(last) >= self.inner.options.poll_interval) {
+            sp.last_poll = Some(now);
+            let commands = self.inner.client.poll_commands().map_err(|e| SafePointError::Kairo(self.observe(e)))?;
+            if let Some(command) = commands.into_iter().find(|c| c.kind == "suspend") {
+                return self.suspend(command, callback);
+            }
+        }
         if crate::signals::stop_requested() {
             if !sp.signal_handled {
                 let request = SuspendRequest {
                     command_id: String::new(),
                     origin: "signal".into(),
-                    reason: "stop requested".into(),
+                    reason: "stop_signal".into(),
                     delivery_count: 1,
                     execution_id: self.inner.execution_id.clone(),
                     attempt_id: self.inner.attempt_id.clone(),
@@ -386,16 +396,7 @@ impl Session {
             }
             return Ok(true);
         }
-        let now = Instant::now();
-        if sp.last_poll.is_some_and(|last| now.duration_since(last) < self.inner.options.poll_interval) {
-            return Ok(false);
-        }
-        sp.last_poll = Some(now);
-        let commands = self.inner.client.poll_commands().map_err(|e| SafePointError::Kairo(self.observe(e)))?;
-        match commands.into_iter().find(|c| c.kind == "suspend") {
-            Some(command) => self.suspend(command, callback),
-            None => Ok(false),
-        }
+        Ok(false)
     }
 
     fn suspend<E: fmt::Display>(

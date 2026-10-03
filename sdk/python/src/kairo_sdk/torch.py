@@ -11,6 +11,7 @@ from .runtime import (
     AttemptSession,
     CommandContext,
     _current_process_identity,
+    _stop_signal_context,
     normalize_suspend_result,
     stop_requested,
     suspend_payload,
@@ -33,6 +34,7 @@ class DistributedAdapter:
         if not session.managed:
             raise ValueError("DistributedAdapter requires a managed AttemptSession")
         self.session = session
+        self._stop_signal_handled = False
         self._registered = False
 
     @staticmethod
@@ -135,8 +137,10 @@ class DistributedAdapter:
         message = envelope[0]
         _raise_terminal(self.session, message["terminal"])
         raw = message["command"]
+        if raw is None and message["stop"]:
+            return self._checkpoint_for_stop_signal(checkpoint, dist, distributed, rank)
         if raw is None:
-            return bool(message["stop"])
+            return False
 
         context = CommandContext(
             execution_id=self.session.execution_id,
@@ -190,6 +194,30 @@ class DistributedAdapter:
         if outcome["ok"]:
             self.session.suspend_handled = True
         return bool(outcome["ok"])
+
+    def _checkpoint_for_stop_signal(self, checkpoint, dist, distributed: bool, rank: int) -> bool:
+        """Rank 0 received a stop signal: every rank checkpoints once, then stops.
+
+        Nothing is acknowledged (a force stop plans no continuation); the
+        checkpoint lets the work be resumed by hand.
+        """
+        if not self._stop_signal_handled:
+            local_error: str | None = None
+            try:
+                checkpoint(_stop_signal_context(self.session))
+            except BaseException as exc:
+                local_error = f"rank {rank} checkpoint failed: {type(exc).__name__}: {exc}"
+            errors_by_rank: list[Any] = [None] * (dist.get_world_size() if distributed else 1)
+            if distributed:
+                dist.all_gather_object(errors_by_rank, local_error)
+                dist.barrier()
+            else:
+                errors_by_rank[0] = local_error
+            self._stop_signal_handled = True
+            failures = [error for error in errors_by_rank if error is not None]
+            if failures:
+                raise RuntimeError("; ".join(failures))
+        return True
 
     def _poll_on_rank_zero(self, progress: dict[str, Any] | None) -> dict[str, Any]:
         """Poll and accept a suspend on rank 0; the message every rank receives."""

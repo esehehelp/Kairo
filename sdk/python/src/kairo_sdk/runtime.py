@@ -190,6 +190,7 @@ class AttemptSession:
         self.fenced = False
         self._terminal_error: KairoAPIError | None = None
         self.suspend_handled = False
+        self._stop_signal_handled = False
         self.process_identity = _current_process_identity()
         self._process_registered = False
         self._registration_lock = threading.Lock()
@@ -381,11 +382,13 @@ class AttemptSession:
         is raised. A command that disappeared meanwhile (HTTP 404) is dropped
         and the worker carries on. Unknown command kinds are skipped.
 
-        After command handling, ``True`` is also returned once a stop signal
-        arrived (:func:`install_stop_signals`): Kairo's force stop sends
-        CTRL_BREAK / SIGTERM first and kills after its grace period. No
-        checkpoint callback runs for a signal; check :func:`stop_requested`
-        to tell the two apart.
+        After command handling, a stop signal (:func:`install_stop_signals`)
+        also stops the worker: ``checkpoint`` runs once, with ``reason``
+        ``"stop_signal"`` and an empty ``command_id``, so the work can be
+        resumed by hand, and ``True`` is returned. Nothing is acknowledged
+        for it: Kairo's force stop (CTRL_BREAK / SIGTERM first, a kill after
+        its grace period) plans no continuation. Keep that checkpoint within
+        the grace period.
 
         Raises :class:`~kairo_sdk.errors.AttemptRetired` /
         :class:`~kairo_sdk.errors.AttemptFenced` when the attempt is over,
@@ -419,7 +422,12 @@ class AttemptSession:
             for raw in self.poll_commands():
                 if self._handle_command(raw, checkpoint):
                     return True
-        return stop_requested()
+        if stop_requested():
+            if not self._stop_signal_handled:
+                checkpoint(_stop_signal_context(self))
+                self._stop_signal_handled = True
+            return True
+        return False
 
     def _handle_command(
         self,
@@ -744,6 +752,18 @@ def _gang_from_environment() -> GangContext | None:
         size=size,
         master_addr=values["KAIRO_GANG_MASTER_ADDR"],
         master_port=port,
+    )
+
+
+def _stop_signal_context(session: "AttemptSession") -> CommandContext:
+    """The checkpoint request a stop signal stands for (no Kairo command)."""
+    return CommandContext(
+        command_id="",
+        execution_id=session.execution_id,
+        attempt_id=session.attempt_id,
+        kind="suspend",
+        reason="stop_signal",
+        delivery_count=1,
     )
 
 
