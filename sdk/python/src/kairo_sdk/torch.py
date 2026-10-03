@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import logging
 import os
 import time
 from typing import Any
 
+from . import errors
+from .errors import AttemptFenced, AttemptRetired, KairoAPIError, NoContinuationError
 from .runtime import (
     AttemptSession,
     CommandContext,
     _current_process_identity,
-    _normalize_suspend_result,
+    normalize_suspend_result,
+    stop_requested,
+    suspend_payload,
 )
+
+_log = logging.getLogger("kairo_sdk.torch")
 
 
 class DistributedAdapter:
@@ -81,22 +88,40 @@ class DistributedAdapter:
 
     def _try_ack(
         self, command_id: str, phase: str, payload: dict[str, Any] | None = None
-    ) -> bool:
+    ) -> str:
+        """Acknowledge on rank 0: ``"ok"``, ``"gone"``, ``"terminal"`` or ``"failed"``."""
         try:
             self.session._ack(command_id, phase, payload)
+        except (AttemptRetired, AttemptFenced):
+            return "terminal"
+        except KairoAPIError as exc:
+            self.session.last_control_error = exc
+            return "gone" if exc.classification == errors.GONE else "failed"
         except BaseException as exc:
             self.session.last_control_error = exc
-            return False
+            return "failed"
         self.session.last_control_error = None
-        return True
+        return "ok"
 
     def safe_point(self, checkpoint, progress: dict[str, Any] | None = None) -> bool:
         """Poll on rank 0 and suspend only after every rank checkpoints.
 
-        Returns ``True`` only when the terminal acknowledgement reached Kairo.
-        If that acknowledgement fails, training continues and the same command
-        is delivered again at a later safe point; checkpoint callbacks must
-        consequently be idempotent by command ID.
+        Returns ``True`` only when the terminal acknowledgement reached Kairo,
+        or (with no command) when rank 0 received a stop signal
+        (:func:`~kairo_sdk.runtime.install_stop_signals`), so every rank stops
+        together. If the acknowledgement fails, training continues and the
+        same command is delivered again at a later safe point; checkpoint
+        callbacks must consequently be idempotent by command ID.
+
+        The semantics follow :meth:`AttemptSession.safe_point`: unknown
+        command kinds are skipped, a withdrawn command (HTTP 404) is dropped,
+        rank 0 returning no ``continuation_ref`` is acknowledged ``rejected``
+        and raises :class:`~kairo_sdk.errors.NoContinuationError` on every
+        rank, and a retired or fenced attempt raises
+        :class:`~kairo_sdk.errors.AttemptRetired` /
+        :class:`~kairo_sdk.errors.AttemptFenced` on every rank. Transient
+        control-plane failures are reported as "no command" so a temporary
+        outage cannot strand peer ranks in a collective.
         """
         self.start()
         dist, distributed = self._distribution()
@@ -104,62 +129,33 @@ class DistributedAdapter:
 
         envelope: list[Any] = [None]
         if rank == 0:
-            if progress is not None:
-                self.session.set_progress(progress)
-            now = time.monotonic()
-            if now - self.session._last_poll >= self.session.poll_interval_seconds:
-                self.session._last_poll = now
-                try:
-                    commands = self.session.poll_commands()
-                    if commands:
-                        raw = commands[0]
-                        envelope[0] = {
-                            "command_id": str(raw["id"]),
-                            "kind": str(raw["kind"]),
-                            "reason": str(raw.get("reason") or ""),
-                            "delivery_count": int(raw.get("delivery_count") or 0),
-                        }
-                    self.session.last_control_error = None
-                except BaseException as exc:
-                    # Every rank still reaches the broadcast below. A temporary
-                    # control-plane outage must not deadlock the process group.
-                    self.session.last_control_error = exc
+            envelope[0] = self._poll_on_rank_zero(progress)
         if distributed:
             dist.broadcast_object_list(envelope, src=0)
-        raw = envelope[0]
+        message = envelope[0]
+        _raise_terminal(self.session, message["terminal"])
+        raw = message["command"]
         if raw is None:
-            return False
+            return bool(message["stop"])
 
         context = CommandContext(
             execution_id=self.session.execution_id,
             attempt_id=self.session.attempt_id,
             **raw,
         )
-        if context.kind != "suspend":
-            if rank == 0:
-                self._try_ack(
-                    context.command_id,
-                    "rejected",
-                    {"reason": f"unsupported command kind {context.kind!r}"},
-                )
-            return False
-
-        accepted = self._try_ack(context.command_id, "accepted") if rank == 0 else False
         result = None
         local_error: str | None = None
-        if rank == 0:
-            self._try_ack(context.command_id, "checkpointing")
         try:
-            result = _normalize_suspend_result(checkpoint(context))
+            result = normalize_suspend_result(checkpoint(context))
         except BaseException as exc:
-            local_error = f"rank {rank} checkpoint failed: {exc}"
+            local_error = f"rank {rank} checkpoint failed: {type(exc).__name__}: {exc}"
 
-        errors: list[Any] = [None] * (dist.get_world_size() if distributed else 1)
+        errors_by_rank: list[Any] = [None] * (dist.get_world_size() if distributed else 1)
         if distributed:
-            dist.all_gather_object(errors, local_error)
+            dist.all_gather_object(errors_by_rank, local_error)
         else:
-            errors[0] = local_error
-        failures = [error for error in errors if error is not None]
+            errors_by_rank[0] = local_error
+        failures = [error for error in errors_by_rank if error is not None]
         if failures:
             if rank == 0:
                 self._try_ack(
@@ -171,15 +167,104 @@ class DistributedAdapter:
 
         if distributed:
             dist.barrier()
-        checkpointed = accepted
+        outcome: dict[str, Any] = {"ok": False, "no_continuation": False, "terminal": None}
         if rank == 0:
-            payload = dict(result.payload)
-            if result.continuation_ref is not None:
-                payload["continuation_ref"] = result.continuation_ref
-            checkpointed = self._try_ack(context.command_id, "checkpointed", payload)
-        acknowledgement = [checkpointed]
+            assert result is not None
+            if not result.continuation_ref:
+                self._try_ack(context.command_id, "rejected", {"reason": "no continuation_ref"})
+                outcome["no_continuation"] = True
+            else:
+                status = self._try_ack(context.command_id, "checkpointed", suspend_payload(result))
+                outcome["ok"] = status == "ok"
+                if status == "terminal":
+                    outcome["terminal"] = _terminal_message(self.session)
+        acknowledgement = [outcome]
         if distributed:
             dist.broadcast_object_list(acknowledgement, src=0)
-        if acknowledgement[0]:
+        outcome = acknowledgement[0]
+        _raise_terminal(self.session, outcome["terminal"])
+        if outcome["no_continuation"]:
+            raise NoContinuationError(
+                f"rank 0 checkpoint returned no continuation_ref for command {context.command_id}"
+            )
+        if outcome["ok"]:
             self.session.suspend_handled = True
-        return bool(acknowledgement[0])
+        return bool(outcome["ok"])
+
+    def _poll_on_rank_zero(self, progress: dict[str, Any] | None) -> dict[str, Any]:
+        """Poll and accept a suspend on rank 0; the message every rank receives."""
+        session = self.session
+        message: dict[str, Any] = {"command": None, "stop": False, "terminal": None}
+        if progress is not None:
+            session.set_progress(progress)
+        if session._terminal_error is not None:
+            message["terminal"] = _terminal_message(session)
+            return message
+        now = time.monotonic()
+        if now - session._last_poll >= session.poll_interval_seconds:
+            session._last_poll = now
+            try:
+                commands = session.poll_commands()
+                session.last_control_error = None
+            except (AttemptRetired, AttemptFenced):
+                message["terminal"] = _terminal_message(session)
+                return message
+            except BaseException as exc:
+                # Every rank still reaches the broadcast. A temporary
+                # control-plane outage must not deadlock the process group.
+                session.last_control_error = exc
+                commands = []
+            for raw in commands:
+                if str(raw.get("kind") or "") != "suspend":
+                    _log.debug(
+                        "skipping Kairo command %s of unknown kind %r", raw.get("id"), raw.get("kind")
+                    )
+                    continue
+                command_id = str(raw["id"])
+                status = self._try_ack(command_id, "accepted")
+                if status == "ok":
+                    status = self._try_ack(command_id, "checkpointing")
+                if status == "terminal":
+                    message["terminal"] = _terminal_message(session)
+                    return message
+                if status == "gone":
+                    continue
+                # A transient acknowledgement failure still checkpoints: the
+                # terminal acknowledgement decides, and Kairo redelivers.
+                message["command"] = {
+                    "command_id": command_id,
+                    "kind": "suspend",
+                    "reason": str(raw.get("reason") or ""),
+                    "delivery_count": int(raw.get("delivery_count") or 0),
+                }
+                return message
+        message["stop"] = stop_requested()
+        return message
+
+
+def _terminal_message(session: AttemptSession) -> dict[str, Any] | None:
+    error = session._terminal_error
+    if error is None:
+        return None
+    return {
+        "retired": isinstance(error, AttemptRetired),
+        "status": error.status,
+        "code": error.code,
+        "message": error.message,
+        "detail": error.detail,
+    }
+
+
+def _raise_terminal(session: AttemptSession, message: dict[str, Any] | None) -> None:
+    if message is None:
+        return
+    if session._terminal_error is not None:
+        raise session._terminal_error  # rank 0 re-raises what it received
+    error_type = AttemptRetired if message["retired"] else AttemptFenced
+    raise error_type(
+        message["status"],
+        message["code"],
+        message["message"],
+        detail=message["detail"],
+        role=errors.WORKER,
+    )

@@ -147,7 +147,7 @@ def test_every_request_carries_the_attempt_token_and_no_lease_headers(control_se
 def test_command_ids_are_quoted_into_one_path_segment(control_server):
     _Handler.command_id = "cmd/../odd id"
     session = managed_session(control_server, "quote")
-    assert session.safe_point(checkpoint=lambda _context: None)
+    assert session.safe_point(checkpoint=lambda _context: "ckpt://quoted")
     ack_paths = {path for path, _headers, _body in _Handler.posts if path.endswith("/acks")}
     assert ack_paths == {"/api/worker/commands/cmd%2F..%2Fodd%20id/acks"}
 
@@ -231,7 +231,7 @@ def test_managed_environment_requires_execution_attempt_and_token(monkeypatch, m
     monkeypatch.setenv("KAIRO_ATTEMPT_ID", "att_environment")
     monkeypatch.setenv("KAIRO_ATTEMPT_TOKEN", "tok_environment")
     monkeypatch.delenv(missing)
-    with pytest.raises(RuntimeError, match="requires execution ID, attempt ID, and attempt token"):
+    with pytest.raises(RuntimeError, match=f"is missing {missing}"):
         AttemptSession.from_environment()
 
 
@@ -321,7 +321,7 @@ def test_distributed_adapter_supports_single_process_suspend(tmp_path: Path, con
     ]
 
 
-def test_unknown_worker_command_is_rejected_without_stopping(control_server):
+def test_unknown_worker_command_is_skipped_without_an_ack(control_server):
     _Handler.command_kind = "cancel"
     session = managed_session(control_server, "unknown")
     called = False
@@ -332,9 +332,4 @@ def test_unknown_worker_command_is_rejected_without_stopping(control_server):
 
     assert not session.safe_point(checkpoint=checkpoint)
     assert not called
-    assert _Handler.acks == [
-        {
-            "phase": "rejected",
-            "payload": {"reason": "unsupported command kind 'cancel'"},
-        }
-    ]
+    assert _Handler.acks == []

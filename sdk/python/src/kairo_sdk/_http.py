@@ -18,6 +18,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from . import errors
+
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Surface a 3xx as an ``HTTPError`` instead of following it."""
@@ -27,7 +29,11 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def is_loopback(host: str | None) -> bool:
-    """``localhost`` or a loopback IP literal; never a name that merely resolves to one."""
+    """``localhost`` or a loopback IP literal; never a name that merely resolves to one.
+
+    ``loopback.json``: 127.0.0.0/8, ::1 and ::ffff:127.x match; zoned IPv6
+    literals, trailing dots and other names do not. Brackets are optional.
+    """
     if not host:
         return False
     if host.startswith("[") and host.endswith("]"):
@@ -45,20 +51,36 @@ def is_loopback(host: str | None) -> bool:
     return address.is_loopback
 
 
-def require_token_transport(url: str) -> None:
-    """Refuse a URL a bearer token must not travel to: plain http off loopback."""
+def check_api_url(url: str) -> urllib.parse.SplitResult:
+    """Parse a Kairo API URL: ``http(s)://HOST[:PORT]``, never with user:password."""
     parts = urllib.parse.urlsplit(url)
-    scheme = parts.scheme.lower()
-    if scheme == "https":
-        return
-    if scheme != "http":
+    host = parts.netloc.rpartition("@")[2]  # never echo userinfo
+    shown = f"{parts.scheme}://{host}{parts.path}" if "@" in parts.netloc else url
+    try:
+        hostname, _port = parts.hostname, parts.port
+    except ValueError:
+        hostname = None
+    if parts.scheme.lower() not in ("http", "https") or not hostname:
+        raise ValueError(f"invalid Kairo API URL {shown!r}: want https://HOST:PORT")
+    if "@" in parts.netloc:
         raise ValueError(
-            f"Kairo API URL must use https (or http to loopback), not {scheme!r}"
+            f"Kairo API URL {shown!r} must not carry user:password; pass the token separately"
         )
+    return parts
+
+
+def require_token_transport(url: str) -> None:
+    """Refuse a URL a bearer token must not travel to (``token_transport.json``).
+
+    https always; plain http only to a loopback host; any other scheme, a
+    missing host, or user:password in the URL is refused.
+    """
+    parts = check_api_url(url)
+    if parts.scheme.lower() == "https":
+        return
     if not is_loopback(parts.hostname):
-        host = parts.netloc.rpartition("@")[2]  # never echo userinfo
         raise ValueError(
-            f"refusing to send a token over plain http to {host}: use https"
+            f"refusing to send a token over plain http to {parts.netloc}: use https"
         )
 
 
@@ -101,8 +123,16 @@ def request_json(
     token: str,
     body: Any,
     timeout: float,
+    *,
+    role: str = errors.OPERATOR,
 ) -> dict[str, Any]:
-    """Send one JSON request; transport errors (``URLError``) propagate."""
+    """Send one JSON request.
+
+    An HTTP error status raises :class:`~kairo_sdk.errors.KairoAPIError` (or
+    ``AttemptRetired``/``AttemptFenced``, classified for ``role``); transport
+    errors (``URLError``, ``OSError``) propagate unchanged, and
+    :func:`~kairo_sdk.errors.classify` maps them.
+    """
     require_token_transport(url)
     data = None
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
@@ -114,8 +144,11 @@ def request_json(
         with opener.open(request, timeout=timeout) as response:
             payload = response.read()
     except urllib.error.HTTPError as error:
-        detail = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Kairo API returned HTTP {error.code}: {detail}") from error
+        try:
+            detail = error.read()
+        except OSError:
+            detail = b""
+        raise errors.api_error(error.code, detail, role=role) from error
     if not payload:
         return {}
     decoded = json.loads(payload)

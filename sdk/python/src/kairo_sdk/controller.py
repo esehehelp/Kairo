@@ -4,59 +4,26 @@ import copy
 import hashlib
 import json
 import logging
-import os
 import sqlite3
-import ssl
-import sys
 import time
-import urllib.error
-import urllib.parse
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
-from . import _http
-
-DEFAULT_API_URL = "https://127.0.0.1:7474"
+# DEFAULT_API_URL, ControllerConfigurationError and _user_config_dir moved to
+# .client with the operator settings; they stay importable from here.
+from .client import (  # noqa: F401
+    DEFAULT_API_URL,
+    ControllerConfigurationError,
+    CoordinationEvent,
+    KairoClient,
+    TransientControllerError,
+    _user_config_dir,
+)
+from .errors import RETRY_LATER, TRANSIENT, KairoAPIError
 
 _log = logging.getLogger("kairo_sdk.controller")
-
-# Connection-level TLS failures: the peer went away mid-handshake or mid-read,
-# which a daemon restart produces. Every other SSLError is a trust or protocol
-# mismatch that no retry can fix.
-_TRANSIENT_SSL_ERRORS = (
-    ssl.SSLEOFError,
-    ssl.SSLZeroReturnError,
-    ssl.SSLSyscallError,
-    ssl.SSLWantReadError,
-    ssl.SSLWantWriteError,
-)
-
-
-@dataclass(frozen=True)
-class CoordinationEvent:
-    sequence: int
-    event_type: str
-    aggregate_type: str
-    aggregate_id: str
-    coordination_epoch: int | None
-    payload: Mapping[str, Any]
-
-    @classmethod
-    def from_api(cls, raw: Mapping[str, Any]) -> CoordinationEvent:
-        payload = raw.get("payload") or {}
-        if not isinstance(payload, Mapping):
-            raise TypeError("coordination event payload must be an object")
-        epoch = raw.get("coordination_epoch")
-        return cls(
-            sequence=int(raw["sequence"]),
-            event_type=str(raw["event_type"]),
-            aggregate_type=str(raw["aggregate_type"]),
-            aggregate_id=str(raw["aggregate_id"]),
-            coordination_epoch=int(epoch) if epoch is not None else None,
-            payload=payload,
-        )
 
 
 class ControllerAPI(Protocol):
@@ -65,148 +32,25 @@ class ControllerAPI(Protocol):
     def submit_execution(self, request: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
 
-class TransientControllerError(RuntimeError):
-    """A transport failure that the controller loop may safely retry."""
-
-
-class ControllerConfigurationError(RuntimeError):
-    """A failure no retry can fix, such as a TLS handshake or verification failure."""
-
-
-class KairoControllerClient:
+class KairoControllerClient(KairoClient):
     """Small project-controller client for Kairo's coordination API.
 
-    Unset arguments resolve the way the ``kairo`` CLI does: the API URL from
+    Unset arguments resolve the way the ``kairo`` CLI does (see
+    :func:`~kairo_sdk.client.resolve_operator_settings`): the API URL from
     ``KAIRO_API``; the token from ``KAIRO_TOKEN``, ``KAIRO_TOKEN_FILE`` or
     ``<user config dir>/kairo/token``; the CA from ``KAIRO_CA_FILE`` or
-    ``<user config dir>/kairo/ca.pem``, falling back to the system roots.
+    ``<user config dir>/kairo/ca.pem``, falling back to the system roots. A
+    missing token fails the first request, not the constructor.
     """
 
-    def __init__(
-        self,
-        api_url: str | None = None,
-        *,
-        token: str | None = None,
-        token_file: str | Path | None = None,
-        ca_file: str | Path | None = None,
-        timeout_seconds: float = 10.0,
-    ) -> None:
-        self.api_url = (api_url or os.environ.get("KAIRO_API") or DEFAULT_API_URL).rstrip("/")
-        _http.require_token_transport(self.api_url)
-        self.timeout_seconds = timeout_seconds
-        self._token = _resolve_token(token, token_file)
-        self.ca_file = _resolve_ca_file(ca_file)
-        self._opener = _http.build_opener(ca_file=self.ca_file)
-
     def list_events(self, project: str, after: int = 0) -> list[CoordinationEvent]:
-        events: list[CoordinationEvent] = []
-        cursor = after
-        while True:
-            query = urllib.parse.urlencode(
-                {"project": project, "after": cursor, "limit": 1000}
-            )
-            response = self._request("GET", f"/api/events?{query}")
-            page = response.get("events") or []
-            if not isinstance(page, list):
-                raise TypeError("Kairo events response must contain an array")
-            decoded = [CoordinationEvent.from_api(raw) for raw in page]
-            events.extend(decoded)
-            if len(decoded) < 1000:
-                return events
-            next_cursor = decoded[-1].sequence
-            if next_cursor <= cursor:
-                raise RuntimeError("Kairo events response did not advance the cursor")
-            cursor = next_cursor
+        return list(self.events(project, after))
 
     def submit_execution(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
         # Journaled submissions may still carry the retired schema_version;
         # the journal keeps them verbatim, but the API rejects unknown fields.
         body = {key: value for key, value in request.items() if key != "schema_version"}
         return self._request("POST", "/api/executions", body)
-
-    def _request(
-        self, method: str, path: str, body: Mapping[str, Any] | None = None
-    ) -> dict[str, Any]:
-        try:
-            return _http.request_json(
-                self._opener,
-                method,
-                self.api_url + path,
-                self._token,
-                body,
-                self.timeout_seconds,
-            )
-        except urllib.error.URLError as error:
-            raise self._transport_error(error.reason) from error
-        except (TimeoutError, ConnectionError, ssl.SSLError) as error:
-            raise self._transport_error(error) from error
-
-    def _transport_error(self, reason: object) -> RuntimeError:
-        if isinstance(reason, ssl.SSLError) and not isinstance(
-            reason, _TRANSIENT_SSL_ERRORS
-        ):
-            trust = f"CA file {self.ca_file}" if self.ca_file else "the system CA roots"
-            return ControllerConfigurationError(
-                f"TLS to the Kairo API at {self.api_url} failed, trusting {trust}: "
-                f"{reason}"
-            )
-        return TransientControllerError(f"Kairo API transport failed: {reason}")
-
-
-def _user_config_dir() -> Path | None:
-    """Mirror Go's os.UserConfigDir, where the ``kairo`` CLI keeps its files."""
-    if os.name == "nt":
-        appdata = os.environ.get("APPDATA")
-        return Path(appdata) if appdata else None
-    home = os.environ.get("HOME")
-    if sys.platform == "darwin":
-        return Path(home, "Library", "Application Support") if home else None
-    xdg = os.environ.get("XDG_CONFIG_HOME")
-    if xdg:
-        # Go rejects a relative XDG_CONFIG_HOME rather than falling back.
-        return Path(xdg) if os.path.isabs(xdg) else None
-    return Path(home, ".config") if home else None
-
-
-def _read_token_file(path: Path) -> str:
-    try:
-        token = path.read_text(encoding="utf-8").strip()
-    except OSError as error:
-        raise RuntimeError(f"cannot read Kairo token file {path}: {error}") from error
-    if not token:
-        raise RuntimeError(f"Kairo token file {path} is empty")
-    return token
-
-
-def _resolve_token(token: str | None, token_file: str | Path | None) -> str:
-    if token is not None:
-        if not token.strip():
-            raise ValueError("Kairo token must not be empty")
-        return token.strip()
-    if token_file is not None:
-        return _read_token_file(Path(token_file))
-    if environment_token := os.environ.get("KAIRO_TOKEN", "").strip():
-        return environment_token
-    if environment_file := os.environ.get("KAIRO_TOKEN_FILE"):
-        return _read_token_file(Path(environment_file))
-    config_dir = _user_config_dir()
-    if config_dir is not None and (config_dir / "kairo" / "token").is_file():
-        return _read_token_file(config_dir / "kairo" / "token")
-    raise RuntimeError(
-        "no Kairo API token: pass token or token_file, set KAIRO_TOKEN or "
-        "KAIRO_TOKEN_FILE, or provide <user config dir>/kairo/token"
-    )
-
-
-def _resolve_ca_file(ca_file: str | Path | None) -> Path | None:
-    if ca_file is not None:
-        return Path(ca_file)
-    if environment_file := os.environ.get("KAIRO_CA_FILE"):
-        return Path(environment_file)
-    config_dir = _user_config_dir()
-    if config_dir is not None and (config_dir / "kairo" / "ca.pem").is_file():
-        return config_dir / "kairo" / "ca.pem"
-    return None
 
 
 @dataclass(frozen=True)
@@ -885,7 +729,12 @@ class ProjectController:
         while True:
             try:
                 self.run_once()
-            except TransientControllerError as error:
+            except (TransientControllerError, KairoAPIError) as error:
+                if isinstance(error, KairoAPIError) and error.classification not in (
+                    TRANSIENT,
+                    RETRY_LATER,
+                ):
+                    raise
                 _log.warning(
                     "Kairo controller pass failed transiently; retrying in %.2fs: %s",
                     backoff,

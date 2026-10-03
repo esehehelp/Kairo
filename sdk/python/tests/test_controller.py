@@ -653,9 +653,13 @@ def test_client_defaults_to_local_https_and_cli_token(config_dir: Path):
     assert client.ca_file is None
 
 
-def test_client_without_any_token_fails(config_dir: Path):
-    with pytest.raises(RuntimeError, match="no Kairo API token"):
-        KairoControllerClient()
+def test_client_without_any_token_fails_on_the_first_request(config_dir: Path):
+    # Resolution never fails for a missing token (operator_resolution.json);
+    # the request that needs one does, before any network traffic.
+    client = KairoControllerClient("http://127.0.0.1:1")
+    assert client._token is None
+    with pytest.raises(ControllerConfigurationError, match="no Kairo API token"):
+        client.list_events("p")
 
 
 def test_client_rejects_empty_token_file(config_dir: Path):
