@@ -1,6 +1,8 @@
 package api
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
@@ -8,8 +10,15 @@ import (
 	"strconv"
 	"sync"
 
+	"modernc.org/sqlite"
+	sqlite3 "modernc.org/sqlite/lib"
+
 	"kairo/internal/store"
 )
+
+// APIVersion is the version of the API contract, reported by GET /health. It
+// changes only when a change would break an existing client.
+const APIVersion = 1
 
 // Server is the daemon's HTTP API: one /api surface for operators, node
 // agents and the processes of attempts, each authenticated by a bearer token
@@ -75,15 +84,39 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	_ = json.NewEncoder(w).Encode(value)
 }
 
+// codeInternal marks a failure of the daemon rather than of the request:
+// 503 when it is likely to pass (a busy database, a deadline), else 500.
+// Clients treat both as transient.
+const codeInternal = "internal"
+
 func writeError(w http.ResponseWriter, err error) {
-	status, code := http.StatusBadRequest, "bad_request"
+	status, code := errorStatus(err)
+	writeJSON(w, status, map[string]string{"error": err.Error(), "code": code})
+}
+
+// errorStatus maps an error to its HTTP status and wire code: a store
+// sentinel to its code, a database or context failure to "internal", and
+// anything else (validation) to 400 bad_request.
+func errorStatus(err error) (int, string) {
 	for _, c := range errorCodes {
 		if errors.Is(err, c.err) {
-			status, code = c.status, c.code
-			break
+			return c.status, c.code
 		}
 	}
-	writeJSON(w, status, map[string]string{"error": err.Error(), "code": code})
+	var sqliteErr *sqlite.Error
+	switch {
+	case errors.As(err, &sqliteErr):
+		// Extended result codes keep the primary code in the low byte.
+		if primary := sqliteErr.Code() & 0xff; primary == sqlite3.SQLITE_BUSY || primary == sqlite3.SQLITE_LOCKED {
+			return http.StatusServiceUnavailable, codeInternal
+		}
+		return http.StatusInternalServerError, codeInternal
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+		return http.StatusServiceUnavailable, codeInternal
+	case errors.Is(err, sql.ErrConnDone), errors.Is(err, sql.ErrTxDone):
+		return http.StatusInternalServerError, codeInternal
+	}
+	return http.StatusBadRequest, "bad_request"
 }
 
 func decode(r *http.Request, target any) error {
@@ -124,5 +157,5 @@ func queryInt64(r *http.Request, key string, fallback int64) int64 {
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "api": APIVersion})
 }

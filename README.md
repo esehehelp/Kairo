@@ -209,6 +209,14 @@ An agent refuses an `http://` URL unless `insecure_http = true`.
 Errors are `{"error": ..., "code": ...}`. An empty `actor` in a pause, resume
 or quarantine request is recorded as the token's name.
 
+Clients follow the contract in `sdk/conformance` (how to find the daemon, when
+a token may be sent, how to classify each error); every SDK's tests replay it.
+Codes: `unauthorized` 401, `forbidden` 403, `not_found` 404, `stale_epoch` and
+other conflicts 409, `gate_closed`/`observe_only` 423, `bad_request` 400 (fix
+the request), and `internal` 500/503 (a daemon-side failure such as a busy
+database: transient, retry). `GET /health` returns `{"ok": true, "api": 1}`;
+`api` is the contract version and changes only on a breaking change.
+
 ## Coordination model
 
 - Execution request: immutable and one-shot (`waiting`, `authorized`,

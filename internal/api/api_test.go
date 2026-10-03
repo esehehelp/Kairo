@@ -16,13 +16,15 @@ import (
 
 type testDaemon struct {
 	store  *store.Store
+	path   string // the database file
 	server *httptest.Server
 	admin  string
 }
 
 func newTestDaemon(t *testing.T, observeOnly bool) *testDaemon {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "api.db"))
+	path := filepath.Join(t.TempDir(), "api.db")
+	st, err := store.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +37,7 @@ func newTestDaemon(t *testing.T, observeOnly bool) *testDaemon {
 		server.Close()
 		st.Close()
 	})
-	return &testDaemon{store: st, server: server, admin: admin}
+	return &testDaemon{store: st, path: path, server: server, admin: admin}
 }
 
 func (d *testDaemon) token(t *testing.T, name, role, node string) string {
@@ -49,6 +51,12 @@ func (d *testDaemon) token(t *testing.T, name, role, node string) string {
 
 // workerToken authorizes one attempt and returns its token.
 func (d *testDaemon) workerToken(t *testing.T) string {
+	t.Helper()
+	return d.workerLaunch(t).WorkerToken
+}
+
+// workerLaunch authorizes and activates one attempt on executor "executor".
+func (d *testDaemon) workerLaunch(t *testing.T) *store.Launch {
 	t.Helper()
 	ctx := context.Background()
 	if err := d.store.UpsertNode(ctx, store.Node{ID: "node", Name: "node", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
@@ -74,7 +82,7 @@ func (d *testDaemon) workerToken(t *testing.T) string {
 	if err = d.store.ActivateLaunch(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, 100, "launcher:100"); err != nil {
 		t.Fatal(err)
 	}
-	return launch.WorkerToken
+	return launch
 }
 
 func (d *testDaemon) call(t *testing.T, method, path, token string, body any) (int, []byte) {

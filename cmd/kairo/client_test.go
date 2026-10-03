@@ -153,7 +153,7 @@ func TestClientHealthNeedsNoToken(t *testing.T) {
 		if r.Header.Get("Authorization") != "" {
 			t.Errorf("sent Authorization without a token")
 		}
-		_, _ = w.Write([]byte(`{"ok":true}`))
+		_, _ = w.Write([]byte(`{"ok":true,"api":1}`))
 	}))
 	defer server.Close()
 	c, err := newAPIClient(server.URL)
