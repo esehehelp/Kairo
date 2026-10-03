@@ -78,7 +78,7 @@ func TestWSLProcessLivenessRecognizesLivePID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expected, err := linuxIdentityFromStat(pid, string(stat))
+	expected, err := LinuxIdentityFromStat(pid, string(stat))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,22 +96,5 @@ func TestWSLArgsUseDirectExecAndPreserveArguments(t *testing.T) {
 	want := []string{"-d", "Ubuntu", "--exec", "test", "!", "-e", "/proc/42/stat"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("wslArgs() = %#v, want %#v", got, want)
-	}
-}
-
-func TestLinuxIdentityFromStatHandlesSpacesAndParenthesesInComm(t *testing.T) {
-	body := "42 (worker name) with ) paren) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 98765 20 21\n"
-	got, err := linuxIdentityFromStat(42, body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if want := "proc:42:starttime:98765"; got != want {
-		t.Fatalf("identity = %q, want %q", got, want)
-	}
-}
-
-func TestLinuxIdentityFromStatRejectsTruncatedInput(t *testing.T) {
-	if _, err := linuxIdentityFromStat(42, "42 (worker) S 1 2"); err == nil {
-		t.Fatal("expected malformed stat error")
 	}
 }

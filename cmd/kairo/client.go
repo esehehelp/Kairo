@@ -46,9 +46,20 @@ func kairoConfigDir() (string, error) {
 	return filepath.Join(dir, "kairo"), nil
 }
 
-// newAPIClient resolves the API URL, token and CA (see apiFlag) without any
-// network traffic. A missing token is only an error once a request needs one.
-func newAPIClient(apiFlag string) (*apiClient, error) {
+// apiSettings is where an operator client finds the daemon: its URL, token
+// and the CA it trusts (sdk/conformance/operator_resolution.json).
+type apiSettings struct {
+	url   string
+	token string // "" when none was found: a request needing one fails
+	// caPath is the CA file trusted ("" for the system roots); caPEM its content.
+	caPath string
+	caPEM  []byte
+}
+
+// resolveSettings resolves the API URL, token and CA (see apiFlag) without
+// any network traffic. A missing token is only an error once a request needs
+// one.
+func resolveSettings(apiFlag string) (apiSettings, error) {
 	base := apiFlag
 	if base == "" {
 		base = os.Getenv("KAIRO_API")
@@ -59,26 +70,38 @@ func newAPIClient(apiFlag string) (*apiClient, error) {
 	base = strings.TrimRight(base, "/")
 	parsed, err := url.Parse(base)
 	if err != nil || parsed.Host == "" || (parsed.Scheme != "https" && parsed.Scheme != "http") {
-		return nil, fmt.Errorf("invalid Kairo API URL %q: want https://HOST:PORT", base)
+		return apiSettings{}, fmt.Errorf("invalid Kairo API URL %q: want https://HOST:PORT", base)
+	}
+	if parsed.User != nil {
+		return apiSettings{}, fmt.Errorf("invalid Kairo API URL: credentials do not belong in the URL (use KAIRO_TOKEN)")
 	}
 	token, err := resolveToken()
 	if err != nil {
-		return nil, err
+		return apiSettings{}, err
 	}
-	if parsed.Scheme == "http" && token != "" && !isLoopback(parsed.Hostname()) {
-		return nil, fmt.Errorf("refusing to send a token over plain http to %s: use https", parsed.Host)
+	if token != "" && !tokenTransportAllowed(parsed) {
+		return apiSettings{}, fmt.Errorf("refusing to send a token over plain http to %s: use https", parsed.Host)
 	}
-	caPEM, err := resolveCA()
+	caPath, caPEM, err := resolveCA()
+	if err != nil {
+		return apiSettings{}, err
+	}
+	return apiSettings{url: base, token: token, caPath: caPath, caPEM: caPEM}, nil
+}
+
+// newAPIClient resolves the settings (resolveSettings) and builds the client.
+func newAPIClient(apiFlag string) (*apiClient, error) {
+	settings, err := resolveSettings(apiFlag)
 	if err != nil {
 		return nil, err
 	}
-	tlsConfig, err := tlsutil.ClientConfig(caPEM)
+	tlsConfig, err := tlsutil.ClientConfig(settings.caPEM)
 	if err != nil {
 		return nil, fmt.Errorf("Kairo CA: %w", err)
 	}
 	return &apiClient{
-		baseURL: base,
-		token:   token,
+		baseURL: settings.url,
+		token:   settings.token,
 		http: &http.Client{
 			Timeout: 30 * time.Second,
 			// Never proxied, never redirected: the token goes to this URL only.
@@ -99,7 +122,11 @@ func resolveToken() (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("KAIRO_TOKEN_FILE: %w", err)
 		}
-		return strings.TrimSpace(string(data)), nil
+		token := strings.TrimSpace(string(data))
+		if token == "" {
+			return "", fmt.Errorf("KAIRO_TOKEN_FILE %s is empty", path)
+		}
+		return token, nil
 	}
 	dir, err := kairoConfigDir()
 	if err != nil {
@@ -115,31 +142,58 @@ func resolveToken() (string, error) {
 	return strings.TrimSpace(string(data)), nil
 }
 
-func resolveCA() ([]byte, error) {
+// resolveCA returns the CA file to trust and its content, or "" and nil for
+// the system roots.
+func resolveCA() (string, []byte, error) {
 	if path := os.Getenv("KAIRO_CA_FILE"); path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("KAIRO_CA_FILE: %w", err)
+			return "", nil, fmt.Errorf("KAIRO_CA_FILE: %w", err)
 		}
-		return data, nil
+		return path, data, nil
 	}
 	dir, err := kairoConfigDir()
 	if err != nil {
-		return nil, nil
+		return "", nil, nil
 	}
-	data, err := os.ReadFile(filepath.Join(dir, tlsutil.CACertFile))
+	path := filepath.Join(dir, tlsutil.CACertFile)
+	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, nil
+		return "", nil, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read CA: %w", err)
+		return "", nil, fmt.Errorf("read CA: %w", err)
 	}
-	return data, nil
+	return path, data, nil
 }
 
-func isLoopback(host string) bool {
-	if host == "localhost" {
+// tokenTransportAllowed reports whether a bearer token may be sent to u:
+// https always, http only to a loopback host; never another scheme, a URL
+// without a host or one carrying user:password
+// (sdk/conformance/token_transport.json).
+func tokenTransportAllowed(u *url.URL) bool {
+	if u.Host == "" || u.User != nil {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
 		return true
+	case "http":
+		return isLoopback(u.Hostname())
+	default:
+		return false
+	}
+}
+
+// isLoopback reports whether host (brackets removed) is "localhost" in any
+// case or a loopback IP literal, IPv4-mapped ones included. Nothing else
+// matches: no DNS lookups, no zone suffixes (sdk/conformance/loopback.json).
+func isLoopback(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	if strings.Contains(host, "%") {
+		return false
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()

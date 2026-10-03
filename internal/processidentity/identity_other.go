@@ -6,15 +6,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
-)
-
-type Liveness int
-
-const (
-	LivenessUnknown Liveness = iota
-	LivenessAlive
-	LivenessAbsent
 )
 
 func ForPID(pid int) (string, error) {
@@ -22,16 +13,7 @@ func ForPID(pid int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	end := strings.LastIndexByte(string(body), ')')
-	if end < 0 {
-		return "", fmt.Errorf("malformed /proc/%d/stat", pid)
-	}
-	fields := strings.Fields(string(body[end+1:]))
-	// The suffix starts at proc field 3, so starttime (field 22) is index 19.
-	if len(fields) <= 19 {
-		return "", fmt.Errorf("malformed /proc/%d/stat", pid)
-	}
-	return fmt.Sprintf("proc:%d:starttime:%s", pid, fields[19]), nil
+	return LinuxIdentityFromStat(pid, string(body))
 }
 
 func HostProcessLiveness(pid int, expected string) (Liveness, error) {

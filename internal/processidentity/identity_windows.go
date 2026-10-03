@@ -12,14 +12,6 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-type Liveness int
-
-const (
-	LivenessUnknown Liveness = iota
-	LivenessAlive
-	LivenessAbsent
-)
-
 func ForPID(pid int) (string, error) {
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
@@ -30,7 +22,7 @@ func ForPID(pid int) (string, error) {
 	if err = windows.GetProcessTimes(handle, &created, &exited, &kernel, &user); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("pid:%d:start:%d", pid, created.Nanoseconds()), nil
+	return WindowsIdentityFromFiletime(pid, uint64(created.HighDateTime)<<32|uint64(created.LowDateTime)), nil
 }
 
 // HostProcessLiveness distinguishes PID reuse and keeps observation errors
@@ -65,9 +57,9 @@ func WSLProcessLiveness(ctx context.Context, distro string, pid int, expected st
 			err, strings.TrimSpace(string(out)), absentErr, strings.TrimSpace(string(absentOut)),
 		)
 	}
-	actual, err := linuxIdentityFromStat(pid, string(out))
+	actual, err := LinuxIdentityFromStat(pid, string(out))
 	if err != nil {
-		return LivenessUnknown, err
+		return LivenessUnknown, fmt.Errorf("WSL: %w", err)
 	}
 	if actual == expected {
 		return LivenessAlive, nil
@@ -85,16 +77,4 @@ func wslArgs(distro string, command ...string) []string {
 	// commands that contain shell metacharacters.
 	args = append(args, "--exec")
 	return append(args, command...)
-}
-
-func linuxIdentityFromStat(pid int, body string) (string, error) {
-	end := strings.LastIndexByte(body, ')')
-	if end < 0 {
-		return "", fmt.Errorf("malformed WSL %s", fmt.Sprintf("/proc/%d/stat", pid))
-	}
-	fields := strings.Fields(body[end+1:])
-	if len(fields) <= 19 {
-		return "", fmt.Errorf("malformed WSL %s", fmt.Sprintf("/proc/%d/stat", pid))
-	}
-	return fmt.Sprintf("proc:%d:starttime:%s", pid, fields[19]), nil
 }
