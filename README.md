@@ -78,6 +78,9 @@ never changes what the daemon stores.
 reserves, launches, suspends, or releases work. It is the recommended first
 deployment mode on a host with unmanaged training processes.
 
+Resource observations describe the present: only each resource's latest one
+is used, and the daemon prunes the others once they are an hour old.
+
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
 limits. GPU exclusion is a coordination guarantee among Kairo participants;
 external processes are observed and excluded but cannot be physically fenced.

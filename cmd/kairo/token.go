@@ -127,7 +127,7 @@ func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 
 func openTokenStore(configPath, dbPath string) (*store.Store, error) {
 	if (configPath == "") == (dbPath == "") {
-		return nil, errors.New("token commands need exactly one of --config or --db")
+		return nil, errors.New("need exactly one of --config or --db")
 	}
 	if configPath != "" {
 		daemonConfig, err := config.Load(configPath)

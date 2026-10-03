@@ -8,7 +8,7 @@ import (
 func TestCommandGroupsAreDispatched(t *testing.T) {
 	isolateClientEnv(t)
 	t.Setenv("KAIRO_API", "http://127.0.0.1:1")
-	for _, command := range []string{"execution", "project", "queue", "task", "resource", "node", "token", "tls", "doctor"} {
+	for _, command := range []string{"execution", "project", "queue", "task", "resource", "node", "token", "tls", "db", "doctor"} {
 		err := run([]string{command})
 		if err == nil || err.Error() == usage().Error() {
 			t.Fatalf("command group %q was not dispatched: %v", command, err)

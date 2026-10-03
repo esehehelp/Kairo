@@ -56,6 +56,8 @@ func run(args []string) error {
 		return resourceCommand(args[1:])
 	case "node":
 		return nodeCommand(args[1:])
+	case "db":
+		return dbCommand(args[1:])
 	case "token":
 		return tokenCommand(args[1:])
 	case "tls":
@@ -68,7 +70,7 @@ func run(args []string) error {
 }
 
 func usage() error {
-	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|token|tls|doctor>")
+	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|token|tls|db|doctor>")
 }
 
 func serve(args []string) error {
@@ -193,6 +195,26 @@ func serve(args []string) error {
 		for {
 			if err := st.ReconcilePauseOperations(ctx, !daemonConfig.ObserveOnly); err != nil && ctx.Err() == nil {
 				logger.Error("pause reconciliation failed", "error", err)
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			}
+		}
+	}()
+	// Resource observations describe the present; only each resource's
+	// latest one is ever read. Prune the rest periodically (observe-only
+	// daemons record observations too).
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			removed, err := st.PruneObservations(ctx, store.ObservationRetention)
+			if err != nil && ctx.Err() == nil {
+				logger.Error("observation pruning failed", "error", err)
+			} else if removed > 0 {
+				logger.Info("pruned resource observations", "rows", removed)
 			}
 			select {
 			case <-ctx.Done():
