@@ -74,12 +74,22 @@ merge key by key, arrays and scalars are replaced, and an omitted `depends_on`
 becomes `[]`. Digests are those of the fully written Task, so `[defaults]`
 never changes what the daemon stores.
 
+`kairo task cancel [--dry-run] PROJECT QUEUE TASK` ends a paused or never
+started Task: it withdraws every execution of the Task that has not started
+(every gang rank included), after which the Task is marked failed. It refuses
+while an execution is started and not terminal (pause the Task first) and
+leaves checkpoints and other outputs alone. `kairo project prune [--write]
+FILE` reports (or, with `--write`, rewrites FILE to) the Tasks that can still
+run and the dependencies they need, keeping each kept Task's digest.
+
 `observe_only = true` inventories resources and external claims but never
 reserves, launches, suspends, or releases work. It is the recommended first
 deployment mode on a host with unmanaged training processes.
 
 Resource observations describe the present: only each resource's latest one
 is used, and the daemon prunes the others once they are an hour old.
+`kairo db compact --config kairo.toml` (with the daemon stopped) prunes them
+at once and runs `VACUUM`.
 
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
 limits. GPU exclusion is a coordination guarantee among Kairo participants;
@@ -175,7 +185,7 @@ tools with `NODE_EXTRA_CA_CERTS=ca.pem`. Attempts receive the CA itself in
 The certificates carry no revocation endpoint, so Windows `curl.exe`
 (Schannel) needs `--ssl-no-revoke` with `--cacert ca.pem`.
 
-Node agent configuration:
+A node agent runs `kairo agent --config agent.toml`. Its configuration:
 
 ```toml
 server_url = "https://192.168.1.12:7474"
@@ -184,7 +194,10 @@ ca_file = "/etc/kairo/ca.pem"
 # attempt_api_url = "https://192.168.1.12:7474"  # KAIRO_API_URL of this node's attempts
 ```
 
-An agent refuses an `http://` URL unless `insecure_http = true`.
+The rest (`log_directory`, `observe_only`, `observation_interval_seconds`,
+`[node]`, `[[executors]]`, `[[providers]]`) has the same form as in the daemon
+configuration (`examples/kairo.toml`). An agent refuses an `http://` URL
+unless `insecure_http = true`.
 
 ## API
 
