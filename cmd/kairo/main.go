@@ -102,6 +102,8 @@ func serve(args []string) error {
 		return fmt.Errorf("restrict database to its owner: %w", err)
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
+	slog.SetDefault(logger)
 	providerSet := map[string]provider.Provider{}
 	attributes, _ := json.Marshal(daemonConfig.Node.Labels)
 	if err := st.UpsertNode(context.Background(), store.Node{ID: daemonConfig.Node.ID, Name: daemonConfig.Node.Name, OS: daemonConfig.Node.OS, Architecture: daemonConfig.Node.Architecture, Attributes: attributes, Enabled: true}); err != nil {

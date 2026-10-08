@@ -1,9 +1,12 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -225,6 +228,47 @@ func TestGangRankFailureTerminatesTheOthersAndFailsTheTask(t *testing.T) {
 	finishGangRank(t, store, rank0, 137)
 	if task := gangTaskState(t, store); task.State != "failed" {
 		t.Fatalf("task: %+v", task)
+	}
+}
+
+// An abort for a rank that was never prepared says, for each rank, where it
+// waits, whether its lease was delivered and when its executor last polled; the
+// daemon logs the same reason.
+func TestGangAbortNamesEachRankExecutorDeliveryAndLastPoll(t *testing.T) {
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	store := openCoordinationStore(t)
+	setupGangInventory(t, store)
+	gangProject(t, store, false)
+	ctx := context.Background()
+	rb, err := store.ReserveNext(ctx, "exec-b")
+	if err != nil || rb == nil {
+		t.Fatalf("reserve: %+v %v", rb, err)
+	}
+	if err = store.MarkLeasePrepared(ctx, rb.Lease.ID, rb.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	// exec-b polls; exec-a never received its rank, so it has not polled.
+	if _, err = store.db.Exec(`UPDATE executors SET last_seen_at=? WHERE id='exec-b'`, "2026-10-06T19:23:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`UPDATE gang_placements SET created_at=?`, time.Now().UTC().Add(-2*GangPrepareTimeout).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ReconcileGangs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	want := "not every rank was prepared within 2m0s: " +
+		"rank 0 on executor exec-a: lease reserved, delivered=false, executor last_seen_at=none; " +
+		"rank 1 on executor exec-b: lease prepared, delivered=true, executor last_seen_at=2026-10-06T19:23:00Z"
+	var reason string
+	if err = store.db.QueryRow(`SELECT abort_reason FROM gang_placements WHERE state='aborted'`).Scan(&reason); err != nil || reason != want {
+		t.Fatalf("abort reason %q (%v), want %q", reason, err, want)
+	}
+	if !strings.Contains(logs.String(), "gang placement aborted") || !strings.Contains(logs.String(), want) {
+		t.Fatalf("abort not logged with its reason: %s", logs.String())
 	}
 }
 

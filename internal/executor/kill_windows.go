@@ -3,12 +3,20 @@
 package executor
 
 import (
+	"context"
 	"os/exec"
 	"strconv"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/windows"
+
+	"kairo/internal/extcmd"
 )
+
+// taskkillTimeout bounds one taskkill. One that does not finish in time fails,
+// so the caller keeps the tree as not yet killed.
+const taskkillTimeout = 30 * time.Second
 
 // prepareProcessTree starts the launcher as the leader of its own console
 // process group, so a force stop can send CTRL_BREAK to the attempt alone
@@ -23,5 +31,8 @@ func prepareProcessTree(cmd *exec.Cmd) {
 // killProcessTree terminates pid and every descendant (taskkill /T /F), for a
 // node quarantine of an attempt that cannot checkpoint.
 func killProcessTree(pid int) error {
-	return exec.Command("taskkill", "/T", "/F", "/PID", strconv.Itoa(pid)).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), taskkillTimeout)
+	defer cancel()
+	_, err := extcmd.Output(ctx, "taskkill", "/T", "/F", "/PID", strconv.Itoa(pid))
+	return err
 }

@@ -6,11 +6,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
-	"strings"
+	"time"
 
 	"golang.org/x/sys/windows"
+
+	"kairo/internal/extcmd"
 )
+
+// wslLivenessTimeout bounds each wsl.exe run of the liveness check, so a WSL
+// that stopped answering makes the identity unknown instead of blocking.
+const wslLivenessTimeout = 15 * time.Second
 
 func ForPID(pid int) (string, error) {
 	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
@@ -46,16 +51,13 @@ func HostProcessLiveness(pid int, expected string) (Liveness, error) {
 // preserve a quoted shell program across the Windows/Linux command boundary.
 func WSLProcessLiveness(ctx context.Context, distro string, pid int, expected string) (Liveness, error) {
 	path := fmt.Sprintf("/proc/%d/stat", pid)
-	out, err := exec.CommandContext(ctx, "wsl.exe", wslArgs(distro, "cat", path)...).CombinedOutput()
+	out, err := wslRun(ctx, distro, "cat", path)
 	if err != nil {
-		absentOut, absentErr := exec.CommandContext(ctx, "wsl.exe", wslArgs(distro, "test", "!", "-e", path)...).CombinedOutput()
+		_, absentErr := wslRun(ctx, distro, "test", "!", "-e", path)
 		if absentErr == nil {
 			return LivenessAbsent, nil
 		}
-		return LivenessUnknown, fmt.Errorf(
-			"query WSL process identity: %w: %s (absence check: %v: %s)",
-			err, strings.TrimSpace(string(out)), absentErr, strings.TrimSpace(string(absentOut)),
-		)
+		return LivenessUnknown, fmt.Errorf("query WSL process identity: %w (absence check: %v)", err, absentErr)
 	}
 	actual, err := LinuxIdentityFromStat(pid, string(out))
 	if err != nil {
@@ -65,6 +67,13 @@ func WSLProcessLiveness(ctx context.Context, distro string, pid int, expected st
 		return LivenessAlive, nil
 	}
 	return LivenessAbsent, nil
+}
+
+// wslRun runs one command in the distro under wslLivenessTimeout.
+func wslRun(ctx context.Context, distro string, command ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, wslLivenessTimeout)
+	defer cancel()
+	return extcmd.Output(ctx, "wsl.exe", wslArgs(distro, command...)...)
 }
 
 func wslArgs(distro string, command ...string) []string {

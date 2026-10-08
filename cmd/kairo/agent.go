@@ -42,6 +42,8 @@ func agentCommand(args []string) error {
 		return err
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	// The external-command helper (internal/extcmd) logs through the default.
+	slog.SetDefault(logger)
 	var caPEM []byte
 	apiCA := ""
 	if cfg.CAFile != "" {

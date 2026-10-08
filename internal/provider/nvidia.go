@@ -7,30 +7,53 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
 
+	"kairo/internal/extcmd"
 	"kairo/internal/processidentity"
 	"kairo/internal/store"
 )
+
+// nvidiaSMITimeout bounds each nvidia-smi run. A run that never returns (a
+// pmon whose driver stopped answering) fails the observation instead of
+// holding the executor's tick.
+const nvidiaSMITimeout = 20 * time.Second
 
 type NVIDIA struct {
 	ProviderID      string
 	NodeID          string
 	TTL             time.Duration
+	Timeout         time.Duration
 	Command         func(context.Context, ...string) ([]byte, error)
 	ProcessIdentity func(int) (string, error)
 }
 
 func (p *NVIDIA) ID() string { return p.ProviderID }
+
+// run runs nvidia-smi with args under the provider's timeout. A run that does
+// not finish in time fails with an error wrapping context.DeadlineExceeded.
 func (p *NVIDIA) run(ctx context.Context, args ...string) ([]byte, error) {
-	if p.Command != nil {
-		return p.Command(ctx, args...)
+	timeout := p.Timeout
+	if timeout == 0 {
+		timeout = nvidiaSMITimeout
 	}
-	return exec.CommandContext(ctx, "nvidia-smi", args...).Output()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	var body []byte
+	var err error
+	if p.Command != nil {
+		body, err = p.Command(ctx, args...)
+	} else {
+		body, err = extcmd.Output(ctx, "nvidia-smi", args...)
+	}
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("did not finish within %s: %w", timeout, ctx.Err())
+	}
+	return body, err
 }
+
 func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 	body, err := p.run(ctx, "--query-gpu=uuid,index,memory.total,memory.free,utilization.gpu,temperature.gpu", "--format=csv,noheader,nounits")
 	if err != nil {
@@ -80,6 +103,11 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 	// pmon exposes the C/G process type. query-compute-apps on WDDM drivers may
 	// include ordinary desktop graphics clients, which must not claim a GPU.
 	processes, processErr := p.run(ctx, "pmon", "-c", "1", "-s", "m")
+	if errors.Is(processErr, context.DeadlineExceeded) {
+		// Without the process list the GPUs' claims are unknown: fail the
+		// observation rather than record them as unclaimed.
+		return Snapshot{}, fmt.Errorf("nvidia-smi pmon: %w", processErr)
+	}
 	seenProcess := map[string]bool{}
 	if processErr == nil {
 		for _, line := range strings.Split(string(processes), "\n") {

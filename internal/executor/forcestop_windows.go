@@ -16,6 +16,7 @@ import (
 
 	"golang.org/x/sys/windows"
 
+	"kairo/internal/extcmd"
 	"kairo/internal/processidentity"
 )
 
@@ -159,7 +160,7 @@ func wslAttemptProcesses(ctx context.Context, distro, attemptID, signal string) 
 		args = append(args, "-d", distro)
 	}
 	args = append(args, "--exec", "sh", "-c", wslAttemptScript, "kairo-force-stop", attemptID, signal)
-	out, err := exec.CommandContext(ctx, "wsl.exe", args...).Output()
+	out, err := extcmd.Output(ctx, "wsl.exe", args...)
 	if err != nil {
 		return nil, fmt.Errorf("find attempt processes in WSL: %w", err)
 	}

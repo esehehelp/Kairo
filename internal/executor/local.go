@@ -33,6 +33,11 @@ type Local struct {
 	Attributes          map[string]string
 	ObserveOnly         bool
 	ObservationInterval time.Duration
+	// ProviderCallTimeout bounds each provider call made on the tick (zero:
+	// defaultProviderCallTimeout). StallThreshold is how long a step of the tick
+	// may run before it is reported (zero: defaultStallThreshold).
+	ProviderCallTimeout time.Duration
+	StallThreshold      time.Duration
 	Providers           map[string]provider.Provider
 	lastObservation     time.Time
 
@@ -48,6 +53,12 @@ type Local struct {
 	forceChecked       map[string]time.Time
 	forceKilled        map[string]bool
 	forceOrdersFailing bool
+
+	// The step the tick is in and when it started; stepStalled is set once
+	// watchSteps has reported it (see beginStep).
+	step        string
+	stepStart   time.Time
+	stepStalled bool
 }
 
 type pendingGangRank struct {
@@ -69,6 +80,7 @@ func (e *Local) Run(ctx context.Context) error {
 	if err := os.MkdirAll(e.LogDir, 0o755); err != nil {
 		return err
 	}
+	go e.watchSteps(ctx)
 	ticker := time.NewTicker(e.Interval)
 	defer ticker.Stop()
 	for {
@@ -91,12 +103,16 @@ func (e *Local) tick(ctx context.Context) error {
 	}
 	if time.Since(e.lastObservation) >= e.ObservationInterval {
 		for providerID, p := range e.Providers {
-			snap, err := p.Observe(ctx)
+			e.beginStep("observe:" + providerID)
+			snap, err := providerCall(ctx, e, providerID, p.Observe)
 			if err != nil {
+				e.endStep()
 				e.Logger.Warn("provider observation failed", "provider_id", providerID, "error", err)
 				continue
 			}
-			if err = e.Store.ApplyObservationBatch(ctx, providerID, snap.Resources, snap.Observations, snap.Claims); err != nil {
+			err = e.Store.ApplyObservationBatch(ctx, providerID, snap.Resources, snap.Observations, snap.Claims)
+			e.endStep()
+			if err != nil {
 				return err
 			}
 		}
@@ -105,90 +121,249 @@ func (e *Local) tick(ctx context.Context) error {
 	if e.ObserveOnly {
 		return nil
 	}
-	if err := e.reconcileQuiescence(ctx); err != nil {
+	if err := e.inStep("quiescence", func() error { return e.reconcileQuiescence(ctx) }); err != nil {
 		return err
 	}
-	if err := e.carryOutQuarantineTerminations(ctx); err != nil {
+	if err := e.inStep("quarantine", func() error { return e.carryOutQuarantineTerminations(ctx) }); err != nil {
 		return err
 	}
+	e.beginStep("force-stops")
 	e.carryOutForceStops(ctx)
-	if err := e.retryPendingGangRanks(ctx); err != nil {
+	e.endStep()
+	if err := e.inStep("gang-retry", func() error { return e.retryPendingGangRanks(ctx) }); err != nil {
 		return err
 	}
 	for {
-		reservation, err := e.Store.ReserveNext(ctx, e.ID)
-		if err != nil {
+		reservation, err := e.reserveNext(ctx)
+		if err != nil || reservation == nil {
 			return err
 		}
-		if reservation == nil {
-			commands, preemptErr := e.Store.EnsurePriorityPreemption(ctx, e.ID)
-			if preemptErr != nil {
-				return preemptErr
-			}
-			if len(commands) != 0 {
-				e.Logger.Info("requested cooperative priority preemption", "commands", commands)
-			}
-			return nil
+		again, err := e.prepareReservation(ctx, reservation)
+		if err != nil || !again {
+			return err
 		}
-		prepared := make([]store.ResourceInstance, 0, len(reservation.Resources))
-		prepareErr := error(nil)
-		refreshed := map[string]bool{}
-		for _, resource := range reservation.Resources {
-			p := e.Providers[resource.ProviderID]
-			if p == nil {
-				prepareErr = fmt.Errorf("provider %s is unavailable", resource.ProviderID)
-				break
-			}
-			if !refreshed[resource.ProviderID] {
-				snap, err := p.Observe(ctx)
-				if err != nil {
-					prepareErr = err
-					break
-				}
-				if err = e.Store.ApplyObservationBatch(ctx, resource.ProviderID, snap.Resources, snap.Observations, snap.Claims); err != nil {
-					prepareErr = err
-					break
-				}
-				refreshed[resource.ProviderID] = true
-			}
-			// Release must be safe even when Prepare returns after a partial
-			// provider-side change, so include the resource before invoking it.
-			prepared = append(prepared, resource)
-			if err := p.Prepare(ctx, resource); err != nil {
+	}
+}
+
+// reserveNext returns this executor's next reservation, or nil when it has
+// none (after requesting any priority preemption that it needs).
+func (e *Local) reserveNext(ctx context.Context) (*store.Reservation, error) {
+	e.beginStep("reserve-next")
+	defer e.endStep()
+	reservation, err := e.Store.ReserveNext(ctx, e.ID)
+	if err != nil || reservation != nil {
+		return reservation, err
+	}
+	commands, err := e.Store.EnsurePriorityPreemption(ctx, e.ID)
+	if err != nil {
+		return nil, err
+	}
+	if len(commands) != 0 {
+		e.Logger.Info("requested cooperative priority preemption", "commands", commands)
+	}
+	return nil, nil
+}
+
+// prepareReservation prepares a reservation's resources, marks its lease
+// prepared and launches it once the launch barrier allows. It reports whether
+// the tick goes on reserving; false ends the tick.
+func (e *Local) prepareReservation(ctx context.Context, reservation *store.Reservation) (bool, error) {
+	e.beginStep("prepare")
+	defer e.endStep()
+	prepared := make([]store.ResourceInstance, 0, len(reservation.Resources))
+	prepareErr := error(nil)
+	refreshed := map[string]bool{}
+	for _, resource := range reservation.Resources {
+		p := e.Providers[resource.ProviderID]
+		if p == nil {
+			prepareErr = fmt.Errorf("provider %s is unavailable", resource.ProviderID)
+			break
+		}
+		if !refreshed[resource.ProviderID] {
+			snap, err := providerCall(ctx, e, resource.ProviderID, p.Observe)
+			if err != nil {
 				prepareErr = err
 				break
 			}
-		}
-		if prepareErr == nil {
-			prepareErr = e.Store.ValidateReservation(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch)
-		}
-		if prepareErr != nil {
-			if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, prepareErr.Error()); cleanupErr != nil {
-				e.Logger.Error("reservation cleanup failed", "lease_id", reservation.Lease.ID, "error", cleanupErr)
+			if err = e.Store.ApplyObservationBatch(ctx, resource.ProviderID, snap.Resources, snap.Observations, snap.Claims); err != nil {
+				prepareErr = err
+				break
 			}
-			e.Logger.Warn("lease prepare failed", "lease_id", reservation.Lease.ID, "error", prepareErr)
-			return nil
+			refreshed[resource.ProviderID] = true
 		}
-		if err := e.Store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
-			if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, err.Error()); cleanupErr != nil {
-				return fmt.Errorf("mark lease prepared: %v; cleanup: %w", err, cleanupErr)
-			}
-			return nil
+		// Release must be safe even when Prepare returns after a partial
+		// provider-side change, so include the resource before invoking it.
+		prepared = append(prepared, resource)
+		if err := providerAction(ctx, e, resource.ProviderID, func(ctx context.Context) error { return p.Prepare(ctx, resource) }); err != nil {
+			prepareErr = err
+			break
 		}
-		launch, err := e.Store.AuthorizeLaunch(ctx, reservation)
-		if errors.Is(err, store.ErrGangNotReady) {
-			// Hold the prepared rank at the barrier until every rank is prepared.
-			e.holdGangRank(reservation, prepared)
-			continue
-		}
-		if err != nil {
-			if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, err.Error()); cleanupErr != nil {
-				return fmt.Errorf("authorize launch: %v; cleanup: %w", err, cleanupErr)
-			}
-			return nil
-		}
-		e.launchAuthorized(launch)
 	}
+	if prepareErr == nil {
+		prepareErr = e.Store.ValidateReservation(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch)
+	}
+	if prepareErr != nil {
+		if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, prepareErr.Error()); cleanupErr != nil {
+			e.Logger.Error("reservation cleanup failed", "lease_id", reservation.Lease.ID, "error", cleanupErr)
+		}
+		e.Logger.Warn("lease prepare failed", "lease_id", reservation.Lease.ID, "error", prepareErr)
+		return false, nil
+	}
+	if err := e.Store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, err.Error()); cleanupErr != nil {
+			return false, fmt.Errorf("mark lease prepared: %v; cleanup: %w", err, cleanupErr)
+		}
+		return false, nil
+	}
+	launch, err := e.Store.AuthorizeLaunch(ctx, reservation)
+	if errors.Is(err, store.ErrGangNotReady) {
+		// Hold the prepared rank at the barrier until every rank is prepared.
+		e.holdGangRank(reservation, prepared)
+		return true, nil
+	}
+	if err != nil {
+		if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, err.Error()); cleanupErr != nil {
+			return false, fmt.Errorf("authorize launch: %v; cleanup: %w", err, cleanupErr)
+		}
+		return false, nil
+	}
+	e.launchAuthorized(launch)
+	return true, nil
+}
+
+// defaultStallThreshold is how long a step of the tick may run before
+// watchSteps reports it.
+const defaultStallThreshold = 30 * time.Second
+
+// defaultProviderCallTimeout bounds one provider call made on the tick. It is
+// longer than the two nvidia-smi runs of an NVIDIA observation (each has its
+// own, shorter, timeout), so a hung run fails that observation naming the
+// command instead of being cut short here.
+const defaultProviderCallTimeout = 45 * time.Second
+
+// beginStep records that the tick is in step now.
+func (e *Local) beginStep(step string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.step, e.stepStart, e.stepStalled = step, time.Now(), false
+}
+
+// endStep ends the current step. A step that watchSteps reported as stalled is
+// reported as resumed.
+func (e *Local) endStep() {
+	e.mu.Lock()
+	step, age, stalled := e.step, time.Since(e.stepStart), e.stepStalled
+	e.step, e.stepStalled = "", false
+	e.mu.Unlock()
+	if stalled {
+		e.Logger.Info("executor step resumed", "executor_id", e.ID, "step", step, "age_seconds", age.Seconds())
+	}
+}
+
+// inStep runs fn as the named step of the tick.
+func (e *Local) inStep(step string, fn func() error) error {
+	e.beginStep(step)
+	defer e.endStep()
+	return fn()
+}
+
+// watchSteps runs beside the tick and reports a step that has run for
+// StallThreshold. The tick cannot report it itself: it is blocked inside the
+// step.
+func (e *Local) watchSteps(ctx context.Context) {
+	threshold := e.StallThreshold
+	if threshold == 0 {
+		threshold = defaultStallThreshold
+	}
+	ticker := time.NewTicker(max(min(time.Second, threshold/4), time.Millisecond))
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		e.mu.Lock()
+		step, age := e.step, time.Since(e.stepStart)
+		stalled := step != "" && !e.stepStalled && age >= threshold
+		if stalled {
+			e.stepStalled = true
+		}
+		e.mu.Unlock()
+		if stalled {
+			e.Logger.Warn("executor step stalled", "executor_id", e.ID, "step", step, "age_seconds", age.Seconds())
+		}
+	}
+}
+
+// abandonedMu guards abandonedCalls: per provider, the call that was given up
+// on (its wait timed out) and has not returned yet. It is process-wide because
+// the executors of one daemon share their providers: while such a call is
+// still running (some, such as GetDiskFreeSpaceEx, cannot be cancelled and may
+// never return), no executor starts another on that provider. Calls that run
+// normally are not tracked and may overlap, as the executors' ticks do.
+var (
+	abandonedMu    sync.Mutex
+	abandonedCalls = map[string]*int{}
+)
+
+// providerCall runs one call of a provider (Observe, Prepare or Release) on its
+// own goroutine and waits for it at most ProviderCallTimeout. A call that has
+// not returned by then is abandoned: the tick treats it as failed and goes on,
+// and further calls on that provider fail at once until it returns.
+func providerCall[T any](ctx context.Context, e *Local, providerID string, call func(context.Context) (T, error)) (T, error) {
+	var zero T
+	timeout := e.ProviderCallTimeout
+	if timeout == 0 {
+		timeout = defaultProviderCallTimeout
+	}
+	abandonedMu.Lock()
+	stuck := abandonedCalls[providerID] != nil
+	abandonedMu.Unlock()
+	if stuck {
+		return zero, fmt.Errorf("provider %s: an earlier call timed out and has not returned", providerID)
+	}
+	callCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	type result struct {
+		value T
+		err   error
+	}
+	token := new(int) // this call, if it is abandoned
+	done := make(chan result, 1)
+	go func() {
+		value, err := call(callCtx)
+		// Under the lock, so that the waiter either sees the result or has
+		// already marked the call abandoned (and the mark is cleared here).
+		abandonedMu.Lock()
+		if abandonedCalls[providerID] == token {
+			delete(abandonedCalls, providerID)
+		}
+		done <- result{value, err}
+		abandonedMu.Unlock()
+	}()
+	select {
+	case r := <-done:
+		return r.value, r.err
+	case <-callCtx.Done():
+		abandonedMu.Lock()
+		defer abandonedMu.Unlock()
+		select {
+		case r := <-done: // it returned just now
+			return r.value, r.err
+		default:
+		}
+		abandonedCalls[providerID] = token
+		return zero, fmt.Errorf("provider %s: call did not return: %w", providerID, callCtx.Err())
+	}
+}
+
+// providerAction runs a provider's Prepare or Release through providerCall.
+func providerAction(ctx context.Context, e *Local, providerID string, action func(context.Context) error) error {
+	_, err := providerCall(ctx, e, providerID, func(ctx context.Context) (struct{}, error) {
+		return struct{}{}, action(ctx)
+	})
+	return err
 }
 
 func (e *Local) launchAuthorized(launch *store.Launch) {
@@ -270,13 +445,13 @@ func (e *Local) cleanupReservation(ctx context.Context, lease store.Lease, resou
 		if p == nil {
 			return fmt.Errorf("provider %s is unavailable during reservation cleanup", resource.ProviderID)
 		}
-		if err := p.Release(ctx, resource); err != nil {
+		if err := providerAction(ctx, e, resource.ProviderID, func(ctx context.Context) error { return p.Release(ctx, resource) }); err != nil {
 			return fmt.Errorf("release resource %s: %w", resource.ID, err)
 		}
 		providers[resource.ProviderID] = p
 	}
 	for providerID, p := range providers {
-		snapshot, err := p.Observe(ctx)
+		snapshot, err := providerCall(ctx, e, providerID, p.Observe)
 		if err != nil {
 			return fmt.Errorf("observe provider %s after reservation cleanup: %w", providerID, err)
 		}
@@ -324,14 +499,14 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 			if p == nil {
 				return fmt.Errorf("provider %s is unavailable during release", resource.ProviderID)
 			}
-			if err := p.Release(ctx, resource); err != nil {
+			if err := providerAction(ctx, e, resource.ProviderID, func(ctx context.Context) error { return p.Release(ctx, resource) }); err != nil {
 				return fmt.Errorf("release resource %s: %w", resource.ID, err)
 			}
 			refreshed[resource.ProviderID] = false
 		}
 		for providerID := range refreshed {
 			p := e.Providers[providerID]
-			snapshot, observeErr := p.Observe(ctx)
+			snapshot, observeErr := providerCall(ctx, e, providerID, p.Observe)
 			if observeErr != nil {
 				return fmt.Errorf("observe provider %s after release: %w", providerID, observeErr)
 			}

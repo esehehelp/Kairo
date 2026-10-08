@@ -252,6 +252,19 @@ registered process is absent and provider observations taken after that
 absence show resources unclaimed. An expired or executor-lost lease becomes
 stale; it is never made free based on time alone.
 
+### Executor ticks
+
+An executor's tick is bounded in time. Every external call on it has a
+deadline: each `nvidia-smi` run 20 s (a `pmon` that does not return fails that
+GPU observation), each `wsl.exe` liveness run 15 s, each `taskkill` 30 s, and
+each provider call (observe, prepare, release) 45 s. A call that cannot be
+cancelled is abandoned at its deadline, and no further call on that provider
+starts until it returns. A step of the tick that runs for 30 s is logged at
+WARN as `executor step stalled` (with `executor_id`, `step` and
+`age_seconds`), and its end at INFO as `executor step resumed`. External
+commands that take longer than 2 s are logged at INFO with their duration; a
+timeout is logged at WARN with the command.
+
 ### Node quarantine
 
 `kairo node quarantine --reason ... <NODE_ID>` (or `--all`) stops all work on a
@@ -321,7 +334,9 @@ executor = { labels = { environment = "linux" } }
   one transaction. Rank 0's node needs an `interconnect_addr` label.
 - No rank launches before every rank is prepared. A placement not prepared
   within two minutes, or losing a lease before launch, is aborted and the ranks
-  wait again.
+  wait again. The abort reason (kept on the placement and logged) names each
+  rank's executor, whether that executor received the rank's lease, and the
+  executor's `last_seen_at`.
 - Every rank is launched with `RANK`, `WORLD_SIZE`, `MASTER_ADDR` (rank 0's
   `interconnect_addr`), `MASTER_PORT` (29500-29999, free on that node) and
   `KAIRO_GANG_*`; an executor labelled `interconnect_ifname` also sets

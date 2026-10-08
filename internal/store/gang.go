@@ -29,7 +29,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
+	"strings"
 	"time"
 
 	"kairo/internal/id"
@@ -455,6 +457,7 @@ func (s *Store) abortStalePlacements(ctx context.Context) error {
 		id, reason string
 	}
 	var aborts []pending
+	var unprepared []string
 	for rows.Next() {
 		var placementID, created string
 		var lost int
@@ -467,49 +470,96 @@ func (s *Store) abortStalePlacements(ctx context.Context) error {
 		case lost != 0:
 			aborts = append(aborts, pending{placementID, "a rank lost its lease before launch"})
 		case time.Since(createdAt) > GangPrepareTimeout:
-			aborts = append(aborts, pending{placementID, fmt.Sprintf("not every rank was prepared within %s", GangPrepareTimeout)})
+			unprepared = append(unprepared, placementID)
 		}
 	}
 	if err = rows.Close(); err != nil {
 		return err
 	}
-	for _, a := range aborts {
-		if err := s.abortPlacement(ctx, a.id, a.reason); err != nil {
+	for _, placementID := range unprepared {
+		ranks, err := s.gangRankDetail(ctx, placementID)
+		if err != nil {
 			return err
+		}
+		aborts = append(aborts, pending{placementID, fmt.Sprintf("not every rank was prepared within %s: %s", GangPrepareTimeout, ranks)})
+	}
+	for _, a := range aborts {
+		aborted, err := s.abortPlacement(ctx, a.id, a.reason)
+		if err != nil {
+			return err
+		}
+		if aborted {
+			slog.Default().Warn("gang placement aborted", "placement_id", a.id, "reason", a.reason)
 		}
 	}
 	return nil
 }
 
+// gangRankDetail says where each rank of a placement waits: its executor,
+// whether that executor received the rank's lease, and when the executor last
+// polled. It is what shows why a rank was never prepared.
+func (s *Store) gangRankDetail(ctx context.Context, placementID string) (string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT gpl.rank,gpl.executor_id,l.state,gpl.delivered_at IS NOT NULL,x.last_seen_at
+		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id LEFT JOIN executors x ON x.id=gpl.executor_id
+		WHERE gpl.placement_id=? ORDER BY gpl.rank`, placementID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var ranks []string
+	for rows.Next() {
+		var rank int
+		var executorID, leaseState string
+		var delivered bool
+		var lastSeen sql.NullString
+		if err = rows.Scan(&rank, &executorID, &leaseState, &delivered, &lastSeen); err != nil {
+			return "", err
+		}
+		seen := "none"
+		if lastSeen.Valid {
+			seen = lastSeen.String
+		}
+		ranks = append(ranks, fmt.Sprintf("rank %d on executor %s: lease %s, delivered=%t, executor last_seen_at=%s", rank, executorID, leaseState, delivered, seen))
+	}
+	if err = rows.Err(); err != nil {
+		return "", err
+	}
+	return strings.Join(ranks, "; "), nil
+}
+
 // abortPlacement gives a placement up. Leases no executor has received yet are
 // released here (nothing was prepared for them); a received lease is released
-// by its executor, which learns of the abort from AuthorizeLaunch.
-func (s *Store) abortPlacement(ctx context.Context, placementID, reason string) error {
+// by its executor, which learns of the abort from AuthorizeLaunch. It reports
+// whether the placement was still placed, and so was aborted now.
+func (s *Store) abortPlacement(ctx context.Context, placementID, reason string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer tx.Rollback()
 	stamp := now()
 	res, err := tx.ExecContext(ctx, `UPDATE gang_placements SET state='aborted',abort_reason=?,updated_at=? WHERE id=? AND state='placed'`, reason, stamp, placementID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
-		return tx.Commit()
+		return false, tx.Commit()
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=? WHERE state IN('reserved','revocation_requested') AND id IN(
 		SELECT lease_id FROM gang_placement_leases WHERE placement_id=? AND delivered_at IS NULL)`, stamp, placementID); err != nil {
-		return err
+		return false, err
 	}
 	var gangID, projectID string
 	if err = tx.QueryRowContext(ctx, `SELECT gp.gang_id,e.project_scope_id FROM gang_placements gp JOIN execution_gangs g ON g.id=gp.gang_id JOIN execution_requests e ON e.id=g.leader_execution_id WHERE gp.id=?`, placementID).Scan(&gangID, &projectID); err != nil {
-		return err
+		return false, err
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "gang_placement_aborted", &projectID, "gang", gangID, nil, map[string]any{"placement_id": placementID, "reason": reason}); err != nil {
-		return err
+		return false, err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 type gangRankState struct {
