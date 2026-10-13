@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -149,13 +150,13 @@ func (f *contractAPI) project(r *http.Request) map[string]any {
 		state, _ := task["state"].(string)
 		counts[state]++
 		name, _ := task["name"].(string)
-		if names := q["task"]; len(names) > 0 && !contains(names, name) {
+		if names := q["task"]; len(names) > 0 && !slices.Contains(names, name) {
 			continue
 		}
 		if m := q.Get("match"); m != "" && !strings.HasPrefix(name, m) {
 			continue
 		}
-		if len(states) > 0 && !contains(states, state) {
+		if len(states) > 0 && !slices.Contains(states, state) {
 			continue
 		}
 		if q.Get("live") == "1" && !liveState(state) {
@@ -179,24 +180,33 @@ func (f *contractAPI) serveLog(w http.ResponseWriter, r *http.Request, attempt s
 		notFoundJSON(w, "attempt has no "+stream+" log")
 		return
 	}
+	serveLogBytes(w, r, data)
+}
+
+// serveLogBytes answers GET /api/attempts/{id}/log from data as the daemon
+// does: ?tail=N, or ?offset= and ?limit=; the headers Kairo-Log-Size and
+// Kairo-Log-Next-Offset.
+func serveLogBytes(w http.ResponseWriter, r *http.Request, data []byte) {
+	q := r.URL.Query()
 	size := int64(len(data))
-	var offset int64
-	end := size
-	if tail := r.URL.Query().Get("tail"); tail != "" {
-		n, _ := strconv.ParseInt(tail, 10, 64)
-		offset = max(0, size-n)
-	} else {
-		offset, _ = strconv.ParseInt(r.URL.Query().Get("offset"), 10, 64)
-		offset = min(offset, size)
-		if limit := r.URL.Query().Get("limit"); limit != "" {
-			n, _ := strconv.ParseInt(limit, 10, 64)
-			end = min(size, offset+n)
-		}
+	offset, _ := strconv.ParseInt(q.Get("offset"), 10, 64)
+	limit := int64(1 << 20)
+	if q.Has("limit") {
+		limit, _ = strconv.ParseInt(q.Get("limit"), 10, 64)
 	}
-	w.Header().Set("Content-Type", "text/plain")
-	w.Header().Set("X-Kairo-Log-Size", strconv.FormatInt(size, 10))
-	w.Header().Set("X-Kairo-Log-Offset", strconv.FormatInt(offset, 10))
-	_, _ = w.Write(data[offset:end])
+	if q.Has("tail") {
+		tail, _ := strconv.ParseInt(q.Get("tail"), 10, 64)
+		limit = min(tail, maxLogChunk)
+		offset = max(size-limit, 0)
+	}
+	var body []byte
+	if n := max(min(limit, size-offset), 0); n > 0 {
+		body = data[offset : offset+n]
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Kairo-Log-Size", strconv.FormatInt(size, 10))
+	w.Header().Set("Kairo-Log-Next-Offset", strconv.FormatInt(offset+int64(len(body)), 10))
+	_, _ = w.Write(body)
 }
 
 // fakeClock replaces the polling clock: every sleep advances the time and

@@ -6,11 +6,6 @@ import (
 	"os"
 )
 
-// dbCommand maintains the daemon's database directly (like kairo token).
-func dbCommand(args []string) error {
-	return dispatch(findGroup("db"), args, map[string]func([]string) error{"compact": dbCompact})
-}
-
 func dbCompact(args []string) error {
 	fs := newFlags("db compact")
 	configPath := fs.String("config", "", "daemon configuration (its database_path)")

@@ -178,7 +178,7 @@ func TestTokenCreateValidation(t *testing.T) {
 		{"revoke", "--db", db},
 		{"rotate", "--db", db},
 	} {
-		if _, err := captureStdout(t, func() error { return tokenCommand(args) }); err == nil {
+		if _, err := captureStdout(t, func() error { return run(append([]string{"token"}, args...)) }); err == nil {
 			t.Fatalf("token %v was accepted", args)
 		}
 	}
@@ -186,7 +186,7 @@ func TestTokenCreateValidation(t *testing.T) {
 		t.Fatal("token create created a database")
 	}
 	out, err := captureStdout(t, func() error {
-		return tokenCommand([]string{"create", "--db", db, "--name", "agent", "--role", "node", "--node", "pve0"})
+		return run([]string{"token", "create", "--db", db, "--name", "agent", "--role", "node", "--node", "pve0"})
 	})
 	if err != nil || !strings.HasPrefix(strings.TrimSpace(out), "kairo_node_") {
 		t.Fatalf("node token: %v %q", err, out)

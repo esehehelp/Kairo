@@ -99,7 +99,7 @@ func projectApply(args []string) error {
 		SpecDigest string          `json:"spec_digest"`
 		Idempotent bool            `json:"idempotent"`
 		Created    *[]string       `json:"created"`
-		Unchanged  *int            `json:"unchanged"`
+		Unchanged  int             `json:"unchanged"`
 	}
 	if err := json.Unmarshal(payload, &applied); err != nil {
 		return fmt.Errorf("decode apply response: %w", err)
@@ -117,14 +117,10 @@ func projectApply(args []string) error {
 		} else {
 			fmt.Printf("applied %s: %d tasks in the spec, digest %s\n", name, len(validated.Manifest.Tasks), shortDigest(applied.SpecDigest))
 		}
-	case len(*applied.Created) == 0 && (applied.Idempotent || applied.Unchanged == nil || *applied.Unchanged == len(validated.Manifest.Tasks)):
+	case len(*applied.Created) == 0 && (applied.Idempotent || applied.Unchanged == len(validated.Manifest.Tasks)):
 		fmt.Printf("applied %s: no changes (idempotent)\n", name)
 	default:
-		unchanged := len(validated.Manifest.Tasks) - len(*applied.Created)
-		if applied.Unchanged != nil {
-			unchanged = *applied.Unchanged
-		}
-		fmt.Printf("applied %s: %d new task(s), %d unchanged\n", name, len(*applied.Created), unchanged)
+		fmt.Printf("applied %s: %d new task(s), %d unchanged\n", name, len(*applied.Created), applied.Unchanged)
 		for _, task := range *applied.Created {
 			fmt.Printf("  + %s\n", task)
 		}

@@ -247,9 +247,9 @@ func (c *apiClient) send(method, path string, body any) (int, http.Header, []byt
 	return resp.StatusCode, resp.Header, payload, nil
 }
 
-// getJSON decodes the body of a 2xx GET response into target.
-func (c *apiClient) getJSON(path string, target any) error {
-	payload, err := c.call(http.MethodGet, path, nil)
+// callJSON is call that decodes the body of the 2xx response into target.
+func (c *apiClient) callJSON(method, path string, body, target any) error {
+	payload, err := c.call(method, path, body)
 	if err != nil {
 		return err
 	}
@@ -285,9 +285,6 @@ func (c *apiClient) print(method, path string, body any) error {
 // apiError is a non-2xx response.
 type apiError struct {
 	Status int
-	Code   string // the server's error code ("" when the body was not a Kairo error)
-	// Message is the server's error message (or the start of the body).
-	Message string
 	// RouteMissing: the daemon's mux, not a handler, answered: the daemon does
 	// not know the route, so it is likely older than this CLI.
 	RouteMissing bool
@@ -326,7 +323,7 @@ func httpError(status int, payload []byte) error {
 		if code == "" {
 			code = strings.ToLower(http.StatusText(status))
 		}
-		return &apiError{Status: status, Code: wire.Code, Message: wire.Error, text: fmt.Sprintf("HTTP %d %s: %s", status, code, wire.Error)}
+		return &apiError{Status: status, text: fmt.Sprintf("HTTP %d %s: %s", status, code, wire.Error)}
 	}
 	text := strings.TrimSpace(string(payload))
 	if len(text) > 200 {
@@ -343,5 +340,5 @@ func httpError(status int, payload []byte) error {
 	if missing {
 		message += "; " + olderDaemonHint()
 	}
-	return &apiError{Status: status, Message: text, RouteMissing: missing, text: message}
+	return &apiError{Status: status, RouteMissing: missing, text: message}
 }

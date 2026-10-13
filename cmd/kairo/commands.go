@@ -15,16 +15,6 @@ import (
 	"kairo/internal/id"
 )
 
-func executionCommand(args []string) error {
-	return dispatch(findGroup("execution"), args, map[string]func([]string) error{
-		"submit":   executionSubmit,
-		"list":     executionList,
-		"show":     func(a []string) error { return executionByID("show", a) },
-		"withdraw": func(a []string) error { return executionByID("withdraw", a) },
-		"logs":     executionLogs,
-	})
-}
-
 func executionSubmit(args []string) error {
 	fs := newFlags("execution submit")
 	api := apiFlag(fs)
@@ -119,25 +109,6 @@ func submitBody(m manifest.Manifest) (map[string]any, error) {
 	return body, nil
 }
 
-func projectCommand(args []string) error {
-	return dispatch(findGroup("project"), args, map[string]func([]string) error{
-		"validate": projectValidate,
-		"apply":    projectApply,
-		"status":   projectStatusCommand,
-		"watch":    projectWatch,
-		"prune":    projectPrune,
-		"pause":    func(a []string) error { return scopeAction("project", "pause", a) },
-		"resume":   func(a []string) error { return scopeAction("project", "resume", a) },
-	})
-}
-
-func queueCommand(args []string) error {
-	return dispatch(findGroup("queue"), args, map[string]func([]string) error{
-		"pause":  func(a []string) error { return scopeAction("queue", "pause", a) },
-		"resume": func(a []string) error { return scopeAction("queue", "resume", a) },
-	})
-}
-
 // scopeAction pauses or resumes a project, a queue or a task. A task may be
 // named without its queue: it is looked up.
 func scopeAction(kind, action string, args []string) error {
@@ -208,17 +179,13 @@ func scopeAction(kind, action string, args []string) error {
 	if kind == "task" {
 		query.Set("task", ref.task)
 	}
-	payload, err := client.call(http.MethodGet, withQuery("/api/scopes", query), nil)
-	if err != nil {
-		return err
-	}
 	var listed struct {
 		Scopes []struct {
 			ID string `json:"id"`
 		} `json:"scopes"`
 	}
-	if err := json.Unmarshal(payload, &listed); err != nil {
-		return fmt.Errorf("decode scope response: %w", err)
+	if err := client.callJSON(http.MethodGet, withQuery("/api/scopes", query), nil, &listed); err != nil {
+		return err
 	}
 	if len(listed.Scopes) != 1 {
 		return fmt.Errorf("coordination scope not found or ambiguous (%d matches)", len(listed.Scopes))
@@ -235,7 +202,7 @@ func scopeAction(kind, action string, args []string) error {
 	default:
 		body = map[string]string{"actor": *actor}
 	}
-	payload, err = client.call(http.MethodPost, path, body)
+	payload, err := client.call(http.MethodPost, path, body)
 	if err != nil {
 		return err
 	}
@@ -351,16 +318,6 @@ func (r pauseOperationResponse) forceSummary() []string {
 	return lines
 }
 
-func resourceCommand(args []string) error {
-	handler := func(action string) func([]string) error {
-		return func(a []string) error { return resourceAction(action, a) }
-	}
-	return dispatch(findGroup("resource"), args, map[string]func([]string) error{
-		"status": handler("status"), "quarantine": handler("quarantine"),
-		"enable": handler("enable"), "reconcile": handler("reconcile"),
-	})
-}
-
 func resourceAction(action string, args []string) error {
 	fs := newFlags("resource " + action)
 	api := apiFlag(fs)
@@ -423,18 +380,14 @@ func doctorCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	payload, err := client.call(http.MethodGet, "/api/whoami", nil)
-	if err != nil {
-		return fmt.Errorf("%s: %w", client.baseURL, err)
-	}
 	var who struct {
 		Name    string `json:"name"`
 		Role    string `json:"role"`
 		NodeID  string `json:"node_id"`
 		Version string `json:"version"`
 	}
-	if err := json.Unmarshal(payload, &who); err != nil {
-		return fmt.Errorf("decode whoami: %w", err)
+	if err := client.callJSON(http.MethodGet, "/api/whoami", nil, &who); err != nil {
+		return fmt.Errorf("%s: %w", client.baseURL, err)
 	}
 	line := fmt.Sprintf("authenticated as %s (%s)", who.Name, who.Role)
 	if who.NodeID != "" {

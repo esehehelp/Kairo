@@ -4,14 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"kairo/internal/orchestration"
+	"kairo/internal/store"
 )
 
 // The project and task views of the API (GET /api/projects/{p} and
@@ -20,7 +23,6 @@ import (
 
 type projectStatus struct {
 	Name        string         `json:"name"`
-	SpecDigests []string       `json:"spec_digests"`
 	StateCounts map[string]int `json:"state_counts"`
 	Tasks       []taskStatus   `json:"tasks"`
 }
@@ -55,14 +57,13 @@ type taskExecution struct {
 	ExitedAt         *string         `json:"exited_at"`
 	Progress         json.RawMessage `json:"progress"`
 	// Task detail only.
-	Attempts []attemptInfo    `json:"attempts"`
-	Gang     []gangRankInfo   `json:"gang"`
-	Waiting  []map[string]any `json:"waiting"`
+	Attempts []attemptInfo        `json:"attempts"` // at most one
+	Gang     []store.TaskGangRank `json:"gang"`
+	Waiting  []map[string]any     `json:"waiting"`
 }
 
 type attemptInfo struct {
 	ID              string          `json:"id"`
-	ExecutionID     string          `json:"execution_id"`
 	State           string          `json:"state"`
 	ExecutorID      string          `json:"executor_id"`
 	NodeID          string          `json:"node_id"`
@@ -70,7 +71,6 @@ type attemptInfo struct {
 	ExitCode        *int            `json:"exit_code"`
 	ExitSignal      *string         `json:"exit_signal"`
 	Progress        json.RawMessage `json:"progress"`
-	StartedAt       *string         `json:"started_at"`
 	LastHeartbeatAt *string         `json:"last_heartbeat_at"`
 	ExitedAt        *string         `json:"exited_at"`
 	QuiescedAt      *string         `json:"quiesced_at"`
@@ -89,54 +89,12 @@ func (a attemptInfo) ended() bool {
 	return a.ExitedAt != nil || a.QuiescedAt != nil
 }
 
-// logBytes is stdout+stderr size, and whether the daemon reported either.
-func (a attemptInfo) logBytes() (int64, bool) {
-	if a.StdoutBytes == nil && a.StderrBytes == nil {
-		return 0, false
-	}
-	var n int64
-	if a.StdoutBytes != nil {
-		n += *a.StdoutBytes
-	}
-	if a.StderrBytes != nil {
-		n += *a.StderrBytes
-	}
-	return n, true
-}
-
-type gangRankInfo struct {
-	Rank        int     `json:"rank"`
-	ExecutionID string  `json:"execution_id"`
-	State       string  `json:"state"`
-	AttemptID   *string `json:"attempt_id"`
-	ExecutorID  *string `json:"executor_id"`
-	NodeID      *string `json:"node_id"`
-}
-
-type nameState struct {
-	Name  string `json:"name"`
-	State string `json:"state"`
-}
-
-type gateInfo struct {
-	Scope string `json:"scope"`
-	State string `json:"state"`
-}
-
-type taskSpec struct {
-	Name      string                  `json:"name"`
-	Queue     string                  `json:"queue"`
-	DependsOn []string                `json:"depends_on"`
-	Policy    string                  `json:"policy"`
-	Execution orchestration.Execution `json:"execution"`
-}
-
 type taskDetail struct {
 	taskStatus
-	Spec         *taskSpec   `json:"spec"`
-	Dependencies []nameState `json:"dependencies"`
-	Dependents   []nameState `json:"dependents"`
-	Gates        []gateInfo  `json:"gates"`
+	Spec         *orchestration.Task `json:"spec"`
+	Dependencies []store.TaskRef     `json:"dependencies"`
+	Dependents   []store.TaskRef     `json:"dependents"`
+	Gates        []store.TaskGate    `json:"gates"`
 }
 
 // taskResult is the part of a task's result the CLI shows.
@@ -166,16 +124,42 @@ func (t taskStatus) latest() *taskExecution {
 	return best
 }
 
-// Task states.
-func terminalState(state string) bool {
-	switch state {
-	case "succeeded", "failed", "blocked", "stopped", "cancelled":
-		return true
+// execution is the execution `--attempt which` names: the latest, or #N
+// (nil when there is none).
+func (t taskStatus) execution(which string) *taskExecution {
+	if which == "latest" {
+		return t.latest()
 	}
-	return false
+	n, err := strconv.Atoi(which)
+	if err != nil {
+		return nil
+	}
+	for i := range t.Executions {
+		if t.Executions[i].Ordinal == n {
+			return &t.Executions[i]
+		}
+	}
+	return nil
 }
 
+// attemptID is the execution's attempt, "" before it starts: an execution
+// has at most one.
+func (e *taskExecution) attemptID() string {
+	if len(e.Attempts) > 0 {
+		return e.Attempts[0].ID
+	}
+	if e.AttemptID != nil {
+		return *e.AttemptID
+	}
+	return ""
+}
+
+// liveState: a task in it can still run; terminalState: it ended.
 func liveState(state string) bool { return state == "pending" || state == "running" }
+
+func terminalState(state string) bool {
+	return !liveState(state) && slices.Contains(store.TaskStates, state)
+}
 
 // projectQuery is the filter of GET /api/projects/{p}.
 type projectQuery struct {
@@ -184,106 +168,109 @@ type projectQuery struct {
 	states []string
 	live   bool
 	since  string // RFC3339
+	// raw keeps the response as the daemon sent it (task list --json).
+	raw bool
 }
 
 func (q projectQuery) path(project string) string {
-	values := url.Values{}
-	for _, t := range q.tasks {
-		values.Add("task", t)
-	}
-	if q.match != "" {
-		values.Set("match", q.match)
-	}
-	if len(q.states) > 0 {
-		values.Set("state", strings.Join(q.states, ","))
-	}
+	values := url.Values{"task": q.tasks, "match": {q.match}, "state": {strings.Join(q.states, ",")}, "since": {q.since}}
 	if q.live {
 		values.Set("live", "1")
 	}
-	if q.since != "" {
-		values.Set("since", q.since)
-	}
-	path := "/api/projects/" + url.PathEscape(project)
-	if encoded := values.Encode(); encoded != "" {
-		path += "?" + encoded
-	}
-	return path
+	return withQuery("/api/projects/"+url.PathEscape(project), values)
 }
 
-// keep applies the filter on the client too: a daemon that predates the
-// filters returns every task.
+// keep applies the filter on the client: a daemon that predates the filters
+// returns every task.
 func (q projectQuery) keep(t taskStatus) bool {
-	if len(q.tasks) > 0 && !contains(q.tasks, t.Name) {
+	if len(q.tasks) > 0 && !slices.Contains(q.tasks, t.Name) {
 		return false
 	}
 	if q.match != "" && !strings.HasPrefix(t.Name, q.match) {
 		return false
 	}
-	if len(q.states) > 0 && !contains(q.states, t.State) {
+	if len(q.states) > 0 && !slices.Contains(q.states, t.State) {
 		return false
 	}
 	if q.live && !liveState(t.State) {
 		return false
 	}
-	if q.since != "" {
-		since, err1 := time.Parse(time.RFC3339Nano, q.since)
-		updated, err2 := time.Parse(time.RFC3339Nano, t.UpdatedAt)
-		if err1 == nil && (err2 != nil || updated.Before(since)) {
+	if since, ok := parseStamp(&q.since); ok {
+		if updated, ok := parseStamp(&t.UpdatedAt); !ok || updated.Before(since) {
 			return false
 		}
 	}
 	return true
 }
 
-func contains(list []string, value string) bool {
-	for _, v := range list {
-		if v == value {
-			return true
-		}
-	}
-	return false
-}
-
-// projectResponse is GET /api/projects/{p}: the parsed status and each task
-// as the daemon sent it (for --json).
+// projectResponse is GET /api/projects/{p}: the parsed status and, with
+// projectQuery.raw, the body and each task as the daemon sent them.
 type projectResponse struct {
 	Project  projectStatus
-	RawTasks map[string]json.RawMessage
-	raw      map[string]json.RawMessage
+	payload  []byte
+	rawTasks map[string]json.RawMessage
 }
 
 func fetchProject(client *apiClient, project string, q projectQuery) (*projectResponse, error) {
-	payload, err := client.call("GET", q.path(project), nil)
+	payload, err := client.call(http.MethodGet, q.path(project), nil)
 	if err != nil {
 		return nil, err
 	}
 	var wire struct {
-		Project json.RawMessage `json:"project"`
+		Project struct {
+			Name        string            `json:"name"`
+			StateCounts map[string]int    `json:"state_counts"`
+			Tasks       []json.RawMessage `json:"tasks"`
+		} `json:"project"`
 	}
 	if err := json.Unmarshal(payload, &wire); err != nil {
 		return nil, fmt.Errorf("decode project status: %w", err)
 	}
-	resp := &projectResponse{RawTasks: map[string]json.RawMessage{}}
-	if err := json.Unmarshal(wire.Project, &resp.Project); err != nil {
-		return nil, fmt.Errorf("decode project status: %w", err)
+	resp := &projectResponse{Project: projectStatus{Name: wire.Project.Name, StateCounts: wire.Project.StateCounts}}
+	if q.raw {
+		resp.payload, resp.rawTasks = payload, map[string]json.RawMessage{}
 	}
-	if err := json.Unmarshal(wire.Project, &resp.raw); err != nil {
-		return nil, fmt.Errorf("decode project status: %w", err)
-	}
-	var rawTasks []json.RawMessage
-	_ = json.Unmarshal(resp.raw["tasks"], &rawTasks)
-	kept := resp.Project.Tasks[:0]
-	for i, t := range resp.Project.Tasks {
-		if !q.keep(t) {
+	// A daemon that counts the states also applies the filters.
+	filtered := wire.Project.StateCounts != nil
+	for _, raw := range wire.Project.Tasks {
+		var t taskStatus
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return nil, fmt.Errorf("decode project status: %w", err)
+		}
+		if !filtered && !q.keep(t) {
 			continue
 		}
-		kept = append(kept, t)
-		if i < len(rawTasks) {
-			resp.RawTasks[t.Name] = rawTasks[i]
+		resp.Project.Tasks = append(resp.Project.Tasks, t)
+		if q.raw {
+			resp.rawTasks[t.Name] = raw
 		}
 	}
-	resp.Project.Tasks = kept
 	return resp, nil
+}
+
+// fetchLiveAndRecent is the tasks of q that are live plus those updated
+// since: two calls, made at once, merged.
+func fetchLiveAndRecent(client *apiClient, project string, q projectQuery, since time.Time) (*projectResponse, error) {
+	liveQuery, recentQuery := q, q
+	liveQuery.live = true
+	recentQuery.since = since.UTC().Format(time.RFC3339)
+	var recent *projectResponse
+	var recentErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		recent, recentErr = fetchProject(client, project, recentQuery)
+	}()
+	live, err := fetchProject(client, project, liveQuery)
+	<-done
+	if err == nil {
+		err = recentErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	live.merge(recent)
+	return live, nil
 }
 
 // merge adds the tasks of other not already in r.
@@ -295,31 +282,36 @@ func (r *projectResponse) merge(other *projectResponse) {
 	for _, t := range other.Project.Tasks {
 		if !seen[t.Name] {
 			r.Project.Tasks = append(r.Project.Tasks, t)
-			r.RawTasks[t.Name] = other.RawTasks[t.Name]
+			if r.rawTasks != nil {
+				r.rawTasks[t.Name] = other.rawTasks[t.Name]
+			}
 		}
 	}
 }
 
-// json is the response with only the kept tasks, in their current order.
+// json is the response (fetched with projectQuery.raw) with only the kept
+// tasks, in their current order.
 func (r *projectResponse) json() ([]byte, error) {
-	out := map[string]json.RawMessage{}
-	for k, v := range r.raw {
-		out[k] = v
+	var wire struct {
+		Project map[string]json.RawMessage `json:"project"`
+	}
+	if err := json.Unmarshal(r.payload, &wire); err != nil {
+		return nil, err
 	}
 	tasks := make([]json.RawMessage, 0, len(r.Project.Tasks))
 	for _, t := range r.Project.Tasks {
-		tasks = append(tasks, r.RawTasks[t.Name])
+		tasks = append(tasks, r.rawTasks[t.Name])
 	}
 	encoded, err := json.Marshal(tasks)
 	if err != nil {
 		return nil, err
 	}
-	out["tasks"] = encoded
-	return json.MarshalIndent(map[string]any{"project": out}, "", "  ")
+	wire.Project["tasks"] = encoded
+	return json.MarshalIndent(map[string]any{"project": wire.Project}, "", "  ")
 }
 
 // stateOrder is how summaries list the states.
-var stateOrder = []string{"running", "pending", "paused", "succeeded", "failed", "blocked", "stopped", "cancelled"}
+var stateOrder = []string{"running", "pending", "succeeded", "failed", "blocked", "stopped", "cancelled"}
 
 // stateSummary is "3 running, 12 pending, 2373 succeeded".
 func stateSummary(counts map[string]int) string {
@@ -386,18 +378,24 @@ func parseStamp(s *string) (time.Time, bool) {
 // clock is the HH:MM:SS of event lines.
 func clock(t time.Time) string { return t.Local().Format("15:04:05") }
 
-// shortStamp is the MM-DD HH:MM of tables, "-" when unknown.
+// shortTime is the MM-DD HH:MM of tables; shortStamp is that of a
+// timestamp, "-" when unknown.
+func shortTime(t time.Time) string { return t.Local().Format("01-02 15:04") }
+
 func shortStamp(s *string) string {
 	if t, ok := parseStamp(s); ok {
-		return t.Local().Format("01-02 15:04")
+		return shortTime(t)
 	}
 	return "-"
 }
 
-// longStamp is a full local time for task show, "-" when unknown.
+// longTime is a full local time for task show; longStamp is that of a
+// timestamp, "-" when unknown.
+func longTime(t time.Time) string { return t.Local().Format("2006-01-02 15:04:05") }
+
 func longStamp(s *string) string {
 	if t, ok := parseStamp(s); ok {
-		return t.Local().Format("2006-01-02 15:04:05")
+		return longTime(t)
 	}
 	return "-"
 }

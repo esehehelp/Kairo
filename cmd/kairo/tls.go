@@ -18,16 +18,6 @@ func (l *stringList) Set(value string) error {
 	return nil
 }
 
-// tlsCommand: kairo tls init --dir DIR --host H [--host H ...] creates a CA and
-// a server certificate; kairo tls issue --dir DIR --host H [...] re-issues the
-// server certificate from the existing CA.
-func tlsCommand(args []string) error {
-	return dispatch(findGroup("tls"), args, map[string]func([]string) error{
-		"init":  func(a []string) error { return tlsAction("init", a) },
-		"issue": func(a []string) error { return tlsAction("issue", a) },
-	})
-}
-
 func tlsAction(action string, args []string) error {
 	fs := newFlags("tls " + action)
 	dir := fs.String("dir", "", "directory holding the TLS material")

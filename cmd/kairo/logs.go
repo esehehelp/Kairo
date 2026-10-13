@@ -10,19 +10,75 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"sort"
 	"strconv"
+	"syscall"
 	"time"
+
+	"kairo/internal/store"
 )
 
-// Attempt logs over GET /api/attempts/{id}/log: kairo task logs and
-// kairo execution logs.
+// Attempt logs over GET /api/attempts/{id}/log: kairo logs ATTEMPT_ID reads
+// one attempt's log by bytes; kairo task logs and kairo execution logs find
+// the attempt and read by lines.
 
 const (
 	maxLogChunk = 8 << 20 // the daemon's limit per call
 	// logPollInterval is how often -f asks for new bytes.
 	logPollInterval = 2 * time.Second
 )
+
+// newInterruptibleClient is newAPIClient for the polling commands: Ctrl+C or
+// SIGTERM cancels the returned context and the client's requests.
+func newInterruptibleClient(apiURL string) (context.Context, *apiClient, context.CancelFunc, error) {
+	client, err := newAPIClient(apiURL)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	client.ctx = ctx
+	return ctx, client, stop, nil
+}
+
+// logsCommand: kairo logs ATTEMPT_ID prints an attempt's log as the daemon
+// holds it: whole, its last --tail bytes, and with --follow what is appended
+// after, until interrupted. `kairo task logs` and `kairo execution logs` find
+// the attempt for you.
+func logsCommand(args []string) error {
+	fs := newFlags("logs")
+	api := apiFlag(fs)
+	stream := fs.String("stream", "stderr", "log stream: stdout or stderr")
+	follow := fs.Bool("follow", false, "keep printing what is appended, every 2 s, until interrupted")
+	fs.BoolVar(follow, "f", false, "shorthand for --follow")
+	tail := fs.Int64("tail", -1, "print only the last N bytes")
+	positional, err := parseFlags(fs, leafArgs(args))
+	if err != nil {
+		return err
+	}
+	if len(positional) != 1 {
+		return usageError("logs requires ATTEMPT_ID (kairo task logs PROJECT TASK finds it for you)")
+	}
+	if *stream != "stdout" && *stream != "stderr" {
+		return usageError("--stream must be stdout or stderr, not %q", *stream)
+	}
+	if *tail < -1 {
+		return usageError("--tail must be a number of bytes")
+	}
+	ctx, client, stop, err := newInterruptibleClient(*api)
+	if err != nil {
+		return err
+	}
+	defer stop()
+	target := logTarget{attemptID: positional[0]}
+	out := &logWriter{}
+	end, err := printTailBytes(client, target.attemptID, *stream, *tail, out)
+	if ctx.Err() != nil {
+		return nil
+	}
+	if err != nil || !*follow {
+		return err
+	}
+	return followLogs(ctx, client, target, []string{*stream}, map[string]int64{*stream: end}, out, false)
+}
 
 type logOptions struct {
 	stream  *string
@@ -46,41 +102,36 @@ func addLogFlags(fs *flag.FlagSet, withRank bool) logOptions {
 	return o
 }
 
-func (o logOptions) streams() ([]string, error) {
+// validate checks the flags and returns the streams to print.
+func (o logOptions) validate() ([]string, error) {
+	var streams []string
 	switch *o.stream {
 	case "both":
-		return []string{"stdout", "stderr"}, nil
+		streams = []string{"stdout", "stderr"}
 	case "stdout", "stderr":
-		return []string{*o.stream}, nil
+		streams = []string{*o.stream}
+	default:
+		return nil, usageError("--stream %q: want stdout, stderr or both", *o.stream)
 	}
-	return nil, usageError("--stream %q: want stdout, stderr or both", *o.stream)
-}
-
-func (o logOptions) validate() error {
 	if *o.tail < 0 {
-		return usageError("--tail must be 0 or more")
+		return nil, usageError("--tail must be 0 or more")
 	}
 	if *o.follow && *o.attempt == "all" {
-		return usageError("--follow needs a single attempt (not --attempt all)")
+		return nil, usageError("--follow needs a single attempt (not --attempt all)")
 	}
 	if *o.attempt != "latest" && *o.attempt != "all" {
 		if n, err := strconv.Atoi(*o.attempt); err != nil || n < 0 {
-			return usageError("--attempt %q: want latest, all or a number", *o.attempt)
+			return nil, usageError("--attempt %q: want latest, all or a number", *o.attempt)
 		}
 	}
-	return nil
+	return streams, nil
 }
 
 // logTarget is one attempt whose logs are printed.
 type logTarget struct {
-	label       string // "#2", "#2 rank 1" ("" for an execution's only attempt)
-	executionID string
+	label       string // "#2", "#2 rank 1" ("" for an execution's attempt)
+	executionID string // "" when not known (kairo logs)
 	attemptID   string
-}
-
-// interruptContext is cancelled by Ctrl+C.
-func interruptContext() (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(context.Background(), os.Interrupt)
 }
 
 // taskLogs: kairo task logs PROJECT [QUEUE] TASK [flags].
@@ -96,20 +147,15 @@ func taskLogs(args []string) error {
 	if err != nil {
 		return err
 	}
-	streams, err := opts.streams()
+	streams, err := opts.validate()
 	if err != nil {
 		return err
 	}
-	if err := opts.validate(); err != nil {
-		return err
-	}
-	client, err := newAPIClient(*api)
+	ctx, client, stop, err := newInterruptibleClient(*api)
 	if err != nil {
 		return err
 	}
-	ctx, stop := interruptContext()
 	defer stop()
-	client.ctx = ctx
 	resolve := func() ([]logTarget, string, error) {
 		task, _, err := fetchTask(client, ref)
 		if err != nil {
@@ -118,7 +164,21 @@ func taskLogs(args []string) error {
 		targets, err := taskLogTargets(task, *opts.attempt, *opts.rank)
 		return targets, "task " + ref.task + " is " + task.State, err
 	}
-	return showLogs(ctx, client, resolve, streams, opts)
+	// Until the attempt exists, -f polls the task's status, not its detail.
+	started := func() (bool, error) {
+		resp, err := fetchProject(client, ref.project, projectQuery{tasks: []string{ref.task}})
+		if err != nil {
+			return false, err
+		}
+		for _, t := range resp.Project.Tasks {
+			if t.Name == ref.task {
+				e := t.execution(*opts.attempt)
+				return e != nil && e.AttemptID != nil, nil
+			}
+		}
+		return false, nil
+	}
+	return showLogs(ctx, client, resolve, started, streams, opts)
 }
 
 // executionLogs: kairo execution logs EXECUTION_ID [flags].
@@ -133,106 +193,74 @@ func executionLogs(args []string) error {
 	if len(positional) != 1 {
 		return usageError("execution logs requires EXECUTION_ID")
 	}
-	streams, err := opts.streams()
+	streams, err := opts.validate()
 	if err != nil {
 		return err
 	}
-	if err := opts.validate(); err != nil {
-		return err
-	}
-	client, err := newAPIClient(*api)
+	ctx, client, stop, err := newInterruptibleClient(*api)
 	if err != nil {
 		return err
 	}
-	ctx, stop := interruptContext()
 	defer stop()
-	client.ctx = ctx
 	executionID := positional[0]
 	resolve := func() ([]logTarget, string, error) {
-		attempts, err := executionAttempts(client, executionID)
+		attempt, err := executionAttempt(client, executionID)
 		if err != nil {
 			return nil, "", err
 		}
 		var targets []logTarget
-		for i, a := range attempts {
-			label := ""
-			if len(attempts) > 1 {
-				label = "attempt " + strconv.Itoa(i+1)
-			}
-			targets = append(targets, logTarget{label: label, executionID: executionID, attemptID: a.ID})
+		if attempt != nil {
+			targets = []logTarget{{executionID: executionID, attemptID: attempt.ID}}
 		}
-		switch *opts.attempt {
-		case "all":
-		case "latest":
-			if len(targets) > 0 {
-				targets = targets[len(targets)-1:]
-			}
-		default:
-			n, _ := strconv.Atoi(*opts.attempt)
-			if n < 1 || n > len(targets) {
-				return nil, "", fmt.Errorf("execution %s has %d attempt(s): --attempt counts them from 1, not %d", executionID, len(targets), n)
-			}
-			targets = targets[n-1 : n]
+		if n, err := strconv.Atoi(*opts.attempt); err == nil && (n < 1 || n > len(targets)) {
+			// An execution has at most one attempt.
+			return nil, "", fmt.Errorf("execution %s has %d attempt(s): --attempt counts them from 1, not %d", executionID, len(targets), n)
 		}
 		return targets, "execution " + executionID + " has no attempt yet", nil
 	}
-	return showLogs(ctx, client, resolve, streams, opts)
+	return showLogs(ctx, client, resolve, nil, streams, opts)
 }
 
-// executionAttempts lists an execution's attempts, oldest first.
-func executionAttempts(client *apiClient, executionID string) ([]attemptInfo, error) {
+// executionAttempt is the attempt of an execution (it has at most one), nil
+// before it starts.
+func executionAttempt(client *apiClient, executionID string) (*attemptInfo, error) {
 	var listed struct {
 		Attempts []attemptInfo `json:"attempts"`
 	}
-	if err := client.getJSON(withQuery("/api/attempts", url.Values{"execution_id": {executionID}, "limit": {"1000"}}), &listed); err != nil {
+	if err := client.callJSON(http.MethodGet, withQuery("/api/attempts", url.Values{"execution_id": {executionID}}), nil, &listed); err != nil {
 		return nil, err
 	}
-	sortAttempts(listed.Attempts)
-	return listed.Attempts, nil
-}
-
-// sortAttempts orders attempts by start, the unstarted last.
-func sortAttempts(attempts []attemptInfo) {
-	sort.SliceStable(attempts, func(i, j int) bool {
-		a, aok := parseStamp(attempts[i].StartedAt)
-		b, bok := parseStamp(attempts[j].StartedAt)
-		if aok != bok {
-			return aok
-		}
-		return a.Before(b)
-	})
+	if len(listed.Attempts) == 0 {
+		return nil, nil
+	}
+	return &listed.Attempts[0], nil
 }
 
 // taskLogTargets picks the attempts of `task logs`: of the latest execution,
 // of execution #N, or of all; for a gang, the attempt of the given rank.
 func taskLogTargets(task *taskDetail, which string, rank int) ([]logTarget, error) {
 	executions := task.Executions
-	switch which {
-	case "all":
-	case "latest":
-		if len(executions) > 0 {
-			executions = executions[len(executions)-1:]
-		}
-	default:
-		n, _ := strconv.Atoi(which)
-		var found []taskExecution
-		var ordinals []string
-		for _, e := range executions {
-			ordinals = append(ordinals, "#"+strconv.Itoa(e.Ordinal))
-			if e.Ordinal == n {
-				found = append(found, e)
+	if which != "all" {
+		e := task.execution(which)
+		switch {
+		case e != nil:
+			executions = []taskExecution{*e}
+		case which == "latest":
+			executions = nil
+		default:
+			var ordinals []string
+			for _, e := range executions {
+				ordinals = append(ordinals, "#"+strconv.Itoa(e.Ordinal))
 			}
-		}
-		if len(found) == 0 {
+			n, _ := strconv.Atoi(which)
 			return nil, fmt.Errorf("task %s has no execution #%d (it has: %s)", task.Name, n, orNone(ordinals))
 		}
-		executions = found
 	}
 	var targets []logTarget
 	for _, e := range executions {
 		label := "#" + strconv.Itoa(e.Ordinal)
 		if len(e.Gang) > 0 {
-			var picked *gangRankInfo
+			var picked *store.TaskGangRank
 			for i := range e.Gang {
 				if e.Gang[i].Rank == rank {
 					picked = &e.Gang[i]
@@ -249,16 +277,8 @@ func taskLogTargets(task *taskDetail, which string, rank int) ([]logTarget, erro
 		if rank != 0 {
 			return nil, fmt.Errorf("task %s is not a gang: --rank does not apply", task.Name)
 		}
-		attempts := append([]attemptInfo(nil), e.Attempts...)
-		sortAttempts(attempts)
-		if len(attempts) == 0 && e.AttemptID != nil {
-			attempts = []attemptInfo{{ID: *e.AttemptID}}
-		}
-		if which != "all" && len(attempts) > 1 {
-			attempts = attempts[len(attempts)-1:]
-		}
-		for _, a := range attempts {
-			targets = append(targets, logTarget{label: label, executionID: e.ExecutionID, attemptID: a.ID})
+		if id := e.attemptID(); id != "" {
+			targets = append(targets, logTarget{label: label, executionID: e.ExecutionID, attemptID: id})
 		}
 	}
 	return targets, nil
@@ -272,8 +292,9 @@ func orNone(list []string) string {
 }
 
 // showLogs prints the tails of the targets' logs and, with --follow, the
-// output that follows.
-func showLogs(ctx context.Context, client *apiClient, resolve func() ([]logTarget, string, error), streams []string, opts logOptions) error {
+// output that follows. With --follow and no attempt yet it waits for one,
+// asking started (when given) before resolving the targets again.
+func showLogs(ctx context.Context, client *apiClient, resolve func() ([]logTarget, string, error), started func() (bool, error), streams []string, opts logOptions) error {
 	targets, why, err := resolve()
 	if err != nil {
 		return err
@@ -287,10 +308,17 @@ func showLogs(ctx context.Context, client *apiClient, resolve func() ([]logTarge
 			if !sleepFunc(ctx, logPollInterval) {
 				return nil
 			}
-			if targets, _, err = resolve(); err != nil {
-				if ctx.Err() != nil {
-					return nil
-				}
+			ready := true
+			if started != nil {
+				ready, err = started()
+			}
+			if ready && err == nil {
+				targets, _, err = resolve()
+			}
+			if ctx.Err() != nil {
+				return nil
+			}
+			if err != nil {
 				return err
 			}
 		}
@@ -303,11 +331,14 @@ func showLogs(ctx context.Context, client *apiClient, resolve func() ([]logTarge
 			if len(streams) > 1 || labelled {
 				out.header(target, stream, labelled)
 			}
-			end, err := printTail(client, target.attemptID, stream, *opts.tail, out)
+			end, err := printTailLines(client, target.attemptID, stream, *opts.tail, out)
+			if ctx.Err() != nil {
+				return nil
+			}
+			if routeMissing(err) {
+				return err
+			}
 			if err != nil {
-				if routeMissing(err) || ctx.Err() != nil {
-					return quietCancel(ctx, err)
-				}
 				fmt.Fprintf(os.Stderr, "kairo: %s of %s: %v\n", stream, target.attemptID, err)
 			}
 			offsets[stream] = end
@@ -316,15 +347,7 @@ func showLogs(ctx context.Context, client *apiClient, resolve func() ([]logTarge
 	if !*opts.follow {
 		return nil
 	}
-	return followLogs(ctx, client, targets[0], streams, offsets, out)
-}
-
-// quietCancel turns an error caused by Ctrl+C into a clean exit.
-func quietCancel(ctx context.Context, err error) error {
-	if ctx.Err() != nil {
-		return nil
-	}
-	return err
+	return followLogs(ctx, client, targets[0], streams, offsets, out, true)
 }
 
 // logWriter writes log bytes to stdout and remembers whether the last byte
@@ -356,61 +379,95 @@ func (w *logWriter) header(target logTarget, stream string, labelled bool) {
 	w.stream = stream
 }
 
-// fetchLog is one GET /api/attempts/{id}/log; it returns the bytes, the
-// log's total size and the offset of the first byte returned.
-func fetchLog(client *apiClient, attemptID, stream string, params url.Values) ([]byte, int64, int64, error) {
+// logChunk is one slice of an attempt log: its bytes, the offset that
+// follows them and the log's size when it was read.
+type logChunk struct {
+	data       []byte
+	next, size int64
+}
+
+// start is the offset of the chunk's first byte.
+func (c logChunk) start() int64 { return c.next - int64(len(c.data)) }
+
+// fetchLog is one GET /api/attempts/{id}/log.
+func fetchLog(client *apiClient, attemptID, stream string, params url.Values) (logChunk, error) {
 	params.Set("stream", stream)
 	status, header, body, err := client.send(http.MethodGet, "/api/attempts/"+url.PathEscape(attemptID)+"/log?"+params.Encode(), nil)
 	if err != nil {
-		return nil, 0, 0, err
+		return logChunk{}, err
 	}
 	if status != http.StatusOK {
-		return nil, 0, 0, httpError(status, body)
+		return logChunk{}, httpError(status, body)
 	}
-	size, err1 := strconv.ParseInt(header.Get("X-Kairo-Log-Size"), 10, 64)
-	offset, err2 := strconv.ParseInt(header.Get("X-Kairo-Log-Offset"), 10, 64)
+	size, err1 := strconv.ParseInt(header.Get("Kairo-Log-Size"), 10, 64)
+	next, err2 := strconv.ParseInt(header.Get("Kairo-Log-Next-Offset"), 10, 64)
 	if err1 != nil || err2 != nil {
-		// The first log route answered Kairo-Log-Size and Kairo-Log-Next-Offset.
-		next, err3 := strconv.ParseInt(header.Get("Kairo-Log-Next-Offset"), 10, 64)
-		size, err1 = strconv.ParseInt(header.Get("Kairo-Log-Size"), 10, 64)
-		if err1 != nil || err3 != nil {
-			return nil, 0, 0, errors.New("log response without X-Kairo-Log-Size/X-Kairo-Log-Offset; " + olderDaemonHint())
-		}
-		offset = next - int64(len(body))
+		return logChunk{}, errors.New("log response without Kairo-Log-Size/Kairo-Log-Next-Offset; " + olderDaemonHint())
 	}
-	return body, size, offset, nil
+	return logChunk{data: body, next: next, size: size}, nil
 }
 
-// printTail prints the last n lines of a log (all of it for n == 0) and
-// returns the offset just after what it printed.
-func printTail(client *apiClient, attemptID, stream string, n int, out *logWriter) (int64, error) {
-	if n == 0 {
-		var offset int64
-		for {
-			data, size, start, err := fetchLog(client, attemptID, stream, url.Values{"offset": {strconv.FormatInt(offset, 10)}, "limit": {strconv.Itoa(maxLogChunk)}})
-			if err != nil {
-				return offset, err
-			}
-			out.write(stream, data)
-			offset = start + int64(len(data))
-			if len(data) == 0 || offset >= size {
-				return offset, nil
-			}
+// fetchTail is the last n bytes of a log (at most maxLogChunk) in one call.
+func fetchTail(client *apiClient, attemptID, stream string, n int64) (logChunk, error) {
+	return fetchLog(client, attemptID, stream, url.Values{"tail": {strconv.FormatInt(n, 10)}})
+}
+
+// readLog prints a log from offset to its current end and returns the offset
+// after what it printed and the log's size.
+func readLog(client *apiClient, attemptID, stream string, offset int64, write func([]byte)) (int64, int64, error) {
+	for {
+		chunk, err := fetchLog(client, attemptID, stream, url.Values{"offset": {strconv.FormatInt(offset, 10)}, "limit": {strconv.Itoa(maxLogChunk)}})
+		if err != nil {
+			return offset, 0, err
+		}
+		write(chunk.data)
+		offset = chunk.next
+		if len(chunk.data) == 0 || offset >= chunk.size {
+			return offset, chunk.size, nil
 		}
 	}
-	want := max(64<<10, n*256)
-	for {
-		want = min(want, maxLogChunk)
-		data, _, start, err := fetchLog(client, attemptID, stream, url.Values{"tail": {strconv.Itoa(want)}})
+}
+
+// printTailBytes prints the last n bytes of a log (all of it for n < 0) and
+// returns the offset just after what it printed.
+func printTailBytes(client *apiClient, attemptID, stream string, n int64, out *logWriter) (int64, error) {
+	write := func(data []byte) { out.write(stream, data) }
+	var offset int64
+	if n >= 0 {
+		chunk, err := fetchTail(client, attemptID, stream, n)
 		if err != nil {
 			return 0, err
 		}
-		end := start + int64(len(data))
-		lines := lastLines(data, n)
+		if n <= maxLogChunk || chunk.start() == 0 {
+			write(chunk.data)
+			return chunk.next, nil
+		}
+		// More than one call holds.
+		offset = max(chunk.size-n, 0)
+	}
+	end, _, err := readLog(client, attemptID, stream, offset, write)
+	return end, err
+}
+
+// printTailLines prints the last n lines of a log (all of it for n == 0) and
+// returns the offset just after what it printed.
+func printTailLines(client *apiClient, attemptID, stream string, n int, out *logWriter) (int64, error) {
+	if n == 0 {
+		end, _, err := readLog(client, attemptID, stream, 0, func(data []byte) { out.write(stream, data) })
+		return end, err
+	}
+	want := int64(max(64<<10, n*256))
+	for {
+		want = min(want, maxLogChunk)
+		chunk, err := fetchTail(client, attemptID, stream, want)
+		if err != nil {
+			return 0, err
+		}
+		lines := lastLines(chunk.data, n)
 		// The tail holds n whole lines, or it is the whole log, or the cap.
-		if len(lines) < len(data) || start == 0 || want >= maxLogChunk {
+		if len(lines) < len(chunk.data) || chunk.start() == 0 || want >= maxLogChunk {
 			out.write(stream, lines)
-			return end, nil
+			return chunk.next, nil
 		}
 		want *= 4
 	}
@@ -432,9 +489,10 @@ func lastLines(data []byte, n int) []byte {
 	return data
 }
 
-// followLogs polls the target's logs from offsets and prints new bytes until
-// the attempt has exited and its logs stopped growing, or Ctrl+C.
-func followLogs(ctx context.Context, client *apiClient, target logTarget, streams []string, offsets map[string]int64, out *logWriter) error {
+// followLogs polls the target's logs from offsets and prints the new bytes
+// until Ctrl+C or, with untilEnded, until the attempt has exited and its logs
+// stopped growing.
+func followLogs(ctx context.Context, client *apiClient, target logTarget, streams []string, offsets map[string]int64, out *logWriter, untilEnded bool) error {
 	quiet := 0
 	failing := false
 	for {
@@ -443,10 +501,21 @@ func followLogs(ctx context.Context, client *apiClient, target logTarget, stream
 		}
 		grew := false
 		for _, stream := range streams {
-			data, size, start, err := fetchLog(client, target.attemptID, stream, url.Values{"offset": {strconv.FormatInt(offsets[stream], 10)}, "limit": {strconv.Itoa(maxLogChunk)}})
+			next, size, err := readLog(client, target.attemptID, stream, offsets[stream], func(data []byte) {
+				if len(data) > 0 && len(streams) > 1 && out.stream != stream {
+					out.header(target, stream, false)
+				}
+				out.write(stream, data)
+			})
 			if ctx.Err() != nil {
 				return nil
 			}
+			if err == nil && size < offsets[stream] {
+				// The log was replaced (shipped anew): start over.
+				next = 0
+			}
+			grew = grew || next > offsets[stream]
+			offsets[stream] = next
 			if err != nil {
 				if routeMissing(err) {
 					return err
@@ -458,26 +527,16 @@ func followLogs(ctx context.Context, client *apiClient, target logTarget, stream
 				continue
 			}
 			failing = false
-			if size < offsets[stream] {
-				// The log was replaced (shipped anew): start over.
-				offsets[stream] = 0
-				continue
-			}
-			if len(data) == 0 {
-				continue
-			}
-			if len(streams) > 1 && out.stream != stream {
-				out.header(target, stream, false)
-			}
-			out.write(stream, data)
-			offsets[stream] = start + int64(len(data))
-			grew = true
 		}
-		ended, err := attemptEnded(client, target)
+		if grew || !untilEnded {
+			quiet = 0
+			continue
+		}
+		attempt, err := executionAttempt(client, target.executionID)
 		if ctx.Err() != nil {
 			return nil
 		}
-		if err != nil || !ended || grew {
+		if err != nil || attempt == nil || !attempt.ended() {
 			quiet = 0
 			continue
 		}
@@ -486,18 +545,4 @@ func followLogs(ctx context.Context, client *apiClient, target logTarget, stream
 			return nil
 		}
 	}
-}
-
-// attemptEnded asks the daemon whether the target's attempt has exited.
-func attemptEnded(client *apiClient, target logTarget) (bool, error) {
-	attempts, err := executionAttempts(client, target.executionID)
-	if err != nil {
-		return false, err
-	}
-	for _, a := range attempts {
-		if a.ID == target.attemptID {
-			return a.ended(), nil
-		}
-	}
-	return false, nil
 }

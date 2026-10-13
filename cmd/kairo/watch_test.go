@@ -171,23 +171,15 @@ func TestTaskWaitMatchIncludesNewTasksAndUntilStarted(t *testing.T) {
 
 func TestTaskWaitReportsAStallOnce(t *testing.T) {
 	f := waitFixture()
-	attempt := func(bytes int) map[string]any {
-		return map[string]any{"name": "b", "queue": "q", "state": "running", "executions": []map[string]any{{"ordinal": 1, "execution_id": "exe_b", "state": "started",
-			"attempts": []map[string]any{{"id": "att_b", "state": "running", "stdout_bytes": bytes, "stderr_bytes": 7}}}}}
-	}
-	f.details["b"] = attempt(100)
+	f.appendLog("att_b", "stdout", strings.Repeat("x", 100))
+	f.appendLog("att_b", "stderr", "warning")
 	clock := useFakeClock(t, base)
 	clock.onSleep = func(n int) {
-		f.mu.Lock()
-		defer f.mu.Unlock()
 		switch n {
 		case 6:
-			f.details["b"] = attempt(200)
-		}
-		if n == 12 {
-			f.mu.Unlock()
+			f.appendLog("att_b", "stdout", strings.Repeat("x", 100))
+		case 12:
 			f.setTask("b", ended("succeeded", 0))
-			f.mu.Lock()
 		}
 	}
 	server := f.serve(t)
@@ -203,6 +195,12 @@ func TestTaskWaitReportsAStallOnce(t *testing.T) {
 	}
 	if err != nil || strings.Join(lines(out), "\n") != strings.Join(want, "\n") {
 		t.Fatalf("stall: %v\n%s", err, out)
+	}
+	// The sizes come from the log route, without log bytes or task detail.
+	for _, r := range f.seen() {
+		if strings.Contains(r, "/tasks/") || (strings.Contains(r, "/log?") && !strings.HasSuffix(r, "&tail=0")) {
+			t.Fatalf("stall check request: %s", r)
+		}
 	}
 }
 
@@ -244,9 +242,20 @@ func TestProjectWatchStreamsChangesAndExitsWhenIdle(t *testing.T) {
 	if exitCode(err) != 1 || strings.Join(lines(out), "\n") != strings.Join(want, "\n") {
 		t.Fatalf("watch: %v\n%s", err, out)
 	}
-	requests := f.seen()
-	if !strings.Contains(requests[0], "live=1") || !strings.Contains(requests[1], "since=2026-10-13T11%3A59%3A50Z") {
-		t.Fatalf("requests: %v", requests[:2])
+	// Each poll asks for the live tasks and for those updated since the latest
+	// update it saw, less a minute (the first: since one interval ago).
+	var sinces []string
+	live := 0
+	for _, r := range f.seen() {
+		if _, since, ok := strings.Cut(r, "since="); ok {
+			sinces = append(sinces, since)
+		}
+		if strings.Contains(r, "live=1") {
+			live++
+		}
+	}
+	if live != 10 || len(sinces) != 10 || sinces[0] != "2026-10-13T11%3A59%3A50Z" || sinces[9] != "2026-10-13T12%3A00%3A20Z" {
+		t.Fatalf("polls: %d live, since %v", live, sinces)
 	}
 }
 

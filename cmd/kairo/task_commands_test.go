@@ -67,8 +67,9 @@ func TestTaskListDefaultShowsLiveAndRecentSorted(t *testing.T) {
 	if got[5] != "p: 1 running, 1 pending, 1 succeeded, 2 failed (4 shown)" {
 		t.Fatalf("summary: %q", got[5])
 	}
-	requests := f.seen()
-	if len(requests) != 2 || !strings.Contains(requests[0], "live=1") || !strings.Contains(requests[1], "since=2026-10-12T12%3A00%3A00Z") {
+	// The two fetches run at once, in either order.
+	requests := strings.Join(f.seen(), " ")
+	if len(f.seen()) != 2 || !strings.Contains(requests, "live=1") || !strings.Contains(requests, "since=2026-10-12T12%3A00%3A00Z") {
 		t.Fatalf("requests: %v", requests)
 	}
 }
@@ -112,6 +113,22 @@ func TestTaskListFiltersAllAndJSON(t *testing.T) {
 	}
 	if err := run([]string{"task", "list", "--api", server.URL, "nope"}); err == nil || !strings.Contains(err.Error(), "project nope not found") {
 		t.Fatalf("unknown project: %v", err)
+	}
+}
+
+func TestTaskListFiltersForADaemonWithoutFilters(t *testing.T) {
+	useFakeClock(t, base)
+	// A daemon older than the filters ignores them and counts no states.
+	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeJSONResponse(w, http.StatusOK, map[string]any{"project": map[string]any{"name": "p", "tasks": []map[string]any{
+			{"name": "a", "queue": "q", "state": "failed", "updated_at": stamp(base)},
+			{"name": "b", "queue": "q", "state": "succeeded", "updated_at": stamp(base)},
+		}}})
+	}))
+	defer server.Close()
+	out, err := captureStdout(t, func() error { return run([]string{"task", "list", "--api", server.URL, "p", "--state", "failed"}) })
+	if err != nil || len(lines(out)) != 3 || !strings.HasPrefix(lines(out)[1], "a ") || lines(out)[2] != "p: 1 failed (1 shown)" {
+		t.Fatalf("client-side filter: %v\n%s", err, out)
 	}
 }
 

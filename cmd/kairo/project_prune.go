@@ -13,9 +13,6 @@ import (
 	"kairo/internal/orchestration"
 )
 
-// liveTaskStates are the states in which a declared Task can still run.
-var liveTaskStates = map[string]bool{"pending": true, "running": true, "paused": true}
-
 var (
 	taskBlockStart = regexp.MustCompile(`(?m)^\[\[tasks\]\][ \t]*\r?$`)
 	taskBlockName  = regexp.MustCompile(`(?m)^name[ \t]*=[ \t]*"([^"]+)"`)
@@ -70,7 +67,7 @@ func pruneSpec(source []byte, states map[string]string) (pruneResult, error) {
 	var live, todo []string
 	for _, name := range order {
 		state, declared := states[name]
-		if !declared || liveTaskStates[state] {
+		if !declared || liveState(state) {
 			live = append(live, name)
 			todo = append(todo, name)
 		}

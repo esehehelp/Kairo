@@ -2,9 +2,10 @@ package main
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
+	"sync"
 	"testing"
-	"time"
 )
 
 // logsFixture: task "train" with execution #1 (att_1, exited) and #2
@@ -12,10 +13,10 @@ import (
 func logsFixture() *contractAPI {
 	f := newContractAPI()
 	f.details["train"] = map[string]any{"name": "train", "queue": "gpu", "state": "running", "executions": []map[string]any{
-		{"ordinal": 2, "execution_id": "exe_2", "state": "started", "attempt_id": "att_2",
-			"attempts": []map[string]any{{"id": "att_2", "execution_id": "exe_2", "state": "running"}}},
 		{"ordinal": 1, "execution_id": "exe_1", "state": "terminal", "attempt_id": "att_1",
 			"attempts": []map[string]any{{"id": "att_1", "execution_id": "exe_1", "state": "exited"}}},
+		{"ordinal": 2, "execution_id": "exe_2", "state": "started", "attempt_id": "att_2",
+			"attempts": []map[string]any{{"id": "att_2", "execution_id": "exe_2", "state": "running"}}},
 	}}
 	f.details["gang"] = map[string]any{"name": "gang", "queue": "gpu", "state": "running", "executions": []map[string]any{
 		{"ordinal": 1, "execution_id": "exe_g0", "state": "started", "attempt_id": "att_g0",
@@ -25,6 +26,7 @@ func logsFixture() *contractAPI {
 			}},
 	}}
 	f.details["fresh"] = map[string]any{"name": "fresh", "queue": "gpu", "state": "pending", "executions": []any{}}
+	f.setTask("fresh", map[string]any{"queue": "gpu", "state": "pending", "executions": []any{}})
 	f.attempts["exe_2"] = []map[string]any{{"id": "att_2", "execution_id": "exe_2", "state": "running"}}
 	var numbered strings.Builder
 	for i := 1; i <= 100; i++ {
@@ -204,8 +206,10 @@ func TestTaskLogsFollowWaitsForTheFirstAttempt(t *testing.T) {
 	clock := useFakeClock(t, base)
 	clock.onSleep = func(n int) {
 		if n == 2 {
+			executions := []map[string]any{{"ordinal": 1, "execution_id": "exe_f", "state": "started", "attempt_id": "att_f"}}
+			f.setTask("fresh", map[string]any{"state": "running", "executions": executions})
 			f.mu.Lock()
-			f.details["fresh"]["executions"] = []map[string]any{{"ordinal": 1, "execution_id": "exe_f", "state": "started", "attempt_id": "att_f"}}
+			f.details["fresh"]["executions"] = executions
 			f.attempts["exe_f"] = []map[string]any{{"id": "att_f", "execution_id": "exe_f", "state": "exited"}}
 			f.logs["att_f"] = map[string][]byte{"stdout": []byte("hello\n")}
 			f.mu.Unlock()
@@ -218,33 +222,160 @@ func TestTaskLogsFollowWaitsForTheFirstAttempt(t *testing.T) {
 	if err != nil || out != "hello\n" {
 		t.Fatalf("follow before start: %v %q", err, out)
 	}
+	// While no attempt exists, the polls read the task's status, not its detail.
+	details, polls := 0, 0
+	for _, r := range f.seen() {
+		switch r {
+		case "GET /api/projects/p/tasks/fresh":
+			details++
+		case "GET /api/projects/p?task=fresh":
+			polls++
+		}
+	}
+	if details != 2 || polls != 2 {
+		t.Fatalf("detail fetches %d, status polls %d: %v", details, polls, f.seen())
+	}
 }
 
 func TestExecutionLogs(t *testing.T) {
 	f := newContractAPI()
-	f.attempts["exe_9"] = []map[string]any{ // newest first, as the daemon lists them
-		{"id": "att_new", "execution_id": "exe_9", "state": "running", "started_at": stamp(base)},
-		{"id": "att_old", "execution_id": "exe_9", "state": "quiesced", "started_at": stamp(base.Add(-time.Hour))},
-	}
-	f.appendLog("att_new", "stdout", "resumed\n")
-	f.appendLog("att_old", "stdout", "started\n")
+	f.attempts["exe_9"] = []map[string]any{{"id": "att_9", "execution_id": "exe_9", "state": "running", "started_at": stamp(base)}}
+	f.appendLog("att_9", "stdout", "started\n")
 	server := f.serve(t)
-	out, err := captureStdout(t, func() error {
-		return run([]string{"execution", "logs", "--api", server.URL, "exe_9", "--stream", "stdout"})
-	})
-	if err != nil || out != "resumed\n" {
-		t.Fatalf("latest: %v %q", err, out)
+	for _, attempt := range []string{"latest", "1"} {
+		out, err := captureStdout(t, func() error {
+			return run([]string{"execution", "logs", "--api", server.URL, "exe_9", "--stream", "stdout", "--attempt", attempt})
+		})
+		if err != nil || out != "started\n" {
+			t.Fatalf("--attempt %s: %v %q", attempt, err, out)
+		}
 	}
-	out, err = captureStdout(t, func() error {
+	out, err := captureStdout(t, func() error {
 		return run([]string{"execution", "logs", "--api", server.URL, "exe_9", "--stream", "stdout", "--attempt", "all"})
 	})
-	if err != nil || out != "==> attempt 1 stdout (att_old) <==\nstarted\n==> attempt 2 stdout (att_new) <==\nresumed\n" {
+	if err != nil || out != "==> stdout (att_9) <==\nstarted\n" {
 		t.Fatalf("all: %v %q", err, out)
+	}
+	if err := run([]string{"execution", "logs", "--api", server.URL, "exe_9", "--attempt", "2"}); err == nil || !strings.Contains(err.Error(), "has 1 attempt(s)") {
+		t.Fatalf("--attempt 2: %v", err)
 	}
 	if !strings.Contains(strings.Join(f.seen(), "\n"), "GET /api/attempts?execution_id=exe_9") {
 		t.Fatalf("requests: %v", f.seen())
 	}
 	if err := run([]string{"execution", "logs", "--api", server.URL, "exe_none"}); err == nil || !strings.Contains(err.Error(), "no attempt yet") {
 		t.Fatalf("no attempts: %v", err)
+	}
+}
+
+// logAPI serves GET /api/attempts/att-1/log from a growing in-memory log,
+// recording each request's query.
+type logAPI struct {
+	mu       sync.Mutex
+	log      []byte
+	requests []string
+}
+
+func (l *logAPI) append(data string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.log = append(l.log, data...)
+}
+
+func (l *logAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if r.Method != http.MethodGet || r.URL.Path != "/api/attempts/att-1/log" {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"attempt not found","code":"not_found"}`))
+		return
+	}
+	l.requests = append(l.requests, r.URL.RawQuery)
+	serveLogBytes(w, r, l.log)
+}
+
+func (l *logAPI) queries() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.requests...)
+}
+
+func TestLogsPrintsTheWholeLog(t *testing.T) {
+	api := &logAPI{log: []byte("step 1\nstep 2\n")}
+	server := fakeAPI(t, api)
+	defer server.Close()
+	out, err := captureStdout(t, func() error {
+		return run([]string{"logs", "--api", server.URL, "--stream", "stdout", "att-1"})
+	})
+	if err != nil || out != "step 1\nstep 2\n" {
+		t.Fatalf("logs: %q %v", out, err)
+	}
+	if got := api.queries(); len(got) != 1 || got[0] != "limit=8388608&offset=0&stream=stdout" {
+		t.Fatalf("requests %v", got)
+	}
+}
+
+func TestLogsTailFetchesOnlyTheLastBytes(t *testing.T) {
+	api := &logAPI{log: []byte("0123456789")}
+	server := fakeAPI(t, api)
+	defer server.Close()
+	out, err := captureStdout(t, func() error {
+		return run([]string{"logs", "--api", server.URL, "--tail", "3", "att-1"})
+	})
+	if err != nil || out != "789" {
+		t.Fatalf("tail: %q %v", out, err)
+	}
+	if got := api.queries(); len(got) != 1 || got[0] != "stream=stderr&tail=3" {
+		t.Fatalf("requests %v", got)
+	}
+	// A tail longer than the log prints all of it.
+	if out, err = captureStdout(t, func() error {
+		return run([]string{"logs", "--api", server.URL, "--tail", "50", "att-1"})
+	}); err != nil || out != "0123456789" {
+		t.Fatalf("long tail: %q %v", out, err)
+	}
+}
+
+func TestLogsFollowPollsFromTheNextOffsetUntilInterrupted(t *testing.T) {
+	api := &logAPI{log: []byte("a")}
+	server := fakeAPI(t, api)
+	defer server.Close()
+	clock := useFakeClock(t, base)
+	clock.onSleep = func(n int) {
+		if n == 1 {
+			api.append("bc")
+		}
+	}
+	clock.stopAfter = 3
+	out, err := captureStdout(t, func() error { return run([]string{"logs", "--api", server.URL, "-f", "att-1"}) })
+	if err != nil || out != "abc" {
+		t.Fatalf("follow: %v %q", err, out)
+	}
+	// The log did not grow at the second poll: kairo logs keeps following.
+	want := "limit=8388608&offset=0&stream=stderr limit=8388608&offset=1&stream=stderr limit=8388608&offset=3&stream=stderr"
+	if got := api.queries(); strings.Join(got, " ") != want {
+		t.Fatalf("requests %v", got)
+	}
+}
+
+func TestLogsReportsAnUnknownAttempt(t *testing.T) {
+	server := fakeAPI(t, &logAPI{})
+	defer server.Close()
+	err := run([]string{"logs", "--api", server.URL, "att-missing"})
+	if err == nil || !strings.Contains(err.Error(), "HTTP 404 not_found") {
+		t.Fatalf("unknown attempt: %v", err)
+	}
+}
+
+func TestLogsValidatesArguments(t *testing.T) {
+	isolateClientEnv(t)
+	for _, args := range [][]string{
+		{"logs"},
+		{"logs", "a", "b"},
+		{"logs", "--stream", "journal", "att-1"},
+		{"logs", "--tail", "-5", "att-1"},
+	} {
+		if err := run(args); err == nil {
+			t.Fatalf("%v accepted", args)
+		}
 	}
 }

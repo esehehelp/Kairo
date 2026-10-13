@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -34,25 +35,36 @@ type observed struct {
 // tracker prints the changes between polls.
 type tracker struct {
 	seen map[string]*observed
+	// progressEvery, when set, also prints the progress of a running task
+	// when it changed, at most this often.
+	progressEvery time.Duration
 }
 
 func newTracker() *tracker { return &tracker{seen: map[string]*observed{}} }
 
-// update prints the first sight of t and every change of state (or of
-// execution); it returns the previous observation (nil on first sight).
-func (tr *tracker) update(t taskStatus, now time.Time) *observed {
+// updateAll sorts the tasks by name and updates each.
+func (tr *tracker) updateAll(tasks []taskStatus, now time.Time) {
+	sort.SliceStable(tasks, func(i, j int) bool { return tasks[i].Name < tasks[j].Name })
+	for _, t := range tasks {
+		tr.update(t, now)
+	}
+}
+
+// update prints the first sight of t, every change of state (or of
+// execution) and, with progressEvery, its progress.
+func (tr *tracker) update(t taskStatus, now time.Time) {
 	ordinal := -1 // no execution yet
 	if e := t.latest(); e != nil {
 		ordinal = e.Ordinal
 	}
 	note := taskNote(t)
+	progress := progressOf(t)
 	previous, ok := tr.seen[t.Name]
 	if !ok {
 		stdoutLine("%s %s %s", clock(now), t.Name, withNote(t.State, note))
-		tr.seen[t.Name] = &observed{state: t.State, ordinal: ordinal, progress: progressOf(t), progressAt: now}
-		return nil
+		tr.seen[t.Name] = &observed{state: t.State, ordinal: ordinal, progress: progress, progressAt: now}
+		return
 	}
-	before := *previous
 	if previous.state != t.State || previous.ordinal != ordinal {
 		if previous.ordinal != ordinal && previous.ordinal >= 0 {
 			// A new execution (a rerun or retry), not the first one.
@@ -61,7 +73,10 @@ func (tr *tracker) update(t taskStatus, now time.Time) *observed {
 		stdoutLine("%s %s %s -> %s", clock(now), t.Name, previous.state, withNote(t.State, note))
 		previous.state, previous.ordinal = t.State, ordinal
 	}
-	return &before
+	if tr.progressEvery > 0 && progress != "" && progress != previous.progress && now.Sub(previous.progressAt) >= tr.progressEvery {
+		stdoutLine("%s %s PROGRESS %s", clock(now), t.Name, progress)
+		previous.progress, previous.progressAt = progress, now
+	}
 }
 
 func withNote(state, note string) string {
@@ -109,6 +124,50 @@ func (o *outage) ok(now time.Time) {
 	}
 }
 
+// poll is the loop of task wait and project watch: every interval it reads
+// the project and hands the response to handle, until handle or after ends
+// it. A read that fails for a transient reason is retried, with DOWN and UP
+// lines around the outage; another failure ends the loop with fatal(err).
+// Ctrl+C ends it with interrupted.
+type poll struct {
+	interval time.Duration
+	fetch    func() (*projectResponse, error)
+	handle   func(resp *projectResponse, now time.Time) (done bool, err error)
+	// after, if set, runs after every poll, failed or not.
+	after       func(now time.Time) (done bool, err error)
+	fatal       func(err error) error
+	interrupted error
+}
+
+func (p poll) run(ctx context.Context) error {
+	var out outage
+	for {
+		now := nowFunc()
+		resp, err := p.fetch()
+		switch {
+		case ctx.Err() != nil:
+			return p.interrupted
+		case err != nil && transient(err):
+			out.failed(err, now)
+		case err != nil:
+			return p.fatal(err)
+		default:
+			out.ok(now)
+			if done, err := p.handle(resp, now); done {
+				return err
+			}
+		}
+		if p.after != nil {
+			if done, err := p.after(now); done {
+				return err
+			}
+		}
+		if !sleepFunc(ctx, p.interval) {
+			return p.interrupted
+		}
+	}
+}
+
 // taskWait: kairo task wait PROJECT [QUEUE] TASK [TASK...] | PROJECT --match PREFIX.
 func taskWait(args []string) error {
 	fs := newFlags("task wait")
@@ -134,13 +193,11 @@ func taskWait(args []string) error {
 	case *interval <= 0:
 		return &cliError{code: waitNotFound, msg: "--interval must be positive"}
 	}
-	client, err := newAPIClient(*api)
+	ctx, client, stop, err := newInterruptibleClient(*api)
 	if err != nil {
 		return withCode(err, waitNotFound)
 	}
-	ctx, stop := interruptContext()
 	defer stop()
-	client.ctx = ctx
 	w := &waiter{client: client, project: positional[0], names: positional[1:], match: *match,
 		started: *until == "started", timeout: *timeout, interval: *interval, stall: *stall}
 	return w.run(ctx)
@@ -178,51 +235,36 @@ type stallState struct {
 	reported  bool
 }
 
-func (w *waiter) query() projectQuery {
-	return projectQuery{tasks: w.names, match: w.match}
-}
-
 func (w *waiter) run(ctx context.Context) error {
 	start := nowFunc()
 	tr := newTracker()
-	var out outage
 	first := true
 	var last []taskStatus
 	w.stalls = map[string]*stallState{}
-	for {
-		now := nowFunc()
-		resp, err := fetchProject(w.client, w.project, w.query())
-		switch {
-		case ctx.Err() != nil:
-			return &cliError{code: 130, msg: ""}
-		case err != nil && notFound(err):
-			return &cliError{code: waitNotFound, msg: fmt.Sprintf("project %s not found (%v)", w.project, err)}
-		case err != nil && transient(err):
-			out.failed(err, now)
-		case err != nil:
-			return &cliError{code: waitNotFound, msg: err.Error()}
-		default:
-			out.ok(now)
+	return poll{
+		interval: w.interval,
+		fetch: func() (*projectResponse, error) {
+			return fetchProject(w.client, w.project, projectQuery{tasks: w.names, match: w.match})
+		},
+		handle: func(resp *projectResponse, now time.Time) (bool, error) {
 			if first {
 				if err := w.checkNames(resp); err != nil {
-					return err
+					return true, err
 				}
 				first = false
 			}
-			tasks := resp.Project.Tasks
-			sort.SliceStable(tasks, func(i, j int) bool { return tasks[i].Name < tasks[j].Name })
-			for _, t := range tasks {
-				tr.update(t, now)
-			}
-			last = tasks
+			last = resp.Project.Tasks
+			tr.updateAll(last, now)
 			if w.stall > 0 {
-				w.checkStalls(tasks, now)
+				w.checkStalls(last, now)
 			}
-			if code, done := w.done(tasks, now); done {
-				return exitWith(code)
+			code, done := w.done(last, now)
+			return done, exitWith(code)
+		},
+		after: func(now time.Time) (bool, error) {
+			if w.timeout <= 0 || now.Sub(start) < w.timeout {
+				return false, nil
 			}
-		}
-		if w.timeout > 0 && now.Sub(start) >= w.timeout {
 			var pending []string
 			for _, t := range last {
 				if !w.reached(t) {
@@ -230,12 +272,16 @@ func (w *waiter) run(ctx context.Context) error {
 				}
 			}
 			stdoutLine("%s TIMEOUT after %s: %s", clock(now), compactDuration(w.timeout), strings.Join(pending, ", "))
-			return exitWith(waitTimeout)
-		}
-		if !sleepFunc(ctx, w.interval) {
-			return &cliError{code: 130, msg: ""}
-		}
-	}
+			return true, exitWith(waitTimeout)
+		},
+		fatal: func(err error) error {
+			if notFound(err) {
+				return &cliError{code: waitNotFound, msg: fmt.Sprintf("project %s not found (%v)", w.project, err)}
+			}
+			return &cliError{code: waitNotFound, msg: err.Error()}
+		},
+		interrupted: &cliError{code: 130},
+	}.run(ctx)
 }
 
 func exitWith(code int) error {
@@ -329,24 +375,18 @@ func (w *waiter) checkStalls(tasks []taskStatus, now time.Time) {
 			delete(w.stalls, t.Name)
 			continue
 		}
-		detail, _, err := fetchTask(w.client, taskRef{project: w.project, task: t.Name})
-		if err != nil || len(detail.Executions) == 0 {
+		e := t.latest()
+		if e == nil || e.AttemptID == nil {
 			continue
 		}
-		latest := detail.Executions[len(detail.Executions)-1]
-		attempts := append([]attemptInfo(nil), latest.Attempts...)
-		sortAttempts(attempts)
-		if len(attempts) == 0 {
-			continue
-		}
-		a := attempts[len(attempts)-1]
-		size, ok := a.logBytes()
+		attemptID := *e.AttemptID
+		size, ok := logSize(w.client, attemptID)
 		if !ok {
 			continue
 		}
 		s := w.stalls[t.Name]
-		if s == nil || s.attemptID != a.ID || size != s.bytes {
-			w.stalls[t.Name] = &stallState{attemptID: a.ID, bytes: size, since: now}
+		if s == nil || s.attemptID != attemptID || size != s.bytes {
+			w.stalls[t.Name] = &stallState{attemptID: attemptID, bytes: size, since: now}
 			continue
 		}
 		if !s.reported && now.Sub(s.since) >= w.stall {
@@ -354,6 +394,20 @@ func (w *waiter) checkStalls(tasks []taskStatus, now time.Time) {
 			s.reported = true
 		}
 	}
+}
+
+// logSize is the size of an attempt's stdout plus stderr, and whether the
+// daemon has either log; it reads no log bytes.
+func logSize(client *apiClient, attemptID string) (int64, bool) {
+	var size int64
+	found := false
+	for _, stream := range []string{"stdout", "stderr"} {
+		if chunk, err := fetchTail(client, attemptID, stream, 0); err == nil {
+			size += chunk.size
+			found = true
+		}
+	}
+	return size, found
 }
 
 // projectWatch: kairo project watch PROJECT [--match PREFIX] [--interval D] [--exit-when-idle].
@@ -373,85 +427,71 @@ func projectWatch(args []string) error {
 	if *interval <= 0 {
 		return usageError("--interval must be positive")
 	}
-	client, err := newAPIClient(*api)
+	ctx, client, stop, err := newInterruptibleClient(*api)
 	if err != nil {
 		return err
 	}
-	ctx, stop := interruptContext()
 	defer stop()
-	client.ctx = ctx
 	return watchProject(ctx, client, positional[0], *match, *interval, *exitWhenIdle)
 }
 
 const (
 	progressEvery = time.Minute
 	summaryEvery  = 10 * time.Minute
+	// sinceMargin: each poll of watch asks for the tasks updated since the
+	// latest update it saw (the daemon's clock) less this margin.
+	sinceMargin = time.Minute
 )
 
 func watchProject(ctx context.Context, client *apiClient, project, match string, interval time.Duration, exitWhenIdle bool) error {
-	start := nowFunc()
-	since := start.Add(-interval).UTC().Format(time.RFC3339)
+	since := nowFunc().Add(-interval)
 	tr := newTracker()
-	var out outage
+	tr.progressEvery = progressEvery
 	var lastSummary time.Time
 	first := true
-	for {
-		now := nowFunc()
-		live, err := fetchProject(client, project, projectQuery{match: match, live: true})
-		var recent *projectResponse
-		if err == nil {
-			recent, err = fetchProject(client, project, projectQuery{match: match, since: since})
-		}
-		switch {
-		case ctx.Err() != nil:
-			return nil
-		case err != nil && notFound(err):
-			return fmt.Errorf("project %s not found (%v)", project, err)
-		case err != nil && transient(err):
-			out.failed(err, now)
-		case err != nil:
-			return err
-		default:
-			out.ok(now)
-			idle := len(live.Project.Tasks) == 0
-			counts := live.Project.StateCounts
-			live.merge(recent)
-			tasks := live.Project.Tasks
-			sort.SliceStable(tasks, func(i, j int) bool { return tasks[i].Name < tasks[j].Name })
+	return poll{
+		interval: interval,
+		fetch: func() (*projectResponse, error) {
+			return fetchLiveAndRecent(client, project, projectQuery{match: match}, since)
+		},
+		handle: func(resp *projectResponse, now time.Time) (bool, error) {
+			tasks := resp.Project.Tasks
+			tr.updateAll(tasks, now)
 			for _, t := range tasks {
-				before := tr.update(t, now)
-				o := tr.seen[t.Name]
-				p := progressOf(t)
-				if before != nil && p != "" && p != o.progress && now.Sub(o.progressAt) >= progressEvery {
-					stdoutLine("%s %s PROGRESS %s", clock(now), t.Name, p)
-					o.progress, o.progressAt = p, now
+				if updated, ok := parseStamp(&t.UpdatedAt); ok && updated.Add(-sinceMargin).After(since) {
+					since = updated.Add(-sinceMargin)
 				}
 			}
 			if first || now.Sub(lastSummary) >= summaryEvery {
+				counts := resp.Project.StateCounts
 				if counts == nil {
 					counts = countStates(tasks)
 				}
 				stdoutLine("%s SUMMARY %s: %s", clock(now), project, stateSummary(counts))
 				lastSummary, first = now, false
 			}
-			if exitWhenIdle && idle {
-				var bad []string
-				for name, o := range tr.seen {
-					if terminalState(o.state) && o.state != "succeeded" {
-						bad = append(bad, name+" ("+o.state+")")
-					}
-				}
-				sort.Strings(bad)
-				if len(bad) > 0 {
-					stdoutLine("%s IDLE not succeeded: %s", clock(now), strings.Join(bad, ", "))
-					return &cliError{code: 1}
-				}
-				stdoutLine("%s IDLE nothing pending or running", clock(now))
-				return nil
+			if !exitWhenIdle || slices.ContainsFunc(tasks, func(t taskStatus) bool { return liveState(t.State) }) {
+				return false, nil
 			}
-		}
-		if !sleepFunc(ctx, interval) {
-			return nil
-		}
-	}
+			var bad []string
+			for name, o := range tr.seen {
+				if terminalState(o.state) && o.state != "succeeded" {
+					bad = append(bad, name+" ("+o.state+")")
+				}
+			}
+			sort.Strings(bad)
+			if len(bad) > 0 {
+				stdoutLine("%s IDLE not succeeded: %s", clock(now), strings.Join(bad, ", "))
+				return true, &cliError{code: 1}
+			}
+			stdoutLine("%s IDLE nothing pending or running", clock(now))
+			return true, nil
+		},
+		fatal: func(err error) error {
+			if notFound(err) {
+				return fmt.Errorf("project %s not found (%v)", project, err)
+			}
+			return err
+		},
+	}.run(ctx)
 }
