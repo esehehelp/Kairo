@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 
+	"kairo/internal/buildinfo"
 	"kairo/internal/store"
 )
 
@@ -104,7 +105,7 @@ func actorOr(r *http.Request, actor string) string {
 
 func (s *Server) whoami(w http.ResponseWriter, r *http.Request) {
 	p := principalOf(r)
-	body := map[string]any{"role": p.Role, "name": p.Name}
+	body := map[string]any{"role": p.Role, "name": p.Name, "version": buildinfo.Version()}
 	if p.NodeID != "" {
 		body["node_id"] = p.NodeID
 	}

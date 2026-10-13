@@ -399,7 +399,7 @@ func TestOpenWidensTaskStatesOfAnOlderDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err = widenCheck(db, "orchestration_tasks", "state IN('pending','running','succeeded','failed','blocked','stopped')", "state IN('pending','running','succeeded','failed','blocked')"); err != nil {
+	if err = widenCheck(db, "orchestration_tasks", "state IN('pending','running','succeeded','failed','blocked','stopped','cancelled')", "state IN('pending','running','succeeded','failed','blocked')"); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()

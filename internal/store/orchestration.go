@@ -8,14 +8,18 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"kairo/internal/orchestration"
 )
 
 type ProjectStatus struct {
-	Name        string       `json:"name"`
-	SpecDigests []string     `json:"spec_digests"`
-	Tasks       []TaskStatus `json:"tasks"`
+	Name        string   `json:"name"`
+	SpecDigests []string `json:"spec_digests"`
+	// StateCounts counts every task of the project by state, whatever filter
+	// selected Tasks.
+	StateCounts map[string]int `json:"state_counts"`
+	Tasks       []TaskStatus   `json:"tasks"`
 }
 
 type TaskStatus struct {
@@ -27,6 +31,8 @@ type TaskStatus struct {
 	DependsOn  []string        `json:"depends_on"`
 	Executions []TaskExecution `json:"executions"`
 	Result     json.RawMessage `json:"result,omitempty"`
+	CreatedAt  string          `json:"created_at"`
+	UpdatedAt  string          `json:"updated_at"`
 }
 
 type TaskExecution struct {
@@ -39,6 +45,16 @@ type TaskExecution struct {
 	// TerminalCause tells how a terminal execution ended: process_exit,
 	// force_stopped, withdrawn_before_start, executor_identity_lost, ...
 	TerminalCause *string `json:"terminal_cause,omitempty"`
+	AttemptID     *string `json:"attempt_id,omitempty"`
+	// ExecutorID runs the attempt, or holds the latest lease before one.
+	ExecutorID       *string `json:"executor_id,omitempty"`
+	SubmittedAt      string  `json:"submitted_at,omitempty"`
+	StartedAt        *string `json:"started_at,omitempty"`
+	TerminalAt       *string `json:"terminal_at,omitempty"`
+	AttemptStartedAt *string `json:"attempt_started_at,omitempty"`
+	ExitedAt         *string `json:"exited_at,omitempty"`
+	// Progress is the attempt's latest progress without its free-form detail.
+	Progress json.RawMessage `json:"progress,omitempty"`
 }
 
 type plannedOrchestrationDecision struct {
@@ -71,69 +87,89 @@ type orchestrationTaskRow struct {
 	state         string
 	project       string
 	policyVersion int
+	// rerunOrdinal: the task was rerun; its next execution gets this ordinal.
+	rerunOrdinal *int
 }
 
-func (s *Store) ApplyProject(ctx context.Context, spec orchestration.Validated) (bool, error) {
+// ApplyResult is what applying a ProjectSpec did: Created names the tasks it
+// declared, Unchanged counts those already declared with the same content.
+type ApplyResult struct {
+	Idempotent bool
+	Created    []string
+	Unchanged  int
+}
+
+func (s *Store) ApplyProject(ctx context.Context, spec orchestration.Validated) (ApplyResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return ApplyResult{}, err
 	}
 	defer tx.Rollback()
 	projectScope, _, err := ensureScopeTx(ctx, tx, "project", nil, spec.Manifest.Project.Name)
 	if err != nil {
-		return false, err
+		return ApplyResult{}, err
 	}
 	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO project_declarations(project_scope_id,spec_digest,spec_json,applied_at) VALUES(?,?,?,?)`, projectScope.ID, spec.Digest, string(spec.Normalized), now())
 	if err != nil {
-		return false, err
+		return ApplyResult{}, err
 	}
 	inserted, err := result.RowsAffected()
 	if err != nil {
-		return false, err
+		return ApplyResult{}, err
 	}
+	applied := ApplyResult{Created: []string{}}
+	var conflicts []string
 
 	taskScopes := make(map[string]string, len(spec.Manifest.Tasks))
 	for _, task := range spec.Manifest.Tasks {
 		scopes, err := ensureScopePathTx(ctx, tx, ScopePath{Project: spec.Manifest.Project.Name, Queue: task.Queue, Task: task.Name})
 		if err != nil {
-			return false, err
+			return ApplyResult{}, err
 		}
 		taskScopes[task.Name] = scopes.Task.ID
 		taskBody, err := json.Marshal(task)
 		if err != nil {
-			return false, err
+			return ApplyResult{}, err
 		}
 		executionBody, err := json.Marshal(task.Execution)
 		if err != nil {
-			return false, err
+			return ApplyResult{}, err
 		}
 		var existingDigest, existingScopeID string
 		err = tx.QueryRowContext(ctx, `SELECT spec_digest,task_scope_id FROM orchestration_tasks WHERE project_scope_id=? AND name=?`, projectScope.ID, task.Name).Scan(&existingDigest, &existingScopeID)
 		if err == nil {
 			if existingDigest != spec.TaskDigests[task.Name] || existingScopeID != scopes.Task.ID {
-				return false, fmt.Errorf("%w: %s/%s", ErrOrchestrationConflict, spec.Manifest.Project.Name, task.Name)
+				conflicts = append(conflicts, spec.Manifest.Project.Name+"/"+task.Name)
+			} else {
+				applied.Unchanged++
 			}
 			continue
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
-			return false, err
+			return ApplyResult{}, err
 		}
 		stamp := now()
 		if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_tasks(task_scope_id,project_scope_id,name,queue_name,policy_id,policy_version,spec_digest,spec_json,execution_template_json,state,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?,?,'pending',?,?)`, scopes.Task.ID, projectScope.ID, task.Name, task.Queue, "RunToCompletion", spec.TaskDigests[task.Name], string(taskBody), string(executionBody), stamp, stamp); err != nil {
-			return false, err
+			return ApplyResult{}, err
 		}
+		applied.Created = append(applied.Created, task.Name)
+	}
+	if len(conflicts) > 0 {
+		// Every conflicting task is named, so the operator sees them all at once.
+		return ApplyResult{}, fmt.Errorf("%w: %s", ErrOrchestrationConflict, strings.Join(conflicts, ", "))
 	}
 	for _, task := range spec.Manifest.Tasks {
 		for _, dependency := range task.DependsOn {
 			if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO orchestration_task_dependencies(task_scope_id,dependency_task_scope_id) VALUES(?,?)`, taskScopes[task.Name], taskScopes[dependency]); err != nil {
-				return false, err
+				return ApplyResult{}, err
 			}
 		}
 	}
 	if err = tx.Commit(); err != nil {
-		return false, err
+		return ApplyResult{}, err
 	}
-	return inserted == 0, nil
+	applied.Idempotent = inserted == 0
+	return applied, nil
 }
 
 func (s *Store) ReconcileProjectTasks(ctx context.Context) error {
@@ -162,7 +198,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT t.task_scope_id,t.project_scope_id,t.name,t.queue_name,t.policy_id,t.policy_version,t.execution_template_json,t.state,p.external_key FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id WHERE t.state IN('pending','running') ORDER BY p.external_key,t.name`)
+	rows, err := tx.QueryContext(ctx, `SELECT t.task_scope_id,t.project_scope_id,t.name,t.queue_name,t.policy_id,t.policy_version,t.execution_template_json,t.state,p.external_key,t.rerun_ordinal FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id WHERE t.state IN('pending','running') ORDER BY p.external_key,t.name`)
 	if err != nil {
 		return err
 	}
@@ -170,7 +206,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 	for rows.Next() {
 		var task orchestrationTaskRow
 		var projectScopeID string
-		if err := rows.Scan(&task.taskScopeID, &projectScopeID, &task.name, &task.queue, &task.policyID, &task.policyVersion, &task.template, &task.state, &task.project); err != nil {
+		if err := rows.Scan(&task.taskScopeID, &projectScopeID, &task.name, &task.queue, &task.policyID, &task.policyVersion, &task.template, &task.state, &task.project, &task.rerunOrdinal); err != nil {
 			rows.Close()
 			return err
 		}
@@ -197,14 +233,26 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			continue
 		}
 		current, err := loadCurrentTaskExecution(ctx, tx, task.taskScopeID)
-		if errors.Is(err, sql.ErrNoRows) {
-			if err := planTaskExecution(ctx, tx, task, 0, "initial", map[string]any{"dependencies_succeeded": true}, nil); err != nil {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		// A rerun runs the declaration again from an ordinal past every earlier
+		// execution, which is never read as the task's outcome again.
+		if task.rerunOrdinal != nil && (err != nil || current.Ordinal < *task.rerunOrdinal) {
+			trigger, err := rerunTriggerTx(ctx, tx, task.taskScopeID, *task.rerunOrdinal)
+			if err != nil {
+				return err
+			}
+			if err := planTaskExecution(ctx, tx, task, *task.rerunOrdinal, "rerun", trigger, nil); err != nil {
 				return err
 			}
 			continue
 		}
 		if err != nil {
-			return err
+			if err := planTaskExecution(ctx, tx, task, 0, "initial", map[string]any{"dependencies_succeeded": true}, nil); err != nil {
+				return err
+			}
+			continue
 		}
 		// A gang is read as a whole: terminal only when every rank is, and so on.
 		gang, err := gangAggregateTx(ctx, tx, &current)
@@ -229,6 +277,14 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 				if err := updateTaskState(ctx, tx, task.taskScopeID, "stopped", stopped); err != nil {
 					return err
 				}
+			}
+			continue
+		}
+		// Withdrawn before it started (execution withdraw, or a cancel racing the
+		// submission): the task was cancelled, it did not fail.
+		if current.AttemptID == nil && current.TerminalCause != nil && *current.TerminalCause == "withdrawn_before_start" {
+			if err := updateTaskState(ctx, tx, task.taskScopeID, "cancelled", map[string]any{"reason": "withdrawn before start", "execution_id": current.ExecutionID}); err != nil {
+				return err
 			}
 			continue
 		}
@@ -315,7 +371,7 @@ func taskDependenciesReady(ctx context.Context, tx *sql.Tx, taskScopeID string) 
 		if err := rows.Scan(&state); err != nil {
 			return false, false, err
 		}
-		if state == "failed" || state == "blocked" || state == "stopped" {
+		if state == "failed" || state == "blocked" || state == "stopped" || state == "cancelled" {
 			return false, true, nil
 		}
 		if state != "succeeded" {
@@ -418,13 +474,32 @@ func (s *Store) markOrchestrationDecisionSubmitted(ctx context.Context, decision
 	if err := tx.QueryRowContext(ctx, `SELECT state,execution_id FROM orchestration_decisions WHERE decision_key=?`, decision.DecisionKey).Scan(&state, &existingExecution); err != nil {
 		return err
 	}
-	if state == "submitted" {
+	if state == "submitted" || (state == "abandoned" && existingExecution != nil) {
 		if existingExecution == nil || *existingExecution != executionID {
 			return errors.New("orchestration decision submission changed execution ID")
 		}
 		return tx.Commit()
 	}
+	var taskState string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM orchestration_tasks WHERE task_scope_id=?`, decision.TaskScopeID).Scan(&taskState); err != nil {
+		return err
+	}
 	stamp := now()
+	// The task was cancelled (or rerun) after this decision was read for
+	// submission: keep the link, withdraw what was just submitted, and leave
+	// the task alone.
+	if state == "abandoned" || taskState == "cancelled" {
+		if _, err := tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='abandoned',execution_id=?,submitted_at=? WHERE decision_key=?`, executionID, stamp, decision.DecisionKey); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO orchestration_task_executions(task_scope_id,execution_ordinal,execution_id,decision_key,reason,created_at) VALUES(?,?,?,?,?,?)`, decision.TaskScopeID, decision.Ordinal, executionID, decision.DecisionKey, decision.Reason, stamp); err != nil {
+			return err
+		}
+		if _, err := withdrawExecutionAndRanksTx(ctx, tx, executionID); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='submitted',execution_id=?,submitted_at=? WHERE decision_key=?`, executionID, stamp, decision.DecisionKey); err != nil {
 		return err
 	}
@@ -448,105 +523,6 @@ func updateTaskState(ctx context.Context, tx *sql.Tx, taskScopeID, state string,
 	}
 	_, err := tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state=?,result_json=?,updated_at=? WHERE task_scope_id=? AND (state!=? OR COALESCE(result_json,'')!=COALESCE(?,''))`, state, body, now(), taskScopeID, state, body)
 	return err
-}
-
-func (s *Store) GetProjectStatus(ctx context.Context, project string) (ProjectStatus, error) {
-	scopes, err := s.GetScopeByPath(ctx, ScopePath{Project: project})
-	if err != nil {
-		return ProjectStatus{}, err
-	}
-	status := ProjectStatus{Name: project, SpecDigests: []string{}, Tasks: []TaskStatus{}}
-	rows, err := s.db.QueryContext(ctx, `SELECT spec_digest FROM project_declarations WHERE project_scope_id=? ORDER BY applied_at,spec_digest`, scopes.Project.ID)
-	if err != nil {
-		return ProjectStatus{}, err
-	}
-	for rows.Next() {
-		var digest string
-		if err := rows.Scan(&digest); err != nil {
-			rows.Close()
-			return ProjectStatus{}, err
-		}
-		status.SpecDigests = append(status.SpecDigests, digest)
-	}
-	if err := rows.Close(); err != nil {
-		return ProjectStatus{}, err
-	}
-	if len(status.SpecDigests) == 0 {
-		return ProjectStatus{}, ErrNotFound
-	}
-	taskRows, err := s.db.QueryContext(ctx, `SELECT task_scope_id,name,queue_name,policy_id,policy_version,state,spec_digest,result_json FROM orchestration_tasks WHERE project_scope_id=? ORDER BY name`, scopes.Project.ID)
-	if err != nil {
-		return ProjectStatus{}, err
-	}
-	type statusRow struct {
-		taskScopeID, policyID string
-		policyVersion         int
-		task                  TaskStatus
-		result                *string
-	}
-	var pending []statusRow
-	for taskRows.Next() {
-		var row statusRow
-		if err := taskRows.Scan(&row.taskScopeID, &row.task.Name, &row.task.Queue, &row.policyID, &row.policyVersion, &row.task.State, &row.task.SpecDigest, &row.result); err != nil {
-			taskRows.Close()
-			return ProjectStatus{}, err
-		}
-		pending = append(pending, row)
-	}
-	if err := taskRows.Close(); err != nil {
-		return ProjectStatus{}, err
-	}
-	for _, row := range pending {
-		task := row.task
-		task.Policy = fmt.Sprintf("%s@v%d", row.policyID, row.policyVersion)
-		task.DependsOn, err = s.taskDependencyNames(ctx, row.taskScopeID)
-		if err != nil {
-			return ProjectStatus{}, err
-		}
-		task.Executions, err = s.taskExecutionStatus(ctx, row.taskScopeID)
-		if err != nil {
-			return ProjectStatus{}, err
-		}
-		if row.result != nil {
-			task.Result = json.RawMessage(*row.result)
-		}
-		status.Tasks = append(status.Tasks, task)
-	}
-	return status, nil
-}
-
-func (s *Store) taskDependencyNames(ctx context.Context, taskScopeID string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT t.name FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE d.task_scope_id=? ORDER BY t.name`, taskScopeID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	values := []string{}
-	for rows.Next() {
-		var value string
-		if err := rows.Scan(&value); err != nil {
-			return nil, err
-		}
-		values = append(values, value)
-	}
-	return values, rows.Err()
-}
-
-func (s *Store) taskExecutionStatus(ctx context.Context, taskScopeID string) ([]TaskExecution, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT te.execution_ordinal,te.execution_id,te.reason,e.state,e.terminal_cause,a.exit_code,a.exit_signal FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id WHERE te.task_scope_id=? ORDER BY te.execution_ordinal`, taskScopeID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	values := []TaskExecution{}
-	for rows.Next() {
-		var value TaskExecution
-		if err := rows.Scan(&value.Ordinal, &value.ExecutionID, &value.Reason, &value.State, &value.TerminalCause, &value.ExitCode, &value.ExitSignal); err != nil {
-			return nil, err
-		}
-		values = append(values, value)
-	}
-	return values, rows.Err()
 }
 
 func orchestrationDecisionKey(taskScopeID string, ordinal int, reason, trigger string) string {
