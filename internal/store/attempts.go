@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 )
 
@@ -71,4 +72,19 @@ func (s *Store) ListAttempts(ctx context.Context, filter AttemptFilter) ([]Attem
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// AttemptLogPaths returns where an attempt's logs live on the daemon host, as
+// recorded by its executor ("" for a stream with no recorded path), or
+// ErrNotFound for an unknown attempt.
+func (s *Store) AttemptLogPaths(ctx context.Context, attemptID string) (stdout, stderr string, err error) {
+	var out, errPath sql.NullString
+	err = s.db.QueryRowContext(ctx, `SELECT stdout_path,stderr_path FROM attempts WHERE id=?`, attemptID).Scan(&out, &errPath)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", ErrNotFound
+	}
+	if err != nil {
+		return "", "", err
+	}
+	return out.String, errPath.String, nil
 }

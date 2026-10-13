@@ -13,6 +13,7 @@ import (
 	"modernc.org/sqlite"
 	sqlite3 "modernc.org/sqlite/lib"
 
+	"kairo/internal/buildinfo"
 	"kairo/internal/store"
 )
 
@@ -61,6 +62,7 @@ var errorCodes = []struct {
 	{"execution_started", http.StatusConflict, store.ErrExecutionStarted},
 	{"idempotency_conflict", http.StatusConflict, store.ErrIdempotencyConflict},
 	{"orchestration_conflict", http.StatusConflict, store.ErrOrchestrationConflict},
+	{"task_conflict", http.StatusConflict, store.ErrTaskConflict},
 	{"ownership_conflict", http.StatusConflict, store.ErrOwnershipConflict},
 	{"gang_not_ready", http.StatusConflict, store.ErrGangNotReady},
 	{"gang_aborted", http.StatusConflict, store.ErrGangAborted},
@@ -157,5 +159,5 @@ func queryInt64(r *http.Request, key string, fallback int64) int64 {
 }
 
 func (s *Server) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "api": APIVersion})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "api": APIVersion, "version": buildinfo.Version()})
 }
