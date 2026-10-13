@@ -15,16 +15,6 @@ import (
 	"kairo/internal/id"
 )
 
-func executionCommand(args []string) error {
-	return dispatch(findGroup("execution"), args, map[string]func([]string) error{
-		"submit":   executionSubmit,
-		"list":     executionList,
-		"show":     func(a []string) error { return executionByID("show", a) },
-		"withdraw": func(a []string) error { return executionByID("withdraw", a) },
-		"logs":     executionLogs,
-	})
-}
-
 func executionSubmit(args []string) error {
 	fs := newFlags("execution submit")
 	api := apiFlag(fs)
@@ -117,25 +107,6 @@ func submitBody(m manifest.Manifest) (map[string]any, error) {
 	}
 	delete(body, "schema_version")
 	return body, nil
-}
-
-func projectCommand(args []string) error {
-	return dispatch(findGroup("project"), args, map[string]func([]string) error{
-		"validate": projectValidate,
-		"apply":    projectApply,
-		"status":   projectStatusCommand,
-		"watch":    projectWatch,
-		"prune":    projectPrune,
-		"pause":    func(a []string) error { return scopeAction("project", "pause", a) },
-		"resume":   func(a []string) error { return scopeAction("project", "resume", a) },
-	})
-}
-
-func queueCommand(args []string) error {
-	return dispatch(findGroup("queue"), args, map[string]func([]string) error{
-		"pause":  func(a []string) error { return scopeAction("queue", "pause", a) },
-		"resume": func(a []string) error { return scopeAction("queue", "resume", a) },
-	})
 }
 
 // scopeAction pauses or resumes a project, a queue or a task. A task may be
@@ -345,16 +316,6 @@ func (r pauseOperationResponse) forceSummary() []string {
 		lines = append(lines, fmt.Sprintf("force stop: %s %s", f.ExecutionID, how))
 	}
 	return lines
-}
-
-func resourceCommand(args []string) error {
-	handler := func(action string) func([]string) error {
-		return func(a []string) error { return resourceAction(action, a) }
-	}
-	return dispatch(findGroup("resource"), args, map[string]func([]string) error{
-		"status": handler("status"), "quarantine": handler("quarantine"),
-		"enable": handler("enable"), "reconcile": handler("reconcile"),
-	})
 }
 
 func resourceAction(action string, args []string) error {

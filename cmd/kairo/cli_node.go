@@ -6,16 +6,6 @@ import (
 	"os"
 )
 
-// nodeCommand: kairo node <quarantine|release> <NODE_ID|--all>, kairo node quarantine-status.
-func nodeCommand(args []string) error {
-	handler := func(action string) func([]string) error {
-		return func(a []string) error { return nodeAction(action, a) }
-	}
-	return dispatch(findGroup("node"), args, map[string]func([]string) error{
-		"quarantine": handler("quarantine"), "release": handler("release"), "quarantine-status": handler("quarantine-status"),
-	})
-}
-
 func nodeAction(action string, args []string) error {
 	fs := newFlags("node " + action)
 	api := apiFlag(fs)

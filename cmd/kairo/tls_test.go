@@ -11,7 +11,7 @@ import (
 
 func TestTLSInitAndIssue(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "tls")
-	if err := tlsCommand([]string{"init", "--dir", dir, "--host", "127.0.0.1", "--host", "localhost"}); err != nil {
+	if err := run([]string{"tls", "init", "--dir", dir, "--host", "127.0.0.1", "--host", "localhost"}); err != nil {
 		t.Fatalf("tls init: %v", err)
 	}
 	read := func(name string) []byte {
@@ -27,10 +27,10 @@ func TestTLSInitAndIssue(t *testing.T) {
 	}
 	ca, server := read(tlsutil.CACertFile), read(tlsutil.ServerCertFile)
 
-	if err := tlsCommand([]string{"init", "--dir", dir, "--host", "127.0.0.1"}); err == nil {
+	if err := run([]string{"tls", "init", "--dir", dir, "--host", "127.0.0.1"}); err == nil {
 		t.Fatal("tls init overwrote an existing CA")
 	}
-	if err := tlsCommand([]string{"issue", "--dir", dir, "--host", "127.0.0.1"}); err != nil {
+	if err := run([]string{"tls", "issue", "--dir", dir, "--host", "127.0.0.1"}); err != nil {
 		t.Fatalf("tls issue: %v", err)
 	}
 	if !bytes.Equal(ca, read(tlsutil.CACertFile)) {
@@ -50,7 +50,7 @@ func TestTLSCommandValidatesArguments(t *testing.T) {
 		{"init", "--dir", dir},
 		{"issue", "--dir", dir, "--host", "127.0.0.1", "extra"},
 	} {
-		if err := tlsCommand(args); err == nil {
+		if err := run(append([]string{"tls"}, args...)); err == nil {
 			t.Fatalf("tls %v was accepted", args)
 		}
 	}

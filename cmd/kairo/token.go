@@ -15,17 +15,6 @@ import (
 	"kairo/internal/store"
 )
 
-// tokenCommand manages API tokens directly in the daemon's database (it is
-// safe while the daemon runs), so the first admin token needs no token.
-func tokenCommand(args []string) error {
-	handler := func(action string) func([]string) error {
-		return func(a []string) error { return tokenAction(action, a) }
-	}
-	return dispatch(findGroup("token"), args, map[string]func([]string) error{
-		"create": handler("create"), "list": handler("list"), "revoke": handler("revoke"),
-	})
-}
-
 func tokenAction(action string, args []string) error {
 	fs := newFlags("token " + action)
 	configPath := fs.String("config", "", "daemon TOML configuration (its database_path is used)")

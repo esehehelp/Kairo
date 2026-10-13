@@ -35,7 +35,7 @@ func TestProjectPauseWaitsForDurableOperationByDefault(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := projectCommand([]string{"pause", "--api", server.URL, "--timeout", time.Second.String(), "p"}); err != nil {
+	if err := run([]string{"project", "pause", "--api", server.URL, "--timeout", time.Second.String(), "p"}); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -74,7 +74,7 @@ func TestProjectResumeOnlyOpensGate(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := projectCommand([]string{"resume", "--api", server.URL, "p"}); err != nil {
+	if err := run([]string{"project", "resume", "--api", server.URL, "p"}); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -129,7 +129,7 @@ preemptible = false
 	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := projectCommand([]string{"apply", "--api", server.URL, path}); err != nil {
+	if err := run([]string{"project", "apply", "--api", server.URL, path}); err != nil {
 		t.Fatal(err)
 	}
 	if gotMethod != http.MethodPost || gotPath != "/api/projects" {
@@ -168,7 +168,7 @@ func TestTaskCancelOnAnOlderDaemonWithdrawsEveryExecutionNotStarted(t *testing.T
 	}))
 	defer server.Close()
 
-	if err := taskCommand([]string{"cancel", "--api", server.URL, "p", "q", "t"}); err != nil {
+	if err := run([]string{"task", "cancel", "--api", server.URL, "p", "q", "t"}); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -198,7 +198,7 @@ func TestTaskCancelOnAnOlderDaemonRefusesARunningExecution(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := taskCommand([]string{"cancel", "--api", server.URL, "p", "q", "t"}); err == nil {
+	if err := run([]string{"task", "cancel", "--api", server.URL, "p", "q", "t"}); err == nil {
 		t.Fatal("task cancel withdrew around a running execution")
 	}
 	if posted {
@@ -239,10 +239,10 @@ func TestTaskPauseForceSendsTheForceStop(t *testing.T) {
 		"force_stops": []map[string]any{{"execution_id": "exe_1", "state": "terminated", "detail": map[string]any{"killed": true}}},
 	})
 	defer server.Close()
-	if err := taskCommand([]string{"pause", "--api", server.URL, "-f", "--grace", "90s", "--reason", "superseded", "--timeout", "1s", "p", "q", "t"}); err != nil {
+	if err := run([]string{"task", "pause", "--api", server.URL, "-f", "--grace", "90s", "--reason", "superseded", "--timeout", "1s", "p", "q", "t"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := taskCommand([]string{"pause", "--api", server.URL, "--timeout", "1s", "p", "q", "t"}); err != nil {
+	if err := run([]string{"task", "pause", "--api", server.URL, "--timeout", "1s", "p", "q", "t"}); err != nil {
 		t.Fatal(err)
 	}
 	if len(bodies) != 2 {
@@ -267,7 +267,7 @@ func TestTaskPauseForceFlagValidation(t *testing.T) {
 		{"pause", "--force", "--grace", "2h", "p", "q", "t"},
 		{"resume", "--force", "p", "q", "t"},
 	} {
-		if err := taskCommand(append([]string{args[0], "--api", "http://127.0.0.1:1"}, args[1:]...)); err == nil || !strings.Contains(err.Error(), "--") {
+		if err := run(append([]string{"task", args[0], "--api", "http://127.0.0.1:1"}, args[1:]...)); err == nil || !strings.Contains(err.Error(), "--") {
 			t.Fatalf("%v: %v", args, err)
 		}
 	}
@@ -280,7 +280,7 @@ func TestBlockedPauseNamesTheBlocker(t *testing.T) {
 		"targets":   []map[string]any{{"execution_id": "exe_1", "state": "blocked", "blocker_reason": "force_stop_not_picked_up"}},
 	})
 	defer server.Close()
-	err := taskCommand([]string{"pause", "--api", server.URL, "--force", "--timeout", "1s", "p", "q", "t"})
+	err := run([]string{"task", "pause", "--api", server.URL, "--force", "--timeout", "1s", "p", "q", "t"})
 	if err == nil || !strings.Contains(err.Error(), "exe_1: force_stop_not_picked_up") || !strings.Contains(err.Error(), "check that node's agent log") {
 		t.Fatalf("error = %v", err)
 	}

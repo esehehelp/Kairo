@@ -17,7 +17,11 @@ func TestTopLevelHelpGoesToStdoutAndSucceeds(t *testing.T) {
 
 func TestEveryGroupAndSubcommandHasHelp(t *testing.T) {
 	isolateClientEnv(t)
-	for _, g := range groups {
+	for _, c := range topCommands {
+		g := c.group
+		if g == nil {
+			continue
+		}
 		for _, h := range []string{"help", "--help", "-h"} {
 			out, err := captureStdout(t, func() error { return run([]string{g.name, h}) })
 			if err != nil || !strings.HasPrefix(out, "usage: kairo "+g.name+" <") {
@@ -38,7 +42,11 @@ func TestEveryGroupAndSubcommandHasHelp(t *testing.T) {
 			}
 		}
 	}
-	for name := range leafCommands {
+	for _, c := range topCommands {
+		name := c.name
+		if findLeaf(name) == nil {
+			continue
+		}
 		for _, args := range [][]string{{name, "--help"}, {name, "-h"}, {name, "help"}, {"help", name}} {
 			out, err := captureStdout(t, func() error { return run(args) })
 			if err != nil || !strings.HasPrefix(out, "usage: kairo "+name) || !strings.Contains(out, "flags:") {
@@ -53,6 +61,45 @@ func TestEveryGroupAndSubcommandHasHelp(t *testing.T) {
 	out, err = captureStdout(t, func() error { return run([]string{"task", "wait", "--help"}) })
 	if err != nil || !strings.Contains(out, "2 timeout") {
 		t.Fatalf("task wait --help documents its exit codes: %v %q", err, out)
+	}
+}
+
+// The command table is the only list of commands: every entry runs, names
+// are unique, and kairo dispatches every name it lists (and no other).
+func TestEveryListedCommandHasAHandler(t *testing.T) {
+	isolateClientEnv(t)
+	top := map[string]bool{}
+	leaves := 0
+	for _, c := range topCommands {
+		if c.run == nil || top[c.name] {
+			t.Fatalf("command %q: no handler, or listed twice", c.name)
+		}
+		top[c.name] = true
+		if c.group == nil {
+			if findLeaf(c.name) != nil {
+				leaves++
+			}
+			continue
+		}
+		if c.group.name != c.name || len(c.group.subs) == 0 {
+			t.Fatalf("group %q: name %q, %d subcommands", c.name, c.group.name, len(c.group.subs))
+		}
+		subs := map[string]bool{}
+		for _, s := range c.group.subs {
+			if s.run == nil || subs[s.name] {
+				t.Fatalf("%s %s: no handler, or listed twice", c.name, s.name)
+			}
+			subs[s.name] = true
+		}
+		if err := run([]string{c.name, "nonsense"}); err == nil || !strings.Contains(err.Error(), "unknown "+c.name+" command") {
+			t.Fatalf("%s nonsense: %v", c.name, err)
+		}
+	}
+	if leaves != 5 || !top["help"] {
+		t.Fatalf("leaves %d, commands %v", leaves, top)
+	}
+	if err := run([]string{"nonsense"}); err == nil || !strings.Contains(err.Error(), `unknown command "nonsense"`) {
+		t.Fatalf("unlisted command: %v", err)
 	}
 }
 

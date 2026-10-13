@@ -67,39 +67,32 @@ func isHelpArg(arg string) bool {
 	return false
 }
 
-// command is one entry of a usage text.
+// command is a subcommand of a group: its usage and its handler.
 type command struct {
 	name    string
 	args    string
 	summary string
+	run     func([]string) error
 }
 
 // commandGroup is a top-level command with subcommands.
 type commandGroup struct {
-	name    string
-	summary string
-	note    string // printed under the usage line
-	subs    []command
+	name string
+	note string // printed under the usage line
+	subs []command
 	// aliases maps names people type for a subcommand to a suggestion.
 	aliases map[string]string
 }
 
-var topCommands = []command{
-	{"project", "", "declare (apply), inspect (status) and watch projects"},
-	{"task", "", "list, show, wait for, read logs of, pause, cancel or rerun tasks"},
-	{"execution", "", "submit, list, show, withdraw executions; their logs"},
-	{"logs", "", "print or follow one attempt's log by ATTEMPT_ID (task logs finds the attempt)"},
-	{"queue", "", "pause or resume a queue"},
-	{"resource", "", "resource status, quarantine, enable, reconcile"},
-	{"node", "", "quarantine or release nodes"},
-	{"doctor", "", "check the API URL, token and versions"},
-	{"version", "", "print the CLI version and the daemon's"},
-	{"serve", "", "run the daemon (--config DAEMON.toml)"},
-	{"agent", "", "run this host as a remote node (--config AGENT.toml)"},
-	{"token", "", "create, list or revoke API tokens (direct database access)"},
-	{"tls", "", "create the CA and the server certificate"},
-	{"db", "", "database maintenance (compact)"},
-	{"help", "", "help for a command: kairo help task logs"},
+// topCommand is a command of kairo: a group of subcommands or a leaf
+// command (args and help are a leaf's synopsis and --help summary).
+type topCommand struct {
+	name    string
+	summary string // its line in kairo's usage
+	args    string
+	help    string
+	run     func([]string) error // a group's dispatches to its subcommands
+	group   *commandGroup
 }
 
 var topAliases = map[string]string{
@@ -114,130 +107,162 @@ var topAliases = map[string]string{
 const remoteNote = "API commands take --api URL (default $KAIRO_API, else " + defaultAPIURL + "); the token comes from\n" +
 	"$KAIRO_TOKEN, $KAIRO_TOKEN_FILE or <user config dir>/kairo/token, the CA from $KAIRO_CA_FILE or <user config dir>/kairo/ca.pem."
 
-var groups = []*commandGroup{
-	{
-		name: "task", summary: "tasks of a project",
-		note: "QUEUE may be left out for tasks declared by a ProjectSpec: it is looked up.",
-		subs: []command{
-			{"list", "PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]", "tasks as a table (default: live and updated in the last 24h)"},
-			{"show", "PROJECT [QUEUE] TASK [--json]", "one task: spec, dependencies, executions, attempts, log paths"},
-			{"logs", "PROJECT [QUEUE] TASK [--tail N] [-f] [--stream S] [--attempt A] [--rank R]", "print or follow attempt logs"},
-			{"wait", "PROJECT [QUEUE] TASK [TASK...] | PROJECT --match PREFIX [--until terminal|started] [--timeout D]", "wait for tasks, one line per state change (exit 0 ok, 1 failed, 2 timeout, 3 error)"},
-			{"pause", "PROJECT [QUEUE] TASK [--force [--grace D] [--reason R]] [--no-wait]", "checkpoint and pause a task, or end it with --force"},
-			{"resume", "PROJECT [QUEUE] TASK", "resume a paused task"},
-			{"cancel", "PROJECT [QUEUE] TASK [--dry-run]", "cancel a task that is not running (pause --force a running one)"},
-			{"rerun", "PROJECT [QUEUE] TASK", "run a failed, blocked, stopped or cancelled task again"},
-		},
-		aliases: map[string]string{
-			"get": "show", "describe": "show", "info": "show", "inspect": "show", "status": "show", "detail": "show",
-			"ls": "list", "ps": "list", "all": "list",
-			"log": "logs", "tail": "logs", "output": "logs", "follow": "logs",
-			"stop": "cancel (or pause --force for a running task)", "kill": "pause --force", "abort": "cancel",
-			"delete": "cancel", "rm": "cancel", "remove": "cancel",
-			"retry": "rerun", "restart": "rerun", "run": "rerun",
-			"watch": "wait (or kairo project watch)", "await": "wait", "monitor": "wait",
-			"suspend": "pause", "continue": "resume", "unpause": "resume",
-		},
-	},
-	{
-		name: "project", summary: "projects (ProjectSpec files)",
-		subs: []command{
-			{"validate", "FILE [--json]", "check a ProjectSpec file locally"},
-			{"apply", "FILE [--json]", "declare a ProjectSpec's tasks (additive; declared tasks are immutable)"},
-			{"status", "PROJECT [--task T]... [--match PREFIX] [--state S,..] [--live] [--since D]", "project status as JSON"},
-			{"watch", "PROJECT [--match PREFIX] [--interval D] [--exit-when-idle]", "stream state and progress changes, one line each"},
-			{"prune", "FILE [--write]", "keep only the tasks of FILE that can still run"},
-			{"pause", "PROJECT [--force [--grace D] [--reason R]] [--no-wait]", "pause every task of the project"},
-			{"resume", "PROJECT", "resume the project"},
-		},
-		aliases: map[string]string{
-			"get": "status", "show": "status", "describe": "status", "info": "status",
-			"ls": "status (or kairo task list)", "list": "status (or kairo task list)",
-			"check": "validate", "lint": "validate", "submit": "apply", "declare": "apply", "create": "apply", "up": "apply",
-			"monitor": "watch", "follow": "watch", "wait": "watch (or kairo task wait)",
-		},
-	},
-	{
-		name: "execution", summary: "executions (single process requests)",
-		subs: []command{
-			{"submit", "FILE", "submit an execution TOML file"},
-			{"list", "[--project P] [--queue Q] [--task T] [--state S] [--limit N]", "list executions (JSON)"},
-			{"show", "EXECUTION_ID", "one execution (JSON)"},
-			{"withdraw", "EXECUTION_ID", "withdraw an execution that has not started"},
-			{"logs", "EXECUTION_ID [--tail N] [-f] [--stream S] [--attempt A]", "print or follow the logs of an execution's attempts"},
-		},
-		aliases: map[string]string{
-			"ls": "list", "get": "show", "describe": "show", "status": "show",
-			"cancel": "withdraw", "stop": "withdraw", "rm": "withdraw", "delete": "withdraw",
-			"log": "logs", "tail": "logs",
-		},
-	},
-	{
-		name: "queue", summary: "queues of a project",
-		subs: []command{
-			{"pause", "PROJECT QUEUE [--force [--grace D] [--reason R]] [--no-wait]", "pause every task of the queue"},
-			{"resume", "PROJECT QUEUE", "resume the queue"},
-		},
-		aliases: map[string]string{"suspend": "pause", "continue": "resume", "unpause": "resume"},
-	},
-	{
-		name: "resource", summary: "GPUs, CPU, RAM and disks",
-		subs: []command{
-			{"status", "", "resources and their state (JSON)"},
-			{"quarantine", "RESOURCE_ID [--reason R]", "stop placing work on a resource"},
-			{"enable", "RESOURCE_ID", "release a quarantined resource"},
-			{"reconcile", "RESOURCE_ID --confirm-process-absent", "clear a resource held by stale attempts"},
-		},
-		aliases: map[string]string{"ls": "status", "list": "status", "show": "status", "release": "enable"},
-	},
-	{
-		name: "node", summary: "nodes",
-		subs: []command{
-			{"quarantine", "NODE_ID|--all [--reason R]", "suspend or end the work on a node"},
-			{"release", "NODE_ID|--all", "end a node quarantine"},
-			{"quarantine-status", "", "current node quarantines (JSON)"},
-		},
-		aliases: map[string]string{"status": "quarantine-status", "ls": "quarantine-status", "list": "quarantine-status", "enable": "release"},
-	},
-	{
-		name: "db", summary: "database maintenance (stop the daemon first)",
-		subs: []command{
-			{"compact", "(--config DAEMON.toml | --db PATH)", "prune resource observations and VACUUM the database"},
-		},
-		aliases: map[string]string{"vacuum": "compact"},
-	},
-	{
-		name: "token", summary: "API tokens, written directly to the daemon's database",
-		subs: []command{
-			{"create", "(--config DAEMON.toml | --db PATH) --name NAME --role admin|read|node [--node NODE_ID] [--save | --out FILE] [--force]", "create a token"},
-			{"list", "(--config DAEMON.toml | --db PATH)", "list active tokens"},
-			{"revoke", "(--config DAEMON.toml | --db PATH) ID_OR_NAME", "revoke a token"},
-		},
-		aliases: map[string]string{"new": "create", "add": "create", "ls": "list", "rm": "revoke", "delete": "revoke"},
-	},
-	{
-		name: "tls", summary: "TLS material for the daemon",
-		subs: []command{
-			{"init", "--dir DIR --host HOST [--host HOST ...]", "create a CA and a server certificate"},
-			{"issue", "--dir DIR --host HOST [--host HOST ...]", "re-issue the server certificate from the existing CA"},
-		},
-	},
+// topCommands are kairo's commands, in the order of its usage, with their
+// subcommands and handlers. It is set in init: the handlers read it back.
+var topCommands []*topCommand
+
+// bind is f with its first argument (the subcommand's action) given.
+func bind(f func(string, []string) error, action string) func([]string) error {
+	return func(args []string) error { return f(action, args) }
 }
 
-// leafCommands are top-level commands without subcommands.
-var leafCommands = map[string]command{
-	"serve":   {"serve", "--config DAEMON.toml", "run the daemon"},
-	"agent":   {"agent", "--config AGENT.toml", "run this host as a remote node: its providers and executors report to the daemon"},
-	"doctor":  {"doctor", "[--api URL]", "check the API URL and token, show both versions and the resources"},
-	"version": {"version", "[--api URL]", "print the CLI version and, when reachable, the daemon's"},
-	"logs":    {"logs", "ATTEMPT_ID [--stream stdout|stderr] [--tail BYTES] [-f]", "print an attempt's log (default stderr, whole), or follow it; kairo task logs finds the attempt of a task"},
+// scope is the pause or resume of a project, a queue or a task.
+func scope(kind, action string) func([]string) error {
+	return func(args []string) error { return scopeAction(kind, action, args) }
+}
+
+func init() {
+	topCommands = []*topCommand{
+		{name: "project", summary: "declare (apply), inspect (status) and watch projects", group: &commandGroup{
+			subs: []command{
+				{"validate", "FILE [--json]", "check a ProjectSpec file locally", projectValidate},
+				{"apply", "FILE [--json]", "declare a ProjectSpec's tasks (additive; declared tasks are immutable)", projectApply},
+				{"status", "PROJECT [--task T]... [--match PREFIX] [--state S,..] [--live] [--since D]", "project status as JSON", projectStatusCommand},
+				{"watch", "PROJECT [--match PREFIX] [--interval D] [--exit-when-idle]", "stream state and progress changes, one line each", projectWatch},
+				{"prune", "FILE [--write]", "keep only the tasks of FILE that can still run", projectPrune},
+				{"pause", "PROJECT [--force [--grace D] [--reason R]] [--no-wait]", "pause every task of the project", scope("project", "pause")},
+				{"resume", "PROJECT", "resume the project", scope("project", "resume")},
+			},
+			aliases: map[string]string{
+				"get": "status", "show": "status", "describe": "status", "info": "status",
+				"ls": "status (or kairo task list)", "list": "status (or kairo task list)",
+				"check": "validate", "lint": "validate", "submit": "apply", "declare": "apply", "create": "apply", "up": "apply",
+				"monitor": "watch", "follow": "watch", "wait": "watch (or kairo task wait)",
+			},
+		}},
+		{name: "task", summary: "list, show, wait for, read logs of, pause, cancel or rerun tasks", group: &commandGroup{
+			note: "QUEUE may be left out for tasks declared by a ProjectSpec: it is looked up.",
+			subs: []command{
+				{"list", "PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]", "tasks as a table (default: live and updated in the last 24h)", taskList},
+				{"show", "PROJECT [QUEUE] TASK [--json]", "one task: spec, dependencies, executions, attempts, log paths", taskShow},
+				{"logs", "PROJECT [QUEUE] TASK [--tail N] [-f] [--stream S] [--attempt A] [--rank R]", "print or follow attempt logs", taskLogs},
+				{"wait", "PROJECT [QUEUE] TASK [TASK...] | PROJECT --match PREFIX [--until terminal|started] [--timeout D]", "wait for tasks, one line per state change (exit 0 ok, 1 failed, 2 timeout, 3 error)", taskWait},
+				{"pause", "PROJECT [QUEUE] TASK [--force [--grace D] [--reason R]] [--no-wait]", "checkpoint and pause a task, or end it with --force", scope("task", "pause")},
+				{"resume", "PROJECT [QUEUE] TASK", "resume a paused task", scope("task", "resume")},
+				{"cancel", "PROJECT [QUEUE] TASK [--dry-run]", "cancel a task that is not running (pause --force a running one)", taskCancel},
+				{"rerun", "PROJECT [QUEUE] TASK", "run a failed, blocked, stopped or cancelled task again", taskRerun},
+			},
+			aliases: map[string]string{
+				"get": "show", "describe": "show", "info": "show", "inspect": "show", "status": "show", "detail": "show",
+				"ls": "list", "ps": "list", "all": "list",
+				"log": "logs", "tail": "logs", "output": "logs", "follow": "logs",
+				"stop": "cancel (or pause --force for a running task)", "kill": "pause --force", "abort": "cancel",
+				"delete": "cancel", "rm": "cancel", "remove": "cancel",
+				"retry": "rerun", "restart": "rerun", "run": "rerun",
+				"watch": "wait (or kairo project watch)", "await": "wait", "monitor": "wait",
+				"suspend": "pause", "continue": "resume", "unpause": "resume",
+			},
+		}},
+		{name: "execution", summary: "submit, list, show, withdraw executions; their logs", group: &commandGroup{
+			subs: []command{
+				{"submit", "FILE", "submit an execution TOML file", executionSubmit},
+				{"list", "[--project P] [--queue Q] [--task T] [--state S] [--limit N]", "list executions (JSON)", executionList},
+				{"show", "EXECUTION_ID", "one execution (JSON)", bind(executionByID, "show")},
+				{"withdraw", "EXECUTION_ID", "withdraw an execution that has not started", bind(executionByID, "withdraw")},
+				{"logs", "EXECUTION_ID [--tail N] [-f] [--stream S] [--attempt A]", "print or follow the logs of an execution's attempts", executionLogs},
+			},
+			aliases: map[string]string{
+				"ls": "list", "get": "show", "describe": "show", "status": "show",
+				"cancel": "withdraw", "stop": "withdraw", "rm": "withdraw", "delete": "withdraw",
+				"log": "logs", "tail": "logs",
+			},
+		}},
+		{name: "logs", summary: "print or follow one attempt's log by ATTEMPT_ID (task logs finds the attempt)", run: logsCommand,
+			args: "ATTEMPT_ID [--stream stdout|stderr] [--tail BYTES] [-f]",
+			help: "print an attempt's log (default stderr, whole), or follow it; kairo task logs finds the attempt of a task"},
+		{name: "queue", summary: "pause or resume a queue", group: &commandGroup{
+			subs: []command{
+				{"pause", "PROJECT QUEUE [--force [--grace D] [--reason R]] [--no-wait]", "pause every task of the queue", scope("queue", "pause")},
+				{"resume", "PROJECT QUEUE", "resume the queue", scope("queue", "resume")},
+			},
+			aliases: map[string]string{"suspend": "pause", "continue": "resume", "unpause": "resume"},
+		}},
+		{name: "resource", summary: "resource status, quarantine, enable, reconcile", group: &commandGroup{
+			subs: []command{
+				{"status", "", "resources and their state (JSON)", bind(resourceAction, "status")},
+				{"quarantine", "RESOURCE_ID [--reason R]", "stop placing work on a resource", bind(resourceAction, "quarantine")},
+				{"enable", "RESOURCE_ID", "release a quarantined resource", bind(resourceAction, "enable")},
+				{"reconcile", "RESOURCE_ID --confirm-process-absent", "clear a resource held by stale attempts", bind(resourceAction, "reconcile")},
+			},
+			aliases: map[string]string{"ls": "status", "list": "status", "show": "status", "release": "enable"},
+		}},
+		{name: "node", summary: "quarantine or release nodes", group: &commandGroup{
+			subs: []command{
+				{"quarantine", "NODE_ID|--all [--reason R]", "suspend or end the work on a node", bind(nodeAction, "quarantine")},
+				{"release", "NODE_ID|--all", "end a node quarantine", bind(nodeAction, "release")},
+				{"quarantine-status", "", "current node quarantines (JSON)", bind(nodeAction, "quarantine-status")},
+			},
+			aliases: map[string]string{"status": "quarantine-status", "ls": "quarantine-status", "list": "quarantine-status", "enable": "release"},
+		}},
+		{name: "doctor", summary: "check the API URL, token and versions", run: doctorCommand,
+			args: "[--api URL]", help: "check the API URL and token, show both versions and the resources"},
+		{name: "version", summary: "print the CLI version and the daemon's", run: versionCommand,
+			args: "[--api URL]", help: "print the CLI version and, when reachable, the daemon's"},
+		{name: "serve", summary: "run the daemon (--config DAEMON.toml)", run: serve,
+			args: "--config DAEMON.toml", help: "run the daemon"},
+		{name: "agent", summary: "run this host as a remote node (--config AGENT.toml)", run: agentCommand,
+			args: "--config AGENT.toml", help: "run this host as a remote node: its providers and executors report to the daemon"},
+		{name: "token", summary: "create, list or revoke API tokens (direct database access)", group: &commandGroup{
+			subs: []command{
+				{"create", "(--config DAEMON.toml | --db PATH) --name NAME --role admin|read|node [--node NODE_ID] [--save | --out FILE] [--force]", "create a token", bind(tokenAction, "create")},
+				{"list", "(--config DAEMON.toml | --db PATH)", "list active tokens", bind(tokenAction, "list")},
+				{"revoke", "(--config DAEMON.toml | --db PATH) ID_OR_NAME", "revoke a token", bind(tokenAction, "revoke")},
+			},
+			aliases: map[string]string{"new": "create", "add": "create", "ls": "list", "rm": "revoke", "delete": "revoke"},
+		}},
+		{name: "tls", summary: "create the CA and the server certificate", group: &commandGroup{
+			subs: []command{
+				{"init", "--dir DIR --host HOST [--host HOST ...]", "create a CA and a server certificate", bind(tlsAction, "init")},
+				{"issue", "--dir DIR --host HOST [--host HOST ...]", "re-issue the server certificate from the existing CA", bind(tlsAction, "issue")},
+			},
+		}},
+		{name: "db", summary: "database maintenance (compact)", group: &commandGroup{
+			subs: []command{
+				{"compact", "(--config DAEMON.toml | --db PATH)", "prune resource observations and VACUUM the database", dbCompact},
+			},
+			aliases: map[string]string{"vacuum": "compact"},
+		}},
+		{name: "help", summary: "help for a command: kairo help task logs", run: helpCommand},
+	}
+	for _, c := range topCommands {
+		if g := c.group; g != nil {
+			g.name = c.name
+			c.run = func(args []string) error { return dispatch(g, args) }
+		}
+	}
+}
+
+// findCommand is the top-level command name, nil if there is none.
+func findCommand(name string) *topCommand {
+	for _, c := range topCommands {
+		if c.name == name {
+			return c
+		}
+	}
+	return nil
+}
+
+// findLeaf is the leaf command name (one with its own --help), nil if there is none.
+func findLeaf(name string) *topCommand {
+	if c := findCommand(name); c != nil && c.group == nil && c.help != "" {
+		return c
+	}
+	return nil
 }
 
 func findGroup(name string) *commandGroup {
-	for _, g := range groups {
-		if g.name == name {
-			return g
-		}
+	if c := findCommand(name); c != nil {
+		return c.group
 	}
 	return nil
 }
@@ -351,24 +376,24 @@ func editDistance(a, b string) int {
 }
 
 // dispatch runs the subcommand args[0] of g.
-func dispatch(g *commandGroup, args []string, handlers map[string]func([]string) error) error {
+func dispatch(g *commandGroup, args []string) error {
 	if len(args) == 0 {
 		return missingCommand(g)
 	}
 	if isHelpArg(args[0]) {
 		if len(args) > 1 {
-			if _, ok := handlers[args[1]]; ok {
-				return handlers[args[1]]([]string{"--help"})
+			if c := g.find(args[1]); c != nil {
+				return c.run([]string{"--help"})
 			}
 		}
 		fmt.Fprint(os.Stdout, g.usage())
 		return errHelpShown
 	}
-	handler, ok := handlers[args[0]]
-	if !ok {
+	c := g.find(args[0])
+	if c == nil {
 		return unknownCommand(g, args[0])
 	}
-	return handler(args[1:])
+	return c.run(args[1:])
 }
 
 // helpCommand: kairo help [COMMAND [SUB]].
@@ -377,7 +402,7 @@ func helpCommand(args []string) error {
 		fmt.Fprint(os.Stdout, topUsage())
 		return errHelpShown
 	}
-	if _, ok := leafCommands[args[0]]; ok {
+	if findLeaf(args[0]) != nil {
 		return run([]string{args[0], "--help"})
 	}
 	if findGroup(args[0]) == nil {
@@ -398,8 +423,8 @@ func newFlags(name string) *flag.FlagSet {
 
 // commandSynopsis is "kairo NAME ARGS" and the summary of a command.
 func commandSynopsis(name string) (string, string) {
-	if leaf, ok := leafCommands[name]; ok {
-		return "kairo " + name + " " + leaf.args, leaf.summary
+	if leaf := findLeaf(name); leaf != nil {
+		return "kairo " + name + " " + leaf.args, leaf.help
 	}
 	group, sub, _ := strings.Cut(name, " ")
 	if g := findGroup(group); g != nil {

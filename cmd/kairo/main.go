@@ -50,38 +50,10 @@ func runCommand(args []string) error {
 	if isHelpArg(args[0]) {
 		return helpCommand(args[1:])
 	}
-	switch args[0] {
-	case "serve":
-		return serve(args[1:])
-	case "agent":
-		return agentCommand(args[1:])
-	case "execution":
-		return executionCommand(args[1:])
-	case "project":
-		return projectCommand(args[1:])
-	case "queue":
-		return queueCommand(args[1:])
-	case "task":
-		return taskCommand(args[1:])
-	case "logs":
-		return logsCommand(args[1:])
-	case "resource":
-		return resourceCommand(args[1:])
-	case "node":
-		return nodeCommand(args[1:])
-	case "db":
-		return dbCommand(args[1:])
-	case "token":
-		return tokenCommand(args[1:])
-	case "tls":
-		return tlsCommand(args[1:])
-	case "doctor":
-		return doctorCommand(args[1:])
-	case "version":
-		return versionCommand(args[1:])
-	default:
-		return unknownCommand(nil, args[0])
+	if c := findCommand(args[0]); c != nil {
+		return c.run(args[1:])
 	}
+	return unknownCommand(nil, args[0])
 }
 
 // usage is the error for kairo without a command.

@@ -18,19 +18,6 @@ import (
 	"kairo/internal/store"
 )
 
-func taskCommand(args []string) error {
-	return dispatch(findGroup("task"), args, map[string]func([]string) error{
-		"list":   taskList,
-		"show":   taskShow,
-		"logs":   taskLogs,
-		"wait":   taskWait,
-		"pause":  func(a []string) error { return scopeAction("task", "pause", a) },
-		"resume": func(a []string) error { return scopeAction("task", "resume", a) },
-		"cancel": taskCancel,
-		"rerun":  taskRerun,
-	})
-}
-
 // taskRef names a task: PROJECT [QUEUE] TASK. The queue is "" until given or
 // looked up (resolveQueue); routes under /api/projects/{p}/tasks/{t} do not
 // need it.
