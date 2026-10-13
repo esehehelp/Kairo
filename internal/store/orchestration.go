@@ -383,7 +383,7 @@ func taskDependenciesReady(ctx context.Context, tx *sql.Tx, taskScopeID string) 
 
 func loadCurrentTaskExecution(ctx context.Context, tx *sql.Tx, taskScopeID string) (currentTaskExecution, error) {
 	var value currentTaskExecution
-	err := tx.QueryRowContext(ctx, `SELECT te.execution_ordinal,e.id,e.state,e.terminal_cause,a.id,a.state,a.exit_code,a.exit_signal,a.continuation_ref,l.state FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id LEFT JOIN leases l ON l.id=(SELECT id FROM leases WHERE execution_id=e.id ORDER BY created_at DESC LIMIT 1) WHERE te.task_scope_id=? ORDER BY te.execution_ordinal DESC LIMIT 1`, taskScopeID).Scan(&value.Ordinal, &value.ExecutionID, &value.ExecutionState, &value.TerminalCause, &value.AttemptID, &value.AttemptState, &value.ExitCode, &value.ExitSignal, &value.ContinuationRef, &value.LeaseState)
+	err := tx.QueryRowContext(ctx, `SELECT te.execution_ordinal,e.id,e.state,e.terminal_cause,a.id,a.state,a.exit_code,a.exit_signal,a.continuation_ref,l.state FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+` WHERE te.task_scope_id=? ORDER BY te.execution_ordinal DESC LIMIT 1`, taskScopeID).Scan(&value.Ordinal, &value.ExecutionID, &value.ExecutionState, &value.TerminalCause, &value.AttemptID, &value.AttemptState, &value.ExitCode, &value.ExitSignal, &value.ContinuationRef, &value.LeaseState)
 	return value, err
 }
 

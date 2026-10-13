@@ -41,13 +41,13 @@ type RerunResult struct {
 }
 
 type taskRow struct {
-	scopeID, projectID, project, queue, name, state string
-	result                                          sql.NullString
+	scopeID, projectID, queueScopeID, project, queue, name, state, spec string
+	result                                                              sql.NullString
 }
 
 func loadTaskTx(ctx context.Context, q queryer, project, name string) (taskRow, error) {
 	var t taskRow
-	err := q.QueryRowContext(ctx, `SELECT t.task_scope_id,t.project_scope_id,p.external_key,t.queue_name,t.name,t.state,t.result_json FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id WHERE p.kind='project' AND p.external_key=? AND t.name=?`, project, name).Scan(&t.scopeID, &t.projectID, &t.project, &t.queue, &t.name, &t.state, &t.result)
+	err := q.QueryRowContext(ctx, `SELECT t.task_scope_id,t.project_scope_id,ts.parent_id,p.external_key,t.queue_name,t.name,t.state,t.spec_json,t.result_json FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id JOIN coordination_scopes ts ON ts.id=t.task_scope_id WHERE p.kind='project' AND p.external_key=? AND t.name=?`, project, name).Scan(&t.scopeID, &t.projectID, &t.queueScopeID, &t.project, &t.queue, &t.name, &t.state, &t.spec, &t.result)
 	if errors.Is(err, sql.ErrNoRows) {
 		return taskRow{}, ErrNotFound
 	}

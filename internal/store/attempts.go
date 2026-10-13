@@ -16,6 +16,23 @@ type AttemptView struct {
 	StderrPath *string `json:"stderr_path,omitempty"`
 }
 
+// attemptColumns reads an AttemptView (scanAttempt) from attempts a.
+const attemptColumns = `a.id,a.execution_id,a.state,a.executor_id,a.coordination_epoch,a.pid,a.process_identity,a.exit_code,a.exit_signal,a.continuation_ref,a.progress_json,a.started_at,a.last_heartbeat_at,a.checkpointed_at,a.exited_at,a.quiesced_at,a.stdout_path,a.stderr_path`
+
+// scanAttempt reads the extra destinations, then attemptColumns.
+func scanAttempt(rows *sql.Rows, extra ...any) (AttemptView, error) {
+	var v AttemptView
+	var progress sql.NullString
+	dest := append(extra, &v.ID, &v.ExecutionID, &v.State, &v.ExecutorID, &v.CoordinationEpoch, &v.PID, &v.ProcessIdentity, &v.ExitCode, &v.ExitSignal, &v.ContinuationRef, &progress, &v.StartedAt, &v.LastHeartbeatAt, &v.CheckpointedAt, &v.ExitedAt, &v.QuiescedAt, &v.StdoutPath, &v.StderrPath)
+	if err := rows.Scan(dest...); err != nil {
+		return AttemptView{}, err
+	}
+	if progress.Valid && json.Valid([]byte(progress.String)) {
+		v.Progress = json.RawMessage(progress.String)
+	}
+	return v, nil
+}
+
 type AttemptFilter struct {
 	ProjectScopeID string
 	ExecutionID    string
@@ -26,8 +43,7 @@ type AttemptFilter struct {
 // ListAttempts returns attempts newest first (by authorization time), with
 // their last reported progress.
 func (s *Store) ListAttempts(ctx context.Context, filter AttemptFilter) ([]AttemptView, error) {
-	query := `SELECT a.id,a.execution_id,a.state,a.executor_id,a.coordination_epoch,a.pid,a.process_identity,a.exit_code,a.exit_signal,a.continuation_ref,a.progress_json,a.started_at,a.last_heartbeat_at,a.checkpointed_at,a.exited_at,a.quiesced_at,a.stdout_path,a.stderr_path
-		FROM attempts a JOIN execution_requests e ON e.id=a.execution_id`
+	query := `SELECT ` + attemptColumns + ` FROM attempts a JOIN execution_requests e ON e.id=a.execution_id`
 	conditions := make([]string, 0, 3)
 	args := make([]any, 0, 4)
 	if filter.ProjectScopeID != "" {
@@ -61,13 +77,9 @@ func (s *Store) ListAttempts(ctx context.Context, filter AttemptFilter) ([]Attem
 	defer rows.Close()
 	out := make([]AttemptView, 0)
 	for rows.Next() {
-		var v AttemptView
-		var progress sql.NullString
-		if err = rows.Scan(&v.ID, &v.ExecutionID, &v.State, &v.ExecutorID, &v.CoordinationEpoch, &v.PID, &v.ProcessIdentity, &v.ExitCode, &v.ExitSignal, &v.ContinuationRef, &progress, &v.StartedAt, &v.LastHeartbeatAt, &v.CheckpointedAt, &v.ExitedAt, &v.QuiescedAt, &v.StdoutPath, &v.StderrPath); err != nil {
+		v, err := scanAttempt(rows)
+		if err != nil {
 			return nil, err
-		}
-		if progress.Valid && json.Valid([]byte(progress.String)) {
-			v.Progress = json.RawMessage(progress.String)
 		}
 		out = append(out, v)
 	}
