@@ -137,7 +137,7 @@ func taskList(args []string) error {
 		return usageError("task list requires PROJECT")
 	}
 	project := positional[0]
-	q := projectQuery{match: *match, states: splitList(*state), live: *live}
+	q := projectQuery{match: *match, states: splitList(*state), live: *live, raw: *asJSON}
 	if q.since, err = sinceStamp(*since); err != nil {
 		return err
 	}
@@ -150,16 +150,7 @@ func taskList(args []string) error {
 		resp, err = fetchProject(client, project, q)
 	} else {
 		// Default: what is live plus what changed in the last day.
-		liveQuery := q
-		liveQuery.live = true
-		if resp, err = fetchProject(client, project, liveQuery); err == nil {
-			recentQuery := q
-			recentQuery.since = nowFunc().Add(-24 * time.Hour).UTC().Format(time.RFC3339)
-			var recent *projectResponse
-			if recent, err = fetchProject(client, project, recentQuery); err == nil {
-				resp.merge(recent)
-			}
-		}
+		resp, err = fetchLiveAndRecent(client, project, q, nowFunc().Add(-24*time.Hour))
 	}
 	if notFound(err) {
 		return fmt.Errorf("project %s not found (%v)", project, err)

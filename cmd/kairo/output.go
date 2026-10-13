@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -87,21 +89,6 @@ func (a attemptInfo) ended() bool {
 		return true
 	}
 	return a.ExitedAt != nil || a.QuiescedAt != nil
-}
-
-// logBytes is stdout+stderr size, and whether the daemon reported either.
-func (a attemptInfo) logBytes() (int64, bool) {
-	if a.StdoutBytes == nil && a.StderrBytes == nil {
-		return 0, false
-	}
-	var n int64
-	if a.StdoutBytes != nil {
-		n += *a.StdoutBytes
-	}
-	if a.StderrBytes != nil {
-		n += *a.StderrBytes
-	}
-	return n, true
 }
 
 type gangRankInfo struct {
@@ -214,106 +201,109 @@ type projectQuery struct {
 	states []string
 	live   bool
 	since  string // RFC3339
+	// raw keeps the response as the daemon sent it (task list --json).
+	raw bool
 }
 
 func (q projectQuery) path(project string) string {
-	values := url.Values{}
-	for _, t := range q.tasks {
-		values.Add("task", t)
-	}
-	if q.match != "" {
-		values.Set("match", q.match)
-	}
-	if len(q.states) > 0 {
-		values.Set("state", strings.Join(q.states, ","))
-	}
+	values := url.Values{"task": q.tasks, "match": {q.match}, "state": {strings.Join(q.states, ",")}, "since": {q.since}}
 	if q.live {
 		values.Set("live", "1")
 	}
-	if q.since != "" {
-		values.Set("since", q.since)
-	}
-	path := "/api/projects/" + url.PathEscape(project)
-	if encoded := values.Encode(); encoded != "" {
-		path += "?" + encoded
-	}
-	return path
+	return withQuery("/api/projects/"+url.PathEscape(project), values)
 }
 
-// keep applies the filter on the client too: a daemon that predates the
-// filters returns every task.
+// keep applies the filter on the client: a daemon that predates the filters
+// returns every task.
 func (q projectQuery) keep(t taskStatus) bool {
-	if len(q.tasks) > 0 && !contains(q.tasks, t.Name) {
+	if len(q.tasks) > 0 && !slices.Contains(q.tasks, t.Name) {
 		return false
 	}
 	if q.match != "" && !strings.HasPrefix(t.Name, q.match) {
 		return false
 	}
-	if len(q.states) > 0 && !contains(q.states, t.State) {
+	if len(q.states) > 0 && !slices.Contains(q.states, t.State) {
 		return false
 	}
 	if q.live && !liveState(t.State) {
 		return false
 	}
-	if q.since != "" {
-		since, err1 := time.Parse(time.RFC3339Nano, q.since)
-		updated, err2 := time.Parse(time.RFC3339Nano, t.UpdatedAt)
-		if err1 == nil && (err2 != nil || updated.Before(since)) {
+	if since, ok := parseStamp(&q.since); ok {
+		if updated, ok := parseStamp(&t.UpdatedAt); !ok || updated.Before(since) {
 			return false
 		}
 	}
 	return true
 }
 
-func contains(list []string, value string) bool {
-	for _, v := range list {
-		if v == value {
-			return true
-		}
-	}
-	return false
-}
-
-// projectResponse is GET /api/projects/{p}: the parsed status and each task
-// as the daemon sent it (for --json).
+// projectResponse is GET /api/projects/{p}: the parsed status and, with
+// projectQuery.raw, the body and each task as the daemon sent them.
 type projectResponse struct {
 	Project  projectStatus
-	RawTasks map[string]json.RawMessage
-	raw      map[string]json.RawMessage
+	payload  []byte
+	rawTasks map[string]json.RawMessage
 }
 
 func fetchProject(client *apiClient, project string, q projectQuery) (*projectResponse, error) {
-	payload, err := client.call("GET", q.path(project), nil)
+	payload, err := client.call(http.MethodGet, q.path(project), nil)
 	if err != nil {
 		return nil, err
 	}
 	var wire struct {
-		Project json.RawMessage `json:"project"`
+		Project struct {
+			Name        string            `json:"name"`
+			StateCounts map[string]int    `json:"state_counts"`
+			Tasks       []json.RawMessage `json:"tasks"`
+		} `json:"project"`
 	}
 	if err := json.Unmarshal(payload, &wire); err != nil {
 		return nil, fmt.Errorf("decode project status: %w", err)
 	}
-	resp := &projectResponse{RawTasks: map[string]json.RawMessage{}}
-	if err := json.Unmarshal(wire.Project, &resp.Project); err != nil {
-		return nil, fmt.Errorf("decode project status: %w", err)
+	resp := &projectResponse{Project: projectStatus{Name: wire.Project.Name, StateCounts: wire.Project.StateCounts}}
+	if q.raw {
+		resp.payload, resp.rawTasks = payload, map[string]json.RawMessage{}
 	}
-	if err := json.Unmarshal(wire.Project, &resp.raw); err != nil {
-		return nil, fmt.Errorf("decode project status: %w", err)
-	}
-	var rawTasks []json.RawMessage
-	_ = json.Unmarshal(resp.raw["tasks"], &rawTasks)
-	kept := resp.Project.Tasks[:0]
-	for i, t := range resp.Project.Tasks {
-		if !q.keep(t) {
+	// A daemon that counts the states also applies the filters.
+	filtered := wire.Project.StateCounts != nil
+	for _, raw := range wire.Project.Tasks {
+		var t taskStatus
+		if err := json.Unmarshal(raw, &t); err != nil {
+			return nil, fmt.Errorf("decode project status: %w", err)
+		}
+		if !filtered && !q.keep(t) {
 			continue
 		}
-		kept = append(kept, t)
-		if i < len(rawTasks) {
-			resp.RawTasks[t.Name] = rawTasks[i]
+		resp.Project.Tasks = append(resp.Project.Tasks, t)
+		if q.raw {
+			resp.rawTasks[t.Name] = raw
 		}
 	}
-	resp.Project.Tasks = kept
 	return resp, nil
+}
+
+// fetchLiveAndRecent is the tasks of q that are live plus those updated
+// since: two calls, made at once, merged.
+func fetchLiveAndRecent(client *apiClient, project string, q projectQuery, since time.Time) (*projectResponse, error) {
+	liveQuery, recentQuery := q, q
+	liveQuery.live = true
+	recentQuery.since = since.UTC().Format(time.RFC3339)
+	var recent *projectResponse
+	var recentErr error
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		recent, recentErr = fetchProject(client, project, recentQuery)
+	}()
+	live, err := fetchProject(client, project, liveQuery)
+	<-done
+	if err == nil {
+		err = recentErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	live.merge(recent)
+	return live, nil
 }
 
 // merge adds the tasks of other not already in r.
@@ -325,27 +315,32 @@ func (r *projectResponse) merge(other *projectResponse) {
 	for _, t := range other.Project.Tasks {
 		if !seen[t.Name] {
 			r.Project.Tasks = append(r.Project.Tasks, t)
-			r.RawTasks[t.Name] = other.RawTasks[t.Name]
+			if r.rawTasks != nil {
+				r.rawTasks[t.Name] = other.rawTasks[t.Name]
+			}
 		}
 	}
 }
 
-// json is the response with only the kept tasks, in their current order.
+// json is the response (fetched with projectQuery.raw) with only the kept
+// tasks, in their current order.
 func (r *projectResponse) json() ([]byte, error) {
-	out := map[string]json.RawMessage{}
-	for k, v := range r.raw {
-		out[k] = v
+	var wire struct {
+		Project map[string]json.RawMessage `json:"project"`
+	}
+	if err := json.Unmarshal(r.payload, &wire); err != nil {
+		return nil, err
 	}
 	tasks := make([]json.RawMessage, 0, len(r.Project.Tasks))
 	for _, t := range r.Project.Tasks {
-		tasks = append(tasks, r.RawTasks[t.Name])
+		tasks = append(tasks, r.rawTasks[t.Name])
 	}
 	encoded, err := json.Marshal(tasks)
 	if err != nil {
 		return nil, err
 	}
-	out["tasks"] = encoded
-	return json.MarshalIndent(map[string]any{"project": out}, "", "  ")
+	wire.Project["tasks"] = encoded
+	return json.MarshalIndent(map[string]any{"project": wire.Project}, "", "  ")
 }
 
 // stateOrder is how summaries list the states.

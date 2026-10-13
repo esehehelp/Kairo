@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -149,13 +150,13 @@ func (f *contractAPI) project(r *http.Request) map[string]any {
 		state, _ := task["state"].(string)
 		counts[state]++
 		name, _ := task["name"].(string)
-		if names := q["task"]; len(names) > 0 && !contains(names, name) {
+		if names := q["task"]; len(names) > 0 && !slices.Contains(names, name) {
 			continue
 		}
 		if m := q.Get("match"); m != "" && !strings.HasPrefix(name, m) {
 			continue
 		}
-		if len(states) > 0 && !contains(states, state) {
+		if len(states) > 0 && !slices.Contains(states, state) {
 			continue
 		}
 		if q.Get("live") == "1" && !liveState(state) {
