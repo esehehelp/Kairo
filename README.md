@@ -40,6 +40,9 @@ go run ./cmd/kairo doctor
 go run ./cmd/kairo project validate examples/project-spec.toml
 go run ./cmd/kairo project apply examples/project-spec.toml
 go run ./cmd/kairo project status example-project
+go run ./cmd/kairo task list example-project
+go run ./cmd/kairo task wait example-project train
+go run ./cmd/kairo task logs example-project train --follow
 go run ./cmd/kairo execution submit examples/execution.toml
 go run ./cmd/kairo execution list --project llm-develop
 go run ./cmd/kairo project pause llm-develop
@@ -76,11 +79,36 @@ merge key by key, arrays and scalars are replaced, and an omitted `depends_on`
 becomes `[]`. Digests are those of the fully written Task, so `[defaults]`
 never changes what the daemon stores.
 
-`kairo task cancel [--dry-run] PROJECT QUEUE TASK` ends a paused or never
-started Task: it withdraws every execution of the Task that has not started
-(every gang rank included), after which the Task is marked failed. It refuses
-while an execution is started and not terminal (pause the Task first) and
-leaves checkpoints and other outputs alone. `kairo project prune [--write]
+`[tasks.execution.env]` (and `[env]` in an execution TOML) sets environment
+variables of the attempt, instead of `powershell -Command '$env:...'` or
+`env A=B` wrappers. `[defaults.execution.env]` merges key by key, and `env` on
+a `[[tasks.execution.gang.ranks]]` entry merges over the task's for that rank.
+The attempt inherits the executor's environment, then the declared variables
+(which may replace `PATH` and the like; on Windows names compare without
+case), then what Kairo sets (`KAIRO_*`, gang variables, `CUDA_VISIBLE_DEVICES`
+for bound GPUs), which a declaration cannot override. Names starting with
+`KAIRO_` and `WSLENV` are rejected, and so is `CUDA_VISIBLE_DEVICES` on an
+execution with an exclusive GPU request (a CPU task may set it to `-1`). WSL
+executors pass the variables through `WSLENV` as written (`/u`, no path
+translation). `argv[0]` is still looked up on the executor's own `PATH`.
+Env is part of the task's digest and is stored and shown in plain text to any
+reader of the API: it is not a place for secrets.
+
+`kairo task cancel [--dry-run] PROJECT [QUEUE] TASK` ends a Task that is not
+running: one still waiting for its dependencies, a pending or blocked one, or
+a paused one. It withdraws every execution of the Task that has not started
+(every gang rank included) and marks the Task `cancelled`; dependants are
+blocked as for a failed Task. It refuses while an execution is started and
+not terminal (pause the Task first, or `task pause --force`) and leaves
+checkpoints and other outputs alone. An execution withdrawn with `execution
+withdraw` before it started also leaves its Task `cancelled`.
+
+`kairo task rerun PROJECT [QUEUE] TASK` runs the same declaration of a
+`failed`, `stopped`, `cancelled` or `blocked` Task again, as its next
+Execution (reason `rerun`), once all of its executions have ended. Dependants
+that were blocked only because a dependency did not succeed return to
+`pending` and run if their dependencies now succeed. A changed declaration
+still needs a new Task name. `kairo project prune [--write]
 FILE` reports (or, with `--write`, rewrites FILE to) the Tasks that can still
 run and the dependencies they need, keeping each kept Task's digest.
 
@@ -96,6 +124,30 @@ at once and runs `VACUUM`.
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
 limits. GPU exclusion is a coordination guarantee among Kairo participants;
 external processes are observed and excluded but cannot be physically fenced.
+
+## Following tasks from the CLI
+
+Every command group answers `help`, `--help` and `-h` (`kairo task --help`,
+`kairo task wait --help`); a mistyped subcommand gets a suggestion. QUEUE may
+be left out of task commands for Tasks declared by a ProjectSpec.
+
+| Command | What it prints |
+|---|---|
+| `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
+| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates, every execution with its attempts, nodes, exit, log paths and sizes, gang ranks, and why a waiting execution waits |
+| `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | the last N lines (default 50, `0` all) of the latest attempt's logs, also for attempts on agent nodes; `-f` follows until the attempt has exited and its logs stopped growing |
+| `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | one line per state change (`10:01:33 hello running -> succeeded`), `DOWN`/`UP` while the daemon is unreachable, `STALL` when a running Task's logs stop growing for D; exits 0 when all succeeded (or started), 1 when one ended otherwise, 2 on timeout, 3 on a usage or lookup error |
+| `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | state changes, progress (once a minute per Task) and a summary every 10 min; with `--exit-when-idle` it exits when nothing is pending or running (1 if a watched Task did not succeed) |
+| `kairo execution logs EXECUTION_ID`, `kairo logs ATTEMPT_ID` | the same logs by execution or attempt |
+| `kairo version` | the CLI's and the daemon's build; `doctor` warns when they differ |
+
+The line-oriented `wait` and `watch` suit a background monitor: each line is
+one event and is flushed at once. `project status PROJECT` still prints JSON
+and takes `--task NAME` (repeatable), `--match`, `--state`, `--live` and
+`--since`. `project apply` prints the Tasks it declared (`--json` for the
+response) and, on a conflict, names every Task declared before with different
+content; `project validate` prints one line (`--json` for the expanded Tasks).
+A command the daemon does not know (a CLI newer than the daemon) says so.
 
 ## Authentication and TLS
 
@@ -209,6 +261,8 @@ unless `insecure_http = true`.
 | GET | `/api/whoami` | any token |
 | POST | `/api/projects` (apply a ProjectSpec) | admin |
 | GET | `/api/projects/{project}` | read |
+| GET | `/api/projects/{project}/tasks/{task}` | read |
+| POST | `/api/projects/{project}/tasks/{task}/cancel`, `/rerun` | admin |
 | POST, GET | `/api/executions` | admin, read |
 | GET | `/api/executions/{id}` | read |
 | POST | `/api/executions/{id}/withdraw` | admin |
@@ -225,15 +279,33 @@ unless `insecure_http = true`.
 | GET | `/api/worker/commands` | worker |
 | POST | `/api/worker/commands/{command}/acks` | worker |
 
-Errors are `{"error": ..., "code": ...}`. An empty `actor` in a pause, resume
-or quarantine request is recorded as the token's name.
+Errors are `{"error": ..., "code": ...}`. An empty `actor` in a pause, resume,
+quarantine, cancel or rerun request is recorded as the token's name.
+`/health` and `/api/whoami` include the build `version`.
+
+`GET /api/projects/{project}` takes the filters `task` (repeatable),
+`match` (name prefix), `state` (comma list), `live=1` (pending or running) and
+`since` (RFC 3339, by `updated_at`); `state_counts` counts every Task whatever
+the filter. Each Task has `created_at` and `updated_at`, and each execution its
+attempt, executor, timestamps and latest progress without `detail`.
+`GET /api/projects/{project}/tasks/{task}` adds the declaration (`spec`),
+dependencies, dependants, scope gates, and per execution its attempts (with
+log paths and sizes), gang ranks and `waiting` reasons. Apply answers
+`{"project", "spec_digest", "idempotent", "created", "unchanged"}`. Cancel
+takes `{"actor", "dry_run"}` and answers `{"task", "state", "withdrawn",
+"dry_run"}`; rerun takes `{"actor", "request_id"}` (a repeated `request_id`
+returns the first answer) and answers `{"task", "state", "ordinal",
+"unblocked"}`; a Task in the wrong state is `409 task_conflict`.
 
 `GET /api/attempts/{id}/log?stream=stdout|stderr&offset=N&limit=M` returns an
 attempt's log as the daemon holds it (written by its own executor or shipped
 by an agent), as raw bytes: `stream` defaults to `stderr`, `limit` to 1 MiB
-(at most 8 MiB). `Kairo-Log-Size` is the current size and
-`Kairo-Log-Next-Offset` where to continue; an offset past the end returns an
-empty body, and an unknown attempt or log is `not_found`. `kairo logs
+(at most 8 MiB); `tail=N` instead returns the last N bytes. `Kairo-Log-Size`
+(also `X-Kairo-Log-Size`) is the current size, `X-Kairo-Log-Offset` the
+offset of the first byte returned and `Kairo-Log-Next-Offset` where to
+continue; an offset past the end or a log not written yet returns an empty
+body, and an unknown attempt or log is `not_found`. Only files inside the
+daemon's `log_directory` are served. `kairo logs
 [--stream stdout|stderr] [--tail N] [--follow] ATTEMPT_ID` prints it (`--tail`
 the last N bytes, `--follow` polls every 2 s until Ctrl-C), and the Python
 SDK's `KairoClient.attempt_log` reads one slice.
@@ -476,6 +548,12 @@ replace the binaries and configurations, start the daemon, then the agents,
 check `kairo doctor` and `kairo resource status`, and resume. Code that queued
 executions will load (scripts, the editable SDK) must not change while they
 wait.
+
+Replace the agents together with the daemon: an agent older than the daemon
+starts attempts without their declared `env`. A daemon opening an older
+database migrates it in place (the `cancelled` task state, reruns, the `env`
+column); keep the backup, since an older binary would read a rerun Task's
+earlier execution as its outcome again.
 
 ## Verification
 
