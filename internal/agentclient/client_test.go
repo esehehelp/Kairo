@@ -31,6 +31,10 @@ func TestHelperProcess(t *testing.T) {
 		return
 	}
 	fmt.Fprintln(os.Stderr, "hello from remote attempt")
+	if got := os.Getenv("AGENTCLIENT_DECLARED"); got != "from the spec" {
+		fmt.Fprintln(os.Stderr, "declared env:", got)
+		os.Exit(5)
+	}
 	caPEM, err := tlsutil.CAFromEnv(os.Getenv("KAIRO_API_CA"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "KAIRO_API_CA:", err)
@@ -261,10 +265,12 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 		CWD:              t.TempDir(),
 		ExecutorSelector: selector,
 		Exclusive:        []store.ExclusiveRequest{{Kind: "gpu", Count: 1}},
+		Env:              map[string]string{"AGENTCLIENT_DECLARED": "from the spec"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENTCLIENT_TEST_HELPER", "1")
+	t.Setenv("AGENTCLIENT_DECLARED", "from the agent")
 
 	nodeLogs := t.TempDir()
 	exec := executor.NewLocal("remote-exec", c, nodeLogs, nil)

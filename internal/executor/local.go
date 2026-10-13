@@ -9,10 +9,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
 
+	"kairo/internal/envspec"
 	"kairo/internal/processidentity"
 	"kairo/internal/provider"
 	"kairo/internal/store"
@@ -608,12 +610,48 @@ func (e *Local) launchEnv(launch *store.Launch) []string {
 	return env
 }
 
-// command builds the attempt's launcher. The parent's own KAIRO_* variables
-// (an operator's KAIRO_TOKEN, say) never reach the attempt. A WSL attempt gets
-// its variables through WSLENV rather than on the wsl.exe command line, which
+// envKey is how the OS compares variable names: case-insensitively on Windows
+// (a declared Path replaces the parent's PATH).
+func envKey(name string) string {
+	if runtime.GOOS == "windows" {
+		return strings.ToUpper(name)
+	}
+	return name
+}
+
+// userEnv is the execution's declared env in name order, without the names
+// Kairo sets itself for this launch.
+func userEnv(declared map[string]string, launchEnv []string) []string {
+	kairo := map[string]bool{}
+	for _, kv := range launchEnv {
+		name, _, _ := strings.Cut(kv, "=")
+		kairo[envKey(name)] = true
+	}
+	env := make([]string, 0, len(declared))
+	for _, name := range envspec.Names(declared) {
+		if !kairo[envKey(name)] {
+			env = append(env, name+"="+declared[name])
+		}
+	}
+	return env
+}
+
+// command builds the attempt's launcher. Its environment is the parent's,
+// then the execution's declared env, then Kairo's launch variables; a later
+// layer replaces a name of an earlier one, so declared env overrides PATH and
+// the like but never what Kairo sets. The parent's own KAIRO_* variables (an
+// operator's KAIRO_TOKEN, say) never reach the attempt. A WSL attempt gets its
+// variables through WSLENV rather than on the wsl.exe command line, which
 // other tools can read and log.
 func (e *Local) command(launch *store.Launch) *exec.Cmd {
 	launchEnv := e.launchEnv(launch)
+	// own is what the attempt is given on top of the parent's environment.
+	own := append(userEnv(launch.Env, launchEnv), launchEnv...)
+	replaced := map[string]bool{}
+	for _, kv := range own {
+		name, _, _ := strings.Cut(kv, "=")
+		replaced[envKey(name)] = true
+	}
 	parent := make([]string, 0, len(os.Environ()))
 	wslenv := ""
 	for _, kv := range os.Environ() {
@@ -622,6 +660,7 @@ func (e *Local) command(launch *store.Launch) *exec.Cmd {
 		case strings.HasPrefix(strings.ToUpper(name), "KAIRO_"):
 		case strings.EqualFold(name, "WSLENV"):
 			wslenv = value
+		case replaced[envKey(name)]:
 		default:
 			parent = append(parent, kv)
 		}
@@ -638,11 +677,11 @@ func (e *Local) command(launch *store.Launch) *exec.Cmd {
 		if wslenv != "" {
 			shared = append(shared, wslenv)
 		}
-		for _, kv := range launchEnv {
+		for _, kv := range own {
 			name, _, _ := strings.Cut(kv, "=")
 			shared = append(shared, name+"/u")
 		}
-		cmd.Env = append(append(parent, launchEnv...), "WSLENV="+strings.Join(shared, ":"))
+		cmd.Env = append(append(parent, own...), "WSLENV="+strings.Join(shared, ":"))
 		return cmd
 	}
 	cmd := exec.Command(launch.Argv[0], launch.Argv[1:]...)
@@ -650,7 +689,7 @@ func (e *Local) command(launch *store.Launch) *exec.Cmd {
 	if wslenv != "" {
 		parent = append(parent, "WSLENV="+wslenv)
 	}
-	cmd.Env = append(parent, launchEnv...)
+	cmd.Env = append(parent, own...)
 	return cmd
 }
 

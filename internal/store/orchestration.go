@@ -363,11 +363,12 @@ func planTaskExecution(ctx context.Context, tx *sql.Tx, task orchestrationTaskRo
 		InputContinuationRef: continuation,
 		Exclusive:            convertExclusive(template.Exclusive),
 		Capacity:             convertCapacity(template.Capacity),
+		Env:                  template.Env,
 	}
 	if template.Gang != nil {
 		gang := GangSpec{Size: template.Gang.Size, Port: template.Gang.Port}
 		for _, r := range template.Gang.Ranks {
-			rank := GangRank{Rank: r.Rank, Argv: r.Argv, CWD: r.CWD}
+			rank := GangRank{Rank: r.Rank, Argv: r.Argv, CWD: r.CWD, Env: r.Env}
 			if r.Executor != nil {
 				if rank.ExecutorSelector, err = json.Marshal(r.Executor); err != nil {
 					return err

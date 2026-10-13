@@ -24,6 +24,7 @@ type submitExecutionRequest struct {
 	} `json:"executor"`
 	Exclusive []store.ExclusiveRequest `json:"exclusive"`
 	Capacity  store.CapacityRequest    `json:"capacity"`
+	Env       map[string]string        `json:"env,omitempty"`
 }
 
 func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
@@ -46,6 +47,7 @@ func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		Argv:            body.Argv, CWD: body.CWD, ExecutorSelector: executor,
 		Priority: body.Priority, Checkpointable: body.Checkpointable, Preemptible: body.Preemptible,
 		InputContinuationRef: body.InputContinuationRef, Exclusive: body.Exclusive, Capacity: body.Capacity,
+		Env: body.Env,
 	})
 	if err != nil {
 		writeError(w, err)
