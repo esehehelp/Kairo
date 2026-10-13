@@ -304,10 +304,16 @@ func TestOpenMigratesAnOlderDatabaseForCancelAndRerun(t *testing.T) {
 		if status.Tasks[2].Name != "train" || status.Tasks[2].State != "failed" {
 			t.Fatalf("train: %+v", status.Tasks[2])
 		}
-		for table, want := range map[string]string{"orchestration_tasks": "'cancelled'", "orchestration_decisions": "'abandoned'"} {
+		for _, w := range []struct{ table, want string }{{"orchestration_tasks", "'cancelled'"}, {"orchestration_decisions", "'abandoned'"}, {"orchestration_decisions", "'rerun'"}} {
 			var ddl string
-			if err = st.db.QueryRow(`SELECT sql FROM sqlite_master WHERE name=?`, table).Scan(&ddl); err != nil || !strings.Contains(ddl, want) {
-				t.Fatalf("%s not widened: %s %v", table, ddl, err)
+			if err = st.db.QueryRow(`SELECT sql FROM sqlite_master WHERE name=?`, w.table).Scan(&ddl); err != nil || !strings.Contains(ddl, w.want) {
+				t.Fatalf("%s not widened: %s %v", w.table, ddl, err)
+			}
+		}
+		for _, index := range []string{"orchestration_task_dependents_idx", "executions_task_idx"} {
+			var n int
+			if err = st.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&n); err != nil || n != 1 {
+				t.Fatalf("index %s: %d %v", index, n, err)
 			}
 		}
 		st.Close()

@@ -62,7 +62,7 @@ type liveExecution struct {
 // liveTaskExecutionsTx lists the executions of a task's scope that are not
 // terminal, every gang rank included.
 func liveTaskExecutionsTx(ctx context.Context, tx *sql.Tx, task taskRow) ([]liveExecution, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id,state,started_at IS NOT NULL FROM execution_requests WHERE project_scope_id=? AND task_scope_id=? AND state!='terminal' ORDER BY submitted_at,id`, task.projectID, task.scopeID)
+	rows, err := tx.QueryContext(ctx, `SELECT id,state,started_at IS NOT NULL FROM execution_requests WHERE task_scope_id=? AND state!='terminal' ORDER BY submitted_at,id`, task.scopeID)
 	if err != nil {
 		return nil, err
 	}
