@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"kairo/internal/buildinfo"
 	"kairo/internal/tlsutil"
 )
 
@@ -24,9 +26,8 @@ const defaultAPIURL = "https://127.0.0.1:7474"
 var errNoToken = errors.New("no Kairo token: set KAIRO_TOKEN, KAIRO_TOKEN_FILE or run `kairo token create ... --save`")
 
 func apiFlag(fs *flag.FlagSet) *string {
-	return fs.String("api", "", "Kairo API URL (default: $KAIRO_API, else "+defaultAPIURL+"); "+
-		"token from $KAIRO_TOKEN, else the file $KAIRO_TOKEN_FILE, else <user config dir>/kairo/token; "+
-		"CA from $KAIRO_CA_FILE, else <user config dir>/kairo/ca.pem if present, else the system roots")
+	// The token and CA resolution is in `kairo help` (remoteNote).
+	return fs.String("api", "", "Kairo API URL (default: $KAIRO_API, else "+defaultAPIURL+"; token and CA: see kairo help)")
 }
 
 // apiClient is the one HTTP client of every CLI command: it talks to one
@@ -35,6 +36,8 @@ type apiClient struct {
 	baseURL string
 	token   string
 	http    *http.Client
+	// ctx, when set, cancels requests (Ctrl+C while following or waiting).
+	ctx context.Context
 }
 
 // kairoConfigDir is <user config dir>/kairo, where the token and CA live.
@@ -201,20 +204,30 @@ func isLoopback(host string) bool {
 
 // do sends one request and returns the status and body whatever the status.
 func (c *apiClient) do(method, path string, body any) (int, []byte, error) {
+	status, _, payload, err := c.send(method, path, body)
+	return status, payload, err
+}
+
+// send is do with the response headers.
+func (c *apiClient) send(method, path string, body any) (int, http.Header, []byte, error) {
 	if c.token == "" && path != "/health" {
-		return 0, nil, errNoToken
+		return 0, nil, nil, errNoToken
 	}
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
 		reader = bytes.NewReader(encoded)
 	}
-	req, err := http.NewRequest(method, c.baseURL+path, reader)
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, reader)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -224,14 +237,26 @@ func (c *apiClient) do(method, path string, body any) (int, []byte, error) {
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
 	payload, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
-	return resp.StatusCode, payload, nil
+	return resp.StatusCode, resp.Header, payload, nil
+}
+
+// getJSON decodes the body of a 2xx GET response into target.
+func (c *apiClient) getJSON(path string, target any) error {
+	payload, err := c.call(http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(payload, target); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	return nil
 }
 
 // call returns the body of a 2xx response, and an error naming the status and
@@ -257,7 +282,40 @@ func (c *apiClient) print(method, path string, body any) error {
 	return err
 }
 
+// apiError is a non-2xx response.
+type apiError struct {
+	Status int
+	Code   string // the server's error code ("" when the body was not a Kairo error)
+	// Message is the server's error message (or the start of the body).
+	Message string
+	// RouteMissing: the daemon's mux, not a handler, answered: the daemon does
+	// not know the route, so it is likely older than this CLI.
+	RouteMissing bool
+	text         string
+}
+
+func (e *apiError) Error() string { return e.text }
+
+// notFound reports whether err is a 404 for a missing entity (not a missing route).
+func notFound(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && ae.Status == http.StatusNotFound && !ae.RouteMissing
+}
+
+// routeMissing reports whether err says the daemon does not know the route.
+func routeMissing(err error) bool {
+	var ae *apiError
+	return errors.As(err, &ae) && ae.RouteMissing
+}
+
+// olderDaemonHint is added when the daemon does not know a route.
+func olderDaemonHint() string {
+	return "the daemon may be older than this CLI (cli " + buildinfo.Version() + "); restart it from the same build"
+}
+
 // httpError turns a non-2xx response into "HTTP 403 forbidden: <message>".
+// Handlers answer {"error", "code"}; the daemon's mux answers an unknown route
+// with a plain-text 404 (a 405 for a known path with another method).
 func httpError(status int, payload []byte) error {
 	var wire struct {
 		Error string `json:"error"`
@@ -268,7 +326,7 @@ func httpError(status int, payload []byte) error {
 		if code == "" {
 			code = strings.ToLower(http.StatusText(status))
 		}
-		return fmt.Errorf("HTTP %d %s: %s", status, code, wire.Error)
+		return &apiError{Status: status, Code: wire.Code, Message: wire.Error, text: fmt.Sprintf("HTTP %d %s: %s", status, code, wire.Error)}
 	}
 	text := strings.TrimSpace(string(payload))
 	if len(text) > 200 {
@@ -281,5 +339,9 @@ func httpError(status int, payload []byte) error {
 	if text != "" {
 		message += ": " + text
 	}
-	return errors.New(message)
+	missing := status == http.StatusNotFound || status == http.StatusMethodNotAllowed
+	if missing {
+		message += "; " + olderDaemonHint()
+	}
+	return &apiError{Status: status, Message: text, RouteMissing: missing, text: message}
 }

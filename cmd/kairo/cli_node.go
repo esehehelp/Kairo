@@ -1,9 +1,6 @@
 package main
 
 import (
-	"errors"
-	"flag"
-	"fmt"
 	"net/http"
 	"net/url"
 	"os"
@@ -11,35 +8,51 @@ import (
 
 // nodeCommand: kairo node <quarantine|release> <NODE_ID|--all>, kairo node quarantine-status.
 func nodeCommand(args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: kairo node <quarantine|release> <NODE_ID|--all> | kairo node quarantine-status")
+	handler := func(action string) func([]string) error {
+		return func(a []string) error { return nodeAction(action, a) }
 	}
-	action := args[0]
-	fs := flag.NewFlagSet("node "+action, flag.ContinueOnError)
+	return dispatch(findGroup("node"), args, map[string]func([]string) error{
+		"quarantine": handler("quarantine"), "release": handler("release"), "quarantine-status": handler("quarantine-status"),
+	})
+}
+
+func nodeAction(action string, args []string) error {
+	fs := newFlags("node " + action)
 	api := apiFlag(fs)
-	all := fs.Bool("all", false, "every node")
-	reason := fs.String("reason", "operator request", "quarantine reason")
-	actor := fs.String("actor", defaultActor(), "who acts")
-	if err := fs.Parse(args[1:]); err != nil {
-		return err
+	var all *bool
+	var reason, actor *string
+	if action != "quarantine-status" {
+		all = fs.Bool("all", false, "every node")
+		actor = fs.String("actor", defaultActor(), "who acts")
 	}
-	if action != "quarantine" && action != "release" && action != "quarantine-status" {
-		return fmt.Errorf("unknown node command %q", action)
+	if action == "quarantine" {
+		reason = fs.String("reason", "operator request", "quarantine reason")
 	}
-	client, err := newAPIClient(*api)
+	positional, err := parseFlags(fs, args)
 	if err != nil {
 		return err
 	}
 	if action == "quarantine-status" {
+		if len(positional) != 0 {
+			return usageError("node quarantine-status accepts no arguments")
+		}
+		client, err := newAPIClient(*api)
+		if err != nil {
+			return err
+		}
 		return client.print(http.MethodGet, "/api/nodes/quarantines", nil)
 	}
 	node := "all"
 	switch {
-	case *all && fs.NArg() == 0:
-	case !*all && fs.NArg() == 1:
-		node = fs.Arg(0)
+	case *all && len(positional) == 0:
+	case !*all && len(positional) == 1:
+		node = positional[0]
 	default:
-		return fmt.Errorf("node %s takes exactly one of NODE_ID or --all", action)
+		return usageError("node %s takes exactly one of NODE_ID or --all", action)
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
 	}
 	path := "/api/nodes/" + url.PathEscape(node) + "/quarantine"
 	if action == "quarantine" {

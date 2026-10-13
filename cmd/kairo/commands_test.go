@@ -137,7 +137,8 @@ preemptible = false
 	}
 }
 
-func TestTaskCancelWithdrawsEveryExecutionNotStarted(t *testing.T) {
+// A daemon without the cancel route: the CLI withdraws the executions itself.
+func TestTaskCancelOnAnOlderDaemonWithdrawsEveryExecutionNotStarted(t *testing.T) {
 	var mu sync.Mutex
 	var posts []string
 	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -154,6 +155,8 @@ func TestTaskCancelWithdrawsEveryExecutionNotStarted(t *testing.T) {
 				{"id": "exe_rank0", "state": "waiting"},
 				{"id": "exe_rank1", "state": "waiting"},
 			}})
+		case strings.HasSuffix(r.URL.Path, "/cancel"):
+			http.NotFound(w, r)
 		case r.Method == http.MethodPost:
 			mu.Lock()
 			posts = append(posts, r.URL.Path)
@@ -176,9 +179,13 @@ func TestTaskCancelWithdrawsEveryExecutionNotStarted(t *testing.T) {
 	}
 }
 
-func TestTaskCancelRefusesARunningExecution(t *testing.T) {
+func TestTaskCancelOnAnOlderDaemonRefusesARunningExecution(t *testing.T) {
 	posted := false
 	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/cancel") {
+			http.NotFound(w, r)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method == http.MethodPost {
 			posted = true

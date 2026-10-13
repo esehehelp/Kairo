@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -26,13 +25,14 @@ import (
 // the daemon's store through its /api/agent operations. Attempt logs are written
 // locally and shipped into the daemon's log directory.
 func agentCommand(args []string) error {
-	fs := flag.NewFlagSet("agent", flag.ContinueOnError)
+	fs := newFlags("agent")
 	configPath := fs.String("config", "", "agent TOML configuration")
-	if err := fs.Parse(args); err != nil {
+	positional, err := parseFlags(fs, leafArgs(args))
+	if err != nil {
 		return err
 	}
-	if *configPath == "" {
-		return errors.New("agent requires --config")
+	if *configPath == "" || len(positional) != 0 {
+		return usageError("agent requires --config AGENT.toml and no arguments")
 	}
 	cfg, err := config.LoadAgent(*configPath)
 	if err != nil {

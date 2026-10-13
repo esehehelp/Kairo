@@ -2,8 +2,6 @@ package main
 
 import (
 	"encoding/json"
-	"errors"
-	"flag"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -116,16 +114,17 @@ func pruneSpec(source []byte, states map[string]string) (pruneResult, error) {
 // projectPrune: `kairo project prune [--api URL] [--write] FILE` asks the daemon for the project's task states
 // and rewrites FILE (with --write) to the Tasks that can still run and their dependencies.
 func projectPrune(args []string) error {
-	fs := flag.NewFlagSet("project prune", flag.ContinueOnError)
+	fs := newFlags("project prune")
 	api := apiFlag(fs)
 	write := fs.Bool("write", false, "rewrite the file (default: only report)")
-	if err := fs.Parse(args); err != nil {
+	positional, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() != 1 {
-		return errors.New("project prune requires a project TOML file")
+	if len(positional) != 1 {
+		return usageError("project prune requires a project TOML file")
 	}
-	path := fs.Arg(0)
+	path := positional[0]
 	source, err := os.ReadFile(path)
 	if err != nil {
 		return err

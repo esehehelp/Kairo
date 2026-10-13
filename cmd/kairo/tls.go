@@ -1,8 +1,6 @@
 package main
 
 import (
-	"errors"
-	"flag"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -24,29 +22,29 @@ func (l *stringList) Set(value string) error {
 // a server certificate; kairo tls issue --dir DIR --host H [...] re-issues the
 // server certificate from the existing CA.
 func tlsCommand(args []string) error {
-	const usageText = "usage: kairo tls <init|issue> --dir DIR --host HOST [--host HOST ...]"
-	if len(args) == 0 {
-		return errors.New(usageText)
-	}
-	action := args[0]
-	if action != "init" && action != "issue" {
-		return fmt.Errorf("unknown tls command %q; %s", action, usageText)
-	}
-	fs := flag.NewFlagSet("tls "+action, flag.ContinueOnError)
+	return dispatch(findGroup("tls"), args, map[string]func([]string) error{
+		"init":  func(a []string) error { return tlsAction("init", a) },
+		"issue": func(a []string) error { return tlsAction("issue", a) },
+	})
+}
+
+func tlsAction(action string, args []string) error {
+	fs := newFlags("tls " + action)
 	dir := fs.String("dir", "", "directory holding the TLS material")
 	var hosts stringList
 	fs.Var(&hosts, "host", "server IP address or DNS name (repeatable)")
-	if err := fs.Parse(args[1:]); err != nil {
+	positional, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() != 0 {
-		return fmt.Errorf("tls %s takes no positional arguments; %s", action, usageText)
+	if len(positional) != 0 {
+		return usageError("tls %s takes no positional arguments", action)
 	}
 	if *dir == "" {
-		return fmt.Errorf("tls %s requires --dir", action)
+		return usageError("tls %s requires --dir", action)
 	}
 	if len(hosts) == 0 {
-		return fmt.Errorf("tls %s requires at least one --host", action)
+		return usageError("tls %s requires at least one --host", action)
 	}
 	var written []string
 	if action == "init" {

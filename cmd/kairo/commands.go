@@ -16,67 +16,92 @@ import (
 )
 
 func executionCommand(args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: kairo execution <submit|list|show|withdraw>")
+	return dispatch(findGroup("execution"), args, map[string]func([]string) error{
+		"submit":   executionSubmit,
+		"list":     executionList,
+		"show":     func(a []string) error { return executionByID("show", a) },
+		"withdraw": func(a []string) error { return executionByID("withdraw", a) },
+		"logs":     executionLogs,
+	})
+}
+
+func executionSubmit(args []string) error {
+	fs := newFlags("execution submit")
+	api := apiFlag(fs)
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return err
 	}
-	action := args[0]
-	fs := flag.NewFlagSet("execution "+action, flag.ContinueOnError)
+	if len(positional) != 1 {
+		return usageError("execution submit requires an execution TOML file")
+	}
+	source, err := os.ReadFile(positional[0])
+	if err != nil {
+		return err
+	}
+	parsed, err := manifest.Parse(source)
+	if err != nil {
+		return err
+	}
+	body, err := submitBody(parsed.Manifest)
+	if err != nil {
+		return err
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	return client.print(http.MethodPost, "/api/executions", body)
+}
+
+func executionList(args []string) error {
+	fs := newFlags("execution list")
 	api := apiFlag(fs)
 	project := fs.String("project", "", "filter by project")
 	queue := fs.String("queue", "", "filter by queue")
 	task := fs.String("task", "", "filter by task")
 	state := fs.String("state", "", "filter by coordination state")
 	limit := fs.Int("limit", 100, "maximum results")
-	if err := fs.Parse(args[1:]); err != nil {
+	positional, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
-	if action != "submit" && action != "list" && action != "show" && action != "withdraw" {
-		return fmt.Errorf("unknown execution command %q", action)
+	if len(positional) != 0 {
+		return usageError("execution list accepts only flags")
 	}
 	client, err := newAPIClient(*api)
 	if err != nil {
 		return err
 	}
-	switch action {
-	case "submit":
-		if fs.NArg() != 1 {
-			return errors.New("execution submit requires an execution TOML file")
-		}
-		source, err := os.ReadFile(fs.Arg(0))
-		if err != nil {
-			return err
-		}
-		parsed, err := manifest.Parse(source)
-		if err != nil {
-			return err
-		}
-		body, err := submitBody(parsed.Manifest)
-		if err != nil {
-			return err
-		}
-		return client.print(http.MethodPost, "/api/executions", body)
-	case "list":
-		if fs.NArg() != 0 {
-			return errors.New("execution list accepts only flags")
-		}
-		query := url.Values{}
-		query.Set("project", *project)
-		query.Set("queue", *queue)
-		query.Set("task", *task)
-		query.Set("state", *state)
-		query.Set("limit", fmt.Sprint(*limit))
-		return client.print(http.MethodGet, withQuery("/api/executions", query), nil)
-	case "show", "withdraw":
-		if fs.NArg() != 1 {
-			return fmt.Errorf("execution %s requires EXECUTION_ID", action)
-		}
-		path := "/api/executions/" + url.PathEscape(fs.Arg(0))
-		if action == "withdraw" {
-			return client.print(http.MethodPost, path+"/withdraw", nil)
-		}
-		return client.print(http.MethodGet, path, nil)
+	query := url.Values{}
+	query.Set("project", *project)
+	query.Set("queue", *queue)
+	query.Set("task", *task)
+	query.Set("state", *state)
+	query.Set("limit", fmt.Sprint(*limit))
+	return client.print(http.MethodGet, withQuery("/api/executions", query), nil)
+}
+
+// executionByID: execution show|withdraw EXECUTION_ID.
+func executionByID(action string, args []string) error {
+	fs := newFlags("execution " + action)
+	api := apiFlag(fs)
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return err
 	}
-	return nil
+	if len(positional) != 1 {
+		return usageError("execution %s requires EXECUTION_ID", action)
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	path := "/api/executions/" + url.PathEscape(positional[0])
+	if action == "withdraw" {
+		return client.print(http.MethodPost, path+"/withdraw", nil)
+	}
+	return client.print(http.MethodGet, path, nil)
 }
 
 // submitBody is the execution file as the API takes it: schema_version
@@ -94,155 +119,94 @@ func submitBody(m manifest.Manifest) (map[string]any, error) {
 	return body, nil
 }
 
-const projectUsage = "usage: kairo project <validate|apply|status|prune|pause|resume>"
-
 func projectCommand(args []string) error {
-	if len(args) == 0 {
-		return errors.New(projectUsage)
-	}
-	switch args[0] {
-	case "validate", "apply", "status":
-		return projectSpecCommand(args)
-	case "prune":
-		return projectPrune(args[1:])
-	case "pause", "resume":
-		return scopeCommand("project", args)
-	default:
-		return fmt.Errorf("unknown project command %q; %s", args[0], projectUsage)
-	}
+	return dispatch(findGroup("project"), args, map[string]func([]string) error{
+		"validate": projectValidate,
+		"apply":    projectApply,
+		"status":   projectStatusCommand,
+		"watch":    projectWatch,
+		"prune":    projectPrune,
+		"pause":    func(a []string) error { return scopeAction("project", "pause", a) },
+		"resume":   func(a []string) error { return scopeAction("project", "resume", a) },
+	})
 }
 
 func queueCommand(args []string) error {
-	return scopeCommand("queue", args)
-}
-
-func taskCommand(args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: kairo task <pause|resume|cancel>")
-	}
-	if args[0] == "cancel" {
-		return taskCancel(args[1:])
-	}
-	return scopeCommand("task", args)
-}
-
-// taskCancel ends a paused (or never started) Task: it withdraws every execution
-// of the Task that has not started, every gang rank included. Once all of its
-// current executions are terminal before an attempt, the orchestrator marks the
-// Task failed ("execution terminal before attempt"), so it no longer shows as
-// running and `project prune` drops it. Checkpoints and other outputs are left
-// alone. It refuses while an execution is started and not terminal: pause the
-// Task first.
-func taskCancel(args []string) error {
-	fs := flag.NewFlagSet("task cancel", flag.ContinueOnError)
-	api := apiFlag(fs)
-	dryRun := fs.Bool("dry-run", false, "list the executions that would be withdrawn")
-	if err := fs.Parse(args); err != nil {
-		return err
-	}
-	if fs.NArg() != 3 {
-		return errors.New("task cancel requires PROJECT QUEUE TASK")
-	}
-	client, err := newAPIClient(*api)
-	if err != nil {
-		return err
-	}
-	query := url.Values{"project": {fs.Arg(0)}, "queue": {fs.Arg(1)}, "task": {fs.Arg(2)}, "limit": {"1000"}}
-	payload, err := client.call(http.MethodGet, withQuery("/api/executions", query), nil)
-	if err != nil {
-		return err
-	}
-	var listed struct {
-		Executions []struct {
-			ID        string  `json:"id"`
-			State     string  `json:"state"`
-			StartedAt *string `json:"started_at"`
-		} `json:"executions"`
-	}
-	if err := json.Unmarshal(payload, &listed); err != nil {
-		return err
-	}
-	var todo []string
-	for _, e := range listed.Executions {
-		if e.State == "terminal" {
-			continue
-		}
-		if e.StartedAt != nil || e.State == "started" {
-			return fmt.Errorf("execution %s of %s/%s/%s is running (%s); pause the task first, or end it with `task pause --force`", e.ID, fs.Arg(0), fs.Arg(1), fs.Arg(2), e.State)
-		}
-		todo = append(todo, e.ID)
-	}
-	if len(todo) == 0 {
-		fmt.Println("nothing to withdraw")
-		return nil
-	}
-	for _, id := range todo {
-		if *dryRun {
-			fmt.Println("would withdraw", id)
-			continue
-		}
-		if _, err := client.call(http.MethodPost, "/api/executions/"+url.PathEscape(id)+"/withdraw", nil); err != nil {
-			return fmt.Errorf("withdraw %s: %w", id, err)
-		}
-		fmt.Println("withdrawn", id)
-	}
-	return nil
-}
-
-func scopeCommand(kind string, args []string) error {
-	if len(args) == 0 {
-		return fmt.Errorf("usage: kairo %s <pause|resume>", kind)
-	}
-	action := args[0]
-	if action != "pause" && action != "resume" {
-		return fmt.Errorf("unknown %s command %q", kind, action)
-	}
-	fs := flag.NewFlagSet(kind+" "+action, flag.ContinueOnError)
-	api := apiFlag(fs)
-	noWait := fs.Bool("no-wait", false, "return after the pause operation is persisted")
-	waitTimeout := fs.Duration("timeout", 30*time.Minute, "maximum time to wait for pause convergence")
-	actor := fs.String("actor", os.Getenv("USERNAME"), "audit actor")
-	requestID := fs.String("request-id", id.New("cli"), "idempotency request ID")
-	// --force / -f: end the captured executions instead of suspending them.
-	force := fs.Bool("force", false, "force stop: terminate running process trees (graceful stop, then kill after --grace) and withdraw unstarted executions; the task ends stopped")
-	fs.BoolVar(force, "f", false, "shorthand for --force")
-	grace := fs.Duration("grace", 30*time.Second, "with --force: time between the graceful stop and the kill")
-	reason := fs.String("reason", "", "with --force: why the work is stopped (recorded)")
-	if err := fs.Parse(args[1:]); err != nil {
-		return err
-	}
-	want := map[string]int{"project": 1, "queue": 2, "task": 3}[kind]
-	if fs.NArg() != want {
-		return fmt.Errorf("%s %s requires %s", kind, action, scopeArguments(kind))
-	}
-	if action == "resume" && *noWait {
-		return errors.New("--no-wait applies only to pause")
-	}
-	graceSet, reasonSet := false, false
-	fs.Visit(func(f *flag.Flag) {
-		graceSet = graceSet || f.Name == "grace"
-		reasonSet = reasonSet || f.Name == "reason"
+	return dispatch(findGroup("queue"), args, map[string]func([]string) error{
+		"pause":  func(a []string) error { return scopeAction("queue", "pause", a) },
+		"resume": func(a []string) error { return scopeAction("queue", "resume", a) },
 	})
-	if !*force && (graceSet || reasonSet) {
-		return errors.New("--grace and --reason apply only to pause --force")
+}
+
+// scopeAction pauses or resumes a project, a queue or a task. A task may be
+// named without its queue: it is looked up.
+func scopeAction(kind, action string, args []string) error {
+	fs := newFlags(kind + " " + action)
+	api := apiFlag(fs)
+	var noWait, force *bool
+	var waitTimeout, grace *time.Duration
+	var requestID, reason *string
+	actor := fs.String("actor", defaultActor(), "audit actor")
+	if action == "pause" {
+		noWait = fs.Bool("no-wait", false, "return after the pause operation is persisted")
+		waitTimeout = fs.Duration("timeout", 30*time.Minute, "maximum time to wait for pause convergence")
+		requestID = fs.String("request-id", id.New("cli"), "idempotency request ID")
+		// --force / -f: end the captured executions instead of suspending them.
+		force = fs.Bool("force", false, "force stop: terminate running process trees (graceful stop, then kill after --grace) and withdraw unstarted executions; the task ends stopped")
+		fs.BoolVar(force, "f", false, "shorthand for --force")
+		grace = fs.Duration("grace", 30*time.Second, "with --force: time between the graceful stop and the kill")
+		reason = fs.String("reason", "", "with --force: why the work is stopped (recorded)")
 	}
-	if action == "resume" && *force {
-		return errors.New("--force applies only to pause")
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return err
 	}
-	if *grace < 0 || *grace > time.Hour {
-		return errors.New("--grace must be between 0 and 1h")
+	var ref taskRef
+	switch kind {
+	case "project":
+		if len(positional) != 1 {
+			return usageError("project %s requires PROJECT", action)
+		}
+		ref.project = positional[0]
+	case "queue":
+		if len(positional) != 2 {
+			return usageError("queue %s requires PROJECT QUEUE", action)
+		}
+		ref.project, ref.queue = positional[0], positional[1]
+	default:
+		if ref, err = parseTaskRef("task "+action, positional); err != nil {
+			return err
+		}
+	}
+	if action == "pause" {
+		graceSet, reasonSet := false, false
+		fs.Visit(func(f *flag.Flag) {
+			graceSet = graceSet || f.Name == "grace"
+			reasonSet = reasonSet || f.Name == "reason"
+		})
+		if !*force && (graceSet || reasonSet) {
+			return usageError("--grace and --reason apply only to pause --force")
+		}
+		if *grace < 0 || *grace > time.Hour {
+			return usageError("--grace must be between 0 and 1h")
+		}
 	}
 
 	client, err := newAPIClient(*api)
 	if err != nil {
 		return err
 	}
-	query := url.Values{"project": {fs.Arg(0)}}
-	if want > 1 {
-		query.Set("queue", fs.Arg(1))
+	if kind == "task" {
+		if err := ref.resolveQueue(client); err != nil {
+			return err
+		}
 	}
-	if want > 2 {
-		query.Set("task", fs.Arg(2))
+	query := url.Values{"project": {ref.project}}
+	if kind != "project" {
+		query.Set("queue", ref.queue)
+	}
+	if kind == "task" {
+		query.Set("task", ref.task)
 	}
 	payload, err := client.call(http.MethodGet, withQuery("/api/scopes", query), nil)
 	if err != nil {
@@ -261,13 +225,14 @@ func scopeCommand(kind string, args []string) error {
 	}
 	path := "/api/scopes/" + url.PathEscape(listed.Scopes[0].ID) + "/" + action
 	var body any
-	if action == "pause" && *force {
+	switch {
+	case action == "pause" && *force:
 		// Only a forced pause sends these fields.
 		body = map[string]any{"actor": *actor, "request_id": *requestID, "force": true,
 			"grace_seconds": int((*grace + time.Second - 1) / time.Second), "reason": *reason}
-	} else if action == "pause" {
+	case action == "pause":
 		body = map[string]string{"actor": *actor, "request_id": *requestID}
-	} else {
+	default:
 		body = map[string]string{"actor": *actor}
 	}
 	payload, err = client.call(http.MethodPost, path, body)
@@ -386,32 +351,34 @@ func (r pauseOperationResponse) forceSummary() []string {
 	return lines
 }
 
-func scopeArguments(kind string) string {
-	switch kind {
-	case "project":
-		return "PROJECT"
-	case "queue":
-		return "PROJECT QUEUE"
-	default:
-		return "PROJECT QUEUE TASK"
+func resourceCommand(args []string) error {
+	handler := func(action string) func([]string) error {
+		return func(a []string) error { return resourceAction(action, a) }
 	}
+	return dispatch(findGroup("resource"), args, map[string]func([]string) error{
+		"status": handler("status"), "quarantine": handler("quarantine"),
+		"enable": handler("enable"), "reconcile": handler("reconcile"),
+	})
 }
 
-func resourceCommand(args []string) error {
-	if len(args) == 0 {
-		return errors.New("usage: kairo resource <status|quarantine|enable|reconcile>")
-	}
-	action := args[0]
-	fs := flag.NewFlagSet("resource "+action, flag.ContinueOnError)
+func resourceAction(action string, args []string) error {
+	fs := newFlags("resource " + action)
 	api := apiFlag(fs)
-	reason := fs.String("reason", "operator request", "quarantine reason")
-	confirmAbsent := fs.Bool("confirm-process-absent", false, "confirm provider/OS evidence that stale attempt processes are absent")
-	if err := fs.Parse(args[1:]); err != nil {
+	var reason *string
+	var confirmAbsent *bool
+	switch action {
+	case "quarantine":
+		reason = fs.String("reason", "operator request", "quarantine reason")
+	case "reconcile":
+		confirmAbsent = fs.Bool("confirm-process-absent", false, "confirm provider/OS evidence that stale attempt processes are absent")
+	}
+	positional, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
 	if action == "status" {
-		if fs.NArg() != 0 {
-			return errors.New("resource status accepts no arguments")
+		if len(positional) != 0 {
+			return usageError("resource status accepts no arguments")
 		}
 		client, err := newAPIClient(*api)
 		if err != nil {
@@ -419,18 +386,15 @@ func resourceCommand(args []string) error {
 		}
 		return printResources(client)
 	}
-	if fs.NArg() != 1 {
-		return fmt.Errorf("resource %s requires RESOURCE_ID", action)
-	}
-	if action != "quarantine" && action != "enable" && action != "reconcile" {
-		return fmt.Errorf("unknown resource command %q", action)
+	if len(positional) != 1 {
+		return usageError("resource %s requires RESOURCE_ID", action)
 	}
 	var body any
 	if action == "quarantine" {
 		body = map[string]string{"reason": *reason}
 	} else if action == "reconcile" {
 		if !*confirmAbsent {
-			return errors.New("resource reconcile requires --confirm-process-absent")
+			return usageError("resource reconcile requires --confirm-process-absent")
 		}
 		body = map[string]bool{"confirm_process_absent": true}
 	}
@@ -438,7 +402,7 @@ func resourceCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	return client.print(http.MethodPost, "/api/resources/"+url.PathEscape(fs.Arg(0))+"/"+action, body)
+	return client.print(http.MethodPost, "/api/resources/"+url.PathEscape(positional[0])+"/"+action, body)
 }
 
 func printResources(client *apiClient) error {
@@ -446,13 +410,14 @@ func printResources(client *apiClient) error {
 }
 
 func doctorCommand(args []string) error {
-	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	fs := newFlags("doctor")
 	api := apiFlag(fs)
-	if err := fs.Parse(args); err != nil {
+	positional, err := parseFlags(fs, leafArgs(args))
+	if err != nil {
 		return err
 	}
-	if fs.NArg() != 0 {
-		return errors.New("doctor accepts no arguments")
+	if len(positional) != 0 {
+		return usageError("doctor accepts no arguments")
 	}
 	client, err := newAPIClient(*api)
 	if err != nil {
@@ -463,9 +428,10 @@ func doctorCommand(args []string) error {
 		return fmt.Errorf("%s: %w", client.baseURL, err)
 	}
 	var who struct {
-		Name   string `json:"name"`
-		Role   string `json:"role"`
-		NodeID string `json:"node_id"`
+		Name    string `json:"name"`
+		Role    string `json:"role"`
+		NodeID  string `json:"node_id"`
+		Version string `json:"version"`
 	}
 	if err := json.Unmarshal(payload, &who); err != nil {
 		return fmt.Errorf("decode whoami: %w", err)
@@ -475,6 +441,7 @@ func doctorCommand(args []string) error {
 		line += " for node " + who.NodeID
 	}
 	fmt.Println(line)
+	printVersions(who.Version, nil)
 	return printResources(client)
 }
 

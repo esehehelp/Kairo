@@ -2,25 +2,25 @@ package main
 
 import (
 	"context"
-	"errors"
-	"flag"
 	"fmt"
 	"os"
 )
 
 // dbCommand maintains the daemon's database directly (like kairo token).
 func dbCommand(args []string) error {
-	if len(args) == 0 || args[0] != "compact" {
-		return errors.New("usage: kairo db compact (--config DAEMON.toml | --db PATH)")
-	}
-	fs := flag.NewFlagSet("db compact", flag.ContinueOnError)
+	return dispatch(findGroup("db"), args, map[string]func([]string) error{"compact": dbCompact})
+}
+
+func dbCompact(args []string) error {
+	fs := newFlags("db compact")
 	configPath := fs.String("config", "", "daemon configuration (its database_path)")
 	dbPath := fs.String("db", "", "database file")
-	if err := fs.Parse(args[1:]); err != nil {
+	positional, err := parseFlags(fs, args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() != 0 {
-		return errors.New("usage: kairo db compact (--config DAEMON.toml | --db PATH)")
+	if len(positional) != 0 {
+		return usageError("usage: kairo db compact (--config DAEMON.toml | --db PATH)")
 	}
 	st, err := openTokenStore(*configPath, *dbPath)
 	if err != nil {

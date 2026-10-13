@@ -14,7 +14,7 @@ func TestCommandGroupsAreDispatched(t *testing.T) {
 			t.Fatalf("command group %q was not dispatched: %v", command, err)
 		}
 	}
-	if err := run([]string{"nonsense"}); err == nil || err.Error() != usage().Error() {
+	if err := run([]string{"nonsense"}); err == nil || !strings.Contains(err.Error(), `unknown command "nonsense"`) || exitCode(err) != exitUsage {
 		t.Fatalf("unknown command: %v", err)
 	}
 }
@@ -22,7 +22,7 @@ func TestCommandGroupsAreDispatched(t *testing.T) {
 func TestProjectUsageListsEverySubcommand(t *testing.T) {
 	for _, args := range [][]string{{"project"}, {"project", "nonsense"}} {
 		err := run(args)
-		if err == nil || !strings.Contains(err.Error(), "validate|apply|status|prune|pause|resume") {
+		if err == nil || !strings.Contains(err.Error(), "validate|apply|status|watch|prune|pause|resume") {
 			t.Fatalf("%v: %v", args, err)
 		}
 	}

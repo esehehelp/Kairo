@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -30,14 +29,26 @@ func main() {
 	// A Windows force stop runs this binary as a short-lived CTRL_BREAK helper.
 	executor.RunHelper(os.Args)
 	if err := run(os.Args[1:]); err != nil {
-		fmt.Fprintln(os.Stderr, "kairo:", err)
-		os.Exit(1)
+		reportError(os.Stderr, err)
+		os.Exit(exitCode(err))
 	}
 }
 
+// run runs one command; a command that printed its help returns nil.
 func run(args []string) error {
+	err := runCommand(args)
+	if errors.Is(err, errHelpShown) {
+		return nil
+	}
+	return err
+}
+
+func runCommand(args []string) error {
 	if len(args) == 0 {
 		return usage()
+	}
+	if isHelpArg(args[0]) {
+		return helpCommand(args[1:])
 	}
 	switch args[0] {
 	case "serve":
@@ -64,23 +75,35 @@ func run(args []string) error {
 		return tlsCommand(args[1:])
 	case "doctor":
 		return doctorCommand(args[1:])
+	case "version":
+		return versionCommand(args[1:])
 	default:
-		return usage()
+		return unknownCommand(nil, args[0])
 	}
 }
 
+// usage is the error for kairo without a command.
 func usage() error {
-	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|token|tls|db|doctor>")
+	return &cliError{code: exitUsage, msg: topUsage(), raw: true}
+}
+
+// leafArgs handles "kairo CMD help" for a command without subcommands.
+func leafArgs(args []string) []string {
+	if len(args) > 0 && args[0] == "help" {
+		return []string{"--help"}
+	}
+	return args
 }
 
 func serve(args []string) error {
-	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs := newFlags("serve")
 	configPath := fs.String("config", "", "daemon TOML configuration")
-	if err := fs.Parse(args); err != nil {
+	positional, err := parseFlags(fs, leafArgs(args))
+	if err != nil {
 		return err
 	}
-	if *configPath == "" {
-		return errors.New("serve requires --config")
+	if *configPath == "" || len(positional) != 0 {
+		return usageError("serve requires --config DAEMON.toml and no arguments")
 	}
 	daemonConfig, err := config.Load(*configPath)
 	if err != nil {

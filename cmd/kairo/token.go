@@ -15,21 +15,19 @@ import (
 	"kairo/internal/store"
 )
 
-const tokenUsage = "usage: kairo token create (--config DAEMON.toml | --db PATH) --name NAME --role admin|read|node [--node NODE_ID] [--save | --out FILE] [--force]\n" +
-	"       kairo token list (--config DAEMON.toml | --db PATH)\n" +
-	"       kairo token revoke (--config DAEMON.toml | --db PATH) ID_OR_NAME"
-
 // tokenCommand manages API tokens directly in the daemon's database (it is
 // safe while the daemon runs), so the first admin token needs no token.
 func tokenCommand(args []string) error {
-	if len(args) == 0 {
-		return errors.New(tokenUsage)
+	handler := func(action string) func([]string) error {
+		return func(a []string) error { return tokenAction(action, a) }
 	}
-	action := args[0]
-	if action != "create" && action != "list" && action != "revoke" {
-		return fmt.Errorf("unknown token command %q\n%s", action, tokenUsage)
-	}
-	fs := flag.NewFlagSet("token "+action, flag.ContinueOnError)
+	return dispatch(findGroup("token"), args, map[string]func([]string) error{
+		"create": handler("create"), "list": handler("list"), "revoke": handler("revoke"),
+	})
+}
+
+func tokenAction(action string, args []string) error {
+	fs := newFlags("token " + action)
 	configPath := fs.String("config", "", "daemon TOML configuration (its database_path is used)")
 	dbPath := fs.String("db", "", "daemon database path")
 	var name, role, node, out *string
@@ -42,7 +40,7 @@ func tokenCommand(args []string) error {
 		out = fs.String("out", "", "write the token to FILE instead of printing it")
 		force = fs.Bool("force", false, "with --save or --out: replace an existing file")
 	}
-	positional, err := parseInterleaved(fs, args[1:])
+	positional, err := parseFlags(fs, args)
 	if err != nil {
 		return err
 	}
