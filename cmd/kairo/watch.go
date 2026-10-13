@@ -134,13 +134,11 @@ func taskWait(args []string) error {
 	case *interval <= 0:
 		return &cliError{code: waitNotFound, msg: "--interval must be positive"}
 	}
-	client, err := newAPIClient(*api)
+	ctx, client, stop, err := newInterruptibleClient(*api)
 	if err != nil {
 		return withCode(err, waitNotFound)
 	}
-	ctx, stop := interruptContext()
 	defer stop()
-	client.ctx = ctx
 	w := &waiter{client: client, project: positional[0], names: positional[1:], match: *match,
 		started: *until == "started", timeout: *timeout, interval: *interval, stall: *stall}
 	return w.run(ctx)
@@ -334,12 +332,10 @@ func (w *waiter) checkStalls(tasks []taskStatus, now time.Time) {
 			continue
 		}
 		latest := detail.Executions[len(detail.Executions)-1]
-		attempts := append([]attemptInfo(nil), latest.Attempts...)
-		sortAttempts(attempts)
-		if len(attempts) == 0 {
+		if len(latest.Attempts) == 0 {
 			continue
 		}
-		a := attempts[len(attempts)-1]
+		a := latest.Attempts[0]
 		size, ok := a.logBytes()
 		if !ok {
 			continue
@@ -373,13 +369,11 @@ func projectWatch(args []string) error {
 	if *interval <= 0 {
 		return usageError("--interval must be positive")
 	}
-	client, err := newAPIClient(*api)
+	ctx, client, stop, err := newInterruptibleClient(*api)
 	if err != nil {
 		return err
 	}
-	ctx, stop := interruptContext()
 	defer stop()
-	client.ctx = ctx
 	return watchProject(ctx, client, positional[0], *match, *interval, *exitWhenIdle)
 }
 

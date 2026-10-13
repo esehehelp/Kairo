@@ -166,6 +166,36 @@ func (t taskStatus) latest() *taskExecution {
 	return best
 }
 
+// execution is the execution `--attempt which` names: the latest, or #N
+// (nil when there is none).
+func (t taskStatus) execution(which string) *taskExecution {
+	if which == "latest" {
+		return t.latest()
+	}
+	n, err := strconv.Atoi(which)
+	if err != nil {
+		return nil
+	}
+	for i := range t.Executions {
+		if t.Executions[i].Ordinal == n {
+			return &t.Executions[i]
+		}
+	}
+	return nil
+}
+
+// attemptID is the execution's attempt, "" before it starts: an execution
+// has at most one.
+func (e *taskExecution) attemptID() string {
+	if len(e.Attempts) > 0 {
+		return e.Attempts[0].ID
+	}
+	if e.AttemptID != nil {
+		return *e.AttemptID
+	}
+	return ""
+}
+
 // Task states.
 func terminalState(state string) bool {
 	switch state {
