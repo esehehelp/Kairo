@@ -619,21 +619,10 @@ func envKey(name string) string {
 	return name
 }
 
-// userEnv is the execution's declared env in name order, without the names
-// Kairo sets itself for this launch.
-func userEnv(declared map[string]string, launchEnv []string) []string {
-	kairo := map[string]bool{}
-	for _, kv := range launchEnv {
-		name, _, _ := strings.Cut(kv, "=")
-		kairo[envKey(name)] = true
-	}
-	env := make([]string, 0, len(declared))
-	for _, name := range envspec.Names(declared) {
-		if !kairo[envKey(name)] {
-			env = append(env, name+"="+declared[name])
-		}
-	}
-	return env
+// envName is the name of a NAME=value entry.
+func envName(kv string) string {
+	name, _, _ := strings.Cut(kv, "=")
+	return name
 }
 
 // command builds the attempt's launcher. Its environment is the parent's,
@@ -645,22 +634,31 @@ func userEnv(declared map[string]string, launchEnv []string) []string {
 // other tools can read and log.
 func (e *Local) command(launch *store.Launch) *exec.Cmd {
 	launchEnv := e.launchEnv(launch)
-	// own is what the attempt is given on top of the parent's environment.
-	own := append(userEnv(launch.Env, launchEnv), launchEnv...)
-	replaced := map[string]bool{}
-	for _, kv := range own {
-		name, _, _ := strings.Cut(kv, "=")
-		replaced[envKey(name)] = true
+	// own is what the attempt is given on top of the parent's environment:
+	// the declared env in name order without the names Kairo sets, then
+	// Kairo's; given holds its names.
+	given := map[string]bool{}
+	for _, kv := range launchEnv {
+		given[envKey(envName(kv))] = true
 	}
+	own := make([]string, 0, len(launch.Env)+len(launchEnv))
+	for _, name := range envspec.Names(launch.Env) {
+		if !given[envKey(name)] {
+			own = append(own, name+"="+launch.Env[name])
+		}
+	}
+	for _, kv := range own {
+		given[envKey(envName(kv))] = true
+	}
+	own = append(own, launchEnv...)
 	parent := make([]string, 0, len(os.Environ()))
 	wslenv := ""
 	for _, kv := range os.Environ() {
 		name, value, _ := strings.Cut(kv, "=")
 		switch {
-		case strings.HasPrefix(strings.ToUpper(name), "KAIRO_"):
 		case strings.EqualFold(name, "WSLENV"):
 			wslenv = value
-		case replaced[envKey(name)]:
+		case envspec.Reserved(name), given[envKey(name)]:
 		default:
 			parent = append(parent, kv)
 		}
@@ -678,8 +676,7 @@ func (e *Local) command(launch *store.Launch) *exec.Cmd {
 			shared = append(shared, wslenv)
 		}
 		for _, kv := range own {
-			name, _, _ := strings.Cut(kv, "=")
-			shared = append(shared, name+"/u")
+			shared = append(shared, envName(kv)+"/u")
 		}
 		cmd.Env = append(append(parent, own...), "WSLENV="+strings.Join(shared, ":"))
 		return cmd

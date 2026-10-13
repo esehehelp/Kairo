@@ -92,10 +92,7 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		spec.InputContinuationRef = nil
 	}
 	exclusiveGPU := len(spec.Exclusive) != 0
-	if len(spec.Env) == 0 {
-		spec.Env = nil
-	}
-	if err := envspec.Validate(spec.Env, exclusiveGPU); err != nil {
+	if spec.Env, err = envspec.Normalize(spec.Env, exclusiveGPU); err != nil {
 		return ExecutionSpec{}, nil, "", err
 	}
 	if spec.Gang != nil {
@@ -163,10 +160,8 @@ func normalizeGangSpec(gang GangSpec, exclusiveGPU bool) (GangSpec, error) {
 			}
 			r.ExecutorSelector = canonical
 		}
-		if len(r.Env) == 0 {
-			r.Env = nil
-		}
-		if err := envspec.Validate(r.Env, exclusiveGPU); err != nil {
+		var err error
+		if r.Env, err = envspec.Normalize(r.Env, exclusiveGPU); err != nil {
 			return GangSpec{}, fmt.Errorf("gang rank %d: %w", r.Rank, err)
 		}
 	}
