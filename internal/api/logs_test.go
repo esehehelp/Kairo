@@ -44,24 +44,23 @@ func TestAttemptLogServesRecordedPaths(t *testing.T) {
 	}
 	read := d.token(t, "dashboard", store.RoleRead, "")
 	for _, c := range []struct {
-		query, body, offset, next string
+		query, body, next string
 	}{
-		{"", "0123456789", "0", "10"},
-		{"?stream=stderr&offset=3&limit=4", "3456", "3", "7"},
-		{"?offset=8", "89", "8", "10"},
-		{"?offset=10", "", "10", "10"},
-		{"?offset=25", "", "25", "25"},
-		{"?limit=0", "", "0", "0"},
-		{"?tail=3", "789", "7", "10"},
-		{"?tail=100", "0123456789", "0", "10"},
-		{"?tail=0", "", "10", "10"},
+		{"", "0123456789", "10"},
+		{"?stream=stderr&offset=3&limit=4", "3456", "7"},
+		{"?offset=8", "89", "10"},
+		{"?offset=10", "", "10"},
+		{"?offset=25", "", "25"},
+		{"?limit=0", "", "0"},
+		{"?tail=3", "789", "10"},
+		{"?tail=100", "0123456789", "10"},
+		{"?tail=0", "", "10"},
 	} {
 		response, body := d.getLog(t, read, "/api/attempts/"+id+"/log"+c.query)
 		if response.StatusCode != http.StatusOK || body != c.body {
 			t.Fatalf("%q: %d %q", c.query, response.StatusCode, body)
 		}
 		for header, want := range map[string]string{
-			"X-Kairo-Log-Size": "10", "X-Kairo-Log-Offset": c.offset,
 			"Kairo-Log-Size": "10", "Kairo-Log-Next-Offset": c.next,
 			"Content-Type": "text/plain; charset=utf-8",
 		} {
@@ -87,8 +86,8 @@ func TestAttemptLogServesRecordedPaths(t *testing.T) {
 	}
 	// A recorded log a node agent has not shipped yet reads as empty so far.
 	response, body := d.getLog(t, read, "/api/attempts/"+id+"/log?stream=stdout")
-	if response.StatusCode != http.StatusOK || len(body) != 0 || response.Header.Get("X-Kairo-Log-Size") != "0" || response.Header.Get("X-Kairo-Log-Offset") != "0" {
-		t.Fatalf("unshipped log: %d %q size=%q", response.StatusCode, body, response.Header.Get("X-Kairo-Log-Size"))
+	if response.StatusCode != http.StatusOK || len(body) != 0 || response.Header.Get("Kairo-Log-Size") != "0" || response.Header.Get("Kairo-Log-Next-Offset") != "0" {
+		t.Fatalf("unshipped log: %d %q size=%q", response.StatusCode, body, response.Header.Get("Kairo-Log-Size"))
 	}
 }
 

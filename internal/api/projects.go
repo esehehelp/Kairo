@@ -123,6 +123,10 @@ func (s *Server) cancelTask(w http.ResponseWriter, r *http.Request) {
 // rerunTask runs a failed, stopped, cancelled or blocked task's declaration
 // again (store.RerunTask).
 func (s *Server) rerunTask(w http.ResponseWriter, r *http.Request) {
+	if s.ObserveOnly {
+		writeError(w, errObserveOnly)
+		return
+	}
 	var body struct {
 		Actor     string `json:"actor"`
 		RequestID string `json:"request_id"`

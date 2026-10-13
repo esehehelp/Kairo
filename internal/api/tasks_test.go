@@ -270,6 +270,15 @@ func TestObserveOnlyRefusesTaskCancelButNotItsDryRun(t *testing.T) {
 	}
 }
 
+func TestObserveOnlyRefusesTaskRerun(t *testing.T) {
+	d := newTestDaemon(t, true)
+	if status, raw := d.call(t, http.MethodPost, "/api/projects", d.admin, projectBody("uv", "run", "train")); status != http.StatusCreated {
+		t.Fatalf("apply: %d %s", status, raw)
+	}
+	status, raw := d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/rerun", d.admin, map[string]any{"request_id": "r1"})
+	expectError(t, "observe-only rerun", status, raw, http.StatusLocked, "observe_only")
+}
+
 func TestHealthAndWhoAmIReportTheBuild(t *testing.T) {
 	d := newTestDaemon(t, false)
 	want := []byte(`"version":"` + buildinfo.Version() + `"`)

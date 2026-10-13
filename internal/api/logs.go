@@ -24,13 +24,12 @@ const (
 // bytes: ?stream=stdout|stderr (default stderr), then either ?offset=
 // (default 0) and ?limit= (default 1 MiB, at most 8 MiB), or ?tail=N for the
 // last N bytes (at most 8 MiB). Only the path recorded for the attempt is
-// ever read, and only inside the daemon's log directory. X-Kairo-Log-Size
-// carries the file's current size and X-Kairo-Log-Offset the offset of the
-// first byte served; Kairo-Log-Size and Kairo-Log-Next-Offset (where the next
-// read continues) are kept for older clients. An offset at or past the end
-// returns an empty body, so a follower polls from the next offset. A recorded
-// log that does not exist yet (a node agent ships one once it has bytes)
-// reads as empty.
+// ever read, and only inside the daemon's log directory. Kairo-Log-Size
+// carries the file's current size and Kairo-Log-Next-Offset the offset where
+// the next read continues (the first byte served is at that offset minus the
+// body's length). An offset at or past the end returns an empty body, so a
+// follower polls from the next offset. A recorded log that does not exist yet
+// (a node agent ships one once it has bytes) reads as empty.
 func (s *Server) attemptLog(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	stream := query.Get("stream")
@@ -122,8 +121,6 @@ func (s *Server) attemptLog(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("X-Kairo-Log-Size", strconv.FormatInt(size, 10))
-	w.Header().Set("X-Kairo-Log-Offset", strconv.FormatInt(offset, 10))
 	w.Header().Set("Kairo-Log-Size", strconv.FormatInt(size, 10))
 	w.Header().Set("Kairo-Log-Next-Offset", strconv.FormatInt(offset+int64(len(body)), 10))
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -138,11 +135,10 @@ func (s *Server) logFile(path string) (string, error) {
 	if s.LogDirectory == "" {
 		return "", fmt.Errorf("%w: the daemon has no log directory", store.ErrNotFound)
 	}
-	dir, err := filepath.Abs(s.LogDirectory)
+	dir, err := s.logDirectory()
 	if err != nil {
 		return "", err
 	}
-	dir = resolveLinks(dir)
 	file, err := filepath.Abs(path)
 	if err != nil {
 		return "", err
@@ -157,6 +153,27 @@ func (s *Server) logFile(path string) (string, error) {
 		return "", fmt.Errorf("%w: log path is outside the daemon's log directory", ErrForbidden)
 	}
 	return file, nil
+}
+
+// logDirectory is the daemon's log directory, absolute and with its links
+// followed. It is resolved again on each call until it exists (it may be
+// created after the server starts), then kept.
+func (s *Server) logDirectory() (string, error) {
+	s.logDirMu.Lock()
+	defer s.logDirMu.Unlock()
+	if s.logDir != "" {
+		return s.logDir, nil
+	}
+	dir, err := filepath.Abs(s.LogDirectory)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return dir, nil
+	}
+	s.logDir = resolved
+	return resolved, nil
 }
 
 // resolveLinks follows the symbolic links of an existing path; a path that
