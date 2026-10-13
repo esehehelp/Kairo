@@ -301,9 +301,9 @@ returns the first answer) and answers `{"task", "state", "ordinal",
 attempt's log as the daemon holds it (written by its own executor or shipped
 by an agent), as raw bytes: `stream` defaults to `stderr`, `limit` to 1 MiB
 (at most 8 MiB); `tail=N` instead returns the last N bytes. `Kairo-Log-Size`
-(also `X-Kairo-Log-Size`) is the current size, `X-Kairo-Log-Offset` the
-offset of the first byte returned and `Kairo-Log-Next-Offset` where to
-continue; an offset past the end or a log not written yet returns an empty
+is the current size and `Kairo-Log-Next-Offset` where to continue (the body
+started at that offset minus its length); an offset past the end or a log
+not written yet returns an empty
 body, and an unknown attempt or log is `not_found`. Only files inside the
 daemon's `log_directory` are served. `kairo logs
 [--stream stdout|stderr] [--tail N] [--follow] ATTEMPT_ID` prints it (`--tail`
