@@ -15,6 +15,7 @@ import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.message import Message
 from pathlib import Path
 from typing import Any
 
@@ -133,25 +134,56 @@ def request_json(
     errors (``URLError``, ``OSError``) propagate unchanged, and
     :func:`~kairo_sdk.errors.classify` maps them.
     """
-    require_token_transport(url)
     data = None
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
+    headers = {"Accept": "application/json"}
     if body is not None:
         data = json.dumps(body, separators=(",", ":")).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers, method=method)
-    try:
-        with opener.open(request, timeout=timeout) as response:
-            payload = response.read()
-    except urllib.error.HTTPError as error:
-        try:
-            detail = error.read()
-        except OSError:
-            detail = b""
-        raise errors.api_error(error.code, detail, role=role) from error
+    payload, _headers = _send(opener, method, url, token, data, headers, timeout, role)
     if not payload:
         return {}
     decoded = json.loads(payload)
     if not isinstance(decoded, dict):
         raise RuntimeError("Kairo API response must be a JSON object")
     return decoded
+
+
+def request_bytes(
+    opener: urllib.request.OpenerDirector,
+    method: str,
+    url: str,
+    token: str,
+    timeout: float,
+    *,
+    role: str = errors.OPERATOR,
+) -> tuple[bytes, Message]:
+    """Send one bodiless request and return the raw response body and headers.
+
+    For non-JSON responses (attempt logs); errors are raised as by
+    :func:`request_json`, whose error bodies stay JSON.
+    """
+    return _send(opener, method, url, token, None, {}, timeout, role)
+
+
+def _send(
+    opener: urllib.request.OpenerDirector,
+    method: str,
+    url: str,
+    token: str,
+    data: bytes | None,
+    headers: dict[str, str],
+    timeout: float,
+    role: str,
+) -> tuple[bytes, Message]:
+    require_token_transport(url)
+    headers = {**headers, "Authorization": f"Bearer {token}"}
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with opener.open(request, timeout=timeout) as response:
+            return response.read(), response.headers
+    except urllib.error.HTTPError as error:
+        try:
+            detail = error.read()
+        except OSError:
+            detail = b""
+        raise errors.api_error(error.code, detail, role=role) from error

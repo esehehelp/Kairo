@@ -457,3 +457,14 @@ def test_adapter_checkpoints_once_for_a_stop_signal(single_process):
         assert adapter.safe_point(lambda c: calls.append(c) or "ckpt://signal") is True
         assert [(c.command_id, c.reason) for c in calls] == [("", "stop_signal")]
         assert acks(daemon) == []
+
+
+def test_closing_a_started_session_sends_a_final_heartbeat():
+    with serve(FakeDaemon(worker_routes())) as daemon:
+        with session_for(daemon.url) as session:
+            wait_until(lambda: daemon.paths("POST").count("/api/worker/heartbeat") >= 1)
+            session.set_progress({"unit": "step", "current": 7, "total": 8})
+        beats = [r.body for r in daemon.requests if r.path == "/api/worker/heartbeat"]
+    # The first heartbeat when the session starts, the final one on close.
+    assert len(beats) == 2
+    assert beats[-1]["progress"]["current"] == 7

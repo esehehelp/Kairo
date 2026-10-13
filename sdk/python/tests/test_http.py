@@ -179,6 +179,22 @@ def test_environment_proxies_are_ignored(monkeypatch, tls):
     assert [path for _method, path, _headers in _Handler.requests] == ["/api/x"]
 
 
+@pytest.mark.parametrize("tls", [False, True], ids=["http", "https"])
+def test_raw_requests_follow_the_same_rules(monkeypatch, tls):
+    monkeypatch.setenv("HTTPS_PROXY", f"http://127.0.0.1:{dead_port()}")
+    monkeypatch.setenv("HTTP_PROXY", f"http://127.0.0.1:{dead_port()}")
+    opener = _http.build_opener(ca_der=ca_der())
+    with serve(tls=tls) as url:
+        with pytest.raises(RuntimeError, match="Kairo API returned HTTP 302"):
+            _http.request_bytes(opener, "GET", url + "/redirect", "tok", 5)
+        body, headers = _http.request_bytes(opener, "GET", url + "/api/raw", "tok", 5)
+    assert json.loads(body)["ok"] and headers["Content-Type"] == "application/json"
+    assert [path for _method, path, _headers in _Handler.requests] == ["/redirect", "/api/raw"]
+    assert _Handler.requests[-1][2]["Authorization"] == "Bearer tok"
+    with pytest.raises(ValueError, match="plain http"):
+        _http.request_bytes(opener, "GET", "http://192.0.2.1:7474/api/raw", "tok", 5)
+
+
 def test_non_object_response_is_rejected(monkeypatch):
     monkeypatch.setattr(_Handler, "response_body", [])
     with serve(tls=False) as url:

@@ -14,7 +14,7 @@ import ssl
 import sys
 import urllib.error
 import urllib.parse
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -240,24 +240,68 @@ class KairoClient:
                 return
             cursor = highest
 
+    def attempt_log(
+        self,
+        attempt_id: str,
+        stream: str = "stderr",
+        offset: int = 0,
+        limit: int | None = None,
+    ) -> tuple[bytes, int, int]:
+        """A slice of an attempt's log as the daemon holds it.
+
+        Returns ``(data, next_offset, size)``: the bytes from ``offset`` (at
+        most ``limit``; the daemon's default is 1 MiB, its maximum 8 MiB), the
+        offset to continue from, and the log's current size. Polling from
+        ``next_offset`` follows a growing log; an offset at or past the end
+        returns no data. An unknown attempt or a log the daemon does not hold
+        raises :class:`~kairo_sdk.errors.KairoAPIError` (HTTP 404).
+        """
+        if stream not in ("stdout", "stderr"):
+            raise ValueError(f"stream must be 'stdout' or 'stderr', not {stream!r}")
+        if int(offset) < 0 or (limit is not None and int(limit) < 0):
+            raise ValueError("offset and limit must not be negative")
+        query = _query(
+            stream=stream, offset=int(offset), limit=None if limit is None else int(limit)
+        )
+        path = f"/api/attempts/{urllib.parse.quote(attempt_id, safe='')}/log?{query}"
+        data, headers = self._call(
+            lambda url, token: _http.request_bytes(
+                self._opener, "GET", url, token, self.timeout_seconds, role=errors.OPERATOR
+            ),
+            path,
+        )
+        try:
+            next_offset = int(headers["Kairo-Log-Next-Offset"])
+            size = int(headers["Kairo-Log-Size"])
+        except (KeyError, TypeError, ValueError) as error:
+            raise RuntimeError("Kairo log response lacks valid Kairo-Log-* headers") from error
+        return data, next_offset, size
+
     def _request(
         self, method: str, path: str, body: Mapping[str, Any] | None = None
     ) -> dict[str, Any]:
+        return self._call(
+            lambda url, token: _http.request_json(
+                self._opener,
+                method,
+                url,
+                token,
+                body,
+                self.timeout_seconds,
+                role=errors.OPERATOR,
+            ),
+            path,
+        )
+
+    def _call[T](self, send: Callable[[str, str], T], path: str) -> T:
+        """Send one request to ``path`` with the token, mapping transport failures."""
         if self._token is None:
             raise ControllerConfigurationError(
                 "no Kairo API token: pass token or token_file, set KAIRO_TOKEN or "
                 "KAIRO_TOKEN_FILE, or provide <user config dir>/kairo/token"
             )
         try:
-            return _http.request_json(
-                self._opener,
-                method,
-                self.api_url + path,
-                self._token,
-                body,
-                self.timeout_seconds,
-                role=errors.OPERATOR,
-            )
+            return send(self.api_url + path, self._token)
         except urllib.error.URLError as error:
             raise self._transport_error(error.reason) from error
         except (OSError, http.client.HTTPException) as error:

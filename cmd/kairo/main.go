@@ -52,6 +52,8 @@ func run(args []string) error {
 		return queueCommand(args[1:])
 	case "task":
 		return taskCommand(args[1:])
+	case "logs":
+		return logsCommand(args[1:])
 	case "resource":
 		return resourceCommand(args[1:])
 	case "node":
@@ -70,7 +72,7 @@ func run(args []string) error {
 }
 
 func usage() error {
-	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|resource|node|token|tls|db|doctor>")
+	return errors.New("usage: kairo <serve|agent|execution|project|queue|task|logs|resource|node|token|tls|db|doctor>")
 }
 
 func serve(args []string) error {
@@ -264,6 +266,11 @@ func serve(args []string) error {
 				}
 			}
 		}()
+	}
+	// A control-only daemon has no executors (and no providers): it runs the
+	// API and the reconcilers above, and every job host runs `kairo agent`.
+	if len(daemonConfig.Executors) == 0 {
+		logger.Info("control-only daemon: no local executors; jobs run on node agents", "node_id", daemonConfig.Node.ID)
 	}
 	for _, configured := range daemonConfig.Executors {
 		if configured.Enabled != nil && !*configured.Enabled {

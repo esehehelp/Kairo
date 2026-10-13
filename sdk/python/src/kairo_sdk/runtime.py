@@ -291,6 +291,13 @@ class AttemptSession:
         thread, self._heartbeat_thread = self._heartbeat_thread, None
         if thread is not None:
             thread.join(timeout=max(1.0, self.timeout_seconds + 0.5))
+            # A final heartbeat, so a short attempt does not end with only the
+            # progress of its first one.
+            if self.managed and not (self.retired or self.fenced):
+                try:
+                    self.heartbeat()
+                except Exception as error:
+                    _log.debug("final Kairo heartbeat failed: %s", error)
         with _shared_lock:
             if _shared_session is self:
                 _shared_session = None

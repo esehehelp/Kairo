@@ -201,20 +201,26 @@ func isLoopback(host string) bool {
 
 // do sends one request and returns the status and body whatever the status.
 func (c *apiClient) do(method, path string, body any) (int, []byte, error) {
+	status, _, payload, err := c.send(method, path, body)
+	return status, payload, err
+}
+
+// send is do that also returns the response headers.
+func (c *apiClient) send(method, path string, body any) (int, http.Header, []byte, error) {
 	if c.token == "" && path != "/health" {
-		return 0, nil, errNoToken
+		return 0, nil, nil, errNoToken
 	}
 	var reader io.Reader
 	if body != nil {
 		encoded, err := json.Marshal(body)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, nil, err
 		}
 		reader = bytes.NewReader(encoded)
 	}
 	req, err := http.NewRequest(method, c.baseURL+path, reader)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
@@ -224,14 +230,14 @@ func (c *apiClient) do(method, path string, body any) (int, []byte, error) {
 	}
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
 	payload, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
-	return resp.StatusCode, payload, nil
+	return resp.StatusCode, resp.Header, payload, nil
 }
 
 // call returns the body of a 2xx response, and an error naming the status and

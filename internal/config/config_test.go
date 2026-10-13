@@ -91,3 +91,23 @@ func TestExampleConfigLoads(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestControlOnlyDaemonLoads(t *testing.T) {
+	c, err := Load(writeConfig(t, "[node]\nid = \"control\"\nname = \"control\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(c.Executors) != 0 || len(c.Providers) != 0 {
+		t.Fatalf("executors %v providers %v", c.Executors, c.Providers)
+	}
+	if _, err := Load(writeConfig(t, "listen = \"127.0.0.1:7474\"\n")); err == nil || !strings.Contains(err.Error(), "node.id") {
+		t.Fatalf("missing [node] accepted: %v", err)
+	}
+}
+
+func TestAgentStillRequiresAnExecutor(t *testing.T) {
+	_, err := LoadAgent(writeConfig(t, "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0\"\nname = \"pve0\"\n"))
+	if err == nil || !strings.Contains(err.Error(), "at least one executor") {
+		t.Fatalf("agent without executors: %v", err)
+	}
+}

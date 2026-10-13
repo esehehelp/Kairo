@@ -25,6 +25,7 @@ func (s *Server) routes() []route {
 		{"GET", "/api/executions/{id}", roleRead, s.getExecution},
 		{"POST", "/api/executions/{id}/withdraw", roleAdmin, s.withdrawExecution},
 		{"GET", "/api/attempts", roleRead, s.listAttempts},
+		{"GET", "/api/attempts/{id}/log", roleRead, s.attemptLog},
 		{"GET", "/api/events", roleRead, s.listEvents},
 
 		{"GET", "/api/scopes", roleRead, s.listScopes},

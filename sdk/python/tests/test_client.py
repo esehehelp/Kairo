@@ -8,7 +8,7 @@ import urllib.error
 from pathlib import Path
 
 import pytest
-from fake_daemon import FakeDaemon, serve
+from fake_daemon import FakeDaemon, Raw, serve
 
 from kairo_sdk import (
     ControllerConfigurationError,
@@ -96,6 +96,48 @@ def test_events_refuse_a_non_advancing_cursor():
         client = KairoClient(daemon.url, token="tok")
         with pytest.raises(RuntimeError, match="did not advance"):
             list(client.events(after=10, page_size=2))
+
+
+def log_slice(body: bytes, next_offset: int, size: int) -> tuple[int, Raw]:
+    return 200, Raw(body, {"Kairo-Log-Next-Offset": str(next_offset), "Kairo-Log-Size": str(size)})
+
+
+def test_attempt_log_returns_raw_bytes_and_offsets():
+    routes = {
+        ("GET", "/api/attempts/att_1/log?stream=stderr&offset=0"): log_slice(b"step 1\n\xff", 8, 8),
+        ("GET", "/api/attempts/att_1/log?stream=stdout&offset=8&limit=4"): log_slice(b"", 8, 8),
+        ("GET", "/api/attempts/att%2F2/log?stream=stderr&offset=0"): (
+            404,
+            {"error": "attempt att/2 has no stderr log", "code": "not_found"},
+        ),
+    }
+    with serve(FakeDaemon(routes)) as daemon:
+        client = KairoClient(daemon.url, token="kairo_read_x")
+        assert client.attempt_log("att_1") == (b"step 1\n\xff", 8, 8)
+        assert client.attempt_log("att_1", "stdout", offset=8, limit=4) == (b"", 8, 8)
+        with pytest.raises(KairoAPIError) as missing:
+            client.attempt_log("att/2")
+        with pytest.raises(ValueError, match="stream"):
+            client.attempt_log("att_1", "journal")
+        with pytest.raises(ValueError, match="negative"):
+            client.attempt_log("att_1", offset=-1)
+    assert missing.value.status == 404 and missing.value.code == "not_found"
+    assert {r.headers["Authorization"] for r in daemon.requests} == {"Bearer kairo_read_x"}
+
+
+def test_attempt_log_refuses_a_response_without_offsets():
+    routes = {("GET", "/api/attempts/att_1/log?stream=stderr&offset=0"): (200, Raw(b"x"))}
+    with serve(FakeDaemon(routes)) as daemon:
+        with pytest.raises(RuntimeError, match="Kairo-Log"):
+            KairoClient(daemon.url, token="tok").attempt_log("att_1")
+
+
+def test_attempt_log_transport_failure_is_transient():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    with pytest.raises(TransientControllerError):
+        KairoClient(f"http://127.0.0.1:{port}", token="tok").attempt_log("att_1")
 
 
 def test_operator_http_errors_are_classified_for_the_operator():
