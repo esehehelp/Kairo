@@ -181,11 +181,7 @@ func (s *Store) ReconcileProjectTasks(ctx context.Context) error {
 		return err
 	}
 	for _, decision := range decisions {
-		execution, _, err := s.SubmitExecution(ctx, decision.Spec)
-		if err != nil {
-			return err
-		}
-		if err := s.markOrchestrationDecisionSubmitted(ctx, decision, execution.ID); err != nil {
+		if err := s.submitOrchestrationDecision(ctx, decision); err != nil {
 			return err
 		}
 	}
@@ -280,8 +276,8 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			}
 			continue
 		}
-		// Withdrawn before it started (execution withdraw, or a cancel racing the
-		// submission): the task was cancelled, it did not fail.
+		// Withdrawn before it started by an execution withdraw: the task was
+		// cancelled, it did not fail. (A task cancel sets the state itself.)
 		if current.AttemptID == nil && current.TerminalCause != nil && *current.TerminalCause == "withdrawn_before_start" {
 			if err := updateTaskState(ctx, tx, task.taskScopeID, "cancelled", map[string]any{"reason": "withdrawn before start", "execution_id": current.ExecutionID}); err != nil {
 				return err
@@ -463,50 +459,40 @@ func (s *Store) pendingOrchestrationDecisions(ctx context.Context) ([]plannedOrc
 	return values, rows.Err()
 }
 
-func (s *Store) markOrchestrationDecisionSubmitted(ctx context.Context, decision plannedOrchestrationDecision, executionID string) error {
+// submitOrchestrationDecision submits a planned decision's execution and
+// records it as the task's, in one transaction that first checks the decision
+// is still planned: a decision a cancel or rerun abandoned after it was read is
+// never submitted, and a cancel committed after the submission finds the
+// execution live and withdraws it.
+func (s *Store) submitOrchestrationDecision(ctx context.Context, decision plannedOrchestrationDecision) error {
+	spec, _, digest, err := normalizeExecutionSpec(decision.Spec)
+	if err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var state string
-	var existingExecution *string
-	if err := tx.QueryRowContext(ctx, `SELECT state,execution_id FROM orchestration_decisions WHERE decision_key=?`, decision.DecisionKey).Scan(&state, &existingExecution); err != nil {
+	var state, taskState string
+	if err = tx.QueryRowContext(ctx, `SELECT d.state,t.state FROM orchestration_decisions d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.decision_key=?`, decision.DecisionKey).Scan(&state, &taskState); err != nil {
 		return err
 	}
-	if state == "submitted" || (state == "abandoned" && existingExecution != nil) {
-		if existingExecution == nil || *existingExecution != executionID {
-			return errors.New("orchestration decision submission changed execution ID")
-		}
-		return tx.Commit()
+	if state != "planned" || taskState == "cancelled" {
+		return nil
 	}
-	var taskState string
-	if err := tx.QueryRowContext(ctx, `SELECT state FROM orchestration_tasks WHERE task_scope_id=?`, decision.TaskScopeID).Scan(&taskState); err != nil {
+	executionID, _, err := submitExecutionTx(ctx, tx, spec, digest)
+	if err != nil {
 		return err
 	}
 	stamp := now()
-	// The task was cancelled (or rerun) after this decision was read for
-	// submission: keep the link, withdraw what was just submitted, and leave
-	// the task alone.
-	if state == "abandoned" || taskState == "cancelled" {
-		if _, err := tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='abandoned',execution_id=?,submitted_at=? WHERE decision_key=?`, executionID, stamp, decision.DecisionKey); err != nil {
-			return err
-		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO orchestration_task_executions(task_scope_id,execution_ordinal,execution_id,decision_key,reason,created_at) VALUES(?,?,?,?,?,?)`, decision.TaskScopeID, decision.Ordinal, executionID, decision.DecisionKey, decision.Reason, stamp); err != nil {
-			return err
-		}
-		if _, err := withdrawExecutionAndRanksTx(ctx, tx, executionID); err != nil {
-			return err
-		}
-		return tx.Commit()
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='submitted',execution_id=?,submitted_at=? WHERE decision_key=?`, executionID, stamp, decision.DecisionKey); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='submitted',execution_id=?,submitted_at=? WHERE decision_key=?`, executionID, stamp, decision.DecisionKey); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO orchestration_task_executions(task_scope_id,execution_ordinal,execution_id,decision_key,reason,created_at) VALUES(?,?,?,?,?,?)`, decision.TaskScopeID, decision.Ordinal, executionID, decision.DecisionKey, decision.Reason, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_executions(task_scope_id,execution_ordinal,execution_id,decision_key,reason,created_at) VALUES(?,?,?,?,?,?)`, decision.TaskScopeID, decision.Ordinal, executionID, decision.DecisionKey, decision.Reason, stamp); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state='running',result_json=NULL,updated_at=? WHERE task_scope_id=?`, stamp, decision.TaskScopeID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state='running',result_json=NULL,updated_at=? WHERE task_scope_id=?`, stamp, decision.TaskScopeID); err != nil {
 		return err
 	}
 	return tx.Commit()

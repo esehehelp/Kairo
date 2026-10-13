@@ -7,11 +7,10 @@ import (
 
 // tasksSchema records each rerun of a task (task_control.go): the ordinal its
 // new execution gets, the request that asked for it and the answer it got, so
-// a repeated request is answered again instead of rerunning twice (a dependent
-// rerun along with it has no answer of its own). The indexes serve the
-// lookups of task cancel, rerun and detail: a task's dependents, and its
-// executions that are not terminal. Applied idempotently on every open, like
-// the orchestration schema.
+// a repeated request is answered again instead of rerunning twice. The
+// indexes serve the lookups of task cancel, rerun and detail: a task's
+// dependents, and its executions that are not terminal. Applied idempotently
+// on every open, like the orchestration schema.
 const tasksSchema = `CREATE TABLE IF NOT EXISTS orchestration_task_reruns(
  task_scope_id TEXT NOT NULL REFERENCES orchestration_tasks(task_scope_id),
  execution_ordinal INTEGER NOT NULL CHECK(execution_ordinal>=0),

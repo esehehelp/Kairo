@@ -11,7 +11,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 
 	"kairo/internal/id"
 )
@@ -80,45 +79,11 @@ func liveTaskExecutionsTx(ctx context.Context, tx *sql.Tx, task taskRow) ([]live
 }
 
 // abandonPlannedDecisionsTx makes sure no decision of the task that was planned
-// but not submitted is ever submitted (markOrchestrationDecisionSubmitted
-// withdraws one whose submission was already under way).
+// but not submitted is ever submitted (submitOrchestrationDecision checks it
+// in the transaction that would submit it).
 func abandonPlannedDecisionsTx(ctx context.Context, tx *sql.Tx, taskScopeID string) error {
 	_, err := tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='abandoned' WHERE task_scope_id=? AND state='planned'`, taskScopeID)
 	return err
-}
-
-// withdrawExecutionAndRanksTx withdraws an execution and, for a gang leader,
-// every other rank. A rank that already started is left alone.
-func withdrawExecutionAndRanksTx(ctx context.Context, tx *sql.Tx, executionID string) ([]string, error) {
-	ids := []string{executionID}
-	gangID, _, leaderID, err := gangOfExecutionTx(ctx, tx, executionID)
-	if err != nil {
-		return nil, err
-	}
-	if gangID != "" && leaderID == executionID {
-		members, err := gangMembersTx(ctx, tx, gangID)
-		if err != nil {
-			return nil, err
-		}
-		ids = ids[:0]
-		for _, m := range members {
-			ids = append(ids, m.candidate.execution.ID)
-		}
-	}
-	var withdrawn []string
-	for _, executionID := range ids {
-		ok, err := withdrawExecutionTx(ctx, tx, executionID)
-		if errors.Is(err, ErrExecutionStarted) {
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		if ok {
-			withdrawn = append(withdrawn, executionID)
-		}
-	}
-	return withdrawn, nil
 }
 
 // CancelTask ends a task that has not started, or whose executions are all
@@ -159,6 +124,13 @@ func (s *Store) CancelTask(ctx context.Context, project, name, actor string, dry
 			return CancelResult{}, taskConflict{fmt.Sprintf("execution %s of %s/%s/%s is running (%s); pause the task first, or end it with task pause --force", e.id, task.project, task.queue, task.name, e.state)}
 		}
 	}
+	if dryRun {
+		// None of them started, so a cancel withdraws every one.
+		for _, e := range live {
+			out.Withdrawn = append(out.Withdrawn, e.id)
+		}
+		return out, nil
+	}
 	for _, e := range live {
 		withdrawn, err := withdrawExecutionTx(ctx, tx, e.id)
 		if err != nil {
@@ -176,9 +148,6 @@ func (s *Store) CancelTask(ctx context.Context, project, name, actor string, dry
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "task_cancelled", &task.projectID, "task", task.scopeID, nil, map[string]any{"task": name, "actor": actor, "withdrawn": out.Withdrawn}); err != nil {
 		return CancelResult{}, err
-	}
-	if dryRun {
-		return out, nil
 	}
 	return out, tx.Commit()
 }
@@ -235,21 +204,21 @@ func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID s
 	 SELECT task_scope_id FROM orchestration_task_dependencies WHERE dependency_task_scope_id=?
 	 UNION SELECT d.task_scope_id FROM orchestration_task_dependencies d JOIN dependents ON d.dependency_task_scope_id=dependents.id
 	)
-	SELECT t.task_scope_id,t.name,EXISTS(SELECT 1 FROM orchestration_decisions o WHERE o.task_scope_id=t.task_scope_id)
+	SELECT t.task_scope_id,t.name
 	FROM orchestration_tasks t JOIN dependents ON dependents.id=t.task_scope_id
 	WHERE t.state='blocked' AND json_valid(t.result_json) AND json_extract(t.result_json,'$.reason')='dependency did not succeed'
 	ORDER BY t.name`, task.scopeID)
 	if err != nil {
 		return RerunResult{}, err
 	}
-	type dependent struct {
-		scopeID, name string
-		ran           bool
-	}
+	// A dependent is blocked before it runs (it plans an execution only once
+	// every dependency succeeded, and a succeeded task stays so): it only goes
+	// back to pending.
+	type dependent struct{ scopeID, name string }
 	var unblock []dependent
 	for dependents.Next() {
 		var d dependent
-		if err = dependents.Scan(&d.scopeID, &d.name, &d.ran); err != nil {
+		if err = dependents.Scan(&d.scopeID, &d.name); err != nil {
 			dependents.Close()
 			return RerunResult{}, err
 		}
@@ -259,19 +228,11 @@ func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID s
 		return RerunResult{}, err
 	}
 	for _, d := range unblock {
-		if d.ran {
-			// Not reached by the planner today (a dependent is blocked before it
-			// runs); a dependent with executions is rerun too, so none of them
-			// is read as its outcome.
-			if _, err = markTaskRerunTx(ctx, tx, d.scopeID, requestID, actor); err != nil {
-				return RerunResult{}, err
-			}
-		} else if err = updateTaskState(ctx, tx, d.scopeID, "pending", nil); err != nil {
+		if err = updateTaskState(ctx, tx, d.scopeID, "pending", nil); err != nil {
 			return RerunResult{}, err
 		}
 		out.Unblocked = append(out.Unblocked, d.name)
 	}
-	sort.Strings(out.Unblocked)
 	response, err := json.Marshal(out)
 	if err != nil {
 		return RerunResult{}, err
@@ -316,11 +277,7 @@ func markTaskRerunTx(ctx context.Context, tx *sql.Tx, taskScopeID, requestID, ac
 func rerunTriggerTx(ctx context.Context, tx *sql.Tx, taskScopeID string, ordinal int) (map[string]any, error) {
 	var requestID string
 	var predecessor sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT request_id,predecessor_execution_id FROM orchestration_task_reruns WHERE task_scope_id=? AND execution_ordinal=?`, taskScopeID, ordinal).Scan(&requestID, &predecessor)
-	if errors.Is(err, sql.ErrNoRows) {
-		return map[string]any{"rerun": true}, nil
-	}
-	if err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT request_id,predecessor_execution_id FROM orchestration_task_reruns WHERE task_scope_id=? AND execution_ordinal=?`, taskScopeID, ordinal).Scan(&requestID, &predecessor); err != nil {
 		return nil, err
 	}
 	trigger := map[string]any{"request_id": requestID}

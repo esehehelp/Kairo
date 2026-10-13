@@ -183,8 +183,9 @@ func TestCancelWithdrawsEveryGangRank(t *testing.T) {
 }
 
 // The reconciler reads a planned decision, then submits it; a cancel can land
-// on either side of the submission. Either way the task stays cancelled and
-// the submitted execution is withdrawn.
+// on either side of the submission. A cancel committed first abandons the
+// decision, which is then never submitted; a cancel committed after finds the
+// execution live and withdraws it. Either way the task stays cancelled.
 func TestCancelRacingTheReconcilerNeverRevivesTheTask(t *testing.T) {
 	for _, cancelAfterSubmit := range []bool{false, true} {
 		store := openCoordinationStore(t)
@@ -199,39 +200,47 @@ func TestCancelRacingTheReconcilerNeverRevivesTheTask(t *testing.T) {
 		if err != nil || len(decisions) != 1 {
 			t.Fatalf("decisions: %+v %v", decisions, err)
 		}
-		cancel := func() {
-			if _, err := store.CancelTask(ctx, "orchestrated", "prepare", "tester", false); err != nil {
+		cancel := func() CancelResult {
+			result, err := store.CancelTask(ctx, "orchestrated", "prepare", "tester", false)
+			if err != nil {
 				t.Fatal(err)
 			}
+			return result
 		}
+		var result CancelResult
 		if !cancelAfterSubmit {
-			cancel()
+			result = cancel()
 		}
-		execution, _, err := store.SubmitExecution(ctx, decisions[0].Spec)
-		if err != nil {
+		if err = store.submitOrchestrationDecision(ctx, decisions[0]); err != nil {
 			t.Fatal(err)
 		}
 		if cancelAfterSubmit {
-			cancel()
+			result = cancel()
 		}
-		if err = store.markOrchestrationDecisionSubmitted(ctx, decisions[0], execution.ID); err != nil {
+		// A retried submission of the decision read before is harmless.
+		if err = store.submitOrchestrationDecision(ctx, decisions[0]); err != nil {
 			t.Fatal(err)
 		}
-		// A retried mark is harmless.
-		if err = store.markOrchestrationDecisionSubmitted(ctx, decisions[0], execution.ID); err != nil {
+		executions, err := store.ListExecutions(ctx, ExecutionFilter{})
+		if err != nil {
 			t.Fatal(err)
-		}
-		withdrawn, _ := store.GetExecution(ctx, execution.ID)
-		if withdrawn.State != "terminal" || *withdrawn.TerminalCause != "withdrawn_before_start" {
-			t.Fatalf("after submit=%v: execution %+v", cancelAfterSubmit, withdrawn)
-		}
-		var state string
-		if err = store.db.QueryRow(`SELECT state FROM orchestration_decisions WHERE decision_key=?`, decisions[0].DecisionKey).Scan(&state); err != nil || state != "abandoned" {
-			t.Fatalf("decision: %s %v", state, err)
 		}
 		tasks := projectTasks(t, store, "orchestrated")
-		if tasks["prepare"].State != "cancelled" || len(tasks["prepare"].Executions) != 1 {
-			t.Fatalf("after submit=%v: %+v", cancelAfterSubmit, tasks["prepare"])
+		var state string
+		if err = store.db.QueryRow(`SELECT state FROM orchestration_decisions WHERE decision_key=?`, decisions[0].DecisionKey).Scan(&state); err != nil {
+			t.Fatal(err)
+		}
+		if !cancelAfterSubmit {
+			if len(executions) != 0 || len(result.Withdrawn) != 0 || state != "abandoned" || tasks["prepare"].State != "cancelled" || len(tasks["prepare"].Executions) != 0 {
+				t.Fatalf("cancel before submit: executions %+v, cancel %+v, decision %s, task %+v", executions, result, state, tasks["prepare"])
+			}
+		} else {
+			if len(executions) != 1 || len(result.Withdrawn) != 1 || result.Withdrawn[0] != executions[0].ID || state != "submitted" || tasks["prepare"].State != "cancelled" || len(tasks["prepare"].Executions) != 1 {
+				t.Fatalf("cancel after submit: executions %+v, cancel %+v, decision %s, task %+v", executions, result, state, tasks["prepare"])
+			}
+			if executions[0].State != "terminal" || *executions[0].TerminalCause != "withdrawn_before_start" {
+				t.Fatalf("cancel after submit: execution %+v", executions[0])
+			}
 		}
 		if pending, _ := store.pendingOrchestrationDecisions(ctx); len(pending) != 0 {
 			t.Fatalf("planned again: %+v", pending)

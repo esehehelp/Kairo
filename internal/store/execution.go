@@ -214,28 +214,39 @@ func (s *Store) SubmitExecution(ctx context.Context, input ExecutionSpec) (Execu
 		return ExecutionRequest{}, false, err
 	}
 	defer tx.Rollback()
-	project, _, err := ensureScopeTx(ctx, tx, "project", nil, spec.Scope.Project)
+	executionID, idempotent, err := submitExecutionTx(ctx, tx, spec, digest)
 	if err != nil {
 		return ExecutionRequest{}, false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return ExecutionRequest{}, false, err
+	}
+	execution, err := s.GetExecution(ctx, executionID)
+	return execution, idempotent, err
+}
+
+// submitExecutionTx inserts a normalized execution (every rank of a gang), or
+// finds the one already submitted with its client request ID and digest
+// (idempotent).
+func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, digest string) (string, bool, error) {
+	project, _, err := ensureScopeTx(ctx, tx, "project", nil, spec.Scope.Project)
+	if err != nil {
+		return "", false, err
 	}
 	var existingID, existingDigest string
 	err = tx.QueryRowContext(ctx, `SELECT id,spec_digest FROM execution_requests WHERE project_scope_id=? AND client_request_id=?`, project.ID, spec.ClientRequestID).Scan(&existingID, &existingDigest)
 	if err == nil {
 		if existingDigest != digest {
-			return ExecutionRequest{}, false, ErrIdempotencyConflict
+			return "", false, ErrIdempotencyConflict
 		}
-		if err = tx.Commit(); err != nil {
-			return ExecutionRequest{}, false, err
-		}
-		execution, err := s.GetExecution(ctx, existingID)
-		return execution, true, err
+		return existingID, true, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
-		return ExecutionRequest{}, false, err
+		return "", false, err
 	}
 	scopes, err := ensureScopePathTx(ctx, tx, spec.Scope)
 	if err != nil {
-		return ExecutionRequest{}, false, err
+		return "", false, err
 	}
 	var queueID, taskID *string
 	if scopes.Queue != nil {
@@ -273,33 +284,29 @@ func (s *Store) SubmitExecution(ctx context.Context, input ExecutionSpec) (Execu
 	}
 	executionID, err := insert(leaderSpec, spec.ClientRequestID, digest)
 	if err != nil {
-		return ExecutionRequest{}, false, err
+		return "", false, err
 	}
 	if spec.Gang != nil {
 		// Members carry the leader's request ID and digest with their rank, so a
 		// resubmitted gang is idempotent through its leader alone.
 		gangID, stamp := id.New("gng"), now()
 		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_gangs(id,leader_execution_id,size,port,created_at) VALUES(?,?,?,?,?)`, gangID, executionID, spec.Gang.Size, spec.Gang.Port, stamp); err != nil {
-			return ExecutionRequest{}, false, err
+			return "", false, err
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_members(gang_id,rank,execution_id) VALUES(?,0,?)`, gangID, executionID); err != nil {
-			return ExecutionRequest{}, false, err
+			return "", false, err
 		}
 		for rank := 1; rank < spec.Gang.Size; rank++ {
 			memberID, err := insert(rankSpec(spec, rank), fmt.Sprintf("%s#rank%d", spec.ClientRequestID, rank), fmt.Sprintf("%s#rank%d", digest, rank))
 			if err != nil {
-				return ExecutionRequest{}, false, err
+				return "", false, err
 			}
 			if _, err = tx.ExecContext(ctx, `INSERT INTO gang_members(gang_id,rank,execution_id) VALUES(?,?,?)`, gangID, rank, memberID); err != nil {
-				return ExecutionRequest{}, false, err
+				return "", false, err
 			}
 		}
 	}
-	if err = tx.Commit(); err != nil {
-		return ExecutionRequest{}, false, err
-	}
-	execution, err := s.GetExecution(ctx, executionID)
-	return execution, false, err
+	return executionID, false, nil
 }
 
 func insertExecutionResourcesTx(ctx context.Context, tx *sql.Tx, executionID string, spec ExecutionSpec) error {
