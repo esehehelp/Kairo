@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"kairo/internal/store"
 )
 
 // Attempt logs over GET /api/attempts/{id}/log: kairo logs ATTEMPT_ID reads
@@ -225,7 +227,7 @@ func executionAttempt(client *apiClient, executionID string) (*attemptInfo, erro
 	var listed struct {
 		Attempts []attemptInfo `json:"attempts"`
 	}
-	if err := client.getJSON(withQuery("/api/attempts", url.Values{"execution_id": {executionID}}), &listed); err != nil {
+	if err := client.callJSON(http.MethodGet, withQuery("/api/attempts", url.Values{"execution_id": {executionID}}), nil, &listed); err != nil {
 		return nil, err
 	}
 	if len(listed.Attempts) == 0 {
@@ -258,7 +260,7 @@ func taskLogTargets(task *taskDetail, which string, rank int) ([]logTarget, erro
 	for _, e := range executions {
 		label := "#" + strconv.Itoa(e.Ordinal)
 		if len(e.Gang) > 0 {
-			var picked *gangRankInfo
+			var picked *store.TaskGangRank
 			for i := range e.Gang {
 				if e.Gang[i].Rank == rank {
 					picked = &e.Gang[i]

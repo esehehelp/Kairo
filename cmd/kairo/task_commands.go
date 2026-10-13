@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"kairo/internal/id"
+	"kairo/internal/store"
 )
 
 func taskCommand(args []string) error {
@@ -85,15 +86,13 @@ func fetchTask(client *apiClient, ref taskRef) (*taskDetail, []byte, error) {
 	if err != nil {
 		return nil, nil, err
 	}
+	// The executions come in ordinal order.
 	var wire struct {
 		Task taskDetail `json:"task"`
 	}
 	if err := json.Unmarshal(payload, &wire); err != nil {
 		return nil, nil, fmt.Errorf("decode task: %w", err)
 	}
-	sort.SliceStable(wire.Task.Executions, func(i, j int) bool {
-		return wire.Task.Executions[i].Ordinal < wire.Task.Executions[j].Ordinal
-	})
 	return &wire.Task, payload, nil
 }
 
@@ -123,7 +122,7 @@ func sinceStamp(value string) (string, error) {
 func taskList(args []string) error {
 	fs := newFlags("task list")
 	api := apiFlag(fs)
-	state := fs.String("state", "", "only tasks in these states (comma separated: pending,running,succeeded,failed,blocked,stopped,cancelled)")
+	state := fs.String("state", "", "only tasks in these states (comma separated: "+strings.Join(store.TaskStates, ",")+")")
 	match := fs.String("match", "", "only tasks whose name starts with PREFIX")
 	live := fs.Bool("live", false, "only pending and running tasks")
 	since := fs.String("since", "", "only tasks updated since DURATION ago (90m, 24h, 3d) or an RFC 3339 time")
@@ -175,8 +174,7 @@ func taskList(args []string) error {
 			if e := t.latest(); e != nil {
 				exec = "#" + strconv.Itoa(e.Ordinal)
 				if at, ok := e.startedAt(); ok {
-					stamp := at.Format(time.RFC3339Nano)
-					started = shortStamp(&stamp)
+					started = shortTime(at)
 				}
 			}
 			rows = append(rows, strings.Join([]string{t.Name, t.Queue, t.State, exec, started, dash(elapsed(t, now)), taskNote(t)}, "\t"))
@@ -245,8 +243,8 @@ func sortTasks(tasks []taskStatus) {
 			return rank(a.State) < rank(b.State)
 		}
 		if rank(a.State) == 2 && a.UpdatedAt != b.UpdatedAt {
-			ta, _ := time.Parse(time.RFC3339Nano, a.UpdatedAt)
-			tb, _ := time.Parse(time.RFC3339Nano, b.UpdatedAt)
+			ta, _ := parseStamp(&a.UpdatedAt)
+			tb, _ := parseStamp(&b.UpdatedAt)
 			return ta.After(tb)
 		}
 		return a.Name < b.Name
@@ -304,7 +302,8 @@ func taskCancel(args []string) error {
 	if err != nil {
 		return err
 	}
-	payload, err := client.call(http.MethodPost, ref.path()+"/cancel", map[string]any{"actor": *actor, "dry_run": *dryRun})
+	var result store.CancelResult
+	err = client.callJSON(http.MethodPost, ref.path()+"/cancel", map[string]any{"actor": *actor, "dry_run": *dryRun}, &result)
 	switch {
 	case routeMissing(err):
 		fmt.Fprintf(os.Stderr, "kairo: the daemon does not know task cancel: %s; withdrawing the task's executions instead\n", olderDaemonHint())
@@ -319,15 +318,6 @@ func taskCancel(args []string) error {
 		return fmt.Errorf("%w (%v)", ref.notFound(), err)
 	case err != nil:
 		return err
-	}
-	var result struct {
-		Task      string   `json:"task"`
-		State     string   `json:"state"`
-		Withdrawn []string `json:"withdrawn"`
-		DryRun    bool     `json:"dry_run"`
-	}
-	if err := json.Unmarshal(payload, &result); err != nil {
-		return fmt.Errorf("decode cancel response: %w", err)
 	}
 	if result.Task == "" {
 		result.Task = ref.task
@@ -352,10 +342,6 @@ func taskCancel(args []string) error {
 // plain executions).
 func withdrawTaskExecutions(client *apiClient, ref taskRef, dryRun bool) error {
 	query := url.Values{"project": {ref.project}, "queue": {ref.queue}, "task": {ref.task}, "limit": {"1000"}}
-	payload, err := client.call(http.MethodGet, withQuery("/api/executions", query), nil)
-	if err != nil {
-		return err
-	}
 	var listed struct {
 		Executions []struct {
 			ID        string  `json:"id"`
@@ -363,7 +349,7 @@ func withdrawTaskExecutions(client *apiClient, ref taskRef, dryRun bool) error {
 			StartedAt *string `json:"started_at"`
 		} `json:"executions"`
 	}
-	if err := json.Unmarshal(payload, &listed); err != nil {
+	if err := client.callJSON(http.MethodGet, withQuery("/api/executions", query), nil, &listed); err != nil {
 		return err
 	}
 	var todo []string
@@ -412,21 +398,13 @@ func taskRerun(args []string) error {
 	if err != nil {
 		return err
 	}
-	payload, err := client.call(http.MethodPost, ref.path()+"/rerun", map[string]string{"actor": *actor, "request_id": *requestID})
+	var result store.RerunResult
+	err = client.callJSON(http.MethodPost, ref.path()+"/rerun", map[string]string{"actor": *actor, "request_id": *requestID}, &result)
 	if notFound(err) {
 		return fmt.Errorf("%w (%v)", ref.notFound(), err)
 	}
 	if err != nil {
 		return err
-	}
-	var result struct {
-		Task      string   `json:"task"`
-		State     string   `json:"state"`
-		Ordinal   int      `json:"ordinal"`
-		Unblocked []string `json:"unblocked"`
-	}
-	if err := json.Unmarshal(payload, &result); err != nil {
-		return fmt.Errorf("decode rerun response: %w", err)
 	}
 	if result.Task == "" {
 		result.Task = ref.task

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"kairo/internal/orchestration"
+	"kairo/internal/store"
 )
 
 // The project and task views of the API (GET /api/projects/{p} and
@@ -22,7 +23,6 @@ import (
 
 type projectStatus struct {
 	Name        string         `json:"name"`
-	SpecDigests []string       `json:"spec_digests"`
 	StateCounts map[string]int `json:"state_counts"`
 	Tasks       []taskStatus   `json:"tasks"`
 }
@@ -57,14 +57,13 @@ type taskExecution struct {
 	ExitedAt         *string         `json:"exited_at"`
 	Progress         json.RawMessage `json:"progress"`
 	// Task detail only.
-	Attempts []attemptInfo    `json:"attempts"`
-	Gang     []gangRankInfo   `json:"gang"`
-	Waiting  []map[string]any `json:"waiting"`
+	Attempts []attemptInfo        `json:"attempts"` // at most one
+	Gang     []store.TaskGangRank `json:"gang"`
+	Waiting  []map[string]any     `json:"waiting"`
 }
 
 type attemptInfo struct {
 	ID              string          `json:"id"`
-	ExecutionID     string          `json:"execution_id"`
 	State           string          `json:"state"`
 	ExecutorID      string          `json:"executor_id"`
 	NodeID          string          `json:"node_id"`
@@ -72,7 +71,6 @@ type attemptInfo struct {
 	ExitCode        *int            `json:"exit_code"`
 	ExitSignal      *string         `json:"exit_signal"`
 	Progress        json.RawMessage `json:"progress"`
-	StartedAt       *string         `json:"started_at"`
 	LastHeartbeatAt *string         `json:"last_heartbeat_at"`
 	ExitedAt        *string         `json:"exited_at"`
 	QuiescedAt      *string         `json:"quiesced_at"`
@@ -91,39 +89,12 @@ func (a attemptInfo) ended() bool {
 	return a.ExitedAt != nil || a.QuiescedAt != nil
 }
 
-type gangRankInfo struct {
-	Rank        int     `json:"rank"`
-	ExecutionID string  `json:"execution_id"`
-	State       string  `json:"state"`
-	AttemptID   *string `json:"attempt_id"`
-	ExecutorID  *string `json:"executor_id"`
-	NodeID      *string `json:"node_id"`
-}
-
-type nameState struct {
-	Name  string `json:"name"`
-	State string `json:"state"`
-}
-
-type gateInfo struct {
-	Scope string `json:"scope"`
-	State string `json:"state"`
-}
-
-type taskSpec struct {
-	Name      string                  `json:"name"`
-	Queue     string                  `json:"queue"`
-	DependsOn []string                `json:"depends_on"`
-	Policy    string                  `json:"policy"`
-	Execution orchestration.Execution `json:"execution"`
-}
-
 type taskDetail struct {
 	taskStatus
-	Spec         *taskSpec   `json:"spec"`
-	Dependencies []nameState `json:"dependencies"`
-	Dependents   []nameState `json:"dependents"`
-	Gates        []gateInfo  `json:"gates"`
+	Spec         *orchestration.Task `json:"spec"`
+	Dependencies []store.TaskRef     `json:"dependencies"`
+	Dependents   []store.TaskRef     `json:"dependents"`
+	Gates        []store.TaskGate    `json:"gates"`
 }
 
 // taskResult is the part of a task's result the CLI shows.
@@ -183,16 +154,12 @@ func (e *taskExecution) attemptID() string {
 	return ""
 }
 
-// Task states.
-func terminalState(state string) bool {
-	switch state {
-	case "succeeded", "failed", "blocked", "stopped", "cancelled":
-		return true
-	}
-	return false
-}
-
+// liveState: a task in it can still run; terminalState: it ended.
 func liveState(state string) bool { return state == "pending" || state == "running" }
+
+func terminalState(state string) bool {
+	return !liveState(state) && slices.Contains(store.TaskStates, state)
+}
 
 // projectQuery is the filter of GET /api/projects/{p}.
 type projectQuery struct {
@@ -344,7 +311,7 @@ func (r *projectResponse) json() ([]byte, error) {
 }
 
 // stateOrder is how summaries list the states.
-var stateOrder = []string{"running", "pending", "paused", "succeeded", "failed", "blocked", "stopped", "cancelled"}
+var stateOrder = []string{"running", "pending", "succeeded", "failed", "blocked", "stopped", "cancelled"}
 
 // stateSummary is "3 running, 12 pending, 2373 succeeded".
 func stateSummary(counts map[string]int) string {
@@ -411,18 +378,24 @@ func parseStamp(s *string) (time.Time, bool) {
 // clock is the HH:MM:SS of event lines.
 func clock(t time.Time) string { return t.Local().Format("15:04:05") }
 
-// shortStamp is the MM-DD HH:MM of tables, "-" when unknown.
+// shortTime is the MM-DD HH:MM of tables; shortStamp is that of a
+// timestamp, "-" when unknown.
+func shortTime(t time.Time) string { return t.Local().Format("01-02 15:04") }
+
 func shortStamp(s *string) string {
 	if t, ok := parseStamp(s); ok {
-		return t.Local().Format("01-02 15:04")
+		return shortTime(t)
 	}
 	return "-"
 }
 
-// longStamp is a full local time for task show, "-" when unknown.
+// longTime is a full local time for task show; longStamp is that of a
+// timestamp, "-" when unknown.
+func longTime(t time.Time) string { return t.Local().Format("2006-01-02 15:04:05") }
+
 func longStamp(s *string) string {
 	if t, ok := parseStamp(s); ok {
-		return t.Local().Format("2006-01-02 15:04:05")
+		return longTime(t)
 	}
 	return "-"
 }

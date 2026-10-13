@@ -208,17 +208,13 @@ func scopeAction(kind, action string, args []string) error {
 	if kind == "task" {
 		query.Set("task", ref.task)
 	}
-	payload, err := client.call(http.MethodGet, withQuery("/api/scopes", query), nil)
-	if err != nil {
-		return err
-	}
 	var listed struct {
 		Scopes []struct {
 			ID string `json:"id"`
 		} `json:"scopes"`
 	}
-	if err := json.Unmarshal(payload, &listed); err != nil {
-		return fmt.Errorf("decode scope response: %w", err)
+	if err := client.callJSON(http.MethodGet, withQuery("/api/scopes", query), nil, &listed); err != nil {
+		return err
 	}
 	if len(listed.Scopes) != 1 {
 		return fmt.Errorf("coordination scope not found or ambiguous (%d matches)", len(listed.Scopes))
@@ -235,7 +231,7 @@ func scopeAction(kind, action string, args []string) error {
 	default:
 		body = map[string]string{"actor": *actor}
 	}
-	payload, err = client.call(http.MethodPost, path, body)
+	payload, err := client.call(http.MethodPost, path, body)
 	if err != nil {
 		return err
 	}
@@ -423,18 +419,14 @@ func doctorCommand(args []string) error {
 	if err != nil {
 		return err
 	}
-	payload, err := client.call(http.MethodGet, "/api/whoami", nil)
-	if err != nil {
-		return fmt.Errorf("%s: %w", client.baseURL, err)
-	}
 	var who struct {
 		Name    string `json:"name"`
 		Role    string `json:"role"`
 		NodeID  string `json:"node_id"`
 		Version string `json:"version"`
 	}
-	if err := json.Unmarshal(payload, &who); err != nil {
-		return fmt.Errorf("decode whoami: %w", err)
+	if err := client.callJSON(http.MethodGet, "/api/whoami", nil, &who); err != nil {
+		return fmt.Errorf("%s: %w", client.baseURL, err)
 	}
 	line := fmt.Sprintf("authenticated as %s (%s)", who.Name, who.Role)
 	if who.NodeID != "" {

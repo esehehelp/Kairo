@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"kairo/internal/orchestration"
+	"kairo/internal/store"
 )
 
 // renderTask prints `kairo task show`: one "label: value" line per fact, so
@@ -55,12 +56,12 @@ func renderTask(w io.Writer, project string, t *taskDetail, now time.Time) {
 		}
 	}
 	if len(t.Dependencies) > 0 {
-		line("depends on", "%s", nameStates(t.Dependencies))
+		line("depends on", "%s", taskRefs(t.Dependencies))
 	} else if len(t.DependsOn) > 0 {
 		line("depends on", "%s", strings.Join(t.DependsOn, ", "))
 	}
 	if len(t.Dependents) > 0 {
-		line("dependents", "%s", nameStates(t.Dependents))
+		line("dependents", "%s", taskRefs(t.Dependents))
 	}
 	if len(t.Gates) > 0 {
 		var parts []string
@@ -100,11 +101,9 @@ func renderExecution(w io.Writer, e taskExecution, now time.Time) {
 		times = append(times, "submitted "+longStamp(e.SubmittedAt))
 	}
 	if start, ok := e.startedAt(); ok {
-		stamp := start.Format(time.RFC3339Nano)
-		times = append(times, "started "+longStamp(&stamp))
+		times = append(times, "started "+longTime(start))
 		if end, ok := e.endedAt(); ok {
-			stamp := end.Format(time.RFC3339Nano)
-			times = append(times, "ended "+longStamp(&stamp)+" ("+compactDuration(end.Sub(start))+")")
+			times = append(times, "ended "+longTime(end)+" ("+compactDuration(end.Sub(start))+")")
 		} else if e.State != "terminal" {
 			times = append(times, "running for "+compactDuration(now.Sub(start)))
 		}
@@ -114,18 +113,16 @@ func renderExecution(w io.Writer, e taskExecution, now time.Time) {
 	if len(times) > 0 {
 		line("time", "%s", strings.Join(times, "  "))
 	}
-	attempts := e.Attempts
-	if len(attempts) == 0 && e.AttemptID != nil {
+	switch {
+	case len(e.Attempts) > 0:
+		renderAttempt(w, e.Attempts[0])
+	case e.AttemptID != nil:
 		executor := ""
 		if e.ExecutorID != nil {
 			executor = *e.ExecutorID
 		}
-		attempts = []attemptInfo{{ID: *e.AttemptID, ExecutorID: executor, Progress: e.Progress}}
-	}
-	for _, a := range attempts {
-		renderAttempt(w, a, len(attempts) > 1)
-	}
-	if len(e.Attempts) == 0 && e.AttemptID == nil {
+		renderAttempt(w, attemptInfo{ID: *e.AttemptID, ExecutorID: executor, Progress: e.Progress})
+	default:
 		if p := progressText(e.Progress); p != "" {
 			line("progress", "%s", p)
 		}
@@ -148,7 +145,7 @@ func renderExecution(w io.Writer, e taskExecution, now time.Time) {
 	}
 }
 
-func renderAttempt(w io.Writer, a attemptInfo, several bool) {
+func renderAttempt(w io.Writer, a attemptInfo) {
 	line := func(label, format string, args ...any) {
 		fmt.Fprintf(w, "  %-11s %s\n", label+":", fmt.Sprintf(format, args...))
 	}
@@ -169,15 +166,6 @@ func renderAttempt(w io.Writer, a attemptInfo, several bool) {
 		text += " " + exit
 	}
 	line("attempt", "%s", text)
-	if several && a.StartedAt != nil {
-		times := "started " + longStamp(a.StartedAt)
-		if a.ExitedAt != nil {
-			times += "  exited " + longStamp(a.ExitedAt)
-		} else if a.QuiescedAt != nil {
-			times += "  quiesced " + longStamp(a.QuiescedAt)
-		}
-		line("time", "%s", times)
-	}
 	if a.LastHeartbeatAt != nil && !a.ended() {
 		line("heartbeat", "%s", longStamp(a.LastHeartbeatAt))
 	}
@@ -284,7 +272,7 @@ func plain(v any) string {
 	return fmt.Sprint(v)
 }
 
-func nameStates(list []nameState) string {
+func taskRefs(list []store.TaskRef) string {
 	var parts []string
 	for _, d := range list {
 		parts = append(parts, d.Name+" ("+d.State+")")

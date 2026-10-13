@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -21,18 +20,12 @@ func versionCommand(args []string) error {
 	if len(positional) != 0 {
 		return usageError("version accepts no arguments")
 	}
-	client, err := newAPIClient(*api)
-	if err != nil {
-		fmt.Printf("kairo cli %s\n", buildinfo.Version())
-		fmt.Printf("daemon unreachable: %v\n", err)
-		return nil
-	}
 	var health struct {
 		Version string `json:"version"`
 	}
-	payload, err := client.call(http.MethodGet, "/health", nil)
+	client, err := newAPIClient(*api)
 	if err == nil {
-		err = json.Unmarshal(payload, &health)
+		err = client.callJSON(http.MethodGet, "/health", nil, &health)
 	}
 	printVersions(health.Version, err)
 	return nil
