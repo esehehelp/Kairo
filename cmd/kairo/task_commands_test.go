@@ -171,8 +171,8 @@ func showFixture() *contractAPI {
 			{"ordinal": 2, "execution_id": "exe_2", "reason": "retry", "state": "waiting",
 				"gang": []map[string]any{{"rank": 0, "execution_id": "exe_2", "state": "waiting"}, {"rank": 1, "execution_id": "exe_2r1", "state": "authorized", "node_id": "pve0"}},
 				"waiting": []map[string]any{
-					{"reason_code": "external_claim", "resource_id": "GPU-1234", "pid": 4242},
-					{"reason_code": "scope_gate_closed", "scope": "p/gpu"},
+					{"reason_code": "external_claim", "detail": map[string]any{"resource_id": "GPU-1234", "pid": 4242}, "created_at": stamp(base.Add(-10 * time.Minute))},
+					{"reason_code": "scope_gate_closed", "scope": "queue"},
 				}},
 		},
 	}
@@ -207,8 +207,8 @@ func TestTaskShowRendersTheDetail(t *testing.T) {
 		"  stderr:     D:\\logs\\att_1.err (10 B)\n",
 		"execution #2 (retry)  waiting\n",
 		"  gang:       rank 1 exe_2r1 authorized node pve0\n",
-		"  waiting:    external_claim on GPU-1234 (pid=4242)\n",
-		"  waiting:    scope_gate_closed on scope p/gpu\n",
+		"  waiting:    external_claim on GPU-1234 (pid=4242) (since 10-13 11:50)\n",
+		"  waiting:    scope_gate_closed: the queue is paused\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in:\n%s", want, out)

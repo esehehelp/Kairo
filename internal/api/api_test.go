@@ -19,6 +19,7 @@ type testDaemon struct {
 	path   string // the database file
 	server *httptest.Server
 	admin  string
+	logs   string // the daemon's log directory
 }
 
 func newTestDaemon(t *testing.T, observeOnly bool) *testDaemon {
@@ -32,12 +33,13 @@ func newTestDaemon(t *testing.T, observeOnly bool) *testDaemon {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server := httptest.NewServer((&Server{Store: st, ObserveOnly: observeOnly}).Handler())
+	logs := t.TempDir()
+	server := httptest.NewServer((&Server{Store: st, ObserveOnly: observeOnly, LogDirectory: logs}).Handler())
 	t.Cleanup(func() {
 		server.Close()
 		st.Close()
 	})
-	return &testDaemon{store: st, path: path, server: server, admin: admin}
+	return &testDaemon{store: st, path: path, server: server, admin: admin, logs: logs}
 }
 
 func (d *testDaemon) token(t *testing.T, name, role, node string) string {
@@ -127,7 +129,7 @@ func TestEveryRouteEnforcesItsRole(t *testing.T) {
 		roleWorker: d.workerToken(t),
 	}
 	for _, rt := range (&Server{}).routes() {
-		path := strings.NewReplacer("{id}", "x", "{project}", "x", "{command}", "x").Replace(rt.pattern)
+		path := strings.NewReplacer("{id}", "x", "{project}", "x", "{task}", "x", "{command}", "x").Replace(rt.pattern)
 		status, payload := d.call(t, rt.method, path, "", nil)
 		if rt.role == roleNone {
 			if status != http.StatusOK {

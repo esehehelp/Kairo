@@ -88,6 +88,7 @@ var topCommands = []command{
 	{"project", "", "declare (apply), inspect (status) and watch projects"},
 	{"task", "", "list, show, wait for, read logs of, pause, cancel or rerun tasks"},
 	{"execution", "", "submit, list, show, withdraw executions; their logs"},
+	{"logs", "", "print or follow one attempt's log by ATTEMPT_ID (task logs finds the attempt)"},
 	{"queue", "", "pause or resume a queue"},
 	{"resource", "", "resource status, quarantine, enable, reconcile"},
 	{"node", "", "quarantine or release nodes"},
@@ -104,7 +105,7 @@ var topCommands = []command{
 var topAliases = map[string]string{
 	"tasks": "task", "projects": "project", "executions": "execution", "exec": "execution",
 	"queues": "queue", "resources": "resource", "nodes": "node", "tokens": "token",
-	"logs": "task logs", "log": "task logs", "status": "project status", "ls": "task list",
+	"log": "logs (or kairo task logs)", "status": "project status", "ls": "task list",
 	"list": "task list", "wait": "task wait", "watch": "project watch", "apply": "project apply",
 	"show": "task show", "cancel": "task cancel", "rerun": "task rerun", "-v": "version",
 	"--version": "version", "health": "doctor", "daemon": "serve", "server": "serve",
@@ -229,6 +230,7 @@ var leafCommands = map[string]command{
 	"agent":   {"agent", "--config AGENT.toml", "run this host as a remote node: its providers and executors report to the daemon"},
 	"doctor":  {"doctor", "[--api URL]", "check the API URL and token, show both versions and the resources"},
 	"version": {"version", "[--api URL]", "print the CLI version and, when reachable, the daemon's"},
+	"logs":    {"logs", "ATTEMPT_ID [--stream stdout|stderr] [--tail BYTES] [-f]", "print an attempt's log (default stderr, whole), or follow it; kairo task logs finds the attempt of a task"},
 }
 
 func findGroup(name string) *commandGroup {

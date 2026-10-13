@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"kairo/internal/orchestration"
 )
 
 // renderTask prints `kairo task show`: one "label: value" line per fact, so
@@ -201,12 +203,35 @@ func renderAttempt(w io.Writer, a attemptInfo, several bool) {
 func waitingText(reason map[string]any) string {
 	rest := map[string]any{}
 	for k, v := range reason {
-		rest[k] = v
+		if k != "detail" {
+			rest[k] = v
+		}
+	}
+	// The daemon nests the block's facts in a "detail" object.
+	switch detail := reason["detail"].(type) {
+	case map[string]any:
+		for k, v := range detail {
+			if _, taken := rest[k]; !taken {
+				rest[k] = v
+			}
+		}
+	case nil:
+	default:
+		rest["detail"] = detail
 	}
 	text := fmt.Sprint(rest["reason_code"])
 	delete(rest, "reason_code")
 	if text == "<nil>" || text == "" {
 		text = "unknown"
+	}
+	since := ""
+	if created, ok := rest["created_at"].(string); ok {
+		since = shortStamp(&created)
+		delete(rest, "created_at")
+	}
+	if scope, ok := rest["scope"].(string); ok && scope != "" && text == "scope_gate_closed" {
+		text += ": the " + scope + " is paused"
+		delete(rest, "scope")
 	}
 	for _, key := range []string{"resource_id", "resource", "gpu", "gpu_uuid", "device", "uuid", "scope", "node_id", "executor_id"} {
 		if v, ok := rest[key]; ok && v != nil && fmt.Sprint(v) != "" {
@@ -244,6 +269,9 @@ func waitingText(reason map[string]any) string {
 	}
 	if message != "" {
 		text += ": " + message
+	}
+	if since != "" && since != "-" {
+		text += " (since " + since + ")"
 	}
 	return text
 }
@@ -298,7 +326,7 @@ func quoteArgv(argv []string) string {
 }
 
 // resourceSummary is "gpu x1 (same node); cpu 4000m; ram 16.0 GiB; disk data 10.0 GiB".
-func resourceSummary(e specExecution) string {
+func resourceSummary(e orchestration.Execution) string {
 	var parts []string
 	for _, x := range e.Exclusive {
 		text := fmt.Sprintf("%s x%d", x.Kind, x.Count)

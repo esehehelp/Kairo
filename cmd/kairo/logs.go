@@ -64,8 +64,8 @@ func (o logOptions) validate() error {
 		return usageError("--follow needs a single attempt (not --attempt all)")
 	}
 	if *o.attempt != "latest" && *o.attempt != "all" {
-		if n, err := strconv.Atoi(*o.attempt); err != nil || n < 1 {
-			return usageError("--attempt %q: want latest, all or a number from 1", *o.attempt)
+		if n, err := strconv.Atoi(*o.attempt); err != nil || n < 0 {
+			return usageError("--attempt %q: want latest, all or a number", *o.attempt)
 		}
 	}
 	return nil
@@ -169,8 +169,8 @@ func executionLogs(args []string) error {
 			}
 		default:
 			n, _ := strconv.Atoi(*opts.attempt)
-			if n > len(targets) {
-				return nil, "", fmt.Errorf("execution %s has %d attempt(s), not %d", executionID, len(targets), n)
+			if n < 1 || n > len(targets) {
+				return nil, "", fmt.Errorf("execution %s has %d attempt(s): --attempt counts them from 1, not %d", executionID, len(targets), n)
 			}
 			targets = targets[n-1 : n]
 		}
@@ -370,7 +370,13 @@ func fetchLog(client *apiClient, attemptID, stream string, params url.Values) ([
 	size, err1 := strconv.ParseInt(header.Get("X-Kairo-Log-Size"), 10, 64)
 	offset, err2 := strconv.ParseInt(header.Get("X-Kairo-Log-Offset"), 10, 64)
 	if err1 != nil || err2 != nil {
-		return nil, 0, 0, errors.New("log response without X-Kairo-Log-Size/X-Kairo-Log-Offset; " + olderDaemonHint())
+		// The first log route answered Kairo-Log-Size and Kairo-Log-Next-Offset.
+		next, err3 := strconv.ParseInt(header.Get("Kairo-Log-Next-Offset"), 10, 64)
+		size, err1 = strconv.ParseInt(header.Get("Kairo-Log-Size"), 10, 64)
+		if err1 != nil || err3 != nil {
+			return nil, 0, 0, errors.New("log response without X-Kairo-Log-Size/X-Kairo-Log-Offset; " + olderDaemonHint())
+		}
+		offset = next - int64(len(body))
 	}
 	return body, size, offset, nil
 }

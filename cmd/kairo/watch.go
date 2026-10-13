@@ -26,7 +26,7 @@ const (
 // observed is what a poller last saw of a task.
 type observed struct {
 	state      string
-	ordinal    int
+	ordinal    int // of the latest execution, -1 without one
 	progress   string
 	progressAt time.Time
 }
@@ -41,14 +41,11 @@ func newTracker() *tracker { return &tracker{seen: map[string]*observed{}} }
 // update prints the first sight of t and every change of state (or of
 // execution); it returns the previous observation (nil on first sight).
 func (tr *tracker) update(t taskStatus, now time.Time) *observed {
-	ordinal := 0
+	ordinal := -1 // no execution yet
 	if e := t.latest(); e != nil {
 		ordinal = e.Ordinal
 	}
 	note := taskNote(t)
-	if t.State == "running" && ordinal > 1 {
-		note = strings.TrimSpace("exec #" + strconv.Itoa(ordinal) + " " + note)
-	}
 	previous, ok := tr.seen[t.Name]
 	if !ok {
 		stdoutLine("%s %s %s", clock(now), t.Name, withNote(t.State, note))
@@ -57,7 +54,8 @@ func (tr *tracker) update(t taskStatus, now time.Time) *observed {
 	}
 	before := *previous
 	if previous.state != t.State || previous.ordinal != ordinal {
-		if previous.ordinal != ordinal && previous.ordinal > 0 && !strings.Contains(note, "exec #") {
+		if previous.ordinal != ordinal && previous.ordinal >= 0 {
+			// A new execution (a rerun or retry), not the first one.
 			note = strings.TrimSpace("exec #" + strconv.Itoa(ordinal) + " " + note)
 		}
 		stdoutLine("%s %s %s -> %s", clock(now), t.Name, previous.state, withNote(t.State, note))
@@ -189,6 +187,7 @@ func (w *waiter) run(ctx context.Context) error {
 	tr := newTracker()
 	var out outage
 	first := true
+	var last []taskStatus
 	w.stalls = map[string]*stallState{}
 	for {
 		now := nowFunc()
@@ -215,6 +214,7 @@ func (w *waiter) run(ctx context.Context) error {
 			for _, t := range tasks {
 				tr.update(t, now)
 			}
+			last = tasks
 			if w.stall > 0 {
 				w.checkStalls(tasks, now)
 			}
@@ -224,12 +224,11 @@ func (w *waiter) run(ctx context.Context) error {
 		}
 		if w.timeout > 0 && now.Sub(start) >= w.timeout {
 			var pending []string
-			for name, o := range tr.seen {
-				if !w.reached(o.state) {
-					pending = append(pending, name+" ("+o.state+")")
+			for _, t := range last {
+				if !w.reached(t) {
+					pending = append(pending, t.Name+" ("+t.State+")")
 				}
 			}
-			sort.Strings(pending)
 			stdoutLine("%s TIMEOUT after %s: %s", clock(now), compactDuration(w.timeout), strings.Join(pending, ", "))
 			return exitWith(waitTimeout)
 		}
@@ -279,18 +278,24 @@ func (w *waiter) checkNames(resp *projectResponse) error {
 	return nil
 }
 
-func (w *waiter) reached(state string) bool {
-	if w.started {
-		return state != "pending" && state != "paused"
+// reached: the task ended, or (--until started) its latest execution has an
+// attempt (a running task's execution may still wait for resources).
+func (w *waiter) reached(t taskStatus) bool {
+	if terminalState(t.State) {
+		return true
 	}
-	return terminalState(state)
+	if w.started && t.State == "running" {
+		e := t.latest()
+		return e != nil && e.AttemptID != nil
+	}
+	return false
 }
 
 // done reports whether every task reached the target, and the exit code.
 func (w *waiter) done(tasks []taskStatus, now time.Time) (int, bool) {
 	var bad []string
 	for _, t := range tasks {
-		if !w.reached(t.State) {
+		if !w.reached(t) {
 			return 0, false
 		}
 		ok := t.State == "succeeded" || (w.started && t.State == "running")

@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"kairo/internal/envspec"
 )
 
 const (
@@ -48,10 +50,14 @@ type Execution struct {
 	// Gang runs the task as Size ranks on distinct nodes (store/gang.go).
 	// Absent from the JSON when unset, so existing task digests do not change.
 	Gang *Gang `toml:"gang" json:"gang,omitempty"`
+	// Env is [tasks.execution.env], added to the attempt's environment (see
+	// envspec.Validate for what is allowed). Absent from the JSON when empty.
+	Env map[string]string `toml:"env" json:"env,omitempty"`
 }
 
 // Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
-// [[tasks.execution.gang.ranks]] overriding argv, cwd or executor labels of a rank.
+// [[tasks.execution.gang.ranks]] overriding argv, cwd or executor labels of a
+// rank; a rank's env is merged over the task's (the rank's value wins).
 type Gang struct {
 	Size  int        `toml:"size" json:"size"`
 	Port  int        `toml:"port" json:"port,omitempty"`
@@ -63,6 +69,7 @@ type GangRank struct {
 	Argv     []string          `toml:"argv" json:"argv,omitempty"`
 	CWD      string            `toml:"cwd" json:"cwd,omitempty"`
 	Executor *ExecutorSelector `toml:"executor" json:"executor,omitempty"`
+	Env      map[string]string `toml:"env" json:"env,omitempty"`
 }
 
 type ExecutorSelector struct {
@@ -319,13 +326,20 @@ func normalizeExecution(value *Execution) error {
 			return fmt.Errorf("disk request %d is invalid", i)
 		}
 	}
+	exclusiveGPU := len(value.Exclusive) != 0
+	if len(value.Env) == 0 {
+		value.Env = nil
+	}
+	if err := envspec.Validate(value.Env, exclusiveGPU); err != nil {
+		return err
+	}
 	if value.Gang != nil {
-		return normalizeGang(value.Gang)
+		return normalizeGang(value.Gang, exclusiveGPU)
 	}
 	return nil
 }
 
-func normalizeGang(gang *Gang) error {
+func normalizeGang(gang *Gang, exclusiveGPU bool) error {
 	if gang.Size < 2 {
 		return errors.New("gang size must be at least 2")
 	}
@@ -348,6 +362,12 @@ func normalizeGang(gang *Gang) error {
 		}
 		if r.Executor != nil && r.Executor.Labels == nil {
 			r.Executor.Labels = map[string]string{}
+		}
+		if len(r.Env) == 0 {
+			r.Env = nil
+		}
+		if err := envspec.Validate(r.Env, exclusiveGPU); err != nil {
+			return fmt.Errorf("gang rank %d: %w", r.Rank, err)
 		}
 	}
 	sort.Slice(gang.Ranks, func(i, j int) bool { return gang.Ranks[i].Rank < gang.Ranks[j].Rank })

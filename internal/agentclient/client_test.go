@@ -31,6 +31,10 @@ func TestHelperProcess(t *testing.T) {
 		return
 	}
 	fmt.Fprintln(os.Stderr, "hello from remote attempt")
+	if got := os.Getenv("AGENTCLIENT_DECLARED"); got != "from the spec" {
+		fmt.Fprintln(os.Stderr, "declared env:", got)
+		os.Exit(5)
+	}
 	caPEM, err := tlsutil.CAFromEnv(os.Getenv("KAIRO_API_CA"))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "KAIRO_API_CA:", err)
@@ -261,10 +265,12 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 		CWD:              t.TempDir(),
 		ExecutorSelector: selector,
 		Exclusive:        []store.ExclusiveRequest{{Kind: "gpu", Count: 1}},
+		Env:              map[string]string{"AGENTCLIENT_DECLARED": "from the spec"},
 	}); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("AGENTCLIENT_TEST_HELPER", "1")
+	t.Setenv("AGENTCLIENT_DECLARED", "from the agent")
 
 	nodeLogs := t.TempDir()
 	exec := executor.NewLocal("remote-exec", c, nodeLogs, nil)
@@ -469,5 +475,21 @@ func TestLogShipperGivesUpOnRefusedLogs(t *testing.T) {
 	}
 	if appends != 1 {
 		t.Fatalf("orphan log sent %d times", appends)
+	}
+}
+
+// A Windows agent reports its log paths with backslashes; a daemon on Linux
+// still records them (as its own copies).
+func TestLogPathsFromAWindowsAgent(t *testing.T) {
+	st, ts, token, logDir := newDaemon(t)
+	c := New(ts.URL, token, nil)
+	launch := remoteAttempt(t, st, c)
+	id := launch.Attempt.ID
+	if err := c.SetAttemptLogPaths(context.Background(), id, launch.Lease.CoordinationEpoch, `C:\Users\admin\kairo\attempts\`+id+`.stdout.log`, `C:\Users\admin\kairo\attempts\`+id+`.stderr.log`); err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, err := st.AttemptLogPaths(context.Background(), id)
+	if err != nil || stdout != filepath.Join(logDir, id+".stdout.log") || stderr != filepath.Join(logDir, id+".stderr.log") {
+		t.Fatalf("recorded %q %q (%v)", stdout, stderr, err)
 	}
 }

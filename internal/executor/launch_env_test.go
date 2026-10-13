@@ -2,6 +2,7 @@ package executor
 
 import (
 	"encoding/json"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -98,5 +99,59 @@ func TestNativeLaunchEnvironment(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("KAIRO_ATTEMPT_TOKEN set %d times", count)
+	}
+}
+
+// Declared env replaces the parent's variables (case-insensitively on
+// Windows, so a declared "path" replaces PATH) but never what Kairo sets.
+func TestDeclaredEnvOverridesTheParentButNotKairo(t *testing.T) {
+	t.Setenv("PYTHONUTF8", "0")
+	launch := testLaunch()
+	launch.Env = map[string]string{"PYTHONUTF8": "1", "path": `C:\only`, "RANK": "7", "CUDA_VISIBLE_DEVICES": "9", "Zeta": "z", "Alpha": "a"}
+	e := &Local{ID: "windows-local", NodeID: "host", Kind: "windows", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
+	cmd := e.command(launch)
+	values := func(name string) []string {
+		var out []string
+		for _, kv := range cmd.Env {
+			k, v, _ := strings.Cut(kv, "=")
+			if k == name || (runtime.GOOS == "windows" && strings.EqualFold(k, name)) {
+				out = append(out, v)
+			}
+		}
+		return out
+	}
+	for name, want := range map[string]string{"PYTHONUTF8": "1", "RANK": "1", "CUDA_VISIBLE_DEVICES": "0,1", "Alpha": "a"} {
+		if got := values(name); len(got) != 1 || got[0] != want {
+			t.Fatalf("%s = %q", name, got)
+		}
+	}
+	if runtime.GOOS == "windows" {
+		if got := values("PATH"); len(got) != 1 || got[0] != `C:\only` {
+			t.Fatalf("PATH = %q", got)
+		}
+	}
+	if alpha, zeta := slices.Index(cmd.Env, "Alpha=a"), slices.Index(cmd.Env, "Zeta=z"); alpha < 0 || zeta < alpha {
+		t.Fatalf("declared env out of order: %q", cmd.Env)
+	}
+}
+
+// Declared env crosses into WSL through WSLENV like Kairo's own variables.
+func TestWSLLaunchSharesDeclaredEnvThroughWSLENV(t *testing.T) {
+	t.Setenv("WSLENV", "USERPROFILE/p")
+	launch := testLaunch()
+	launch.Env = map[string]string{"PYTHONUTF8": "1", "HF_HOME": "/srv/hf", "RANK": "7"}
+	e := &Local{ID: "ubuntu-wsl", NodeID: "host", Kind: "wsl2", APIURL: "https://192.168.1.12:7474", Attributes: map[string]string{"distro": "Ubuntu"}}
+	cmd := e.command(launch)
+	for name, want := range map[string]string{"PYTHONUTF8": "1", "HF_HOME": "/srv/hf", "RANK": "1"} {
+		if got, _ := envValue(cmd.Env, name); got != want {
+			t.Fatalf("%s = %q", name, got)
+		}
+	}
+	wslenv, _ := envValue(cmd.Env, "WSLENV")
+	if !strings.HasPrefix(wslenv, "USERPROFILE/p:HF_HOME/u:PYTHONUTF8/u:KAIRO_") {
+		t.Fatalf("WSLENV = %q", wslenv)
+	}
+	if count := strings.Count(":"+wslenv+":", ":RANK/u:"); count != 1 {
+		t.Fatalf("RANK shared %d times: %q", count, wslenv)
 	}
 }

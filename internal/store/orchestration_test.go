@@ -92,9 +92,9 @@ func TestProjectTaskDAGReconcilesIntoImmutableExecutions(t *testing.T) {
 	setupSchedulerInventory(t, store)
 	ctx := context.Background()
 	spec := projectSpec(t, orchestrationManifest())
-	idempotent, err := store.ApplyProject(ctx, spec)
-	if err != nil || idempotent {
-		t.Fatalf("apply: idempotent=%v err=%v", idempotent, err)
+	applied, err := store.ApplyProject(ctx, spec)
+	if err != nil || applied.Idempotent || len(applied.Created) != 2 {
+		t.Fatalf("apply: %+v err=%v", applied, err)
 	}
 	if err = store.ReconcileProjectTasks(ctx); err != nil {
 		t.Fatal(err)

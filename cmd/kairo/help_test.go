@@ -69,7 +69,7 @@ func TestMistypedCommandsSuggestTheRightOne(t *testing.T) {
 		{[]string{"project", "stauts"}, "did you mean `kairo project status`"},
 		{[]string{"execution", "ls"}, "did you mean `kairo execution list`"},
 		{[]string{"tasks"}, "did you mean `kairo task`"},
-		{[]string{"logs"}, "did you mean `kairo task logs`"},
+		{[]string{"log"}, "did you mean `kairo logs (or kairo task logs)`"},
 	} {
 		out, err := captureStdout(t, func() error { return run(c.args) })
 		if err == nil || exitCode(err) != exitUsage || !strings.Contains(err.Error(), c.want) {

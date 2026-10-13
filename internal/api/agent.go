@@ -317,7 +317,8 @@ func (s *Server) agentRegister(ctx context.Context, b agentRegisterRequest) (any
 func (s *Server) agentSetLogPaths(ctx context.Context, b agentLogPathsRequest) (any, error) {
 	paths := make([]string, 0, 2)
 	for _, path := range []string{b.StdoutPath, b.StderrPath} {
-		name := filepath.Base(filepath.ToSlash(path))
+		// The agent may be on another OS: a Windows path uses backslashes.
+		name := path[strings.LastIndexAny(path, `/\`)+1:]
 		if attempt, _ := logAttempt(name); attempt != b.AttemptID {
 			return nil, fmt.Errorf("log %q is not named after attempt %s", name, b.AttemptID)
 		}

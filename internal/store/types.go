@@ -71,11 +71,15 @@ type ExecutionSpec struct {
 	// (see gang.go). The submitted execution is rank 0 (the leader); ranks
 	// 1..Size-1 are member executions created with it.
 	Gang *GangSpec `json:"gang,omitempty"`
+	// Env is added to the attempt's environment (envspec.Validate); it never
+	// overrides what Kairo sets. Left out of the digest when empty.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the same
 // resources on its own node; Ranks overrides argv, cwd or the executor selector
-// of single ranks (a Windows/WSL rank and a Linux rank need different paths).
+// of single ranks (a Windows/WSL rank and a Linux rank need different paths)
+// and merges a rank's env over the execution's.
 type GangSpec struct {
 	Size int `json:"size"`
 	// Port is the rendezvous port on rank 0's interconnect address; 0 picks a
@@ -85,10 +89,11 @@ type GangSpec struct {
 }
 
 type GangRank struct {
-	Rank             int             `json:"rank"`
-	Argv             []string        `json:"argv,omitempty"`
-	CWD              string          `json:"cwd,omitempty"`
-	ExecutorSelector json.RawMessage `json:"executor_selector,omitempty"`
+	Rank             int               `json:"rank"`
+	Argv             []string          `json:"argv,omitempty"`
+	CWD              string            `json:"cwd,omitempty"`
+	ExecutorSelector json.RawMessage   `json:"executor_selector,omitempty"`
+	Env              map[string]string `json:"env,omitempty"`
 }
 
 // GangLaunch is what one rank of a placed gang is told at launch: its rank and
@@ -123,6 +128,7 @@ type ExecutionRequest struct {
 	StartedAt            *string           `json:"started_at,omitempty"`
 	TerminalAt           *string           `json:"terminal_at,omitempty"`
 	Resources            []ResourceRequest `json:"resource_requests,omitempty"`
+	Env                  map[string]string `json:"env,omitempty"`
 }
 
 type ExecutionFilter struct {

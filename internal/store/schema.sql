@@ -81,6 +81,7 @@ CREATE TABLE execution_requests(
  authorized_at TEXT,
  started_at TEXT,
  terminal_at TEXT,
+ env_json TEXT,
  UNIQUE(project_scope_id,client_request_id),
  CHECK(preemptible=0 OR checkpointable=1)
 );

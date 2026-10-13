@@ -11,6 +11,8 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+
+	"kairo/internal/envspec"
 )
 
 type Manifest struct {
@@ -28,6 +30,9 @@ type Manifest struct {
 	Executor             ExecutorSelector   `toml:"executor" json:"executor"`
 	Exclusive            []ExclusiveRequest `toml:"exclusive" json:"exclusive"`
 	Capacity             CapacityRequest    `toml:"capacity" json:"capacity"`
+	// Env is [env], added to the attempt's environment. Absent from the JSON
+	// when empty, so the digest of a manifest without it does not change.
+	Env map[string]string `toml:"env" json:"env,omitempty"`
 }
 
 type ExecutorSelector struct {
@@ -149,7 +154,10 @@ func normalizeAndValidate(m *Manifest) error {
 			return errors.New("invalid disk request")
 		}
 	}
-	return nil
+	if len(m.Env) == 0 {
+		m.Env = nil
+	}
+	return envspec.Validate(m.Env, len(m.Exclusive) != 0)
 }
 
 func oneOf(value string, values ...string) bool {

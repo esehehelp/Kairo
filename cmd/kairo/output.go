@@ -124,16 +124,11 @@ type gateInfo struct {
 }
 
 type taskSpec struct {
-	Name      string        `json:"name"`
-	Queue     string        `json:"queue"`
-	DependsOn []string      `json:"depends_on"`
-	Policy    string        `json:"policy"`
-	Execution specExecution `json:"execution"`
-}
-
-type specExecution struct {
-	orchestration.Execution
-	Env map[string]string `json:"env,omitempty"`
+	Name      string                  `json:"name"`
+	Queue     string                  `json:"queue"`
+	DependsOn []string                `json:"depends_on"`
+	Policy    string                  `json:"policy"`
+	Execution orchestration.Execution `json:"execution"`
 }
 
 type taskDetail struct {
@@ -526,6 +521,10 @@ func taskNote(t taskStatus) string {
 		if e != nil {
 			if p := progressText(e.Progress); p != "" {
 				return p
+			}
+			if e.AttemptID == nil && e.State != "" && e.State != "started" {
+				// Submitted, not started yet (waiting for resources or a gate).
+				return "execution " + e.State
 			}
 		}
 		return ""

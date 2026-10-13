@@ -46,6 +46,9 @@ type Launch struct {
 	Resources            []ResourceInstance `json:"resources"`
 	InputContinuationRef *string            `json:"input_continuation_ref,omitempty"`
 	Gang                 *GangLaunch        `json:"gang,omitempty"`
+	// Env is the execution's declared environment (a gang rank's already
+	// merged with the gang's), read from the store, never from the caller.
+	Env map[string]string `json:"env,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -694,7 +697,8 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	defer tx.Rollback()
 	var executionID, projectID, leaseState, executionState, executorID string
 	var leaseEpoch int64
-	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=?`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch)
+	var envJSON sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch,e.env_json FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=?`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch, &envJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -703,6 +707,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	}
 	if executionID != reservation.Execution.ID || leaseEpoch != reservation.Lease.CoordinationEpoch {
 		return nil, fmt.Errorf("%w: reservation does not match lease", ErrStaleEpoch)
+	}
+	env, err := decodeEnv(envJSON)
+	if err != nil {
+		return nil, err
 	}
 	if leaseState != "prepared" || executionState != "waiting" {
 		return nil, fmt.Errorf("%w: lease=%s execution=%s", ErrExecutionStarted, leaseState, executionState)
@@ -765,6 +773,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		Resources:            append([]ResourceInstance(nil), reservation.Resources...),
 		InputContinuationRef: reservation.Execution.InputContinuationRef,
 		Gang:                 gang,
+		Env:                  env,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp
