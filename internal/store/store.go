@@ -158,7 +158,8 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("apply auth schema: %w", err)
 	}
-	if err := migrateExecutionEnv(db); err != nil {
+	// Executions declare env: execution_requests.env_json, NULL when none.
+	if err := addColumnIfMissing(db, "execution_requests", "env_json", "TEXT"); err != nil {
 		db.Close()
 		return nil, err
 	}
@@ -176,30 +177,44 @@ func Open(path string) (*Store, error) {
 // verified before committing. A table that already allows the value is left
 // alone.
 func widenCheck(db *sql.DB, table, oldList, newList string) error {
+	return widenChecks(db, table, [2]string{oldList, newList})
+}
+
+// widenChecks is widenCheck for several lists of one table ({old, new} each),
+// with a single rebuild for all the lists that need widening.
+func widenChecks(db *sql.DB, table string, lists ...[2]string) error {
 	var ddl string
 	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&ddl); err != nil {
 		return err
 	}
-	if strings.Contains(ddl, newList) {
-		return nil
-	}
-	// A later widening of the same list has already added these values.
 	quoted := regexp.MustCompile(`'[^']*'`)
-	added := 0
-	for _, value := range quoted.FindAllString(newList, -1) {
-		if !strings.Contains(oldList, value) {
-			added++
-			if !strings.Contains(ddl, value) {
-				added = -1
-				break
+	var pending [][2]string
+	for _, list := range lists {
+		oldList, newList := list[0], list[1]
+		if strings.Contains(ddl, newList) {
+			continue
+		}
+		// A later widening of the same list has already added these values.
+		added := 0
+		for _, value := range quoted.FindAllString(newList, -1) {
+			if !strings.Contains(oldList, value) {
+				added++
+				if !strings.Contains(ddl, value) {
+					added = -1
+					break
+				}
 			}
 		}
+		if added > 0 {
+			continue
+		}
+		if !strings.Contains(ddl, oldList) {
+			return fmt.Errorf("unexpected %s definition: %s", table, ddl)
+		}
+		pending = append(pending, list)
 	}
-	if added > 0 {
+	if len(pending) == 0 {
 		return nil
-	}
-	if !strings.Contains(ddl, oldList) {
-		return fmt.Errorf("unexpected %s definition: %s", table, ddl)
 	}
 	ctx := context.Background()
 	rows, err := db.QueryContext(ctx, `SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL`, table)
@@ -240,7 +255,9 @@ func widenCheck(db *sql.DB, table, oldList, newList string) error {
 		return fmt.Errorf("unexpected %s definition: %s", table, ddl)
 	}
 	newDDL := "CREATE TABLE " + widened + "(" + ddl[loc[1]:]
-	newDDL = strings.Replace(newDDL, oldList, newList, 1)
+	for _, list := range pending {
+		newDDL = strings.Replace(newDDL, list[0], list[1], 1)
+	}
 	stmts := []string{newDDL, `INSERT INTO ` + widened + ` SELECT * FROM ` + table, `DROP TABLE ` + table, `ALTER TABLE ` + widened + ` RENAME TO ` + table}
 	stmts = append(stmts, indexes...)
 	for _, stmt := range stmts {
@@ -260,6 +277,22 @@ func widenCheck(db *sql.DB, table, oldList, newList string) error {
 		return fmt.Errorf("foreign key check failed after rebuilding %s", table)
 	}
 	return tx.Commit()
+}
+
+// addColumnIfMissing adds a column to an existing table, for databases
+// created before it existed. A table that has the column is left alone.
+func addColumnIfMissing(db *sql.DB, table, column, decl string) error {
+	var found bool
+	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pragma_table_info(?) WHERE name=?)`, table, column).Scan(&found); err != nil {
+		return err
+	}
+	if found {
+		return nil
+	}
+	if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + decl); err != nil {
+		return fmt.Errorf("add %s.%s: %w", table, column, err)
+	}
+	return nil
 }
 
 func (s *Store) Close() error { return s.db.Close() }

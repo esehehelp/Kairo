@@ -154,10 +154,9 @@ func normalizeAndValidate(m *Manifest) error {
 			return errors.New("invalid disk request")
 		}
 	}
-	if len(m.Env) == 0 {
-		m.Env = nil
-	}
-	return envspec.Validate(m.Env, len(m.Exclusive) != 0)
+	var err error
+	m.Env, err = envspec.Normalize(m.Env, len(m.Exclusive) != 0)
+	return err
 }
 
 func oneOf(value string, values ...string) bool {

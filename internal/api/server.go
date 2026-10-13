@@ -31,6 +31,9 @@ type Server struct {
 	LogDirectory string
 
 	logMu sync.Mutex
+	// logDirMu guards logDir, the log directory resolved once it exists.
+	logDirMu sync.Mutex
+	logDir   string
 }
 
 var (

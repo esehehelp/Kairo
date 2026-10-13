@@ -70,10 +70,15 @@ func (f TaskFilter) where() (string, []any) {
 	return ` AND ` + strings.Join(conditions, ` AND `), args
 }
 
+// latestLeaseJoin joins the latest lease of execution e as l: until an attempt
+// runs the execution, the executor holding that lease is the one it waits on.
+const latestLeaseJoin = ` LEFT JOIN leases l ON l.id=(SELECT id FROM leases WHERE execution_id=e.id ORDER BY created_at DESC LIMIT 1)`
+
 // taskExecutionColumns reads a TaskExecution (scanTaskExecution) from
-// orchestration_task_executions te, execution_requests e and attempts a.
+// orchestration_task_executions te, execution_requests e, attempts a and the
+// latest lease l (latestLeaseJoin).
 const taskExecutionColumns = `te.execution_ordinal,te.execution_id,te.reason,e.state,e.terminal_cause,a.exit_code,a.exit_signal,a.id,
- COALESCE(a.executor_id,(SELECT l.executor_id FROM leases l WHERE l.execution_id=e.id ORDER BY l.created_at DESC LIMIT 1)),
+ COALESCE(a.executor_id,l.executor_id),
  e.submitted_at,e.started_at,e.terminal_at,a.started_at,a.exited_at,
  CASE WHEN NOT json_valid(a.progress_json) THEN NULL WHEN json_type(a.progress_json)='object' THEN json_remove(a.progress_json,'$.detail') ELSE a.progress_json END`
 
@@ -88,6 +93,21 @@ func scanTaskExecution(rows *sql.Rows, extra ...any) (TaskExecution, error) {
 		v.Progress = json.RawMessage(progress.String)
 	}
 	return v, nil
+}
+
+// eachRow runs a query and calls scan on each of its rows.
+func eachRow(ctx context.Context, q queryer, query string, args []any, scan func(*sql.Rows) error) error {
+	rows, err := q.QueryContext(ctx, query, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		if err = scan(rows); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
 }
 
 func (s *Store) GetProjectStatus(ctx context.Context, project string) (ProjectStatus, error) {
@@ -105,106 +125,94 @@ func (s *Store) QueryProjectStatus(ctx context.Context, project string, filter T
 		return ProjectStatus{}, err
 	}
 	projectID := scopes.Project.ID
-	status := ProjectStatus{Name: project, SpecDigests: []string{}, StateCounts: map[string]int{}, Tasks: []TaskStatus{}}
-	rows, err := s.db.QueryContext(ctx, `SELECT spec_digest FROM project_declarations WHERE project_scope_id=? ORDER BY applied_at,spec_digest`, projectID)
-	if err != nil {
-		return ProjectStatus{}, err
-	}
-	for rows.Next() {
+	status := ProjectStatus{Name: project, SpecDigests: []string{}, StateCounts: map[string]int{}}
+	err = eachRow(ctx, s.db, `SELECT spec_digest FROM project_declarations WHERE project_scope_id=? ORDER BY applied_at,spec_digest`, []any{projectID}, func(rows *sql.Rows) error {
 		var digest string
 		if err := rows.Scan(&digest); err != nil {
-			rows.Close()
-			return ProjectStatus{}, err
+			return err
 		}
 		status.SpecDigests = append(status.SpecDigests, digest)
-	}
-	if err := rows.Close(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return ProjectStatus{}, err
 	}
 	if len(status.SpecDigests) == 0 {
 		return ProjectStatus{}, ErrNotFound
 	}
-	if rows, err = s.db.QueryContext(ctx, `SELECT state,COUNT(*) FROM orchestration_tasks WHERE project_scope_id=? GROUP BY state`, projectID); err != nil {
-		return ProjectStatus{}, err
-	}
-	for rows.Next() {
+	err = eachRow(ctx, s.db, `SELECT state,COUNT(*) FROM orchestration_tasks WHERE project_scope_id=? GROUP BY state`, []any{projectID}, func(rows *sql.Rows) error {
 		var state string
 		var n int
 		if err := rows.Scan(&state, &n); err != nil {
-			rows.Close()
-			return ProjectStatus{}, err
+			return err
 		}
 		status.StateCounts[state] = n
-	}
-	if err := rows.Close(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return ProjectStatus{}, err
 	}
+	if status.Tasks, err = s.taskStatuses(ctx, projectID, filter); err != nil {
+		return ProjectStatus{}, err
+	}
+	return status, nil
+}
 
+// taskStatuses reads the tasks of a project that the filter selects, with
+// their dependencies and executions.
+func (s *Store) taskStatuses(ctx context.Context, projectID string, filter TaskFilter) ([]TaskStatus, error) {
 	where, args := filter.where()
 	args = append([]any{projectID}, args...)
-	if rows, err = s.db.QueryContext(ctx, `SELECT o.task_scope_id,o.name,o.queue_name,o.policy_id,o.policy_version,o.state,o.spec_digest,o.result_json,o.created_at,o.updated_at FROM orchestration_tasks o WHERE o.project_scope_id=?`+where+` ORDER BY o.name`, args...); err != nil {
-		return ProjectStatus{}, err
-	}
+	tasks := []TaskStatus{}
 	index := map[string]int{}
-	for rows.Next() {
+	err := eachRow(ctx, s.db, `SELECT o.task_scope_id,o.name,o.queue_name,o.policy_id,o.policy_version,o.state,o.spec_digest,o.result_json,o.created_at,o.updated_at FROM orchestration_tasks o WHERE o.project_scope_id=?`+where+` ORDER BY o.name`, args, func(rows *sql.Rows) error {
 		var task TaskStatus
 		var scopeID, policyID string
 		var policyVersion int
 		var result sql.NullString
 		if err := rows.Scan(&scopeID, &task.Name, &task.Queue, &policyID, &policyVersion, &task.State, &task.SpecDigest, &result, &task.CreatedAt, &task.UpdatedAt); err != nil {
-			rows.Close()
-			return ProjectStatus{}, err
+			return err
 		}
 		task.Policy = fmt.Sprintf("%s@v%d", policyID, policyVersion)
 		task.DependsOn, task.Executions = []string{}, []TaskExecution{}
 		if result.Valid {
 			task.Result = json.RawMessage(result.String)
 		}
-		index[scopeID] = len(status.Tasks)
-		status.Tasks = append(status.Tasks, task)
+		index[scopeID] = len(tasks)
+		tasks = append(tasks, task)
+		return nil
+	})
+	if err != nil || len(tasks) == 0 {
+		return tasks, err
 	}
-	if err := rows.Close(); err != nil {
-		return ProjectStatus{}, err
-	}
-	if len(status.Tasks) == 0 {
-		return status, nil
-	}
-
-	if rows, err = s.db.QueryContext(ctx, `SELECT d.task_scope_id,t.name FROM orchestration_tasks o JOIN orchestration_task_dependencies d ON d.task_scope_id=o.task_scope_id JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE o.project_scope_id=?`+where+` ORDER BY t.name`, args...); err != nil {
-		return ProjectStatus{}, err
-	}
-	for rows.Next() {
+	err = eachRow(ctx, s.db, `SELECT d.task_scope_id,t.name FROM orchestration_tasks o JOIN orchestration_task_dependencies d ON d.task_scope_id=o.task_scope_id JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE o.project_scope_id=?`+where+` ORDER BY t.name`, args, func(rows *sql.Rows) error {
 		var scopeID, name string
 		if err := rows.Scan(&scopeID, &name); err != nil {
-			rows.Close()
-			return ProjectStatus{}, err
+			return err
 		}
 		if i, ok := index[scopeID]; ok {
-			status.Tasks[i].DependsOn = append(status.Tasks[i].DependsOn, name)
+			tasks[i].DependsOn = append(tasks[i].DependsOn, name)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	if err := rows.Close(); err != nil {
-		return ProjectStatus{}, err
-	}
-
-	if rows, err = s.db.QueryContext(ctx, `SELECT te.task_scope_id,`+taskExecutionColumns+` FROM orchestration_tasks o JOIN orchestration_task_executions te ON te.task_scope_id=o.task_scope_id JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id WHERE o.project_scope_id=?`+where+` ORDER BY te.task_scope_id,te.execution_ordinal`, args...); err != nil {
-		return ProjectStatus{}, err
-	}
-	for rows.Next() {
+	err = eachRow(ctx, s.db, `SELECT te.task_scope_id,`+taskExecutionColumns+` FROM orchestration_tasks o JOIN orchestration_task_executions te ON te.task_scope_id=o.task_scope_id JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+` WHERE o.project_scope_id=?`+where+` ORDER BY te.task_scope_id,te.execution_ordinal`, args, func(rows *sql.Rows) error {
 		var scopeID string
 		execution, err := scanTaskExecution(rows, &scopeID)
 		if err != nil {
-			rows.Close()
-			return ProjectStatus{}, err
+			return err
 		}
 		if i, ok := index[scopeID]; ok {
-			status.Tasks[i].Executions = append(status.Tasks[i].Executions, execution)
+			tasks[i].Executions = append(tasks[i].Executions, execution)
 		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	if err := rows.Close(); err != nil {
-		return ProjectStatus{}, err
-	}
-	return status, nil
+	return tasks, nil
 }
 
 // TaskDetail is one task with its declaration, its neighbours in the DAG, its
@@ -265,55 +273,65 @@ type WaitReason struct {
 	CreatedAt  string          `json:"created_at,omitempty"`
 }
 
+// GetTaskDetail reads one task in a fixed number of queries: the attempts,
+// gang ranks and admission blocks of all its executions are read at once.
 func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDetail, error) {
-	status, err := s.QueryProjectStatus(ctx, project, TaskFilter{Names: []string{name}})
+	task, err := loadTaskTx(ctx, s.db, project, name)
 	if err != nil {
 		return TaskDetail{}, err
 	}
-	if len(status.Tasks) != 1 {
+	tasks, err := s.taskStatuses(ctx, task.projectID, TaskFilter{Names: []string{name}})
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	if len(tasks) != 1 {
 		return TaskDetail{}, ErrNotFound
 	}
-	detail := TaskDetail{TaskStatus: status.Tasks[0], Executions: []TaskExecutionDetail{}}
-	var taskScopeID, spec string
-	var queueScopeID, projectScopeID string
-	if err := s.db.QueryRowContext(ctx, `SELECT t.task_scope_id,t.spec_json,ts.parent_id,t.project_scope_id FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id JOIN coordination_scopes ts ON ts.id=t.task_scope_id WHERE p.kind='project' AND p.external_key=? AND t.name=?`, project, name).Scan(&taskScopeID, &spec, &queueScopeID, &projectScopeID); err != nil {
+	detail := TaskDetail{TaskStatus: tasks[0], Spec: json.RawMessage(task.spec), Executions: []TaskExecutionDetail{}, Gates: []TaskGate{}}
+	if detail.Dependencies, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE d.task_scope_id=? ORDER BY t.name`, task.scopeID); err != nil {
 		return TaskDetail{}, err
 	}
-	detail.Spec = json.RawMessage(spec)
-	if detail.Dependencies, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE d.task_scope_id=? ORDER BY t.name`, taskScopeID); err != nil {
+	if detail.Dependents, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.dependency_task_scope_id=? ORDER BY t.name`, task.scopeID); err != nil {
 		return TaskDetail{}, err
 	}
-	if detail.Dependents, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.dependency_task_scope_id=? ORDER BY t.name`, taskScopeID); err != nil {
-		return TaskDetail{}, err
-	}
-	rows, err := s.db.QueryContext(ctx, `SELECT s.kind,COALESCE(g.state,'open') FROM coordination_scopes s LEFT JOIN admission_gates g ON g.scope_id=s.id WHERE s.id IN(?,?,?) ORDER BY CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, projectScopeID, queueScopeID, taskScopeID)
+	err = eachRow(ctx, s.db, `SELECT s.kind,COALESCE(g.state,'open') FROM coordination_scopes s LEFT JOIN admission_gates g ON g.scope_id=s.id WHERE s.id IN(?,?,?) ORDER BY CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, []any{task.projectID, task.queueScopeID, task.scopeID}, func(rows *sql.Rows) error {
+		var gate TaskGate
+		if err := rows.Scan(&gate.Scope, &gate.State); err != nil {
+			return err
+		}
+		detail.Gates = append(detail.Gates, gate)
+		return nil
+	})
 	if err != nil {
 		return TaskDetail{}, err
 	}
-	detail.Gates = []TaskGate{}
-	for rows.Next() {
-		var gate TaskGate
-		if err = rows.Scan(&gate.Scope, &gate.State); err != nil {
-			rows.Close()
-			return TaskDetail{}, err
-		}
-		detail.Gates = append(detail.Gates, gate)
-	}
-	if err = rows.Close(); err != nil {
+	attempts, err := s.taskAttemptDetails(ctx, task.scopeID)
+	if err != nil {
 		return TaskDetail{}, err
 	}
-	for _, execution := range detail.TaskStatus.Executions {
-		item := TaskExecutionDetail{TaskExecution: execution}
-		if item.Attempts, err = s.attemptDetails(ctx, execution.ExecutionID); err != nil {
-			return TaskDetail{}, err
+	gangs, err := s.taskGangRanks(ctx, task.scopeID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	blocks, err := s.taskAdmissionBlocks(ctx, task.scopeID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	// The task's executions are in its project, queue and task scopes: a
+	// closed gate of the task holds back each of them that has not started.
+	var closed []WaitReason
+	for _, gate := range detail.Gates {
+		if gate.State == "closed" {
+			closed = append(closed, WaitReason{ReasonCode: "scope_gate_closed", Scope: gate.Scope})
 		}
-		if item.Gang, err = s.taskGangRanks(ctx, execution.ExecutionID); err != nil {
-			return TaskDetail{}, err
+	}
+	for _, execution := range detail.TaskStatus.Executions {
+		item := TaskExecutionDetail{TaskExecution: execution, Attempts: attempts[execution.ExecutionID], Gang: gangs[execution.ExecutionID]}
+		if item.Attempts == nil {
+			item.Attempts = []AttemptDetail{}
 		}
 		if execution.State == "waiting" || execution.State == "authorized" {
-			if item.Waiting, err = s.waitReasons(ctx, execution.ExecutionID); err != nil {
-				return TaskDetail{}, err
-			}
+			item.Waiting = append(blocks[execution.ExecutionID], closed...)
 		}
 		detail.Executions = append(detail.Executions, item)
 	}
@@ -321,104 +339,67 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 }
 
 func (s *Store) taskRefs(ctx context.Context, query, taskScopeID string) ([]TaskRef, error) {
-	rows, err := s.db.QueryContext(ctx, query, taskScopeID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
 	out := []TaskRef{}
-	for rows.Next() {
+	err := eachRow(ctx, s.db, query, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var ref TaskRef
-		if err = rows.Scan(&ref.Name, &ref.State); err != nil {
-			return nil, err
+		if err := rows.Scan(&ref.Name, &ref.State); err != nil {
+			return err
 		}
 		out = append(out, ref)
-	}
-	return out, rows.Err()
+		return nil
+	})
+	return out, err
 }
 
-func (s *Store) attemptDetails(ctx context.Context, executionID string) ([]AttemptDetail, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.execution_id,a.state,a.executor_id,a.coordination_epoch,a.pid,a.process_identity,a.exit_code,a.exit_signal,a.continuation_ref,a.progress_json,a.started_at,a.last_heartbeat_at,a.checkpointed_at,a.exited_at,a.quiesced_at,a.stdout_path,a.stderr_path,x.node_id
-		FROM attempts a LEFT JOIN executors x ON x.id=a.executor_id WHERE a.execution_id=? ORDER BY COALESCE(a.authorized_at,a.started_at),a.id`, executionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []AttemptDetail{}
-	for rows.Next() {
-		var v AttemptDetail
-		var progress sql.NullString
-		if err = rows.Scan(&v.ID, &v.ExecutionID, &v.State, &v.ExecutorID, &v.CoordinationEpoch, &v.PID, &v.ProcessIdentity, &v.ExitCode, &v.ExitSignal, &v.ContinuationRef, &progress, &v.StartedAt, &v.LastHeartbeatAt, &v.CheckpointedAt, &v.ExitedAt, &v.QuiescedAt, &v.StdoutPath, &v.StderrPath, &v.NodeID); err != nil {
-			return nil, err
+// taskAttemptDetails lists the attempts of a task's executions by execution.
+func (s *Store) taskAttemptDetails(ctx context.Context, taskScopeID string) (map[string][]AttemptDetail, error) {
+	out := map[string][]AttemptDetail{}
+	err := eachRow(ctx, s.db, `SELECT x.node_id,`+attemptColumns+` FROM orchestration_task_executions te JOIN attempts a ON a.execution_id=te.execution_id LEFT JOIN executors x ON x.id=a.executor_id WHERE te.task_scope_id=? ORDER BY COALESCE(a.authorized_at,a.started_at),a.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		var nodeID *string
+		v, err := scanAttempt(rows, &nodeID)
+		if err != nil {
+			return err
 		}
-		if progress.Valid && json.Valid([]byte(progress.String)) {
-			v.Progress = json.RawMessage(progress.String)
-		}
-		out = append(out, v)
-	}
-	return out, rows.Err()
+		out[v.ExecutionID] = append(out[v.ExecutionID], AttemptDetail{AttemptView: v, NodeID: nodeID})
+		return nil
+	})
+	return out, err
 }
 
-// taskGangRanks lists the ranks of the gang an execution leads (nil if it
-// leads none).
-func (s *Store) taskGangRanks(ctx context.Context, executionID string) ([]TaskGangRank, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT m.rank,m.execution_id,e.state,a.id,
-		COALESCE(a.executor_id,(SELECT l.executor_id FROM leases l WHERE l.execution_id=e.id ORDER BY l.created_at DESC LIMIT 1)),
-		(SELECT x.node_id FROM executors x WHERE x.id=COALESCE(a.executor_id,(SELECT l.executor_id FROM leases l WHERE l.execution_id=e.id ORDER BY l.created_at DESC LIMIT 1)))
-		FROM execution_gangs g JOIN gang_members m ON m.gang_id=g.id JOIN execution_requests e ON e.id=m.execution_id LEFT JOIN attempts a ON a.execution_id=e.id
-		WHERE g.leader_execution_id=? ORDER BY m.rank`, executionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []TaskGangRank
-	for rows.Next() {
+// taskGangRanks lists the ranks of the gangs a task's executions lead, by
+// leader.
+func (s *Store) taskGangRanks(ctx context.Context, taskScopeID string) (map[string][]TaskGangRank, error) {
+	out := map[string][]TaskGangRank{}
+	err := eachRow(ctx, s.db, `SELECT g.leader_execution_id,m.rank,m.execution_id,e.state,a.id,COALESCE(a.executor_id,l.executor_id),x.node_id
+		FROM orchestration_task_executions te JOIN execution_gangs g ON g.leader_execution_id=te.execution_id JOIN gang_members m ON m.gang_id=g.id JOIN execution_requests e ON e.id=m.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+`
+		LEFT JOIN executors x ON x.id=COALESCE(a.executor_id,l.executor_id) WHERE te.task_scope_id=? ORDER BY m.rank`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		var leaderID string
 		var r TaskGangRank
-		if err = rows.Scan(&r.Rank, &r.ExecutionID, &r.State, &r.AttemptID, &r.ExecutorID, &r.NodeID); err != nil {
-			return nil, err
+		if err := rows.Scan(&leaderID, &r.Rank, &r.ExecutionID, &r.State, &r.AttemptID, &r.ExecutorID, &r.NodeID); err != nil {
+			return err
 		}
-		out = append(out, r)
-	}
-	return out, rows.Err()
+		out[leaderID] = append(out[leaderID], r)
+		return nil
+	})
+	return out, err
 }
 
-// waitReasons lists the admission blocks of an execution that has not started
-// and the closed admission gates of its project, queue and task scopes.
-func (s *Store) waitReasons(ctx context.Context, executionID string) ([]WaitReason, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT reason_code,detail_json,created_at FROM admission_blocks WHERE execution_id=? AND cleared_at IS NULL ORDER BY created_at,id`, executionID)
-	if err != nil {
-		return nil, err
-	}
-	var out []WaitReason
-	for rows.Next() {
+// taskAdmissionBlocks lists the admission blocks of a task's executions that
+// have not started, by execution.
+func (s *Store) taskAdmissionBlocks(ctx context.Context, taskScopeID string) (map[string][]WaitReason, error) {
+	out := map[string][]WaitReason{}
+	err := eachRow(ctx, s.db, `SELECT b.execution_id,b.reason_code,b.detail_json,b.created_at FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id JOIN admission_blocks b ON b.execution_id=e.id
+		WHERE te.task_scope_id=? AND e.state IN('waiting','authorized') AND b.cleared_at IS NULL ORDER BY b.created_at,b.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		var executionID, detail string
 		var w WaitReason
-		var detail string
-		if err = rows.Scan(&w.ReasonCode, &detail, &w.CreatedAt); err != nil {
-			rows.Close()
-			return nil, err
+		if err := rows.Scan(&executionID, &w.ReasonCode, &detail, &w.CreatedAt); err != nil {
+			return err
 		}
 		if json.Valid([]byte(detail)) {
 			w.Detail = json.RawMessage(detail)
 		}
-		out = append(out, w)
-	}
-	if err = rows.Close(); err != nil {
-		return nil, err
-	}
-	rows, err = s.db.QueryContext(ctx, `SELECT s.kind FROM execution_requests e JOIN coordination_scopes s ON s.id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) JOIN admission_gates g ON g.scope_id=s.id WHERE e.id=? AND g.state='closed' ORDER BY CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, executionID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		w := WaitReason{ReasonCode: "scope_gate_closed"}
-		if err = rows.Scan(&w.Scope); err != nil {
-			return nil, err
-		}
-		out = append(out, w)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
+		out[executionID] = append(out[executionID], w)
+		return nil
+	})
+	return out, err
 }

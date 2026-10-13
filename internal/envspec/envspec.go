@@ -5,7 +5,8 @@ package envspec
 import (
 	"errors"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 )
 
@@ -15,7 +16,6 @@ import (
 // GPUs (it is set from the lease); a CPU-only execution may set it, say to -1.
 func Validate(env map[string]string, exclusiveGPU bool) error {
 	for _, name := range Names(env) {
-		upper := strings.ToUpper(name)
 		switch {
 		case name == "" || strings.TrimSpace(name) != name:
 			return fmt.Errorf("env name %q is empty or has surrounding spaces", name)
@@ -23,23 +23,36 @@ func Validate(env map[string]string, exclusiveGPU bool) error {
 			return fmt.Errorf("env name %q contains '=' or NUL", name)
 		case strings.Contains(env[name], "\x00"):
 			return fmt.Errorf("env %s value contains NUL", name)
-		case strings.HasPrefix(upper, "KAIRO_") || upper == "WSLENV":
+		case Reserved(name):
 			return fmt.Errorf("env %s is set by Kairo", name)
-		case exclusiveGPU && upper == "CUDA_VISIBLE_DEVICES":
+		case exclusiveGPU && strings.ToUpper(name) == "CUDA_VISIBLE_DEVICES":
 			return errors.New("env CUDA_VISIBLE_DEVICES is set by Kairo from the GPU lease")
 		}
 	}
 	return nil
 }
 
+// Normalize validates env and returns it, or nil when it is empty.
+func Normalize(env map[string]string, exclusiveGPU bool) (map[string]string, error) {
+	if len(env) == 0 {
+		return nil, nil
+	}
+	if err := Validate(env, exclusiveGPU); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+// Reserved reports whether a variable belongs to Kairo whatever the execution
+// declares: KAIRO_* and WSLENV, in any case.
+func Reserved(name string) bool {
+	upper := strings.ToUpper(name)
+	return strings.HasPrefix(upper, "KAIRO_") || upper == "WSLENV"
+}
+
 // Names returns the names of env in sorted order.
 func Names(env map[string]string) []string {
-	names := make([]string, 0, len(env))
-	for name := range env {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
+	return slices.Sorted(maps.Keys(env))
 }
 
 // Merge returns base with over's values on top; nil when both are empty.
@@ -48,11 +61,7 @@ func Merge(base, over map[string]string) map[string]string {
 		return nil
 	}
 	out := make(map[string]string, len(base)+len(over))
-	for name, value := range base {
-		out[name] = value
-	}
-	for name, value := range over {
-		out[name] = value
-	}
+	maps.Copy(out, base)
+	maps.Copy(out, over)
 	return out
 }

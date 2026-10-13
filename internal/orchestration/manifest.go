@@ -327,10 +327,8 @@ func normalizeExecution(value *Execution) error {
 		}
 	}
 	exclusiveGPU := len(value.Exclusive) != 0
-	if len(value.Env) == 0 {
-		value.Env = nil
-	}
-	if err := envspec.Validate(value.Env, exclusiveGPU); err != nil {
+	var err error
+	if value.Env, err = envspec.Normalize(value.Env, exclusiveGPU); err != nil {
 		return err
 	}
 	if value.Gang != nil {
@@ -363,10 +361,8 @@ func normalizeGang(gang *Gang, exclusiveGPU bool) error {
 		if r.Executor != nil && r.Executor.Labels == nil {
 			r.Executor.Labels = map[string]string{}
 		}
-		if len(r.Env) == 0 {
-			r.Env = nil
-		}
-		if err := envspec.Validate(r.Env, exclusiveGPU); err != nil {
+		var err error
+		if r.Env, err = envspec.Normalize(r.Env, exclusiveGPU); err != nil {
 			return fmt.Errorf("gang rank %d: %w", r.Rank, err)
 		}
 	}
