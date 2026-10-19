@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import time
@@ -87,6 +88,63 @@ class DistributedAdapter:
         rank = dist.get_rank() if distributed else 0
         if rank == 0:
             self.session.close()
+
+    def local_continuation(
+        self, dest_dir: str | os.PathLike[str], *, chunk_bytes: int = 64 << 20
+    ) -> str | None:
+        """The continuation Kairo handed this attempt, as a file this rank can open.
+
+        Opt-in for projects whose continuation is a single file written by
+        rank 0: Kairo hands every rank the same reference, a path that may
+        exist only on rank 0's node. Every rank must call this together.
+        A rank that already sees the same bytes (size and SHA-256 equal to
+        rank 0's) gets the reference back; any other rank receives the file
+        from rank 0 over the process group into ``dest_dir`` under the same
+        file name, verified, and gets that path. A different file already at
+        that name is never overwritten. Any rank's failure raises on every
+        rank. Returns ``None`` when the attempt has no continuation.
+        """
+        ref = self.session.input_continuation_ref
+        if not ref:
+            return None
+        dist, distributed = self._distribution()
+        if not distributed:
+            return ref
+        rank = dist.get_rank()
+        world_size = dist.get_world_size()
+
+        source: list[Any] = [None]
+        if rank == 0:
+            try:
+                source[0] = {"size": os.path.getsize(ref), "sha256": _sha256_file(ref)}
+            except OSError as exc:
+                source[0] = {"error": f"rank 0 cannot read continuation {ref}: {exc}"}
+        dist.broadcast_object_list(source, src=0)
+        if "error" in source[0]:
+            raise RuntimeError(source[0]["error"])
+        size, digest = source[0]["size"], source[0]["sha256"]
+
+        local, receive, error = ref, False, None
+        try:
+            if rank != 0 and not _same_file(ref, size, digest):
+                local = os.path.join(os.fspath(dest_dir), os.path.basename(ref))
+                if not os.path.exists(local):
+                    receive = True
+                elif not _same_file(local, size, digest):
+                    error = f"rank {rank}: {local} exists with other contents"
+        except OSError as exc:
+            error = f"rank {rank}: {exc}"
+        states: list[Any] = [None] * world_size
+        dist.all_gather_object(states, (receive, error))
+        _raise_rank_errors(state[1] for state in states)
+        if any(state[0] for state in states):
+            error = _broadcast_file(
+                dist, rank, ref, local if receive else None, size, digest, chunk_bytes
+            )
+            errors: list[Any] = [None] * world_size
+            dist.all_gather_object(errors, error)
+            _raise_rank_errors(errors)
+        return local
 
     def _try_ack(
         self, command_id: str, phase: str, payload: dict[str, Any] | None = None
@@ -268,6 +326,90 @@ class DistributedAdapter:
                 return message
         message["stop"] = stop_requested()
         return message
+
+
+def _raise_rank_errors(errors) -> None:
+    failures = [error for error in errors if error]
+    if failures:
+        raise RuntimeError("; ".join(failures))
+
+
+def _sha256_file(path: str, block: int = 8 << 20) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while chunk := handle.read(block):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _same_file(path: str, size: int, digest: str) -> bool:
+    return os.path.isfile(path) and os.path.getsize(path) == size and _sha256_file(path) == digest
+
+
+def _broadcast_file(
+    dist, rank: int, ref: str, target: str | None, size: int, digest: str, chunk_bytes: int
+) -> str | None:
+    """Stream rank 0's file to every rank in chunks; ``target`` is where this rank keeps it.
+
+    Every rank takes part in every chunk's broadcast (a rank that needs
+    nothing discards it), and no I/O failure leaves the loop early, so the
+    collective sequence is the same on all ranks. Returns this rank's error.
+    """
+    import torch  # optional dependency, intentionally lazy
+
+    device = torch.device("cpu")
+    if dist.get_backend() == "nccl":
+        device = torch.device("cuda", torch.cuda.current_device())
+    buffer = torch.empty(min(chunk_bytes, max(size, 1)), dtype=torch.uint8, device=device)
+    error: str | None = None
+    reader = writer = partial = None
+    check = hashlib.sha256()
+    try:
+        if rank == 0:
+            reader = open(ref, "rb")
+        elif target is not None:
+            os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+            partial = f"{target}.partial-{os.getpid()}"
+            writer = open(partial, "wb")
+    except OSError as exc:
+        error = f"rank {rank}: {exc}"
+    offset = 0
+    while offset < size:
+        length = min(buffer.numel(), size - offset)
+        view = buffer[:length]
+        if reader is not None and error is None:
+            try:
+                data = reader.read(length)
+                if len(data) != length:
+                    raise OSError(f"{ref} ended at {offset + len(data)} of {size} bytes")
+                view.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
+            except OSError as exc:
+                error = f"rank 0: reading {ref}: {exc}"
+        dist.broadcast(view, src=0)
+        if writer is not None and error is None:
+            data = view.cpu().numpy().tobytes()
+            check.update(data)
+            try:
+                writer.write(data)
+            except OSError as exc:
+                error = f"rank {rank}: writing {partial}: {exc}"
+        offset += length
+    if reader is not None:
+        reader.close()
+    if writer is not None:
+        try:
+            writer.flush()
+            os.fsync(writer.fileno())
+        except OSError as exc:
+            error = error or f"rank {rank}: writing {partial}: {exc}"
+        writer.close()
+        if error is None and check.hexdigest() != digest:
+            error = f"rank {rank}: the received continuation does not match rank 0's SHA-256"
+        if error is None:
+            os.replace(partial, target)
+        else:
+            os.remove(partial)
+    return error
 
 
 def _terminal_message(session: AttemptSession) -> dict[str, Any] | None:
