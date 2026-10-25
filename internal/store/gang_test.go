@@ -32,6 +32,7 @@ func setupGangInventory(t *testing.T, store *Store) {
 		if err := store.UpsertResourceInstance(ctx, ResourceInstance{ID: n.gpu, NodeID: n.node, ProviderID: n.gpu + "-provider", Kind: "gpu", StableIdentity: n.gpu, Binding: json.RawMessage(`{"index":0}`), AdminState: "enabled"}); err != nil {
 			t.Fatal(err)
 		}
+		declareTestGPU(t, store, n.gpu, n.node)
 	}
 	refreshGangGPUs(t, store)
 }

@@ -208,7 +208,7 @@ func preemptionGPUsTx(ctx context.Context, tx *sql.Tx, nodeID string, waitingPri
 		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity')
 		FROM resource_instances ri
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY id DESC LIMIT 1)
-		WHERE ri.node_id=? AND ri.kind='gpu' AND ri.admin_state='enabled'
+		WHERE ri.node_id=? AND ri.kind='gpu' AND ri.admin_state='enabled' AND `+declaredGPUFilter+`
 		ORDER BY ri.id`, nodeID)
 	if err != nil {
 		return nil, err

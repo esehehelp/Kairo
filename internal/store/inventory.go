@@ -90,7 +90,9 @@ func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 // ApplyObservationBatch persists one provider poll and only clears a known
 // claim when the same fresh poll observed that resource without that claim.
 // A provider only reports resources of its own node, and observations and
-// claims only for its own resources.
+// claims only for its own resources. A GPU it reports that is not declared for
+// its node is left out, with its observations and claims, and recorded in
+// undeclared_gpus; the rest of the poll still applies.
 func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, resources []ResourceInstance, observations []Observation, claims []ExternalClaim) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -121,6 +123,8 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		return nil
 	}
 	t := now()
+	undeclared := map[string]bool{}
+	var undeclaredUUIDs []string
 	for _, resource := range resources {
 		if resource.ID == "" || resource.NodeID == "" || resource.ProviderID == "" || resource.Kind == "" || resource.StableIdentity == "" {
 			return errors.New("resource identity fields are required")
@@ -134,14 +138,31 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		if resource.AdminState == "" {
 			resource.AdminState = "enabled"
 		}
+		if resource.Kind == "gpu" {
+			register, err := registerGPUTx(ctx, tx, resource, providerNode, t)
+			if err != nil {
+				return err
+			}
+			if !register {
+				undeclared[resource.ID] = true
+				undeclaredUUIDs = append(undeclaredUUIDs, resource.StableIdentity)
+				continue
+			}
+		}
 		if err = upsertResourceTx(ctx, tx, resource, t); err != nil {
 			return err
 		}
 		owned[resource.ID] = true
 	}
+	if err = recordUndeclaredGPUsTx(ctx, tx, providerID, providerNode, undeclaredUUIDs, t); err != nil {
+		return err
+	}
 	for _, observation := range observations {
 		if observation.ResourceID == "" || observation.ObservedAt == "" || observation.ValidUntil == "" {
 			return errors.New("resource_id, observed_at, and valid_until are required")
+		}
+		if undeclared[observation.ResourceID] {
+			continue
 		}
 		if err = ownedByProvider(observation.ResourceID); err != nil {
 			return err
@@ -158,6 +179,9 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		}
 		if claim.ResourceID == "" || claim.ClaimKind == "" {
 			return errors.New("claim resource and kind are required")
+		}
+		if undeclared[claim.ResourceID] {
+			continue
 		}
 		if err = ownedByProvider(claim.ResourceID); err != nil {
 			return err
@@ -185,7 +209,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 	}
 	observed := map[string]bool{}
 	for _, o := range observations {
-		observed[o.ResourceID] = true
+		observed[o.ResourceID] = !undeclared[o.ResourceID]
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.resource_id FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id WHERE r.provider_id=? AND c.cleared_at IS NULL`, providerID)
 	if err != nil {
@@ -259,7 +283,8 @@ func (s *Store) ListResourceStatus(ctx context.Context) ([]ResourceInstance, err
 	 (SELECT observed_at FROM resource_observations o WHERE o.resource_id=r.id ORDER BY id DESC LIMIT 1),
 	 (SELECT valid_until FROM resource_observations o WHERE o.resource_id=r.id ORDER BY id DESC LIMIT 1),
 	 EXISTS(SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=r.id AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')),
-	 EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=r.id AND c.cleared_at IS NULL)
+	 EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=r.id AND c.cleared_at IS NULL),
+	 (SELECT node_id FROM machine_gpus d WHERE r.kind='gpu' AND d.uuid=r.stable_identity)
 	 FROM resource_instances r ORDER BY r.node_id,r.kind,r.id`)
 	if err != nil {
 		return nil, err
@@ -271,7 +296,7 @@ func (s *Store) ListResourceStatus(ctx context.Context) ([]ResourceInstance, err
 		var binding, attrs string
 		var observed, valid sql.NullString
 		var leased, claimed bool
-		if err := rows.Scan(&r.ID, &r.NodeID, &r.ProviderID, &r.Kind, &r.StableIdentity, &binding, &attrs, &r.AdminState, &r.QuarantineReason, &observed, &valid, &leased, &claimed); err != nil {
+		if err := rows.Scan(&r.ID, &r.NodeID, &r.ProviderID, &r.Kind, &r.StableIdentity, &binding, &attrs, &r.AdminState, &r.QuarantineReason, &observed, &valid, &leased, &claimed, &r.DeclaredNodeID); err != nil {
 			return nil, err
 		}
 		r.Binding = json.RawMessage(binding)
@@ -279,6 +304,10 @@ func (s *Store) ListResourceStatus(ctx context.Context) ([]ResourceInstance, err
 		r.DerivedState = "unknown"
 		if r.AdminState != "enabled" {
 			r.DerivedState = r.AdminState
+		} else if r.Kind == "gpu" && (r.DeclaredNodeID == nil || *r.DeclaredNodeID != r.NodeID) && !leased {
+			// Not schedulable: declared for no node, or moved to another one
+			// whose provider has not reported it yet.
+			r.DerivedState = "undeclared"
 		} else if leased {
 			r.DerivedState = "leased"
 		} else if claimed {

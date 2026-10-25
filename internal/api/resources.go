@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 
+	"kairo/internal/machine"
 	"kairo/internal/store"
 )
 
@@ -23,7 +24,39 @@ func (s *Server) resourceStatus(w http.ResponseWriter, r *http.Request) {
 	if claims == nil {
 		claims = []store.ExternalClaim{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"resources": resources, "external_claims": claims})
+	machines, err := s.Store.ListMachines(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"resources": resources, "external_claims": claims, "undeclared_gpus": machines.Undeclared})
+}
+
+func (s *Server) getMachines(w http.ResponseWriter, r *http.Request) {
+	machines, err := s.Store.ListMachines(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, machines)
+}
+
+// applyMachines replaces the machine declaration (kairo machine apply).
+func (s *Server) applyMachines(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		machine.Spec
+		DryRun bool `json:"dry_run"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	result, err := s.Store.ApplyMachines(r.Context(), body.Spec, body.DryRun)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (s *Server) enableResource(w http.ResponseWriter, r *http.Request) {

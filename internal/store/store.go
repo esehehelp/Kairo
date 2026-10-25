@@ -31,6 +31,9 @@ var forceStopSchema string
 //go:embed auth_schema.sql
 var authSchema string
 
+//go:embed machine_schema.sql
+var machineSchema string
+
 var (
 	ErrNotFound              = errors.New("not found")
 	ErrIdempotencyConflict   = errors.New("idempotency key was already used for different content")
@@ -167,7 +170,31 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
+	if err := applyMachineSchema(db); err != nil {
+		db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
+}
+
+// applyMachineSchema creates the machine declaration tables. A database that
+// predates them gets every registered GPU declared for the node it is
+// registered on, so GPU scheduling goes on unchanged after the upgrade.
+func applyMachineSchema(db *sql.DB) error {
+	var existed int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='machine_gpus'`).Scan(&existed); err != nil {
+		return err
+	}
+	if _, err := db.Exec(machineSchema); err != nil {
+		return fmt.Errorf("apply machine schema: %w", err)
+	}
+	if existed != 0 {
+		return nil
+	}
+	if _, err := db.Exec(`INSERT OR IGNORE INTO machine_gpus(uuid,node_id,declared_at) SELECT stable_identity,node_id,? FROM resource_instances WHERE kind='gpu'`, now()); err != nil {
+		return fmt.Errorf("seed machine declaration: %w", err)
+	}
+	return nil
 }
 
 // widenCheck adds a value to a CHECK(... IN(...)) list of an existing table,
