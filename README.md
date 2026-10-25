@@ -431,7 +431,7 @@ seen).
 `[tasks.execution.gang]` runs a task as `size` ranks on distinct nodes (DDP
 training across hosts, a pipeline-parallel server). Every rank asks for the
 task's resources on its own node; `[[tasks.execution.gang.ranks]]` overrides
-`argv`, `cwd` or `executor` labels of single ranks:
+`argv`, `cwd`, `executor` labels, `exclusive` or `capacity` of single ranks:
 
 ```toml
 [tasks.execution.gang]
@@ -441,7 +441,18 @@ rank = 1
 argv = ["/root/.local/bin/uv", "run", "train.py"]
 cwd = "/srv/project"
 executor = { labels = { environment = "linux" } }
+[[tasks.execution.gang.ranks.exclusive]]   # this rank's node has two GPUs
+kind = "gpu"
+count = 2
+same_node = true
+[tasks.execution.gang.ranks.capacity]
+ram_bytes = 17179869184
 ```
+
+A rank's `exclusive` (`exclusive = []` for no GPU) or `capacity` replaces the
+task's for that rank as a whole; a rank without them asks for the task's. The
+task's `env` reaches every rank, so it may not set `CUDA_VISIBLE_DEVICES` when
+any rank leases a GPU.
 
 - Each rank is an ordinary execution; rank 0 (the leader) is the one
   orchestration tracks, and the task's outcome is read over every rank.

@@ -76,10 +76,12 @@ type ExecutionSpec struct {
 	Env map[string]string `json:"env,omitempty"`
 }
 
-// GangSpec describes a multi-node execution. Every rank asks for the same
-// resources on its own node; Ranks overrides argv, cwd or the executor selector
-// of single ranks (a Windows/WSL rank and a Linux rank need different paths)
-// and merges a rank's env over the execution's.
+// GangSpec describes a multi-node execution. Every rank asks for the
+// execution's resources on its own node unless it gives its own; Ranks
+// overrides argv, cwd, the executor selector, exclusive or capacity of single
+// ranks (a Windows/WSL rank and a Linux rank need different paths, a two-GPU
+// node and a one-GPU node different requests) and merges a rank's env over the
+// execution's.
 type GangSpec struct {
 	Size int `json:"size"`
 	// Port is the rendezvous port on rank 0's interconnect address; 0 picks a
@@ -94,6 +96,11 @@ type GangRank struct {
 	CWD              string            `json:"cwd,omitempty"`
 	ExecutorSelector json.RawMessage   `json:"executor_selector,omitempty"`
 	Env              map[string]string `json:"env,omitempty"`
+	// Exclusive and Capacity, when set, replace the execution's for this rank
+	// (an empty Exclusive asks for no GPU). Absent from the JSON when unset, so
+	// existing gang digests do not change.
+	Exclusive *[]ExclusiveRequest `json:"exclusive,omitempty"`
+	Capacity  *CapacityRequest    `json:"capacity,omitempty"`
 }
 
 // GangLaunch is what one rank of a placed gang is told at launch: its rank and

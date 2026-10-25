@@ -44,63 +44,34 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		return ExecutionSpec{}, nil, "", err
 	}
 	spec.ExecutorSelector = canonicalSelector
-	if spec.Exclusive == nil {
-		spec.Exclusive = []ExclusiveRequest{}
+	if spec.Exclusive, err = normalizeExclusive(spec.Exclusive); err != nil {
+		return ExecutionSpec{}, nil, "", err
 	}
-	for i := range spec.Exclusive {
-		r := &spec.Exclusive[i]
-		r.Kind = strings.TrimSpace(r.Kind)
-		if r.Kind != "gpu" || r.Count < 1 {
-			return ExecutionSpec{}, nil, "", fmt.Errorf("exclusive request %d must be a positive GPU request", i)
-		}
-		if r.MinTotalMemoryBytes < 0 || r.MinObservedFreeMemoryBytes < 0 {
-			return ExecutionSpec{}, nil, "", fmt.Errorf("exclusive request %d has negative memory", i)
-		}
-		if r.OnExternalClaim == "" {
-			r.OnExternalClaim = "wait"
-		}
-		if r.OnUnattributedActivity == "" {
-			r.OnUnattributedActivity = "wait"
-		}
-		if r.OnStaleObservation == "" {
-			r.OnStaleObservation = "wait"
-		}
-		if !stringIn(r.OnExternalClaim, "wait", "fail") || !stringIn(r.OnUnattributedActivity, "wait", "fail", "allow") || !stringIn(r.OnStaleObservation, "wait", "fail") {
-			return ExecutionSpec{}, nil, "", fmt.Errorf("exclusive request %d has an invalid conflict policy", i)
-		}
-	}
-	if spec.Capacity.Strength == "" {
-		spec.Capacity.Strength = "admitted"
-	}
-	if spec.Capacity.Strength != "admitted" {
-		return ExecutionSpec{}, nil, "", errors.New("only admitted capacity is supported")
-	}
-	if spec.Capacity.CPUMillis < 0 || spec.Capacity.RAMBytes < 0 {
-		return ExecutionSpec{}, nil, "", errors.New("capacity cannot be negative")
-	}
-	if spec.Capacity.Disks == nil {
-		spec.Capacity.Disks = []DiskRequest{}
-	}
-	for i := range spec.Capacity.Disks {
-		d := &spec.Capacity.Disks[i]
-		d.Filesystem = strings.TrimSpace(d.Filesystem)
-		if d.Filesystem == "" || d.ReserveBytes < 0 || d.MinFreeAfterBytes < 0 {
-			return ExecutionSpec{}, nil, "", fmt.Errorf("disk request %d is invalid", i)
-		}
+	if err = normalizeCapacity(&spec.Capacity); err != nil {
+		return ExecutionSpec{}, nil, "", err
 	}
 	if spec.InputContinuationRef != nil && *spec.InputContinuationRef == "" {
 		spec.InputContinuationRef = nil
 	}
-	exclusiveGPU := len(spec.Exclusive) != 0
-	if spec.Env, err = envspec.Normalize(spec.Env, exclusiveGPU); err != nil {
-		return ExecutionSpec{}, nil, "", err
-	}
 	if spec.Gang != nil {
-		gang, err := normalizeGangSpec(*spec.Gang, exclusiveGPU)
+		gang, err := normalizeGangSpec(*spec.Gang)
 		if err != nil {
 			return ExecutionSpec{}, nil, "", err
 		}
 		spec.Gang = &gang
+	}
+	// The execution's env reaches every rank, so it is checked against a GPU
+	// any rank leases; a rank's env against its own.
+	if spec.Env, err = envspec.Normalize(spec.Env, anyRankLeasesGPU(spec)); err != nil {
+		return ExecutionSpec{}, nil, "", err
+	}
+	if spec.Gang != nil {
+		for i := range spec.Gang.Ranks {
+			r := &spec.Gang.Ranks[i]
+			if r.Env, err = envspec.Normalize(r.Env, len(rankSpec(spec, r.Rank).Exclusive) != 0); err != nil {
+				return ExecutionSpec{}, nil, "", fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+		}
 	}
 	// Gang and Env are left out of the digest when absent, so an execution
 	// without them keeps the digest it had before they existed.
@@ -126,9 +97,76 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 	return spec, normalized, hex.EncodeToString(sum[:]), nil
 }
 
+func normalizeExclusive(requests []ExclusiveRequest) ([]ExclusiveRequest, error) {
+	if requests == nil {
+		requests = []ExclusiveRequest{}
+	}
+	for i := range requests {
+		r := &requests[i]
+		r.Kind = strings.TrimSpace(r.Kind)
+		if r.Kind != "gpu" || r.Count < 1 {
+			return nil, fmt.Errorf("exclusive request %d must be a positive GPU request", i)
+		}
+		if r.MinTotalMemoryBytes < 0 || r.MinObservedFreeMemoryBytes < 0 {
+			return nil, fmt.Errorf("exclusive request %d has negative memory", i)
+		}
+		if r.OnExternalClaim == "" {
+			r.OnExternalClaim = "wait"
+		}
+		if r.OnUnattributedActivity == "" {
+			r.OnUnattributedActivity = "wait"
+		}
+		if r.OnStaleObservation == "" {
+			r.OnStaleObservation = "wait"
+		}
+		if !stringIn(r.OnExternalClaim, "wait", "fail") || !stringIn(r.OnUnattributedActivity, "wait", "fail", "allow") || !stringIn(r.OnStaleObservation, "wait", "fail") {
+			return nil, fmt.Errorf("exclusive request %d has an invalid conflict policy", i)
+		}
+	}
+	return requests, nil
+}
+
+func normalizeCapacity(c *CapacityRequest) error {
+	if c.Strength == "" {
+		c.Strength = "admitted"
+	}
+	if c.Strength != "admitted" {
+		return errors.New("only admitted capacity is supported")
+	}
+	if c.CPUMillis < 0 || c.RAMBytes < 0 {
+		return errors.New("capacity cannot be negative")
+	}
+	if c.Disks == nil {
+		c.Disks = []DiskRequest{}
+	}
+	for i := range c.Disks {
+		d := &c.Disks[i]
+		d.Filesystem = strings.TrimSpace(d.Filesystem)
+		if d.Filesystem == "" || d.ReserveBytes < 0 || d.MinFreeAfterBytes < 0 {
+			return fmt.Errorf("disk request %d is invalid", i)
+		}
+	}
+	return nil
+}
+
+// anyRankLeasesGPU reports whether the execution, or any rank of its gang,
+// asks for an exclusive GPU.
+func anyRankLeasesGPU(spec ExecutionSpec) bool {
+	if spec.Gang == nil {
+		return len(spec.Exclusive) != 0
+	}
+	for rank := 0; rank < spec.Gang.Size; rank++ {
+		if len(rankSpec(spec, rank).Exclusive) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // normalizeGangSpec checks a gang and puts its rank overrides in rank order with
-// canonical selectors.
-func normalizeGangSpec(gang GangSpec, exclusiveGPU bool) (GangSpec, error) {
+// canonical selectors and requests. Rank envs are checked by the caller, which
+// knows each rank's resources.
+func normalizeGangSpec(gang GangSpec) (GangSpec, error) {
 	if gang.Size < 2 {
 		return GangSpec{}, errors.New("gang size must be at least 2")
 	}
@@ -160,9 +198,19 @@ func normalizeGangSpec(gang GangSpec, exclusiveGPU bool) (GangSpec, error) {
 			}
 			r.ExecutorSelector = canonical
 		}
-		var err error
-		if r.Env, err = envspec.Normalize(r.Env, exclusiveGPU); err != nil {
-			return GangSpec{}, fmt.Errorf("gang rank %d: %w", r.Rank, err)
+		if r.Exclusive != nil {
+			exclusive, err := normalizeExclusive(*r.Exclusive)
+			if err != nil {
+				return GangSpec{}, fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+			r.Exclusive = &exclusive
+		}
+		if r.Capacity != nil {
+			capacity := *r.Capacity
+			if err := normalizeCapacity(&capacity); err != nil {
+				return GangSpec{}, fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+			r.Capacity = &capacity
 		}
 	}
 	sort.Slice(gang.Ranks, func(i, j int) bool { return gang.Ranks[i].Rank < gang.Ranks[j].Rank })
@@ -173,7 +221,8 @@ func normalizeGangSpec(gang GangSpec, exclusiveGPU bool) (GangSpec, error) {
 }
 
 // rankSpec is the execution of one gang rank: the gang's spec with that rank's
-// overrides applied and its env merged over the gang's.
+// overrides applied (its exclusive and capacity replace the gang's) and its env
+// merged over the gang's.
 func rankSpec(spec ExecutionSpec, rank int) ExecutionSpec {
 	out := spec
 	out.Gang = nil
@@ -189,6 +238,12 @@ func rankSpec(spec ExecutionSpec, rank int) ExecutionSpec {
 		}
 		if len(r.ExecutorSelector) != 0 {
 			out.ExecutorSelector = r.ExecutorSelector
+		}
+		if r.Exclusive != nil {
+			out.Exclusive = *r.Exclusive
+		}
+		if r.Capacity != nil {
+			out.Capacity = *r.Capacity
 		}
 		out.Env = envspec.Merge(spec.Env, r.Env)
 	}

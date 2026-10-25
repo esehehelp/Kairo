@@ -56,8 +56,9 @@ type Execution struct {
 }
 
 // Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
-// [[tasks.execution.gang.ranks]] overriding argv, cwd or executor labels of a
-// rank; a rank's env is merged over the task's (the rank's value wins).
+// [[tasks.execution.gang.ranks]] overriding argv, cwd, executor labels,
+// exclusive or capacity of a rank; a rank's env is merged over the task's (the
+// rank's value wins).
 type Gang struct {
 	Size  int        `toml:"size" json:"size"`
 	Port  int        `toml:"port" json:"port,omitempty"`
@@ -70,6 +71,12 @@ type GangRank struct {
 	CWD      string            `toml:"cwd" json:"cwd,omitempty"`
 	Executor *ExecutorSelector `toml:"executor" json:"executor,omitempty"`
 	Env      map[string]string `toml:"env" json:"env,omitempty"`
+	// Exclusive ([[tasks.execution.gang.ranks.exclusive]], or `exclusive = []`
+	// for no GPU) and Capacity ([tasks.execution.gang.ranks.capacity]) replace
+	// the task's for this rank when given. Absent from the JSON when unset, so
+	// existing task digests do not change.
+	Exclusive *[]ExclusiveRequest `toml:"exclusive" json:"exclusive,omitempty"`
+	Capacity  *CapacityRequest    `toml:"capacity" json:"capacity,omitempty"`
 }
 
 type ExecutorSelector struct {
@@ -280,17 +287,53 @@ func normalizeExecution(value *Execution) error {
 	if value.Executor.Labels == nil {
 		value.Executor.Labels = map[string]string{}
 	}
-	if value.Exclusive == nil {
-		value.Exclusive = []ExclusiveRequest{}
+	var err error
+	if value.Exclusive, err = normalizeExclusive(value.Exclusive); err != nil {
+		return err
 	}
-	for i := range value.Exclusive {
-		request := &value.Exclusive[i]
+	if err = normalizeCapacity(&value.Capacity); err != nil {
+		return err
+	}
+	if value.Gang != nil {
+		if err = normalizeGang(value.Gang); err != nil {
+			return err
+		}
+	}
+	// The task's env reaches every rank, so it is checked against a GPU any rank
+	// leases; a rank's env against its own.
+	anyGPU := len(value.Exclusive) != 0
+	if value.Gang != nil {
+		anyGPU = false
+		for rank := 0; rank < value.Gang.Size; rank++ {
+			anyGPU = anyGPU || len(rankExclusive(value, rank)) != 0
+		}
+	}
+	if value.Env, err = envspec.Normalize(value.Env, anyGPU); err != nil {
+		return err
+	}
+	if value.Gang != nil {
+		for i := range value.Gang.Ranks {
+			r := &value.Gang.Ranks[i]
+			if r.Env, err = envspec.Normalize(r.Env, len(rankExclusive(value, r.Rank)) != 0); err != nil {
+				return fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+		}
+	}
+	return nil
+}
+
+func normalizeExclusive(requests []ExclusiveRequest) ([]ExclusiveRequest, error) {
+	if requests == nil {
+		requests = []ExclusiveRequest{}
+	}
+	for i := range requests {
+		request := &requests[i]
 		request.Kind = strings.TrimSpace(request.Kind)
 		if request.Kind != "gpu" || request.Count < 1 {
-			return fmt.Errorf("exclusive request %d must be a positive GPU request", i)
+			return nil, fmt.Errorf("exclusive request %d must be a positive GPU request", i)
 		}
 		if request.MinTotalMemoryBytes < 0 || request.MinObservedFreeMemoryBytes < 0 {
-			return fmt.Errorf("exclusive request %d has negative memory", i)
+			return nil, fmt.Errorf("exclusive request %d has negative memory", i)
 		}
 		if request.OnExternalClaim == "" {
 			request.OnExternalClaim = "wait"
@@ -304,40 +347,52 @@ func normalizeExecution(value *Execution) error {
 		if !oneOf(request.OnExternalClaim, "wait", "fail") ||
 			!oneOf(request.OnUnattributedActivity, "wait", "fail", "allow") ||
 			!oneOf(request.OnStaleObservation, "wait", "fail") {
-			return fmt.Errorf("exclusive request %d has an invalid conflict policy", i)
+			return nil, fmt.Errorf("exclusive request %d has an invalid conflict policy", i)
 		}
 	}
-	if value.Capacity.Strength == "" {
-		value.Capacity.Strength = "admitted"
+	return requests, nil
+}
+
+func normalizeCapacity(capacity *CapacityRequest) error {
+	if capacity.Strength == "" {
+		capacity.Strength = "admitted"
 	}
-	if value.Capacity.Strength != "admitted" {
+	if capacity.Strength != "admitted" {
 		return errors.New("only admitted capacity is supported")
 	}
-	if value.Capacity.CPUMillis < 0 || value.Capacity.RAMBytes < 0 {
+	if capacity.CPUMillis < 0 || capacity.RAMBytes < 0 {
 		return errors.New("capacity cannot be negative")
 	}
-	if value.Capacity.Disks == nil {
-		value.Capacity.Disks = []DiskRequest{}
+	if capacity.Disks == nil {
+		capacity.Disks = []DiskRequest{}
 	}
-	for i := range value.Capacity.Disks {
-		disk := &value.Capacity.Disks[i]
+	for i := range capacity.Disks {
+		disk := &capacity.Disks[i]
 		disk.Filesystem = strings.TrimSpace(disk.Filesystem)
 		if disk.Filesystem == "" || disk.ReserveBytes < 0 || disk.MinFreeAfterBytes < 0 {
 			return fmt.Errorf("disk request %d is invalid", i)
 		}
 	}
-	exclusiveGPU := len(value.Exclusive) != 0
-	var err error
-	if value.Env, err = envspec.Normalize(value.Env, exclusiveGPU); err != nil {
-		return err
-	}
-	if value.Gang != nil {
-		return normalizeGang(value.Gang, exclusiveGPU)
-	}
 	return nil
 }
 
-func normalizeGang(gang *Gang, exclusiveGPU bool) error {
+// rankExclusive is the exclusive request one rank of the task makes: its own
+// when it gives one, the task's otherwise.
+func rankExclusive(value *Execution, rank int) []ExclusiveRequest {
+	if value.Gang != nil {
+		for _, r := range value.Gang.Ranks {
+			if r.Rank == rank && r.Exclusive != nil {
+				return *r.Exclusive
+			}
+		}
+	}
+	return value.Exclusive
+}
+
+// normalizeGang checks a gang and puts its rank overrides in rank order with
+// normalized requests. Rank envs are checked by normalizeExecution, which knows
+// each rank's resources.
+func normalizeGang(gang *Gang) error {
 	if gang.Size < 2 {
 		return errors.New("gang size must be at least 2")
 	}
@@ -361,9 +416,17 @@ func normalizeGang(gang *Gang, exclusiveGPU bool) error {
 		if r.Executor != nil && r.Executor.Labels == nil {
 			r.Executor.Labels = map[string]string{}
 		}
-		var err error
-		if r.Env, err = envspec.Normalize(r.Env, exclusiveGPU); err != nil {
-			return fmt.Errorf("gang rank %d: %w", r.Rank, err)
+		if r.Exclusive != nil {
+			exclusive, err := normalizeExclusive(*r.Exclusive)
+			if err != nil {
+				return fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+			r.Exclusive = &exclusive
+		}
+		if r.Capacity != nil {
+			if err := normalizeCapacity(r.Capacity); err != nil {
+				return fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
 		}
 	}
 	sort.Slice(gang.Ranks, func(i, j int) bool { return gang.Ranks[i].Rank < gang.Ranks[j].Rank })
