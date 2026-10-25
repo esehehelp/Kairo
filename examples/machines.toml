@@ -1,0 +1,8 @@
+# Machine declaration for `kairo machine apply`: which node holds which GPU.
+# The file is the whole declaration; a GPU left out is not scheduled. Each
+# node id must be known to the daemon (its daemon or agent has started).
+# GPU UUIDs are as `nvidia-smi -L` prints them.
+
+[[nodes]]
+id = "windows-host-1"
+gpus = ["GPU-00000000-0000-0000-0000-000000000000"]

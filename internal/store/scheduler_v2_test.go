@@ -45,6 +45,7 @@ func setupSchedulerInventory(t *testing.T, store *Store) {
 	if err := store.UpsertResourceInstance(ctx, ResourceInstance{ID: "gpu-0", NodeID: "node", ProviderID: "gpu-provider", Kind: "gpu", StableIdentity: "GPU-0", Binding: json.RawMessage(`{"index":0}`), AdminState: "enabled"}); err != nil {
 		t.Fatal(err)
 	}
+	declareTestGPU(t, store, "GPU-0", "node")
 	total, free := int64(24<<30), int64(23<<30)
 	observed := time.Now().UTC()
 	if err := store.RecordObservation(ctx, Observation{ResourceID: "gpu-0", ObservedAt: observed.Format(time.RFC3339Nano), ValidUntil: observed.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &free}); err != nil {
@@ -271,6 +272,7 @@ func TestSchedulerNeverSelectsOneResourceTwiceWithinGang(t *testing.T) {
 	if err := store.UpsertResourceInstance(ctx, ResourceInstance{ID: "gpu-1", NodeID: "node", ProviderID: "gpu-provider", Kind: "gpu", StableIdentity: "GPU-1", Binding: json.RawMessage(`{"index":1}`), AdminState: "enabled"}); err != nil {
 		t.Fatal(err)
 	}
+	declareTestGPU(t, store, "GPU-1", "node")
 	total, free := int64(24<<30), int64(23<<30)
 	observed := time.Now().UTC()
 	if err := store.RecordObservation(ctx, Observation{ResourceID: "gpu-1", ObservedAt: observed.Format(time.RFC3339Nano), ValidUntil: observed.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &free}); err != nil {

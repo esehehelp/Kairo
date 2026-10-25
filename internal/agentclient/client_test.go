@@ -17,6 +17,7 @@ import (
 
 	"kairo/internal/api"
 	"kairo/internal/executor"
+	"kairo/internal/machine"
 	"kairo/internal/provider"
 	"kairo/internal/store"
 	"kairo/internal/tlsutil"
@@ -257,6 +258,9 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 	}
 	c := New(ts.URL, token, tlsConfig)
 	registerRemote(t, c)
+	if _, err := st.ApplyMachines(ctx, machine.Spec{Nodes: []machine.Node{{ID: "remote", GPUs: []string{"GPU-remote-0"}}}}, false); err != nil {
+		t.Fatal(err)
+	}
 	selector, _ := json.Marshal(map[string]any{"labels": map[string]string{"environment": "remote-test"}})
 	if _, _, err := st.SubmitExecution(ctx, store.ExecutionSpec{
 		ClientRequestID:  "remote-1",

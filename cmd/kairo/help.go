@@ -97,7 +97,7 @@ type topCommand struct {
 
 var topAliases = map[string]string{
 	"tasks": "task", "projects": "project", "executions": "execution", "exec": "execution",
-	"queues": "queue", "resources": "resource", "nodes": "node", "tokens": "token",
+	"queues": "queue", "resources": "resource", "machines": "machine", "nodes": "node", "tokens": "token",
 	"log": "logs (or kairo task logs)", "status": "project status", "ls": "task list",
 	"list": "task list", "wait": "task wait", "watch": "project watch", "apply": "project apply",
 	"show": "task show", "cancel": "task cancel", "rerun": "task rerun", "-v": "version",
@@ -195,6 +195,16 @@ func init() {
 				{"reconcile", "RESOURCE_ID --confirm-process-absent", "clear a resource held by stale attempts", bind(resourceAction, "reconcile")},
 			},
 			aliases: map[string]string{"ls": "status", "list": "status", "show": "status", "release": "enable"},
+		}},
+		{name: "machine", summary: "declare which node holds which GPU (apply), and show it", group: &commandGroup{
+			subs: []command{
+				{"apply", "FILE [--dry-run] [--json]", "replace the machine declaration with FILE's", machineApply},
+				{"show", "[--json]", "declared GPUs, their state, and GPUs reported but not declared", machineShow},
+			},
+			aliases: map[string]string{
+				"status": "show", "get": "show", "ls": "show", "list": "show",
+				"declare": "apply", "submit": "apply", "set": "apply",
+			},
 		}},
 		{name: "node", summary: "quarantine or release nodes", group: &commandGroup{
 			subs: []command{
@@ -466,6 +476,9 @@ var commandNotes = map[string]string{
 		"--attempt all prints every attempt; for a gang, --rank selects the rank (default 0).",
 	"task list":     "Columns: NAME QUEUE STATE EXEC (latest execution) STARTED ELAPSED NOTE.",
 	"project apply": "A declared task is immutable: to change one give it a new name; `kairo task rerun` runs it again.",
+	"machine apply": "FILE is the whole declaration: [[nodes]] with id and gpus (UUIDs as nvidia-smi -L prints them).\n" +
+		"A GPU left out is no longer scheduled. A moved GPU is taken over when its new node reports it;\n" +
+		"a GPU held by a live lease cannot be moved or dropped.",
 }
 
 // parseFlags parses args interleaving flags and positionals; on --help it

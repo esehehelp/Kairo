@@ -48,6 +48,8 @@ go run ./cmd/kairo execution list --project llm-develop
 go run ./cmd/kairo project pause llm-develop
 go run ./cmd/kairo project resume llm-develop
 go run ./cmd/kairo resource status
+go run ./cmd/kairo machine apply examples/machines.toml
+go run ./cmd/kairo machine show
 ```
 
 The example configuration listens on loopback over plain HTTP (with
@@ -274,6 +276,7 @@ unless `insecure_http = true`.
 | POST, DELETE | `/api/nodes/{id}/quarantine` | admin |
 | GET | `/api/resources` | read |
 | POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
+| GET, POST | `/api/machines` (the machine declaration) | read, admin |
 | POST | `/api/agent/{operation}`, `/api/agent/logs` | node |
 | POST | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
 | GET | `/api/worker/commands` | worker |
@@ -349,6 +352,33 @@ WARN as `executor step stalled` (with `executor_id`, `step` and
 `age_seconds`), and its end at INFO as `executor step resumed`. External
 commands that take longer than 2 s are logged at INFO with their duration; a
 timeout is logged at WARN with the command.
+
+### Machine declaration
+
+Which node holds which GPU is declared, not discovered. `kairo machine apply
+FILE` replaces the whole declaration: `[[nodes]]` tables with an `id` (a node
+known to the daemon) and `gpus`, NVIDIA UUIDs as `nvidia-smi -L` prints them
+(see `examples/machines.toml`). Providers only observe. A GPU a provider
+reports that is not declared for its node, whether declared for another node
+or for none, is not registered and not scheduled; the rest of that poll still
+applies, and the GPU is listed as undeclared by `kairo machine show` and in
+`undeclared_gpus` of `kairo resource status` (a registered GPU in that
+situation has `derived_state` `undeclared`).
+
+To move a GPU between nodes, declare it for its new node. It stays registered
+on the old node, unschedulable, until the new node's provider reports it,
+which takes it over (event `gpu_ownership_transferred`); the old node's open
+claims on it are cleared when the declaration changes (event
+`gpu_declaration_changed`). Apply refuses to move or drop a GPU that a live
+lease holds, and to declare an unknown node. `--dry-run` prints the changes
+(`+` declared, `~` moved, `-` dropped) without applying them. `machine show`
+lists each declared GPU as `observed`, `stale`, `pending` (not yet reported by
+its node) or `unseen`.
+
+`POST /api/machines` takes `{"nodes": [{"id", "gpus"}], "dry_run"}` and
+answers `{"changes": [{"uuid", "from", "to"}], "unchanged", "dry_run"}`; a
+leased GPU is `409 machine_conflict`. `GET /api/machines` answers `{"gpus",
+"undeclared"}`.
 
 ### Node quarantine
 
@@ -552,7 +582,8 @@ wait.
 Replace the agents together with the daemon: an agent older than the daemon
 starts attempts without their declared `env`. A daemon opening an older
 database migrates it in place (the `cancelled` task state, reruns, the `env`
-column); keep the backup, since an older binary would read a rerun Task's
+column, the machine declaration, which starts out declaring every registered
+GPU for the node it is registered on); keep the backup, since an older binary would read a rerun Task's
 earlier execution as its outcome again.
 
 ## Verification

@@ -424,7 +424,7 @@ func selectExclusive(ctx context.Context, tx *sql.Tx, nodeID string, request req
 		EXISTS(SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=ri.id AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested'))
 		FROM resource_instances ri
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY id DESC LIMIT 1)
-		WHERE ri.node_id=? AND ri.kind=? AND ri.admin_state='enabled' ORDER BY ri.id`, nodeID, request.Kind)
+		WHERE ri.node_id=? AND ri.kind=? AND ri.admin_state='enabled' AND (ri.kind<>'gpu' OR `+declaredGPUFilter+`) ORDER BY ri.id`, nodeID, request.Kind)
 	if err != nil {
 		return nil, "", false, err
 	}

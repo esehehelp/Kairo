@@ -150,9 +150,14 @@ func TestNodesCannotTakeOverEachOthersObjects(t *testing.T) {
 	if err := store.ApplyObservationBatch(ctx, "other-provider", nil, nil, []ExternalClaim{{ResourceID: "gpu-0", ClaimKind: "external_process"}}); !errors.Is(err, ErrOwnershipConflict) {
 		t.Fatalf("claim on another provider's resource: %v", err)
 	}
+	// A GPU declared for another node is not taken over: it is left out of
+	// the poll and reported as undeclared.
 	stolen := ResourceInstance{ID: "gpu-0", NodeID: "other", ProviderID: "other-provider", Kind: "gpu", StableIdentity: "GPU-0"}
-	if err := store.ApplyObservationBatch(ctx, "other-provider", []ResourceInstance{stolen}, nil, nil); !errors.Is(err, ErrOwnershipConflict) {
-		t.Fatalf("resource moved to another provider: %v", err)
+	if err := store.ApplyObservationBatch(ctx, "other-provider", []ResourceInstance{stolen}, nil, nil); err != nil {
+		t.Fatalf("GPU declared for another node: %v", err)
+	}
+	if resources, err := store.ListResourceStatus(ctx); err != nil || len(resources) != 1 || resources[0].NodeID != "node" || resources[0].ProviderID != "gpu-provider" {
+		t.Fatalf("GPU of another node was taken over: %+v %v", resources, err)
 	}
 	foreign := ResourceInstance{ID: "gpu-9", NodeID: "node", ProviderID: "other-provider", Kind: "gpu", StableIdentity: "GPU-9"}
 	if err := store.ApplyObservationBatch(ctx, "other-provider", []ResourceInstance{foreign}, nil, nil); !errors.Is(err, ErrOwnershipConflict) {

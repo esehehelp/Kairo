@@ -45,6 +45,8 @@ func (s *Server) routes() []route {
 		{"POST", "/api/resources/{id}/enable", roleAdmin, s.enableResource},
 		{"POST", "/api/resources/{id}/quarantine", roleAdmin, s.quarantineResource},
 		{"POST", "/api/resources/{id}/reconcile", roleAdmin, s.reconcileResource},
+		{"GET", "/api/machines", roleRead, s.getMachines},
+		{"POST", "/api/machines", roleAdmin, s.applyMachines},
 
 		{"POST", "/api/worker/heartbeat", roleWorker, s.workerHeartbeat},
 		{"POST", "/api/worker/processes", roleWorker, s.workerProcess},

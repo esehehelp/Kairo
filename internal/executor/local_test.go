@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"kairo/internal/machine"
 	"kairo/internal/provider"
 	"kairo/internal/store"
 )
@@ -46,6 +47,9 @@ func TestObserveOnlyRecordsExternalActivityWithoutAllocating(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err = st.UpsertProvider(ctx, "gpu-provider", "n", "nvidia", nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.ApplyMachines(ctx, machine.Spec{Nodes: []machine.Node{{ID: "n", GPUs: []string{"GPU-0"}}}}, false); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err = st.SubmitExecution(ctx, store.ExecutionSpec{

@@ -30,6 +30,8 @@ type ResourceInstance struct {
 	Attributes            json.RawMessage `json:"attributes"`
 	AdminState            string          `json:"admin_state"`
 	QuarantineReason      *string         `json:"quarantine_reason,omitempty"`
+	// DeclaredNodeID is the node a GPU is declared for (kairo machine apply).
+	DeclaredNodeID        *string         `json:"declared_node_id,omitempty"`
 	DerivedState          string          `json:"derived_state"`
 	ObservationAgeSeconds *float64        `json:"observation_age_seconds,omitempty"`
 }
