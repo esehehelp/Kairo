@@ -570,16 +570,20 @@ func (e *Local) carryOutQuarantineTerminations(ctx context.Context) error {
 	return nil
 }
 
+// resourceBinding is how CUDA_VISIBLE_DEVICES names a resource. A GPU is
+// named by its UUID: cuda_index is nvidia-smi's PCI bus order, while CUDA
+// enumerates fastest first unless CUDA_DEVICE_ORDER=PCI_BUS_ID, so on a node
+// with two GPUs an index can select the card another attempt holds.
 func resourceBinding(resource store.ResourceInstance) string {
 	var value map[string]string
 	if json.Unmarshal(resource.Binding, &value) == nil {
+		if x := value["uuid"]; x != "" {
+			return x
+		}
 		if x := value["cuda_index"]; x != "" {
 			return x
 		}
 		if x := value["value"]; x != "" {
-			return x
-		}
-		if x := value["uuid"]; x != "" {
 			return x
 		}
 	}

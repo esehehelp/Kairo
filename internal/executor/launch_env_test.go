@@ -102,6 +102,23 @@ func TestNativeLaunchEnvironment(t *testing.T) {
 	}
 }
 
+// A leased GPU is named by UUID, not by nvidia-smi's index, so CUDA's own
+// device order cannot hand the attempt another card.
+func TestGPUBindingIsTheUUID(t *testing.T) {
+	launch := testLaunch()
+	launch.Resources = []store.ResourceInstance{
+		{ID: "gpu-b", Binding: json.RawMessage(`{"cuda_index":"1","uuid":"GPU-bbbb"}`)},
+		{ID: "gpu-a", Binding: json.RawMessage(`{"cuda_index":"0","uuid":"GPU-aaaa"}`)},
+	}
+	e := &Local{ID: "pve0", NodeID: "node", Kind: "linux", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
+	env := e.launchEnv(launch)
+	for name, want := range map[string]string{"CUDA_VISIBLE_DEVICES": "GPU-bbbb,GPU-aaaa", "KAIRO_RESOURCE_BINDINGS": "GPU-bbbb,GPU-aaaa", "KAIRO_RESOURCE_IDS": "gpu-b,gpu-a"} {
+		if got, ok := envValue(env, name); !ok || got != want {
+			t.Fatalf("%s = %q (%v)", name, got, ok)
+		}
+	}
+}
+
 // Declared env replaces the parent's variables (case-insensitively on
 // Windows, so a declared "path" replaces PATH) but never what Kairo sets.
 func TestDeclaredEnvOverridesTheParentButNotKairo(t *testing.T) {
