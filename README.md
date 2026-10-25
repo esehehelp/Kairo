@@ -479,7 +479,7 @@ with AttemptSession.from_environment() as kairo:
 Managed attempts receive `KAIRO_API_URL`, `KAIRO_EXECUTION_ID`,
 `KAIRO_ATTEMPT_ID`, `KAIRO_ATTEMPT_TOKEN` and, when the daemon serves TLS,
 `KAIRO_API_CA`; also `KAIRO_NODE_ID`, `KAIRO_EXECUTOR_ID`,
-`KAIRO_RESOURCE_IDS`, `KAIRO_RESOURCE_BINDINGS`, `CUDA_VISIBLE_DEVICES`,
+`KAIRO_RESOURCE_IDS`, `KAIRO_RESOURCE_BINDINGS` and `CUDA_VISIBLE_DEVICES` (a leased GPU by its UUID, never by index),
 `KAIRO_CONTINUATION_REF` when resuming, and the gang variables for a gang
 rank. WSL attempts get them through `WSLENV`, never on the `wsl.exe` command
 line. Rank zero polls and acknowledges commands; the PyTorch adapter broadcasts the command,
