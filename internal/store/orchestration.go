@@ -426,6 +426,14 @@ func planTaskExecution(ctx context.Context, tx *sql.Tx, task orchestrationTaskRo
 					return err
 				}
 			}
+			if r.Exclusive != nil {
+				exclusive := convertExclusive(*r.Exclusive)
+				rank.Exclusive = &exclusive
+			}
+			if r.Capacity != nil {
+				capacity := convertCapacity(*r.Capacity)
+				rank.Capacity = &capacity
+			}
 			gang.Ranks = append(gang.Ranks, rank)
 		}
 		spec.Gang = &gang
