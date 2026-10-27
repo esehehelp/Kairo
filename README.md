@@ -340,6 +340,20 @@ registered process is absent and provider observations taken after that
 absence show resources unclaimed. An expired or executor-lost lease becomes
 stale; it is never made free based on time alone.
 
+A compute process a provider sees on a GPU (`nvidia-smi pmon`) is an
+`external_process` claim unless it is the work of the attempt holding that GPU
+(on any node's row of it): one of the attempt's registered processes, a
+descendant of one (by its parent chain, each parent alive and started no later
+than its child), or, on Linux, a process carrying the attempt's
+`KAIRO_ATTEMPT_ID` (read from `/proc/PID/environ`, as force stop finds the
+attempt's processes; Windows reads only the parent chain). That holds only
+while the attempt is `running` or `quiescing` with a registered process alive:
+a descendant that outlives them is a claim again, and the lease is not
+released while it runs. A process that cannot be tied to the lease holder (one
+of another attempt, one whose parent has exited or whose environment cannot be
+read) stays a claim, and a GPU with a claim is not given to a preempting
+execution.
+
 ### Executor ticks
 
 An executor's tick is bounded in time. Every external call on it has a
@@ -385,7 +399,8 @@ container's processes, so while one node's row is leased, the other nodes'
 claims of activity without a process (`unattributed_activity`) on it are the
 lease holder's work and are not recorded; the lease holder's own provider
 still reports what it cannot attribute, and a process another node does see
-there stays an `external_process` claim. Priority preemption reaches a
+there stays an `external_process` claim unless it is the lease holder's own
+work (see Coordination model). Priority preemption reaches a
 lower-priority victim holding the device through another node's row. Apply
 refuses to drop a node from a GPU whose row on that node a live lease holds;
 `from` / `to` of a shared GPU's change list its nodes, comma-separated.
