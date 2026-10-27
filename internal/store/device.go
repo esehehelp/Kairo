@@ -545,14 +545,18 @@ func deleteDeviceSettingTx(ctx context.Context, tx *sql.Tx, setting DeviceSettin
 // released: no setting outlives its lease. Every path that releases a lease
 // calls it in the releasing transaction.
 func clearReleasedLeaseSettingsTx(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, `SELECT s.host_id,s.device_id,s.owner_kind,s.owner_ref FROM device_settings s JOIN leases l ON l.id=s.lease_id WHERE l.state='released'`)
+	rows, err := tx.QueryContext(ctx, `SELECT s.host_id,s.device_id,s.owner_kind,s.owner_ref,s.settings_json FROM device_settings s JOIN leases l ON l.id=s.lease_id WHERE l.state='released'`)
 	if err != nil {
 		return err
 	}
 	var released []DeviceSetting
 	for rows.Next() {
 		var setting DeviceSetting
-		if err = rows.Scan(&setting.HostID, &setting.DeviceID, &setting.Owner.Kind, &setting.Owner.Ref); err != nil {
+		var body string
+		if err = rows.Scan(&setting.HostID, &setting.DeviceID, &setting.Owner.Kind, &setting.Owner.Ref, &body); err == nil {
+			err = json.Unmarshal([]byte(body), &setting.Settings)
+		}
+		if err != nil {
 			rows.Close()
 			return err
 		}

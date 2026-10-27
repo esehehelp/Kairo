@@ -88,7 +88,8 @@ func (s *Server) controllerOps() []agentOp {
 				return map[string]any{"ok": true, "version": buildinfo.Version()}, s.Store.RegisterDeviceController(ctx, b.Node, b.Version)
 			}),
 		// An observe-only daemon changes nothing: the controller is told it
-		// controls no device, so it touches none.
+		// controls no device, so it only returns those it may have changed to
+		// their defaults.
 		newAgentOp(s, "device-settings", observeAllowed, nil,
 			func(_ context.Context, b controllerPollRequest) (string, error) { return b.NodeID, nil },
 			func(ctx context.Context, b controllerPollRequest) (any, error) {

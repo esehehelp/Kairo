@@ -125,13 +125,18 @@ func (n *NVIDIA) Apply(ctx context.Context, uuid string, s store.DeviceSettings)
 	n.mu.Lock()
 	caps, known := n.caps[uuid]
 	n.mu.Unlock()
+	var errs []error
 	if !known {
 		var err error
 		if caps, err = n.Capabilities(ctx, uuid); err != nil {
-			return err
+			if !s.IsDefault() {
+				return err
+			}
+			// A reset needs no capabilities but the default power limit:
+			// the clocks are reset all the same.
+			errs = append(errs, fmt.Errorf("power limit not reset: %w", err))
 		}
 	}
-	var errs []error
 	step := func(reset bool, args ...string) {
 		_, err := n.run(ctx, append([]string{"-i", uuid}, args...)...)
 		if err != nil && !(reset && exitCode(err) == nvidiaNotSupported) {
@@ -159,6 +164,8 @@ func (n *NVIDIA) Apply(ctx context.Context, uuid string, s store.DeviceSettings)
 	case caps.PowerLimitDefaultW != nil:
 		step(true, "-pl", strconv.FormatFloat(*caps.PowerLimitDefaultW, 'f', -1, 64))
 	}
+	// (a default limit nvidia-smi reports as [N/A]: the card has no power
+	// limit to change, so it cannot have been changed)
 	return errors.Join(errs...)
 }
 

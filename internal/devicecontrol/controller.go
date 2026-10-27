@@ -52,8 +52,10 @@ func HostActuators(state *State) map[string]Actuator {
 const (
 	DefaultPollInterval = 10 * time.Second
 	DefaultResetAfter   = 2 * time.Minute
-	// capabilitiesRefresh is how often a device's capabilities are read again.
+	// capabilitiesRefresh is how often a device's capabilities are read again,
+	// reapplyEvery how often a setting in place is carried out again.
 	capabilitiesRefresh = 10 * time.Minute
+	reapplyEvery        = 10 * time.Minute
 	// Failed changes are retried after retryBase, doubling up to retryMax.
 	retryBase = 5 * time.Second
 	retryMax  = 5 * time.Minute
@@ -104,12 +106,16 @@ type device struct {
 	// the defaults), inPlaceGeneration the generation it carried out.
 	inPlace           *store.DeviceSettings
 	inPlaceGeneration *int64
+	// appliedAt is when inPlace was last carried out.
+	appliedAt time.Time
 	// failures counts the failed changes in a row; the next is tried at retryAt.
 	failures int
 	retryAt  time.Time
 	failedOf int64 // the generation that failed
-	capsAt   time.Time
-	report   *store.DeviceReport
+	// leftTries counts the resets tried since the device left control.
+	leftTries int
+	capsAt    time.Time
+	report    *store.DeviceReport
 }
 
 func (c *Controller) now() time.Time {
@@ -228,12 +234,14 @@ func (c *Controller) unreachable(ctx context.Context, err error) {
 	if c.now().Sub(c.lastContact) < c.ResetAfter {
 		return
 	}
-	if !c.lossReset {
+	first := !c.lossReset
+	if first {
 		c.lossReset = true
 		c.logger().Warn("daemon unreachable too long: returning devices to their defaults", "since", c.lastContact.Format(time.RFC3339), "reset_after", c.ResetAfter.String())
 	}
+	// The first reset does not wait for the retry delay of a failed change.
 	for _, key := range c.keys() {
-		c.reset(ctx, key, c.devices[key], "daemon unreachable", false)
+		c.reset(ctx, key, c.devices[key], "daemon unreachable", first)
 	}
 }
 
@@ -254,7 +262,7 @@ func (c *Controller) sync(ctx context.Context, listed []store.ControlledDevice) 
 		if d.desired.Generation != entry.Generation && d.failedOf != entry.Generation {
 			d.retryAt = time.Time{} // a new request is tried at once
 		}
-		d.kind, d.listed, d.desired = entry.Kind, true, entry
+		d.kind, d.listed, d.desired, d.leftTries = entry.Kind, true, entry, 0
 	}
 	changed := false
 	for _, key := range c.keys() {
@@ -262,10 +270,19 @@ func (c *Controller) sync(ctx context.Context, listed []store.ControlledDevice) 
 		if d.listed {
 			continue
 		}
-		if c.reset(ctx, key, d, "no longer controlled", false) || d.failures >= abandonAfter {
-			if d.failures >= abandonAfter {
-				c.logger().Error("giving up resetting a device no longer controlled", "device", key.String(), "failures", d.failures)
-			}
+		// The first reset after it left is tried at once; then with the retry
+		// delay, abandonAfter times at most.
+		tried := d.leftTries == 0 || !c.now().Before(d.retryAt)
+		if c.reset(ctx, key, d, "no longer controlled", d.leftTries == 0) {
+			delete(c.devices, key)
+			changed = true
+			continue
+		}
+		if tried {
+			d.leftTries++
+		}
+		if d.leftTries >= abandonAfter {
+			c.logger().Error("giving up resetting a device no longer controlled", "device", key.String(), "tries", d.leftTries)
 			delete(c.devices, key)
 			changed = true
 		}
@@ -298,7 +315,10 @@ func (c *Controller) reconcile(ctx context.Context, key deviceKey, d *device) {
 		}
 	}
 	want, generation := d.desired.Settings, d.desired.Generation
-	if d.inPlace != nil && d.inPlace.Equal(want) {
+	// A setting in place is carried out again every reapplyEvery: a driver
+	// that reloaded, or another controller's reset, may have undone it.
+	due := !want.IsDefault() && c.now().Sub(d.appliedAt) >= reapplyEvery
+	if d.inPlace != nil && d.inPlace.Equal(want) && !due {
 		if d.inPlaceGeneration == nil || *d.inPlaceGeneration != generation {
 			d.inPlaceGeneration = &generation
 			c.applied(key, d, "")
@@ -313,8 +333,12 @@ func (c *Controller) reconcile(ctx context.Context, key deviceKey, d *device) {
 		c.failed(key, d, generation, err)
 		return
 	}
-	d.inPlace, d.inPlaceGeneration = &want, &generation
+	again := d.inPlace != nil && d.inPlace.Equal(want) && d.inPlaceGeneration != nil && *d.inPlaceGeneration == generation
+	d.inPlace, d.inPlaceGeneration, d.appliedAt = &want, &generation, c.now()
 	d.failures, d.retryAt = 0, time.Time{}
+	if again {
+		return
+	}
 	c.logger().Info("device settings applied", "device", key.String(), "generation", generation, "settings", want.String())
 	c.applied(key, d, "")
 }

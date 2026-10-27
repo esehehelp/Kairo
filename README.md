@@ -667,11 +667,14 @@ It errs toward the hardware's defaults:
 - A change that fails is reported and retried after 5 s, doubling up to 5 min
   (a new request is tried at once); it never stops the loop.
 - A device that leaves its control (dropped from the host, `control = false`,
-  another controller) is reset once if it may have changed it, then never
-  touched again.
+  another controller) is reset at once if it may have changed it (a failed
+  reset is retried, five times at most), then never touched again.
 
-An observe-only daemon tells a controller it controls nothing, so nothing is
-changed. Changing GPU clocks, power limits and processor settings needs
+A setting in place is carried out again every 10 minutes, in case a driver
+reload or another controller's reset undid it. An observe-only daemon tells a
+controller it controls nothing: it changes no setting, and only returns the
+devices it may have changed (those its state file lists) to their defaults.
+Changing GPU clocks, power limits and processor settings needs
 privileges the daemon does not have:
 
 - Linux (a Proxmox host, as root; containers see the GPU but may not change
