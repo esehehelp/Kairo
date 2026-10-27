@@ -635,7 +635,9 @@ func envName(kv string) string {
 // the like but never what Kairo sets. The parent's own KAIRO_* variables (an
 // operator's KAIRO_TOKEN, say) never reach the attempt. A WSL attempt gets its
 // variables through WSLENV rather than on the wsl.exe command line, which
-// other tools can read and log.
+// other tools can read and log, and runs its argv with --exec: without it
+// wsl.exe joins the arguments into a line for the default shell, which expands
+// $VAR and re-splits quoted words.
 func (e *Local) command(launch *store.Launch) *exec.Cmd {
 	launchEnv := e.launchEnv(launch)
 	// own is what the attempt is given on top of the parent's environment:
@@ -672,7 +674,7 @@ func (e *Local) command(launch *store.Launch) *exec.Cmd {
 		if distro := e.Attributes["distro"]; distro != "" {
 			args = append(args, "-d", distro)
 		}
-		args = append(args, "--cd", launch.CWD, "--")
+		args = append(args, "--cd", launch.CWD, "--exec")
 		args = append(args, launch.Argv...)
 		cmd := exec.Command("wsl.exe", args...)
 		shared := []string{}

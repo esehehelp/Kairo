@@ -42,7 +42,7 @@ func TestWSLLaunchPassesTheEnvironmentThroughWSLENV(t *testing.T) {
 	t.Setenv("WSLENV", "USERPROFILE/p")
 	e := &Local{ID: "ubuntu-wsl", NodeID: "host", Kind: "wsl2", APIURL: "https://192.168.1.12:7474", APICA: "Q0E=", Attributes: map[string]string{"distro": "Ubuntu", "interconnect_ifname": "eth1"}}
 	cmd := e.command(testLaunch())
-	if want := []string{"-d", "Ubuntu", "--cd", "/work", "--", "python", "train.py", "--steps", "10"}; !slices.Equal(cmd.Args[1:], want) {
+	if want := []string{"-d", "Ubuntu", "--cd", "/work", "--exec", "python", "train.py", "--steps", "10"}; !slices.Equal(cmd.Args[1:], want) {
 		t.Fatalf("args = %q", cmd.Args)
 	}
 	for _, arg := range cmd.Args {

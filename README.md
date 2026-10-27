@@ -92,7 +92,10 @@ for bound GPUs), which a declaration cannot override. Names starting with
 `KAIRO_` and `WSLENV` are rejected, and so is `CUDA_VISIBLE_DEVICES` on an
 execution with an exclusive GPU request (a CPU task may set it to `-1`). WSL
 executors pass the variables through `WSLENV` as written (`/u`, no path
-translation). `argv[0]` is still looked up on the executor's own `PATH`.
+translation). `argv[0]` is still looked up on the executor's own `PATH`, and
+argv reaches the program word for word on every executor: no shell sits in
+between (a WSL attempt runs through `wsl.exe --exec`), so `$VAR` in an argument
+is expanded only by a shell the argv itself starts.
 Env is part of the task's digest and is stored and shown in plain text to any
 reader of the API: it is not a place for secrets.
 

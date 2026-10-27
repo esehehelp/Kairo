@@ -96,3 +96,23 @@ func TestWSLLaunchEnvironmentReachesTheAttempt(t *testing.T) {
 		t.Fatalf("attempt saw %q", got)
 	}
 }
+
+// Host-specific: a WSL attempt's argv reaches the program word for word, with
+// no shell of wsl.exe's expanding $VAR or re-splitting quoted words.
+func TestWSLLaunchRunsArgvVerbatim(t *testing.T) {
+	if os.Getenv("KAIRO_TEST_WSL") != "1" {
+		t.Skip("set KAIRO_TEST_WSL=1 to run against WSL")
+	}
+	e := &Local{ID: "ubuntu-wsl", NodeID: "host", Kind: "wsl2", Attributes: map[string]string{"distro": "Ubuntu"}}
+	launch := testLaunch()
+	launch.Gang = nil
+	launch.CWD = "/tmp"
+	launch.Argv = []string{"bash", "-c", `for bm in 64 128; do printf '%s|' "BM=$bm"; done; printf '%s' "$1"`, "x", "two words"}
+	out, err := e.command(launch).Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(out), "BM=64|BM=128|two words"; got != want {
+		t.Fatalf("output = %q, want %q", got, want)
+	}
+}
