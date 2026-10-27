@@ -493,6 +493,9 @@ func (s *Store) ReleaseReservation(ctx context.Context, leaseID string, epoch in
 	if err = appendCoordinationEventTx(ctx, tx, "lease_released_before_activation", &projectID, "lease", leaseID, &epoch, map[string]any{"execution_id": executionID, "reason": reason}); err != nil {
 		return err
 	}
+	if err = clearReleasedLeaseSettingsTx(ctx, tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 

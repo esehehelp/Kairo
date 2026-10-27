@@ -105,6 +105,31 @@ func TestControlOnlyDaemonLoads(t *testing.T) {
 	}
 }
 
+func TestControllerConfig(t *testing.T) {
+	base := "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0-host\"\n"
+	path := writeConfig(t, base)
+	c, err := LoadController(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Node.Name != "pve0-host" || c.PollIntervalSeconds != 10 || c.ResetAfterSeconds != 120 || c.StateFile != strings.TrimSuffix(path, ".toml")+".state.json" {
+		t.Fatalf("defaults: %+v", c)
+	}
+	if c, err = LoadController("../../examples/kairo-controller.toml"); err != nil || c.Node.ID != "pve0-host" {
+		t.Fatalf("example: %+v %v", c, err)
+	}
+	for _, bad := range []struct{ body, want string }{
+		{strings.Replace(base, "https", "http", 1), "plain HTTP"},
+		{"server_url = \"https://h:7474\"\ntoken = \"t\"\n", "node.id is required"},
+		{"reset_after_seconds = 15\n" + base, "at least twice"},
+		{"executors = []\n" + base, "unknown controller config field"},
+	} {
+		if _, err = LoadController(writeConfig(t, bad.body)); err == nil || !strings.Contains(err.Error(), bad.want) {
+			t.Fatalf("%q: %v, want %q", bad.body, err, bad.want)
+		}
+	}
+}
+
 func TestAgentStillRequiresAnExecutor(t *testing.T) {
 	_, err := LoadAgent(writeConfig(t, "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0\"\nname = \"pve0\"\n"))
 	if err == nil || !strings.Contains(err.Error(), "at least one executor") {

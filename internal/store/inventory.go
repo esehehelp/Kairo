@@ -130,7 +130,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 	}
 	t := now()
 	undeclared := map[string]bool{}
-	alias := map[string]string{}   // the provider's id of a shared GPU -> its row on this node
+	alias := map[string]string{} // the provider's id of a shared GPU -> its row on this node
 	var undeclaredUUIDs []string
 	for _, resource := range resources {
 		if resource.ID == "" || resource.NodeID == "" || resource.ProviderID == "" || resource.Kind == "" || resource.StableIdentity == "" {
@@ -198,7 +198,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 			continue
 		}
 		if stored, ok := alias[claim.ResourceID]; ok {
-			claim.ID += "@" + providerNode   // (the first node's provider names its claim the same)
+			claim.ID += "@" + providerNode // (the first node's provider names its claim the same)
 			claim.ResourceID = stored
 		}
 		if err = ownedByProvider(claim.ResourceID); err != nil {
@@ -501,6 +501,9 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 		if err = appendCoordinationEventTx(ctx, tx, "stale_lease_reconciled", &projectID, "lease", x.lease, &x.epoch, map[string]string{"resource_id": resourceID, "execution_id": executionID}); err != nil {
 			return err
 		}
+	}
+	if err = clearReleasedLeaseSettingsTx(ctx, tx); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

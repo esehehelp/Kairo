@@ -102,6 +102,7 @@ var topAliases = map[string]string{
 	"list": "task list", "wait": "task wait", "watch": "project watch", "apply": "project apply",
 	"show": "task show", "cancel": "task cancel", "rerun": "task rerun", "-v": "version",
 	"--version": "version", "health": "doctor", "daemon": "serve", "server": "serve",
+	"hosts": "hardware", "host": "hardware", "devices": "hardware", "device": "hardware",
 }
 
 const remoteNote = "API commands take --api URL (default $KAIRO_API, else " + defaultAPIURL + "); the token comes from\n" +
@@ -196,14 +197,26 @@ func init() {
 			},
 			aliases: map[string]string{"ls": "status", "list": "status", "show": "status", "release": "enable"},
 		}},
-		{name: "machine", summary: "declare which node holds which GPU (apply), and show it", group: &commandGroup{
+		{name: "machine", summary: "declare which node holds which GPU and which host holds which node (apply), and show it", group: &commandGroup{
 			subs: []command{
 				{"apply", "FILE [--dry-run] [--json]", "replace the machine declaration with FILE's", machineApply},
-				{"show", "[--json]", "declared GPUs, their state, and GPUs reported but not declared", machineShow},
+				{"show", "[--json]", "declared GPUs and their state, GPUs reported but not declared, hosts and their devices' policies", machineShow},
 			},
 			aliases: map[string]string{
 				"status": "show", "get": "show", "ls": "show", "list": "show",
 				"declare": "apply", "submit": "apply", "set": "apply",
+			},
+		}},
+		{name: "hardware", summary: "device settings of hosts: show, set and reset them", group: &commandGroup{
+			note: "DEVICE is a GPU UUID or cpu; a host's controller (kairo controller) carries the settings out.",
+			subs: []command{
+				{"show", "[HOST] [--json]", "per host: devices, policy, desired and applied settings, errors, controller", hardwareShow},
+				{"set", "HOST DEVICE [--graphics-clock-max MHz] [--memory-clock MHz] [--power-limit W] [--cpu-max-freq MHz | --cpu-max-perf PCT]", "set a device's manual setting (it overrides bench and policy settings)", hardwareSet},
+				{"reset", "HOST DEVICE", "clear a device's manual setting", hardwareReset},
+			},
+			aliases: map[string]string{
+				"status": "show", "get": "show", "ls": "show", "list": "show",
+				"clear": "reset", "unset": "reset", "default": "reset", "limit": "set", "apply": "set",
 			},
 		}},
 		{name: "node", summary: "quarantine or release nodes", group: &commandGroup{
@@ -222,6 +235,8 @@ func init() {
 			args: "--config DAEMON.toml", help: "run the daemon"},
 		{name: "agent", summary: "run this host as a remote node (--config AGENT.toml)", run: agentCommand,
 			args: "--config AGENT.toml", help: "run this host as a remote node: its providers and executors report to the daemon"},
+		{name: "controller", summary: "run this host's device controller (--config CONTROLLER.toml)", run: controllerCommand,
+			args: "--config CONTROLLER.toml", help: "keep this host's controlled devices at their desired settings (elevated / root)"},
 		{name: "token", summary: "create, list or revoke API tokens (direct database access)", group: &commandGroup{
 			subs: []command{
 				{"create", "(--config DAEMON.toml | --db PATH) --name NAME --role admin|read|node [--node NODE_ID] [--save | --out FILE] [--force]", "create a token", bind(tokenAction, "create")},
@@ -476,9 +491,14 @@ var commandNotes = map[string]string{
 		"--attempt all prints every attempt; for a gang, --rank selects the rank (default 0).",
 	"task list":     "Columns: NAME QUEUE STATE EXEC (latest execution) STARTED ELAPSED NOTE.",
 	"project apply": "A declared task is immutable: to change one give it a new name; `kairo task rerun` runs it again.",
-	"machine apply": "FILE is the whole declaration: [[nodes]] with id and gpus (UUIDs as nvidia-smi -L prints them).\n" +
+	"machine apply": "FILE is the whole declaration: [[nodes]] with id and gpus (UUIDs as nvidia-smi -L prints them),\n" +
+		"and optionally [[hosts]] with id, nodes, controller, max_slowdown and [[hosts.devices]] overrides.\n" +
 		"A GPU left out is no longer scheduled. A moved GPU is taken over when its new node reports it;\n" +
-		"a GPU held by a live lease cannot be moved or dropped.",
+		"a GPU held by a live lease cannot be moved or dropped. Settings of devices no longer controllable are cleared.",
+	"hardware set": "Settable: a GPU's --graphics-clock-max, --memory-clock and --power-limit; a CPU's --cpu-max-freq\n" +
+		"(Windows, Linux cpufreq) or --cpu-max-perf (Linux intel_pstate). A setting left out stays at the default.\n" +
+		"Values are checked against what the host's controller reported the device supports.",
+	"hardware reset": "Clears the manual setting: the device follows a bench or policy setting if one exists, else its defaults.",
 }
 
 // parseFlags parses args interleaving flags and positionals; on --help it
