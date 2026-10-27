@@ -206,6 +206,43 @@ func (c *Client) RecordAttemptUsage(ctx context.Context, attemptID string, ramBy
 	return c.call(ctx, "attempt-usage", map[string]any{"attempt_id": attemptID, "ram_bytes": ramBytes, "disk_written_bytes": diskWrittenBytes}, nil)
 }
 
+// RegisterController records that node's device controller started (kairo
+// controller); a node not known yet is created, a known one left as it is.
+func (c *Client) RegisterController(ctx context.Context, node store.Node, version string) error {
+	return c.call(ctx, "controller-register", map[string]any{"node": node, "version": version}, nil)
+}
+
+// DeviceSettings is a controller's poll: the devices its node controls and
+// the settings each is to have.
+func (c *Client) DeviceSettings(ctx context.Context, nodeID string) ([]store.ControlledDevice, error) {
+	var out struct {
+		Devices []store.ControlledDevice `json:"devices"`
+	}
+	err := c.call(ctx, "device-settings", map[string]string{"node_id": nodeID}, &out)
+	return out.Devices, err
+}
+
+// ReportDevices sends what is in place on the node's devices; it returns the
+// reports of devices the node does not control, which the daemon skipped.
+func (c *Client) ReportDevices(ctx context.Context, nodeID string, reports []store.DeviceReport) ([]string, error) {
+	var out struct {
+		Skipped []string `json:"skipped"`
+	}
+	err := c.call(ctx, "device-report", map[string]any{"node_id": nodeID, "reports": reports}, &out)
+	return out.Skipped, err
+}
+
+// ReportSamples sends what the controller of node read of its host (the CPU
+// package power); it returns the samples the daemon skipped (no host names
+// node as its controller).
+func (c *Client) ReportSamples(ctx context.Context, nodeID string, samples []store.ControllerSample) ([]string, error) {
+	var out struct {
+		Skipped []string `json:"skipped"`
+	}
+	err := c.call(ctx, "device-samples", map[string]any{"node_id": nodeID, "samples": samples}, &out)
+	return out.Skipped, err
+}
+
 // appendLog sends data found at offset of the node-side file and returns the
 // daemon-side size afterwards. A gap (the daemon has less than offset) is
 // reported as *GapError carrying the daemon's size to resume from.

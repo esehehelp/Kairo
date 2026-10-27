@@ -47,15 +47,26 @@ func (s *Server) routes() []route {
 		{"POST", "/api/resources/{id}/reconcile", roleAdmin, s.reconcileResource},
 		{"GET", "/api/machines", roleRead, s.getMachines},
 		{"POST", "/api/machines", roleAdmin, s.applyMachines},
+		{"GET", "/api/hardware", roleRead, s.listHardware},
+		{"POST", "/api/hardware/{host}/{device}/settings", roleAdmin, s.setDeviceSetting},
+		{"DELETE", "/api/hardware/{host}/{device}/settings", roleAdmin, s.clearDeviceSetting},
+		{"POST", "/api/hardware/{host}/{device}/bench", roleAdmin, s.createBench},
+		{"GET", "/api/hardware/{host}/profile", roleRead, s.hardwareProfile},
 
 		{"POST", "/api/worker/heartbeat", roleWorker, s.workerHeartbeat},
 		{"POST", "/api/worker/processes", roleWorker, s.workerProcess},
 		{"GET", "/api/worker/commands", roleWorker, s.workerPoll},
 		{"POST", "/api/worker/commands/{command}/acks", roleWorker, s.workerAck},
+		{"GET", "/api/worker/bench", roleWorker, s.workerBenchStatus},
+		{"POST", "/api/worker/bench/settings", roleWorker, s.workerBenchSetting},
+		{"GET", "/api/worker/bench/cpu-energy", roleWorker, s.workerBenchCPUEnergy},
+		{"POST", "/api/worker/bench/start", roleWorker, s.workerBenchStart},
+		{"POST", "/api/worker/bench/points", roleWorker, s.workerBenchPoints},
+		{"POST", "/api/worker/bench/finish", roleWorker, s.workerBenchFinish},
 
 		{"POST", "/api/agent/logs", roleNode, s.agentLogAppend},
 	}
-	for _, op := range s.agentOps() {
+	for _, op := range append(s.agentOps(), s.controllerOps()...) {
 		routes = append(routes, route{"POST", "/api/agent/" + op.name, roleNode, op.handler})
 	}
 	return routes

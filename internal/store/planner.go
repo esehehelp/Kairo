@@ -490,7 +490,7 @@ func (m *planModel) executor(executorID string) (planExecutor, bool) {
 // node and matches the selector (executors of one node share its resources),
 // else the one the pass chose.
 func (m *planModel) onNode(slot planSlot, caller planExecutor, selector string) planExecutor {
-	if caller.id != "" && caller.nodeID == slot.executor.nodeID && selectorMatches(selector, caller.attributes) &&
+	if caller.id != "" && caller.nodeID == slot.executor.nodeID && selectorMatches(selector, caller.nodeID, caller.attributes) &&
 		(slot.rank != 0 || slot.executor.gang().attribute("interconnect_addr") == "" || caller.gang().attribute("interconnect_addr") != "") {
 		return caller
 	}
@@ -620,7 +620,7 @@ func (m *planModel) fit(node string, demand planDemand, ov planOverlay, freed fu
 			if chosen == d.count {
 				break
 			}
-			if taken[g.device] {
+			if taken[g.device] || d.constraints.Device != "" && g.device != d.constraints.Device {
 				continue
 			}
 			device := m.devices[g.device]
@@ -669,6 +669,9 @@ func (m *planModel) fit(node string, demand planDemand, ov planOverlay, freed fu
 		need := fmt.Sprintf("%s: %d GPU(s) needed, %d usable", node, d.count, chosen)
 		if d.constraints.MinTotal > 0 {
 			need = fmt.Sprintf("%s: %d GPU(s) of >= %s needed, %d usable", node, d.count, formatBytes(d.constraints.MinTotal), chosen)
+		}
+		if d.constraints.Device != "" {
+			need = fmt.Sprintf("%s: GPU %s needed, not usable", node, d.constraints.Device)
 		}
 		switch {
 		case external:
@@ -879,7 +882,7 @@ func (p *planner) slotsFor(selector string, leader bool) []planExecutor {
 	var slots []planExecutor
 	seen := map[string]bool{}
 	for _, e := range p.m.executors {
-		if seen[e.nodeID] || !selectorMatches(selector, e.attributes) {
+		if seen[e.nodeID] || !selectorMatches(selector, e.nodeID, e.attributes) {
 			continue
 		}
 		if leader && e.gang().attribute("interconnect_addr") == "" {

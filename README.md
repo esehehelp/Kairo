@@ -50,6 +50,7 @@ go run ./cmd/kairo project resume llm-develop
 go run ./cmd/kairo resource status
 go run ./cmd/kairo machine apply examples/machines.toml
 go run ./cmd/kairo machine show
+go run ./cmd/kairo hardware show
 ```
 
 The example configuration listens on loopback over plain HTTP (with
@@ -124,17 +125,21 @@ deployment mode on a host with unmanaged training processes.
 `kairo resource status` prints one row per resource, by node (GPUs, then
 cpu, ram and disk): its state (with a quarantine's reason), total and free as
 last observed (a GPU's memory and utilization; a cpu's cores), what live
-leases reserve of a cpu, ram or disk, and the tasks holding it (with the lease
+leases reserve of a cpu, ram or disk, the latest power sample (POWER: a GPU's
+draw and the power limit in force, `289/320 W`, a cpu's CPU package draw;
+CLOCKS: a GPU's SM clock, P-state and active clock event reasons, `1905 MHz
+P2 sw-power`; see Power and energy) and the tasks holding it (with the lease
 state unless `active`); then the external claims with their evidence, and the
 GPUs reported but not declared for their node. `--json` prints the response of
 `GET /api/resources` instead, whose resources also carry `total_bytes`,
-`free_bytes`, `utilization`, `reserved` and `holders`. `kairo doctor` ends with
-the same table.
+`free_bytes`, `utilization`, `reserved`, `holders` and `device` (the latest
+sample). `kairo doctor` ends with the same table.
 
 Resource observations describe the present: only each resource's latest one
-is used, and the daemon prunes the others once they are an hour old.
-`kairo db compact --config kairo.toml` (with the daemon stopped) prunes them
-at once and runs `VACUUM`.
+is used, and the daemon prunes the others once they are an hour old. Device
+samples are kept for 72 hours (each device's latest always). `kairo db
+compact --config kairo.toml` (with the daemon stopped) prunes both at once and
+runs `VACUUM`.
 
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
 limits (see Admission for how they are counted). GPU exclusion is a coordination guarantee among Kairo participants;
@@ -149,7 +154,7 @@ be left out of task commands for Tasks declared by a ProjectSpec.
 | Command | What it prints |
 |---|---|
 | `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress or pause) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
-| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, log paths and sizes, log issues, gang ranks, and why a waiting execution waits |
+| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, log paths and sizes, log issues, the energy its GPUs used (`energy: GPU 1.23 kWh (partial)`), gang ranks, and why a waiting execution waits |
 | `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | the last N lines (default 50, `0` all) of the latest attempt's logs, also for attempts on agent nodes; `-f` follows until the attempt has exited and its logs stopped growing |
 | `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | one line per state change (`10:01:33 hello running -> succeeded`), `DOWN`/`UP` while the daemon is unreachable, `STALL` when a running Task's logs stop growing for D; exits 0 when all succeeded (or started), 1 when one ended otherwise, 2 on timeout, 3 on a usage or lookup error |
 | `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | state changes, progress (once a minute per Task) and a summary every 10 min; with `--exit-when-idle` it exits when nothing is pending or running (1 if a watched Task did not succeed) |
@@ -181,7 +186,7 @@ stored only as SHA-256 hashes; revocation takes effect immediately.
 |---|---|---|
 | `read` | every operator `GET` | dashboards |
 | `admin` | every operator route | the CLI, kairo-monitor, project controllers |
-| `node` | `/api/agent/*`, for one node | a node agent |
+| `node` | `/api/agent/*`, for one node | a node agent, a host's controller |
 | worker | `/api/worker/*`, for one attempt | the processes of an attempt |
 
 Operator and node tokens are managed on the daemon host by opening its
@@ -270,9 +275,11 @@ ca_file = "/etc/kairo/ca.pem"
 ```
 
 The rest (`log_directory`, `log_min_free_mib`, `observe_only`,
-`observation_interval_seconds`, `[node]`, `[[executors]]`, `[[providers]]`)
-has the same form as in the daemon configuration (`examples/kairo.toml`). An
-agent refuses an `http://` URL unless `insecure_http = true`.
+`observation_interval_seconds`, `[node]`, `[bench]`, `[[executors]]`,
+`[[providers]]`) has the same form as in the daemon configuration
+(`examples/kairo.toml`). An
+agent refuses an `http://` URL unless `insecure_http = true`. A host's device
+controller (`kairo controller`, see Hardware settings) connects the same way.
 
 ## API
 
@@ -296,10 +303,16 @@ agent refuses an `http://` URL unless `insecure_http = true`.
 | GET | `/api/resources` | read |
 | POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
 | GET, POST | `/api/machines` (the machine declaration) | read, admin |
+| GET | `/api/hardware` (`?host=`) | read |
+| POST, DELETE | `/api/hardware/{host}/{device}/settings` | admin |
+| POST | `/api/hardware/{host}/{device}/bench` | admin |
+| GET | `/api/hardware/{host}/profile` (`?device=`) | read |
 | POST | `/api/agent/{operation}`, `/api/agent/logs` | node |
 | POST | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
 | GET | `/api/worker/commands` | worker |
 | POST | `/api/worker/commands/{command}/acks` | worker |
+| GET | `/api/worker/bench`, `/api/worker/bench/cpu-energy` | worker (a bench's attempt) |
+| POST | `/api/worker/bench/settings`, `/start`, `/points`, `/finish` | worker (a bench's attempt) |
 
 Errors are `{"error": ..., "code": ...}`. An empty `actor` in a pause, resume,
 quarantine, cancel or rerun request is recorded as the token's name.
@@ -313,7 +326,7 @@ attempt, executor, timestamps and latest progress without `detail`.
 `GET /api/projects/{project}/tasks/{task}` adds the declaration (`spec`),
 dependencies, dependants, scope gates (a closed one with `closed_by` and
 `closed_at`, from the pause operation that closed it), and per execution its
-attempts (with log paths and sizes and `log_problems`), gang ranks and
+attempts (with log paths and sizes, `log_problems` and `energy`), gang ranks and
 `waiting` reasons. A live Task held back by a closed gate has `paused`, the
 innermost such gate. Apply answers
 `{"project", "spec_digest", "idempotent", "created", "unchanged"}`. Cancel
@@ -503,6 +516,59 @@ Each problem is a coordination event (`attempt_log_problem`,
 `task show` (`log_problems` in the API), such as `log issue: stderr not
 shipped to the daemon: ... (10-27 10:01 to 10-27 10:04, caught up)`.
 
+### Power and energy
+
+Providers record what a device draws and how it runs, with the time they read
+it; Kairo keeps these facts and judges none of them against a specification.
+Providers only read: settings are changed by a host's controller alone (see
+Hardware settings).
+
+- GPU: each `nvidia-smi` poll also reads the board power
+  (`power.draw.average`, else `power.draw`), the power limit in force
+  (`enforced.power.limit`), the SM and memory clocks, the P-state, the active
+  clock event reasons (a bitmask: `0x1` idle, `0x4` software power cap, `0x40`
+  hardware thermal slowdown, ...), the PCIe generation and width, memory
+  utilization and fan speed, and, kept once per GPU, its default, least and
+  greatest power limit, its greatest clocks and its greatest PCIe link. A
+  field a GPU does not report (`[N/A]`, `[Not Supported]`) is left out, never
+  an error. A driver that rejects these fields is asked by their older names
+  (`clocks_throttle_reasons.active`, `pcie.link.gen.current`), then for the
+  inventory alone.
+- CPU package: a node's host provider reads the power of its CPU packages,
+  averaged since its previous poll: on Windows the `\Energy Meter(*)\Power`
+  performance counter (instances `rapl_package*_pkg`; no elevation needed),
+  on Linux the RAPL counters `/sys/class/powercap/*-rapl:N/energy_uj`
+  (wraps handled with `max_energy_range_uj`). Where they cannot be read (an
+  unprivileged container, WSL, a CPU without them) the node reports none,
+  silently. The reader is `internal/cpupower`.
+
+Samples are kept per physical device (a GPU by its UUID), so the providers of
+a shared GPU add to one series. As each GPU sample arrives, the energy since
+the device's previous sample, the trapezoid of their power, is added to the
+attempts whose lease holds that GPU (on any node's row of it), cut at the
+attempt's start and at its exit, its lease's release or its lease going
+stale; a GPU is counted once whichever provider reports it. An interval the
+samples do not vouch for is not integrated and makes the attempt's total
+`partial`: a gap longer than the earlier sample's validity
+(`observation_ttl_seconds`, default 15 s), a sample without power, a run that
+began before the GPU's first sample or went on after its lease went stale.
+`task show` prints `energy: GPU 1.23 kWh (partial)` per attempt (`energy`
+with `gpu_joules`, `gpu_seconds_covered`, device-seconds, and `partial` in the
+API). A CPU package is shared by whatever runs on its node, so its power is
+kept for the node only. A host's controller also reads its CPU packages (the
+same `internal/cpupower`) at every poll and reports them as the host's series
+`host/<host>/cpu`: on a Proxmox host only the host itself can read RAPL, its
+containers cannot. While the operating-point policy's setting is in place on
+an attempt's GPU, `task show` adds what it saved: `energy: GPU 1.23 kWh;
+policy 3.0 h, saved ~120.0 Wh (estimate)` (`policy_seconds`,
+`policy_saved_joules`, `policy_unestimated_seconds`), see Operating-point
+policy.
+
+The samples are the tables `device_samples` and `device_properties`, the
+totals `attempt_energy`. Samples are kept for 72 hours (about 5 MB a day per
+GPU and provider reporting it at the default 5 s poll); the totals are kept
+with their attempts.
+
 ### Machine declaration
 
 Which node holds which GPU is declared, not discovered. `kairo machine apply
@@ -543,10 +609,237 @@ refuses to drop a node from a GPU whose row on that node a live lease holds;
 Containers share the host's RAM and CPUs as well, which Kairo accounts per
 node: keep their memory limits within the host's.
 
-`POST /api/machines` takes `{"nodes": [{"id", "gpus"}], "dry_run"}` and
-answers `{"changes": [{"uuid", "from", "to"}], "unchanged", "dry_run"}`; a
-leased GPU is `409 machine_conflict`. `GET /api/machines` answers `{"gpus",
-"undeclared"}`.
+Optional `[[hosts]]` tables declare the physical machines, and only what
+observation cannot tell: policy and authority. A host has an `id`, the `nodes`
+on it (containers, or the machine itself; a node is on at most one host), a
+`controller` (the node of the `kairo controller` that may change its devices'
+settings; none: its devices are only observed) and `max_slowdown`, the share
+of maximum performance its devices may give up for efficiency, in [0, 0.5)
+(omitted: 0, the hardware stays at its defaults). Its devices are every GPU
+declared for one of its nodes and `cpu` (its CPU packages); a GPU whose nodes
+are on two hosts is an error. `[[hosts.devices]]` overrides `max_slowdown` or
+sets `control = false` (never changed, never benched) for one device, a GPU
+UUID or `cpu`, listed once. Host nodes and controllers must be known nodes
+(a controller registers its node when it starts), and a controller controls
+one host. What a device is, how fast it clocks and how much power it draws is
+observed by providers and measured by benches, never declared. A host is
+replaced as a whole on apply; `--dry-run` prints `+ host`, `~ host` (each
+changed field, `from -> to`) and `- host`, and the device settings the apply
+removes (`- setting`: the device is no longer on a host, is `control = false`,
+or its host lost its controller). `machine show` adds the hosts and the
+effective policy of each device (its own value, else its host's; event
+`host_declaration_changed`).
+
+`POST /api/machines` takes `{"nodes": [{"id", "gpus"}], "hosts": [{"id",
+"nodes", "controller", "max_slowdown", "devices": [{"id", "max_slowdown",
+"control"}]}], "dry_run"}` and answers `{"changes": [{"uuid", "from", "to"}],
+"unchanged", "host_changes": [{"host", "from", "to"}], "unchanged_hosts",
+"cleared_settings", "dry_run"}`; a leased GPU is `409 machine_conflict`. `GET
+/api/machines` answers `{"gpus", "undeclared", "hosts", "devices"}`, the
+devices with `host_id`, `device_id`, `kind`, `max_slowdown`, `control` and
+`controller`.
+
+### Hardware settings
+
+A device of a host (a GPU by UUID, or `cpu`) can be given settings: a GPU's
+highest graphics clock (`graphics_clock_max_mhz`), a locked memory clock
+(`memory_clock_mhz`) and a power limit (`power_limit_w`); a CPU's highest
+frequency (`max_freq_mhz`, Windows and Linux cpufreq) or highest performance
+percentage (`max_perf_pct`, Linux intel_pstate). A setting left out is the
+hardware's default; no setting at all is the defaults. Kairo stores what is
+desired; the host's controller carries it out and reports what is in place.
+Nothing here holds back admission or a running job: a setting that fails is a
+recorded fact.
+
+- Owners: a setting is `manual` (an operator's), `bench` (a bench run's) or
+  `policy` (the operating-point policy's), one per owner kind and device. The
+  one in effect is manual, else bench, else policy, so a bench run overrides
+  the policy on a device it has leased. A bench setting, and a GPU's policy
+  setting, belongs to a lease: it needs a reserved, prepared or active lease
+  on a node of the host that, for a GPU, holds that GPU, and is refused (`409
+  device_setting_conflict`) while another lease's setting of that kind is
+  there. When a lease is released, by any path, its settings are removed in
+  the same transaction: no setting outlives its lease. A CPU is shared by
+  whatever runs on its host, so its policy setting belongs to the host (ref
+  `host`), not to a lease; it is removed when the declaration makes the CPU
+  uncontrollable, drops the host, or sets its `max_slowdown` to 0. A policy
+  setting is refused on a device whose `max_slowdown` is 0.
+- Capabilities: the controller reports what it can change on each device and
+  within which range (`nvidia-smi -q -d SUPPORTED_CLOCKS`, the power limit
+  range and default; the CPU's frequency range or intel_pstate's
+  `min_perf_pct`). A setting the device does not support, a value outside its
+  range, or one for a device whose controller has not reported yet is refused
+  with `400`. These capabilities are the only source of what can be set (the
+  bench grid and the policy's fallback come from them); the power limits and
+  greatest clocks a provider reads into `device_properties` are what was seen,
+  shown with the device's samples and used for nothing else.
+- Generation: every change of a device's setting in effect increments its
+  generation; the controller reports the generation it applied, so `hardware
+  show` tells `in sync` from `pending` and `failed` (with the error).
+- Events: `device_setting_requested`, `device_setting_cleared` (with why: an
+  operator, a released lease, the declaration), `device_setting_applied` and
+  `device_setting_failed` (once per distinct error).
+
+| Command | What it does |
+|---|---|
+| `kairo hardware show [HOST] [--json]` | per host: its nodes and controller (when last seen), then per device its policy, the setting in effect and its owner, what is applied, and `in sync`, `pending`, `failed`, `reset` (the controller returned it to defaults on its own), `not reported`, `observe only` or `not controlled`; then the errors, the settings overridden, what each device supports, the policy's latest decision and the latest bench |
+| `kairo hardware set HOST DEVICE [--graphics-clock-max MHz] [--memory-clock MHz] [--power-limit W] [--cpu-max-freq MHz \| --cpu-max-perf PCT]` | sets the device's manual setting (as a whole: what is left out is the default) |
+| `kairo hardware reset HOST DEVICE` | clears the manual setting: the device follows a bench or policy setting, else returns to its defaults |
+| `kairo hardware bench HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run]` | measures the device at each setting of a grid (see Bench runs) |
+| `kairo hardware profile HOST [DEVICE] [--json]` | the measured curves, the point for each device's `max_slowdown`, and drift from its previous bench |
+
+`POST /api/hardware/{host}/{device}/settings` takes `{"settings", "owner":
+{"kind", "ref"}, "actor"}` (owner defaults to manual, whose ref is the actor;
+a bench or policy ref is its lease id, a CPU's policy ref `host`) and `DELETE` the same without
+settings; both answer `{"host_id", "device_id", "generation", "effective",
+"cleared"}`. `GET /api/hardware` answers `{"hosts"}` as `hardware show
+--json` prints them. In-process components use the store's
+`SetDeviceSetting`, `ClearDeviceSetting` and `DevicePolicies`.
+
+#### The controller
+
+`kairo controller --config kairo-controller.toml` (see
+`examples/kairo-controller.toml`) runs on the physical host, with `server_url`,
+`token`, `ca_file` and `insecure_http` as for an agent and a `[node]` of its
+own: give it a node token (`kairo token create --role node --node
+pve0-host`), start it once so its node is known, then name that node as the
+host's `controller`. Its node has no executors and is never scheduled; a node
+that already exists (one that also runs an agent) is left as it is. Every
+`poll_interval_seconds` (10) it fetches the settings of the devices it
+controls, which is every device with `control = true` of the host naming it
+and nothing else, changes what differs, reports what is in place, what failed
+and what each device supports, and counts as its heartbeat. It then reports
+the power of its host's CPU packages since its previous poll (see Power and
+energy); a reading the daemon does not take is dropped.
+
+- GPUs, by UUID with `nvidia-smi -i`: `-lgc LOWEST,MAX` / `-rgc`, `-lmc M,M` /
+  `-rmc`, `-pl W` / `-pl` `power.default_limit`. A reset the card does not
+  offer (exit code 3) is already the default.
+- Linux CPUs: intel_pstate's `max_perf_pct` when the driver has it (default
+  100), else cpufreq's `scaling_max_freq` of every CPU (default its
+  `cpuinfo_max_freq`).
+- Windows CPU: the AC value of `PROCFREQMAX` (and `PROCFREQMAX1` where Windows
+  has it) of the active power scheme, which is then re-activated. What the
+  user had there cannot be read back after a change, so the controller writes
+  it to its state file (`state_file`, default `<config name>.state.json` next
+  to the configuration) before its first change of a scheme, never with values
+  it set itself, and writes it back on reset. A state file it cannot read
+  stops it: fix or remove it by hand.
+
+It errs toward the hardware's defaults:
+
+- On start every controlled device is brought to its desired setting, or
+  reset to its defaults when it has none (a crash may have left settings).
+- On SIGTERM or Ctrl-C it resets every device it may have changed, then
+  reports.
+- When the daemon has not answered for `reset_after_seconds` (120), it resets
+  every device, and applies the desired settings again once the daemon is
+  back. The state file also lists the controlled devices, so a controller
+  restarted while the daemon is down resets them too.
+- A change that fails is reported and retried after 5 s, doubling up to 5 min
+  (a new request is tried at once); it never stops the loop.
+- A device that leaves its control (dropped from the host, `control = false`,
+  another controller) is reset at once if it may have changed it (a failed
+  reset is retried, five times at most), then never touched again.
+
+A setting in place is carried out again every 10 minutes, in case a driver
+reload or another controller's reset undid it. An observe-only daemon tells a
+controller it controls nothing: it changes no setting, and only returns the
+devices it may have changed (those its state file lists) to their defaults.
+Changing GPU clocks, power limits and processor settings needs
+privileges the daemon does not have:
+
+- Linux (a Proxmox host, as root; containers see the GPU but may not change
+  it): a systemd unit,
+
+  ```ini
+  # /etc/systemd/system/kairo-controller.service
+  [Unit]
+  Description=Kairo device controller
+  After=network-online.target nvidia-persistenced.service
+  Wants=network-online.target
+
+  [Service]
+  ExecStart=/usr/local/bin/kairo controller --config /etc/kairo/kairo-controller.toml
+  Restart=on-failure
+  RestartSec=10
+  KillSignal=SIGTERM
+  TimeoutStopSec=150
+
+  [Install]
+  WantedBy=multi-user.target
+  ```
+
+  then `systemctl enable --now kairo-controller`. Keep the NVIDIA persistence
+  daemon running: without it the driver may drop clocks and limits when no
+  process holds the GPU.
+- Windows (elevated; the daemon itself runs unelevated): a scheduled task
+  with the highest run level, started at boot,
+
+  ```powershell
+  $action = New-ScheduledTaskAction -Execute "D:\Kairo\kairo.exe" -Argument "controller --config D:\Kairo\kairo-controller.toml" -WorkingDirectory "D:\Kairo"
+  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+  $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+  Register-ScheduledTask -TaskName "kairo-controller" -Action $action -Trigger (New-ScheduledTaskTrigger -AtStartup) -Principal $principal -Settings $settings
+  ```
+
+  `Stop-ScheduledTask` and a shutdown end it without its graceful stop: the
+  GPUs return to their defaults with the driver at boot, and the processor
+  settings when the controller next starts (from its state file). Ctrl-C in
+  a console is a graceful stop.
+
+The controller warns at start when it is not elevated (Windows) or not root
+(Linux); its changes then fail and are reported as such.
+
+#### Operating-point policy
+
+The daemon (not an observe-only one) evaluates every minute each device a
+controller may change whose `max_slowdown` s is above 0, and asks for the
+setting that keeps performance within s for the least energy as the device's
+`policy` setting. It never holds back admission or waits for anything: a
+setting the controller does not apply is only a fact, and the next
+evaluation goes on.
+
+- A GPU's policy setting belongs to the lease holding it (not a bench's
+  lease, which sets its own; not one whose attempt has not started). The
+  policy compares what the GPU was seen doing since the attempt started, over
+  the last 5 minutes (`utilization.gpu` of its observations, `utilization.memory`
+  of its samples, at least 5 of each varying by at most 15 points), with the
+  fingerprint each swept kind showed in its bench (the same utilizations at
+  the references): every kind within 15 points on both is a candidate. The
+  setting chosen must suit every candidate (the worst case).
+- A CPU's policy setting belongs to its host and must suit all three CPU
+  kinds. While a bench of the host's CPU holds a lease, the policy setting is
+  removed, so the bench measures the defaults.
+- Selection (`internal/hwbench`): for a kind and tolerance s, the valid points
+  whose performance is at least 1 - s - 0.01 of the reference (a measurement
+  is good to about 1%), and among them the one using the least energy per
+  unit of work; none is the defaults. For several kinds, a setting must be
+  such a point of every kind, and the one using the least energy relative to
+  each kind's reference, on average, is taken.
+- Without a valid profile, or without a confident classification (too few
+  samples, usage that varies, no kind alike), the fallback caps the highest
+  graphics clock at (1 - s) of the GPU's greatest supported graphics clock,
+  rounded up to a supported clock (a CPU at (1 - s) of its greatest frequency
+  or performance percentage). The default clocks never exceed the greatest,
+  and performance loses no more than clock does, so this loses at most s
+  whatever runs. A CPU without a reported frequency range (Windows) stays at
+  its defaults.
+- Hysteresis: a new choice is applied once it has been the choice for 3
+  evaluations in a row, and a device's setting changes at most once per 5
+  minutes. A new lease starts at the defaults.
+- Each change is recorded: event `device_policy_decision` with its inputs (the
+  candidate kinds, the observed fingerprint, the runs and expected relative
+  performance and power against the defaults per kind, or the fallback's
+  reason), kept as the device's latest decision (`policy` of `hardware show
+  --json`; `hardware show` prints `policy graphics_clock_max_mhz=1800MHz
+  (profile, for gemm perf 0.970, 250 W vs 300 W) for lease ...`).
+- Energy saved: every evaluation while the policy's setting is in place on a
+  GPU (its controller applied it), the attempt holding it is credited the
+  elapsed time and, from the profile, the power saved for the same work (the
+  least over the candidates of relative performance x default power - power).
+  A fallback setting has no profile to estimate from; its time is counted as
+  unestimated.
 
 ### Node quarantine
 
@@ -747,6 +1040,279 @@ Cloud provisioning, roles beyond the four above, service supervision,
 cron/fair-share scheduling, and hard CPU/RAM enforcement remain outside this
 pilot.
 
+## Hardware benchmarks
+
+### Bench runs
+
+`kairo hardware bench HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run]`
+(admin) measures how a device performs, and what energy it uses, at each
+setting of a grid. DEVICE is a GPU UUID, `cpu`, `disk:FILESYSTEM` (a
+filesystem provider's path on one of the host's nodes) or `net:NODE` (the
+network from the host's node to NODE). The run is an ordinary execution of
+the Kairo-owned project `kairo`, queue `hardware-bench`, at priority -1000000:
+it waits for every other execution, never preempts one, is not preemptible,
+and holds its device alone:
+
+| Device | Lease | Kinds (swept, else at the defaults) |
+|---|---|---|
+| GPU | that GPU (an exclusive request may name its `device`), 1 CPU, 2 GiB | `gemm` (bf16), `copy`, `gemv-b1`, `gemv-b8` swept; `pcie-h2d`, `pcie-d2h`, `pcie-h2d-latency`, `pcie-d2h-latency` |
+| `cpu` | the node's whole CPU (`cpu_millis_min` = all of it: nothing runs beside it), 4 GiB | `cpu-compute`, `cpu-single`, `cpu-stream` swept |
+| `disk:FS` | 9 GiB of FS (the test files) | `disk-seq-read`, `disk-seq-write` (qd 32), `disk-rand-read` (qd 32), `disk-rand-read-qd1`, `disk-rand-write`, `disk-fsync`, `disk-sustained` |
+| `net:NODE` | a 2-rank gang: rank 0 on the host's node (`--node`; it needs `interconnect_addr`, as for any gang) serves (`kairo bench serve` at `KAIRO_GANG_MASTER_ADDR:PORT`), rank 1 on NODE measures | `net-latency`, `net-bandwidth-send`, `net-bandwidth-recv` (4 streams) |
+
+`--kinds` takes kinds or groups by prefix (`pcie`, `gemv`). A GPU or CPU bench
+sweeps settings, so it is refused for a device declared `control = false`, on
+a host without a controller, before the controller reported what the device
+supports, and while the device has a manual setting; a storage or network
+bench measures the defaults and needs no controller. One bench per device
+waits or runs at a time (`409 bench_conflict`), and a network bench is refused
+while another gang spans the two nodes. `--dry-run` prints the run, the lease
+and the argv without submitting.
+
+Where the programs are is reported by each node with its registration, from
+`[bench]` of the agent's (or daemon's, for its own node) configuration:
+`kairo_binary` (default: that kairo), `gpu_binary` (`kairo-bench-gpu`; a node
+without it takes no GPU bench), `cwd` (default the kairo binary's directory)
+and `executor_labels` (the executor that runs them natively, not a WSL one
+for Windows paths). The execution's argv is `kairo hardware bench-run --run
+ID`, the driver, which reaches the daemon through the worker API with its
+attempt token (`KAIRO_API_URL`, `KAIRO_API_CA`, `KAIRO_ATTEMPT_TOKEN`): that
+token reaches only the run its attempt carries out (another run is `403`, an
+attempt that is no bench's `404`), and sets only its own lease's `bench`
+setting.
+
+The driver, per kind, runs one primitive for the whole kind (stopped as soon
+as the kind is done; `--seconds` bounds it), and its clock is the primitive's
+own interval stream:
+
+1. Records the device's facts from the start record (`device`, the workload
+   versions and builds, the GPU driver) and, before the first kind, the GPU's
+   observed temperature at rest.
+2. Clears its setting and waits until the controller reports the defaults
+   applied (no policy setting either), warms up until steady (temperature
+   changing by less than 0.5 °C/min over 60 s, or throughput by less than
+   0.5%/min without a temperature; at most 5 minutes, else `not steady`), and
+   measures the first reference: 20 s settle, 30 s measurement.
+3. Sweeps the grid, from the controller's capabilities: the GPU's graphics
+   clock cap from its greatest supported clock down to 50% of it in steps of
+   5% of it (snapped to the nearest supported clock), then each supported
+   memory clock below the greatest at the caps of 100% and 85%, then (gemm
+   only) power limits of 90, 80, 70 and 60% of the default within the range;
+   the CPU's `max_perf_pct` (intel_pstate) or `max_freq_mhz` (cpufreq) from
+   100% down to 50% in 5% steps (Windows reports no frequency range: no
+   sweep). Each point: ask for the setting, wait until the controller reports
+   that generation applied (60 s, else `not applied`), settle 20 s, measure 30
+   s. The second reference is taken after half the grid, the third at the end.
+4. Per point: work/s, performance relative to the mean of the three
+   references, mean power, energy per unit of work, the achieved clocks,
+   temperature, clock event reasons and utilization. GPU energy is the sum of
+   the intervals' NVML `energy_mj`; CPU energy comes from the daemon, from the
+   host's CPU package samples over the measurement window (of the series
+   covering most of it, the controller's or a node's; the same packages are
+   never added twice), each sample counting for the span since the one before
+   it (`cpu energy not covered` when they miss more than a tenth of it).
+5. A point is invalid when its setting was not applied (or no longer held at
+   its end), its clock fell short of its graphics clock cap by more than 2%
+   with a thermal event reason (`0x20`, `0x40`: the cap says nothing then; an
+   uncapped point measures what the device does with its heat), anything else
+   used the device (a process Kairo did not start on the GPU, another lease
+   on the host's nodes for a CPU, another lease reserving the filesystem, a
+   gang across the two nodes), a manual or policy setting was in effect, or
+   the primitive did no work or ended early. A kind whose three references
+   spread more than 1% ((max - min) / mean), or with an invalid reference, is
+   invalid as a whole: its curve is not used. A kind measured once is its own
+   reference. `disk-sustained` measures until its write limit.
+6. Clears its setting (the lease's release would anyway) and finishes the run:
+   `finished` when every kind is valid, else `invalid` with the reasons. A run
+   whose execution ends without finishing is `failed`.
+
+The primitives' own safety limits apply as they are (free space, the 20 GiB
+written per primitive run, memory). Runs and points are kept indefinitely
+(`bench_runs`, `bench_points`); events `hardware_bench_requested`,
+`hardware_bench_started`, `hardware_bench_finished` and
+`hardware_bench_invalid` (also for a failed run).
+
+`kairo hardware profile HOST [DEVICE] [--json]` prints per device its latest
+runs and, per kind, the curve of the latest run with valid references of it:
+each point's setting, relative performance, power, energy per unit of work,
+clock, temperature and validity, the point the policy would choose for the
+device's `max_slowdown` marked `*`, and the drift from the device's own
+previous run of that kind (`drift from bnc_... (10-20 09:00): work/s -0.8%,
+energy/work +1.2%`). Nothing is compared with a specification or with other
+devices. `GET /api/hardware/{host}/profile` answers `{"host", "runs"}` (runs
+with `references` and `points`); `POST .../bench` takes `{"kinds", "node",
+"dry_run", "actor"}` and answers `{"run", "execution", "dry_run"}`.
+
+### Primitives
+
+Measurement primitives for hardware efficiency: each runs one fixed,
+deterministic workload for a given time and streams what it did, so an
+orchestrator can window the intervals, compare them with a reference run and
+combine them with energy, at each device setting it sweeps (clock caps,
+power limits). They record measured facts, stamped with the date and the
+workload version, and never compare with vendor specifications. A bench is
+an ordinary execution: its argv is
+
+```text
+kairo bench run WORKLOAD [--seconds S] [--interval S] [workload flags]
+kairo-bench-gpu WORKLOAD --device GPU-UUID [--seconds S] [--interval S] [flags]
+kairo bench serve --listen HOST:PORT        # the peer of net-latency / net-bandwidth
+```
+
+`--seconds` (default 60; 0 runs until stopped) ends the run, as does SIGTERM,
+Ctrl-C or CTRL_BREAK: the run stops issuing work, waits for the requests in
+flight, writes its final interval and end record, cleans up and exits 0. A
+usage error (a bad or unsafe parameter) exits 2 and writes no record; a run
+refused by the machine (too little free space or memory, no such device) or
+failing writes an end record and exits 1. `kairo bench run WORKLOAD --help`
+lists a workload's flags.
+
+| Workload | Work | Unit |
+|---|---|---|
+| `cpu-compute` | per iteration 8 FP64 FMA chains + one xorshift64 step in registers (22 ops), `--threads` (default every logical CPU) | op |
+| `cpu-single` | the same on one thread pinned to `--cpu` (start says whether the pin held) | op |
+| `cpu-stream` | STREAM triad `a=b+3c` over three `--bytes` arrays (default 1 GiB each; 24 bytes per element: 2 reads + 1 write, write-allocate not counted) | byte |
+| `disk-seq` | 1 MiB sequential `--mode read\|write` at `--qd 1\|32` | byte |
+| `disk-rand` | 4 KiB random `--mode read\|write`; `--qd 1` for latency, 32 for IOPS (`ops`) | byte |
+| `disk-fsync` | 4 KiB write + fdatasync / FlushFileBuffers, one at a time | byte |
+| `disk-sustained` | 1 MiB sequential writes (default `--qd 32`) until `--max-write-bytes`: per-interval bandwidth shows SLC cache cliffs | byte |
+| `net-latency` | 64-byte TCP ping-pong (TCP_NODELAY), each echo checked | request |
+| `net-bandwidth` | 128 KiB writes (`--dir send`) or reads (`--dir recv`) on `--streams 1\|4` connections, application bytes | byte |
+| `gemm` (GPU) | cuBLAS bf16 tensor-core GEMM, fp32 accumulate, `--n` 8192: 2n³ per op | flop |
+| `copy` (GPU) | device-to-device copy, `--bytes` total footprint (default 2 GiB): read + write counted | byte |
+| `gemv` (GPU) | bf16 n×n matrix times `--batch 1\|8` vectors (memory-bound, like LLM decode) | byte, flop |
+| `pcie` (GPU) | pinned host memory `--dir h2d\|d2h`; `--mode bandwidth` 64 MiB transfers, `latency` 4 KiB transfers with percentiles | byte |
+
+### Records
+
+One JSON object per line. Every record has `schema` (`kairo.bench/v1`),
+`type` (`start`, `interval`, `end`), `run_id` (16 hex digits), `program`
+(`kairo` or `kairo-bench-gpu`), `workload`, `wall` (UTC, RFC 3339 with
+nanoseconds) and `mono_ns` (monotonic nanoseconds since the start record;
+QueryPerformanceCounter on Windows, whose Go clock follows the timer tick).
+
+- `start`, written once setup is done (files prefilled, memory allocated,
+  connections open, GPU warm), right before the timed work: `version` (the
+  workload definition; it changes when a unit of work changes), `build` (VCS
+  revision), `params` (every effective parameter), `units` (primary first),
+  `host` (`hostname`, `os`, `os_version` (kairo only), `arch`, `cpu_model`,
+  `logical_cpus`), `device`
+  (what identifies the device under test, below) and `setup` (facts of the
+  setup: `direct_io`, `prefill_ns`, `pinned`, the GPU batch size...).
+- `interval`, every `--interval` seconds (default 1) at fixed boundaries
+  `start + k·interval`: `index`, `begin_ns`, `end_ns` (each interval begins
+  where the previous ended; the last is partial: kairo credits it the
+  requests in flight at the stop, kairo-bench-gpu ends it at the deadline or
+  signal and drains its in-flight batches uncounted), `work` (`{unit: count}`
+  completed in the interval, credited when an operation completes), `ops`
+  (operations: requests, round trips, kernel chunks, GPU ops),
+  `device_busy_ns` (GPU-measured busy time, CUDA events; null for kairo) and
+  `latency` (`count`, `min_ns`, `mean_ns`, `p50_ns`, `p99_ns`, `p999_ns`,
+  `max_ns`, or null). GPU intervals add `nvml`: `samples`, `energy_mj` (the
+  energy counter's delta over the interval), `power_mw`, `sm_clock_mhz`,
+  `mem_clock_mhz`, `temperature_c`, `util_gpu_pct`, `util_mem_pct` (each
+  `{min, mean, max}` of the `--sample-ms` samples), `pstate` (`{min, max}`)
+  and `clocks_event_reasons` (the OR of the samples); a value NVML cannot
+  read is null.
+- `end`, always last: `reason` (`duration`, `signal` or `limit` — exit 0;
+  `error` or `refused` — exit 1), `limit` and `limit_detail` for a limit,
+  `error`, `elapsed_ns` (the measurement window: the last interval's end;
+  `mono_ns` is later, after cleanup), `intervals`, the `work`, `ops`, `device_busy_ns` and
+  `latency` of the whole run, `energy_mj` (GPU), and for storage
+  `bytes_written` (the probe and the prefill included) and `file_removed`. A
+  run refused or failing before its start record writes only an end record,
+  which then carries `params` and, when known, `device`.
+
+Percentiles are nearest-rank over a log-linear histogram (exact below 128 ns,
+then 128 buckets per power of two: within 0.4%); both programs use the same
+buckets. `device` is `kind` `cpu` (`model`, `logical_cpus`, `gomaxprocs`,
+`fma`), `memory` (the same plus `total_bytes`, `available_bytes`), `storage`
+(`path`, `volume_path`, `filesystem`, `free_bytes`, `total_bytes`, sector
+sizes, `disk_model`, `disk_serial`, `disk_revision`, `disk_bus`, and on Windows
+`volume_serial`, on Linux `mount_source`, `block_device`, `rotational`),
+`network` (`local_addr`, `remote_addr`, the `interface` holding the local
+address — the one the route chose — its `mtu`, and the OS-reported
+`link_speed_tx_bps` / `link_speed_rx_bps`, a fact that a virtual NIC may
+report meaninglessly) or `gpu` (below).
+
+### Safety
+
+- Storage: the test file `kairo-bench-<id>.tmp` in `--path` (an existing
+  directory on the filesystem to test) is refused unless `--file-size` (1 GiB;
+  disk-fsync 64 MiB, disk-sustained 8 GiB) ≤ free space − `--keep-free`
+  (5 GiB) − 1 GiB. Every byte written counts against `--max-write-bytes`
+  (20 GiB, the prefill included; a prefill that alone would pass it is
+  refused), and the run ends with reason `limit` before the write that would
+  pass it; a write run also ends when free space falls below `--keep-free`.
+  The OS cache is bypassed (Windows `FILE_FLAG_NO_BUFFERING |
+  FILE_FLAG_WRITE_THROUGH`, Linux `O_DIRECT`, 4 KiB-aligned buffers or the
+  device's sector size); a filesystem that refuses it (tmpfs) runs buffered
+  with `setup.direct_io` false. The file is removed on every exit: Windows
+  opens it `FILE_FLAG_DELETE_ON_CLOSE` and Linux unlinks it as soon as it is
+  open, so even a killed run leaves nothing. Writes are incompressible and
+  every 4 KiB sector is distinct.
+- `cpu-stream` refuses arrays that, with a 2 GiB margin, exceed the available
+  memory.
+- `kairo bench serve` echoes, sinks or sources one test per connection (at
+  most 16 at a time, each closed after `--max-conn-duration`, default 1h),
+  writes one JSON line per connection, and exits after `--idle-timeout`
+  (default 5m) without connections. It serves anyone who connects: listen on
+  a trusted network.
+
+### GPU bench
+
+`bench/gpu/kairo-bench-gpu.cu` (CUDA C++, cuBLAS, NVML) is built separately
+for Ampere (sm_86, RTX 3080 / 3060) with a compute_86 PTX fallback:
+
+```text
+cmd /c bench\gpu\build-windows.cmd     # CUDA 13.x + MSVC 2022 x64 (finds vcvars64 through vswhere)
+make -C bench/gpu                      # Linux, CUDA_HOME=/usr/local/cuda; CUBLAS_STATIC=1 links cuBLAS statically
+```
+
+Both embed the revision (`BUILD_REV=...` overrides it). cudart is linked
+statically; NVML is loaded at run time (System32 `nvml.dll`,
+`libnvidia-ml.so.1`) and optional — without it every `nvml` value is null.
+On Windows cuBLAS is delay-loaded: `gemm` and `gemv` need `cublas64_13.dll`
+and `cublasLt64_13.dll` on PATH or beside the exe (a missing one is a clean
+`error` end), `copy` and `pcie` need no cuBLAS (their `cublas_version` is
+null). On Linux the shared cuBLAS is needed even for `--help` unless linked
+statically. The driver must support the toolkit it was built with.
+
+- `--device GPU-UUID` (required, as `nvidia-smi -L` prints it) is matched
+  against the visible devices' UUIDs (whatever `CUDA_VISIBLE_DEVICES` is);
+  no match is refused, listing the visible UUIDs.
+- Flags: `--seconds`, `--interval`, `--sample-ms` (NVML sampling period,
+  default 100), `--n` (gemm, gemv; multiple of 64, 256..32768), `--bytes`
+  (copy; binary suffixes, a multiple of 2 MiB), `--batch 1|8` (gemv), `--dir
+  h2d|d2h` and `--mode bandwidth|latency` (pcie), `--reserve-mib` (512: device
+  memory left free). A flag that does not apply to the workload is a usage
+  error. `--help`, `--version` (JSON: build, workload versions) and
+  `--validate-only` (the effective parameters as one `"type":"params"` line)
+  return before any CUDA, cuBLAS or NVML call.
+- Memory is checked, never tried: before creating a context NVML's free
+  memory must hold the buffers, the reserve and a 400 MiB context estimate;
+  after it `cudaMemGetInfo` must hold the buffers and the reserve, and the
+  free memory after allocating must still hold the reserve. Otherwise the run
+  is refused.
+- Inputs are filled on the device with a fixed pseudo-random pattern in
+  [-1, 1) (data values change power). Work is issued in batches calibrated to
+  about 20 ms, two in flight, bracketed by CUDA events: a batch counts in the
+  interval in which its end is seen, and `device_busy_ns` sums the event
+  times. pcie latency mode issues and synchronizes each 4 KiB transfer alone
+  (spin-wait, `setup.sync` `spin`; the others block) and reports host-measured
+  latencies, their sum as `device_busy_ns`.
+- `device` (`kind` `gpu`): `uuid`, `name`, `pci_bus_id`,
+  `compute_capability`, `sm_count`, `memory_total_bytes`,
+  `memory_free_bytes`, `driver_version`, `cuda_driver_version`,
+  `cuda_runtime_version`, `cublas_version`, `nvml_available`,
+  `power_limit_mw` (enforced), `applications_clock_mhz` and `max_clock_mhz`
+  (`sm`, `mem`, as the device reports them), `vbios_version`. The main thread
+  reads the energy counter at every interval boundary, so `energy_mj` covers
+  exactly the interval's work window.
+- SIGTERM, SIGINT, CTRL_C, CTRL_BREAK and CTRL_CLOSE stop it cleanly (exit
+  0); a very long op (gemm at n=32768 is ~2 s) delays the stop by up to two
+  ops.
+
 ## Upgrading a running installation
 
 A daemon (or node agent) that starts marks the attempts its executors had
@@ -761,11 +1327,16 @@ wait.
 
 Replace the agents together with the daemon: an agent older than the daemon
 starts attempts without their declared `env`, and a daemon older than the
-agent refuses its log problem reports (the agent logs them). A daemon opening an older
-database migrates it in place (the `cancelled` task state, reruns, the `env`
-column, the machine declaration, which starts out declaring every registered
-GPU for the node it is registered on, and its (uuid, node) key for shared GPUs, the attempt log problems, the admission tables); keep the backup, since an older binary would read a rerun Task's
-earlier execution as its outcome again.
+agent refuses its log problem reports (the agent logs them) and its
+observations, which carry power samples (its resources then go stale). A
+daemon opening an older database migrates it in place (the `cancelled` task
+state, reruns, the `env` column, the machine declaration, which starts out
+declaring every registered GPU for the node it is registered on, and its
+(uuid, node) key for shared GPUs, the attempt log problems, the admission
+tables, the power and energy tables, the hosts and device settings, the bench
+runs and policy decisions, which start out empty); keep the backup, since an
+older binary would read a rerun
+Task's earlier execution as its outcome again.
 
 ## Verification
 
@@ -778,4 +1349,10 @@ git diff --check
 ```
 
 Real NVIDIA, WSL, process-kill, and DDP runs are host-specific integration
-tests rather than ordinary unit tests.
+tests rather than ordinary unit tests, and so are the controller's changes of
+real clocks, power limits and processor settings (its tests use fake
+actuators). The bench tests run tiny workloads (TempDir files of a few MiB,
+loopback); `kairo-bench-gpu` is only built by them, and a GPU bench belongs on
+an idle GPU. The bench driver and the policy are tested with scripted JSON
+lines and fake daemons and controllers; only real idle hardware shows whether
+the curves, steady state and thermal limits behave as the fakes assume.

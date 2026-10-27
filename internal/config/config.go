@@ -6,7 +6,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -30,8 +32,49 @@ type Config struct {
 	InsecureHTTP bool       `toml:"insecure_http"`
 	Scheduler    Scheduler  `toml:"scheduler"`
 	Node         Node       `toml:"node"`
+	Bench        Bench      `toml:"bench"`
 	Executors    []Executor `toml:"executors"`
 	Providers    []Provider `toml:"providers"`
+}
+
+// Bench tells where the bench programs of a node are, for kairo hardware
+// bench: reported to the daemon with the node (its attributes' "bench").
+type Bench struct {
+	// KairoBinary runs the bench driver and the CPU, storage and network
+	// workloads (default: this kairo binary).
+	KairoBinary string `toml:"kairo_binary"`
+	// GPUBinary is kairo-bench-gpu; without it the node takes no GPU bench.
+	GPUBinary string `toml:"gpu_binary"`
+	// CWD is the benches' working directory (default: KairoBinary's).
+	CWD string `toml:"cwd"`
+	// ExecutorLabels pick the executor of the node that runs benches (one
+	// that runs the binaries above natively, not a WSL one for Windows paths).
+	ExecutorLabels map[string]string `toml:"executor_labels"`
+}
+
+// Attributes are node labels with the bench programs added under "bench".
+func (b Bench) Attributes(labels map[string]string) map[string]any {
+	out := map[string]any{}
+	for k, v := range labels {
+		out[k] = v
+	}
+	kairo := b.KairoBinary
+	if kairo == "" {
+		kairo, _ = os.Executable()
+	}
+	bench := map[string]any{}
+	for key, value := range map[string]string{"kairo": kairo, "gpu": b.GPUBinary, "cwd": b.CWD} {
+		if value != "" {
+			bench[key] = value
+		}
+	}
+	if len(b.ExecutorLabels) != 0 {
+		bench["executor_labels"] = b.ExecutorLabels
+	}
+	if len(bench) != 0 {
+		out["bench"] = bench
+	}
+	return out
 }
 
 // TLS reports whether the daemon serves HTTPS.
@@ -194,6 +237,7 @@ type Agent struct {
 	ObserveOnly                bool       `toml:"observe_only"`
 	ObservationIntervalSeconds int        `toml:"observation_interval_seconds"`
 	Node                       Node       `toml:"node"`
+	Bench                      Bench      `toml:"bench"`
 	Executors                  []Executor `toml:"executors"`
 	Providers                  []Provider `toml:"providers"`
 }
@@ -218,14 +262,8 @@ func LoadAgent(path string) (Agent, error) {
 		a.AttemptAPIURL = a.ServerURL
 	}
 	for _, u := range []string{a.ServerURL, a.AttemptAPIURL} {
-		switch scheme(u) {
-		case "https":
-		case "http":
-			if !a.InsecureHTTP {
-				return a, fmt.Errorf("%q is plain HTTP: the node token would travel unencrypted; use https or set insecure_http = true", u)
-			}
-		default:
-			return a, fmt.Errorf("%q is not an http(s) URL", u)
+		if err = checkNodeURL(u, a.InsecureHTTP); err != nil {
+			return a, err
 		}
 	}
 	if a.LogDirectory == "" {
@@ -258,4 +296,92 @@ func LoadAgent(path string) (Agent, error) {
 		return a, errors.New("at least one executor is required")
 	}
 	return a, nil
+}
+
+// checkNodeURL refuses a URL a node token would travel over in plain HTTP,
+// unless insecure is set.
+func checkNodeURL(u string, insecure bool) error {
+	switch scheme(u) {
+	case "https":
+	case "http":
+		if !insecure {
+			return fmt.Errorf("%q is plain HTTP: the node token would travel unencrypted; use https or set insecure_http = true", u)
+		}
+	default:
+		return fmt.Errorf("%q is not an http(s) URL", u)
+	}
+	return nil
+}
+
+// Controller configures `kairo controller`: the process on a physical host
+// that changes the settings of the devices its node controls (the host's
+// `controller` in the machine declaration). It authenticates like an agent,
+// with its node's token.
+type Controller struct {
+	ServerURL    string `toml:"server_url"`
+	Token        string `toml:"token"`
+	CAFile       string `toml:"ca_file"`
+	InsecureHTTP bool   `toml:"insecure_http"`
+	// Node is the controller's node; its name defaults to its id.
+	Node Node `toml:"node"`
+	// PollIntervalSeconds is how often the desired settings are fetched
+	// (default 10). ResetAfterSeconds is how long the daemon may be
+	// unreachable before every device is returned to its defaults (default
+	// 120).
+	PollIntervalSeconds int `toml:"poll_interval_seconds"`
+	ResetAfterSeconds   int `toml:"reset_after_seconds"`
+	// StateFile keeps what the controller must know across a crash: the
+	// devices it controls and, on Windows, the processor settings it found
+	// before it changed them. Default: next to the configuration file,
+	// <name>.state.json.
+	StateFile string `toml:"state_file"`
+}
+
+func LoadController(path string) (Controller, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return Controller{}, err
+	}
+	c := Controller{}
+	metadata, err := toml.Decode(string(body), &c)
+	if err != nil {
+		return c, err
+	}
+	if undecoded := metadata.Undecoded(); len(undecoded) > 0 {
+		return c, errors.New("unknown controller config field: " + undecoded[0].String())
+	}
+	if c.ServerURL == "" || c.Token == "" {
+		return c, errors.New("server_url and token are required")
+	}
+	if err = checkNodeURL(c.ServerURL, c.InsecureHTTP); err != nil {
+		return c, err
+	}
+	if c.Node.ID == "" {
+		return c, errors.New("node.id is required")
+	}
+	if c.Node.Name == "" {
+		c.Node.Name = c.Node.ID
+	}
+	if c.Node.OS == "" {
+		c.Node.OS = runtime.GOOS
+	}
+	if c.Node.Architecture == "" {
+		c.Node.Architecture = runtime.GOARCH
+	}
+	switch {
+	case c.PollIntervalSeconds < 0 || c.ResetAfterSeconds < 0:
+		return c, errors.New("poll_interval_seconds and reset_after_seconds must not be negative")
+	case c.PollIntervalSeconds == 0:
+		c.PollIntervalSeconds = 10
+	}
+	if c.ResetAfterSeconds == 0 {
+		c.ResetAfterSeconds = 120
+	}
+	if c.ResetAfterSeconds < 2*c.PollIntervalSeconds {
+		return c, fmt.Errorf("reset_after_seconds %d must be at least twice poll_interval_seconds %d", c.ResetAfterSeconds, c.PollIntervalSeconds)
+	}
+	if c.StateFile == "" {
+		c.StateFile = strings.TrimSuffix(path, filepath.Ext(path)) + ".state.json"
+	}
+	return c, nil
 }

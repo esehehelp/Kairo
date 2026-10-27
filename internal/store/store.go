@@ -40,6 +40,15 @@ var machineSchema string
 //go:embed log_problem_schema.sql
 var logProblemSchema string
 
+//go:embed device_schema.sql
+var deviceSchema string
+
+//go:embed device_samples_schema.sql
+var deviceSamplesSchema string
+
+//go:embed hardware_bench_schema.sql
+var hardwareBenchSchema string
+
 var (
 	ErrNotFound              = errors.New("not found")
 	ErrIdempotencyConflict   = errors.New("idempotency key was already used for different content")
@@ -188,6 +197,18 @@ func Open(path string) (*Store, error) {
 	if _, err := db.Exec(logProblemSchema); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("apply log problem schema: %w", err)
+	}
+	if _, err := db.Exec(deviceSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply device schema: %w", err)
+	}
+	if _, err := db.Exec(deviceSamplesSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply device samples schema: %w", err)
+	}
+	if _, err := db.Exec(hardwareBenchSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply hardware bench schema: %w", err)
 	}
 	return &Store{db: db, policy: SchedulingPolicy{DiskMinFreeBytes: DefaultDiskMinFreeBytes}}, nil
 }

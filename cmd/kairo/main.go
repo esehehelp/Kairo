@@ -19,6 +19,7 @@ import (
 	"kairo/internal/api"
 	"kairo/internal/config"
 	"kairo/internal/executor"
+	"kairo/internal/hwpolicy"
 	"kairo/internal/provider"
 	"kairo/internal/secfile"
 	"kairo/internal/store"
@@ -105,7 +106,7 @@ func serve(args []string) error {
 	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
 	slog.SetDefault(logger)
 	providerSet := map[string]provider.Provider{}
-	attributes, _ := json.Marshal(daemonConfig.Node.Labels)
+	attributes, _ := json.Marshal(daemonConfig.Bench.Attributes(daemonConfig.Node.Labels))
 	if err := st.UpsertNode(context.Background(), store.Node{ID: daemonConfig.Node.ID, Name: daemonConfig.Node.Name, OS: daemonConfig.Node.OS, Architecture: daemonConfig.Node.Architecture, Attributes: attributes, Enabled: true}); err != nil {
 		return err
 	}
@@ -206,8 +207,8 @@ func serve(args []string) error {
 		}
 	}()
 	// Resource observations describe the present; only each resource's
-	// latest one is ever read. Prune the rest periodically (observe-only
-	// daemons record observations too).
+	// latest one is ever read. Device samples are kept for a few days. Prune
+	// the rest periodically (observe-only daemons record both too).
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
@@ -217,6 +218,12 @@ func serve(args []string) error {
 				logger.Error("observation pruning failed", "error", err)
 			} else if removed > 0 {
 				logger.Info("pruned resource observations", "rows", removed)
+			}
+			removed, err = st.PruneDeviceSamples(ctx, store.DeviceSampleRetention)
+			if err != nil && ctx.Err() == nil {
+				logger.Error("device sample pruning failed", "error", err)
+			} else if removed > 0 {
+				logger.Info("pruned device samples", "rows", removed)
 			}
 			select {
 			case <-ctx.Done():
@@ -245,6 +252,11 @@ func serve(args []string) error {
 				}
 			}
 		}()
+	}
+	if !daemonConfig.ObserveOnly {
+		// The operating-point policy asks for device settings within each
+		// device's max_slowdown, and ends bench runs whose execution ended.
+		go (&hwpolicy.Policy{Store: st, Logger: logger}).Run(ctx)
 	}
 	if !daemonConfig.ObserveOnly {
 		// Project declarations are reconciled above the V3 execution layer. The

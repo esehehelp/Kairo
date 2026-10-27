@@ -102,6 +102,8 @@ var topAliases = map[string]string{
 	"list": "task list", "wait": "task wait", "watch": "project watch", "apply": "project apply",
 	"show": "task show", "cancel": "task cancel", "rerun": "task rerun", "-v": "version",
 	"--version": "version", "health": "doctor", "daemon": "serve", "server": "serve",
+	"hosts": "hardware", "host": "hardware", "devices": "hardware", "device": "hardware",
+	"benchmark": "bench", "perf": "bench",
 }
 
 const remoteNote = "API commands take --api URL (default $KAIRO_API, else " + defaultAPIURL + "); the token comes from\n" +
@@ -196,14 +198,30 @@ func init() {
 			},
 			aliases: map[string]string{"ls": "status", "list": "status", "show": "status", "release": "enable"},
 		}},
-		{name: "machine", summary: "declare which node holds which GPU (apply), and show it", group: &commandGroup{
+		{name: "machine", summary: "declare which node holds which GPU and which host holds which node (apply), and show it", group: &commandGroup{
 			subs: []command{
 				{"apply", "FILE [--dry-run] [--json]", "replace the machine declaration with FILE's", machineApply},
-				{"show", "[--json]", "declared GPUs, their state, and GPUs reported but not declared", machineShow},
+				{"show", "[--json]", "declared GPUs and their state, GPUs reported but not declared, hosts and their devices' policies", machineShow},
 			},
 			aliases: map[string]string{
 				"status": "show", "get": "show", "ls": "show", "list": "show",
 				"declare": "apply", "submit": "apply", "set": "apply",
+			},
+		}},
+		{name: "hardware", summary: "device settings of hosts: show, set, reset and bench them", group: &commandGroup{
+			note: "DEVICE is a GPU UUID or cpu (a bench also takes disk:FILESYSTEM and net:NODE); a host's controller (kairo controller) carries the settings out.",
+			subs: []command{
+				{"show", "[HOST] [--json]", "per host: devices, policy, desired and applied settings, errors, controller", hardwareShow},
+				{"set", "HOST DEVICE [--graphics-clock-max MHz] [--memory-clock MHz] [--power-limit W] [--cpu-max-freq MHz | --cpu-max-perf PCT]", "set a device's manual setting (it overrides bench and policy settings)", hardwareSet},
+				{"reset", "HOST DEVICE", "clear a device's manual setting", hardwareReset},
+				{"bench", "HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run] [--json]", "measure a device's performance and energy at each setting, as a lowest-priority execution", hardwareBench},
+				{"profile", "HOST [DEVICE] [--json]", "per device and kind the measured curve, the point for its max_slowdown, and drift from its previous bench", hardwareProfile},
+				{"bench-run", "--run RUN_ID", "the bench driver (the argv of a bench execution; runs inside its attempt)", hardwareBenchRun},
+			},
+			aliases: map[string]string{
+				"status": "show", "get": "show", "ls": "show", "list": "show",
+				"clear": "reset", "unset": "reset", "default": "reset", "limit": "set", "apply": "set",
+				"benchmark": "bench", "measure": "bench", "curve": "profile", "profiles": "profile",
 			},
 		}},
 		{name: "node", summary: "quarantine or release nodes", group: &commandGroup{
@@ -222,6 +240,8 @@ func init() {
 			args: "--config DAEMON.toml", help: "run the daemon"},
 		{name: "agent", summary: "run this host as a remote node (--config AGENT.toml)", run: agentCommand,
 			args: "--config AGENT.toml", help: "run this host as a remote node: its providers and executors report to the daemon"},
+		{name: "controller", summary: "run this host's device controller (--config CONTROLLER.toml)", run: controllerCommand,
+			args: "--config CONTROLLER.toml", help: "keep this host's controlled devices at their desired settings (elevated / root)"},
 		{name: "token", summary: "create, list or revoke API tokens (direct database access)", group: &commandGroup{
 			subs: []command{
 				{"create", "(--config DAEMON.toml | --db PATH) --name NAME --role admin|read|node [--node NODE_ID] [--save | --out FILE] [--force]", "create a token", bind(tokenAction, "create")},
@@ -241,6 +261,13 @@ func init() {
 				{"compact", "(--config DAEMON.toml | --db PATH)", "prune resource observations and VACUUM the database", dbCompact},
 			},
 			aliases: map[string]string{"vacuum": "compact"},
+		}},
+		{name: "bench", summary: "measure hardware: run a fixed workload as JSON lines, or serve the network peer", group: &commandGroup{
+			subs: []command{
+				{"run", "WORKLOAD [--seconds S] [--interval S] [workload flags]", "run a workload, streaming start, interval and end records", benchRun},
+				{"serve", "--listen HOST:PORT [--idle-timeout D] [--max-conn-duration D]", "the peer of the network workloads", benchServe},
+			},
+			aliases: map[string]string{"start": "run", "exec": "run", "server": "serve", "listen": "serve", "peer": "serve"},
 		}},
 		{name: "help", summary: "help for a command: kairo help task logs", run: helpCommand},
 	}
@@ -476,9 +503,21 @@ var commandNotes = map[string]string{
 		"--attempt all prints every attempt; for a gang, --rank selects the rank (default 0).",
 	"task list":     "Columns: NAME QUEUE STATE EXEC (latest execution) STARTED ELAPSED NOTE.",
 	"project apply": "A declared task is immutable: to change one give it a new name; `kairo task rerun` runs it again.",
-	"machine apply": "FILE is the whole declaration: [[nodes]] with id and gpus (UUIDs as nvidia-smi -L prints them).\n" +
+	"machine apply": "FILE is the whole declaration: [[nodes]] with id and gpus (UUIDs as nvidia-smi -L prints them),\n" +
+		"and optionally [[hosts]] with id, nodes, controller, max_slowdown and [[hosts.devices]] overrides.\n" +
 		"A GPU left out is no longer scheduled. A moved GPU is taken over when its new node reports it;\n" +
-		"a GPU held by a live lease cannot be moved or dropped.",
+		"a GPU held by a live lease cannot be moved or dropped. Settings of devices no longer controllable are cleared.",
+	"hardware set": "Settable: a GPU's --graphics-clock-max, --memory-clock and --power-limit; a CPU's --cpu-max-freq\n" +
+		"(Windows, Linux cpufreq) or --cpu-max-perf (Linux intel_pstate). A setting left out stays at the default.\n" +
+		"Values are checked against what the host's controller reported the device supports.",
+	"hardware reset": "Clears the manual setting: the device follows a bench or policy setting if one exists, else its defaults.",
+	"hardware bench": "Kinds: GPU gemm, copy, gemv-b1, gemv-b8 (swept), pcie-h2d, pcie-d2h, pcie-h2d-latency, pcie-d2h-latency;\n" +
+		"CPU cpu-compute, cpu-single, cpu-stream (swept); disk:FS disk-seq-read, disk-seq-write, disk-rand-read,\n" +
+		"disk-rand-read-qd1, disk-rand-write, disk-fsync, disk-sustained; net:NODE net-latency, net-bandwidth-send,\n" +
+		"net-bandwidth-recv. A prefix names a group (--kinds pcie,gemv). The bench waits at the lowest priority\n" +
+		"for the device alone (GPU: the GPU; CPU: the node's whole CPU; disk: the filesystem; net: a two-node gang).",
+	"hardware profile": "A point marked * is the one chosen for the device's max_slowdown: the valid point within it using the\n" +
+		"least energy per unit of work. Drift compares a kind with the device's previous bench, never with a specification.",
 }
 
 // parseFlags parses args interleaving flags and positionals; on --help it

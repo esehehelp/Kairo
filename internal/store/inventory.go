@@ -98,7 +98,8 @@ func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 // activity without a process this node sees are dropped while another node's
 // row of the device is leased - that node's processes, which this one cannot
 // see (they are that lease's own). A process claim that is the lease holder's
-// own work (leaseHoldersProcessTx) is not recorded.
+// own work (leaseHoldersProcessTx) is not recorded. An observation's device
+// sample is recorded for the device (recordDeviceSampleTx).
 func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, resources []ResourceInstance, observations []Observation, claims []ExternalClaim) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -130,7 +131,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 	}
 	t := now()
 	undeclared := map[string]bool{}
-	alias := map[string]string{}   // the provider's id of a shared GPU -> its row on this node
+	alias := map[string]string{} // the provider's id of a shared GPU -> its row on this node
 	var undeclaredUUIDs []string
 	for _, resource := range resources {
 		if resource.ID == "" || resource.NodeID == "" || resource.ProviderID == "" || resource.Kind == "" || resource.StableIdentity == "" {
@@ -185,6 +186,11 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		if err != nil {
 			return err
 		}
+		if observation.Device != nil {
+			if err = recordDeviceSampleTx(ctx, tx, observation.ResourceID, observation.ObservedAt, observation.ValidUntil, *observation.Device); err != nil {
+				return err
+			}
+		}
 	}
 	seen := map[string]bool{}
 	for _, claim := range claims {
@@ -198,7 +204,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 			continue
 		}
 		if stored, ok := alias[claim.ResourceID]; ok {
-			claim.ID += "@" + providerNode   // (the first node's provider names its claim the same)
+			claim.ID += "@" + providerNode // (the first node's provider names its claim the same)
 			claim.ResourceID = stored
 		}
 		if err = ownedByProvider(claim.ResourceID); err != nil {
@@ -501,6 +507,9 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 		if err = appendCoordinationEventTx(ctx, tx, "stale_lease_reconciled", &projectID, "lease", x.lease, &x.epoch, map[string]string{"resource_id": resourceID, "execution_id": executionID}); err != nil {
 			return err
 		}
+	}
+	if err = clearReleasedLeaseSettingsTx(ctx, tx); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

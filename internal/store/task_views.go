@@ -285,6 +285,9 @@ type AttemptDetail struct {
 	NodeID      *string `json:"node_id,omitempty"`
 	// LogProblems are what went wrong with the attempt's logs while it ran.
 	LogProblems []LogProblem `json:"log_problems,omitempty"`
+	// Energy is what the GPUs of its lease used while it ran, once a sample
+	// of them has counted for it.
+	Energy *AttemptEnergy `json:"energy,omitempty"`
 }
 
 type TaskGangRank struct {
@@ -355,9 +358,16 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 	if err != nil {
 		return TaskDetail{}, err
 	}
+	energy, err := s.taskAttemptEnergy(ctx, task.scopeID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
 	for _, list := range attempts {
 		for i := range list {
 			list[i].LogProblems = logProblems[list[i].ID]
+			if e, ok := energy[list[i].ID]; ok {
+				list[i].Energy = &e
+			}
 		}
 	}
 	// The task's executions are in its project, queue and task scopes: a

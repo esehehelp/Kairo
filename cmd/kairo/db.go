@@ -26,6 +26,6 @@ func dbCompact(args []string) error {
 	if err != nil {
 		return fmt.Errorf("compact (stop the daemon first: VACUUM needs the database to itself): %w", err)
 	}
-	fmt.Fprintf(os.Stderr, "kairo: pruned %d resource observations and compacted the database\n", removed)
+	fmt.Fprintf(os.Stderr, "kairo: pruned %d resource observations and device samples and compacted the database\n", removed)
 	return nil
 }
