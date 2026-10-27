@@ -1,6 +1,8 @@
 // Package machine parses the machine declaration accepted by `kairo machine
 // apply`: which node holds which GPU. The declaration is the authority on GPU
-// ownership; providers only observe what is there.
+// ownership; providers only observe what is there. A GPU declared for several
+// nodes is SHARED: nodes on one host (containers that all see the card) may each
+// schedule it, and a lease on it through any of them excludes the others.
 package machine
 
 import (
@@ -37,11 +39,9 @@ func Parse(body string) (Spec, error) {
 	return spec, spec.Validate()
 }
 
-// Validate checks that every node is named once and every GPU is declared for
-// one node only.
+// Validate checks that every node is named once and lists a GPU once.
 func (s Spec) Validate() error {
 	nodes := map[string]bool{}
-	gpus := map[string]string{}
 	for _, node := range s.Nodes {
 		if node.ID == "" {
 			return errors.New("every [[nodes]] needs an id")
@@ -50,26 +50,30 @@ func (s Spec) Validate() error {
 			return fmt.Errorf("node %s is declared twice", node.ID)
 		}
 		nodes[node.ID] = true
+		listed := map[string]bool{}
 		for _, uuid := range node.GPUs {
 			if !strings.HasPrefix(uuid, "GPU-") || strings.TrimSpace(uuid) != uuid {
 				return fmt.Errorf("node %s: %q is not a GPU UUID (GPU-..., as nvidia-smi -L prints it)", node.ID, uuid)
 			}
-			if other, ok := gpus[uuid]; ok {
-				return fmt.Errorf("%s is declared for both %s and %s", uuid, other, node.ID)
+			if listed[uuid] {
+				return fmt.Errorf("node %s lists %s twice", node.ID, uuid)
 			}
-			gpus[uuid] = node.ID
+			listed[uuid] = true
 		}
 	}
 	return nil
 }
 
-// GPUs maps each declared GPU UUID to its node.
-func (s Spec) GPUs() map[string]string {
-	out := map[string]string{}
+// GPUs maps each declared GPU UUID to its nodes, sorted (several: a shared GPU).
+func (s Spec) GPUs() map[string][]string {
+	out := map[string][]string{}
 	for _, node := range s.Nodes {
 		for _, uuid := range node.GPUs {
-			out[uuid] = node.ID
+			out[uuid] = append(out[uuid], node.ID)
 		}
+	}
+	for _, nodes := range out {
+		sort.Strings(nodes)
 	}
 	return out
 }

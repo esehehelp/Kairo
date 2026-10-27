@@ -92,7 +92,12 @@ func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 // A provider only reports resources of its own node, and observations and
 // claims only for its own resources. A GPU it reports that is not declared for
 // its node is left out, with its observations and claims, and recorded in
-// undeclared_gpus; the rest of the poll still applies.
+// undeclared_gpus; the rest of the poll still applies. A shared GPU's row on a
+// node other than the first is an alias (registerGPUTx): the poll's
+// observations and claims of it are filed under the alias, and its claims of
+// activity without a process this node sees are dropped while another node's
+// row of the device is leased - that node's processes, which this one cannot
+// see (they are that lease's own).
 func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, resources []ResourceInstance, observations []Observation, claims []ExternalClaim) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -124,6 +129,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 	}
 	t := now()
 	undeclared := map[string]bool{}
+	alias := map[string]string{}   // the provider's id of a shared GPU -> its row on this node
 	var undeclaredUUIDs []string
 	for _, resource := range resources {
 		if resource.ID == "" || resource.NodeID == "" || resource.ProviderID == "" || resource.Kind == "" || resource.StableIdentity == "" {
@@ -139,7 +145,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 			resource.AdminState = "enabled"
 		}
 		if resource.Kind == "gpu" {
-			register, err := registerGPUTx(ctx, tx, resource, providerNode, t)
+			stored, register, err := registerGPUTx(ctx, tx, resource, providerNode, t)
 			if err != nil {
 				return err
 			}
@@ -147,6 +153,10 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 				undeclared[resource.ID] = true
 				undeclaredUUIDs = append(undeclaredUUIDs, resource.StableIdentity)
 				continue
+			}
+			if stored != resource.ID {
+				alias[resource.ID] = stored
+				resource.ID = stored
 			}
 		}
 		if err = upsertResourceTx(ctx, tx, resource, t); err != nil {
@@ -163,6 +173,9 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		}
 		if undeclared[observation.ResourceID] {
 			continue
+		}
+		if stored, ok := alias[observation.ResourceID]; ok {
+			observation.ResourceID = stored
 		}
 		if err = ownedByProvider(observation.ResourceID); err != nil {
 			return err
@@ -183,8 +196,23 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		if undeclared[claim.ResourceID] {
 			continue
 		}
+		if stored, ok := alias[claim.ResourceID]; ok {
+			claim.ID += "@" + providerNode   // (the first node's provider names its claim the same)
+			claim.ResourceID = stored
+		}
 		if err = ownedByProvider(claim.ResourceID); err != nil {
 			return err
+		}
+		if claim.ClaimKind == "unattributed_activity" {
+			var elsewhere int
+			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_instances self JOIN resource_instances sib ON sib.kind='gpu' AND sib.stable_identity=self.stable_identity AND sib.id<>self.id
+				JOIN lease_items li ON li.resource_id=sib.id JOIN leases l ON l.id=li.lease_id
+				WHERE self.id=? AND self.kind='gpu' AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, claim.ResourceID).Scan(&elsewhere); err != nil {
+				return err
+			}
+			if elsewhere > 0 {
+				continue
+			}
 		}
 		if claim.ClaimKind == "external_process" && claim.ProcessIdentity != nil {
 			var registered int
@@ -209,6 +237,10 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 	}
 	observed := map[string]bool{}
 	for _, o := range observations {
+		if stored, ok := alias[o.ResourceID]; ok {
+			observed[stored] = true
+			continue
+		}
 		observed[o.ResourceID] = !undeclared[o.ResourceID]
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.resource_id FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id WHERE r.provider_id=? AND c.cleared_at IS NULL`, providerID)
@@ -282,9 +314,11 @@ func (s *Store) ListResourceStatus(ctx context.Context) ([]ResourceInstance, err
 	rows, err := s.db.QueryContext(ctx, `SELECT r.id,r.node_id,r.provider_id,r.kind,r.stable_identity,r.binding_json,r.attributes_json,r.admin_state,r.quarantine_reason,
 	 (SELECT observed_at FROM resource_observations o WHERE o.resource_id=r.id ORDER BY id DESC LIMIT 1),
 	 (SELECT valid_until FROM resource_observations o WHERE o.resource_id=r.id ORDER BY id DESC LIMIT 1),
-	 EXISTS(SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=r.id AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')),
-	 EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=r.id AND c.cleared_at IS NULL),
-	 (SELECT node_id FROM machine_gpus d WHERE r.kind='gpu' AND d.uuid=r.stable_identity)
+	 EXISTS(SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id IN `+sameDevice("r.id")+` AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')),
+	 EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("r.id")+` AND c.cleared_at IS NULL),
+	 CASE WHEN r.kind='gpu' THEN COALESCE(
+			(SELECT d.node_id FROM machine_gpus d WHERE d.uuid=r.stable_identity AND d.node_id=r.node_id),
+			(SELECT group_concat(node_id) FROM (SELECT d.node_id FROM machine_gpus d WHERE d.uuid=r.stable_identity ORDER BY d.node_id))) END
 	 FROM resource_instances r ORDER BY r.node_id,r.kind,r.id`)
 	if err != nil {
 		return nil, err
@@ -400,7 +434,7 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 	t := now()
 	for _, x := range leases {
 		var unsafe int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1) WHERE li.lease_id=? AND li.resource_id IS NOT NULL AND (o.id IS NULL OR julianday(o.valid_until)<=julianday(?) OR julianday(o.observed_at)<=julianday(l.stale_at) OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL))`, x.lease, t).Scan(&unsafe); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1) WHERE li.lease_id=? AND li.resource_id IS NOT NULL AND (o.id IS NULL OR julianday(o.valid_until)<=julianday(?) OR julianday(o.observed_at)<=julianday(l.stale_at) OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL))`, x.lease, t).Scan(&unsafe); err != nil {
 			return err
 		}
 		if unsafe > 0 {

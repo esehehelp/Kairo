@@ -466,7 +466,7 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 	 (o.id IS NULL OR julianday(o.valid_until)<=julianday(?)
 	 OR julianday(o.observed_at)<=julianday((SELECT exited_at FROM attempts WHERE id=?))
 	 OR EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=? AND julianday(o.observed_at)<=julianday(ap.exited_at))
-	 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL
+	 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL
 	   AND (c.claim_kind='external_process' OR c.claim_kind='unattributed_activity' AND COALESCE(
 	     (SELECT json_extract(rr.policy_json,'$.on_unattributed_activity') FROM resource_requests rr
 	      JOIN leases policy_lease ON policy_lease.execution_id=rr.execution_id

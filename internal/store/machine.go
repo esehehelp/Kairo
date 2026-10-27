@@ -16,8 +16,9 @@ import (
 // live lease holds.
 var ErrMachineConflict = errors.New("machine declaration conflicts with a leased GPU")
 
-// MachineChange is one GPU whose declared node changes: From is empty for a
-// newly declared GPU, To for one no longer declared.
+// MachineChange is one GPU whose declared nodes change (a shared GPU's are
+// comma-separated, sorted): From is empty for a newly declared GPU, To for one
+// no longer declared.
 type MachineChange struct {
 	UUID string `json:"uuid"`
 	From string `json:"from,omitempty"`
@@ -30,10 +31,11 @@ type MachineApplyResult struct {
 	DryRun    bool            `json:"dry_run"`
 }
 
-// DeclaredGPU is a declared GPU and what its node reports of it. State is
-// "observed" (registered on its node, fresh observation), "stale" (registered
-// on its node, no fresh observation), "pending" (still registered on another
-// node until its node's provider reports it) or "unseen" (never reported).
+// DeclaredGPU is one node's declaration of a GPU (a shared GPU has one a node)
+// and what that node reports of it. State is "observed" (registered on its
+// node, fresh observation), "stale" (registered on its node, no fresh
+// observation), "pending" (still registered on a node it is no longer declared
+// for, until its node's provider reports it) or "unseen" (never reported).
 type DeclaredGPU struct {
 	UUID       string  `json:"uuid"`
 	NodeID     string  `json:"node_id"`
@@ -43,7 +45,7 @@ type DeclaredGPU struct {
 }
 
 // UndeclaredGPU is a GPU a provider reports but may not register: it is
-// declared for another node (DeclaredNodeID) or for none.
+// declared for other nodes (DeclaredNodeID, comma-separated) or for none.
 type UndeclaredGPU struct {
 	UUID            string  `json:"uuid"`
 	NodeID          string  `json:"node_id"`
@@ -59,9 +61,11 @@ type Machines struct {
 }
 
 // ApplyMachines replaces the machine declaration with spec. It refuses to move
-// or drop a GPU held by a live lease. A GPU that moves stays registered on its
-// old node, unschedulable, until the new node's provider reports it; the old
-// node's open claims on it are cleared, as they describe the old host.
+// or drop a GPU held by a live lease on a node it would no longer be declared
+// for. A GPU that moves stays registered on its old node, unschedulable, until
+// the new node's provider reports it; the old node's open claims on it are
+// cleared, as they describe the old host. A shared GPU (declared for several
+// nodes) gets a row on each of them as their providers report it.
 func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun bool) (MachineApplyResult, error) {
 	if err := spec.Validate(); err != nil {
 		return MachineApplyResult{}, err
@@ -84,8 +88,8 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	if len(unknown) != 0 {
 		return MachineApplyResult{}, fmt.Errorf("unknown node %s (a node is known once its daemon or agent has started)", strings.Join(unknown, ", "))
 	}
-	current := map[string]string{}
-	rows, err := tx.QueryContext(ctx, `SELECT uuid,node_id FROM machine_gpus`)
+	current := map[string][]string{}
+	rows, err := tx.QueryContext(ctx, `SELECT uuid,node_id FROM machine_gpus ORDER BY uuid,node_id`)
 	if err != nil {
 		return MachineApplyResult{}, err
 	}
@@ -95,7 +99,7 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 			rows.Close()
 			return MachineApplyResult{}, err
 		}
-		current[uuid] = nodeID
+		current[uuid] = append(current[uuid], nodeID)
 	}
 	rows.Close()
 	if err = rows.Err(); err != nil {
@@ -104,23 +108,24 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	declared := spec.GPUs()
 	result := MachineApplyResult{Changes: []MachineChange{}, DryRun: dryRun}
 	for uuid, to := range declared {
-		if from := current[uuid]; from == to {
+		if from := strings.Join(current[uuid], ","); from == strings.Join(to, ",") {
 			result.Unchanged++
 		} else {
-			result.Changes = append(result.Changes, MachineChange{UUID: uuid, From: from, To: to})
+			result.Changes = append(result.Changes, MachineChange{UUID: uuid, From: from, To: strings.Join(to, ",")})
 		}
 	}
 	for uuid, from := range current {
 		if _, kept := declared[uuid]; !kept {
-			result.Changes = append(result.Changes, MachineChange{UUID: uuid, From: from})
+			result.Changes = append(result.Changes, MachineChange{UUID: uuid, From: strings.Join(from, ",")})
 		}
 	}
 	sort.Slice(result.Changes, func(i, j int) bool { return result.Changes[i].UUID < result.Changes[j].UUID })
 	var leased []string
 	for _, change := range result.Changes {
+		// a live lease on the GPU's row of a node it would no longer be declared for
 		var holders int
 		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_instances r JOIN lease_items li ON li.resource_id=r.id JOIN leases l ON l.id=li.lease_id
-			WHERE r.kind='gpu' AND r.stable_identity=? AND r.node_id<>? AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, change.UUID, change.To).Scan(&holders); err != nil {
+			WHERE r.kind='gpu' AND r.stable_identity=? AND instr(','||?||',',','||r.node_id||',')=0 AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, change.UUID, change.To).Scan(&holders); err != nil {
 			return MachineApplyResult{}, err
 		}
 		if holders != 0 {
@@ -135,15 +140,15 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	}
 	t := now()
 	for _, change := range result.Changes {
-		if change.To == "" {
-			_, err = tx.ExecContext(ctx, `DELETE FROM machine_gpus WHERE uuid=?`, change.UUID)
-		} else {
-			_, err = tx.ExecContext(ctx, `INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES(?,?,?) ON CONFLICT(uuid) DO UPDATE SET node_id=excluded.node_id,declared_at=excluded.declared_at`, change.UUID, change.To, t)
-		}
-		if err != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM machine_gpus WHERE uuid=? AND instr(','||?||',',','||node_id||',')=0`, change.UUID, change.To); err != nil {
 			return MachineApplyResult{}, err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=? WHERE cleared_at IS NULL AND resource_id IN(SELECT id FROM resource_instances WHERE kind='gpu' AND stable_identity=? AND node_id<>?)`, t, change.UUID, change.To); err != nil {
+		for _, to := range declared[change.UUID] {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES(?,?,?) ON CONFLICT(uuid,node_id) DO NOTHING`, change.UUID, to, t); err != nil {
+				return MachineApplyResult{}, err
+			}
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=? WHERE cleared_at IS NULL AND resource_id IN(SELECT id FROM resource_instances WHERE kind='gpu' AND stable_identity=? AND instr(','||?||',',','||node_id||',')=0)`, t, change.UUID, change.To); err != nil {
 			return MachineApplyResult{}, err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "gpu_declaration_changed", nil, "gpu", change.UUID, nil, change); err != nil {
@@ -156,9 +161,13 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 // ListMachines is the machine declaration with what the providers report.
 func (s *Store) ListMachines(ctx context.Context) (Machines, error) {
 	out := Machines{GPUs: []DeclaredGPU{}, Undeclared: []UndeclaredGPU{}}
+	// each declaration's row: the one on its node, else one still on a node the GPU is no longer declared for
 	rows, err := s.db.QueryContext(ctx, `SELECT d.uuid,d.node_id,d.declared_at,r.id,r.node_id,
 		(SELECT valid_until FROM resource_observations o WHERE o.resource_id=r.id ORDER BY id DESC LIMIT 1)
-		FROM machine_gpus d LEFT JOIN resource_instances r ON r.kind='gpu' AND r.stable_identity=d.uuid
+		FROM machine_gpus d LEFT JOIN resource_instances r ON r.id=COALESCE(
+			(SELECT own.id FROM resource_instances own WHERE own.kind='gpu' AND own.stable_identity=d.uuid AND own.node_id=d.node_id ORDER BY own.id LIMIT 1),
+			(SELECT old.id FROM resource_instances old WHERE old.kind='gpu' AND old.stable_identity=d.uuid AND NOT EXISTS(
+				SELECT 1 FROM machine_gpus kept WHERE kept.uuid=d.uuid AND kept.node_id=old.node_id) ORDER BY old.id LIMIT 1))
 		ORDER BY d.node_id,d.uuid`)
 	if err != nil {
 		return out, err
@@ -188,8 +197,10 @@ func (s *Store) ListMachines(ctx context.Context) (Machines, error) {
 	if err = rows.Err(); err != nil {
 		return out, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT u.uuid,u.node_id,u.provider_id,d.node_id,u.first_observed_at,u.last_observed_at
-		FROM undeclared_gpus u LEFT JOIN machine_gpus d ON d.uuid=u.uuid ORDER BY u.node_id,u.uuid`)
+	rows, err = s.db.QueryContext(ctx, `SELECT u.uuid,u.node_id,u.provider_id,
+		(SELECT group_concat(node_id) FROM (SELECT d.node_id FROM machine_gpus d WHERE d.uuid=u.uuid ORDER BY d.node_id)),
+		u.first_observed_at,u.last_observed_at
+		FROM undeclared_gpus u ORDER BY u.node_id,u.uuid`)
 	if err != nil {
 		return out, err
 	}
@@ -205,40 +216,64 @@ func (s *Store) ListMachines(ctx context.Context) (Machines, error) {
 }
 
 // registerGPUTx decides whether a provider of node nodeID may register the
-// GPU it reports. A GPU declared for another node, or for none, is not
-// registered (false). A GPU declared for this node that is still registered
-// to another node is taken over, unless a live lease holds it.
-func registerGPUTx(ctx context.Context, tx *sql.Tx, resource ResourceInstance, nodeID, t string) (bool, error) {
-	var declared string
-	err := tx.QueryRowContext(ctx, `SELECT node_id FROM machine_gpus WHERE uuid=?`, resource.StableIdentity).Scan(&declared)
-	if errors.Is(err, sql.ErrNoRows) || err == nil && declared != nodeID {
-		return false, nil
+// GPU it reports, and under which resource id. A GPU declared for another
+// node, or for none, is not registered (false). The GPU's row on this node is
+// kept (the provider's own id, or the alias a shared GPU got here). Without
+// one: the provider's id where no node has it, an alias (`<id>@<node>`) where
+// another node it is still declared for has it (a shared GPU), else that row is
+// taken over (the GPU moved), unless a live lease holds it.
+func registerGPUTx(ctx context.Context, tx *sql.Tx, resource ResourceInstance, nodeID, t string) (string, bool, error) {
+	var declared int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_gpus WHERE uuid=? AND node_id=?`, resource.StableIdentity, nodeID).Scan(&declared); err != nil {
+		return "", false, err
+	}
+	if declared == 0 {
+		return "", false, nil
+	}
+	takeOver := func(id, fromNode string) error {
+		var holders int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=? AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, id).Scan(&holders); err != nil {
+			return err
+		}
+		if holders != 0 {
+			return fmt.Errorf("%w: gpu %s is declared for node %s but still leased on node %s", ErrOwnershipConflict, id, nodeID, fromNode)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE resource_instances SET node_id=?,provider_id=?,updated_at=? WHERE id=?`, resource.NodeID, resource.ProviderID, t, id); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=? WHERE resource_id=? AND cleared_at IS NULL`, t, id); err != nil {
+			return err
+		}
+		return appendCoordinationEventTx(ctx, tx, "gpu_ownership_transferred", nil, "resource", id, nil, map[string]string{"uuid": resource.StableIdentity, "from_node": fromNode, "to_node": resource.NodeID, "provider_id": resource.ProviderID})
+	}
+	// this node's row of the GPU (the provider's own id first)
+	var ownID, ownProvider string
+	err := tx.QueryRowContext(ctx, `SELECT id,provider_id FROM resource_instances WHERE kind='gpu' AND stable_identity=? AND node_id=? ORDER BY id<>? LIMIT 1`, resource.StableIdentity, nodeID, resource.ID).Scan(&ownID, &ownProvider)
+	if err == nil {
+		if ownProvider == resource.ProviderID {
+			return ownID, true, nil
+		}
+		return ownID, true, takeOver(ownID, nodeID) // (another provider of this node registered it)
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", false, err
+	}
+	var fromNode string
+	err = tx.QueryRowContext(ctx, `SELECT node_id FROM resource_instances WHERE id=?`, resource.ID).Scan(&fromNode)
+	if errors.Is(err, sql.ErrNoRows) {
+		return resource.ID, true, nil
 	}
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	var fromNode, fromProvider string
-	err = tx.QueryRowContext(ctx, `SELECT node_id,provider_id FROM resource_instances WHERE id=?`, resource.ID).Scan(&fromNode, &fromProvider)
-	if errors.Is(err, sql.ErrNoRows) || err == nil && fromNode == resource.NodeID && fromProvider == resource.ProviderID {
-		return true, nil
+	var shared int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_gpus WHERE uuid=? AND node_id=?`, resource.StableIdentity, fromNode).Scan(&shared); err != nil {
+		return "", false, err
 	}
-	if err != nil {
-		return false, err
+	if shared != 0 {
+		return resource.ID + "@" + nodeID, true, nil
 	}
-	var holders int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=? AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, resource.ID).Scan(&holders); err != nil {
-		return false, err
-	}
-	if holders != 0 {
-		return false, fmt.Errorf("%w: gpu %s is declared for node %s but still leased on node %s", ErrOwnershipConflict, resource.ID, nodeID, fromNode)
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE resource_instances SET node_id=?,provider_id=?,updated_at=? WHERE id=?`, resource.NodeID, resource.ProviderID, t, resource.ID); err != nil {
-		return false, err
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=? WHERE resource_id=? AND cleared_at IS NULL`, t, resource.ID); err != nil {
-		return false, err
-	}
-	return true, appendCoordinationEventTx(ctx, tx, "gpu_ownership_transferred", nil, "resource", resource.ID, nil, map[string]string{"uuid": resource.StableIdentity, "from_node": fromNode, "to_node": resource.NodeID, "provider_id": resource.ProviderID})
+	return resource.ID, true, takeOver(resource.ID, fromNode)
 }
 
 // recordUndeclaredGPUsTx makes undeclared_gpus hold exactly the GPUs this
@@ -281,3 +316,10 @@ func recordUndeclaredGPUsTx(ctx context.Context, tx *sql.Tx, providerID, nodeID 
 // declaredGPUFilter limits a query over resource_instances ri to GPUs
 // declared for the node they are registered on.
 const declaredGPUFilter = `EXISTS(SELECT 1 FROM machine_gpus d WHERE d.uuid=ri.stable_identity AND d.node_id=ri.node_id)`
+
+// sameDevice is the SQL set of resource ids that are the device the resource id
+// expression x names: every node's row of a shared GPU (its stable identity),
+// else x alone. A lease or a claim on any of them is one on that device.
+func sameDevice(x string) string {
+	return `(SELECT sib.id FROM resource_instances sib JOIN resource_instances self ON self.id=` + x + ` AND self.kind='gpu' WHERE sib.kind='gpu' AND sib.stable_identity=self.stable_identity UNION SELECT ` + x + `)`
+}
