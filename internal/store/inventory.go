@@ -97,7 +97,8 @@ func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 // observations and claims of it are filed under the alias, and its claims of
 // activity without a process this node sees are dropped while another node's
 // row of the device is leased - that node's processes, which this one cannot
-// see (they are that lease's own).
+// see (they are that lease's own). A process claim that is the lease holder's
+// own work (leaseHoldersProcessTx) is not recorded.
 func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, resources []ResourceInstance, observations []Observation, claims []ExternalClaim) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -215,11 +216,11 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 			}
 		}
 		if claim.ClaimKind == "external_process" && claim.ProcessIdentity != nil {
-			var registered int
-			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes ap JOIN attempts a ON a.id=ap.attempt_id JOIN leases l ON l.attempt_id=a.id JOIN lease_items li ON li.lease_id=l.id WHERE ap.process_identity=? AND ap.exited_at IS NULL AND a.state IN('running','quiescing') AND l.state IN('active','releasing') AND li.resource_id=?`, *claim.ProcessIdentity, claim.ResourceID).Scan(&registered); err != nil {
+			var holders bool
+			if holders, err = leaseHoldersProcessTx(ctx, tx, claim); err != nil {
 				return err
 			}
-			if registered > 0 {
+			if holders {
 				continue
 			}
 		}
@@ -267,6 +268,29 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 	}
 	return tx.Commit()
 }
+
+// leaseHoldersProcessTx reports whether the process of an external_process
+// claim is the work of the attempt holding the claimed device (any row of it):
+// a registered process of that attempt, a descendant of one (claim.Ancestors),
+// or a process carrying its KAIRO_ATTEMPT_ID (claim.AttemptID, which force
+// stop trusts as well). Only a live attempt (running or quiescing, with a
+// registered process not exited, on an active or releasing lease) has work:
+// a descendant that outlives the attempt's registered processes is a claim
+// again, and the lease is not released while it runs. Anything else, a
+// process of another attempt included, stays a claim.
+func leaseHoldersProcessTx(ctx context.Context, tx *sql.Tx, claim ExternalClaim) (bool, error) {
+	identities, err := json.Marshal(append([]string{*claim.ProcessIdentity}, claim.Ancestors...))
+	if err != nil {
+		return false, err
+	}
+	var holders bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM leases l JOIN lease_items li ON li.lease_id=l.id JOIN attempts a ON a.id=l.attempt_id
+		WHERE li.resource_id IN `+sameDevice("?")+` AND l.state IN('active','releasing') AND a.state IN('running','quiescing')
+		AND EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=a.id AND ap.exited_at IS NULL
+			AND (a.id=? OR ap.process_identity IN(SELECT value FROM json_each(?)))))`, claim.ResourceID, claim.ResourceID, claim.AttemptID, string(identities)).Scan(&holders)
+	return holders, err
+}
+
 func (s *Store) ObserveClaim(ctx context.Context, c ExternalClaim) error {
 	if c.ID == "" {
 		c.ID = id.New("clm")

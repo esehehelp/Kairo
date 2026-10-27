@@ -31,6 +31,32 @@ func TestHostProcessAliveUsesCreationIdentity(t *testing.T) {
 	}
 }
 
+func TestLineageOfAChildNamesThisProcess(t *testing.T) {
+	cmd := exec.Command("ping", "-n", "30", "127.0.0.1")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cannot start ping: %v", err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	self, err := ForPID(os.Getpid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := ForPID(cmd.Process.Pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := LineageOf(cmd.Process.Pid, child)
+	if len(got.Ancestors) == 0 || got.Ancestors[0] != self || got.AttemptID != "" {
+		t.Fatalf("lineage = %+v, want ancestors starting with %s", got, self)
+	}
+	if stale := LineageOf(cmd.Process.Pid, child+"-stale"); !reflect.DeepEqual(stale, Lineage{}) {
+		t.Fatalf("lineage under a stale identity: %+v", stale)
+	}
+}
+
 func TestWSLProcessLivenessRecognizesAbsentPID(t *testing.T) {
 	if _, err := exec.LookPath("wsl.exe"); err != nil {
 		t.Skip("WSL is unavailable")

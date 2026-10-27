@@ -3,9 +3,13 @@ package provider
 import (
 	"context"
 	"errors"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"kairo/internal/processidentity"
 )
 
 func TestNVIDIAOnlyTreatsComputeProcessesAsClaims(t *testing.T) {
@@ -63,5 +67,49 @@ func TestNVIDIAIdleVRAMFailsClosedAsUnattributedActivity(t *testing.T) {
 	}
 	if len(snap.Claims) != 1 || snap.Claims[0].ClaimKind != "unattributed_activity" {
 		t.Fatalf("idle but occupied GPU must fail closed: %+v", snap.Claims)
+	}
+}
+
+// Each GPU process claim carries the lineage the provider found for it, which
+// lets the daemon recognise the work of the attempt holding the GPU; a process
+// whose identity is unknown gets none.
+func TestNVIDIAClaimsCarryTheProcessLineage(t *testing.T) {
+	var asked []string
+	p := &NVIDIA{ProviderID: "p", NodeID: "n",
+		ProcessIdentity: func(pid int) (string, error) {
+			if pid == 303 {
+				return "", errors.New("gone")
+			}
+			return "proc:" + strconv.Itoa(pid) + ":starttime:1", nil
+		},
+		ProcessLineage: func(pid int, identity string) processidentity.Lineage {
+			asked = append(asked, identity)
+			if pid == 19774 {
+				return processidentity.Lineage{AttemptID: "att_1", Ancestors: []string{"proc:19770:starttime:13733837", "proc:1:starttime:1"}}
+			}
+			return processidentity.Lineage{}
+		},
+		Command: func(_ context.Context, args ...string) ([]byte, error) {
+			if args[0] == "pmon" {
+				return []byte("# gpu pid type fb command\n0 19774 C 9000 maya\n0 202 C 100 python\n0 303 C 100 python\n"), nil
+			}
+			return []byte("GPU-a, 0, 24576, 12000, 90, 70\n"), nil
+		}}
+	snap, err := p.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Claims) != 3 || !reflect.DeepEqual(asked, []string{"proc:19774:starttime:1", "proc:202:starttime:1"}) {
+		t.Fatalf("claims %+v, lineage asked for %v", snap.Claims, asked)
+	}
+	descendant, foreign, unknown := snap.Claims[0], snap.Claims[1], snap.Claims[2]
+	if descendant.AttemptID != "att_1" || !reflect.DeepEqual(descendant.Ancestors, []string{"proc:19770:starttime:13733837", "proc:1:starttime:1"}) || !strings.Contains(string(descendant.Evidence), `"attempt_id":"att_1"`) {
+		t.Fatalf("descendant claim: %+v %s", descendant, descendant.Evidence)
+	}
+	if foreign.AttemptID != "" || foreign.Ancestors != nil || strings.Contains(string(foreign.Evidence), "attempt_id") {
+		t.Fatalf("foreign claim: %+v %s", foreign, foreign.Evidence)
+	}
+	if *unknown.ProcessIdentity != "pid:303:start:unknown" || unknown.AttemptID != "" || unknown.Ancestors != nil {
+		t.Fatalf("claim of an unidentified process: %+v", unknown)
 	}
 }
