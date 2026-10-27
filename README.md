@@ -375,6 +375,23 @@ lease holds, and to declare an unknown node. `--dry-run` prints the changes
 lists each declared GPU as `observed`, `stale`, `pending` (not yet reported by
 its node) or `unseen`.
 
+A GPU listed under several nodes is SHARED: nodes on one host (containers
+that all see the card, each with its agent) may each schedule it. Each node
+registers a row of its own (the first under the provider's id, the others as
+`<id>@<node>`), and a lease on any row of the device excludes the others:
+scheduling, admission checks, lease release and `resource status` count the
+leases and claims of every row of it. A provider cannot see another
+container's processes, so while one node's row is leased, the other nodes'
+claims of activity without a process (`unattributed_activity`) on it are the
+lease holder's work and are not recorded; the lease holder's own provider
+still reports what it cannot attribute, and a process another node does see
+there stays an `external_process` claim. Priority preemption reaches a
+lower-priority victim holding the device through another node's row. Apply
+refuses to drop a node from a GPU whose row on that node a live lease holds;
+`from` / `to` of a shared GPU's change list its nodes, comma-separated.
+Containers share the host's RAM and CPUs as well, which Kairo accounts per
+node: keep their memory limits within the host's.
+
 `POST /api/machines` takes `{"nodes": [{"id", "gpus"}], "dry_run"}` and
 answers `{"changes": [{"uuid", "from", "to"}], "unchanged", "dry_run"}`; a
 leased GPU is `409 machine_conflict`. `GET /api/machines` answers `{"gpus",
@@ -594,7 +611,7 @@ Replace the agents together with the daemon: an agent older than the daemon
 starts attempts without their declared `env`. A daemon opening an older
 database migrates it in place (the `cancelled` task state, reruns, the `env`
 column, the machine declaration, which starts out declaring every registered
-GPU for the node it is registered on); keep the backup, since an older binary would read a rerun Task's
+GPU for the node it is registered on, and its (uuid, node) key for shared GPUs); keep the backup, since an older binary would read a rerun Task's
 earlier execution as its outcome again.
 
 ## Verification

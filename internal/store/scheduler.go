@@ -419,9 +419,9 @@ func selectExclusive(ctx context.Context, tx *sql.Tx, nodeID string, request req
 	_ = json.Unmarshal([]byte(request.Policy), &policy)
 	rows, err := tx.QueryContext(ctx, `SELECT ri.id,ri.node_id,ri.provider_id,ri.kind,ri.stable_identity,ri.binding_json,ri.attributes_json,ri.admin_state,ri.quarantine_reason,
 		o.observed_at,o.valid_until,o.total_bytes,o.free_bytes,
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity'),
-		EXISTS(SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=ri.id AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested'))
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("ri.id")+` AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("ri.id")+` AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity'),
+		EXISTS(SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id IN `+sameDevice("ri.id")+` AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested'))
 		FROM resource_instances ri
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY id DESC LIMIT 1)
 		WHERE ri.node_id=? AND ri.kind=? AND ri.admin_state='enabled' AND (ri.kind<>'gpu' OR `+declaredGPUFilter+`) ORDER BY ri.id`, nodeID, request.Kind)
@@ -541,8 +541,8 @@ func (s *Store) ValidateReservation(ctx context.Context, leaseID string, epoch i
 		return err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT li.resource_id,rr.constraints_json,rr.policy_json,o.valid_until,o.total_bytes,o.free_bytes,
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity')
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity')
 		FROM lease_items li
 		JOIN resource_requests rr ON rr.execution_id=? AND rr.request_type='exclusive' AND rr.kind=li.kind
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
@@ -639,7 +639,7 @@ func (s *Store) ReleaseReservation(ctx context.Context, leaseID string, epoch in
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
 		WHERE li.lease_id=? AND li.kind='gpu' AND li.resource_id IS NOT NULL AND
 		(o.id IS NULL OR julianday(o.valid_until)<=julianday(?) OR julianday(o.observed_at)<=julianday((SELECT created_at FROM leases WHERE id=?))
-		 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=li.resource_id AND c.cleared_at IS NULL
+		 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL
 		   AND (c.claim_kind='external_process' OR c.claim_kind='unattributed_activity' AND COALESCE(
 		     (SELECT json_extract(rr.policy_json,'$.on_unattributed_activity') FROM resource_requests rr
 		      JOIN leases policy_lease ON policy_lease.execution_id=rr.execution_id

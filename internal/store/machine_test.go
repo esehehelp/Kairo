@@ -14,7 +14,10 @@ import (
 // declareTestGPU declares one GPU for a node, keeping the other declarations.
 func declareTestGPU(t *testing.T, store *Store, uuid, nodeID string) {
 	t.Helper()
-	if _, err := store.db.Exec(`INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES(?,?,?) ON CONFLICT(uuid) DO UPDATE SET node_id=excluded.node_id`, uuid, nodeID, now()); err != nil {
+	if _, err := store.db.Exec(`DELETE FROM machine_gpus WHERE uuid=?`, uuid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.db.Exec(`INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES(?,?,?)`, uuid, nodeID, now()); err != nil {
 		t.Fatal(err)
 	}
 }

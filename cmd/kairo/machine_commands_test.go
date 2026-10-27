@@ -47,12 +47,13 @@ func TestMachineApplySendsTheDeclarationAndPrintsTheChanges(t *testing.T) {
 func TestMachineApplyRejectsAnInvalidFileLocally(t *testing.T) {
 	isolateClientEnv(t)
 	path := filepath.Join(t.TempDir(), "machines.toml")
-	source := "[[nodes]]\nid = \"a\"\ngpus = [\"GPU-x\"]\n[[nodes]]\nid = \"b\"\ngpus = [\"GPU-x\"]\n"
+	// (a GPU under two nodes is a shared one; twice under one node is a mistake)
+	source := "[[nodes]]\nid = \"a\"\ngpus = [\"GPU-x\", \"GPU-x\"]\n[[nodes]]\nid = \"b\"\ngpus = [\"GPU-x\"]\n"
 	if err := os.WriteFile(path, []byte(source), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	err := run([]string{"machine", "apply", "--api", "http://127.0.0.1:1", path})
-	if err == nil || !strings.Contains(err.Error(), "GPU-x is declared for both a and b") {
+	if err == nil || !strings.Contains(err.Error(), "node a lists GPU-x twice") {
 		t.Fatalf("duplicate GPU: %v", err)
 	}
 }

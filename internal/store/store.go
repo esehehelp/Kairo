@@ -189,12 +189,41 @@ func applyMachineSchema(db *sql.DB) error {
 		return fmt.Errorf("apply machine schema: %w", err)
 	}
 	if existed != 0 {
-		return nil
+		return widenMachineKey(db)
 	}
 	if _, err := db.Exec(`INSERT OR IGNORE INTO machine_gpus(uuid,node_id,declared_at) SELECT stable_identity,node_id,? FROM resource_instances WHERE kind='gpu'`, now()); err != nil {
 		return fmt.Errorf("seed machine declaration: %w", err)
 	}
 	return nil
+}
+
+// widenMachineKey rebuilds a machine_gpus table keyed by uuid alone (from
+// before shared GPUs) with the (uuid, node_id) key, keeping its rows. Nothing
+// references the table, so a copy and a rename in one transaction suffice.
+func widenMachineKey(db *sql.DB) error {
+	var ddl string
+	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='machine_gpus'`).Scan(&ddl); err != nil {
+		return err
+	}
+	if strings.Contains(ddl, "PRIMARY KEY(uuid,node_id)") {
+		return nil
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, statement := range []string{
+		`CREATE TABLE machine_gpus_shared(uuid TEXT NOT NULL,node_id TEXT NOT NULL REFERENCES nodes(id),declared_at TEXT NOT NULL,PRIMARY KEY(uuid,node_id))`,
+		`INSERT INTO machine_gpus_shared(uuid,node_id,declared_at) SELECT uuid,node_id,declared_at FROM machine_gpus`,
+		`DROP TABLE machine_gpus`,
+		`ALTER TABLE machine_gpus_shared RENAME TO machine_gpus`,
+	} {
+		if _, err = tx.Exec(statement); err != nil {
+			return fmt.Errorf("widen the machine declaration's key: %w", err)
+		}
+	}
+	return tx.Commit()
 }
 
 // widenCheck adds a value to a CHECK(... IN(...)) list of an existing table,

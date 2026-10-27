@@ -180,7 +180,7 @@ func preemptionPlanTx(ctx context.Context, tx *sql.Tx, nodeID string, candidate 
 		}
 	}
 	for _, victim := range victims {
-		safe, safeErr := preemptionVictimLeaseSafeTx(ctx, tx, victim.leaseID, nodeID, stamp)
+		safe, safeErr := preemptionVictimLeaseSafeTx(ctx, tx, victim.leaseID, stamp)
 		if safeErr != nil || !safe {
 			return nil, false, safeErr
 		}
@@ -204,8 +204,8 @@ func preemptionGPUPhysicallyEligible(gpu preemptionGPU, constraints gpuConstrain
 
 func preemptionGPUsTx(ctx context.Context, tx *sql.Tx, nodeID string, waitingPriority int) ([]preemptionGPU, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT ri.id,o.valid_until,o.total_bytes,o.free_bytes,
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity')
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("ri.id")+` AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("ri.id")+` AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity')
 		FROM resource_instances ri
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY id DESC LIMIT 1)
 		WHERE ri.node_id=? AND ri.kind='gpu' AND ri.admin_state='enabled' AND `+declaredGPUFilter+`
@@ -228,26 +228,27 @@ func preemptionGPUsTx(ctx context.Context, tx *sql.Tx, nodeID string, waitingPri
 	for index := range gpus {
 		var victim preemptionVictim
 		var attemptID sql.NullString
-		var leaseState, attemptState, leaseExecutorNode, executionState string
+		var leaseState, attemptState, leaseExecutorNode, leasedNode, executionState string
 		var checkpointable, preemptible, leaseExecutorEnabled bool
-		err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,a.id,l.id,l.coordination_epoch,e.priority,e.checkpointable,e.preemptible,l.state,COALESCE(a.state,''),xe.node_id,xe.enabled,e.state,
+		err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,a.id,l.id,l.coordination_epoch,e.priority,e.checkpointable,e.preemptible,l.state,COALESCE(a.state,''),xe.node_id,xe.enabled,e.state,lr.node_id,
 			COALESCE((SELECT MIN(CASE WHEN COALESCE(json_extract(rr.policy_json,'$.on_unattributed_activity'),'wait')='allow' THEN 1 ELSE 0 END)
 				FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='exclusive' AND rr.kind='gpu'),0)
 			FROM lease_items li
 			JOIN leases l ON l.id=li.lease_id
 			JOIN execution_requests e ON e.id=l.execution_id
 			JOIN executors xe ON xe.id=l.executor_id
+			JOIN resource_instances lr ON lr.id=li.resource_id
 			LEFT JOIN attempts a ON a.id=l.attempt_id
-			WHERE li.resource_id=? AND li.kind='gpu'
+			WHERE li.resource_id IN `+sameDevice("?")+` AND li.kind='gpu'
 			AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')
-			LIMIT 1`, gpus[index].id).Scan(&victim.executionID, &victim.projectID, &attemptID, &victim.leaseID, &victim.epoch, &victim.priority, &checkpointable, &preemptible, &leaseState, &attemptState, &leaseExecutorNode, &leaseExecutorEnabled, &executionState, &victim.allowsUnattributed)
+			LIMIT 1`, gpus[index].id, gpus[index].id).Scan(&victim.executionID, &victim.projectID, &attemptID, &victim.leaseID, &victim.epoch, &victim.priority, &checkpointable, &preemptible, &leaseState, &attemptState, &leaseExecutorNode, &leaseExecutorEnabled, &executionState, &leasedNode, &victim.allowsUnattributed)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
-		if attemptID.Valid && leaseState == "active" && attemptState == "running" && executionState == "started" && checkpointable && preemptible && victim.priority < waitingPriority && leaseExecutorEnabled && leaseExecutorNode == nodeID {
+		if attemptID.Valid && leaseState == "active" && attemptState == "running" && executionState == "started" && checkpointable && preemptible && victim.priority < waitingPriority && leaseExecutorEnabled && leaseExecutorNode == leasedNode {
 			victim.attemptID = attemptID.String
 			gpus[index].victim = &victim
 		} else {
@@ -259,9 +260,9 @@ func preemptionGPUsTx(ctx context.Context, tx *sql.Tx, nodeID string, waitingPri
 	return gpus, nil
 }
 
-func preemptionVictimLeaseSafeTx(ctx context.Context, tx *sql.Tx, leaseID, nodeID string, stamp time.Time) (bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT ri.node_id,ri.admin_state,o.valid_until,
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id=ri.id AND c.cleared_at IS NULL AND
+func preemptionVictimLeaseSafeTx(ctx context.Context, tx *sql.Tx, leaseID string, stamp time.Time) (bool, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT ri.node_id,(SELECT x.node_id FROM executors x WHERE x.id=l.executor_id),ri.admin_state,o.valid_until,
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("ri.id")+` AND c.cleared_at IS NULL AND
 			(c.claim_kind='external_process' OR c.claim_kind='unattributed_activity' AND COALESCE(
 				(SELECT MIN(CASE WHEN COALESCE(json_extract(rr.policy_json,'$.on_unattributed_activity'),'wait')='allow' THEN 1 ELSE 0 END)
 				 FROM resource_requests rr WHERE rr.execution_id=l.execution_id AND rr.request_type='exclusive' AND rr.kind=li.kind),
@@ -278,14 +279,14 @@ func preemptionVictimLeaseSafeTx(ctx context.Context, tx *sql.Tx, leaseID, nodeI
 	count := 0
 	for rows.Next() {
 		count++
-		var resourceNode, adminState string
+		var resourceNode, leaseNode, adminState string
 		var validUntil sql.NullString
 		var unsafeClaim bool
-		if err = rows.Scan(&resourceNode, &adminState, &validUntil, &unsafeClaim); err != nil {
+		if err = rows.Scan(&resourceNode, &leaseNode, &adminState, &validUntil, &unsafeClaim); err != nil {
 			return false, err
 		}
 		deadline, parseErr := time.Parse(time.RFC3339Nano, validUntil.String)
-		if resourceNode != nodeID || adminState != "enabled" || unsafeClaim || !validUntil.Valid || parseErr != nil || !deadline.After(stamp) {
+		if resourceNode != leaseNode || adminState != "enabled" || unsafeClaim || !validUntil.Valid || parseErr != nil || !deadline.After(stamp) {
 			return false, nil
 		}
 	}
