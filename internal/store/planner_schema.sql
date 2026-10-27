@@ -12,8 +12,8 @@ CREATE TABLE IF NOT EXISTS admission_waits(
  updated_at TEXT NOT NULL
 );
 -- attempt_usage: what an attempt's process tree uses now, sampled by its
--- executor. Admission counts a lease's capacity as used, not twice, for the
--- part its attempt has already taken up (RAM in use, bytes written).
+-- executor. Admission counts a lease's RAM as used, not twice, for the part
+-- its attempt already uses; bytes written are kept for operators only.
 CREATE TABLE IF NOT EXISTS attempt_usage(
  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
  ram_bytes INTEGER,

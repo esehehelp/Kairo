@@ -25,9 +25,10 @@ package store
 //   - accounting: a lease's capacity is counted once. CPU is total minus
 //     reservations, where an execution that declared cpu_millis_min lends
 //     the rest of its reservation to executions of no higher priority (it
-//     runs slower instead of being stopped); RAM and disk are what is
-//     observed free minus the part of each reservation its attempt has not
-//     taken up yet (attempt_usage).
+//     runs slower instead of being stopped); RAM is what is observed free
+//     minus the part of each reservation its attempt does not use yet
+//     (attempt_usage); disk is what is observed free minus every
+//     reservation, since bytes written overstate what stays on disk.
 //   - a node with a filesystem under the free-space watermark admits nothing.
 //
 // Every waiting execution's reason is kept in admission_waits.
@@ -439,14 +440,12 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 		if !running[l.id] || !u.at.Valid || parseErr != nil || m.stamp.Sub(at) > usageFreshness {
 			continue
 		}
-		written := u.disk.Int64
+		// Bytes written are not taken as disk used: a rewritten checkpoint
+		// or a deleted temporary file counts in them, so they could only
+		// shrink a reservation too far.
 		for _, key := range sortedCapKeys(l.capacity) {
-			switch {
-			case key.kind == "ram" && u.ram.Valid:
+			if key.kind == "ram" && u.ram.Valid {
 				l.used[key] = min(u.ram.Int64, l.capacity[key])
-			case key.kind == "disk" && u.disk.Valid:
-				l.used[key] = min(written, l.capacity[key])
-				written -= l.used[key]
 			}
 		}
 	}
