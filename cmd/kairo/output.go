@@ -67,22 +67,23 @@ type taskExecution struct {
 }
 
 type attemptInfo struct {
-	ID              string             `json:"id"`
-	State           string             `json:"state"`
-	ExecutorID      string             `json:"executor_id"`
-	NodeID          string             `json:"node_id"`
-	PID             *int               `json:"pid"`
-	ExitCode        *int               `json:"exit_code"`
-	ExitSignal      *string            `json:"exit_signal"`
-	Progress        json.RawMessage    `json:"progress"`
-	LastHeartbeatAt *string            `json:"last_heartbeat_at"`
-	ExitedAt        *string            `json:"exited_at"`
-	QuiescedAt      *string            `json:"quiesced_at"`
-	StdoutPath      *string            `json:"stdout_path"`
-	StderrPath      *string            `json:"stderr_path"`
-	StdoutBytes     *int64             `json:"stdout_bytes"`
-	StderrBytes     *int64             `json:"stderr_bytes"`
-	LogProblems     []store.LogProblem `json:"log_problems"`
+	ID              string               `json:"id"`
+	State           string               `json:"state"`
+	ExecutorID      string               `json:"executor_id"`
+	NodeID          string               `json:"node_id"`
+	PID             *int                 `json:"pid"`
+	ExitCode        *int                 `json:"exit_code"`
+	ExitSignal      *string              `json:"exit_signal"`
+	Progress        json.RawMessage      `json:"progress"`
+	LastHeartbeatAt *string              `json:"last_heartbeat_at"`
+	ExitedAt        *string              `json:"exited_at"`
+	QuiescedAt      *string              `json:"quiesced_at"`
+	StdoutPath      *string              `json:"stdout_path"`
+	StderrPath      *string              `json:"stderr_path"`
+	StdoutBytes     *int64               `json:"stdout_bytes"`
+	StderrBytes     *int64               `json:"stderr_bytes"`
+	LogProblems     []store.LogProblem   `json:"log_problems"`
+	Energy          *store.AttemptEnergy `json:"energy"`
 }
 
 // ended reports whether the attempt's process is gone for good.

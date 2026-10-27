@@ -18,7 +18,7 @@ func TestNVIDIAOnlyTreatsComputeProcessesAsClaims(t *testing.T) {
 		if args[0] == "pmon" {
 			return []byte("# gpu pid type fb command\n0 101 C+G 0 explorer.exe\n1 202 C+G 0 python.exe\n"), nil
 		}
-		return []byte("GPU-a, 0, 8192, 7600, 2, 40\nGPU-b, 1, 24576, 12000, 90, 70\n"), nil
+		return queryAnswer(args, inventory("GPU-a, 0, 8192, 7600, 2, 40"), inventory("GPU-b, 1, 24576, 12000, 90, 70")), nil
 	}}
 	snap, err := p.Observe(context.Background())
 	if err != nil {
@@ -45,7 +45,7 @@ func TestNVIDIAHungCommandFailsTheObservationNamingIt(t *testing.T) {
 				if args[0] == "pmon" {
 					return []byte("# gpu pid type fb command\n"), nil
 				}
-				return []byte("GPU-a, 0, 8192, 7600, 2, 40\n"), nil
+				return queryAnswer(args, inventory("GPU-a, 0, 8192, 7600, 2, 40")), nil
 			}}
 			_, err := p.Observe(context.Background())
 			if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), tc.wantName) {
@@ -60,7 +60,7 @@ func TestNVIDIAPrepareMatchesPhysicalIdentityNotStoreResourceID(t *testing.T) {
 		if args[0] == "pmon" {
 			return []byte("# gpu pid type fb command\n"), nil
 		}
-		return []byte("GPU-a, 0, 12288, 12287, 0, 40\n"), nil
+		return queryAnswer(args, inventory("GPU-a, 0, 12288, 12287, 0, 40")), nil
 	}}
 	for _, tc := range []struct {
 		name, id, uuid, node, provider, kind string
@@ -90,7 +90,7 @@ func TestNVIDIAIdleVRAMFailsClosedAsUnattributedActivity(t *testing.T) {
 		if args[0] == "pmon" {
 			return []byte("# gpu pid type fb command\n"), nil
 		}
-		return []byte("GPU-a, 0, 24576, 20000, 0, 42\n"), nil
+		return queryAnswer(args, inventory("GPU-a, 0, 24576, 20000, 0, 42")), nil
 	}}
 	snap, err := p.Observe(context.Background())
 	if err != nil {
@@ -124,7 +124,7 @@ func TestNVIDIAClaimsCarryTheProcessLineage(t *testing.T) {
 			if args[0] == "pmon" {
 				return []byte("# gpu pid type fb command\n0 19774 C 9000 maya\n0 202 C 100 python\n0 303 C 100 python\n"), nil
 			}
-			return []byte("GPU-a, 0, 24576, 12000, 90, 70\n"), nil
+			return queryAnswer(args, inventory("GPU-a, 0, 24576, 12000, 90, 70")), nil
 		}}
 	snap, err := p.Observe(context.Background())
 	if err != nil {

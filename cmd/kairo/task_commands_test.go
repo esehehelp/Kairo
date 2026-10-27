@@ -223,7 +223,8 @@ func showFixture() *contractAPI {
 						{"problem": "log_space_exhausted", "detail": "/srv/kairo has 0 B free (minimum 1.0 GiB)", "first_seen_at": stamp(base.Add(-3*time.Hour - 30*time.Minute)), "last_seen_at": stamp(base.Add(-3*time.Hour - 30*time.Minute))},
 						{"problem": "log_forward_failed", "stream": "stderr", "detail": "agent API 500: no space left on device", "first_seen_at": stamp(base.Add(-3*time.Hour - 20*time.Minute)),
 							"last_seen_at": stamp(base.Add(-3*time.Hour - 15*time.Minute)), "resolved_at": stamp(base.Add(-3*time.Hour - 15*time.Minute))},
-					}}}},
+					},
+					"energy": map[string]any{"gpu_joules": 4428000, "gpu_seconds_covered": 3590, "partial": true, "updated_at": stamp(base.Add(-3 * time.Hour))}}}},
 			{"ordinal": 2, "execution_id": "exe_2", "reason": "retry", "state": "waiting",
 				"gang": []map[string]any{{"rank": 0, "execution_id": "exe_2", "state": "waiting"}, {"rank": 1, "execution_id": "exe_2r1", "state": "authorized", "node_id": "pve0"}},
 				"waiting": []map[string]any{
@@ -264,6 +265,7 @@ func TestTaskShowRendersTheDetail(t *testing.T) {
 		"  stderr:     D:\\logs\\att_1.err (10 B)\n",
 		"  log issue:  log filesystem full, output lost: /srv/kairo has 0 B free (minimum 1.0 GiB) (10-13 08:30)\n",
 		"  log issue:  stderr not shipped to the daemon: agent API 500: no space left on device (10-13 08:40 to 10-13 08:45, caught up)\n",
+		"  energy:     GPU 1.23 kWh (partial)\n",
 		"execution #2 (retry)  waiting\n",
 		"  gang:       rank 1 exe_2r1 authorized node pve0\n",
 		"  waiting:    external_claim on GPU-1234 (pid=4242) (since 10-13 11:50)\n",
