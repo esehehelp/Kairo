@@ -328,7 +328,11 @@ func resourceSummary(e orchestration.Execution) string {
 	}
 	c := e.Capacity
 	if c.CPUMillis > 0 {
-		parts = append(parts, fmt.Sprintf("cpu %dm", c.CPUMillis))
+		text := fmt.Sprintf("cpu %dm", c.CPUMillis)
+		if c.CPUMillisMin > 0 {
+			text += fmt.Sprintf(" (min %dm)", c.CPUMillisMin)
+		}
+		parts = append(parts, text)
 	}
 	if c.RAMBytes > 0 {
 		parts = append(parts, "ram "+byteSize(c.RAMBytes))

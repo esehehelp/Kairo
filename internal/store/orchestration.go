@@ -55,6 +55,9 @@ type TaskExecution struct {
 	ExitedAt         *string `json:"exited_at,omitempty"`
 	// Progress is the attempt's latest progress without its free-form detail.
 	Progress json.RawMessage `json:"progress,omitempty"`
+	// AdmissionWait is the reason code admission planning last gave for an
+	// execution that waits (admission_waits).
+	AdmissionWait *string `json:"admission_wait,omitempty"`
 }
 
 type plannedOrchestrationDecision struct {
@@ -545,5 +548,5 @@ func convertCapacity(value orchestration.CapacityRequest) CapacityRequest {
 	for i, disk := range value.Disks {
 		disks[i] = DiskRequest(disk)
 	}
-	return CapacityRequest{CPUMillis: value.CPUMillis, RAMBytes: value.RAMBytes, Strength: value.Strength, Disks: disks}
+	return CapacityRequest{CPUMillis: value.CPUMillis, CPUMillisMin: value.CPUMillisMin, RAMBytes: value.RAMBytes, Strength: value.Strength, Disks: disks}
 }

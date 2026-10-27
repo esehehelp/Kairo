@@ -127,7 +127,7 @@ is used, and the daemon prunes the others once they are an hour old.
 at once and runs `VACUUM`.
 
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
-limits. GPU exclusion is a coordination guarantee among Kairo participants;
+limits (see Admission for how they are counted). GPU exclusion is a coordination guarantee among Kairo participants;
 external processes are observed and excluded but cannot be physically fenced.
 
 ## Following tasks from the CLI
@@ -343,6 +343,64 @@ registered process is absent and provider observations taken after that
 absence show resources unclaimed. An expired or executor-lost lease becomes
 stale; it is never made free based on time alone.
 
+### Admission
+
+Which waiting execution runs where is decided by one planning pass over the
+whole installation: every waiting execution whose scope gates are open, every
+node with an executor that has polled in the last minute (or not yet), every
+lease and claim. Each executor's reserve and preemption call runs the same
+pass, and the pass, not the executor that polls first, chooses; an execution
+placed on another node waits for that node's executor (`awaiting_executor`).
+Executors of one node share its resources, so any of them that matches the
+labels may take what is placed there.
+
+- Order: higher `priority` first. Within a priority, the project holding the
+  smallest share of the installation's GPUs, CPU or RAM (whichever share is
+  largest) goes next, then the earlier submission.
+- Placement: among the nodes an execution fits on, the one left with the
+  fewest free GPUs (CPU work stays off GPU nodes, GPU work packs onto as few
+  as it can), then the most free CPU. A gang's ranks go on distinct nodes, all
+  or none.
+- Backfill: an execution that fits nowhere holds, on the node it would run on
+  once the leases in its way end, what it can already use there; executions
+  after it run on everything nobody holds. It holds nothing when what stops it
+  does not end by itself: a process Kairo did not start on a GPU, activity no
+  process explains, a stale observation, a node too small for it, the disk
+  watermark.
+- Preemption: an execution that fits nowhere (any priority, a gang too) may
+  suspend executions of lower priority that are `checkpointable` and
+  `preemptible` and whose GPUs or RAM are what stops it, the fewest needed
+  (already suspending ones first, then the lowest priority, single executions
+  before gangs, the most recently started). Too little CPU or disk is waited
+  for, never a reason to suspend anything.
+- Accounting: CPU is the node's total minus the reservations on it. RAM is
+  the lesser of total minus reservations and observed free memory minus the
+  part of each reservation its attempt does not use yet; disk is observed free
+  space minus the part of each reservation its attempt has not written yet
+  (what an attempt uses or wrote, sampled by its executor, counts for two
+  minutes; without a sample the whole reservation counts). A disk request
+  keeps its `min_free_after_bytes` and the watermark free.
+- Elastic CPU: `cpu_millis_min` (at most `cpu_millis`) under `[capacity]`
+  (`[tasks.execution.capacity]`) is the least an execution keeps. The rest of
+  its CPU reservation is lent to executions of the same or lower priority,
+  which then run beside it and slow it down instead of stopping it: a server
+  declared with `cpu_millis = 16000` and `cpu_millis_min = 4000` lets 12 CPUs
+  of evaluations run next to it.
+- Disk watermark: a node with a registered filesystem under
+  `[scheduler] disk_min_free_bytes` of the daemon configuration (default
+  5 GiB, at most 5% of the filesystem; `0` turns it off) admits nothing until
+  space is freed. Each such filesystem is kept in `node_alerts` and announced
+  by the events `disk_low_watermark` and `disk_watermark_cleared`.
+
+Every waiting execution's latest reason is kept: `task show` prints it under
+`waiting:` (for example `gpu_leased: pve0: 1 GPU(s) of >= 11.0 GiB needed, 0
+usable; leased by glm/maya-r3 (priority -100)`), and `task list` adds its
+code to the NOTE (`execution waiting: insufficient_ram`). The codes are
+`no_executor`, `awaiting_executor`, `gpu_leased`, `held_for_higher_priority`,
+`gpu_memory_low`, `insufficient_gpu`, `insufficient_cpu`, `insufficient_ram`,
+`insufficient_disk`, `external_claim`, `unattributed_activity`,
+`stale_observation`, `disk_low_watermark` and `preempting`.
+
 ### Executor ticks
 
 An executor's tick is bounded in time. Every external call on it has a
@@ -491,7 +549,8 @@ any rank leases a GPU.
   others terminated; a `suspend` to one rank (pause, preemption, quarantine)
   is sent to every rank. A rank that failed to launch after others started
   restarts the gang (orchestration reason `gang_restart`).
-- A waiting gang does not preempt; its running ranks can be preempted.
+- A waiting gang preempts like a single execution (each rank on its node,
+  see Admission); its running ranks can be preempted.
 
 ## Worker SDK
 

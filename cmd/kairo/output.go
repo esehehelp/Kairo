@@ -56,6 +56,7 @@ type taskExecution struct {
 	AttemptStartedAt *string         `json:"attempt_started_at"`
 	ExitedAt         *string         `json:"exited_at"`
 	Progress         json.RawMessage `json:"progress"`
+	AdmissionWait    *string         `json:"admission_wait"`
 	// Task detail only.
 	Attempts []attemptInfo        `json:"attempts"` // at most one
 	Gang     []store.TaskGangRank `json:"gang"`
@@ -522,6 +523,9 @@ func taskNote(t taskStatus) string {
 			}
 			if e.AttemptID == nil && e.State != "" && e.State != "started" {
 				// Submitted, not started yet (waiting for resources or a gate).
+				if e.AdmissionWait != nil {
+					return "execution " + e.State + ": " + *e.AdmissionWait
+				}
 				return "execution " + e.State
 			}
 		}

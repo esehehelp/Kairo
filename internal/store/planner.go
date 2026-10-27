@@ -19,10 +19,15 @@ package store
 //     holds nothing.
 //   - preemption: an execution that fits nowhere may suspend cooperative
 //     executions of lower priority (checkpointable and preemptible) whose
-//     leases are what stops it, the fewest needed, whatever the resource.
+//     GPUs or RAM are what stops it, the fewest needed. CPU is never a reason
+//     to suspend anything: too little of it slows work down, it breaks
+//     nothing.
 //   - accounting: a lease's capacity is counted once. CPU is total minus
-//     reservations; RAM and disk are what is observed free minus the part of
-//     each reservation its attempt has not taken up yet (attempt_usage).
+//     reservations, where an execution that declared cpu_millis_min lends
+//     the rest of its reservation to executions of no higher priority (it
+//     runs slower instead of being stopped); RAM and disk are what is
+//     observed free minus the part of each reservation its attempt has not
+//     taken up yet (attempt_usage).
 //   - a node with a filesystem under the free-space watermark admits nothing.
 //
 // Every waiting execution's reason is kept in admission_waits.
@@ -93,10 +98,10 @@ type planCapacity struct {
 
 type planLease struct {
 	id, executionID, attemptID, executorID, nodeID, projectID, label string
-	epoch                                                             int64
-	priority                                                          int
-	gang                                                              bool
-	startedAt                                                         string
+	epoch                                                            int64
+	priority                                                         int
+	gang                                                             bool
+	startedAt                                                        string
 	// victim: a running cooperative attempt that priority preemption may
 	// suspend; suspending: it already has a live suspend command.
 	victim, suspending, allowsUnattributed bool
@@ -104,6 +109,7 @@ type planLease struct {
 	devices                                []string
 	capacity                               map[capKey]int64
 	used                                   map[capKey]int64 // taken up, of capacity
+	cpuLendable                            int64            // reserved CPU above cpu_millis_min
 }
 
 type gpuDemand struct {
@@ -119,6 +125,7 @@ type capDemand struct {
 }
 
 type planDemand struct {
+	priority int // borrows lendable CPU of leases of no higher priority
 	gpus     []gpuDemand
 	capacity []capDemand
 }
@@ -353,7 +360,8 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 		EXISTS(SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id),
 		COALESCE((SELECT MIN(CASE WHEN COALESCE(json_extract(rr.policy_json,'$.on_unattributed_activity'),'wait')='allow' THEN 1 ELSE 0 END)
 			FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='exclusive' AND rr.kind='gpu'),0),
-		u.ram_bytes,u.disk_written_bytes,u.observed_at
+		u.ram_bytes,u.disk_written_bytes,u.observed_at,
+		COALESCE((SELECT rr.quantity-json_extract(rr.constraints_json,'$.min_quantity') FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='capacity' AND rr.kind='cpu' AND json_extract(rr.constraints_json,'$.min_quantity') IS NOT NULL),0)
 		FROM leases l JOIN executors x ON x.id=l.executor_id JOIN execution_requests e ON e.id=l.execution_id
 		LEFT JOIN attempts a ON a.id=l.attempt_id LEFT JOIN attempt_usage u ON u.attempt_id=l.attempt_id
 		WHERE l.state IN `+liveLeaseStates+` ORDER BY l.id`)
@@ -373,7 +381,7 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 		var u usage
 		if err = rows.Scan(&l.id, &l.executionID, &l.attemptID, &l.executorID, &l.nodeID, &executorEnabled, &leaseState, &l.epoch, &attemptState,
 			&l.priority, &checkpointable, &preemptible, &executionState, &l.projectID, &l.label, &l.startedAt, &l.gang, &l.allowsUnattributed,
-			&u.ram, &u.disk, &u.at); err != nil {
+			&u.ram, &u.disk, &u.at, &l.cpuLendable); err != nil {
 			rows.Close()
 			return err
 		}
@@ -551,10 +559,10 @@ func sortedPlanKeys(capacity map[capKey]planCapacity) []capKey {
 	return keys
 }
 
-// available is what capacity key offers before this pass hands any out, with
-// the leases freed() names counted as gone.
-func (m *planModel) available(key capKey, c planCapacity, freed func(string) bool) (int64, bool) {
-	var reserved, outstanding, reclaimed int64
+// available is what capacity key offers to an execution of priority before
+// this pass hands any out, with the leases freed() names counted as gone.
+func (m *planModel) available(key capKey, c planCapacity, freed func(string) bool, priority int) (int64, bool) {
+	var reserved, outstanding, reclaimed, lent int64
 	for _, leaseID := range m.leaseIDs {
 		l := m.leases[leaseID]
 		quantity, ok := l.capacity[key]
@@ -576,10 +584,13 @@ func (m *planModel) available(key capKey, c planCapacity, freed func(string) boo
 		}
 		reserved += quantity
 		outstanding += quantity - used
+		if key.kind == "cpu" && l.priority <= priority {
+			lent += l.cpuLendable
+		}
 	}
 	switch key.kind {
 	case "cpu":
-		return c.total.Int64 - reserved, c.total.Valid
+		return c.total.Int64 - reserved + lent, c.total.Valid
 	case "ram":
 		if !c.total.Valid || !c.free.Valid {
 			return 0, false
@@ -688,7 +699,7 @@ func (m *planModel) fit(node string, demand planDemand, ov planOverlay, freed fu
 			f.fail("insufficient_"+c.kind, fmt.Sprintf("%s: no observed %s", node, name), false)
 			continue
 		}
-		available, known := m.available(key, row, freed)
+		available, known := m.available(key, row, freed, demand.priority)
 		if !known {
 			f.fail("insufficient_"+c.kind, fmt.Sprintf("%s: %s is not observed", node, name), false)
 			continue
@@ -754,7 +765,7 @@ func (m *planModel) cpuLeft(f planFit, ov planOverlay) float64 {
 	if !ok || !row.total.Valid || row.total.Int64 <= 0 {
 		return 0
 	}
-	available, _ := m.available(key, row, noneFreed)
+	available, _ := m.available(key, row, noneFreed, math.MinInt)
 	available -= ov.capacity[key]
 	for _, c := range f.capacity {
 		if c.key == key {
@@ -1039,11 +1050,22 @@ func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot
 		}
 		return x.id < y.id
 	})
+	// Victims are chosen for GPUs and RAM only; CPU and disk the waiting
+	// execution waits for, or borrows, as without preemption.
+	needs := make([]planDemand, len(ranks))
+	for i, r := range ranks {
+		needs[i] = planDemand{priority: r.demand.priority, gpus: r.demand.gpus}
+		for _, c := range r.demand.capacity {
+			if c.kind == "ram" {
+				needs[i].capacity = append(needs[i].capacity, c)
+			}
+		}
+	}
 	fits := func(chosen map[string]bool) ([]planSlot, bool) {
 		freed := func(leaseID string) bool { return chosen[leaseID] }
 		slots := make([]planSlot, len(target))
 		for i, s := range target {
-			f := p.m.fit(s.fit.node, ranks[i].demand, p.ov, freed)
+			f := p.m.fit(s.fit.node, needs[i], p.ov, freed)
 			if !f.ok {
 				return nil, false
 			}
@@ -1131,6 +1153,7 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 		if c.demand, err = loadDemandTx(ctx, tx, c.execution.ID); err != nil {
 			return nil, err
 		}
+		c.demand.priority = c.execution.Priority
 		gangID, _, _, gangErr := gangOfExecutionTx(ctx, tx, c.execution.ID)
 		if gangErr != nil {
 			return nil, gangErr
@@ -1148,6 +1171,7 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 			if demandErr != nil {
 				return nil, demandErr
 			}
+			demand.priority = c.execution.Priority
 			c.ranks = append(c.ranks, planRank{rank: member.rank, candidate: member.candidate, demand: demand})
 		}
 	}

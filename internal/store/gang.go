@@ -121,8 +121,6 @@ func gangMembersTx(ctx context.Context, tx *sql.Tx, gangID string) ([]gangMember
 	return members, nil
 }
 
-
-
 // freeGangPortTx picks the lowest rendezvous port no live placement on the
 // node uses (0 if all are taken).
 // placeGangTx reserves every rank of the gang on the executor the planning

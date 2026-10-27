@@ -80,12 +80,13 @@ const latestLeaseJoin = ` LEFT JOIN leases l ON l.id=(SELECT id FROM leases WHER
 const taskExecutionColumns = `te.execution_ordinal,te.execution_id,te.reason,e.state,e.terminal_cause,a.exit_code,a.exit_signal,a.id,
  COALESCE(a.executor_id,l.executor_id),
  e.submitted_at,e.started_at,e.terminal_at,a.started_at,a.exited_at,
- CASE WHEN NOT json_valid(a.progress_json) THEN NULL WHEN json_type(a.progress_json)='object' THEN json_remove(a.progress_json,'$.detail') ELSE a.progress_json END`
+ CASE WHEN NOT json_valid(a.progress_json) THEN NULL WHEN json_type(a.progress_json)='object' THEN json_remove(a.progress_json,'$.detail') ELSE a.progress_json END,
+ (SELECT w.reason_code FROM admission_waits w WHERE w.execution_id=e.id AND e.state='waiting')`
 
 func scanTaskExecution(rows *sql.Rows, extra ...any) (TaskExecution, error) {
 	var v TaskExecution
 	var progress sql.NullString
-	dest := append(extra, &v.Ordinal, &v.ExecutionID, &v.Reason, &v.State, &v.TerminalCause, &v.ExitCode, &v.ExitSignal, &v.AttemptID, &v.ExecutorID, &v.SubmittedAt, &v.StartedAt, &v.TerminalAt, &v.AttemptStartedAt, &v.ExitedAt, &progress)
+	dest := append(extra, &v.Ordinal, &v.ExecutionID, &v.Reason, &v.State, &v.TerminalCause, &v.ExitCode, &v.ExitSignal, &v.AttemptID, &v.ExecutorID, &v.SubmittedAt, &v.StartedAt, &v.TerminalAt, &v.AttemptStartedAt, &v.ExitedAt, &progress, &v.AdmissionWait)
 	if err := rows.Scan(dest...); err != nil {
 		return TaskExecution{}, err
 	}
@@ -389,7 +390,11 @@ func (s *Store) taskGangRanks(ctx context.Context, taskScopeID string) (map[stri
 func (s *Store) taskAdmissionBlocks(ctx context.Context, taskScopeID string) (map[string][]WaitReason, error) {
 	out := map[string][]WaitReason{}
 	err := eachRow(ctx, s.db, `SELECT b.execution_id,b.reason_code,b.detail_json,b.created_at FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id JOIN admission_blocks b ON b.execution_id=e.id
-		WHERE te.task_scope_id=? AND e.state IN('waiting','authorized') AND b.cleared_at IS NULL ORDER BY b.created_at,b.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		WHERE te.task_scope_id=? AND e.state IN('waiting','authorized') AND b.cleared_at IS NULL
+		UNION ALL
+		SELECT w.execution_id,w.reason_code,w.detail_json,w.since FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id JOIN admission_waits w ON w.execution_id=e.id
+		WHERE te.task_scope_id=? AND e.state='waiting'
+		ORDER BY 4`, []any{taskScopeID, taskScopeID}, func(rows *sql.Rows) error {
 		var executionID, detail string
 		var w WaitReason
 		if err := rows.Scan(&executionID, &w.ReasonCode, &detail, &w.CreatedAt); err != nil {

@@ -136,6 +136,9 @@ func normalizeCapacity(c *CapacityRequest) error {
 	if c.CPUMillis < 0 || c.RAMBytes < 0 {
 		return errors.New("capacity cannot be negative")
 	}
+	if c.CPUMillisMin < 0 || c.CPUMillisMin > c.CPUMillis {
+		return errors.New("cpu_millis_min must be between 0 and cpu_millis")
+	}
 	if c.Disks == nil {
 		c.Disks = []DiskRequest{}
 	}
@@ -380,7 +383,11 @@ func insertExecutionResourcesTx(ctx context.Context, tx *sql.Tx, executionID str
 	}
 	strength := spec.Capacity.Strength
 	if spec.Capacity.CPUMillis > 0 {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,strength) VALUES(?,?,'capacity','cpu',?,?)`, id.New("req"), executionID, spec.Capacity.CPUMillis, strength); err != nil {
+		constraints := "{}"
+		if spec.Capacity.CPUMillisMin > 0 {
+			constraints = fmt.Sprintf(`{"min_quantity":%d}`, spec.Capacity.CPUMillisMin)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,strength,constraints_json) VALUES(?,?,'capacity','cpu',?,?,?)`, id.New("req"), executionID, spec.Capacity.CPUMillis, strength, constraints); err != nil {
 			return err
 		}
 	}

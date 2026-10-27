@@ -75,7 +75,6 @@ type executionCandidate struct {
 	selectorJSON string
 }
 
-
 // ReserveNext runs a planning pass (planner.go) and reserves for executorID
 // what the pass places on it: one execution, or, when the pass places a gang
 // anywhere, every rank of it (this executor's rank, if any, is handed over).
@@ -253,7 +252,6 @@ func selectorMatches(selectorJSON, executorJSON string) bool {
 	return true
 }
 
-
 func loadResourceRequestsTx(ctx context.Context, tx *sql.Tx, executionID string) ([]requestRow, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT id,request_type,kind,quantity,filesystem,constraints_json,policy_json FROM resource_requests WHERE execution_id=? ORDER BY request_type DESC,id`, executionID)
 	if err != nil {
@@ -331,8 +329,6 @@ func validateLeaseGatesTx(ctx context.Context, tx *sql.Tx, leaseID string) error
 	}
 	return nil
 }
-
-
 
 // ValidateReservation re-observes the lease's exclusive resources and fences
 // any pause/resume generation change since reservation.

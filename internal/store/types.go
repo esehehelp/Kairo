@@ -49,10 +49,13 @@ type DiskRequest struct {
 }
 
 type CapacityRequest struct {
-	CPUMillis int64         `json:"cpu_millis"`
-	RAMBytes  int64         `json:"ram_bytes"`
-	Strength  string        `json:"strength"`
-	Disks     []DiskRequest `json:"disks"`
+	CPUMillis int64 `json:"cpu_millis"`
+	// CPUMillisMin is the least of CPUMillis the execution keeps: executions
+	// of no higher priority may be admitted on the rest (planner.go).
+	CPUMillisMin int64         `json:"cpu_millis_min,omitempty"`
+	RAMBytes     int64         `json:"ram_bytes"`
+	Strength     string        `json:"strength"`
+	Disks        []DiskRequest `json:"disks"`
 }
 
 type ExecutionSpec struct {

@@ -25,6 +25,7 @@ type Config struct {
 	TLSCAFile   string `toml:"tls_ca_file"`
 	// InsecureHTTP allows plain HTTP on an address other hosts can reach.
 	InsecureHTTP bool       `toml:"insecure_http"`
+	Scheduler    Scheduler  `toml:"scheduler"`
 	Node         Node       `toml:"node"`
 	Executors    []Executor `toml:"executors"`
 	Providers    []Provider `toml:"providers"`
@@ -32,6 +33,14 @@ type Config struct {
 
 // TLS reports whether the daemon serves HTTPS.
 func (c Config) TLS() bool { return c.TLSCertFile != "" || c.TLSKeyFile != "" || c.TLSCAFile != "" }
+
+// Scheduler holds the admission settings of the installation.
+type Scheduler struct {
+	// DiskMinFreeBytes is the free space every registered filesystem keeps
+	// (capped at 5% of its size): a node with a filesystem under it admits
+	// nothing. Unset means 5 GiB; 0 disables it.
+	DiskMinFreeBytes *int64 `toml:"disk_min_free_bytes"`
+}
 
 type Node struct {
 	ID           string            `toml:"id"`

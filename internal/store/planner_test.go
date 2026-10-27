@@ -324,3 +324,62 @@ func TestPlannerRecordsThatNoExecutorMatches(t *testing.T) {
 		t.Fatalf("orphan waits for %+v", w)
 	}
 }
+
+// An execution that declared cpu_millis_min lends the rest of its CPU to
+// executions of no higher priority: they run beside it, slowing it down,
+// instead of stopping it.
+func TestPlannerRunsSmallWorkBesideAnElasticExecution(t *testing.T) {
+	c := newPlanCluster(t)
+	c.node("a", 0, 16000, 64, 500)
+	serving := planSpec("serving", "glm", -100, 0, 16000, 20)
+	serving.Capacity.CPUMillisMin = 4000
+	c.submit(serving)
+	c.start("exec-a")
+	eval := c.submit(planSpec("eval", "neo", 2, 0, 4000, 8))
+	if commands, err := c.store.EnsurePriorityPreemption(c.ctx, "exec-a"); err != nil || len(commands) != 0 {
+		t.Fatalf("preempted for CPU: %v %v", commands, err)
+	}
+	c.expectReserved("exec-a", eval)
+	// It never goes under its minimum: 16000 - 12000 lent = 4000 kept.
+	c.submit(planSpec("more", "neo", 2, 0, 8000, 1))
+	c.start("exec-a")
+	tooMuch := c.submit(planSpec("too-much", "neo", 2, 0, 1000, 1))
+	if r := c.reserve("exec-a"); r != nil {
+		t.Fatalf("borrowed under the minimum: %s", r.Execution.ClientRequestID)
+	}
+	if w := c.wait(tooMuch.ID); w.Reason != "insufficient_cpu" {
+		t.Fatalf("too-much waits for %+v", w)
+	}
+}
+
+// A higher-priority elastic execution lends nothing to lower ones.
+func TestPlannerLendsCPUOnlyDownward(t *testing.T) {
+	c := newPlanCluster(t)
+	c.node("a", 0, 16000, 64, 500)
+	important := planSpec("important", "p1", 10, 0, 16000, 1)
+	important.Capacity.CPUMillisMin = 4000
+	c.submit(important)
+	c.start("exec-a")
+	c.submit(planSpec("low", "p2", 2, 0, 4000, 1))
+	if r := c.reserve("exec-a"); r != nil {
+		t.Fatalf("a lower priority borrowed: %s", r.Execution.ClientRequestID)
+	}
+}
+
+// Too little CPU is waited for, never a reason to suspend anything.
+func TestPlannerNeverPreemptsForCPU(t *testing.T) {
+	c := newPlanCluster(t)
+	c.node("a", 0, 16000, 64, 500)
+	c.submit(planSpec("busy", "p1", 0, 0, 16000, 1))
+	c.start("exec-a")
+	waiter := c.submit(planSpec("waiter", "p2", 10, 0, 4000, 1))
+	if commands, err := c.store.EnsurePriorityPreemption(c.ctx, "exec-a"); err != nil || len(commands) != 0 {
+		t.Fatalf("preempted for CPU: %v %v", commands, err)
+	}
+	if r := c.reserve("exec-a"); r != nil {
+		t.Fatalf("unexpected %+v", r)
+	}
+	if w := c.wait(waiter.ID); w.Reason != "insufficient_cpu" {
+		t.Fatalf("waiter waits for %+v", w)
+	}
+}

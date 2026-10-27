@@ -1,6 +1,7 @@
 package orchestration
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -191,5 +192,32 @@ func TestParseWithoutDefaultsKeepsOmittedDependsOnAsNull(t *testing.T) {
 	full, _ := Parse([]byte(validManifest()))
 	if parsed.TaskDigests["prepare"] == full.TaskDigests["prepare"] {
 		t.Fatal("a spec without [defaults] must keep its existing digests (omitted depends_on is null)")
+	}
+}
+
+func TestParseCPUMillisMinStaysWithinCPUMillis(t *testing.T) {
+	source := func(min int) string {
+		return fmt.Sprintf(`schema_version = 1
+[project]
+name = "p"
+[[tasks]]
+name = "a"
+queue = "q"
+policy = "RunToCompletion@v1"
+[tasks.execution]
+schema_version = 2
+argv = ["serve"]
+cwd = "/work"
+[tasks.execution.capacity]
+cpu_millis = 16000
+cpu_millis_min = %d
+`, min)
+	}
+	parsed, err := Parse([]byte(source(4000)))
+	if err != nil || parsed.Manifest.Tasks[0].Execution.Capacity.CPUMillisMin != 4000 {
+		t.Fatalf("parsed=%+v err=%v", parsed, err)
+	}
+	if _, err = Parse([]byte(source(20000))); err == nil || !strings.Contains(err.Error(), "cpu_millis_min") {
+		t.Fatalf("over cpu_millis: %v", err)
 	}
 }

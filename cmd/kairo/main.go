@@ -93,6 +93,9 @@ func serve(args []string) error {
 		return err
 	}
 	defer st.Close()
+	if daemonConfig.Scheduler.DiskMinFreeBytes != nil {
+		st.SetSchedulingPolicy(store.SchedulingPolicy{DiskMinFreeBytes: *daemonConfig.Scheduler.DiskMinFreeBytes})
+	}
 	// Anyone who can write the database can mint tokens: keep it (and its
 	// WAL, which holds recent pages) to this user.
 	if err := secfile.RestrictExisting(daemonConfig.DatabasePath, daemonConfig.DatabasePath+"-wal", daemonConfig.DatabasePath+"-shm"); err != nil {
