@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"kairo/internal/store"
 )
 
 func TestNVIDIAOnlyTreatsComputeProcessesAsClaims(t *testing.T) {
@@ -45,6 +47,36 @@ func TestNVIDIAHungCommandFailsTheObservationNamingIt(t *testing.T) {
 			_, err := p.Observe(context.Background())
 			if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), tc.wantName) {
 				t.Fatalf("hung %s must fail the observation naming %q: %v", tc.hungArg, tc.wantName, err)
+			}
+		})
+	}
+}
+
+func TestNVIDIAPrepareMatchesPhysicalIdentityNotStoreResourceID(t *testing.T) {
+	p := &NVIDIA{ProviderID: "p", NodeID: "n", Command: func(_ context.Context, args ...string) ([]byte, error) {
+		if args[0] == "pmon" {
+			return []byte("# gpu pid type fb command\n"), nil
+		}
+		return []byte("GPU-a, 0, 12288, 12287, 0, 40\n"), nil
+	}}
+	for _, tc := range []struct {
+		name, id, uuid, node, provider, kind string
+		wantOK                               bool
+	}{
+		{"original", "gpu-a", "GPU-a", "n", "p", "gpu", true},
+		{"shared", "gpu-a@n", "GPU-a", "n", "p", "gpu", true},
+		{"missing", "gpu-a@n", "GPU-missing", "n", "p", "gpu", false},
+		{"wrong-node", "gpu-a", "GPU-a", "other", "p", "gpu", false},
+		{"wrong-provider", "gpu-a", "GPU-a", "n", "other", "gpu", false},
+		{"wrong-kind", "gpu-a", "GPU-a", "n", "p", "cpu", false},
+		{"empty-identity", "gpu-a", "", "n", "p", "gpu", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := p.Prepare(context.Background(), store.ResourceInstance{
+				ID: tc.id, StableIdentity: tc.uuid, NodeID: tc.node, ProviderID: tc.provider, Kind: tc.kind,
+			})
+			if (err == nil) != tc.wantOK {
+				t.Fatalf("Prepare() = %v, wantOK %v", err, tc.wantOK)
 			}
 		})
 	}
