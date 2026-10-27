@@ -284,6 +284,10 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 	exec.APIURL = ts.URL
 	exec.APICA = apiCA
 	exec.Interval = 50 * time.Millisecond
+	exec.MinLogFreeBytes = 1 // the real measurement, whatever the test disk has free
+	// As in the agent: an attempt's logs are shipped as it exits.
+	shipper := &LogShipper{Client: c, Dir: nodeLogs}
+	exec.FlushLogs = shipper.ShipAttempt
 	exec.ObservationInterval = 50 * time.Millisecond
 	exec.Providers = map[string]provider.Provider{"remote-gpu": &fakeGPU{node: "remote"}}
 	runCtx, stop := context.WithCancel(ctx)
@@ -314,8 +318,7 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 		t.Fatalf("attempt did not report with its token: %+v %v", attempts, err)
 	}
 
-	shipper := &LogShipper{Client: c, Dir: nodeLogs}
-	shipper.Sweep(ctx)
+	// Shipped before the exit was recorded: no sweep needed.
 	matches, _ := filepath.Glob(filepath.Join(daemonLogs, "*.stderr.log"))
 	if len(matches) != 1 {
 		t.Fatalf("expected one shipped stderr log, got %v", matches)

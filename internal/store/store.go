@@ -34,6 +34,9 @@ var authSchema string
 //go:embed machine_schema.sql
 var machineSchema string
 
+//go:embed log_problem_schema.sql
+var logProblemSchema string
+
 var (
 	ErrNotFound              = errors.New("not found")
 	ErrIdempotencyConflict   = errors.New("idempotency key was already used for different content")
@@ -173,6 +176,10 @@ func Open(path string) (*Store, error) {
 	if err := applyMachineSchema(db); err != nil {
 		db.Close()
 		return nil, err
+	}
+	if _, err := db.Exec(logProblemSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply log problem schema: %w", err)
 	}
 	return &Store{db: db}, nil
 }

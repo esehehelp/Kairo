@@ -38,6 +38,9 @@ type taskStatus struct {
 	UpdatedAt  string          `json:"updated_at"`
 	Result     json.RawMessage `json:"result,omitempty"`
 	Executions []taskExecution `json:"executions"`
+	// Paused is the closed gate holding a live task back (a view of the
+	// daemon; the stored state stays pending or running).
+	Paused *store.TaskGate `json:"paused"`
 }
 
 type taskExecution struct {
@@ -63,21 +66,22 @@ type taskExecution struct {
 }
 
 type attemptInfo struct {
-	ID              string          `json:"id"`
-	State           string          `json:"state"`
-	ExecutorID      string          `json:"executor_id"`
-	NodeID          string          `json:"node_id"`
-	PID             *int            `json:"pid"`
-	ExitCode        *int            `json:"exit_code"`
-	ExitSignal      *string         `json:"exit_signal"`
-	Progress        json.RawMessage `json:"progress"`
-	LastHeartbeatAt *string         `json:"last_heartbeat_at"`
-	ExitedAt        *string         `json:"exited_at"`
-	QuiescedAt      *string         `json:"quiesced_at"`
-	StdoutPath      *string         `json:"stdout_path"`
-	StderrPath      *string         `json:"stderr_path"`
-	StdoutBytes     *int64          `json:"stdout_bytes"`
-	StderrBytes     *int64          `json:"stderr_bytes"`
+	ID              string             `json:"id"`
+	State           string             `json:"state"`
+	ExecutorID      string             `json:"executor_id"`
+	NodeID          string             `json:"node_id"`
+	PID             *int               `json:"pid"`
+	ExitCode        *int               `json:"exit_code"`
+	ExitSignal      *string            `json:"exit_signal"`
+	Progress        json.RawMessage    `json:"progress"`
+	LastHeartbeatAt *string            `json:"last_heartbeat_at"`
+	ExitedAt        *string            `json:"exited_at"`
+	QuiescedAt      *string            `json:"quiesced_at"`
+	StdoutPath      *string            `json:"stdout_path"`
+	StderrPath      *string            `json:"stderr_path"`
+	StdoutBytes     *int64             `json:"stdout_bytes"`
+	StderrBytes     *int64             `json:"stderr_bytes"`
+	LogProblems     []store.LogProblem `json:"log_problems"`
 }
 
 // ended reports whether the attempt's process is gone for good.
@@ -514,6 +518,9 @@ func exitText(code *int, signal *string) string {
 // and watch: progress while running, the exit or reason once ended.
 func taskNote(t taskStatus) string {
 	e := t.latest()
+	if note := pausedNote(t, e); note != "" {
+		return note
+	}
 	switch {
 	case t.State == "running":
 		if e != nil {
@@ -553,6 +560,28 @@ func taskNote(t taskStatus) string {
 		return *e.TerminalCause
 	}
 	return ""
+}
+
+// pausedNote is the note of a live task held back by a closed gate:
+// "paused: task gate closed by alice" once nothing of it runs, "pausing"
+// while its execution is still started (a suspend in progress), "" when no
+// gate of it is closed.
+func pausedNote(t taskStatus, e *taskExecution) string {
+	g := t.Paused
+	if g == nil || !liveState(t.State) {
+		return ""
+	}
+	if e != nil && e.State == "started" {
+		if p := progressText(e.Progress); p != "" {
+			return "pausing; " + p
+		}
+		return "pausing"
+	}
+	text := "paused: " + g.Scope + " gate closed"
+	if g.ClosedBy != "" {
+		text += " by " + g.ClosedBy
+	}
+	return text
 }
 
 // stdoutLine writes one event line; stdout is unbuffered, so every line

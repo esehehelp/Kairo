@@ -68,6 +68,11 @@ type agentLogPathsRequest struct {
 	StderrPath string `json:"stderr_path"`
 }
 
+type agentLogProblemRequest struct {
+	AttemptID string           `json:"attempt_id"`
+	Problem   store.LogProblem `json:"problem"`
+}
+
 type agentProcessExitedRequest struct {
 	AttemptID string `json:"attempt_id"`
 	Role      string `json:"role"`
@@ -220,6 +225,13 @@ func (s *Server) agentOps() []agentOp {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
 			s.agentSetLogPaths),
+		newAgentOp(s, "log-problem", observeAllowed, nil,
+			func(ctx context.Context, b agentLogProblemRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			func(ctx context.Context, b agentLogProblemRequest) (any, error) {
+				return okBody, s.Store.RecordAttemptLogProblem(ctx, b.AttemptID, b.Problem)
+			}),
 		newAgentOp(s, "mark-process-exited", observeAllowed, nil,
 			func(ctx context.Context, b agentProcessExitedRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
@@ -380,18 +392,18 @@ func (s *Server) agentLogAppend(w http.ResponseWriter, r *http.Request) {
 	s.logMu.Lock()
 	defer s.logMu.Unlock()
 	if err = os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		writeError(w, err)
+		writeLogDirError(w, err)
 		return
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
-		writeError(w, err)
+		writeLogDirError(w, err)
 		return
 	}
 	defer f.Close()
 	info, err := f.Stat()
 	if err != nil {
-		writeError(w, err)
+		writeLogDirError(w, err)
 		return
 	}
 	size := info.Size()
@@ -402,10 +414,18 @@ func (s *Server) agentLogAppend(w http.ResponseWriter, r *http.Request) {
 	}
 	if skip := size - b.Offset; skip < int64(len(b.Data)) {
 		if _, err = f.WriteAt(b.Data[skip:], size); err != nil {
-			writeError(w, err)
+			// A partial write is kept: the retry appends after it.
+			writeLogDirError(w, err)
 			return
 		}
 		size += int64(len(b.Data)) - skip
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"size": size})
+}
+
+// writeLogDirError reports a failure of the daemon's own log directory (a
+// full disk, say) as a daemon-side failure, which the agent retries from the
+// daemon's size, rather than as a bad request.
+func writeLogDirError(w http.ResponseWriter, err error) {
+	writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "daemon log directory: " + err.Error(), "code": codeInternal})
 }

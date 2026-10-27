@@ -7,19 +7,32 @@ import (
 	"kairo/internal/store"
 )
 
+// ResourceStatusEntry is a resource of GET /api/resources: its state, plus
+// its latest observation, reservations and holders.
+type ResourceStatusEntry struct {
+	store.ResourceInstance
+	store.ResourceUsage
+}
+
 func (s *Server) resourceStatus(w http.ResponseWriter, r *http.Request) {
 	resources, err := s.Store.ListResourceStatus(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	claims, err := s.Store.ListClaims(r.Context())
+	usage, err := s.Store.ListResourceUsage(r.Context())
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	if resources == nil {
-		resources = []store.ResourceInstance{}
+	entries := make([]ResourceStatusEntry, 0, len(resources))
+	for _, resource := range resources {
+		entries = append(entries, ResourceStatusEntry{resource, usage[resource.ID]})
+	}
+	claims, err := s.Store.ListClaims(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
 	}
 	if claims == nil {
 		claims = []store.ExternalClaim{}
@@ -29,7 +42,7 @@ func (s *Server) resourceStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"resources": resources, "external_claims": claims, "undeclared_gpus": machines.Undeclared})
+	writeJSON(w, http.StatusOK, map[string]any{"resources": entries, "external_claims": claims, "undeclared_gpus": machines.Undeclared})
 }
 
 func (s *Server) getMachines(w http.ResponseWriter, r *http.Request) {

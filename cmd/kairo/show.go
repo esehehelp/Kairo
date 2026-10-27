@@ -66,7 +66,14 @@ func renderTask(w io.Writer, project string, t *taskDetail, now time.Time) {
 	if len(t.Gates) > 0 {
 		var parts []string
 		for _, g := range t.Gates {
-			parts = append(parts, g.Scope+" "+g.State)
+			text := g.Scope + " " + g.State
+			if g.State == "closed" && g.ClosedBy != "" {
+				text += " by " + g.ClosedBy
+			}
+			if g.State == "closed" && g.ClosedAt != "" {
+				text += " at " + longStamp(&g.ClosedAt)
+			}
+			parts = append(parts, text)
 		}
 		line("gates", "%s", strings.Join(parts, ", "))
 	}
@@ -184,6 +191,40 @@ func renderAttempt(w io.Writer, a attemptInfo) {
 	}
 	logLine("stdout", a.StdoutPath, a.StdoutBytes)
 	logLine("stderr", a.StderrPath, a.StderrBytes)
+	for _, p := range a.LogProblems {
+		line("log issue", "%s", logProblemText(p))
+	}
+}
+
+// logProblemText makes a problem with an attempt's logs readable:
+// "stderr not shipped to the daemon: agent API 500: ... (10-27 10:01 to
+// 10-27 10:04, caught up)".
+func logProblemText(p store.LogProblem) string {
+	var text string
+	switch p.Problem {
+	case store.LogSpaceLow:
+		text = "log filesystem low on space"
+	case store.LogSpaceExhausted:
+		text = "log filesystem full, output lost"
+	case store.LogForwardFailed:
+		text = "not shipped to the daemon"
+	default:
+		text = p.Problem
+	}
+	if p.Stream != "" {
+		text = p.Stream + " " + text
+	}
+	if p.Detail != "" {
+		text += ": " + p.Detail
+	}
+	when := shortStamp(&p.FirstSeenAt)
+	switch {
+	case p.ResolvedAt != nil:
+		when += " to " + shortStamp(p.ResolvedAt) + ", caught up"
+	case p.LastSeenAt != "" && p.LastSeenAt != p.FirstSeenAt:
+		when += ", last " + shortStamp(&p.LastSeenAt)
+	}
+	return text + " (" + when + ")"
 }
 
 // waitingText makes a waiting reason readable:
@@ -220,6 +261,10 @@ func waitingText(reason map[string]any) string {
 	if scope, ok := rest["scope"].(string); ok && scope != "" && text == "scope_gate_closed" {
 		text += ": the " + scope + " is paused"
 		delete(rest, "scope")
+		if by, ok := rest["closed_by"].(string); ok && by != "" {
+			text += " by " + by
+			delete(rest, "closed_by")
+		}
 	}
 	for _, key := range []string{"resource_id", "resource", "gpu", "gpu_uuid", "device", "uuid", "scope", "node_id", "executor_id"} {
 		if v, ok := rest[key]; ok && v != nil && fmt.Sprint(v) != "" {

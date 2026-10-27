@@ -70,6 +70,11 @@ func (f TaskFilter) where() (string, []any) {
 	return ` AND ` + strings.Join(conditions, ` AND `), args
 }
 
+// gateCloserColumns reads who closed admission gate g and when: the first
+// pause operation at the gate's current generation (NULL for an open gate).
+const gateCloserColumns = `(SELECT p.actor FROM pause_operations p WHERE g.state='closed' AND p.scope_id=g.scope_id AND p.scope_generation=g.generation ORDER BY p.created_at,p.id LIMIT 1),
+ (SELECT p.created_at FROM pause_operations p WHERE g.state='closed' AND p.scope_id=g.scope_id AND p.scope_generation=g.generation ORDER BY p.created_at,p.id LIMIT 1)`
+
 // latestLeaseJoin joins the latest lease of execution e as l: until an attempt
 // runs the execution, the executor holding that lease is the one it waits on.
 const latestLeaseJoin = ` LEFT JOIN leases l ON l.id=(SELECT id FROM leases WHERE execution_id=e.id ORDER BY created_at DESC LIMIT 1)`
@@ -198,6 +203,26 @@ func (s *Store) taskStatuses(ctx context.Context, projectID string, filter TaskF
 	if err != nil {
 		return nil, err
 	}
+	// A live task is paused while a gate of one of its scopes (project,
+	// queue, task) is closed; the innermost closed one is reported.
+	err = eachRow(ctx, s.db, `SELECT o.task_scope_id,s.kind,`+gateCloserColumns+` FROM orchestration_tasks o JOIN coordination_scopes ts ON ts.id=o.task_scope_id
+		JOIN coordination_scopes s ON s.id IN(o.project_scope_id,ts.parent_id,o.task_scope_id) JOIN admission_gates g ON g.scope_id=s.id AND g.state='closed'
+		WHERE o.project_scope_id=? AND o.state IN('pending','running')`+where+` ORDER BY o.task_scope_id,CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, args, func(rows *sql.Rows) error {
+		var scopeID string
+		gate := TaskGate{State: "closed"}
+		var closedBy, closedAt sql.NullString
+		if err := rows.Scan(&scopeID, &gate.Scope, &closedBy, &closedAt); err != nil {
+			return err
+		}
+		gate.ClosedBy, gate.ClosedAt = closedBy.String, closedAt.String
+		if i, ok := index[scopeID]; ok {
+			tasks[i].Paused = &gate
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	err = eachRow(ctx, s.db, `SELECT te.task_scope_id,`+taskExecutionColumns+` FROM orchestration_tasks o JOIN orchestration_task_executions te ON te.task_scope_id=o.task_scope_id JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+` WHERE o.project_scope_id=?`+where+` ORDER BY te.task_scope_id,te.execution_ordinal`, args, func(rows *sql.Rows) error {
 		var scopeID string
 		execution, err := scanTaskExecution(rows, &scopeID)
@@ -235,6 +260,10 @@ type TaskRef struct {
 type TaskGate struct {
 	Scope string `json:"scope"` // project, queue or task
 	State string `json:"state"` // open or closed
+	// A closed gate: who closed it and when (the pause operation that closed
+	// it at its current generation).
+	ClosedBy string `json:"closed_by,omitempty"`
+	ClosedAt string `json:"closed_at,omitempty"`
 }
 
 type TaskExecutionDetail struct {
@@ -253,6 +282,8 @@ type AttemptDetail struct {
 	StdoutBytes *int64  `json:"stdout_bytes,omitempty"`
 	StderrBytes *int64  `json:"stderr_bytes,omitempty"`
 	NodeID      *string `json:"node_id,omitempty"`
+	// LogProblems are what went wrong with the attempt's logs while it ran.
+	LogProblems []LogProblem `json:"log_problems,omitempty"`
 }
 
 type TaskGangRank struct {
@@ -294,11 +325,13 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 	if detail.Dependents, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.dependency_task_scope_id=? ORDER BY t.name`, task.scopeID); err != nil {
 		return TaskDetail{}, err
 	}
-	err = eachRow(ctx, s.db, `SELECT s.kind,COALESCE(g.state,'open') FROM coordination_scopes s LEFT JOIN admission_gates g ON g.scope_id=s.id WHERE s.id IN(?,?,?) ORDER BY CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, []any{task.projectID, task.queueScopeID, task.scopeID}, func(rows *sql.Rows) error {
+	err = eachRow(ctx, s.db, `SELECT s.kind,COALESCE(g.state,'open'),`+gateCloserColumns+` FROM coordination_scopes s LEFT JOIN admission_gates g ON g.scope_id=s.id WHERE s.id IN(?,?,?) ORDER BY CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, []any{task.projectID, task.queueScopeID, task.scopeID}, func(rows *sql.Rows) error {
 		var gate TaskGate
-		if err := rows.Scan(&gate.Scope, &gate.State); err != nil {
+		var closedBy, closedAt sql.NullString
+		if err := rows.Scan(&gate.Scope, &gate.State, &closedBy, &closedAt); err != nil {
 			return err
 		}
+		gate.ClosedBy, gate.ClosedAt = closedBy.String, closedAt.String
 		detail.Gates = append(detail.Gates, gate)
 		return nil
 	})
@@ -317,12 +350,25 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 	if err != nil {
 		return TaskDetail{}, err
 	}
+	logProblems, err := s.taskLogProblems(ctx, task.scopeID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	for _, list := range attempts {
+		for i := range list {
+			list[i].LogProblems = logProblems[list[i].ID]
+		}
+	}
 	// The task's executions are in its project, queue and task scopes: a
 	// closed gate of the task holds back each of them that has not started.
 	var closed []WaitReason
 	for _, gate := range detail.Gates {
 		if gate.State == "closed" {
-			closed = append(closed, WaitReason{ReasonCode: "scope_gate_closed", Scope: gate.Scope})
+			var who json.RawMessage
+			if gate.ClosedBy != "" {
+				who, _ = json.Marshal(map[string]string{"closed_by": gate.ClosedBy})
+			}
+			closed = append(closed, WaitReason{ReasonCode: "scope_gate_closed", Scope: gate.Scope, Detail: who, CreatedAt: gate.ClosedAt})
 		}
 	}
 	for _, execution := range detail.TaskStatus.Executions {

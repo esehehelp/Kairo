@@ -20,6 +20,7 @@ type Coordinator interface {
 	AuthorizeLaunch(ctx context.Context, reservation *store.Reservation) (*store.Launch, error)
 	ActivateLaunch(ctx context.Context, attemptID, leaseID string, epoch int64, token string, pid int, processIdentity string) error
 	SetAttemptLogPaths(ctx context.Context, attemptID string, epoch int64, stdoutPath, stderrPath string) error
+	RecordAttemptLogProblem(ctx context.Context, attemptID string, problem store.LogProblem) error
 	MarkAttemptProcessExited(ctx context.Context, attemptID, role string, rank int, identity string) error
 	RecordTerminal(ctx context.Context, attemptID, leaseID string, epoch int64, exitCode int, exitSignal string) error
 	ListQuiescenceCandidates(ctx context.Context, executorID string) ([]store.QuiescenceCandidate, error)

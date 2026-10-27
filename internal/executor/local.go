@@ -43,6 +43,22 @@ type Local struct {
 	Providers           map[string]provider.Provider
 	lastObservation     time.Time
 
+	// Attempt logs (logspace.go): the free space the log directory's
+	// filesystem must have for a launch (zero: DefaultMinLogFreeBytes), how
+	// often it is checked while attempts run (zero: defaultLogCheckInterval),
+	// and how it is measured (nil: the filesystem's own figure).
+	MinLogFreeBytes  int64
+	LogCheckInterval time.Duration
+	FreeSpace        func(dir string) (int64, error)
+	// FlushLogs, when set, ships an attempt's logs before its exit is
+	// recorded (a node agent's log shipper), so that they are complete at
+	// the daemon once the attempt is seen to have ended.
+	FlushLogs      func(ctx context.Context, attemptID string) error
+	lastLogCheck   time.Time
+	freeSpaceStuck bool
+	// logProblems are the problems already recorded, by attempt.
+	logProblems map[string]map[string]bool
+
 	mu      sync.Mutex
 	running map[string]*exec.Cmd
 
@@ -131,6 +147,9 @@ func (e *Local) tick(ctx context.Context) error {
 	}
 	e.beginStep("force-stops")
 	e.carryOutForceStops(ctx)
+	e.endStep()
+	e.beginStep("log-space")
+	e.watchLogSpace(ctx)
 	e.endStep()
 	if err := e.inStep("gang-retry", func() error { return e.retryPendingGangRanks(ctx) }); err != nil {
 		return err
@@ -695,6 +714,11 @@ func (e *Local) command(launch *store.Launch) *exec.Cmd {
 }
 
 func (e *Local) start(launch *store.Launch) error {
+	// Output written to a full filesystem goes nowhere: refuse the launch
+	// rather than start a process nobody can follow.
+	if err := e.checkLaunchLogSpace(); err != nil {
+		return err
+	}
 	cmd := e.command(launch)
 	prepareProcessTree(cmd)
 	outPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stdout.log")
@@ -737,9 +761,7 @@ func (e *Local) start(launch *store.Launch) error {
 		stderr.Close()
 		return err
 	}
-	if err := e.Store.SetAttemptLogPaths(context.Background(), launch.Attempt.ID, launch.Lease.CoordinationEpoch, outPath, errPath); err != nil {
-		e.Logger.Warn("attempt log paths not recorded", "attempt_id", launch.Attempt.ID, "error", err)
-	}
+	go e.recordLogPaths(launch, outPath, errPath)
 	e.mu.Lock()
 	e.running[launch.Attempt.ID] = cmd
 	if tree != nil {
@@ -754,6 +776,15 @@ func (e *Local) start(launch *store.Launch) error {
 		stdout.Close()
 		stderr.Close()
 		exit := cmd.ProcessState.ExitCode()
+		e.checkLogSpaceAtExit(launch.Attempt.ID)
+		if e.FlushLogs != nil {
+			// Bounded: the shipper goes on retrying in the background.
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := e.FlushLogs(ctx, launch.Attempt.ID); err != nil {
+				e.Logger.Warn("attempt logs not shipped at exit; retrying in the background", "attempt_id", launch.Attempt.ID, "error", err)
+			}
+			cancel()
+		}
 		// RecordTerminal is idempotent, so a transient failure (a remote
 		// agent losing its connection to the daemon) is retried rather than
 		// leaving the lease stuck in active.
@@ -771,6 +802,26 @@ func (e *Local) start(launch *store.Launch) error {
 		e.mu.Lock()
 		delete(e.running, launch.Attempt.ID)
 		e.mu.Unlock()
+		e.forgetLogProblems(launch.Attempt.ID)
 	}()
 	return nil
+}
+
+// recordLogPaths records where an attempt's logs are, retrying while the
+// store is unreachable: without them task show and task logs cannot find the
+// logs.
+func (e *Local) recordLogPaths(launch *store.Launch, outPath, errPath string) {
+	deadline := time.Now().Add(30 * time.Minute)
+	for delay := time.Second; ; delay = min(2*delay, time.Minute) {
+		err := e.Store.SetAttemptLogPaths(context.Background(), launch.Attempt.ID, launch.Lease.CoordinationEpoch, outPath, errPath)
+		if err == nil {
+			return
+		}
+		if errors.Is(err, store.ErrStaleEpoch) || errors.Is(err, store.ErrNotFound) || time.Now().After(deadline) {
+			e.Logger.Error("attempt log paths not recorded", "attempt_id", launch.Attempt.ID, "error", err)
+			return
+		}
+		e.Logger.Warn("attempt log paths not recorded; retrying", "attempt_id", launch.Attempt.ID, "error", err)
+		time.Sleep(delay)
+	}
 }
