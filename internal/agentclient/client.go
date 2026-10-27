@@ -198,6 +198,10 @@ func (c *Client) AckForceStop(ctx context.Context, attemptID, phase string, deta
 	return c.call(ctx, "force-stop-ack", map[string]any{"attempt_id": attemptID, "phase": phase, "detail": detail}, nil)
 }
 
+func (c *Client) RecordAttemptUsage(ctx context.Context, attemptID string, ramBytes, diskWrittenBytes *int64) error {
+	return c.call(ctx, "attempt-usage", map[string]any{"attempt_id": attemptID, "ram_bytes": ramBytes, "disk_written_bytes": diskWrittenBytes}, nil)
+}
+
 // appendLog sends data found at offset of the node-side file and returns the
 // daemon-side size afterwards. A gap (the daemon has less than offset) is
 // reported as *GapError carrying the daemon's size to resume from.

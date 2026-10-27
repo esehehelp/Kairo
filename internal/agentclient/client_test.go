@@ -186,6 +186,11 @@ func TestNodeTokenIsBoundToItsNode(t *testing.T) {
 	_, err = other.ForceStopOrders(ctx, "remote-exec")
 	forbidden(t, "read another node's force stops", err)
 	forbidden(t, "ack another node's attempt", other.AckForceStop(ctx, launch.Attempt.ID, "signalled", nil))
+	ram := int64(1 << 30)
+	forbidden(t, "report another node's attempt usage", other.RecordAttemptUsage(ctx, launch.Attempt.ID, &ram, nil))
+	if err := c.RecordAttemptUsage(ctx, launch.Attempt.ID, &ram, nil); err != nil {
+		t.Fatalf("report own attempt usage: %v", err)
+	}
 	forbidden(t, "terminal for another node's attempt", other.RecordTerminal(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, 0, ""))
 	forbidden(t, "release another node's lease", other.ReleaseReservation(ctx, launch.Lease.ID, launch.Lease.CoordinationEpoch, "x"))
 	forbidden(t, "observe with another node's provider", other.ApplyObservationBatch(ctx, "remote-gpu", nil, nil, nil))
