@@ -93,6 +93,14 @@ type agentAttemptRequest struct {
 	AttemptID string `json:"attempt_id"`
 }
 
+// agentAttemptUsage is what an attempt's process tree uses now; a field left
+// out is not known.
+type agentAttemptUsage struct {
+	AttemptID        string `json:"attempt_id"`
+	RAMBytes         *int64 `json:"ram_bytes"`
+	DiskWrittenBytes *int64 `json:"disk_written_bytes"`
+}
+
 type agentForceStopAck struct {
 	AttemptID string          `json:"attempt_id"`
 	Phase     string          `json:"phase"`
@@ -269,6 +277,13 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentForceStopAck) (any, error) {
 				return okBody, s.Store.AckForceStop(ctx, b.AttemptID, b.Phase, b.Detail)
+			}),
+		newAgentOp(s, "attempt-usage", observeAllowed, nil,
+			func(ctx context.Context, b agentAttemptUsage) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			func(ctx context.Context, b agentAttemptUsage) (any, error) {
+				return okBody, s.Store.RecordAttemptUsage(ctx, b.AttemptID, b.RAMBytes, b.DiskWrittenBytes)
 			}),
 	}
 }

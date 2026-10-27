@@ -356,6 +356,27 @@ WARN as `executor step stalled` (with `executor_id`, `step` and
 commands that take longer than 2 s are logged at INFO with their duration; a
 timeout is logged at WARN with the command.
 
+Every 15 s an executor samples what each attempt it launched takes up, for
+admission to count that part of the attempt's RAM and disk reservation once
+(`attempt-usage` on the agent API). The sample runs beside the tick, one at a
+time, bounded to 15 s, so it never holds the tick. RAM is the memory the
+attempt's processes hold, bytes written what they have written, never less
+than an earlier sample showed:
+
+- Linux: the processes carrying the attempt's `KAIRO_ATTEMPT_ID` and the
+  descendants of its launcher; the sum of their PSS (`smaps_rollup`) and of
+  their `write_bytes` less `cancelled_write_bytes` (`/proc/PID/io`).
+- Windows: the processes of the attempt's job object, their private working
+  sets and the bytes the job has written; without a job object, the launcher
+  and its descendants by parent pid and what they have written while alive.
+- WSL: the Linux processes carrying `KAIRO_ATTEMPT_ID`, as on Linux, read by
+  one `wsl.exe` run per sample.
+
+A process that cannot be read (another user's, a kernel without
+`smaps_rollup`) makes that figure unknown, and an unknown figure counts as
+nothing taken up. Attempts launched by an earlier instance of the executor
+(before an agent restart) are not sampled.
+
 ### Machine declaration
 
 Which node holds which GPU is declared, not discovered. `kairo machine apply

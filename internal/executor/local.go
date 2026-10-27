@@ -56,6 +56,14 @@ type Local struct {
 	forceKilled        map[string]bool
 	forceOrdersFailing bool
 
+	// Attempt usage (usage.go): the running attempts this instance samples,
+	// whether a round is running and when the last one started. usageSampler
+	// replaces sampleTrees in tests.
+	usage        map[string]*usageState
+	usageRunning bool
+	usageSampled time.Time
+	usageSampler func(context.Context, []usageTarget) map[string]usageSample
+
 	// The step the tick is in and when it started; stepStalled is set once
 	// watchSteps has reported it (see beginStep).
 	step        string
@@ -123,6 +131,7 @@ func (e *Local) tick(ctx context.Context) error {
 	if e.ObserveOnly {
 		return nil
 	}
+	e.sampleUsage(ctx)
 	if err := e.inStep("quiescence", func() error { return e.reconcileQuiescence(ctx) }); err != nil {
 		return err
 	}
@@ -751,8 +760,10 @@ func (e *Local) start(launch *store.Launch) error {
 		e.trees[launch.Attempt.ID] = tree
 	}
 	e.mu.Unlock()
+	e.trackUsage(launch.Attempt.ID, cmd.Process.Pid, identity)
 	go func() {
 		waitErr := cmd.Wait()
+		e.untrackUsage(launch.Attempt.ID)
 		stdout.Close()
 		stderr.Close()
 		exit := cmd.ProcessState.ExitCode()

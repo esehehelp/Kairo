@@ -29,6 +29,7 @@ type Coordinator interface {
 	MarkQuarantineTerminated(ctx context.Context, attemptID string) error
 	ForceStopOrders(ctx context.Context, executorID string) ([]store.ForceStopOrder, error)
 	AckForceStop(ctx context.Context, attemptID, phase string, detail json.RawMessage) error
+	RecordAttemptUsage(ctx context.Context, attemptID string, ramBytes, diskWrittenBytes *int64) error
 }
 
 var _ Coordinator = (*store.Store)(nil)
