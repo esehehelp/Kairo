@@ -95,7 +95,7 @@ func TestEveryListedCommandHasAHandler(t *testing.T) {
 			t.Fatalf("%s nonsense: %v", c.name, err)
 		}
 	}
-	if leaves != 5 || !top["help"] {
+	if leaves != 6 || !top["help"] {
 		t.Fatalf("leaves %d, commands %v", leaves, top)
 	}
 	if err := run([]string{"nonsense"}); err == nil || !strings.Contains(err.Error(), `unknown command "nonsense"`) {

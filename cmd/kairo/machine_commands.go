@@ -56,22 +56,78 @@ func machineApply(args []string) error {
 	if result.DryRun {
 		verb = "would apply"
 	}
-	if len(result.Changes) == 0 {
-		fmt.Printf("%s: no changes (%d GPUs declared)\n", verb, result.Unchanged)
-		return nil
+	fmt.Print(formatApply(verb, result))
+	return nil
+}
+
+// formatApply is the changes of an apply: GPUs (+ declared, ~ moved, -
+// dropped), then hosts, then the device settings it clears.
+func formatApply(verb string, result store.MachineApplyResult) string {
+	var b strings.Builder
+	changes := len(result.Changes) + len(result.HostChanges)
+	switch {
+	case changes == 0 && result.UnchangedHosts == 0:
+		fmt.Fprintf(&b, "%s: no changes (%d GPUs declared)\n", verb, result.Unchanged)
+	case changes == 0:
+		fmt.Fprintf(&b, "%s: no changes (%d GPUs, %d hosts declared)\n", verb, result.Unchanged, result.UnchangedHosts)
+	default:
+		fmt.Fprintf(&b, "%s: %d change(s), %d unchanged\n", verb, changes, result.Unchanged+result.UnchangedHosts)
 	}
-	fmt.Printf("%s: %d change(s), %d unchanged\n", verb, len(result.Changes), result.Unchanged)
 	for _, c := range result.Changes {
 		switch {
 		case c.From == "":
-			fmt.Printf("  + %s  %s\n", c.UUID, c.To)
+			fmt.Fprintf(&b, "  + %s  %s\n", c.UUID, c.To)
 		case c.To == "":
-			fmt.Printf("  - %s  %s\n", c.UUID, c.From)
+			fmt.Fprintf(&b, "  - %s  %s\n", c.UUID, c.From)
 		default:
-			fmt.Printf("  ~ %s  %s -> %s\n", c.UUID, c.From, c.To)
+			fmt.Fprintf(&b, "  ~ %s  %s -> %s\n", c.UUID, c.From, c.To)
 		}
 	}
-	return nil
+	for _, c := range result.HostChanges {
+		switch {
+		case c.From == nil:
+			fmt.Fprintf(&b, "  + host %s  %s\n", c.Host, strings.Join(hostFields(*c.To), "; "))
+		case c.To == nil:
+			fmt.Fprintf(&b, "  - host %s\n", c.Host)
+		default:
+			from, to := hostFields(*c.From), hostFields(*c.To)
+			var diff []string
+			for i := range from {
+				if from[i] != to[i] {
+					name, before, _ := strings.Cut(from[i], " ")
+					_, after, _ := strings.Cut(to[i], " ")
+					diff = append(diff, name+" "+before+" -> "+after)
+				}
+			}
+			fmt.Fprintf(&b, "  ~ host %s  %s\n", c.Host, strings.Join(diff, "; "))
+		}
+	}
+	for _, s := range result.ClearedSettings {
+		fmt.Fprintf(&b, "  - setting %s/%s  %s: %s (no longer controllable)\n", s.HostID, s.DeviceID, s.Owner.String(), s.Settings.String())
+	}
+	return b.String()
+}
+
+// hostFields are a host's declaration as "name value" texts, always the same
+// fields in the same order.
+func hostFields(h machine.Host) []string {
+	devices := []string{}
+	for _, d := range h.Devices {
+		var overrides []string
+		if d.MaxSlowdown != nil {
+			overrides = append(overrides, "max_slowdown="+number(*d.MaxSlowdown))
+		}
+		if d.Control != nil {
+			overrides = append(overrides, fmt.Sprintf("control=%t", *d.Control))
+		}
+		devices = append(devices, d.ID+"("+strings.Join(overrides, ",")+")")
+	}
+	return []string{
+		"nodes " + strings.Join(h.Nodes, ","),
+		"controller " + dash(h.Controller),
+		"max_slowdown " + number(h.MaxSlowdown),
+		"devices " + dash(strings.Join(devices, ",")),
+	}
 }
 
 // machineShow: kairo machine show [--json].
@@ -107,7 +163,8 @@ func machineShow(args []string) error {
 }
 
 // formatMachines is the declared GPUs as a table, then the GPUs that
-// providers report but may not register.
+// providers report but may not register, then the hosts and the effective
+// policy of each of their devices.
 func formatMachines(m store.Machines) string {
 	var b strings.Builder
 	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
@@ -125,6 +182,29 @@ func formatMachines(m store.Machines) string {
 			}
 			fmt.Fprintf(&b, "  %s  on %s (%s), %s\n", gpu.UUID, gpu.NodeID, gpu.ProviderID, declared)
 		}
+	}
+	if len(m.Hosts) != 0 {
+		fmt.Fprintln(&b)
+		w = tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "HOST\tNODES\tCONTROLLER")
+		for _, host := range m.Hosts {
+			fmt.Fprintf(w, "%s\t%s\t%s\n", host.ID, strings.Join(host.Nodes, ","), dash(host.Controller))
+		}
+		w.Flush()
+		fmt.Fprintln(&b)
+		w = tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "HOST\tDEVICE\tMAX_SLOWDOWN\tCONTROL")
+		for _, device := range m.Devices {
+			control := "no"
+			switch {
+			case device.Controllable():
+				control = "yes"
+			case device.Control:
+				control = "no (no controller)"
+			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", device.HostID, device.DeviceID, number(device.MaxSlowdown), control)
+		}
+		w.Flush()
 	}
 	return b.String()
 }

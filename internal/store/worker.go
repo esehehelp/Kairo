@@ -498,6 +498,9 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 	if err = appendCoordinationEventTx(ctx, tx, "lease_released", &projectID, "lease", leaseID, &epoch, map[string]any{"execution_id": executionID, "attempt_id": attemptID}); err != nil {
 		return err
 	}
+	if err = clearReleasedLeaseSettingsTx(ctx, tx); err != nil {
+		return err
+	}
 	return tx.Commit()
 }
 

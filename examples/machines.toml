@@ -1,9 +1,42 @@
-# Machine declaration for `kairo machine apply`: which node holds which GPU.
-# The file is the whole declaration; a GPU left out is not scheduled. Each
-# node id must be known to the daemon (its daemon or agent has started).
-# GPU UUIDs are as `nvidia-smi -L` prints them. A GPU under several nodes is
-# shared (containers of one host): a lease through any of them excludes the rest.
+# Machine declaration for `kairo machine apply`: which node holds which GPU,
+# and which physical host holds which nodes. The file is the whole
+# declaration; a GPU left out is not scheduled. Each node id must be known to
+# the daemon (its daemon, agent or controller has started). GPU UUIDs are as
+# `nvidia-smi -L` prints them. A GPU under several nodes is shared (containers
+# of one host): a lease through any of them excludes the rest.
 
 [[nodes]]
 id = "windows-host-1"
 gpus = ["GPU-00000000-0000-0000-0000-000000000000"]
+
+[[nodes]]
+id = "pve0-neo-train"
+gpus = ["GPU-11111111-1111-1111-1111-111111111111"]
+
+[[nodes]]
+id = "pve0-glm"
+gpus = ["GPU-11111111-1111-1111-1111-111111111111"]
+
+# Hosts are optional. A host declares only policy and authority: its devices
+# (every GPU declared for its nodes, and "cpu") may run up to max_slowdown
+# slower than their maximum (omitted: 0, the hardware stays at its defaults),
+# and only its controller node (`kairo controller`) may change their settings
+# (no controller: observe only).
+[[hosts]]
+id = "pve0"
+nodes = ["pve0-neo-train", "pve0-glm"]
+controller = "pve0-host"
+max_slowdown = 0.05
+
+[[hosts.devices]]                 # a device's own policy
+id = "GPU-11111111-1111-1111-1111-111111111111"
+max_slowdown = 0.10
+
+[[hosts.devices]]
+id = "cpu"
+control = false                   # never changed, never benched: observe only
+
+[[hosts]]
+id = "windows-host-1"
+nodes = ["windows-host-1"]
+controller = "windows-host-1-ctl"

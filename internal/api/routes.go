@@ -47,6 +47,9 @@ func (s *Server) routes() []route {
 		{"POST", "/api/resources/{id}/reconcile", roleAdmin, s.reconcileResource},
 		{"GET", "/api/machines", roleRead, s.getMachines},
 		{"POST", "/api/machines", roleAdmin, s.applyMachines},
+		{"GET", "/api/hardware", roleRead, s.listHardware},
+		{"POST", "/api/hardware/{host}/{device}/settings", roleAdmin, s.setDeviceSetting},
+		{"DELETE", "/api/hardware/{host}/{device}/settings", roleAdmin, s.clearDeviceSetting},
 
 		{"POST", "/api/worker/heartbeat", roleWorker, s.workerHeartbeat},
 		{"POST", "/api/worker/processes", roleWorker, s.workerProcess},
@@ -55,7 +58,7 @@ func (s *Server) routes() []route {
 
 		{"POST", "/api/agent/logs", roleNode, s.agentLogAppend},
 	}
-	for _, op := range s.agentOps() {
+	for _, op := range append(s.agentOps(), s.controllerOps()...) {
 		routes = append(routes, route{"POST", "/api/agent/" + op.name, roleNode, op.handler})
 	}
 	return routes

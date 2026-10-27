@@ -6,7 +6,9 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 
 	"github.com/BurntSushi/toml"
 )
@@ -218,14 +220,8 @@ func LoadAgent(path string) (Agent, error) {
 		a.AttemptAPIURL = a.ServerURL
 	}
 	for _, u := range []string{a.ServerURL, a.AttemptAPIURL} {
-		switch scheme(u) {
-		case "https":
-		case "http":
-			if !a.InsecureHTTP {
-				return a, fmt.Errorf("%q is plain HTTP: the node token would travel unencrypted; use https or set insecure_http = true", u)
-			}
-		default:
-			return a, fmt.Errorf("%q is not an http(s) URL", u)
+		if err = checkNodeURL(u, a.InsecureHTTP); err != nil {
+			return a, err
 		}
 	}
 	if a.LogDirectory == "" {
@@ -258,4 +254,92 @@ func LoadAgent(path string) (Agent, error) {
 		return a, errors.New("at least one executor is required")
 	}
 	return a, nil
+}
+
+// checkNodeURL refuses a URL a node token would travel over in plain HTTP,
+// unless insecure is set.
+func checkNodeURL(u string, insecure bool) error {
+	switch scheme(u) {
+	case "https":
+	case "http":
+		if !insecure {
+			return fmt.Errorf("%q is plain HTTP: the node token would travel unencrypted; use https or set insecure_http = true", u)
+		}
+	default:
+		return fmt.Errorf("%q is not an http(s) URL", u)
+	}
+	return nil
+}
+
+// Controller configures `kairo controller`: the process on a physical host
+// that changes the settings of the devices its node controls (the host's
+// `controller` in the machine declaration). It authenticates like an agent,
+// with its node's token.
+type Controller struct {
+	ServerURL    string `toml:"server_url"`
+	Token        string `toml:"token"`
+	CAFile       string `toml:"ca_file"`
+	InsecureHTTP bool   `toml:"insecure_http"`
+	// Node is the controller's node; its name defaults to its id.
+	Node Node `toml:"node"`
+	// PollIntervalSeconds is how often the desired settings are fetched
+	// (default 10). ResetAfterSeconds is how long the daemon may be
+	// unreachable before every device is returned to its defaults (default
+	// 120).
+	PollIntervalSeconds int `toml:"poll_interval_seconds"`
+	ResetAfterSeconds   int `toml:"reset_after_seconds"`
+	// StateFile keeps what the controller must know across a crash: the
+	// devices it controls and, on Windows, the processor settings it found
+	// before it changed them. Default: next to the configuration file,
+	// <name>.state.json.
+	StateFile string `toml:"state_file"`
+}
+
+func LoadController(path string) (Controller, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return Controller{}, err
+	}
+	c := Controller{}
+	metadata, err := toml.Decode(string(body), &c)
+	if err != nil {
+		return c, err
+	}
+	if undecoded := metadata.Undecoded(); len(undecoded) > 0 {
+		return c, errors.New("unknown controller config field: " + undecoded[0].String())
+	}
+	if c.ServerURL == "" || c.Token == "" {
+		return c, errors.New("server_url and token are required")
+	}
+	if err = checkNodeURL(c.ServerURL, c.InsecureHTTP); err != nil {
+		return c, err
+	}
+	if c.Node.ID == "" {
+		return c, errors.New("node.id is required")
+	}
+	if c.Node.Name == "" {
+		c.Node.Name = c.Node.ID
+	}
+	if c.Node.OS == "" {
+		c.Node.OS = runtime.GOOS
+	}
+	if c.Node.Architecture == "" {
+		c.Node.Architecture = runtime.GOARCH
+	}
+	switch {
+	case c.PollIntervalSeconds < 0 || c.ResetAfterSeconds < 0:
+		return c, errors.New("poll_interval_seconds and reset_after_seconds must not be negative")
+	case c.PollIntervalSeconds == 0:
+		c.PollIntervalSeconds = 10
+	}
+	if c.ResetAfterSeconds == 0 {
+		c.ResetAfterSeconds = 120
+	}
+	if c.ResetAfterSeconds < 2*c.PollIntervalSeconds {
+		return c, fmt.Errorf("reset_after_seconds %d must be at least twice poll_interval_seconds %d", c.ResetAfterSeconds, c.PollIntervalSeconds)
+	}
+	if c.StateFile == "" {
+		c.StateFile = strings.TrimSuffix(path, filepath.Ext(path)) + ".state.json"
+	}
+	return c, nil
 }

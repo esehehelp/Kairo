@@ -22,3 +22,12 @@ CREATE TABLE IF NOT EXISTS undeclared_gpus(
  last_observed_at TEXT NOT NULL,
  PRIMARY KEY(provider_id,uuid)
 );
+-- Physical hosts (`[[hosts]]`): each row is a host's declaration as applied
+-- (machine.Host, normalized): its nodes, the controller node that may change
+-- its devices' settings, and their max_slowdown and control. Its devices are
+-- derived from it and machine_gpus (machine.Spec.DevicePolicies).
+CREATE TABLE IF NOT EXISTS machine_hosts(
+ id TEXT PRIMARY KEY,
+ declaration_json TEXT NOT NULL,
+ declared_at TEXT NOT NULL
+);

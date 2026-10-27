@@ -1,0 +1,14 @@
+# `kairo controller --config kairo-controller.toml`: the device controller of
+# one physical host. It changes the settings of the devices of the host whose
+# `controller` (examples/machines.toml) is this node, and nothing else. Run it
+# elevated on Windows and as root on Linux (see README, Hardware settings).
+server_url = "https://192.168.1.12:7474"
+# kairo token create --config kairo.toml --name pve0-host --role node --node pve0-host
+token = "kairo_node_..."
+ca_file = "/etc/kairo/ca.pem"
+# poll_interval_seconds = 10   # how often the desired settings are fetched
+# reset_after_seconds = 120    # daemon unreachable this long: every device back to its defaults
+# state_file = "/etc/kairo/kairo-controller.state.json"   # default: next to this file
+
+[node]
+id = "pve0-host"   # a node of its own: it has no executors and is never scheduled

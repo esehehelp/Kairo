@@ -25,10 +25,25 @@ type MachineChange struct {
 	To   string `json:"to,omitempty"`
 }
 
+// HostChange is one host whose declaration changes (normalized): From is
+// nil for a new host, To for one no longer declared.
+type HostChange struct {
+	Host string        `json:"host"`
+	From *machine.Host `json:"from,omitempty"`
+	To   *machine.Host `json:"to,omitempty"`
+}
+
 type MachineApplyResult struct {
 	Changes   []MachineChange `json:"changes"`
 	Unchanged int             `json:"unchanged"`
-	DryRun    bool            `json:"dry_run"`
+	// HostChanges and UnchangedHosts are the same for [[hosts]].
+	HostChanges    []HostChange `json:"host_changes"`
+	UnchangedHosts int          `json:"unchanged_hosts"`
+	// ClearedSettings are the device settings removed because their device is
+	// no longer controllable (no longer on a host, control = false, or its
+	// host has no controller).
+	ClearedSettings []DeviceSetting `json:"cleared_settings"`
+	DryRun          bool            `json:"dry_run"`
 }
 
 // DeclaredGPU is one node's declaration of a GPU (a shared GPU has one a node)
@@ -58,6 +73,10 @@ type UndeclaredGPU struct {
 type Machines struct {
 	GPUs       []DeclaredGPU   `json:"gpus"`
 	Undeclared []UndeclaredGPU `json:"undeclared"`
+	// Hosts are the declared hosts (normalized), Devices their devices'
+	// effective policies.
+	Hosts   []machine.Host         `json:"hosts"`
+	Devices []machine.DevicePolicy `json:"devices"`
 }
 
 // ApplyMachines replaces the machine declaration with spec. It refuses to move
@@ -65,7 +84,9 @@ type Machines struct {
 // for. A GPU that moves stays registered on its old node, unschedulable, until
 // the new node's provider reports it; the old node's open claims on it are
 // cleared, as they describe the old host. A shared GPU (declared for several
-// nodes) gets a row on each of them as their providers report it.
+// nodes) gets a row on each of them as their providers report it. Hosts are
+// replaced as a whole; the settings of devices no longer controllable are
+// removed, so their controller returns them to defaults.
 func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun bool) (MachineApplyResult, error) {
 	if err := spec.Validate(); err != nil {
 		return MachineApplyResult{}, err
@@ -135,7 +156,14 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	if len(leased) != 0 {
 		return MachineApplyResult{}, fmt.Errorf("%w: %s (wait until the work on it has ended)", ErrMachineConflict, strings.Join(leased, ", "))
 	}
-	if dryRun || len(result.Changes) == 0 {
+	if result.HostChanges, result.UnchangedHosts, err = hostChangesTx(ctx, tx, spec); err != nil {
+		return MachineApplyResult{}, err
+	}
+	policies := spec.DevicePolicies()
+	if result.ClearedSettings, err = uncontrollableSettingsTx(ctx, tx, policies); err != nil {
+		return MachineApplyResult{}, err
+	}
+	if dryRun || len(result.Changes) == 0 && len(result.HostChanges) == 0 {
 		return result, nil
 	}
 	t := now()
@@ -155,12 +183,29 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 			return MachineApplyResult{}, err
 		}
 	}
+	if err = applyHostsTx(ctx, tx, result.HostChanges, t); err != nil {
+		return MachineApplyResult{}, err
+	}
+	for _, setting := range result.ClearedSettings {
+		if err = deleteDeviceSettingTx(ctx, tx, setting, "declaration"); err != nil {
+			return MachineApplyResult{}, err
+		}
+	}
+	if err = pruneDeviceStateTx(ctx, tx, policies); err != nil {
+		return MachineApplyResult{}, err
+	}
 	return result, tx.Commit()
 }
 
 // ListMachines is the machine declaration with what the providers report.
 func (s *Store) ListMachines(ctx context.Context) (Machines, error) {
 	out := Machines{GPUs: []DeclaredGPU{}, Undeclared: []UndeclaredGPU{}}
+	spec, err := declaredSpec(ctx, s.db)
+	if err != nil {
+		return out, err
+	}
+	out.Hosts = append([]machine.Host{}, spec.Hosts...)
+	out.Devices = append([]machine.DevicePolicy{}, spec.DevicePolicies()...)
 	// each declaration's row: the one on its node, else one still on a node the GPU is no longer declared for
 	rows, err := s.db.QueryContext(ctx, `SELECT d.uuid,d.node_id,d.declared_at,r.id,r.node_id,
 		(SELECT valid_until FROM resource_observations o WHERE o.resource_id=r.id ORDER BY id DESC LIMIT 1)

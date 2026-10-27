@@ -50,6 +50,7 @@ go run ./cmd/kairo project resume llm-develop
 go run ./cmd/kairo resource status
 go run ./cmd/kairo machine apply examples/machines.toml
 go run ./cmd/kairo machine show
+go run ./cmd/kairo hardware show
 ```
 
 The example configuration listens on loopback over plain HTTP (with
@@ -181,7 +182,7 @@ stored only as SHA-256 hashes; revocation takes effect immediately.
 |---|---|---|
 | `read` | every operator `GET` | dashboards |
 | `admin` | every operator route | the CLI, kairo-monitor, project controllers |
-| `node` | `/api/agent/*`, for one node | a node agent |
+| `node` | `/api/agent/*`, for one node | a node agent, a host's controller |
 | worker | `/api/worker/*`, for one attempt | the processes of an attempt |
 
 Operator and node tokens are managed on the daemon host by opening its
@@ -272,7 +273,8 @@ ca_file = "/etc/kairo/ca.pem"
 The rest (`log_directory`, `log_min_free_mib`, `observe_only`,
 `observation_interval_seconds`, `[node]`, `[[executors]]`, `[[providers]]`)
 has the same form as in the daemon configuration (`examples/kairo.toml`). An
-agent refuses an `http://` URL unless `insecure_http = true`.
+agent refuses an `http://` URL unless `insecure_http = true`. A host's device
+controller (`kairo controller`, see Hardware settings) connects the same way.
 
 ## API
 
@@ -296,6 +298,8 @@ agent refuses an `http://` URL unless `insecure_http = true`.
 | GET | `/api/resources` | read |
 | POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
 | GET, POST | `/api/machines` (the machine declaration) | read, admin |
+| GET | `/api/hardware` (`?host=`) | read |
+| POST, DELETE | `/api/hardware/{host}/{device}/settings` | admin |
 | POST | `/api/agent/{operation}`, `/api/agent/logs` | node |
 | POST | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
 | GET | `/api/worker/commands` | worker |
@@ -543,10 +547,177 @@ refuses to drop a node from a GPU whose row on that node a live lease holds;
 Containers share the host's RAM and CPUs as well, which Kairo accounts per
 node: keep their memory limits within the host's.
 
-`POST /api/machines` takes `{"nodes": [{"id", "gpus"}], "dry_run"}` and
-answers `{"changes": [{"uuid", "from", "to"}], "unchanged", "dry_run"}`; a
-leased GPU is `409 machine_conflict`. `GET /api/machines` answers `{"gpus",
-"undeclared"}`.
+Optional `[[hosts]]` tables declare the physical machines, and only what
+observation cannot tell: policy and authority. A host has an `id`, the `nodes`
+on it (containers, or the machine itself; a node is on at most one host), a
+`controller` (the node of the `kairo controller` that may change its devices'
+settings; none: its devices are only observed) and `max_slowdown`, the share
+of maximum performance its devices may give up for efficiency, in [0, 0.5)
+(omitted: 0, the hardware stays at its defaults). Its devices are every GPU
+declared for one of its nodes and `cpu` (its CPU packages); a GPU whose nodes
+are on two hosts is an error. `[[hosts.devices]]` overrides `max_slowdown` or
+sets `control = false` (never changed, never benched) for one device, a GPU
+UUID or `cpu`, listed once. Host nodes and controllers must be known nodes
+(a controller registers its node when it starts), and a controller controls
+one host. What a device is, how fast it clocks and how much power it draws is
+observed by providers and measured by benches, never declared. A host is
+replaced as a whole on apply; `--dry-run` prints `+ host`, `~ host` (each
+changed field, `from -> to`) and `- host`, and the device settings the apply
+removes (`- setting`: the device is no longer on a host, is `control = false`,
+or its host lost its controller). `machine show` adds the hosts and the
+effective policy of each device (its own value, else its host's; event
+`host_declaration_changed`).
+
+`POST /api/machines` takes `{"nodes": [{"id", "gpus"}], "hosts": [{"id",
+"nodes", "controller", "max_slowdown", "devices": [{"id", "max_slowdown",
+"control"}]}], "dry_run"}` and answers `{"changes": [{"uuid", "from", "to"}],
+"unchanged", "host_changes": [{"host", "from", "to"}], "unchanged_hosts",
+"cleared_settings", "dry_run"}`; a leased GPU is `409 machine_conflict`. `GET
+/api/machines` answers `{"gpus", "undeclared", "hosts", "devices"}`, the
+devices with `host_id`, `device_id`, `kind`, `max_slowdown`, `control` and
+`controller`.
+
+### Hardware settings
+
+A device of a host (a GPU by UUID, or `cpu`) can be given settings: a GPU's
+highest graphics clock (`graphics_clock_max_mhz`), a locked memory clock
+(`memory_clock_mhz`) and a power limit (`power_limit_w`); a CPU's highest
+frequency (`max_freq_mhz`, Windows and Linux cpufreq) or highest performance
+percentage (`max_perf_pct`, Linux intel_pstate). A setting left out is the
+hardware's default; no setting at all is the defaults. Kairo stores what is
+desired; the host's controller carries it out and reports what is in place.
+Nothing here holds back admission or a running job: a setting that fails is a
+recorded fact.
+
+- Owners: a setting is `manual` (an operator's), `bench` or `policy` (a bench
+  run's or the operating-point policy's, each belonging to a lease), one per
+  owner kind and device. The one in effect is manual, else bench, else policy,
+  so a bench run overrides the policy on a device it has leased. A bench or
+  policy setting needs a reserved, prepared or active lease on a node of the
+  host that, for a GPU, holds that GPU, and is refused (`409
+  device_setting_conflict`) while another lease's setting of that kind is
+  there; a policy setting is refused on a device whose `max_slowdown` is 0.
+  When a lease is released, by any path, its settings are removed in the same
+  transaction: no setting outlives its lease.
+- Capabilities: the controller reports what it can change on each device and
+  within which range (`nvidia-smi -q -d SUPPORTED_CLOCKS`, the power limit
+  range and default; the CPU's frequency range or intel_pstate's
+  `min_perf_pct`). A setting the device does not support, a value outside its
+  range, or one for a device whose controller has not reported yet is refused
+  with `400`.
+- Generation: every change of a device's setting in effect increments its
+  generation; the controller reports the generation it applied, so `hardware
+  show` tells `in sync` from `pending` and `failed` (with the error).
+- Events: `device_setting_requested`, `device_setting_cleared` (with why: an
+  operator, a released lease, the declaration), `device_setting_applied` and
+  `device_setting_failed` (once per distinct error).
+
+| Command | What it does |
+|---|---|
+| `kairo hardware show [HOST] [--json]` | per host: its nodes and controller (when last seen), then per device its policy, the setting in effect and its owner, what is applied, and `in sync`, `pending`, `failed`, `reset` (the controller returned it to defaults on its own), `not reported`, `observe only` or `not controlled`; then the errors, the settings overridden and what each device supports |
+| `kairo hardware set HOST DEVICE [--graphics-clock-max MHz] [--memory-clock MHz] [--power-limit W] [--cpu-max-freq MHz \| --cpu-max-perf PCT]` | sets the device's manual setting (as a whole: what is left out is the default) |
+| `kairo hardware reset HOST DEVICE` | clears the manual setting: the device follows a bench or policy setting, else returns to its defaults |
+
+`POST /api/hardware/{host}/{device}/settings` takes `{"settings", "owner":
+{"kind", "ref"}, "actor"}` (owner defaults to manual, whose ref is the actor;
+a bench or policy ref is its lease id) and `DELETE` the same without
+settings; both answer `{"host_id", "device_id", "generation", "effective",
+"cleared"}`. `GET /api/hardware` answers `{"hosts"}` as `hardware show
+--json` prints them. In-process components use the store's
+`SetDeviceSetting`, `ClearDeviceSetting` and `DevicePolicies`.
+
+#### The controller
+
+`kairo controller --config kairo-controller.toml` (see
+`examples/kairo-controller.toml`) runs on the physical host, with `server_url`,
+`token`, `ca_file` and `insecure_http` as for an agent and a `[node]` of its
+own: give it a node token (`kairo token create --role node --node
+pve0-host`), start it once so its node is known, then name that node as the
+host's `controller`. Its node has no executors and is never scheduled; a node
+that already exists (one that also runs an agent) is left as it is. Every
+`poll_interval_seconds` (10) it fetches the settings of the devices it
+controls, which is every device with `control = true` of the host naming it
+and nothing else, changes what differs, reports what is in place, what failed
+and what each device supports, and counts as its heartbeat.
+
+- GPUs, by UUID with `nvidia-smi -i`: `-lgc LOWEST,MAX` / `-rgc`, `-lmc M,M` /
+  `-rmc`, `-pl W` / `-pl` `power.default_limit`. A reset the card does not
+  offer (exit code 3) is already the default.
+- Linux CPUs: intel_pstate's `max_perf_pct` when the driver has it (default
+  100), else cpufreq's `scaling_max_freq` of every CPU (default its
+  `cpuinfo_max_freq`).
+- Windows CPU: the AC value of `PROCFREQMAX` (and `PROCFREQMAX1` where Windows
+  has it) of the active power scheme, which is then re-activated. What the
+  user had there cannot be read back after a change, so the controller writes
+  it to its state file (`state_file`, default `<config name>.state.json` next
+  to the configuration) before its first change of a scheme, never with values
+  it set itself, and writes it back on reset. A state file it cannot read
+  stops it: fix or remove it by hand.
+
+It errs toward the hardware's defaults:
+
+- On start every controlled device is brought to its desired setting, or
+  reset to its defaults when it has none (a crash may have left settings).
+- On SIGTERM or Ctrl-C it resets every device it may have changed, then
+  reports.
+- When the daemon has not answered for `reset_after_seconds` (120), it resets
+  every device, and applies the desired settings again once the daemon is
+  back. The state file also lists the controlled devices, so a controller
+  restarted while the daemon is down resets them too.
+- A change that fails is reported and retried after 5 s, doubling up to 5 min
+  (a new request is tried at once); it never stops the loop.
+- A device that leaves its control (dropped from the host, `control = false`,
+  another controller) is reset at once if it may have changed it (a failed
+  reset is retried, five times at most), then never touched again.
+
+A setting in place is carried out again every 10 minutes, in case a driver
+reload or another controller's reset undid it. An observe-only daemon tells a
+controller it controls nothing: it changes no setting, and only returns the
+devices it may have changed (those its state file lists) to their defaults.
+Changing GPU clocks, power limits and processor settings needs
+privileges the daemon does not have:
+
+- Linux (a Proxmox host, as root; containers see the GPU but may not change
+  it): a systemd unit,
+
+  ```ini
+  # /etc/systemd/system/kairo-controller.service
+  [Unit]
+  Description=Kairo device controller
+  After=network-online.target nvidia-persistenced.service
+  Wants=network-online.target
+
+  [Service]
+  ExecStart=/usr/local/bin/kairo controller --config /etc/kairo/kairo-controller.toml
+  Restart=on-failure
+  RestartSec=10
+  KillSignal=SIGTERM
+  TimeoutStopSec=150
+
+  [Install]
+  WantedBy=multi-user.target
+  ```
+
+  then `systemctl enable --now kairo-controller`. Keep the NVIDIA persistence
+  daemon running: without it the driver may drop clocks and limits when no
+  process holds the GPU.
+- Windows (elevated; the daemon itself runs unelevated): a scheduled task
+  with the highest run level, started at boot,
+
+  ```powershell
+  $action = New-ScheduledTaskAction -Execute "D:\Kairo\kairo.exe" -Argument "controller --config D:\Kairo\kairo-controller.toml" -WorkingDirectory "D:\Kairo"
+  $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+  $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit 0 -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
+  Register-ScheduledTask -TaskName "kairo-controller" -Action $action -Trigger (New-ScheduledTaskTrigger -AtStartup) -Principal $principal -Settings $settings
+  ```
+
+  `Stop-ScheduledTask` and a shutdown end it without its graceful stop: the
+  GPUs return to their defaults with the driver at boot, and the processor
+  settings when the controller next starts (from its state file). Ctrl-C in
+  a console is a graceful stop.
+
+The controller warns at start when it is not elevated (Windows) or not root
+(Linux); its changes then fail and are reported as such.
 
 ### Node quarantine
 
@@ -764,7 +935,7 @@ starts attempts without their declared `env`, and a daemon older than the
 agent refuses its log problem reports (the agent logs them). A daemon opening an older
 database migrates it in place (the `cancelled` task state, reruns, the `env`
 column, the machine declaration, which starts out declaring every registered
-GPU for the node it is registered on, and its (uuid, node) key for shared GPUs, the attempt log problems, the admission tables); keep the backup, since an older binary would read a rerun Task's
+GPU for the node it is registered on, and its (uuid, node) key for shared GPUs, the attempt log problems, the admission tables, the hosts and device settings, which start out empty); keep the backup, since an older binary would read a rerun Task's
 earlier execution as its outcome again.
 
 ## Verification
@@ -778,4 +949,6 @@ git diff --check
 ```
 
 Real NVIDIA, WSL, process-kill, and DDP runs are host-specific integration
-tests rather than ordinary unit tests.
+tests rather than ordinary unit tests, and so are the controller's changes of
+real clocks, power limits and processor settings (its tests use fake
+actuators).

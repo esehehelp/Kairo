@@ -499,6 +499,9 @@ func (s *Store) abortPlacement(ctx context.Context, placementID, reason string) 
 	if err = appendCoordinationEventTx(ctx, tx, "gang_placement_aborted", &projectID, "gang", gangID, nil, map[string]any{"placement_id": placementID, "reason": reason}); err != nil {
 		return false, err
 	}
+	if err = clearReleasedLeaseSettingsTx(ctx, tx); err != nil {
+		return false, err
+	}
 	if err = tx.Commit(); err != nil {
 		return false, err
 	}
