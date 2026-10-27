@@ -747,6 +747,176 @@ Cloud provisioning, roles beyond the four above, service supervision,
 cron/fair-share scheduling, and hard CPU/RAM enforcement remain outside this
 pilot.
 
+## Hardware benchmarks
+
+Measurement primitives for hardware efficiency: each runs one fixed,
+deterministic workload for a given time and streams what it did, so an
+orchestrator can window the intervals, compare them with a reference run and
+combine them with energy, at each device setting it sweeps (clock caps,
+power limits). They record measured facts, stamped with the date and the
+workload version, and never compare with vendor specifications. A bench is
+an ordinary execution: its argv is
+
+```text
+kairo bench run WORKLOAD [--seconds S] [--interval S] [workload flags]
+kairo-bench-gpu WORKLOAD --device GPU-UUID [--seconds S] [--interval S] [flags]
+kairo bench serve --listen HOST:PORT        # the peer of net-latency / net-bandwidth
+```
+
+`--seconds` (default 60; 0 runs until stopped) ends the run, as does SIGTERM,
+Ctrl-C or CTRL_BREAK: the run stops issuing work, waits for the requests in
+flight, writes its final interval and end record, cleans up and exits 0. A
+usage error (a bad or unsafe parameter) exits 2 and writes no record; a run
+refused by the machine (too little free space or memory, no such device) or
+failing writes an end record and exits 1. `kairo bench run WORKLOAD --help`
+lists a workload's flags.
+
+| Workload | Work | Unit |
+|---|---|---|
+| `cpu-compute` | per iteration 8 FP64 FMA chains + one xorshift64 step in registers (22 ops), `--threads` (default every logical CPU) | op |
+| `cpu-single` | the same on one thread pinned to `--cpu` (start says whether the pin held) | op |
+| `cpu-stream` | STREAM triad `a=b+3c` over three `--bytes` arrays (default 1 GiB each; 24 bytes per element: 2 reads + 1 write, write-allocate not counted) | byte |
+| `disk-seq` | 1 MiB sequential `--mode read\|write` at `--qd 1\|32` | byte |
+| `disk-rand` | 4 KiB random `--mode read\|write`; `--qd 1` for latency, 32 for IOPS (`ops`) | byte |
+| `disk-fsync` | 4 KiB write + fdatasync / FlushFileBuffers, one at a time | byte |
+| `disk-sustained` | 1 MiB sequential writes (default `--qd 32`) until `--max-write-bytes`: per-interval bandwidth shows SLC cache cliffs | byte |
+| `net-latency` | 64-byte TCP ping-pong (TCP_NODELAY), each echo checked | request |
+| `net-bandwidth` | 128 KiB writes (`--dir send`) or reads (`--dir recv`) on `--streams 1\|4` connections, application bytes | byte |
+| `gemm` (GPU) | cuBLAS bf16 tensor-core GEMM, fp32 accumulate, `--n` 8192: 2n³ per op | flop |
+| `copy` (GPU) | device-to-device copy, `--bytes` total footprint (default 2 GiB): read + write counted | byte |
+| `gemv` (GPU) | bf16 n×n matrix times `--batch 1\|8` vectors (memory-bound, like LLM decode) | byte, flop |
+| `pcie` (GPU) | pinned host memory `--dir h2d\|d2h`; `--mode bandwidth` 64 MiB transfers, `latency` 4 KiB transfers with percentiles | byte |
+
+### Records
+
+One JSON object per line. Every record has `schema` (`kairo.bench/v1`),
+`type` (`start`, `interval`, `end`), `run_id` (16 hex digits), `program`
+(`kairo` or `kairo-bench-gpu`), `workload`, `wall` (UTC, RFC 3339 with
+nanoseconds) and `mono_ns` (monotonic nanoseconds since the start record;
+QueryPerformanceCounter on Windows, whose Go clock follows the timer tick).
+
+- `start`, written once setup is done (files prefilled, memory allocated,
+  connections open, GPU warm), right before the timed work: `version` (the
+  workload definition; it changes when a unit of work changes), `build` (VCS
+  revision), `params` (every effective parameter), `units` (primary first),
+  `host` (`hostname`, `os`, `os_version` (kairo only), `arch`, `cpu_model`,
+  `logical_cpus`), `device`
+  (what identifies the device under test, below) and `setup` (facts of the
+  setup: `direct_io`, `prefill_ns`, `pinned`, the GPU batch size...).
+- `interval`, every `--interval` seconds (default 1) at fixed boundaries
+  `start + k·interval`: `index`, `begin_ns`, `end_ns` (each interval begins
+  where the previous ended; the last is partial: kairo credits it the
+  requests in flight at the stop, kairo-bench-gpu ends it at the deadline or
+  signal and drains its in-flight batches uncounted), `work` (`{unit: count}`
+  completed in the interval, credited when an operation completes), `ops`
+  (operations: requests, round trips, kernel chunks, GPU ops),
+  `device_busy_ns` (GPU-measured busy time, CUDA events; null for kairo) and
+  `latency` (`count`, `min_ns`, `mean_ns`, `p50_ns`, `p99_ns`, `p999_ns`,
+  `max_ns`, or null). GPU intervals add `nvml`: `samples`, `energy_mj` (the
+  energy counter's delta over the interval), `power_mw`, `sm_clock_mhz`,
+  `mem_clock_mhz`, `temperature_c`, `util_gpu_pct`, `util_mem_pct` (each
+  `{min, mean, max}` of the `--sample-ms` samples), `pstate` (`{min, max}`)
+  and `clocks_event_reasons` (the OR of the samples); a value NVML cannot
+  read is null.
+- `end`, always last: `reason` (`duration`, `signal` or `limit` — exit 0;
+  `error` or `refused` — exit 1), `limit` and `limit_detail` for a limit,
+  `error`, `elapsed_ns` (the measurement window: the last interval's end;
+  `mono_ns` is later, after cleanup), `intervals`, the `work`, `ops`, `device_busy_ns` and
+  `latency` of the whole run, `energy_mj` (GPU), and for storage
+  `bytes_written` (the probe and the prefill included) and `file_removed`. A
+  run refused or failing before its start record writes only an end record,
+  which then carries `params` and, when known, `device`.
+
+Percentiles are nearest-rank over a log-linear histogram (exact below 128 ns,
+then 128 buckets per power of two: within 0.4%); both programs use the same
+buckets. `device` is `kind` `cpu` (`model`, `logical_cpus`, `gomaxprocs`,
+`fma`), `memory` (the same plus `total_bytes`, `available_bytes`), `storage`
+(`path`, `volume_path`, `filesystem`, `free_bytes`, `total_bytes`, sector
+sizes, `disk_model`, `disk_serial`, `disk_revision`, `disk_bus`, and on Windows
+`volume_serial`, on Linux `mount_source`, `block_device`, `rotational`),
+`network` (`local_addr`, `remote_addr`, the `interface` holding the local
+address — the one the route chose — its `mtu`, and the OS-reported
+`link_speed_tx_bps` / `link_speed_rx_bps`, a fact that a virtual NIC may
+report meaninglessly) or `gpu` (below).
+
+### Safety
+
+- Storage: the test file `kairo-bench-<id>.tmp` in `--path` (an existing
+  directory on the filesystem to test) is refused unless `--file-size` (1 GiB;
+  disk-fsync 64 MiB, disk-sustained 8 GiB) ≤ free space − `--keep-free`
+  (5 GiB) − 1 GiB. Every byte written counts against `--max-write-bytes`
+  (20 GiB, the prefill included; a prefill that alone would pass it is
+  refused), and the run ends with reason `limit` before the write that would
+  pass it; a write run also ends when free space falls below `--keep-free`.
+  The OS cache is bypassed (Windows `FILE_FLAG_NO_BUFFERING |
+  FILE_FLAG_WRITE_THROUGH`, Linux `O_DIRECT`, 4 KiB-aligned buffers or the
+  device's sector size); a filesystem that refuses it (tmpfs) runs buffered
+  with `setup.direct_io` false. The file is removed on every exit: Windows
+  opens it `FILE_FLAG_DELETE_ON_CLOSE` and Linux unlinks it as soon as it is
+  open, so even a killed run leaves nothing. Writes are incompressible and
+  every 4 KiB sector is distinct.
+- `cpu-stream` refuses arrays that, with a 2 GiB margin, exceed the available
+  memory.
+- `kairo bench serve` echoes, sinks or sources one test per connection (at
+  most 16 at a time, each closed after `--max-conn-duration`, default 1h),
+  writes one JSON line per connection, and exits after `--idle-timeout`
+  (default 5m) without connections. It serves anyone who connects: listen on
+  a trusted network.
+
+### GPU bench
+
+`bench/gpu/kairo-bench-gpu.cu` (CUDA C++, cuBLAS, NVML) is built separately
+for Ampere (sm_86, RTX 3080 / 3060) with a compute_86 PTX fallback:
+
+```text
+cmd /c bench\gpu\build-windows.cmd     # CUDA 13.x + MSVC 2022 x64 (finds vcvars64 through vswhere)
+make -C bench/gpu                      # Linux, CUDA_HOME=/usr/local/cuda; CUBLAS_STATIC=1 links cuBLAS statically
+```
+
+Both embed the revision (`BUILD_REV=...` overrides it). cudart is linked
+statically; NVML is loaded at run time (System32 `nvml.dll`,
+`libnvidia-ml.so.1`) and optional — without it every `nvml` value is null.
+On Windows cuBLAS is delay-loaded: `gemm` and `gemv` need `cublas64_13.dll`
+and `cublasLt64_13.dll` on PATH or beside the exe (a missing one is a clean
+`error` end), `copy` and `pcie` need no cuBLAS (their `cublas_version` is
+null). On Linux the shared cuBLAS is needed even for `--help` unless linked
+statically. The driver must support the toolkit it was built with.
+
+- `--device GPU-UUID` (required, as `nvidia-smi -L` prints it) is matched
+  against the visible devices' UUIDs (whatever `CUDA_VISIBLE_DEVICES` is);
+  no match is refused, listing the visible UUIDs.
+- Flags: `--seconds`, `--interval`, `--sample-ms` (NVML sampling period,
+  default 100), `--n` (gemm, gemv; multiple of 64, 256..32768), `--bytes`
+  (copy; binary suffixes, a multiple of 2 MiB), `--batch 1|8` (gemv), `--dir
+  h2d|d2h` and `--mode bandwidth|latency` (pcie), `--reserve-mib` (512: device
+  memory left free). A flag that does not apply to the workload is a usage
+  error. `--help`, `--version` (JSON: build, workload versions) and
+  `--validate-only` (the effective parameters as one `"type":"params"` line)
+  return before any CUDA, cuBLAS or NVML call.
+- Memory is checked, never tried: before creating a context NVML's free
+  memory must hold the buffers, the reserve and a 400 MiB context estimate;
+  after it `cudaMemGetInfo` must hold the buffers and the reserve, and the
+  free memory after allocating must still hold the reserve. Otherwise the run
+  is refused.
+- Inputs are filled on the device with a fixed pseudo-random pattern in
+  [-1, 1) (data values change power). Work is issued in batches calibrated to
+  about 20 ms, two in flight, bracketed by CUDA events: a batch counts in the
+  interval in which its end is seen, and `device_busy_ns` sums the event
+  times. pcie latency mode issues and synchronizes each 4 KiB transfer alone
+  (spin-wait, `setup.sync` `spin`; the others block) and reports host-measured
+  latencies, their sum as `device_busy_ns`.
+- `device` (`kind` `gpu`): `uuid`, `name`, `pci_bus_id`,
+  `compute_capability`, `sm_count`, `memory_total_bytes`,
+  `memory_free_bytes`, `driver_version`, `cuda_driver_version`,
+  `cuda_runtime_version`, `cublas_version`, `nvml_available`,
+  `power_limit_mw` (enforced), `applications_clock_mhz` and `max_clock_mhz`
+  (`sm`, `mem`, as the device reports them), `vbios_version`. The main thread
+  reads the energy counter at every interval boundary, so `energy_mj` covers
+  exactly the interval's work window.
+- SIGTERM, SIGINT, CTRL_C, CTRL_BREAK and CTRL_CLOSE stop it cleanly (exit
+  0); a very long op (gemm at n=32768 is ~2 s) delays the stop by up to two
+  ops.
+
 ## Upgrading a running installation
 
 A daemon (or node agent) that starts marks the attempts its executors had
@@ -778,4 +948,6 @@ git diff --check
 ```
 
 Real NVIDIA, WSL, process-kill, and DDP runs are host-specific integration
-tests rather than ordinary unit tests.
+tests rather than ordinary unit tests. The bench tests run tiny workloads
+(TempDir files of a few MiB, loopback); `kairo-bench-gpu` is only built by
+them, and a GPU bench belongs on an idle GPU.

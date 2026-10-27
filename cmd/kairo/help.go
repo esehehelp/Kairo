@@ -102,6 +102,7 @@ var topAliases = map[string]string{
 	"list": "task list", "wait": "task wait", "watch": "project watch", "apply": "project apply",
 	"show": "task show", "cancel": "task cancel", "rerun": "task rerun", "-v": "version",
 	"--version": "version", "health": "doctor", "daemon": "serve", "server": "serve",
+	"benchmark": "bench", "perf": "bench",
 }
 
 const remoteNote = "API commands take --api URL (default $KAIRO_API, else " + defaultAPIURL + "); the token comes from\n" +
@@ -241,6 +242,13 @@ func init() {
 				{"compact", "(--config DAEMON.toml | --db PATH)", "prune resource observations and VACUUM the database", dbCompact},
 			},
 			aliases: map[string]string{"vacuum": "compact"},
+		}},
+		{name: "bench", summary: "measure hardware: run a fixed workload as JSON lines, or serve the network peer", group: &commandGroup{
+			subs: []command{
+				{"run", "WORKLOAD [--seconds S] [--interval S] [workload flags]", "run a workload, streaming start, interval and end records", benchRun},
+				{"serve", "--listen HOST:PORT [--idle-timeout D] [--max-conn-duration D]", "the peer of the network workloads", benchServe},
+			},
+			aliases: map[string]string{"start": "run", "exec": "run", "server": "serve", "listen": "serve", "peer": "serve"},
 		}},
 		{name: "help", summary: "help for a command: kairo help task logs", run: helpCommand},
 	}

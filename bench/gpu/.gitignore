@@ -1,0 +1,8 @@
+# build outputs of build-windows.cmd / Makefile
+*.exe
+*.obj
+*.o
+*.lib
+*.exp
+*.pdb
+/kairo-bench-gpu
