@@ -12,12 +12,15 @@ import (
 )
 
 type Config struct {
-	DatabasePath               string `toml:"database_path"`
-	Listen                     string `toml:"listen"`
-	AdvertiseURL               string `toml:"advertise_url"`
-	LogDirectory               string `toml:"log_directory"`
-	ObserveOnly                bool   `toml:"observe_only"`
-	ObservationIntervalSeconds int    `toml:"observation_interval_seconds"`
+	DatabasePath string `toml:"database_path"`
+	Listen       string `toml:"listen"`
+	AdvertiseURL string `toml:"advertise_url"`
+	LogDirectory string `toml:"log_directory"`
+	// LogMinFreeMiB is the free space (MiB) the filesystem holding
+	// log_directory must have for an executor to launch (0: 1024).
+	LogMinFreeMiB              int  `toml:"log_min_free_mib"`
+	ObserveOnly                bool `toml:"observe_only"`
+	ObservationIntervalSeconds int  `toml:"observation_interval_seconds"`
 	// TLS: the daemon serves HTTPS with this certificate (kairo tls init).
 	// The CA is handed to attempts so they can verify the daemon.
 	TLSCertFile string `toml:"tls_cert_file"`
@@ -76,6 +79,9 @@ func Load(path string) (Config, error) {
 		return c, errors.New("unknown config field: " + undecoded[0].String())
 	}
 	defaults(&c)
+	if c.LogMinFreeMiB < 0 {
+		return c, errors.New("log_min_free_mib must not be negative")
+	}
 	// [node] names the control node itself. Executors and providers are
 	// optional: a control-only daemon runs no jobs, and every job host runs
 	// `kairo agent` instead.
@@ -145,6 +151,9 @@ func defaults(c *Config) {
 	if c.LogDirectory == "" {
 		c.LogDirectory = "local/attempts-v3"
 	}
+	if c.LogMinFreeMiB == 0 {
+		c.LogMinFreeMiB = DefaultLogMinFreeMiB
+	}
 	if c.ObservationIntervalSeconds == 0 {
 		c.ObservationIntervalSeconds = 5
 	}
@@ -160,6 +169,9 @@ func defaults(c *Config) {
 		}
 	}
 }
+
+// DefaultLogMinFreeMiB is log_min_free_mib when it is not set.
+const DefaultLogMinFreeMiB = 1024
 
 // Agent configures `kairo agent`: a node on another host whose executors and
 // providers are driven through the daemon's /api/agent operations.
@@ -178,6 +190,7 @@ type Agent struct {
 	// InsecureHTTP allows an http:// server_url.
 	InsecureHTTP               bool       `toml:"insecure_http"`
 	LogDirectory               string     `toml:"log_directory"`
+	LogMinFreeMiB              int        `toml:"log_min_free_mib"`
 	ObserveOnly                bool       `toml:"observe_only"`
 	ObservationIntervalSeconds int        `toml:"observation_interval_seconds"`
 	Node                       Node       `toml:"node"`
@@ -217,6 +230,12 @@ func LoadAgent(path string) (Agent, error) {
 	}
 	if a.LogDirectory == "" {
 		a.LogDirectory = "local/attempts-agent"
+	}
+	switch {
+	case a.LogMinFreeMiB < 0:
+		return a, errors.New("log_min_free_mib must not be negative")
+	case a.LogMinFreeMiB == 0:
+		a.LogMinFreeMiB = DefaultLogMinFreeMiB
 	}
 	if a.ObservationIntervalSeconds == 0 {
 		a.ObservationIntervalSeconds = 5

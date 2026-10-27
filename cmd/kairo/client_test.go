@@ -390,7 +390,7 @@ func TestDoctorChecksTheTokenThenShowsResources(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(out, "authenticated as operator (admin)\n") || !strings.Contains(out, `"resources"`) {
+	if !strings.HasPrefix(out, "authenticated as operator (admin)\n") || !strings.HasSuffix(out, "\n\nno resources registered\n") {
 		t.Fatalf("output: %q", out)
 	}
 	if strings.Join(requests, ",") != "GET /api/whoami,GET /api/resources" {

@@ -68,6 +68,7 @@ const (
 	usageFreshness = 2 * time.Minute
 )
 
+// liveLeaseStates are the lease states that hold their resources.
 const liveLeaseStates = `('reserved','prepared','active','releasing','stale','revocation_requested')`
 
 type planExecutor struct {

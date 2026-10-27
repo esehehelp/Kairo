@@ -33,6 +33,10 @@ type TaskStatus struct {
 	Result     json.RawMessage `json:"result,omitempty"`
 	CreatedAt  string          `json:"created_at"`
 	UpdatedAt  string          `json:"updated_at"`
+	// Paused is the closed admission gate holding a pending or running task
+	// back (the innermost of its project, queue and task gates), nil when all
+	// are open. It is a view, not a state: the task stays pending or running.
+	Paused *TaskGate `json:"paused,omitempty"`
 }
 
 type TaskExecution struct {

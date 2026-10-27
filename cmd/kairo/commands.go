@@ -322,8 +322,10 @@ func resourceAction(action string, args []string) error {
 	fs := newFlags("resource " + action)
 	api := apiFlag(fs)
 	var reason *string
-	var confirmAbsent *bool
+	var confirmAbsent, asJSON *bool
 	switch action {
+	case "status":
+		asJSON = fs.Bool("json", false, "print the daemon's response")
 	case "quarantine":
 		reason = fs.String("reason", "operator request", "quarantine reason")
 	case "reconcile":
@@ -341,7 +343,7 @@ func resourceAction(action string, args []string) error {
 		if err != nil {
 			return err
 		}
-		return printResources(client)
+		return printResources(client, *asJSON)
 	}
 	if len(positional) != 1 {
 		return usageError("resource %s requires RESOURCE_ID", action)
@@ -360,10 +362,6 @@ func resourceAction(action string, args []string) error {
 		return err
 	}
 	return client.print(http.MethodPost, "/api/resources/"+url.PathEscape(positional[0])+"/"+action, body)
-}
-
-func printResources(client *apiClient) error {
-	return client.print(http.MethodGet, "/api/resources", nil)
 }
 
 func doctorCommand(args []string) error {
@@ -395,7 +393,8 @@ func doctorCommand(args []string) error {
 	}
 	fmt.Println(line)
 	printVersions(who.Version, nil)
-	return printResources(client)
+	fmt.Println()
+	return printResources(client, false)
 }
 
 func withQuery(path string, values url.Values) string {

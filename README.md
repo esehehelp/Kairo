@@ -121,6 +121,16 @@ run and the dependencies they need, keeping each kept Task's digest.
 reserves, launches, suspends, or releases work. It is the recommended first
 deployment mode on a host with unmanaged training processes.
 
+`kairo resource status` prints one row per resource, by node (GPUs, then
+cpu, ram and disk): its state (with a quarantine's reason), total and free as
+last observed (a GPU's memory and utilization; a cpu's cores), what live
+leases reserve of a cpu, ram or disk, and the tasks holding it (with the lease
+state unless `active`); then the external claims with their evidence, and the
+GPUs reported but not declared for their node. `--json` prints the response of
+`GET /api/resources` instead, whose resources also carry `total_bytes`,
+`free_bytes`, `utilization`, `reserved` and `holders`. `kairo doctor` ends with
+the same table.
+
 Resource observations describe the present: only each resource's latest one
 is used, and the daemon prunes the others once they are an hour old.
 `kairo db compact --config kairo.toml` (with the daemon stopped) prunes them
@@ -138,13 +148,19 @@ be left out of task commands for Tasks declared by a ProjectSpec.
 
 | Command | What it prints |
 |---|---|
-| `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
-| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates, every execution with its attempts, nodes, exit, log paths and sizes, gang ranks, and why a waiting execution waits |
+| `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress or pause) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
+| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, log paths and sizes, log issues, gang ranks, and why a waiting execution waits |
 | `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | the last N lines (default 50, `0` all) of the latest attempt's logs, also for attempts on agent nodes; `-f` follows until the attempt has exited and its logs stopped growing |
 | `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | one line per state change (`10:01:33 hello running -> succeeded`), `DOWN`/`UP` while the daemon is unreachable, `STALL` when a running Task's logs stop growing for D; exits 0 when all succeeded (or started), 1 when one ended otherwise, 2 on timeout, 3 on a usage or lookup error |
 | `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | state changes, progress (once a minute per Task) and a summary every 10 min; with `--exit-when-idle` it exits when nothing is pending or running (1 if a watched Task did not succeed) |
 | `kairo execution logs EXECUTION_ID`, `kairo logs ATTEMPT_ID` | the same logs by execution or attempt |
 | `kairo version` | the CLI's and the daemon's build; `doctor` warns when they differ |
+
+A pending or running Task held back by a closed gate of its project, queue or
+task keeps its state; its note says `paused: task gate closed by alice` once
+nothing of it runs (its continuation waits behind the gate), or `pausing`
+while its execution is still being suspended. A pause is a view of the gates,
+not a stored Task state, so `--state` does not select it.
 
 The line-oriented `wait` and `watch` suit a background monitor: each line is
 one event and is flushed at once. `project status PROJECT` still prints JSON
@@ -253,10 +269,10 @@ ca_file = "/etc/kairo/ca.pem"
 # attempt_api_url = "https://192.168.1.12:7474"  # KAIRO_API_URL of this node's attempts
 ```
 
-The rest (`log_directory`, `observe_only`, `observation_interval_seconds`,
-`[node]`, `[[executors]]`, `[[providers]]`) has the same form as in the daemon
-configuration (`examples/kairo.toml`). An agent refuses an `http://` URL
-unless `insecure_http = true`.
+The rest (`log_directory`, `log_min_free_mib`, `observe_only`,
+`observation_interval_seconds`, `[node]`, `[[executors]]`, `[[providers]]`)
+has the same form as in the daemon configuration (`examples/kairo.toml`). An
+agent refuses an `http://` URL unless `insecure_http = true`.
 
 ## API
 
@@ -295,8 +311,11 @@ quarantine, cancel or rerun request is recorded as the token's name.
 the filter. Each Task has `created_at` and `updated_at`, and each execution its
 attempt, executor, timestamps and latest progress without `detail`.
 `GET /api/projects/{project}/tasks/{task}` adds the declaration (`spec`),
-dependencies, dependants, scope gates, and per execution its attempts (with
-log paths and sizes), gang ranks and `waiting` reasons. Apply answers
+dependencies, dependants, scope gates (a closed one with `closed_by` and
+`closed_at`, from the pause operation that closed it), and per execution its
+attempts (with log paths and sizes and `log_problems`), gang ranks and
+`waiting` reasons. A live Task held back by a closed gate has `paused`, the
+innermost such gate. Apply answers
 `{"project", "spec_digest", "idempotent", "created", "unchanged"}`. Cancel
 takes `{"actor", "dry_run"}` and answers `{"task", "state", "withdrawn",
 "dry_run"}`; rerun takes `{"actor", "request_id"}` (a repeated `request_id`
@@ -451,6 +470,39 @@ A process that cannot be read (another user's, a kernel without
 whole reservation. Attempts launched by an earlier instance of the executor
 (before an agent restart) are not sampled.
 
+### Attempt logs
+
+An attempt's stdout and stderr are files in its executor's `log_directory`
+(`<attempt>.stdout.log`, `<attempt>.stderr.log`), written by the attempt's
+processes themselves. A node agent ships them into the daemon's
+`log_directory`, which `task show`, `task logs` and `GET
+/api/attempts/{id}/log` read.
+
+- An executor does not launch while the filesystem holding its
+  `log_directory` has less than `log_min_free_mib` free (default 1024, in the
+  daemon and the agent configuration): the execution ends `launch_aborted:
+  launch failed before activation: the filesystem of the attempt log
+  directory ... has 12.0 MiB free, below the minimum of 1.0 GiB`, which `task
+  show` and `task list` print. So does a free space measurement that fails,
+  and a log file that cannot be created.
+- While its attempts run, the executor checks that space every 15 s and
+  records on each attempt when it falls below the minimum (`log_space_low`)
+  or runs out (`log_space_exhausted`: output is being lost), and checks once
+  more as an attempt exits. A write the attempt's own process makes cannot be
+  seen to fail, so the space is what is watched.
+- An agent ships every log, an empty one too, and retries one the daemon
+  does not take (the daemon unreachable, or its own disk full, answered as an
+  `internal` failure) at every sweep from where the daemon's copy ends, so
+  nothing the node-side file holds is lost. One that has not reached the
+  daemon for 30 s is recorded on its attempt (`log_forward_failed`, per
+  stream), and so is its catching up. As an attempt exits, its logs are
+  shipped before its exit is recorded.
+
+Each problem is a coordination event (`attempt_log_problem`,
+`attempt_log_problem_resolved`) and a `log issue:` line of the attempt in
+`task show` (`log_problems` in the API), such as `log issue: stderr not
+shipped to the daemon: ... (10-27 10:01 to 10-27 10:04, caught up)`.
+
 ### Machine declaration
 
 Which node holds which GPU is declared, not discovered. `kairo machine apply
@@ -459,9 +511,9 @@ known to the daemon) and `gpus`, NVIDIA UUIDs as `nvidia-smi -L` prints them
 (see `examples/machines.toml`). Providers only observe. A GPU a provider
 reports that is not declared for its node, whether declared for another node
 or for none, is not registered and not scheduled; the rest of that poll still
-applies, and the GPU is listed as undeclared by `kairo machine show` and in
-`undeclared_gpus` of `kairo resource status` (a registered GPU in that
-situation has `derived_state` `undeclared`).
+applies, and the GPU is listed as undeclared by `kairo machine show` and
+`kairo resource status` (`undeclared_gpus` with `--json`; a registered GPU in
+that situation has `derived_state` `undeclared`).
 
 To move a GPU between nodes, declare it for its new node. It stays registered
 on the old node, unschedulable, until the new node's provider reports it,
@@ -708,10 +760,11 @@ executions will load (scripts, the editable SDK) must not change while they
 wait.
 
 Replace the agents together with the daemon: an agent older than the daemon
-starts attempts without their declared `env`. A daemon opening an older
+starts attempts without their declared `env`, and a daemon older than the
+agent refuses its log problem reports (the agent logs them). A daemon opening an older
 database migrates it in place (the `cancelled` task state, reruns, the `env`
 column, the machine declaration, which starts out declaring every registered
-GPU for the node it is registered on, and its (uuid, node) key for shared GPUs); keep the backup, since an older binary would read a rerun Task's
+GPU for the node it is registered on, and its (uuid, node) key for shared GPUs, the attempt log problems, the admission tables); keep the backup, since an older binary would read a rerun Task's
 earlier execution as its outcome again.
 
 ## Verification

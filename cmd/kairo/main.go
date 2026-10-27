@@ -283,6 +283,7 @@ func serve(args []string) error {
 		exec.Attributes = configured.Labels
 		exec.ObserveOnly = daemonConfig.ObserveOnly
 		exec.ObservationInterval = time.Duration(daemonConfig.ObservationIntervalSeconds) * time.Second
+		exec.MinLogFreeBytes = int64(daemonConfig.LogMinFreeMiB) << 20
 		exec.Providers = providerSet
 		go func() {
 			if err := exec.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

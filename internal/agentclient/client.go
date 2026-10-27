@@ -154,6 +154,10 @@ func (c *Client) SetAttemptLogPaths(ctx context.Context, attemptID string, epoch
 	return c.call(ctx, "set-log-paths", map[string]any{"attempt_id": attemptID, "epoch": epoch, "stdout_path": stdoutPath, "stderr_path": stderrPath}, nil)
 }
 
+func (c *Client) RecordAttemptLogProblem(ctx context.Context, attemptID string, problem store.LogProblem) error {
+	return c.call(ctx, "log-problem", map[string]any{"attempt_id": attemptID, "problem": problem}, nil)
+}
+
 func (c *Client) MarkAttemptProcessExited(ctx context.Context, attemptID, role string, rank int, identity string) error {
 	return c.call(ctx, "mark-process-exited", map[string]any{"attempt_id": attemptID, "role": role, "rank": rank, "identity": identity}, nil)
 }
@@ -246,19 +250,39 @@ type GapError struct{ Size int64 }
 func (e *GapError) Error() string { return fmt.Sprintf("log gap; daemon has %d bytes", e.Size) }
 
 // LogShipper copies every attempt log in Dir to the daemon, appending new
-// bytes as the files grow. Offsets live in memory: after an agent restart the
-// first append starts at 0 and the daemon skips what it already has.
+// bytes as the files grow; an empty log is shipped too, so the daemon holds
+// every log an attempt has, even one it could not write to. Offsets live in
+// memory: after an agent restart the first append starts at 0 and the daemon
+// skips what it already has. A log that cannot be shipped (the daemon is
+// unreachable, or its disk is full) is retried at every sweep from where the
+// daemon's copy ends, so nothing is lost while the node-side file exists; one
+// that has not reached the daemon for ReportAfter is recorded on its attempt
+// (log_forward_failed), and so is its catching up.
 type LogShipper struct {
 	Client   *Client
 	Dir      string
 	Interval time.Duration
 	Chunk    int
+	// ReportAfter is how long shipping a log may fail before the failure is
+	// recorded on its attempt (zero: 30 s); a shorter outage leaves no trace.
+	ReportAfter time.Duration
+	// Clock is the time source (nil: time.Now).
+	Clock func() time.Time
 
 	mu      sync.Mutex
 	shipped map[string]int64
 	// refused holds logs the daemon will never take (no such attempt, or
 	// another node's), so they are not read and re-sent every sweep.
 	refused map[string]bool
+	// failing holds the logs whose last shipping failed, by name.
+	failing map[string]*shipFailure
+}
+
+// shipFailure is a log that has not reached the daemon since a time.
+type shipFailure struct {
+	since    time.Time
+	err      string
+	reported bool // recorded on the attempt
 }
 
 func (s *LogShipper) Run(ctx context.Context) error {
@@ -278,33 +302,116 @@ func (s *LogShipper) Run(ctx context.Context) error {
 	}
 }
 
-// Sweep ships whatever each log file has gained since the last sweep.
-func (s *LogShipper) Sweep(ctx context.Context) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *LogShipper) init() {
 	if s.shipped == nil {
 		s.shipped = map[string]int64{}
 		s.refused = map[string]bool{}
+		s.failing = map[string]*shipFailure{}
 	}
 	if s.Chunk <= 0 {
 		s.Chunk = 512 << 10
 	}
+}
+
+// Sweep ships whatever each log file has gained since the last sweep.
+func (s *LogShipper) Sweep(ctx context.Context) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.init()
 	matches, _ := filepath.Glob(filepath.Join(s.Dir, "*.log"))
 	for _, path := range matches {
 		name := filepath.Base(path)
 		if !strings.HasSuffix(name, ".stdout.log") && !strings.HasSuffix(name, ".stderr.log") || s.refused[name] {
 			continue
 		}
-		err := s.shipFile(ctx, path, name)
-		if errors.Is(err, store.ErrNotFound) || errors.Is(err, api.ErrForbidden) {
-			s.refused[name] = true
-			fmt.Fprintf(os.Stderr, "kairo agent: not shipping %s: %v\n", name, err)
-			continue
-		}
-		if err != nil && ctx.Err() == nil {
-			fmt.Fprintf(os.Stderr, "kairo agent: ship %s: %v\n", name, err)
+		_ = s.ship(ctx, path, name)
+	}
+}
+
+// ShipAttempt ships both logs of one attempt now (an executor calls it as the
+// attempt exits, through executor.Local.FlushLogs).
+func (s *LogShipper) ShipAttempt(ctx context.Context, attemptID string) error {
+	// A sweep in progress holds the lock; wait for it no longer than ctx.
+	for !s.mu.TryLock() {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(20 * time.Millisecond):
 		}
 	}
+	defer s.mu.Unlock()
+	s.init()
+	var first error
+	for _, stream := range []string{"stdout", "stderr"} {
+		name := attemptID + "." + stream + ".log"
+		path := filepath.Join(s.Dir, name)
+		if _, err := os.Stat(path); err != nil || s.refused[name] {
+			continue
+		}
+		if err := s.ship(ctx, path, name); err != nil && first == nil {
+			first = err
+		}
+	}
+	return first
+}
+
+// ship ships one log and keeps track of its failures.
+func (s *LogShipper) ship(ctx context.Context, path, name string) error {
+	err := s.shipFile(ctx, path, name)
+	if errors.Is(err, store.ErrNotFound) || errors.Is(err, api.ErrForbidden) {
+		s.refused[name] = true
+		delete(s.failing, name)
+		fmt.Fprintf(os.Stderr, "kairo agent: not shipping %s: %v\n", name, err)
+		return err
+	}
+	if ctx.Err() != nil {
+		// Shutting down (or a flush that ran out of time): not the log's fault.
+		return err
+	}
+	s.track(ctx, name, err)
+	return err
+}
+
+// track follows a log's shipping failures: the first is logged, one that
+// lasts ReportAfter is recorded on the attempt, and so is the catching up
+// that ends it.
+func (s *LogShipper) track(ctx context.Context, name string, err error) {
+	now := time.Now()
+	if s.Clock != nil {
+		now = s.Clock()
+	}
+	reportAfter := s.ReportAfter
+	if reportAfter == 0 {
+		reportAfter = 30 * time.Second
+	}
+	attemptID, _ := strings.CutSuffix(name, ".log")
+	attemptID, stream, _ := strings.Cut(attemptID, ".")
+	f := s.failing[name]
+	if err != nil {
+		if f == nil {
+			f = &shipFailure{since: now}
+			s.failing[name] = f
+			fmt.Fprintf(os.Stderr, "kairo agent: ship %s: %v (retrying)\n", name, err)
+		}
+		f.err = err.Error()
+		if !f.reported && now.Sub(f.since) >= reportAfter {
+			problem := store.LogProblem{Problem: store.LogForwardFailed, Stream: stream, Detail: f.err + " (retrying)"}
+			f.reported = s.Client.RecordAttemptLogProblem(ctx, attemptID, problem) == nil
+		}
+		return
+	}
+	if f == nil {
+		return
+	}
+	if f.reported || now.Sub(f.since) >= reportAfter {
+		problem := store.LogProblem{Problem: store.LogForwardFailed, Stream: stream, Resolved: true,
+			Detail: fmt.Sprintf("%s; caught up after %s", f.err, now.Sub(f.since).Round(time.Second))}
+		if s.Client.RecordAttemptLogProblem(ctx, attemptID, problem) != nil {
+			return // recorded at the next sweep
+		}
+	}
+	delete(s.failing, name)
+	fmt.Fprintf(os.Stderr, "kairo agent: ship %s: caught up\n", name)
 }
 
 func (s *LogShipper) shipFile(ctx context.Context, path, name string) error {
@@ -317,7 +424,17 @@ func (s *LogShipper) shipFile(ctx context.Context, path, name string) error {
 	if err != nil {
 		return err
 	}
-	offset := s.shipped[name]
+	offset, known := s.shipped[name]
+	if !known {
+		// The first append of a log (also an empty one) creates the daemon's
+		// copy and tells where it ends.
+		size, err := s.Client.appendLog(ctx, name, 0, nil)
+		if err != nil {
+			return err
+		}
+		offset = size
+		s.shipped[name] = offset
+	}
 	buf := make([]byte, s.Chunk)
 	for offset < info.Size() {
 		n, err := f.ReadAt(buf, offset)
