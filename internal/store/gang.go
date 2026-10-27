@@ -30,7 +30,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"sort"
 	"strings"
 	"time"
 
@@ -122,31 +121,14 @@ func gangMembersTx(ctx context.Context, tx *sql.Tx, gangID string) ([]gangMember
 	return members, nil
 }
 
-// gangMatchesExecutor reports whether any rank of the gang led by leaderID may
-// run on an executor with these attributes.
-func gangMatchesExecutor(ctx context.Context, tx *sql.Tx, gangID, executorAttributes string) (bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT e.executor_selector_json FROM gang_members m JOIN execution_requests e ON e.id=m.execution_id WHERE m.gang_id=?`, gangID)
-	if err != nil {
-		return false, err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var selector string
-		if err = rows.Scan(&selector); err != nil {
-			return false, err
-		}
-		if selectorMatches(selector, executorAttributes) {
-			return true, nil
-		}
-	}
-	return false, rows.Err()
-}
 
-// placeGangTx places every rank of the gang on a distinct node, preferring the
-// calling executor for the first rank it can take. All leases are created or
-// none (a savepoint is rolled back when a rank finds no node). It reports
-// whether the gang was placed.
-func placeGangTx(ctx context.Context, tx *sql.Tx, gangID, callerExecutorID string) (bool, error) {
+
+// freeGangPortTx picks the lowest rendezvous port no live placement on the
+// node uses (0 if all are taken).
+// placeGangTx reserves every rank of the gang on the executor the planning
+// pass chose for it, all or none (a savepoint is rolled back when a rank
+// cannot be reserved). It reports whether the gang was placed.
+func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlot) (bool, error) {
 	var size, port int
 	if err := tx.QueryRowContext(ctx, `SELECT size,port FROM execution_gangs WHERE id=?`, gangID).Scan(&size, &port); err != nil {
 		return false, err
@@ -155,7 +137,7 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID, callerExecutorID strin
 	if err != nil {
 		return false, err
 	}
-	if len(members) != size {
+	if len(members) != size || len(slots) != size {
 		return false, fmt.Errorf("gang %s has %d of %d ranks", gangID, len(members), size)
 	}
 	for _, m := range members {
@@ -167,25 +149,10 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID, callerExecutorID strin
 			return false, nil
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT x.id,x.node_id,x.attributes_json,n.attributes_json FROM executors x JOIN nodes n ON n.id=x.node_id
-		WHERE x.enabled=1 AND n.enabled=1 AND NOT EXISTS(SELECT 1 FROM node_quarantines q WHERE q.node_id IN(x.node_id,'*'))
-		ORDER BY x.id`)
-	if err != nil {
-		return false, err
+	byRank := make(map[int]planSlot, len(slots))
+	for _, s := range slots {
+		byRank[s.rank] = s
 	}
-	var executors []gangExecutor
-	for rows.Next() {
-		var e gangExecutor
-		if err = rows.Scan(&e.id, &e.nodeID, &e.attributes, &e.nodeAttributes); err != nil {
-			rows.Close()
-			return false, err
-		}
-		executors = append(executors, e)
-	}
-	if err = rows.Close(); err != nil {
-		return false, err
-	}
-	sort.SliceStable(executors, func(i, j int) bool { return executors[i].id == callerExecutorID && executors[j].id != callerExecutorID })
 
 	if _, err = tx.ExecContext(ctx, `SAVEPOINT gang_place`); err != nil {
 		return false, err
@@ -203,37 +170,17 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID, callerExecutorID strin
 		executor             gangExecutor
 	}
 	var placed []assignment
-	usedNodes := map[string]bool{}
 	for _, m := range members {
-		found := false
-		for _, e := range executors {
-			if usedNodes[e.nodeID] || !selectorMatches(m.candidate.selectorJSON, e.attributes) {
-				continue
-			}
-			if m.rank == 0 && e.attribute("interconnect_addr") == "" {
-				continue // rank 0 must be reachable by the others
-			}
-			reservation, terminalized, err := reserveExecutionTx(ctx, tx, e.id, e.nodeID, m.candidate)
-			if err != nil {
-				_, _ = abandon()
-				return false, err
-			}
-			if terminalized {
-				// A rank's conflict policy asked to fail; the gang waits instead
-				// of failing one rank (the terminalization is rolled back).
-				return abandon()
-			}
-			if reservation == nil {
-				continue
-			}
-			placed = append(placed, assignment{rank: m.rank, leaseID: reservation.Lease.ID, executionID: m.candidate.execution.ID, executor: e})
-			usedNodes[e.nodeID] = true
-			found = true
-			break
+		slot := byRank[m.rank]
+		reservation, err := writeReservationTx(ctx, tx, slot.executor.id, m.candidate, slot.fit)
+		if err != nil {
+			_, _ = abandon()
+			return false, err
 		}
-		if !found {
+		if reservation == nil {
 			return abandon()
 		}
+		placed = append(placed, assignment{rank: m.rank, leaseID: reservation.Lease.ID, executionID: m.candidate.execution.ID, executor: slot.executor.gang()})
 	}
 	master := placed[0].executor
 	if port == 0 {
@@ -268,8 +215,6 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID, callerExecutorID strin
 	return true, nil
 }
 
-// freeGangPortTx picks the lowest rendezvous port no live placement on the
-// node uses (0 if all are taken).
 func freeGangPortTx(ctx context.Context, tx *sql.Tx, nodeID string) (int, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT gp.master_port FROM gang_placements gp WHERE gp.master_node_id=? AND gp.state IN('placed','launched')
 		AND EXISTS(SELECT 1 FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=gp.id AND l.state!='released')`, nodeID)

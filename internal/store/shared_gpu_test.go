@@ -149,6 +149,10 @@ func TestALeaseOnASharedGPUExcludesItsOtherNodes(t *testing.T) {
 	if err = store.ReleaseReservation(ctx, first.Lease.ID, first.Lease.CoordinationEpoch, "test"); err != nil {
 		t.Fatal(err)
 	}
+	// (on-a, waiting again and submitted first, would take the device back)
+	if err = store.WithdrawExecution(ctx, first.Execution.ID); err != nil {
+		t.Fatal(err)
+	}
 	pollShared(t, store, false, false)
 	second, err := store.ReserveNext(ctx, "exec-b")
 	if err != nil || second == nil || second.Resources[0].ID != "gpu-GPU-S@b" || second.Resources[0].NodeID != "b" {
