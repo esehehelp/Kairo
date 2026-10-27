@@ -430,8 +430,9 @@ commands that take longer than 2 s are logged at INFO with their duration; a
 timeout is logged at WARN with the command.
 
 Every 15 s an executor samples what each attempt it launched takes up, for
-admission to count that part of the attempt's RAM and disk reservation once
-(`attempt-usage` on the agent API). The sample runs beside the tick, one at a
+admission to count that part of the attempt's RAM reservation once
+(`attempt-usage` on the agent API; bytes written are recorded but do not
+change disk admission, see Admission). The sample runs beside the tick, one at a
 time, bounded to 15 s, so it never holds the tick. RAM is the memory the
 attempt's processes hold, bytes written what they have written, never less
 than an earlier sample showed:
@@ -446,8 +447,8 @@ than an earlier sample showed:
   one `wsl.exe` run per sample.
 
 A process that cannot be read (another user's, a kernel without
-`smaps_rollup`) makes that figure unknown, and an unknown figure counts as
-nothing taken up. Attempts launched by an earlier instance of the executor
+`smaps_rollup`) makes that figure unknown, and admission then counts the
+whole reservation. Attempts launched by an earlier instance of the executor
 (before an agent restart) are not sampled.
 
 ### Machine declaration
