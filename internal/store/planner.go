@@ -666,7 +666,10 @@ func (m *planModel) fit(node string, demand planDemand, ov planOverlay, freed fu
 		if chosen == d.count {
 			continue
 		}
-		need := fmt.Sprintf("%s: %d GPU(s) of >= %s needed, %d usable", node, d.count, formatBytes(d.constraints.MinTotal), chosen)
+		need := fmt.Sprintf("%s: %d GPU(s) needed, %d usable", node, d.count, chosen)
+		if d.constraints.MinTotal > 0 {
+			need = fmt.Sprintf("%s: %d GPU(s) of >= %s needed, %d usable", node, d.count, formatBytes(d.constraints.MinTotal), chosen)
+		}
 		switch {
 		case external:
 			f.fail("external_claim", need+"; used by a process Kairo did not start: "+strings.Join(evidence, ", "), d.policy.External == "fail")
@@ -1215,21 +1218,29 @@ func loadDemandTx(ctx context.Context, tx *sql.Tx, executionID string) (planDema
 	return d, nil
 }
 
-// saveWaitsTx records the pass's wait reasons: a row is rewritten only when
-// its reason changes and, after a complete pass, dropped for executions that
-// no longer wait.
+// waitRefresh: a wait whose reason and node stay the same is rewritten (for
+// numbers in its message) at most this often.
+const waitRefresh = 30 * time.Second
+
+// saveWaitsTx records the pass's wait reasons: a row is rewritten when its
+// reason changes (its message at most every waitRefresh) and, after a
+// complete pass, dropped for executions that no longer wait.
 func saveWaitsTx(ctx context.Context, tx *sql.Tx, waits map[string]planWait, complete bool) error {
-	rows, err := tx.QueryContext(ctx, `SELECT execution_id,reason_code,COALESCE(node_id,''),detail_json FROM admission_waits`)
+	rows, err := tx.QueryContext(ctx, `SELECT execution_id,reason_code,COALESCE(node_id,''),detail_json,updated_at FROM admission_waits`)
 	if err != nil {
 		return err
 	}
 	existing := map[string]planWait{}
+	fresh := map[string]bool{}
 	for rows.Next() {
-		var executionID, detail string
+		var executionID, detail, updated string
 		var w planWait
-		if err = rows.Scan(&executionID, &w.reason, &w.node, &detail); err != nil {
+		if err = rows.Scan(&executionID, &w.reason, &w.node, &detail, &updated); err != nil {
 			rows.Close()
 			return err
+		}
+		if at, parseErr := time.Parse(time.RFC3339Nano, updated); parseErr == nil && time.Since(at) < waitRefresh {
+			fresh[executionID] = true
 		}
 		var d map[string]string
 		_ = json.Unmarshal([]byte(detail), &d)
@@ -1248,7 +1259,7 @@ func saveWaitsTx(ctx context.Context, tx *sql.Tx, waits map[string]planWait, com
 		}
 	}
 	for executionID, w := range waits {
-		if old, ok := existing[executionID]; ok && old == w {
+		if old, ok := existing[executionID]; ok && (old == w || fresh[executionID] && old.reason == w.reason && old.node == w.node) {
 			continue
 		}
 		detail, _ := json.Marshal(map[string]string{"message": w.message})
