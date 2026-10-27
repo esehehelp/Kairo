@@ -26,12 +26,17 @@ const (
 	OwnerPolicy = "policy"
 )
 
+// HostPolicyRef is the Ref of a CPU's policy setting, which belongs to its
+// host rather than to a lease.
+const HostPolicyRef = "host"
+
 // ErrDeviceSettingConflict: the device's bench or policy setting belongs to
 // another lease.
 var ErrDeviceSettingConflict = errors.New("device setting belongs to another lease")
 
 // DeviceOwner is who asked for a setting: Ref is the actor of a manual
-// setting, the lease a bench or policy setting belongs to.
+// setting, the lease a bench or policy setting belongs to; a CPU's policy
+// setting belongs to its host (HostPolicyRef), not to a lease.
 type DeviceOwner struct {
 	Kind string `json:"kind"`
 	Ref  string `json:"ref,omitempty"`
@@ -296,13 +301,18 @@ type HardwareDevice struct {
 	Capabilities      *DeviceCapabilities `json:"capabilities,omitempty"`
 	CapabilitiesAt    *string             `json:"capabilities_at,omitempty"`
 	ReportedAt        *string             `json:"reported_at,omitempty"`
+	// Policy is the operating-point policy's latest decision; Bench the
+	// device's latest bench run (without its points).
+	Policy *PolicyDecision `json:"policy,omitempty"`
+	Bench  *BenchRun       `json:"bench,omitempty"`
 }
 
 // SetDeviceSetting stores owner's setting of a device, replacing the one the
 // owner kind had. The device must be controllable, s must set something the
 // device's controller reported it supports, within its ranges, and a bench
 // or policy setting needs a live lease (owner.Ref) on the host that, for a
-// GPU, holds that GPU. Another lease's bench or policy setting is
+// GPU, holds that GPU; a CPU's policy setting belongs to its host instead
+// (HostPolicyRef). Another lease's bench or policy setting is
 // ErrDeviceSettingConflict: the owner clears its own first.
 func (s *Store) SetDeviceSetting(ctx context.Context, hostID, deviceID string, owner DeviceOwner, settings DeviceSettings, actor string) (DeviceSettingResult, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -347,10 +357,19 @@ func (s *Store) SetDeviceSetting(ctx context.Context, hostID, deviceID string, o
 	case OwnerManual:
 		owner.Ref = actor
 	case OwnerBench, OwnerPolicy:
-		if err = checkSettingLeaseTx(ctx, tx, policy, host, owner.Ref); err != nil {
-			return DeviceSettingResult{}, err
+		if owner.Kind == OwnerPolicy && policy.Kind == machine.CPU {
+			// A host's CPU is shared by whatever runs on it: its policy
+			// setting belongs to the host, not to a lease.
+			if owner.Ref != "" && owner.Ref != HostPolicyRef {
+				return DeviceSettingResult{}, fmt.Errorf("the policy setting of a host's cpu belongs to the host, not to lease %s", owner.Ref)
+			}
+			owner.Ref = HostPolicyRef
+		} else {
+			if err = checkSettingLeaseTx(ctx, tx, policy, host, owner.Ref); err != nil {
+				return DeviceSettingResult{}, err
+			}
+			leaseID = owner.Ref
 		}
-		leaseID = owner.Ref
 		var current string
 		err = tx.QueryRowContext(ctx, `SELECT owner_ref FROM device_settings WHERE host_id=? AND device_id=? AND owner_kind=?`, hostID, deviceID, owner.Kind).Scan(&current)
 		if err == nil && current != owner.Ref {
@@ -575,11 +594,39 @@ func clearReleasedLeaseSettingsTx(ctx context.Context, tx *sql.Tx) error {
 }
 
 // uncontrollableSettingsTx are the stored settings of devices that policies
-// do not make controllable.
+// do not make controllable, and the policy settings of devices whose
+// max_slowdown is 0.
 func uncontrollableSettingsTx(ctx context.Context, tx *sql.Tx, policies []machine.DevicePolicy) ([]DeviceSetting, error) {
 	controllable := map[[2]string]bool{}
+	noSlowdown := map[[2]string]bool{}
 	for _, policy := range policies {
 		controllable[[2]string{policy.HostID, policy.DeviceID}] = policy.Controllable()
+		noSlowdown[[2]string{policy.HostID, policy.DeviceID}] = policy.MaxSlowdown == 0
+	}
+	out := []DeviceSetting{}
+	var slowdownZero [][2]string
+	if err := eachRow(ctx, tx, `SELECT host_id,device_id FROM device_settings WHERE owner_kind='policy' ORDER BY host_id,device_id`, nil, func(rows *sql.Rows) error {
+		var device [2]string
+		if err := rows.Scan(&device[0], &device[1]); err != nil {
+			return err
+		}
+		if controllable[device] && noSlowdown[device] {
+			slowdownZero = append(slowdownZero, device)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	for _, device := range slowdownZero {
+		settings, err := deviceSettingsTx(ctx, tx, device[0], device[1])
+		if err != nil {
+			return nil, err
+		}
+		for _, setting := range settings {
+			if setting.Owner.Kind == OwnerPolicy {
+				out = append(out, setting)
+			}
+		}
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT host_id,device_id FROM device_settings ORDER BY host_id,device_id`)
 	if err != nil {
@@ -600,7 +647,6 @@ func uncontrollableSettingsTx(ctx context.Context, tx *sql.Tx, policies []machin
 	if err = rows.Err(); err != nil {
 		return nil, err
 	}
-	out := []DeviceSetting{}
 	for _, device := range devices {
 		settings, err := deviceSettingsTx(ctx, tx, device[0], device[1])
 		if err != nil {
@@ -854,6 +900,12 @@ func hardwareDeviceTx(ctx context.Context, tx *sql.Tx, policy machine.DevicePoli
 	device := HardwareDevice{DevicePolicy: policy}
 	var err error
 	if device.Settings, err = deviceSettingsTx(ctx, tx, policy.HostID, policy.DeviceID); err != nil {
+		return device, err
+	}
+	if device.Policy, err = devicePolicyDecisionTx(ctx, tx, policy.HostID, policy.DeviceID); err != nil {
+		return device, err
+	}
+	if device.Bench, err = latestBenchRunTx(ctx, tx, policy.HostID, policy.DeviceID); err != nil {
 		return device, err
 	}
 	if len(device.Settings) != 0 {

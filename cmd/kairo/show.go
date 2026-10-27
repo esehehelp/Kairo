@@ -201,21 +201,37 @@ func renderAttempt(w io.Writer, a attemptInfo) {
 
 // energyText is what an attempt's GPUs used: "GPU 1.23 kWh", "GPU 37.5 Wh
 // (partial)", or "GPU not measured" when no interval of its run could be
-// integrated.
+// integrated; then what the operating-point policy saved: "; policy 3.0 h,
+// saved ~120.0 Wh (estimate)".
 func energyText(e store.AttemptEnergy) string {
 	var text string
-	switch kWh := e.GPUJoules / 3.6e6; {
+	switch {
 	case e.GPUSecondsCovered == 0:
 		text = "GPU not measured"
-	case kWh >= 1:
-		text = fmt.Sprintf("GPU %.2f kWh", kWh)
 	default:
-		text = fmt.Sprintf("GPU %.1f Wh", kWh*1000)
+		text = "GPU " + energyAmount(e.GPUJoules)
 	}
 	if e.Partial && e.GPUSecondsCovered > 0 {
 		text += " (partial)"
 	}
+	if e.PolicySeconds > 0 {
+		text += fmt.Sprintf("; policy %.1f h", e.PolicySeconds/3600)
+		if estimated := e.PolicySeconds - e.PolicyUnestimatedSeconds; estimated > 0 {
+			text += ", saved ~" + energyAmount(e.PolicySavedJoules) + " (estimate)"
+		}
+		if e.PolicyUnestimatedSeconds > 0 {
+			text += fmt.Sprintf(", %.1f h without a profile to estimate from", e.PolicyUnestimatedSeconds/3600)
+		}
+	}
 	return text
+}
+
+// energyAmount is joules as "1.23 kWh" or "37.5 Wh".
+func energyAmount(joules float64) string {
+	if kWh := joules / 3.6e6; kWh >= 1 || kWh <= -1 {
+		return fmt.Sprintf("%.2f kWh", kWh)
+	}
+	return fmt.Sprintf("%.1f Wh", joules/3600)
 }
 
 // logProblemText makes a problem with an attempt's logs readable:

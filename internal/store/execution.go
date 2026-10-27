@@ -104,8 +104,12 @@ func normalizeExclusive(requests []ExclusiveRequest) ([]ExclusiveRequest, error)
 	for i := range requests {
 		r := &requests[i]
 		r.Kind = strings.TrimSpace(r.Kind)
+		r.Device = strings.TrimSpace(r.Device)
 		if r.Kind != "gpu" || r.Count < 1 {
 			return nil, fmt.Errorf("exclusive request %d must be a positive GPU request", i)
+		}
+		if r.Device != "" && r.Count != 1 {
+			return nil, fmt.Errorf("exclusive request %d names device %s: its count must be 1", i, r.Device)
 		}
 		if r.MinTotalMemoryBytes < 0 || r.MinObservedFreeMemoryBytes < 0 {
 			return nil, fmt.Errorf("exclusive request %d has negative memory", i)
@@ -369,7 +373,11 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 
 func insertExecutionResourcesTx(ctx context.Context, tx *sql.Tx, executionID string, spec ExecutionSpec) error {
 	for _, request := range spec.Exclusive {
-		constraints, err := json.Marshal(map[string]any{"same_node": request.SameNode, "min_total_memory_bytes": request.MinTotalMemoryBytes, "min_observed_free_memory_bytes": request.MinObservedFreeMemoryBytes})
+		fields := map[string]any{"same_node": request.SameNode, "min_total_memory_bytes": request.MinTotalMemoryBytes, "min_observed_free_memory_bytes": request.MinObservedFreeMemoryBytes}
+		if request.Device != "" {
+			fields["device"] = request.Device
+		}
+		constraints, err := json.Marshal(fields)
 		if err != nil {
 			return err
 		}

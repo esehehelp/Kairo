@@ -32,8 +32,49 @@ type Config struct {
 	InsecureHTTP bool       `toml:"insecure_http"`
 	Scheduler    Scheduler  `toml:"scheduler"`
 	Node         Node       `toml:"node"`
+	Bench        Bench      `toml:"bench"`
 	Executors    []Executor `toml:"executors"`
 	Providers    []Provider `toml:"providers"`
+}
+
+// Bench tells where the bench programs of a node are, for kairo hardware
+// bench: reported to the daemon with the node (its attributes' "bench").
+type Bench struct {
+	// KairoBinary runs the bench driver and the CPU, storage and network
+	// workloads (default: this kairo binary).
+	KairoBinary string `toml:"kairo_binary"`
+	// GPUBinary is kairo-bench-gpu; without it the node takes no GPU bench.
+	GPUBinary string `toml:"gpu_binary"`
+	// CWD is the benches' working directory (default: KairoBinary's).
+	CWD string `toml:"cwd"`
+	// ExecutorLabels pick the executor of the node that runs benches (one
+	// that runs the binaries above natively, not a WSL one for Windows paths).
+	ExecutorLabels map[string]string `toml:"executor_labels"`
+}
+
+// Attributes are node labels with the bench programs added under "bench".
+func (b Bench) Attributes(labels map[string]string) map[string]any {
+	out := map[string]any{}
+	for k, v := range labels {
+		out[k] = v
+	}
+	kairo := b.KairoBinary
+	if kairo == "" {
+		kairo, _ = os.Executable()
+	}
+	bench := map[string]any{}
+	for key, value := range map[string]string{"kairo": kairo, "gpu": b.GPUBinary, "cwd": b.CWD} {
+		if value != "" {
+			bench[key] = value
+		}
+	}
+	if len(b.ExecutorLabels) != 0 {
+		bench["executor_labels"] = b.ExecutorLabels
+	}
+	if len(bench) != 0 {
+		out["bench"] = bench
+	}
+	return out
 }
 
 // TLS reports whether the daemon serves HTTPS.
@@ -196,6 +237,7 @@ type Agent struct {
 	ObserveOnly                bool       `toml:"observe_only"`
 	ObservationIntervalSeconds int        `toml:"observation_interval_seconds"`
 	Node                       Node       `toml:"node"`
+	Bench                      Bench      `toml:"bench"`
 	Executors                  []Executor `toml:"executors"`
 	Providers                  []Provider `toml:"providers"`
 }

@@ -18,6 +18,14 @@ os = "windows"
 architecture = "amd64"
 labels = { site = "local" }
 
+# Hardware benches (README "Hardware benches"): where the bench programs of
+# this node are. kairo_binary defaults to this kairo; without gpu_binary the
+# node takes no GPU bench. executor_labels pick the executor that runs them
+# natively (not WSL, for these Windows paths).
+[bench]
+gpu_binary = "D:/Kairo/kairo-bench-gpu.exe"
+executor_labels = { environment = "windows" }
+
 [[executors]]
 id = "windows-local"
 kind = "windows"

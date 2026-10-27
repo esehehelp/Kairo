@@ -73,7 +73,15 @@ type AttemptEnergy struct {
 	GPUJoules         float64 `json:"gpu_joules"`
 	GPUSecondsCovered float64 `json:"gpu_seconds_covered"`
 	Partial           bool    `json:"partial"`
-	UpdatedAt         string  `json:"updated_at"`
+	// PolicySeconds are the device-seconds the operating-point policy's
+	// setting was in place on the attempt's GPUs, PolicySavedJoules the energy
+	// the device's bench profile says that saved for the same work (an
+	// estimate), PolicyUnestimatedSeconds the part of PolicySeconds without a
+	// profile to estimate from.
+	PolicySeconds            float64 `json:"policy_seconds,omitempty"`
+	PolicySavedJoules        float64 `json:"policy_saved_joules,omitempty"`
+	PolicyUnestimatedSeconds float64 `json:"policy_unestimated_seconds,omitempty"`
+	UpdatedAt                string  `json:"updated_at"`
 }
 
 // sampleStampLayout is RFC 3339 with a fixed number of fractional digits:
@@ -258,16 +266,199 @@ func (s *Store) deviceReadings(ctx context.Context) (map[string]DeviceReading, e
 // taskAttemptEnergy is the GPU energy of a task's attempts, by attempt.
 func (s *Store) taskAttemptEnergy(ctx context.Context, taskScopeID string) (map[string]AttemptEnergy, error) {
 	out := map[string]AttemptEnergy{}
-	err := eachRow(ctx, s.db, `SELECT ae.attempt_id,ae.gpu_joules,ae.gpu_seconds_covered,ae.partial,ae.updated_at
+	err := eachRow(ctx, s.db, `SELECT ae.attempt_id,ae.gpu_joules,ae.gpu_seconds_covered,ae.partial,ae.policy_seconds,ae.policy_saved_joules,ae.policy_unestimated_seconds,ae.updated_at
 		FROM orchestration_task_executions te JOIN attempts a ON a.execution_id=te.execution_id JOIN attempt_energy ae ON ae.attempt_id=a.id
 		WHERE te.task_scope_id=?`, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var attemptID string
 		var e AttemptEnergy
-		if err := rows.Scan(&attemptID, &e.GPUJoules, &e.GPUSecondsCovered, &e.Partial, &e.UpdatedAt); err != nil {
+		if err := rows.Scan(&attemptID, &e.GPUJoules, &e.GPUSecondsCovered, &e.Partial, &e.PolicySeconds, &e.PolicySavedJoules, &e.PolicyUnestimatedSeconds, &e.UpdatedAt); err != nil {
 			return err
 		}
 		out[attemptID] = e
 		return nil
 	})
 	return out, err
+}
+
+// HostCPUDevice is the device_samples series of a host's CPU package as its
+// controller reads it.
+func HostCPUDevice(hostID string) string { return "host/" + hostID + "/cpu" }
+
+// ControllerSample is what a controller read of a device of its host: the CPU
+// package's power averaged since its previous reading.
+type ControllerSample struct {
+	DeviceID   string   `json:"device_id"`
+	ObservedAt string   `json:"observed_at"`
+	ValidUntil string   `json:"valid_until"`
+	PowerW     *float64 `json:"power_w,omitempty"`
+}
+
+// RecordControllerSamples records what node's controller read of its host's
+// devices (only "cpu" is read) into the host's series. A controller that no
+// host names records nothing; the samples it sent are returned as skipped.
+func (s *Store) RecordControllerSamples(ctx context.Context, nodeID string, samples []ControllerSample) ([]string, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	spec, err := declaredSpec(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	hostID := ""
+	for _, host := range spec.Hosts {
+		if host.Controller == nodeID {
+			hostID = host.ID
+		}
+	}
+	skipped := []string{}
+	for _, sample := range samples {
+		if hostID == "" || sample.DeviceID != "cpu" {
+			skipped = append(skipped, sample.DeviceID)
+			continue
+		}
+		at, err := time.Parse(time.RFC3339Nano, sample.ObservedAt)
+		if err != nil {
+			return nil, fmt.Errorf("controller sample: observed_at: %w", err)
+		}
+		until, err := time.Parse(time.RFC3339Nano, sample.ValidUntil)
+		if err != nil {
+			return nil, fmt.Errorf("controller sample: valid_until: %w", err)
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO device_samples(device,resource_id,observed_at,valid_until,power_w) VALUES(?,NULL,?,?,?)`,
+			HostCPUDevice(hostID), sampleStamp(at), sampleStamp(until), sample.PowerW); err != nil {
+			return nil, err
+		}
+	}
+	return skipped, tx.Commit()
+}
+
+// CPUEnergy is the energy of a host's CPU packages over a window, from its
+// samples: each sample is the average power since the one before it, so it
+// counts for the part of that span inside the window.
+type CPUEnergy struct {
+	// Device is the series it was read from (a node's cpu resource, or the
+	// controller's HostCPUDevice).
+	Device         string  `json:"device"`
+	Joules         float64 `json:"joules"`
+	SecondsCovered float64 `json:"seconds_covered"`
+	Seconds        float64 `json:"seconds"`
+}
+
+// MeanPowerW is the window's average power over the part its samples cover.
+func (e CPUEnergy) MeanPowerW() float64 {
+	if e.SecondsCovered == 0 {
+		return 0
+	}
+	return e.Joules / e.SecondsCovered
+}
+
+// HostCPUEnergy is the CPU package energy of host over [from, to]: from the
+// series that covers most of it, among the controller's and those of the
+// host's nodes (the same packages, read by different readers, are never
+// added together). ErrNotFound when no series covers any of it.
+func (s *Store) HostCPUEnergy(ctx context.Context, hostID string, from, to time.Time) (CPUEnergy, error) {
+	spec, err := declaredSpec(ctx, s.db)
+	if err != nil {
+		return CPUEnergy{}, err
+	}
+	devices := []string{HostCPUDevice(hostID)}
+	for _, host := range spec.Hosts {
+		if host.ID != hostID {
+			continue
+		}
+		for _, node := range host.Nodes {
+			err := eachRow(ctx, s.db, `SELECT id FROM resource_instances WHERE node_id=? AND kind='cpu' ORDER BY id`, []any{node}, func(rows *sql.Rows) error {
+				var id string
+				if err := rows.Scan(&id); err != nil {
+					return err
+				}
+				devices = append(devices, id)
+				return nil
+			})
+			if err != nil {
+				return CPUEnergy{}, err
+			}
+		}
+	}
+	best := CPUEnergy{Seconds: to.Sub(from).Seconds()}
+	for _, device := range devices {
+		e, err := s.seriesEnergy(ctx, device, from, to)
+		if err != nil {
+			return CPUEnergy{}, err
+		}
+		if e.SecondsCovered > best.SecondsCovered {
+			best = e
+		}
+	}
+	if best.SecondsCovered == 0 {
+		return best, fmt.Errorf("%w: no CPU package power of host %s between %s and %s", ErrNotFound, hostID, from.UTC().Format(time.RFC3339), to.UTC().Format(time.RFC3339))
+	}
+	return best, nil
+}
+
+// seriesEnergy integrates one series over [from, to]. A sample counts from
+// the sample before it (when that one was still valid then) to its own time.
+func (s *Store) seriesEnergy(ctx context.Context, device string, from, to time.Time) (CPUEnergy, error) {
+	e := CPUEnergy{Device: device, Seconds: to.Sub(from).Seconds()}
+	type sample struct {
+		at, until time.Time
+		power     sql.NullFloat64
+	}
+	var samples []sample
+	// The sample before the window starts the first span.
+	err := eachRow(ctx, s.db, `SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=? AND observed_at<? ORDER BY observed_at DESC LIMIT 1)
+		UNION ALL SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=? AND observed_at>=? ORDER BY observed_at)
+		ORDER BY observed_at`,
+		[]any{device, sampleStamp(from), device, sampleStamp(from)}, func(rows *sql.Rows) error {
+			var at, until string
+			var x sample
+			if err := rows.Scan(&at, &until, &x.power); err != nil {
+				return err
+			}
+			var err error
+			if x.at, err = time.Parse(time.RFC3339Nano, at); err != nil {
+				return err
+			}
+			if x.until, err = time.Parse(time.RFC3339Nano, until); err != nil {
+				return err
+			}
+			samples = append(samples, x)
+			return nil
+		})
+	if err != nil {
+		return e, err
+	}
+	for i := 1; i < len(samples); i++ {
+		prev, cur := samples[i-1], samples[i]
+		if !cur.power.Valid || cur.at.After(prev.until) {
+			continue // the span is not vouched for
+		}
+		begin, end := laterOf(prev.at, from), earlierOf(cur.at, to)
+		if !end.After(begin) {
+			if cur.at.After(to) {
+				break
+			}
+			continue
+		}
+		seconds := end.Sub(begin).Seconds()
+		e.Joules += cur.power.Float64 * seconds
+		e.SecondsCovered += seconds
+	}
+	return e, nil
+}
+
+func laterOf(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
+func earlierOf(a, b time.Time) time.Time {
+	if a.Before(b) {
+		return a
+	}
+	return b
 }

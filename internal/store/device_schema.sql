@@ -3,9 +3,11 @@
 -- Applied idempotently on every open.
 --
 -- One setting per owner kind; the effective one is manual, else bench, else
--- policy. A bench or policy setting belongs to a lease and is removed when the
--- lease is released, so no setting outlives its lease. No setting: the
--- hardware's defaults.
+-- policy. A bench setting, and a GPU's policy setting, belongs to a lease and
+-- is removed when the lease is released, so no setting outlives its lease. A
+-- host's CPU is shared by whatever runs on it: its policy setting belongs to
+-- no lease and is removed when the host's policy no longer allows it. No
+-- setting: the hardware's defaults.
 CREATE TABLE IF NOT EXISTS device_settings(
  host_id TEXT NOT NULL,
  device_id TEXT NOT NULL,
@@ -16,7 +18,7 @@ CREATE TABLE IF NOT EXISTS device_settings(
  requested_by TEXT NOT NULL,
  requested_at TEXT NOT NULL,
  PRIMARY KEY(host_id,device_id,owner_kind),
- CHECK((owner_kind='manual')=(lease_id IS NULL))
+ CHECK(owner_kind='policy' OR (owner_kind='manual')=(lease_id IS NULL))
 );
 CREATE INDEX IF NOT EXISTS device_settings_lease_idx ON device_settings(lease_id);
 -- A device's generation counts changes of its effective setting; the

@@ -102,6 +102,12 @@ func renderHardware(w io.Writer, hosts []store.HardwareHost, now time.Time) erro
 			if d.Capabilities != nil {
 				notes = append(notes, fmt.Sprintf("  %s: supports %s", d.DeviceID, capabilitiesText(*d.Capabilities)))
 			}
+			if d.Policy != nil {
+				notes = append(notes, fmt.Sprintf("  %s: policy %s", d.DeviceID, policyText(*d.Policy)))
+			}
+			if d.Bench != nil {
+				notes = append(notes, fmt.Sprintf("  %s: bench %s", d.DeviceID, benchRunText(*d.Bench)))
+			}
 		}
 		if err := writeTable(w, rows); err != nil {
 			return err
@@ -154,6 +160,34 @@ func deviceState(d store.HardwareDevice) string {
 		return "reset"
 	}
 	return "pending"
+}
+
+// policyText is the policy's latest decision: "graphics_clock_max_mhz=1800MHz
+// (profile, for gemm: perf 0.97, 250 W vs 300 W) at 10-27 10:01".
+func policyText(d store.PolicyDecision) string {
+	text := d.Settings.String() + " (" + d.Basis
+	var expected []string
+	for _, e := range d.Expected {
+		part := fmt.Sprintf("%s perf %.3f", e.Kind, e.RelPerf)
+		if e.PowerW != nil && e.DefaultPowerW != nil {
+			part += fmt.Sprintf(", %.0f W vs %.0f W", *e.PowerW, *e.DefaultPowerW)
+		}
+		expected = append(expected, part)
+	}
+	switch {
+	case len(expected) != 0:
+		text += ", for " + strings.Join(expected, "; ")
+	case len(d.Candidates) != 0:
+		text += ", for " + strings.Join(d.Candidates, ", ")
+	}
+	if d.Reason != "" {
+		text += ": " + d.Reason
+	}
+	text += ")"
+	if d.LeaseID != "" {
+		text += " for lease " + d.LeaseID
+	}
+	return text + " at " + shortStamp(&d.DecidedAt)
 }
 
 // capabilitiesText is "graphics_clock_max_mhz 210-2130MHz, power_limit_w

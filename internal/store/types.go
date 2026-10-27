@@ -32,8 +32,11 @@ type ScopeFilter struct {
 }
 
 type ExclusiveRequest struct {
-	Kind                       string `json:"kind"`
-	Count                      int    `json:"count"`
+	Kind  string `json:"kind"`
+	Count int    `json:"count"`
+	// Device pins the request to one GPU by its UUID (a hardware bench of
+	// that GPU); empty: any GPU that fits.
+	Device                     string `json:"device,omitempty"`
 	SameNode                   bool   `json:"same_node"`
 	MinTotalMemoryBytes        int64  `json:"min_total_memory_bytes"`
 	MinObservedFreeMemoryBytes int64  `json:"min_observed_free_memory_bytes"`

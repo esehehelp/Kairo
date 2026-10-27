@@ -80,6 +80,11 @@ type controllerReportRequest struct {
 	Reports []store.DeviceReport `json:"reports"`
 }
 
+type controllerSamplesRequest struct {
+	NodeID  string                   `json:"node_id"`
+	Samples []store.ControllerSample `json:"samples"`
+}
+
 func (s *Server) controllerOps() []agentOp {
 	return []agentOp{
 		newAgentOp(s, "controller-register", observeAllowed, nil,
@@ -103,6 +108,14 @@ func (s *Server) controllerOps() []agentOp {
 			func(_ context.Context, b controllerReportRequest) (string, error) { return b.NodeID, nil },
 			func(ctx context.Context, b controllerReportRequest) (any, error) {
 				skipped, err := s.Store.ReportDevices(ctx, b.NodeID, b.Reports)
+				return map[string]any{"skipped": skipped}, err
+			}),
+		// What the controller reads of its host (the CPU package's power) is
+		// observation, recorded by an observe-only daemon too.
+		newAgentOp(s, "device-samples", observeAllowed, nil,
+			func(_ context.Context, b controllerSamplesRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b controllerSamplesRequest) (any, error) {
+				skipped, err := s.Store.RecordControllerSamples(ctx, b.NodeID, b.Samples)
 				return map[string]any{"skipped": skipped}, err
 			}),
 	}

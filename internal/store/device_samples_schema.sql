@@ -3,14 +3,16 @@
 --
 -- device_samples: what a provider read of a device at one time. A device is
 -- its physical identity (a GPU's UUID; a node's CPU package is that node's
--- cpu resource), so the providers of a shared GPU add to one series;
--- resource_id is the row whose provider reported the sample. Times are
+-- cpu resource; a host's CPU package as its controller reads it is
+-- "host/<host>/cpu"), so the providers of a shared GPU add to one series;
+-- resource_id is the row whose provider reported the sample (NULL for a
+-- controller's sample, which has no resource row). Times are
 -- fixed-width UTC (sampleStamp), so they order as text. A column is NULL when
 -- the device or its driver does not report it.
 CREATE TABLE IF NOT EXISTS device_samples(
  id INTEGER PRIMARY KEY AUTOINCREMENT,
  device TEXT NOT NULL,
- resource_id TEXT NOT NULL REFERENCES resource_instances(id),
+ resource_id TEXT REFERENCES resource_instances(id),
  observed_at TEXT NOT NULL,
  valid_until TEXT NOT NULL,
  power_w REAL,
@@ -43,11 +45,18 @@ CREATE TABLE IF NOT EXISTS device_properties(
 -- ran, added up as their samples arrive. gpu_seconds_covered is the
 -- device-seconds integrated; partial is 1 once part of the run could not be
 -- (a gap between samples, a sample without power, a run Kairo lost track of).
+-- policy_*: the device-seconds the operating-point policy's setting was in
+-- place on the attempt's GPUs, and the energy its bench profile says that
+-- saved for the same work (policy_unestimated_seconds: a setting without a
+-- profile to estimate from).
 CREATE TABLE IF NOT EXISTS attempt_energy(
  attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
  gpu_joules REAL NOT NULL DEFAULT 0,
  gpu_seconds_covered REAL NOT NULL DEFAULT 0,
  partial INTEGER NOT NULL DEFAULT 0 CHECK(partial IN(0,1)),
+ policy_seconds REAL NOT NULL DEFAULT 0,
+ policy_saved_joules REAL NOT NULL DEFAULT 0,
+ policy_unestimated_seconds REAL NOT NULL DEFAULT 0,
  updated_at TEXT NOT NULL
 );
 -- Finding the leases of a device (every sample, and every sameDevice check)

@@ -232,6 +232,17 @@ func (c *Client) ReportDevices(ctx context.Context, nodeID string, reports []sto
 	return out.Skipped, err
 }
 
+// ReportSamples sends what the controller of node read of its host (the CPU
+// package power); it returns the samples the daemon skipped (no host names
+// node as its controller).
+func (c *Client) ReportSamples(ctx context.Context, nodeID string, samples []store.ControllerSample) ([]string, error) {
+	var out struct {
+		Skipped []string `json:"skipped"`
+	}
+	err := c.call(ctx, "device-samples", map[string]any{"node_id": nodeID, "samples": samples}, &out)
+	return out.Skipped, err
+}
+
 // appendLog sends data found at offset of the node-side file and returns the
 // daemon-side size afterwards. A gap (the daemon has less than offset) is
 // reported as *GapError carrying the daemon's size to resume from.

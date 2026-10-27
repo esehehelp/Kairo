@@ -208,16 +208,20 @@ func init() {
 				"declare": "apply", "submit": "apply", "set": "apply",
 			},
 		}},
-		{name: "hardware", summary: "device settings of hosts: show, set and reset them", group: &commandGroup{
-			note: "DEVICE is a GPU UUID or cpu; a host's controller (kairo controller) carries the settings out.",
+		{name: "hardware", summary: "device settings of hosts: show, set, reset and bench them", group: &commandGroup{
+			note: "DEVICE is a GPU UUID or cpu (a bench also takes disk:FILESYSTEM and net:NODE); a host's controller (kairo controller) carries the settings out.",
 			subs: []command{
 				{"show", "[HOST] [--json]", "per host: devices, policy, desired and applied settings, errors, controller", hardwareShow},
 				{"set", "HOST DEVICE [--graphics-clock-max MHz] [--memory-clock MHz] [--power-limit W] [--cpu-max-freq MHz | --cpu-max-perf PCT]", "set a device's manual setting (it overrides bench and policy settings)", hardwareSet},
 				{"reset", "HOST DEVICE", "clear a device's manual setting", hardwareReset},
+				{"bench", "HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run] [--json]", "measure a device's performance and energy at each setting, as a lowest-priority execution", hardwareBench},
+				{"profile", "HOST [DEVICE] [--json]", "per device and kind the measured curve, the point for its max_slowdown, and drift from its previous bench", hardwareProfile},
+				{"bench-run", "--run RUN_ID", "the bench driver (the argv of a bench execution; runs inside its attempt)", hardwareBenchRun},
 			},
 			aliases: map[string]string{
 				"status": "show", "get": "show", "ls": "show", "list": "show",
 				"clear": "reset", "unset": "reset", "default": "reset", "limit": "set", "apply": "set",
+				"benchmark": "bench", "measure": "bench", "curve": "profile", "profiles": "profile",
 			},
 		}},
 		{name: "node", summary: "quarantine or release nodes", group: &commandGroup{
@@ -507,6 +511,13 @@ var commandNotes = map[string]string{
 		"(Windows, Linux cpufreq) or --cpu-max-perf (Linux intel_pstate). A setting left out stays at the default.\n" +
 		"Values are checked against what the host's controller reported the device supports.",
 	"hardware reset": "Clears the manual setting: the device follows a bench or policy setting if one exists, else its defaults.",
+	"hardware bench": "Kinds: GPU gemm, copy, gemv-b1, gemv-b8 (swept), pcie-h2d, pcie-d2h, pcie-h2d-latency, pcie-d2h-latency;\n" +
+		"CPU cpu-compute, cpu-single, cpu-stream (swept); disk:FS disk-seq-read, disk-seq-write, disk-rand-read,\n" +
+		"disk-rand-read-qd1, disk-rand-write, disk-fsync, disk-sustained; net:NODE net-latency, net-bandwidth-send,\n" +
+		"net-bandwidth-recv. A prefix names a group (--kinds pcie,gemv). The bench waits at the lowest priority\n" +
+		"for the device alone (GPU: the GPU; CPU: the node's whole CPU; disk: the filesystem; net: a two-node gang).",
+	"hardware profile": "A point marked * is the one chosen for the device's max_slowdown: the valid point within it using the\n" +
+		"least energy per unit of work. Drift compares a kind with the device's previous bench, never with a specification.",
 }
 
 // parseFlags parses args interleaving flags and positionals; on --help it

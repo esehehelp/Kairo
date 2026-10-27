@@ -12,6 +12,7 @@ import (
 	"kairo/internal/agentclient"
 	"kairo/internal/buildinfo"
 	"kairo/internal/config"
+	"kairo/internal/cpupower"
 	"kairo/internal/devicecontrol"
 	"kairo/internal/store"
 	"kairo/internal/tlsutil"
@@ -65,6 +66,7 @@ func controllerCommand(args []string) error {
 		State:        state,
 		PollInterval: time.Duration(cfg.PollIntervalSeconds) * time.Second,
 		ResetAfter:   time.Duration(cfg.ResetAfterSeconds) * time.Second,
+		CPUMeter:     cpupower.New(),
 		Logger:       logger,
 	}
 	logger.Info("controller starting", "node_id", cfg.Node.ID, "server", cfg.ServerURL, "state_file", cfg.StateFile)

@@ -542,7 +542,9 @@ func stableDigest(value string) string {
 func convertExclusive(values []orchestration.ExclusiveRequest) []ExclusiveRequest {
 	result := make([]ExclusiveRequest, len(values))
 	for i, value := range values {
-		result[i] = ExclusiveRequest(value)
+		result[i] = ExclusiveRequest{Kind: value.Kind, Count: value.Count, SameNode: value.SameNode, MinTotalMemoryBytes: value.MinTotalMemoryBytes,
+			MinObservedFreeMemoryBytes: value.MinObservedFreeMemoryBytes, OnExternalClaim: value.OnExternalClaim,
+			OnUnattributedActivity: value.OnUnattributedActivity, OnStaleObservation: value.OnStaleObservation}
 	}
 	return result
 }

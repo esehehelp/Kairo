@@ -275,8 +275,9 @@ ca_file = "/etc/kairo/ca.pem"
 ```
 
 The rest (`log_directory`, `log_min_free_mib`, `observe_only`,
-`observation_interval_seconds`, `[node]`, `[[executors]]`, `[[providers]]`)
-has the same form as in the daemon configuration (`examples/kairo.toml`). An
+`observation_interval_seconds`, `[node]`, `[bench]`, `[[executors]]`,
+`[[providers]]`) has the same form as in the daemon configuration
+(`examples/kairo.toml`). An
 agent refuses an `http://` URL unless `insecure_http = true`. A host's device
 controller (`kairo controller`, see Hardware settings) connects the same way.
 
@@ -304,10 +305,14 @@ controller (`kairo controller`, see Hardware settings) connects the same way.
 | GET, POST | `/api/machines` (the machine declaration) | read, admin |
 | GET | `/api/hardware` (`?host=`) | read |
 | POST, DELETE | `/api/hardware/{host}/{device}/settings` | admin |
+| POST | `/api/hardware/{host}/{device}/bench` | admin |
+| GET | `/api/hardware/{host}/profile` (`?device=`) | read |
 | POST | `/api/agent/{operation}`, `/api/agent/logs` | node |
 | POST | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
 | GET | `/api/worker/commands` | worker |
 | POST | `/api/worker/commands/{command}/acks` | worker |
+| GET | `/api/worker/bench`, `/api/worker/bench/cpu-energy` | worker (a bench's attempt) |
+| POST | `/api/worker/bench/settings`, `/start`, `/points`, `/finish` | worker (a bench's attempt) |
 
 Errors are `{"error": ..., "code": ...}`. An empty `actor` in a pause, resume,
 quarantine, cancel or rerun request is recorded as the token's name.
@@ -515,7 +520,8 @@ shipped to the daemon: ... (10-27 10:01 to 10-27 10:04, caught up)`.
 
 Providers record what a device draws and how it runs, with the time they read
 it; Kairo keeps these facts and judges none of them against a specification.
-It only reads: no power limit or clock is ever set.
+Providers only read: settings are changed by a host's controller alone (see
+Hardware settings).
 
 - GPU: each `nvidia-smi` poll also reads the board power
   (`power.draw.average`, else `power.draw`), the power limit in force
@@ -549,7 +555,14 @@ began before the GPU's first sample or went on after its lease went stale.
 `task show` prints `energy: GPU 1.23 kWh (partial)` per attempt (`energy`
 with `gpu_joules`, `gpu_seconds_covered`, device-seconds, and `partial` in the
 API). A CPU package is shared by whatever runs on its node, so its power is
-kept for the node only.
+kept for the node only. A host's controller also reads its CPU packages (the
+same `internal/cpupower`) at every poll and reports them as the host's series
+`host/<host>/cpu`: on a Proxmox host only the host itself can read RAPL, its
+containers cannot. While the operating-point policy's setting is in place on
+an attempt's GPU, `task show` adds what it saved: `energy: GPU 1.23 kWh;
+policy 3.0 h, saved ~120.0 Wh (estimate)` (`policy_seconds`,
+`policy_saved_joules`, `policy_unestimated_seconds`), see Operating-point
+policy.
 
 The samples are the tables `device_samples` and `device_properties`, the
 totals `attempt_energy`. Samples are kept for 72 hours (about 5 MB a day per
@@ -638,22 +651,28 @@ desired; the host's controller carries it out and reports what is in place.
 Nothing here holds back admission or a running job: a setting that fails is a
 recorded fact.
 
-- Owners: a setting is `manual` (an operator's), `bench` or `policy` (a bench
-  run's or the operating-point policy's, each belonging to a lease), one per
-  owner kind and device. The one in effect is manual, else bench, else policy,
-  so a bench run overrides the policy on a device it has leased. A bench or
-  policy setting needs a reserved, prepared or active lease on a node of the
-  host that, for a GPU, holds that GPU, and is refused (`409
+- Owners: a setting is `manual` (an operator's), `bench` (a bench run's) or
+  `policy` (the operating-point policy's), one per owner kind and device. The
+  one in effect is manual, else bench, else policy, so a bench run overrides
+  the policy on a device it has leased. A bench setting, and a GPU's policy
+  setting, belongs to a lease: it needs a reserved, prepared or active lease
+  on a node of the host that, for a GPU, holds that GPU, and is refused (`409
   device_setting_conflict`) while another lease's setting of that kind is
-  there; a policy setting is refused on a device whose `max_slowdown` is 0.
-  When a lease is released, by any path, its settings are removed in the same
-  transaction: no setting outlives its lease.
+  there. When a lease is released, by any path, its settings are removed in
+  the same transaction: no setting outlives its lease. A CPU is shared by
+  whatever runs on its host, so its policy setting belongs to the host (ref
+  `host`), not to a lease; it is removed when the declaration makes the CPU
+  uncontrollable, drops the host, or sets its `max_slowdown` to 0. A policy
+  setting is refused on a device whose `max_slowdown` is 0.
 - Capabilities: the controller reports what it can change on each device and
   within which range (`nvidia-smi -q -d SUPPORTED_CLOCKS`, the power limit
   range and default; the CPU's frequency range or intel_pstate's
   `min_perf_pct`). A setting the device does not support, a value outside its
   range, or one for a device whose controller has not reported yet is refused
-  with `400`.
+  with `400`. These capabilities are the only source of what can be set (the
+  bench grid and the policy's fallback come from them); the power limits and
+  greatest clocks a provider reads into `device_properties` are what was seen,
+  shown with the device's samples and used for nothing else.
 - Generation: every change of a device's setting in effect increments its
   generation; the controller reports the generation it applied, so `hardware
   show` tells `in sync` from `pending` and `failed` (with the error).
@@ -663,13 +682,15 @@ recorded fact.
 
 | Command | What it does |
 |---|---|
-| `kairo hardware show [HOST] [--json]` | per host: its nodes and controller (when last seen), then per device its policy, the setting in effect and its owner, what is applied, and `in sync`, `pending`, `failed`, `reset` (the controller returned it to defaults on its own), `not reported`, `observe only` or `not controlled`; then the errors, the settings overridden and what each device supports |
+| `kairo hardware show [HOST] [--json]` | per host: its nodes and controller (when last seen), then per device its policy, the setting in effect and its owner, what is applied, and `in sync`, `pending`, `failed`, `reset` (the controller returned it to defaults on its own), `not reported`, `observe only` or `not controlled`; then the errors, the settings overridden, what each device supports, the policy's latest decision and the latest bench |
 | `kairo hardware set HOST DEVICE [--graphics-clock-max MHz] [--memory-clock MHz] [--power-limit W] [--cpu-max-freq MHz \| --cpu-max-perf PCT]` | sets the device's manual setting (as a whole: what is left out is the default) |
 | `kairo hardware reset HOST DEVICE` | clears the manual setting: the device follows a bench or policy setting, else returns to its defaults |
+| `kairo hardware bench HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run]` | measures the device at each setting of a grid (see Bench runs) |
+| `kairo hardware profile HOST [DEVICE] [--json]` | the measured curves, the point for each device's `max_slowdown`, and drift from its previous bench |
 
 `POST /api/hardware/{host}/{device}/settings` takes `{"settings", "owner":
 {"kind", "ref"}, "actor"}` (owner defaults to manual, whose ref is the actor;
-a bench or policy ref is its lease id) and `DELETE` the same without
+a bench or policy ref is its lease id, a CPU's policy ref `host`) and `DELETE` the same without
 settings; both answer `{"host_id", "device_id", "generation", "effective",
 "cleared"}`. `GET /api/hardware` answers `{"hosts"}` as `hardware show
 --json` prints them. In-process components use the store's
@@ -687,7 +708,9 @@ that already exists (one that also runs an agent) is left as it is. Every
 `poll_interval_seconds` (10) it fetches the settings of the devices it
 controls, which is every device with `control = true` of the host naming it
 and nothing else, changes what differs, reports what is in place, what failed
-and what each device supports, and counts as its heartbeat.
+and what each device supports, and counts as its heartbeat. It then reports
+the power of its host's CPU packages since its previous poll (see Power and
+energy); a reading the daemon does not take is dropped.
 
 - GPUs, by UUID with `nvidia-smi -i`: `-lgc LOWEST,MAX` / `-rgc`, `-lmc M,M` /
   `-rmc`, `-pl W` / `-pl` `power.default_limit`. A reset the card does not
@@ -767,6 +790,56 @@ privileges the daemon does not have:
 
 The controller warns at start when it is not elevated (Windows) or not root
 (Linux); its changes then fail and are reported as such.
+
+#### Operating-point policy
+
+The daemon (not an observe-only one) evaluates every minute each device a
+controller may change whose `max_slowdown` s is above 0, and asks for the
+setting that keeps performance within s for the least energy as the device's
+`policy` setting. It never holds back admission or waits for anything: a
+setting the controller does not apply is only a fact, and the next
+evaluation goes on.
+
+- A GPU's policy setting belongs to the lease holding it (not a bench's
+  lease, which sets its own; not one whose attempt has not started). The
+  policy compares what the GPU was seen doing since the attempt started, over
+  the last 5 minutes (`utilization.gpu` of its observations, `utilization.memory`
+  of its samples, at least 5 of each varying by at most 15 points), with the
+  fingerprint each swept kind showed in its bench (the same utilizations at
+  the references): every kind within 15 points on both is a candidate. The
+  setting chosen must suit every candidate (the worst case).
+- A CPU's policy setting belongs to its host and must suit all three CPU
+  kinds. While a bench of the host's CPU holds a lease, the policy setting is
+  removed, so the bench measures the defaults.
+- Selection (`internal/hwbench`): for a kind and tolerance s, the valid points
+  whose performance is at least 1 - s - 0.01 of the reference (a measurement
+  is good to about 1%), and among them the one using the least energy per
+  unit of work; none is the defaults. For several kinds, a setting must be
+  such a point of every kind, and the one using the least energy relative to
+  each kind's reference, on average, is taken.
+- Without a valid profile, or without a confident classification (too few
+  samples, usage that varies, no kind alike), the fallback caps the highest
+  graphics clock at (1 - s) of the GPU's greatest supported graphics clock,
+  rounded up to a supported clock (a CPU at (1 - s) of its greatest frequency
+  or performance percentage). The default clocks never exceed the greatest,
+  and performance loses no more than clock does, so this loses at most s
+  whatever runs. A CPU without a reported frequency range (Windows) stays at
+  its defaults.
+- Hysteresis: a new choice is applied once it has been the choice for 3
+  evaluations in a row, and a device's setting changes at most once per 5
+  minutes. A new lease starts at the defaults.
+- Each change is recorded: event `device_policy_decision` with its inputs (the
+  candidate kinds, the observed fingerprint, the runs and expected relative
+  performance and power against the defaults per kind, or the fallback's
+  reason), kept as the device's latest decision (`policy` of `hardware show
+  --json`; `hardware show` prints `policy graphics_clock_max_mhz=1800MHz
+  (profile, for gemm perf 0.970, 250 W vs 300 W) for lease ...`).
+- Energy saved: every evaluation while the policy's setting is in place on a
+  GPU (its controller applied it), the attempt holding it is credited the
+  elapsed time and, from the profile, the power saved for the same work (the
+  least over the candidates of relative performance x default power - power).
+  A fallback setting has no profile to estimate from; its time is counted as
+  unestimated.
 
 ### Node quarantine
 
@@ -969,6 +1042,109 @@ pilot.
 
 ## Hardware benchmarks
 
+### Bench runs
+
+`kairo hardware bench HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run]`
+(admin) measures how a device performs, and what energy it uses, at each
+setting of a grid. DEVICE is a GPU UUID, `cpu`, `disk:FILESYSTEM` (a
+filesystem provider's path on one of the host's nodes) or `net:NODE` (the
+network from the host's node to NODE). The run is an ordinary execution of
+the Kairo-owned project `kairo`, queue `hardware-bench`, at priority -1000000:
+it waits for every other execution, never preempts one, is not preemptible,
+and holds its device alone:
+
+| Device | Lease | Kinds (swept, else at the defaults) |
+|---|---|---|
+| GPU | that GPU (an exclusive request may name its `device`), 1 CPU, 2 GiB | `gemm` (bf16), `copy`, `gemv-b1`, `gemv-b8` swept; `pcie-h2d`, `pcie-d2h`, `pcie-h2d-latency`, `pcie-d2h-latency` |
+| `cpu` | the node's whole CPU (`cpu_millis_min` = all of it: nothing runs beside it), 4 GiB | `cpu-compute`, `cpu-single`, `cpu-stream` swept |
+| `disk:FS` | 9 GiB of FS (the test files) | `disk-seq-read`, `disk-seq-write` (qd 32), `disk-rand-read` (qd 32), `disk-rand-read-qd1`, `disk-rand-write`, `disk-fsync`, `disk-sustained` |
+| `net:NODE` | a 2-rank gang: rank 0 on the host's node (`--node`; it needs `interconnect_addr`, as for any gang) serves (`kairo bench serve` at `KAIRO_GANG_MASTER_ADDR:PORT`), rank 1 on NODE measures | `net-latency`, `net-bandwidth-send`, `net-bandwidth-recv` (4 streams) |
+
+`--kinds` takes kinds or groups by prefix (`pcie`, `gemv`). A GPU or CPU bench
+sweeps settings, so it is refused for a device declared `control = false`, on
+a host without a controller, before the controller reported what the device
+supports, and while the device has a manual setting; a storage or network
+bench measures the defaults and needs no controller. One bench per device
+waits or runs at a time (`409 bench_conflict`), and a network bench is refused
+while another gang spans the two nodes. `--dry-run` prints the run, the lease
+and the argv without submitting.
+
+Where the programs are is reported by each node with its registration, from
+`[bench]` of the agent's (or daemon's, for its own node) configuration:
+`kairo_binary` (default: that kairo), `gpu_binary` (`kairo-bench-gpu`; a node
+without it takes no GPU bench), `cwd` (default the kairo binary's directory)
+and `executor_labels` (the executor that runs them natively, not a WSL one
+for Windows paths). The execution's argv is `kairo hardware bench-run --run
+ID`, the driver, which reaches the daemon through the worker API with its
+attempt token (`KAIRO_API_URL`, `KAIRO_API_CA`, `KAIRO_ATTEMPT_TOKEN`): that
+token reaches only the run its attempt carries out (another run is `403`, an
+attempt that is no bench's `404`), and sets only its own lease's `bench`
+setting.
+
+The driver, per kind, runs one primitive for the whole kind (stopped as soon
+as the kind is done; `--seconds` bounds it), and its clock is the primitive's
+own interval stream:
+
+1. Records the device's facts from the start record (`device`, the workload
+   versions and builds, the GPU driver) and, before the first kind, the GPU's
+   observed temperature at rest.
+2. Clears its setting and waits until the controller reports the defaults
+   applied (no policy setting either), warms up until steady (temperature
+   changing by less than 0.5 °C/min over 60 s, or throughput by less than
+   0.5%/min without a temperature; at most 5 minutes, else `not steady`), and
+   measures the first reference: 20 s settle, 30 s measurement.
+3. Sweeps the grid, from the controller's capabilities: the GPU's graphics
+   clock cap from its greatest supported clock down to 50% of it in steps of
+   5% of it (snapped to the nearest supported clock), then each supported
+   memory clock below the greatest at the caps of 100% and 85%, then (gemm
+   only) power limits of 90, 80, 70 and 60% of the default within the range;
+   the CPU's `max_perf_pct` (intel_pstate) or `max_freq_mhz` (cpufreq) from
+   100% down to 50% in 5% steps (Windows reports no frequency range: no
+   sweep). Each point: ask for the setting, wait until the controller reports
+   that generation applied (60 s, else `not applied`), settle 20 s, measure 30
+   s. The second reference is taken after half the grid, the third at the end.
+4. Per point: work/s, performance relative to the mean of the three
+   references, mean power, energy per unit of work, the achieved clocks,
+   temperature, clock event reasons and utilization. GPU energy is the sum of
+   the intervals' NVML `energy_mj`; CPU energy comes from the daemon, from the
+   host's CPU package samples over the measurement window (of the series
+   covering most of it, the controller's or a node's; the same packages are
+   never added twice), each sample counting for the span since the one before
+   it (`cpu energy not covered` when they miss more than a tenth of it).
+5. A point is invalid when its setting was not applied (or no longer held at
+   its end), its clock fell short of its graphics clock cap by more than 2%
+   with a thermal event reason (`0x20`, `0x40`: the cap says nothing then; an
+   uncapped point measures what the device does with its heat), anything else
+   used the device (a process Kairo did not start on the GPU, another lease
+   on the host's nodes for a CPU, another lease reserving the filesystem, a
+   gang across the two nodes), a manual or policy setting was in effect, or
+   the primitive did no work or ended early. A kind whose three references
+   spread more than 1% ((max - min) / mean), or with an invalid reference, is
+   invalid as a whole: its curve is not used. A kind measured once is its own
+   reference. `disk-sustained` measures until its write limit.
+6. Clears its setting (the lease's release would anyway) and finishes the run:
+   `finished` when every kind is valid, else `invalid` with the reasons. A run
+   whose execution ends without finishing is `failed`.
+
+The primitives' own safety limits apply as they are (free space, the 20 GiB
+written per primitive run, memory). Runs and points are kept indefinitely
+(`bench_runs`, `bench_points`); events `hardware_bench_requested`,
+`hardware_bench_started`, `hardware_bench_finished` and
+`hardware_bench_invalid` (also for a failed run).
+
+`kairo hardware profile HOST [DEVICE] [--json]` prints per device its latest
+runs and, per kind, the curve of the latest run with valid references of it:
+each point's setting, relative performance, power, energy per unit of work,
+clock, temperature and validity, the point the policy would choose for the
+device's `max_slowdown` marked `*`, and the drift from the device's own
+previous run of that kind (`drift from bnc_... (10-20 09:00): work/s -0.8%,
+energy/work +1.2%`). Nothing is compared with a specification or with other
+devices. `GET /api/hardware/{host}/profile` answers `{"host", "runs"}` (runs
+with `references` and `points`); `POST .../bench` takes `{"kinds", "node",
+"dry_run", "actor"}` and answers `{"run", "execution", "dry_run"}`.
+
+### Primitives
+
 Measurement primitives for hardware efficiency: each runs one fixed,
 deterministic workload for a given time and streams what it did, so an
 orchestrator can window the intervals, compare them with a reference run and
@@ -1157,8 +1333,9 @@ daemon opening an older database migrates it in place (the `cancelled` task
 state, reruns, the `env` column, the machine declaration, which starts out
 declaring every registered GPU for the node it is registered on, and its
 (uuid, node) key for shared GPUs, the attempt log problems, the admission
-tables, the power and energy tables, the hosts and device settings, which
-start out empty); keep the backup, since an older binary would read a rerun
+tables, the power and energy tables, the hosts and device settings, the bench
+runs and policy decisions, which start out empty); keep the backup, since an
+older binary would read a rerun
 Task's earlier execution as its outcome again.
 
 ## Verification
@@ -1176,4 +1353,6 @@ tests rather than ordinary unit tests, and so are the controller's changes of
 real clocks, power limits and processor settings (its tests use fake
 actuators). The bench tests run tiny workloads (TempDir files of a few MiB,
 loopback); `kairo-bench-gpu` is only built by them, and a GPU bench belongs on
-an idle GPU.
+an idle GPU. The bench driver and the policy are tested with scripted JSON
+lines and fake daemons and controllers; only real idle hardware shows whether
+the curves, steady state and thermal limits behave as the fakes assume.

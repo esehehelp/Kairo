@@ -55,6 +55,8 @@ type gpuConstraints struct {
 	SameNode bool  `json:"same_node"`
 	MinTotal int64 `json:"min_total_memory_bytes"`
 	MinFree  int64 `json:"min_observed_free_memory_bytes"`
+	// Device: only this GPU (by UUID) will do.
+	Device string `json:"device,omitempty"`
 }
 
 type conflictPolicy struct {
@@ -236,12 +238,19 @@ func writeReservationTx(ctx context.Context, tx *sql.Tx, executorID string, cand
 	return &Reservation{Lease: lease, Execution: candidate.execution, Argv: candidate.execution.Argv, CWD: candidate.execution.CWD, Resources: resources, GateGenerations: gateGenerations}, nil
 }
 
-func selectorMatches(selectorJSON, executorJSON string) bool {
+// selectorMatches reports whether an executor of node nodeID with the
+// attributes executorJSON matches an executor selector: its labels and, when
+// it names one, its node.
+func selectorMatches(selectorJSON, nodeID, executorJSON string) bool {
 	var selector struct {
 		Labels map[string]string `json:"labels"`
+		Node   string            `json:"node"`
 	}
 	var attributes map[string]any
 	if json.Unmarshal([]byte(selectorJSON), &selector) != nil || json.Unmarshal([]byte(executorJSON), &attributes) != nil {
+		return false
+	}
+	if selector.Node != "" && selector.Node != nodeID {
 		return false
 	}
 	for key, want := range selector.Labels {

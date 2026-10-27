@@ -19,6 +19,7 @@ import (
 	"kairo/internal/api"
 	"kairo/internal/config"
 	"kairo/internal/executor"
+	"kairo/internal/hwpolicy"
 	"kairo/internal/provider"
 	"kairo/internal/secfile"
 	"kairo/internal/store"
@@ -105,7 +106,7 @@ func serve(args []string) error {
 	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
 	slog.SetDefault(logger)
 	providerSet := map[string]provider.Provider{}
-	attributes, _ := json.Marshal(daemonConfig.Node.Labels)
+	attributes, _ := json.Marshal(daemonConfig.Bench.Attributes(daemonConfig.Node.Labels))
 	if err := st.UpsertNode(context.Background(), store.Node{ID: daemonConfig.Node.ID, Name: daemonConfig.Node.Name, OS: daemonConfig.Node.OS, Architecture: daemonConfig.Node.Architecture, Attributes: attributes, Enabled: true}); err != nil {
 		return err
 	}
@@ -251,6 +252,11 @@ func serve(args []string) error {
 				}
 			}
 		}()
+	}
+	if !daemonConfig.ObserveOnly {
+		// The operating-point policy asks for device settings within each
+		// device's max_slowdown, and ends bench runs whose execution ended.
+		go (&hwpolicy.Policy{Store: st, Logger: logger}).Run(ctx)
 	}
 	if !daemonConfig.ObserveOnly {
 		// Project declarations are reconciled above the V3 execution layer. The

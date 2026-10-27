@@ -18,6 +18,7 @@ import (
 	"slices"
 	"time"
 
+	"kairo/internal/cpupower"
 	"kairo/internal/store"
 )
 
@@ -26,6 +27,13 @@ type Daemon interface {
 	RegisterController(ctx context.Context, node store.Node, version string) error
 	DeviceSettings(ctx context.Context, nodeID string) ([]store.ControlledDevice, error)
 	ReportDevices(ctx context.Context, nodeID string, reports []store.DeviceReport) ([]string, error)
+}
+
+// SampleReporter is a Daemon that takes what the controller reads of its host
+// (agentclient.Client does): the CPU package power, which on a Proxmox host
+// only the host itself can read.
+type SampleReporter interface {
+	ReportSamples(ctx context.Context, nodeID string, samples []store.ControllerSample) ([]string, error)
 }
 
 // Actuator changes the settings of one kind of device.
@@ -81,8 +89,11 @@ type Controller struct {
 	// ResetAfter is how long the daemon may be unreachable before every
 	// device is returned to its defaults.
 	ResetAfter time.Duration
-	Now        func() time.Time
-	Logger     *slog.Logger
+	// CPUMeter reads the host's CPU package power, reported at every poll to
+	// a Daemon that is a SampleReporter (nil: not read).
+	CPUMeter cpupower.Meter
+	Now      func() time.Time
+	Logger   *slog.Logger
 
 	devices     map[deviceKey]*device
 	registered  bool
@@ -90,6 +101,8 @@ type Controller struct {
 	// unreachableSince is when the daemon stopped answering (zero: it answers).
 	unreachableSince time.Time
 	lossReset        bool
+	// powerSkipped: the daemon skipped the latest power sample (logged once).
+	powerSkipped bool
 }
 
 type deviceKey struct{ host, id string }
@@ -202,6 +215,35 @@ func (c *Controller) Step(ctx context.Context) {
 		}
 	}
 	c.flush(ctx)
+	c.reportPower(ctx)
+}
+
+// reportPower sends the host's CPU package power since the previous poll. A
+// reading the daemon does not take is dropped: the next covers its own span
+// only, and the gap shows as a gap.
+func (c *Controller) reportPower(ctx context.Context) {
+	reporter, ok := c.Daemon.(SampleReporter)
+	if c.CPUMeter == nil || !ok {
+		return
+	}
+	reading, ok := c.CPUMeter.Read()
+	if !ok {
+		return
+	}
+	watts := reading.Watts
+	sample := store.ControllerSample{DeviceID: "cpu", ObservedAt: reading.At.UTC().Format(time.RFC3339Nano),
+		// valid until the next poll's reading, with a poll to spare
+		ValidUntil: reading.At.Add(2 * c.PollInterval).UTC().Format(time.RFC3339Nano), PowerW: &watts}
+	skipped, err := reporter.ReportSamples(ctx, c.Node.ID, []store.ControllerSample{sample})
+	switch {
+	case err != nil:
+		c.logger().Debug("cannot report the CPU package power", "error", err)
+	case len(skipped) != 0 && !c.powerSkipped:
+		c.powerSkipped = true
+		c.logger().Info("daemon skipped the CPU package power: no host names this controller")
+	case len(skipped) == 0:
+		c.powerSkipped = false
+	}
 }
 
 // Stop returns every device not known to be at its defaults to them, and
