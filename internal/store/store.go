@@ -31,8 +31,14 @@ var forceStopSchema string
 //go:embed auth_schema.sql
 var authSchema string
 
+//go:embed planner_schema.sql
+var plannerSchema string
+
 //go:embed machine_schema.sql
 var machineSchema string
+
+//go:embed log_problem_schema.sql
+var logProblemSchema string
 
 var (
 	ErrNotFound              = errors.New("not found")
@@ -51,7 +57,8 @@ var (
 )
 
 type Store struct {
-	db *sql.DB
+	db     *sql.DB
+	policy SchedulingPolicy
 }
 
 func Open(path string) (*Store, error) {
@@ -174,7 +181,15 @@ func Open(path string) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db}, nil
+	if _, err := db.Exec(plannerSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply planner schema: %w", err)
+	}
+	if _, err := db.Exec(logProblemSchema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("apply log problem schema: %w", err)
+	}
+	return &Store{db: db, policy: SchedulingPolicy{DiskMinFreeBytes: DefaultDiskMinFreeBytes}}, nil
 }
 
 // applyMachineSchema creates the machine declaration tables. A database that

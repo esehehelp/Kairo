@@ -74,6 +74,39 @@ func TestTaskListDefaultShowsLiveAndRecentSorted(t *testing.T) {
 	}
 }
 
+// A task whose continuation waits behind its own closed gate is shown paused,
+// not waiting; one still suspending is pausing.
+func TestTaskListShowsPausedTasks(t *testing.T) {
+	useFakeClock(t, base)
+	f := newContractAPI()
+	gate := map[string]string{"scope": "task", "state": "closed", "closed_by": "alice", "closed_at": stamp(base.Add(-time.Hour))}
+	f.setTask("paused", map[string]any{"queue": "gpu", "state": "running", "updated_at": stamp(base), "paused": gate,
+		"executions": []map[string]any{
+			{"ordinal": 1, "execution_id": "exe_1", "state": "terminal", "attempt_id": "att_1", "attempt_started_at": stamp(base.Add(-2 * time.Hour)), "exited_at": stamp(base.Add(-time.Hour))},
+			{"ordinal": 2, "execution_id": "exe_2", "reason": "continuation", "state": "waiting"},
+		}})
+	f.setTask("pausing", map[string]any{"queue": "gpu", "state": "running", "updated_at": stamp(base), "paused": map[string]string{"scope": "project", "state": "closed"},
+		"executions": []map[string]any{{"ordinal": 1, "execution_id": "exe_3", "state": "started", "attempt_id": "att_3", "attempt_started_at": stamp(base.Add(-time.Hour)),
+			"progress": map[string]any{"current": 7, "unit": "steps"}}}})
+	f.setTask("waiting", map[string]any{"queue": "gpu", "state": "running", "updated_at": stamp(base),
+		"executions": []map[string]any{{"ordinal": 1, "execution_id": "exe_4", "state": "waiting"}}})
+	server := f.serve(t)
+	out, err := captureStdout(t, func() error { return run([]string{"task", "list", "--all", "p", "--api", server.URL}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := lines(out)
+	for i, want := range []string{
+		"paused gpu running #2 - - paused: task gate closed by alice",
+		"pausing gpu running #1 10-13 11:00 1h0m pausing; 7 steps",
+		"waiting gpu running #1 - - execution waiting",
+	} {
+		if len(got) < i+2 || strings.Join(strings.Fields(got[i+1]), " ") != want {
+			t.Fatalf("row %d is not %q:\n%s", i+1, want, out)
+		}
+	}
+}
+
 func TestTaskListFiltersAllAndJSON(t *testing.T) {
 	useFakeClock(t, base)
 	f := listFixture()
@@ -178,18 +211,24 @@ func showFixture() *contractAPI {
 				"env": map[string]string{"HF_HOME": `D:\hf`}}},
 		"dependencies": []map[string]string{{"name": "prep", "state": "succeeded"}},
 		"dependents":   []map[string]string{{"name": "eval", "state": "pending"}},
-		"gates":        []map[string]string{{"scope": "task", "state": "open"}, {"scope": "project", "state": "open"}},
+		"gates":        []map[string]string{{"scope": "task", "state": "closed", "closed_by": "alice", "closed_at": stamp(base.Add(-20 * time.Minute))}, {"scope": "project", "state": "open"}},
+		"paused":       map[string]string{"scope": "task", "state": "closed", "closed_by": "alice", "closed_at": stamp(base.Add(-20 * time.Minute))},
 		"executions": []map[string]any{
 			{"ordinal": 1, "execution_id": "exe_1", "reason": "initial", "state": "terminal", "exit_code": 1, "terminal_cause": "process_exit",
 				"attempt_started_at": stamp(base.Add(-4 * time.Hour)), "exited_at": stamp(base.Add(-3 * time.Hour)),
 				"attempts": []map[string]any{{"id": "att_1", "execution_id": "exe_1", "state": "exited", "executor_id": "local-gpu", "node_id": "pc1",
 					"exit_code": 1, "started_at": stamp(base.Add(-4 * time.Hour)), "exited_at": stamp(base.Add(-3 * time.Hour)),
-					"stdout_path": `D:\logs\att_1.out`, "stdout_bytes": 2048, "stderr_path": `D:\logs\att_1.err`, "stderr_bytes": 10}}},
+					"stdout_path": `D:\logs\att_1.out`, "stdout_bytes": 2048, "stderr_path": `D:\logs\att_1.err`, "stderr_bytes": 10,
+					"log_problems": []map[string]any{
+						{"problem": "log_space_exhausted", "detail": "/srv/kairo has 0 B free (minimum 1.0 GiB)", "first_seen_at": stamp(base.Add(-3*time.Hour - 30*time.Minute)), "last_seen_at": stamp(base.Add(-3*time.Hour - 30*time.Minute))},
+						{"problem": "log_forward_failed", "stream": "stderr", "detail": "agent API 500: no space left on device", "first_seen_at": stamp(base.Add(-3*time.Hour - 20*time.Minute)),
+							"last_seen_at": stamp(base.Add(-3*time.Hour - 15*time.Minute)), "resolved_at": stamp(base.Add(-3*time.Hour - 15*time.Minute))},
+					}}}},
 			{"ordinal": 2, "execution_id": "exe_2", "reason": "retry", "state": "waiting",
 				"gang": []map[string]any{{"rank": 0, "execution_id": "exe_2", "state": "waiting"}, {"rank": 1, "execution_id": "exe_2r1", "state": "authorized", "node_id": "pve0"}},
 				"waiting": []map[string]any{
 					{"reason_code": "external_claim", "detail": map[string]any{"resource_id": "GPU-1234", "pid": 4242}, "created_at": stamp(base.Add(-10 * time.Minute))},
-					{"reason_code": "scope_gate_closed", "scope": "queue"},
+					{"reason_code": "scope_gate_closed", "scope": "task", "detail": map[string]any{"closed_by": "alice"}, "created_at": stamp(base.Add(-20 * time.Minute))},
 				}},
 		},
 	}
@@ -216,16 +255,19 @@ func TestTaskShowRendersTheDetail(t *testing.T) {
 		"env:         HF_HOME=D:\\hf\n",
 		"depends on:  prep (succeeded)\n",
 		"dependents:  eval (pending)\n",
-		"gates:       task open, project open\n",
+		"state:       running (paused: task gate closed by alice)\n",
+		"gates:       task closed by alice at 2026-10-13 11:40:00, project open\n",
 		"execution #1 (initial)  terminal  exit 1  [process_exit]\n",
 		"  time:       started 2026-10-13 08:00:00  ended 2026-10-13 09:00:00 (1h0m)\n",
 		"  attempt:    att_1 exited node pc1 executor local-gpu exit 1\n",
 		"  stdout:     D:\\logs\\att_1.out (2.0 KiB)\n",
 		"  stderr:     D:\\logs\\att_1.err (10 B)\n",
+		"  log issue:  log filesystem full, output lost: /srv/kairo has 0 B free (minimum 1.0 GiB) (10-13 08:30)\n",
+		"  log issue:  stderr not shipped to the daemon: agent API 500: no space left on device (10-13 08:40 to 10-13 08:45, caught up)\n",
 		"execution #2 (retry)  waiting\n",
 		"  gang:       rank 1 exe_2r1 authorized node pve0\n",
 		"  waiting:    external_claim on GPU-1234 (pid=4242) (since 10-13 11:50)\n",
-		"  waiting:    scope_gate_closed: the queue is paused\n",
+		"  waiting:    scope_gate_closed: the task is paused by alice (since 10-13 11:40)\n",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in:\n%s", want, out)

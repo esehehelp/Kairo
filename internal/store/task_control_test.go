@@ -548,7 +548,7 @@ func TestTaskDetail(t *testing.T) {
 	if !strings.Contains(string(detail.Spec), `"name":"prepare"`) || len(detail.Dependents) != 1 || detail.Dependents[0] != (TaskRef{"train", "pending"}) || len(detail.Dependencies) != 0 {
 		t.Fatalf("detail: %+v", detail)
 	}
-	if len(detail.Gates) != 3 || detail.Gates[0] != (TaskGate{"project", "open"}) || detail.Gates[2] != (TaskGate{"task", "open"}) {
+	if len(detail.Gates) != 3 || detail.Gates[0] != (TaskGate{Scope: "project", State: "open"}) || detail.Gates[2] != (TaskGate{Scope: "task", State: "open"}) {
 		t.Fatalf("gates: %+v", detail.Gates)
 	}
 	if len(detail.Executions) != 1 || len(detail.Executions[0].Attempts) != 1 {
@@ -568,6 +568,46 @@ func TestTaskDetail(t *testing.T) {
 	if execution.Waiting != nil || execution.Gang != nil {
 		t.Fatalf("a started execution waits: %+v", execution)
 	}
+	if attempt.LogProblems != nil || detail.Paused != nil {
+		t.Fatalf("problems or pause of a healthy task: %+v %+v", attempt.LogProblems, detail.Paused)
+	}
+	// Log problems reported while it runs are shown on its attempt.
+	for _, p := range []LogProblem{
+		{Problem: LogForwardFailed, Stream: "stderr", Detail: "agent API 500: no space left on device"},
+		{Problem: LogForwardFailed, Stream: "stderr", Detail: "", Resolved: true},
+		{Problem: LogSpaceExhausted, Detail: "/srv/kairo has 0 B free"},
+	} {
+		if err := store.RecordAttemptLogProblem(ctx, launch.Attempt.ID, p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.RecordAttemptLogProblem(ctx, launch.Attempt.ID, LogProblem{Problem: "disk_on_fire"}); err == nil {
+		t.Fatal("unknown log problem accepted")
+	}
+	if err := store.RecordAttemptLogProblem(ctx, "att_missing", LogProblem{Problem: LogSpaceLow}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("problem of an unknown attempt: %v", err)
+	}
+	if detail, err = store.GetTaskDetail(ctx, "orchestrated", "prepare"); err != nil {
+		t.Fatal(err)
+	}
+	problems := detail.Executions[0].Attempts[0].LogProblems
+	if len(problems) != 2 || problems[0].Problem != LogForwardFailed || problems[0].Detail != "agent API 500: no space left on device" || !problems[0].Resolved || problems[0].ResolvedAt == nil || problems[0].Occurrences != 2 ||
+		problems[1].Problem != LogSpaceExhausted || problems[1].Resolved {
+		t.Fatalf("log problems: %+v", problems)
+	}
+	events, err := store.ListEvents(ctx, EventFilter{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logEvents []string
+	for _, e := range events {
+		if e.AggregateID == launch.Attempt.ID && strings.HasPrefix(e.EventType, "attempt_log_problem") {
+			logEvents = append(logEvents, e.EventType)
+		}
+	}
+	if strings.Join(logEvents, ",") != "attempt_log_problem,attempt_log_problem_resolved,attempt_log_problem" {
+		t.Fatalf("log problem events: %v", logEvents)
+	}
 
 	// train waits behind its own closed task gate once submitted.
 	finishLaunch(t, store, launch, 0)
@@ -578,11 +618,47 @@ func TestTaskDetail(t *testing.T) {
 	if detail, err = store.GetTaskDetail(ctx, "orchestrated", "train"); err != nil {
 		t.Fatal(err)
 	}
-	if len(detail.Dependencies) != 1 || detail.Dependencies[0] != (TaskRef{"prepare", "succeeded"}) || detail.Gates[2] != (TaskGate{"task", "closed"}) {
+	if len(detail.Dependencies) != 1 || detail.Dependencies[0] != (TaskRef{"prepare", "succeeded"}) || detail.Gates[2].Scope != "task" || detail.Gates[2].State != "closed" || detail.Gates[2].ClosedBy != "tester" || detail.Gates[2].ClosedAt == "" {
 		t.Fatalf("train: %+v", detail)
 	}
-	if len(detail.Executions) != 1 || len(detail.Executions[0].Waiting) != 1 || detail.Executions[0].Waiting[0].ReasonCode != "scope_gate_closed" || detail.Executions[0].Waiting[0].Scope != "task" {
+	if len(detail.Executions) != 1 || len(detail.Executions[0].Waiting) != 1 || detail.Executions[0].Waiting[0].ReasonCode != "scope_gate_closed" || detail.Executions[0].Waiting[0].Scope != "task" ||
+		string(detail.Executions[0].Waiting[0].Detail) != `{"closed_by":"tester"}` || detail.Executions[0].Waiting[0].CreatedAt != detail.Gates[2].ClosedAt {
 		t.Fatalf("waiting: %+v", detail.Executions)
+	}
+	// The task stays running, and is shown paused by its task gate.
+	if detail.State != "running" || detail.Paused == nil || *detail.Paused != detail.Gates[2] {
+		t.Fatalf("paused: %s %+v", detail.State, detail.Paused)
+	}
+	// A closed project gate is reported for every live task, unless an inner
+	// one is closed too; a second pause of a closed gate is not its closer.
+	if _, err = store.PauseScope(ctx, taskScopeID(t, store, "orchestrated", "training", "train"), "someone-else", "pause-train-again"); err != nil {
+		t.Fatal(err)
+	}
+	project, err := store.GetScopeByPath(ctx, ScopePath{Project: "orchestrated"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.PauseScope(ctx, project.Project.ID, "operator", "pause-project"); err != nil {
+		t.Fatal(err)
+	}
+	status, err := store.GetProjectStatus(ctx, "orchestrated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, task := range status.Tasks {
+		want := "project operator"
+		switch task.Name {
+		case "train":
+			want = "task tester"
+		case "prepare": // succeeded: nothing to hold back
+			if task.Paused != nil {
+				t.Fatalf("ended task paused: %+v", task.Paused)
+			}
+			continue
+		}
+		if task.Paused == nil || task.Paused.Scope+" "+task.Paused.ClosedBy != want {
+			t.Fatalf("%s paused: %+v, want %s", task.Name, task.Paused, want)
+		}
 	}
 	if _, err = store.GetTaskDetail(ctx, "orchestrated", "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown task: %v", err)

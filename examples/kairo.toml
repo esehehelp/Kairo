@@ -2,8 +2,14 @@ database_path = "local/kairo-v3.db"
 listen = "127.0.0.1:7474"
 advertise_url = "http://127.0.0.1:7474"
 log_directory = "local/attempts-v3"
+log_min_free_mib = 1024  # launch nothing while log_directory's filesystem has less free
 observe_only = true
 observation_interval_seconds = 5
+
+# Admission (README "Admission"): a node with a filesystem under this much
+# free space (at most 5% of it) admits nothing; 0 turns it off.
+[scheduler]
+disk_min_free_bytes = 5368709120
 
 [node]
 id = "windows-host-1"

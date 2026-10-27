@@ -92,7 +92,10 @@ for bound GPUs), which a declaration cannot override. Names starting with
 `KAIRO_` and `WSLENV` are rejected, and so is `CUDA_VISIBLE_DEVICES` on an
 execution with an exclusive GPU request (a CPU task may set it to `-1`). WSL
 executors pass the variables through `WSLENV` as written (`/u`, no path
-translation). `argv[0]` is still looked up on the executor's own `PATH`.
+translation). `argv[0]` is still looked up on the executor's own `PATH`, and
+argv reaches the program word for word on every executor: no shell sits in
+between (a WSL attempt runs through `wsl.exe --exec`), so `$VAR` in an argument
+is expanded only by a shell the argv itself starts.
 Env is part of the task's digest and is stored and shown in plain text to any
 reader of the API: it is not a place for secrets.
 
@@ -118,13 +121,23 @@ run and the dependencies they need, keeping each kept Task's digest.
 reserves, launches, suspends, or releases work. It is the recommended first
 deployment mode on a host with unmanaged training processes.
 
+`kairo resource status` prints one row per resource, by node (GPUs, then
+cpu, ram and disk): its state (with a quarantine's reason), total and free as
+last observed (a GPU's memory and utilization; a cpu's cores), what live
+leases reserve of a cpu, ram or disk, and the tasks holding it (with the lease
+state unless `active`); then the external claims with their evidence, and the
+GPUs reported but not declared for their node. `--json` prints the response of
+`GET /api/resources` instead, whose resources also carry `total_bytes`,
+`free_bytes`, `utilization`, `reserved` and `holders`. `kairo doctor` ends with
+the same table.
+
 Resource observations describe the present: only each resource's latest one
 is used, and the daemon prunes the others once they are an hour old.
 `kairo db compact --config kairo.toml` (with the daemon stopped) prunes them
 at once and runs `VACUUM`.
 
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
-limits. GPU exclusion is a coordination guarantee among Kairo participants;
+limits (see Admission for how they are counted). GPU exclusion is a coordination guarantee among Kairo participants;
 external processes are observed and excluded but cannot be physically fenced.
 
 ## Following tasks from the CLI
@@ -135,13 +148,19 @@ be left out of task commands for Tasks declared by a ProjectSpec.
 
 | Command | What it prints |
 |---|---|
-| `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
-| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates, every execution with its attempts, nodes, exit, log paths and sizes, gang ranks, and why a waiting execution waits |
+| `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress or pause) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
+| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, log paths and sizes, log issues, gang ranks, and why a waiting execution waits |
 | `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | the last N lines (default 50, `0` all) of the latest attempt's logs, also for attempts on agent nodes; `-f` follows until the attempt has exited and its logs stopped growing |
 | `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | one line per state change (`10:01:33 hello running -> succeeded`), `DOWN`/`UP` while the daemon is unreachable, `STALL` when a running Task's logs stop growing for D; exits 0 when all succeeded (or started), 1 when one ended otherwise, 2 on timeout, 3 on a usage or lookup error |
 | `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | state changes, progress (once a minute per Task) and a summary every 10 min; with `--exit-when-idle` it exits when nothing is pending or running (1 if a watched Task did not succeed) |
 | `kairo execution logs EXECUTION_ID`, `kairo logs ATTEMPT_ID` | the same logs by execution or attempt |
 | `kairo version` | the CLI's and the daemon's build; `doctor` warns when they differ |
+
+A pending or running Task held back by a closed gate of its project, queue or
+task keeps its state; its note says `paused: task gate closed by alice` once
+nothing of it runs (its continuation waits behind the gate), or `pausing`
+while its execution is still being suspended. A pause is a view of the gates,
+not a stored Task state, so `--state` does not select it.
 
 The line-oriented `wait` and `watch` suit a background monitor: each line is
 one event and is flushed at once. `project status PROJECT` still prints JSON
@@ -250,10 +269,10 @@ ca_file = "/etc/kairo/ca.pem"
 # attempt_api_url = "https://192.168.1.12:7474"  # KAIRO_API_URL of this node's attempts
 ```
 
-The rest (`log_directory`, `observe_only`, `observation_interval_seconds`,
-`[node]`, `[[executors]]`, `[[providers]]`) has the same form as in the daemon
-configuration (`examples/kairo.toml`). An agent refuses an `http://` URL
-unless `insecure_http = true`.
+The rest (`log_directory`, `log_min_free_mib`, `observe_only`,
+`observation_interval_seconds`, `[node]`, `[[executors]]`, `[[providers]]`)
+has the same form as in the daemon configuration (`examples/kairo.toml`). An
+agent refuses an `http://` URL unless `insecure_http = true`.
 
 ## API
 
@@ -292,8 +311,11 @@ quarantine, cancel or rerun request is recorded as the token's name.
 the filter. Each Task has `created_at` and `updated_at`, and each execution its
 attempt, executor, timestamps and latest progress without `detail`.
 `GET /api/projects/{project}/tasks/{task}` adds the declaration (`spec`),
-dependencies, dependants, scope gates, and per execution its attempts (with
-log paths and sizes), gang ranks and `waiting` reasons. Apply answers
+dependencies, dependants, scope gates (a closed one with `closed_by` and
+`closed_at`, from the pause operation that closed it), and per execution its
+attempts (with log paths and sizes and `log_problems`), gang ranks and
+`waiting` reasons. A live Task held back by a closed gate has `paused`, the
+innermost such gate. Apply answers
 `{"project", "spec_digest", "idempotent", "created", "unchanged"}`. Cancel
 takes `{"actor", "dry_run"}` and answers `{"task", "state", "withdrawn",
 "dry_run"}`; rerun takes `{"actor", "request_id"}` (a repeated `request_id`
@@ -340,6 +362,79 @@ registered process is absent and provider observations taken after that
 absence show resources unclaimed. An expired or executor-lost lease becomes
 stale; it is never made free based on time alone.
 
+A compute process a provider sees on a GPU (`nvidia-smi pmon`) is an
+`external_process` claim unless it is the work of the attempt holding that GPU
+(on any node's row of it): one of the attempt's registered processes, a
+descendant of one (by its parent chain, each parent alive and started no later
+than its child), or, on Linux, a process carrying the attempt's
+`KAIRO_ATTEMPT_ID` (read from `/proc/PID/environ`, as force stop finds the
+attempt's processes; Windows reads only the parent chain). That holds only
+while the attempt is `running` or `quiescing` with a registered process alive:
+a descendant that outlives them is a claim again, and the lease is not
+released while it runs. A process that cannot be tied to the lease holder (one
+of another attempt, one whose parent has exited or whose environment cannot be
+read) stays a claim, and a GPU with a claim is not given to a preempting
+execution.
+
+### Admission
+
+Which waiting execution runs where is decided by one planning pass over the
+whole installation: every waiting execution whose scope gates are open, every
+node with an executor that has polled in the last minute (or not yet), every
+lease and claim. Each executor's reserve and preemption call runs the same
+pass, and the pass, not the executor that polls first, chooses; an execution
+placed on another node waits for that node's executor (`awaiting_executor`).
+Executors of one node share its resources, so any of them that matches the
+labels may take what is placed there.
+
+- Order: higher `priority` first. Within a priority, the project holding the
+  smallest share of the installation's GPUs, CPU or RAM (whichever share is
+  largest) goes next, then the earlier submission.
+- Placement: among the nodes an execution fits on, the one left with the
+  fewest free GPUs (CPU work stays off GPU nodes, GPU work packs onto as few
+  as it can), then the most free CPU. A gang's ranks go on distinct nodes, all
+  or none.
+- Backfill: an execution that fits nowhere holds, on the node it would run on
+  once the leases in its way end, what it can already use there; executions
+  after it run on everything nobody holds. It holds nothing when what stops it
+  does not end by itself: a process Kairo did not start on a GPU, activity no
+  process explains, a stale observation, a node too small for it, the disk
+  watermark.
+- Preemption: an execution that fits nowhere (any priority, a gang too) may
+  suspend executions of lower priority that are `checkpointable` and
+  `preemptible` and whose GPUs or RAM are what stops it, the fewest needed
+  (already suspending ones first, then the lowest priority, single executions
+  before gangs, the most recently started). Too little CPU or disk is waited
+  for, never a reason to suspend anything.
+- Accounting: CPU is the node's total minus the reservations on it. RAM is
+  the lesser of total minus reservations and observed free memory minus the
+  part of each reservation its attempt does not use yet (what an attempt
+  uses, sampled by its executor, counts for two minutes; without a sample the
+  whole reservation counts). Disk is observed free space minus every
+  reservation on it: bytes written overstate what stays on disk (a rewritten
+  checkpoint counts twice), so they never shrink a reservation. A disk
+  request keeps its `min_free_after_bytes` and the watermark free.
+- Elastic CPU: `cpu_millis_min` (at most `cpu_millis`) under `[capacity]`
+  (`[tasks.execution.capacity]`) is the least an execution keeps. The rest of
+  its CPU reservation is lent to executions of the same or lower priority,
+  which then run beside it and slow it down instead of stopping it: a server
+  declared with `cpu_millis = 16000` and `cpu_millis_min = 4000` lets 12 CPUs
+  of evaluations run next to it.
+- Disk watermark: a node with a registered filesystem under
+  `[scheduler] disk_min_free_bytes` of the daemon configuration (default
+  5 GiB, at most 5% of the filesystem; `0` turns it off) admits nothing until
+  space is freed. Each such filesystem is kept in `node_alerts` and announced
+  by the events `disk_low_watermark` and `disk_watermark_cleared`.
+
+Every waiting execution's latest reason is kept: `task show` prints it under
+`waiting:` (for example `gpu_leased: pve0: 1 GPU(s) of >= 11.0 GiB needed, 0
+usable; leased by glm/maya-r3 (priority -100)`), and `task list` adds its
+code to the NOTE (`execution waiting: insufficient_ram`). The codes are
+`no_executor`, `awaiting_executor`, `gpu_leased`, `held_for_higher_priority`,
+`gpu_memory_low`, `insufficient_gpu`, `insufficient_cpu`, `insufficient_ram`,
+`insufficient_disk`, `external_claim`, `unattributed_activity`,
+`stale_observation`, `disk_low_watermark` and `preempting`.
+
 ### Executor ticks
 
 An executor's tick is bounded in time. Every external call on it has a
@@ -353,6 +448,61 @@ WARN as `executor step stalled` (with `executor_id`, `step` and
 commands that take longer than 2 s are logged at INFO with their duration; a
 timeout is logged at WARN with the command.
 
+Every 15 s an executor samples what each attempt it launched takes up, for
+admission to count that part of the attempt's RAM reservation once
+(`attempt-usage` on the agent API; bytes written are recorded but do not
+change disk admission, see Admission). The sample runs beside the tick, one at a
+time, bounded to 15 s, so it never holds the tick. RAM is the memory the
+attempt's processes hold, bytes written what they have written, never less
+than an earlier sample showed:
+
+- Linux: the processes carrying the attempt's `KAIRO_ATTEMPT_ID` and the
+  descendants of its launcher; the sum of their PSS (`smaps_rollup`) and of
+  their `write_bytes` less `cancelled_write_bytes` (`/proc/PID/io`).
+- Windows: the processes of the attempt's job object, their private working
+  sets and the bytes the job has written; without a job object, the launcher
+  and its descendants by parent pid and what they have written while alive.
+- WSL: the Linux processes carrying `KAIRO_ATTEMPT_ID`, as on Linux, read by
+  one `wsl.exe` run per sample.
+
+A process that cannot be read (another user's, a kernel without
+`smaps_rollup`) makes that figure unknown, and admission then counts the
+whole reservation. Attempts launched by an earlier instance of the executor
+(before an agent restart) are not sampled.
+
+### Attempt logs
+
+An attempt's stdout and stderr are files in its executor's `log_directory`
+(`<attempt>.stdout.log`, `<attempt>.stderr.log`), written by the attempt's
+processes themselves. A node agent ships them into the daemon's
+`log_directory`, which `task show`, `task logs` and `GET
+/api/attempts/{id}/log` read.
+
+- An executor does not launch while the filesystem holding its
+  `log_directory` has less than `log_min_free_mib` free (default 1024, in the
+  daemon and the agent configuration): the execution ends `launch_aborted:
+  launch failed before activation: the filesystem of the attempt log
+  directory ... has 12.0 MiB free, below the minimum of 1.0 GiB`, which `task
+  show` and `task list` print. So does a free space measurement that fails,
+  and a log file that cannot be created.
+- While its attempts run, the executor checks that space every 15 s and
+  records on each attempt when it falls below the minimum (`log_space_low`)
+  or runs out (`log_space_exhausted`: output is being lost), and checks once
+  more as an attempt exits. A write the attempt's own process makes cannot be
+  seen to fail, so the space is what is watched.
+- An agent ships every log, an empty one too, and retries one the daemon
+  does not take (the daemon unreachable, or its own disk full, answered as an
+  `internal` failure) at every sweep from where the daemon's copy ends, so
+  nothing the node-side file holds is lost. One that has not reached the
+  daemon for 30 s is recorded on its attempt (`log_forward_failed`, per
+  stream), and so is its catching up. As an attempt exits, its logs are
+  shipped before its exit is recorded.
+
+Each problem is a coordination event (`attempt_log_problem`,
+`attempt_log_problem_resolved`) and a `log issue:` line of the attempt in
+`task show` (`log_problems` in the API), such as `log issue: stderr not
+shipped to the daemon: ... (10-27 10:01 to 10-27 10:04, caught up)`.
+
 ### Machine declaration
 
 Which node holds which GPU is declared, not discovered. `kairo machine apply
@@ -361,9 +511,9 @@ known to the daemon) and `gpus`, NVIDIA UUIDs as `nvidia-smi -L` prints them
 (see `examples/machines.toml`). Providers only observe. A GPU a provider
 reports that is not declared for its node, whether declared for another node
 or for none, is not registered and not scheduled; the rest of that poll still
-applies, and the GPU is listed as undeclared by `kairo machine show` and in
-`undeclared_gpus` of `kairo resource status` (a registered GPU in that
-situation has `derived_state` `undeclared`).
+applies, and the GPU is listed as undeclared by `kairo machine show` and
+`kairo resource status` (`undeclared_gpus` with `--json`; a registered GPU in
+that situation has `derived_state` `undeclared`).
 
 To move a GPU between nodes, declare it for its new node. It stays registered
 on the old node, unschedulable, until the new node's provider reports it,
@@ -385,7 +535,8 @@ container's processes, so while one node's row is leased, the other nodes'
 claims of activity without a process (`unattributed_activity`) on it are the
 lease holder's work and are not recorded; the lease holder's own provider
 still reports what it cannot attribute, and a process another node does see
-there stays an `external_process` claim. Priority preemption reaches a
+there stays an `external_process` claim unless it is the lease holder's own
+work (see Coordination model). Priority preemption reaches a
 lower-priority victim holding the device through another node's row. Apply
 refuses to drop a node from a GPU whose row on that node a live lease holds;
 `from` / `to` of a shared GPU's change list its nodes, comma-separated.
@@ -488,7 +639,8 @@ any rank leases a GPU.
   others terminated; a `suspend` to one rank (pause, preemption, quarantine)
   is sent to every rank. A rank that failed to launch after others started
   restarts the gang (orchestration reason `gang_restart`).
-- A waiting gang does not preempt; its running ranks can be preempted.
+- A waiting gang preempts like a single execution (each rank on its node,
+  see Admission); its running ranks can be preempted.
 
 ## Worker SDK
 
@@ -608,10 +760,11 @@ executions will load (scripts, the editable SDK) must not change while they
 wait.
 
 Replace the agents together with the daemon: an agent older than the daemon
-starts attempts without their declared `env`. A daemon opening an older
+starts attempts without their declared `env`, and a daemon older than the
+agent refuses its log problem reports (the agent logs them). A daemon opening an older
 database migrates it in place (the `cancelled` task state, reruns, the `env`
 column, the machine declaration, which starts out declaring every registered
-GPU for the node it is registered on, and its (uuid, node) key for shared GPUs); keep the backup, since an older binary would read a rerun Task's
+GPU for the node it is registered on, and its (uuid, node) key for shared GPUs, the attempt log problems, the admission tables); keep the backup, since an older binary would read a rerun Task's
 earlier execution as its outcome again.
 
 ## Verification

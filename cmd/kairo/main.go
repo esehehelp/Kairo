@@ -93,6 +93,9 @@ func serve(args []string) error {
 		return err
 	}
 	defer st.Close()
+	if daemonConfig.Scheduler.DiskMinFreeBytes != nil {
+		st.SetSchedulingPolicy(store.SchedulingPolicy{DiskMinFreeBytes: *daemonConfig.Scheduler.DiskMinFreeBytes})
+	}
 	// Anyone who can write the database can mint tokens: keep it (and its
 	// WAL, which holds recent pages) to this user.
 	if err := secfile.RestrictExisting(daemonConfig.DatabasePath, daemonConfig.DatabasePath+"-wal", daemonConfig.DatabasePath+"-shm"); err != nil {
@@ -280,6 +283,7 @@ func serve(args []string) error {
 		exec.Attributes = configured.Labels
 		exec.ObserveOnly = daemonConfig.ObserveOnly
 		exec.ObservationInterval = time.Duration(daemonConfig.ObservationIntervalSeconds) * time.Second
+		exec.MinLogFreeBytes = int64(daemonConfig.LogMinFreeMiB) << 20
 		exec.Providers = providerSet
 		go func() {
 			if err := exec.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

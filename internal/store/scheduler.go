@@ -75,9 +75,12 @@ type executionCandidate struct {
 	selectorJSON string
 }
 
-// ReserveNext chooses only waiting execution requests whose complete scope
-// chain is currently open. Priority orders coordination admission; it does not
-// imply retry or workflow semantics.
+// ReserveNext runs a planning pass (planner.go) and reserves for executorID
+// what the pass places on it: one execution, or, when the pass places a gang
+// anywhere, every rank of it (this executor's rank, if any, is handed over).
+// Priority orders coordination admission; it does not imply retry or
+// workflow semantics. A pass that reserves nothing records every waiting
+// execution's reason.
 func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservation, error) {
 	// A gang rank already placed on this executor is handed over first.
 	if reservation, err := s.deliverGangLease(ctx, executorID); reservation != nil || err != nil {
@@ -88,112 +91,149 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 		return nil, err
 	}
 	defer tx.Rollback()
+	if ok, err := callerMayPlanTx(ctx, tx, executorID); err != nil || !ok {
+		return nil, err
+	}
+	m, err := loadPlanModel(ctx, tx, s.policy, executorID)
+	if err != nil {
+		return nil, err
+	}
+	candidates, err := loadPlanCandidates(ctx, tx, m)
+	if err != nil {
+		return nil, err
+	}
+	p := newPlanner(m, false)
+	caller, _ := m.executor(executorID)
+	waits := map[string]planWait{}
+	var reservation *Reservation
+	gangPlaced := false
+	err = p.order(candidates, func(c *planCandidate) (bool, error) {
+		placement := p.place(c)
+		switch {
+		case placement.terminal != "":
+			return false, terminalizeAdmissionTx(ctx, tx, c.execution, placement.terminal)
+		case len(placement.slots) == 0:
+			waits[c.execution.ID] = placement.wait
+		case c.gangID != "":
+			for i, slot := range placement.slots {
+				placement.slots[i].executor = m.onNode(slot, caller, c.ranks[i].candidate.selectorJSON)
+			}
+			placed, placeErr := placeGangTx(ctx, tx, c.gangID, placement.slots)
+			if placeErr != nil || placed {
+				gangPlaced = placed
+				return true, placeErr
+			}
+		case m.onNode(placement.slots[0], caller, c.selectorJSON).id != executorID:
+			slot := placement.slots[0]
+			waits[c.execution.ID] = planWait{reason: "awaiting_executor", node: slot.fit.node, message: "placed on executor " + slot.executor.id + ", which reserves it when it next polls"}
+		default:
+			r, writeErr := writeReservationTx(ctx, tx, executorID, c.executionCandidate, placement.slots[0].fit)
+			reservation = r
+			return r != nil || writeErr != nil, writeErr
+		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	// A pass cut short by a reservation has seen only the executions ahead of
+	// it: their reasons are kept, the others' left as they were.
+	complete := reservation == nil && !gangPlaced
+	if err = saveWaitsTx(ctx, tx, waits, complete); err == nil && complete {
+		err = saveNodeAlertsTx(ctx, tx, m)
+	}
+	if err == nil && reservation != nil {
+		_, err = tx.ExecContext(ctx, `DELETE FROM admission_waits WHERE execution_id=?`, reservation.Execution.ID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	if gangPlaced {
+		return s.deliverGangLease(ctx, executorID)
+	}
+	return reservation, nil
+}
 
-	var nodeID, executorAttributes string
+// callerMayPlanTx reports whether executorID may take work: it exists, is
+// enabled, and its node is not quarantined (ReconcileNodeQuarantines stops
+// what runs there).
+func callerMayPlanTx(ctx context.Context, tx *sql.Tx, executorID string) (bool, error) {
+	var nodeID string
 	var enabled bool
-	err = tx.QueryRowContext(ctx, `SELECT node_id,attributes_json,enabled FROM executors WHERE id=?`, executorID).Scan(&nodeID, &executorAttributes, &enabled)
-	if errors.Is(err, sql.ErrNoRows) || !enabled {
-		return nil, nil
+	err := tx.QueryRowContext(ctx, `SELECT node_id,enabled FROM executors WHERE id=?`, executorID).Scan(&nodeID, &enabled)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && !enabled {
+		return false, nil
 	}
+	if err != nil {
+		return false, err
+	}
+	quarantined, err := nodeQuarantinedTx(ctx, tx, nodeID)
+	return !quarantined, err
+}
+
+// writeReservationTx creates the reserved lease of a planned fit, capturing
+// the scope gates' generations. It returns nil when a gate has closed.
+func writeReservationTx(ctx context.Context, tx *sql.Tx, executorID string, candidate executionCandidate, fit planFit) (*Reservation, error) {
+	gates, err := executionGatesTx(ctx, tx, candidate.execution.ID)
 	if err != nil {
 		return nil, err
 	}
-	// A quarantined node takes no work (ReconcileNodeQuarantines stops what runs).
-	if quarantined, err := nodeQuarantinedTx(ctx, tx, nodeID); err != nil || quarantined {
-		return nil, err
-	}
-
-	rows, err := tx.QueryContext(ctx, `SELECT e.id,e.project_scope_id,e.queue_scope_id,e.task_scope_id,e.client_request_id,e.spec_digest,e.state,e.argv_json,e.cwd,e.executor_selector_json,e.priority,e.checkpointable,e.preemptible,e.input_continuation_ref,e.terminal_cause,e.submitted_at,e.authorized_at,e.started_at,e.terminal_at
-		FROM execution_requests e
-		WHERE e.state='waiting'
-		AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.execution_id=e.id AND l.state!='released')
-		AND NOT EXISTS (
-			SELECT 1 FROM admission_gates g
-			WHERE g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) AND g.state!='open'
-		)
-		AND NOT EXISTS (SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id AND gm.rank>0)
-		ORDER BY e.priority DESC,e.submitted_at,e.id`)
-	if err != nil {
-		return nil, err
-	}
-	var candidates []executionCandidate
-	for rows.Next() {
-		var c executionCandidate
-		if err = rows.Scan(&c.execution.ID, &c.execution.ProjectScopeID, &c.execution.QueueScopeID, &c.execution.TaskScopeID, &c.execution.ClientRequestID, &c.execution.SpecDigest, &c.execution.State, &c.argvJSON, &c.execution.CWD, &c.selectorJSON, &c.execution.Priority, &c.execution.Checkpointable, &c.execution.Preemptible, &c.execution.InputContinuationRef, &c.execution.TerminalCause, &c.execution.SubmittedAt, &c.execution.AuthorizedAt, &c.execution.StartedAt, &c.execution.TerminalAt); err != nil {
-			rows.Close()
-			return nil, err
-		}
-		candidates = append(candidates, c)
-	}
-	if err = rows.Close(); err != nil {
-		return nil, err
-	}
-	// A gang leader stands for its whole gang: it is a candidate here when any
-	// of its ranks may run on this executor.
-	gangs := map[string]string{}
-	matching := candidates[:0]
-	for _, c := range candidates {
-		gangID, _, _, gangErr := gangOfExecutionTx(ctx, tx, c.execution.ID)
-		if gangErr != nil {
-			return nil, gangErr
-		}
-		match := false
-		if gangID != "" {
-			gangs[c.execution.ID] = gangID
-			if match, err = gangMatchesExecutor(ctx, tx, gangID, executorAttributes); err != nil {
-				return nil, err
-			}
-		} else {
-			match = selectorMatches(c.selectorJSON, executorAttributes)
-		}
-		if match {
-			matching = append(matching, c)
-		}
-	}
-	candidates = matching
-	if len(candidates) == 0 {
-		return nil, nil
-	}
-
-	// Strict priority: a resource-starved lower-priority request cannot bypass
-	// an eligible request at the highest priority.
-	highest := candidates[0].execution.Priority
-	for _, candidate := range candidates {
-		if candidate.execution.Priority != highest {
-			break
-		}
-		if gangID := gangs[candidate.execution.ID]; gangID != "" {
-			placed, placeErr := placeGangTx(ctx, tx, gangID, executorID)
-			if placeErr != nil {
-				return nil, placeErr
-			}
-			if !placed {
-				continue
-			}
-			if err = tx.Commit(); err != nil {
-				return nil, err
-			}
-			// This executor's rank (if it got one) is handed over like any other.
-			return s.deliverGangLease(ctx, executorID)
-		}
-		reservation, terminalized, reserveErr := reserveExecutionTx(ctx, tx, executorID, nodeID, candidate)
-		if reserveErr != nil {
-			return nil, reserveErr
-		}
-		if terminalized {
-			if err = tx.Commit(); err != nil {
-				return nil, err
-			}
+	for _, gate := range gates {
+		if gate.State != "open" {
 			return nil, nil
 		}
-		if reservation != nil {
-			if err = tx.Commit(); err != nil {
-				return nil, err
-			}
-			return reservation, nil
+	}
+	epoch := int64(1)
+	var previous sql.NullInt64
+	if err = tx.QueryRowContext(ctx, `SELECT MAX(coordination_epoch) FROM leases WHERE execution_id=?`, candidate.execution.ID).Scan(&previous); err != nil {
+		return nil, err
+	}
+	if previous.Valid {
+		epoch = previous.Int64 + 1
+	}
+	leaseID, stamp := id.New("lea"), now()
+	expires := time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339Nano)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,expires_at,created_at) VALUES(?,?,?,?,'reserved',?,?)`, leaseID, candidate.execution.ID, executorID, epoch, expires, stamp); err != nil {
+		return nil, err
+	}
+	gateGenerations := make(map[string]int64, len(gates))
+	for _, gate := range gates {
+		gateGenerations[gate.ScopeID] = gate.Generation
+		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_gate_snapshots(lease_id,scope_id,generation) VALUES(?,?,?)`, leaseID, gate.ScopeID, gate.Generation); err != nil {
+			return nil, err
 		}
 	}
-	return nil, nil
+	resources := make([]ResourceInstance, 0, len(fit.gpus))
+	for _, resourceID := range fit.gpus {
+		var r ResourceInstance
+		var binding, attributes string
+		if err = tx.QueryRowContext(ctx, `SELECT id,node_id,provider_id,kind,stable_identity,binding_json,attributes_json,admin_state,quarantine_reason FROM resource_instances WHERE id=?`, resourceID).Scan(&r.ID, &r.NodeID, &r.ProviderID, &r.Kind, &r.StableIdentity, &binding, &attributes, &r.AdminState, &r.QuarantineReason); err != nil {
+			return nil, err
+		}
+		r.Binding, r.Attributes = json.RawMessage(binding), json.RawMessage(attributes)
+		resources = append(resources, r)
+		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_items(lease_id,resource_id,kind,quantity,filesystem) VALUES(?,?,'gpu',1,'')`, leaseID, resourceID); err != nil {
+			return nil, err
+		}
+	}
+	for _, c := range fit.capacity {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_items(lease_id,resource_id,kind,quantity,filesystem) VALUES(?,?,?,?,?)`, leaseID, c.resourceID, c.key.kind, c.quantity, c.key.filesystem); err != nil {
+			return nil, err
+		}
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "lease_reserved", &candidate.execution.ProjectScopeID, "lease", leaseID, &epoch, map[string]any{"execution_id": candidate.execution.ID, "gate_generations": gateGenerations}); err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal([]byte(candidate.argvJSON), &candidate.execution.Argv); err != nil {
+		return nil, err
+	}
+	candidate.execution.ExecutorSelector = json.RawMessage(candidate.selectorJSON)
+	sortResources(resources)
+	lease := Lease{ID: leaseID, ExecutionID: candidate.execution.ID, ExecutorID: executorID, CoordinationEpoch: epoch, State: "reserved", CreatedAt: stamp, ExpiresAt: &expires}
+	return &Reservation{Lease: lease, Execution: candidate.execution, Argv: candidate.execution.Argv, CWD: candidate.execution.CWD, Resources: resources, GateGenerations: gateGenerations}, nil
 }
 
 func selectorMatches(selectorJSON, executorJSON string) bool {
@@ -210,128 +250,6 @@ func selectorMatches(selectorJSON, executorJSON string) bool {
 		}
 	}
 	return true
-}
-
-func reserveExecutionTx(ctx context.Context, tx *sql.Tx, executorID, nodeID string, candidate executionCandidate) (*Reservation, bool, error) {
-	requests, err := loadResourceRequestsTx(ctx, tx, candidate.execution.ID)
-	if err != nil {
-		return nil, false, err
-	}
-	type leaseItem struct {
-		resourceID       *string
-		kind, filesystem string
-		quantity         int64
-	}
-	var resources []ResourceInstance
-	var items []leaseItem
-	selectedResourceIDs := make(map[string]bool)
-	capacityGroups := make(map[string]requestRow)
-	for _, request := range requests {
-		if request.Type == "exclusive" {
-			selected, reason, terminal, selectErr := selectExclusive(ctx, tx, nodeID, request, selectedResourceIDs)
-			if selectErr != nil {
-				return nil, false, selectErr
-			}
-			if reason != "" {
-				if terminal {
-					if err = terminalizeAdmissionTx(ctx, tx, candidate.execution, reason); err != nil {
-						return nil, false, err
-					}
-					return nil, true, nil
-				}
-				return nil, false, nil
-			}
-			for i := range selected {
-				resources = append(resources, selected[i])
-				resourceID := selected[i].ID
-				selectedResourceIDs[resourceID] = true
-				items = append(items, leaseItem{resourceID: &resourceID, kind: request.Kind, quantity: 1})
-			}
-			continue
-		}
-		key := request.Kind + "\x00" + request.Filesystem
-		if existing, ok := capacityGroups[key]; ok {
-			existing.Quantity += request.Quantity
-			if request.Kind == "disk" {
-				var oldConstraints, newConstraints map[string]int64
-				_ = json.Unmarshal([]byte(existing.Constraints), &oldConstraints)
-				_ = json.Unmarshal([]byte(request.Constraints), &newConstraints)
-				if newConstraints["min_free_after_bytes"] > oldConstraints["min_free_after_bytes"] {
-					oldConstraints["min_free_after_bytes"] = newConstraints["min_free_after_bytes"]
-				}
-				merged, _ := json.Marshal(oldConstraints)
-				existing.Constraints = string(merged)
-			}
-			capacityGroups[key] = existing
-		} else {
-			capacityGroups[key] = request
-		}
-	}
-	capacityKeys := make([]string, 0, len(capacityGroups))
-	for key := range capacityGroups {
-		capacityKeys = append(capacityKeys, key)
-	}
-	sort.Strings(capacityKeys)
-	for _, key := range capacityKeys {
-		request := capacityGroups[key]
-		resourceID, available, capacityErr := capacityAvailable(ctx, tx, nodeID, request)
-		if capacityErr != nil {
-			return nil, false, capacityErr
-		}
-		if !available {
-			return nil, false, nil
-		}
-		items = append(items, leaseItem{resourceID: &resourceID, kind: request.Kind, filesystem: request.Filesystem, quantity: request.Quantity})
-	}
-
-	gates, err := executionGatesTx(ctx, tx, candidate.execution.ID)
-	if err != nil {
-		return nil, false, err
-	}
-	for _, gate := range gates {
-		if gate.State != "open" {
-			return nil, false, nil
-		}
-	}
-	epoch := int64(1)
-	var previous sql.NullInt64
-	if err = tx.QueryRowContext(ctx, `SELECT MAX(coordination_epoch) FROM leases WHERE execution_id=?`, candidate.execution.ID).Scan(&previous); err != nil {
-		return nil, false, err
-	}
-	if previous.Valid {
-		epoch = previous.Int64 + 1
-	}
-	leaseID, stamp := id.New("lea"), now()
-	expires := time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339Nano)
-	if _, err = tx.ExecContext(ctx, `INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,expires_at,created_at) VALUES(?,?,?,?,'reserved',?,?)`, leaseID, candidate.execution.ID, executorID, epoch, expires, stamp); err != nil {
-		return nil, false, err
-	}
-	gateGenerations := make(map[string]int64, len(gates))
-	for _, gate := range gates {
-		gateGenerations[gate.ScopeID] = gate.Generation
-		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_gate_snapshots(lease_id,scope_id,generation) VALUES(?,?,?)`, leaseID, gate.ScopeID, gate.Generation); err != nil {
-			return nil, false, err
-		}
-	}
-	for _, item := range items {
-		var resourceID any
-		if item.resourceID != nil {
-			resourceID = *item.resourceID
-		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_items(lease_id,resource_id,kind,quantity,filesystem) VALUES(?,?,?,?,?)`, leaseID, resourceID, item.kind, item.quantity, item.filesystem); err != nil {
-			return nil, false, err
-		}
-	}
-	if err = appendCoordinationEventTx(ctx, tx, "lease_reserved", &candidate.execution.ProjectScopeID, "lease", leaseID, &epoch, map[string]any{"execution_id": candidate.execution.ID, "gate_generations": gateGenerations}); err != nil {
-		return nil, false, err
-	}
-	if err = json.Unmarshal([]byte(candidate.argvJSON), &candidate.execution.Argv); err != nil {
-		return nil, false, err
-	}
-	candidate.execution.ExecutorSelector = json.RawMessage(candidate.selectorJSON)
-	sortResources(resources)
-	lease := Lease{ID: leaseID, ExecutionID: candidate.execution.ID, ExecutorID: executorID, CoordinationEpoch: epoch, State: "reserved", CreatedAt: stamp, ExpiresAt: &expires}
-	return &Reservation{Lease: lease, Execution: candidate.execution, Argv: candidate.execution.Argv, CWD: candidate.execution.CWD, Resources: resources, GateGenerations: gateGenerations}, false, nil
 }
 
 func loadResourceRequestsTx(ctx context.Context, tx *sql.Tx, executionID string) ([]requestRow, error) {
@@ -410,114 +328,6 @@ func validateLeaseGatesTx(ctx context.Context, tx *sql.Tx, leaseID string) error
 		return fmt.Errorf("%w: admission gate changed after reservation", ErrGateClosed)
 	}
 	return nil
-}
-
-func selectExclusive(ctx context.Context, tx *sql.Tx, nodeID string, request requestRow, excluded map[string]bool) ([]ResourceInstance, string, bool, error) {
-	var constraints gpuConstraints
-	var policy conflictPolicy
-	_ = json.Unmarshal([]byte(request.Constraints), &constraints)
-	_ = json.Unmarshal([]byte(request.Policy), &policy)
-	rows, err := tx.QueryContext(ctx, `SELECT ri.id,ri.node_id,ri.provider_id,ri.kind,ri.stable_identity,ri.binding_json,ri.attributes_json,ri.admin_state,ri.quarantine_reason,
-		o.observed_at,o.valid_until,o.total_bytes,o.free_bytes,
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("ri.id")+` AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("ri.id")+` AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity'),
-		EXISTS(SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id IN `+sameDevice("ri.id")+` AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested'))
-		FROM resource_instances ri
-		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY id DESC LIMIT 1)
-		WHERE ri.node_id=? AND ri.kind=? AND ri.admin_state='enabled' AND (ri.kind<>'gpu' OR `+declaredGPUFilter+`) ORDER BY ri.id`, nodeID, request.Kind)
-	if err != nil {
-		return nil, "", false, err
-	}
-	defer rows.Close()
-	var available []ResourceInstance
-	stale, external, unattributed := false, false, false
-	stamp := time.Now().UTC()
-	for rows.Next() {
-		var resource ResourceInstance
-		var binding, attributes string
-		var observed, valid sql.NullString
-		var total, free sql.NullInt64
-		var hasExternal, hasUnattributed, leased bool
-		if err = rows.Scan(&resource.ID, &resource.NodeID, &resource.ProviderID, &resource.Kind, &resource.StableIdentity, &binding, &attributes, &resource.AdminState, &resource.QuarantineReason, &observed, &valid, &total, &free, &hasExternal, &hasUnattributed, &leased); err != nil {
-			return nil, "", false, err
-		}
-		resource.Binding = json.RawMessage(binding)
-		resource.Attributes = json.RawMessage(attributes)
-		if leased || excluded[resource.ID] {
-			continue
-		}
-		if hasExternal {
-			external = true
-			continue
-		}
-		if hasUnattributed && policy.Unattributed != "allow" {
-			unattributed = true
-			continue
-		}
-		deadline, parseErr := time.Parse(time.RFC3339Nano, valid.String)
-		if !valid.Valid || parseErr != nil || !deadline.After(stamp) {
-			stale = true
-			continue
-		}
-		if !total.Valid || total.Int64 < constraints.MinTotal || !free.Valid || free.Int64 < constraints.MinFree {
-			continue
-		}
-		available = append(available, resource)
-	}
-	if err = rows.Err(); err != nil {
-		return nil, "", false, err
-	}
-	if int64(len(available)) >= request.Quantity {
-		return available[:request.Quantity], "", false, nil
-	}
-	if external {
-		return nil, "external_claim", policy.External == "fail", nil
-	}
-	if unattributed {
-		return nil, "unattributed_activity", policy.Unattributed == "fail", nil
-	}
-	if stale {
-		return nil, "stale_observation", policy.Stale == "fail", nil
-	}
-	return nil, "insufficient_" + request.Kind, false, nil
-}
-
-func capacityAvailable(ctx context.Context, tx *sql.Tx, nodeID string, request requestRow) (string, bool, error) {
-	identity := ""
-	if request.Kind == "disk" {
-		identity = request.Filesystem
-	}
-	var resourceID string
-	var total, free sql.NullInt64
-	err := tx.QueryRowContext(ctx, `SELECT ri.id,o.total_bytes,o.free_bytes
-		FROM resource_instances ri
-		JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY id DESC LIMIT 1)
-		WHERE ri.node_id=? AND ri.kind=? AND ri.admin_state='enabled' AND (?='' OR ri.stable_identity=?) AND julianday(o.valid_until)>julianday(?)
-		ORDER BY ri.id LIMIT 1`, nodeID, request.Kind, identity, identity, now()).Scan(&resourceID, &total, &free)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
-	}
-	if err != nil {
-		return "", false, err
-	}
-	var reserved int64
-	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(li.quantity),0)
-		FROM lease_items li JOIN leases l ON l.id=li.lease_id JOIN executors e ON e.id=l.executor_id
-		WHERE e.node_id=? AND li.kind=? AND li.filesystem=? AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, nodeID, request.Kind, request.Filesystem).Scan(&reserved); err != nil {
-		return "", false, err
-	}
-	if request.Kind == "cpu" {
-		return resourceID, total.Valid && total.Int64-reserved >= request.Quantity, nil
-	}
-	if !free.Valid || free.Int64-reserved-request.Quantity < 0 {
-		return "", false, nil
-	}
-	if request.Kind == "disk" {
-		var constraints map[string]int64
-		_ = json.Unmarshal([]byte(request.Constraints), &constraints)
-		return resourceID, free.Int64-reserved-request.Quantity >= constraints["min_free_after_bytes"], nil
-	}
-	return resourceID, true, nil
 }
 
 // ValidateReservation re-observes the lease's exclusive resources and fences

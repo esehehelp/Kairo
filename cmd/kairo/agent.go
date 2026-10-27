@@ -126,6 +126,8 @@ func agentCommand(args []string) error {
 		exec.Attributes = configured.Labels
 		exec.ObserveOnly = cfg.ObserveOnly
 		exec.ObservationInterval = time.Duration(cfg.ObservationIntervalSeconds) * time.Second
+		exec.MinLogFreeBytes = int64(cfg.LogMinFreeMiB) << 20
+		exec.FlushLogs = shipper.ShipAttempt
 		exec.Providers = providerSet
 		go func() {
 			if err := exec.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

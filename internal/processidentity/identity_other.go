@@ -16,6 +16,23 @@ func ForPID(pid int) (string, error) {
 	return LinuxIdentityFromStat(pid, string(body))
 }
 
+// LineageOf reads the lineage of process pid, named identity, from /proc: its
+// KAIRO_ATTEMPT_ID (readable for a process of the same user, or by root) and
+// its parent chain.
+func LineageOf(pid int, identity string) Lineage {
+	return lineage(pid, identity, readProcess, func(pid int) ([]byte, error) {
+		return os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	})
+}
+
+func readProcess(pid int) (process, error) {
+	body, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return process{}, err
+	}
+	return linuxProcessFromStat(pid, string(body))
+}
+
 func HostProcessLiveness(pid int, expected string) (Liveness, error) {
 	actual, err := ForPID(pid)
 	if err != nil {

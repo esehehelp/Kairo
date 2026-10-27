@@ -189,7 +189,7 @@ func init() {
 		}},
 		{name: "resource", summary: "resource status, quarantine, enable, reconcile", group: &commandGroup{
 			subs: []command{
-				{"status", "", "resources and their state (JSON)", bind(resourceAction, "status")},
+				{"status", "[--json]", "per node: GPUs, cpu, ram, disk, holders and external claims", bind(resourceAction, "status")},
 				{"quarantine", "RESOURCE_ID [--reason R]", "stop placing work on a resource", bind(resourceAction, "quarantine")},
 				{"enable", "RESOURCE_ID", "release a quarantined resource", bind(resourceAction, "enable")},
 				{"reconcile", "RESOURCE_ID --confirm-process-absent", "clear a resource held by stale attempts", bind(resourceAction, "reconcile")},

@@ -111,3 +111,24 @@ func TestAgentStillRequiresAnExecutor(t *testing.T) {
 		t.Fatalf("agent without executors: %v", err)
 	}
 }
+
+func TestLogMinFreeDefaultsAndRefusesNegative(t *testing.T) {
+	agentBase := "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0\"\nname = \"pve0\"\n[[executors]]\nid = \"pve0-linux\"\nkind = \"linux\"\n"
+	c, err := Load(writeConfig(t, daemonBase))
+	if err != nil || c.LogMinFreeMiB != DefaultLogMinFreeMiB {
+		t.Fatalf("daemon default: %d %v", c.LogMinFreeMiB, err)
+	}
+	a, err := LoadAgent(writeConfig(t, "log_min_free_mib = 256\n"+agentBase))
+	if err != nil || a.LogMinFreeMiB != 256 {
+		t.Fatalf("agent setting: %d %v", a.LogMinFreeMiB, err)
+	}
+	if a, err = LoadAgent(writeConfig(t, agentBase)); err != nil || a.LogMinFreeMiB != DefaultLogMinFreeMiB {
+		t.Fatalf("agent default: %d %v", a.LogMinFreeMiB, err)
+	}
+	if _, err = Load(writeConfig(t, "log_min_free_mib = -1\n"+daemonBase)); err == nil || !strings.Contains(err.Error(), "log_min_free_mib") {
+		t.Fatalf("negative daemon setting: %v", err)
+	}
+	if _, err = LoadAgent(writeConfig(t, "log_min_free_mib = -1\n"+agentBase)); err == nil || !strings.Contains(err.Error(), "log_min_free_mib") {
+		t.Fatalf("negative agent setting: %v", err)
+	}
+}

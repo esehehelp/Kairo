@@ -24,6 +24,7 @@ const (
 	helperSleep      = "__test-sleep"       // sleep
 	helperSleepStubb = "__test-sleep-stubb" // sleep ignoring interrupts
 	helperOrphan     = "__test-orphan"      // start a sleeping child and exit at once
+	helperPrint      = "__test-print"       // print a line to stdout and stderr, exit 1
 )
 
 func TestMain(m *testing.M) {
@@ -46,6 +47,10 @@ func TestMain(m *testing.M) {
 			}
 			time.Sleep(2 * time.Minute)
 			os.Exit(0)
+		case helperPrint:
+			os.Stdout.WriteString("hello from the attempt\n")
+			os.Stderr.WriteString("failing\n")
+			os.Exit(1)
 		case helperSleep, helperSleepStubb:
 			if os.Args[1] == helperSleepStubb {
 				signal.Notify(make(chan os.Signal, 1), os.Interrupt, syscall.SIGTERM)

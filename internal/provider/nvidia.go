@@ -28,6 +28,9 @@ type NVIDIA struct {
 	Timeout         time.Duration
 	Command         func(context.Context, ...string) ([]byte, error)
 	ProcessIdentity func(int) (string, error)
+	// ProcessLineage ties a GPU process (pid, identity) to the attempt that
+	// started it; nil means processidentity.LineageOf.
+	ProcessLineage func(int, string) processidentity.Lineage
 }
 
 func (p *NVIDIA) ID() string { return p.ProviderID }
@@ -134,12 +137,26 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 				identityFn = processidentity.ForPID
 			}
 			identity, identityErr := identityFn(pid)
+			// The lineage lets the daemon tell the work of the attempt holding
+			// this GPU (a descendant of its registered processes) from a foreign
+			// process; a process without one is foreign.
+			var lineage processidentity.Lineage
 			if identityErr != nil {
 				identity = "pid:" + pidText + ":start:unknown"
+			} else {
+				lineageFn := p.ProcessLineage
+				if lineageFn == nil {
+					lineageFn = processidentity.LineageOf
+				}
+				lineage = lineageFn(pid, identity)
 			}
-			evidence, _ := json.Marshal(map[string]string{"pid": pidText, "process_name": name, "gpu_uuid": uuid, "process_type": processType})
+			detail := map[string]string{"pid": pidText, "process_name": name, "gpu_uuid": uuid, "process_type": processType}
+			if lineage.AttemptID != "" {
+				detail["attempt_id"] = lineage.AttemptID
+			}
+			evidence, _ := json.Marshal(detail)
 			identityHash := fmt.Sprintf("%x", sha256.Sum256([]byte(identity)))[:16]
-			snap.Claims = append(snap.Claims, store.ExternalClaim{ID: "claim-" + resourceID + "-process-" + identityHash, ResourceID: resourceID, ClaimKind: "external_process", ProcessIdentity: &identity, Evidence: evidence})
+			snap.Claims = append(snap.Claims, store.ExternalClaim{ID: "claim-" + resourceID + "-process-" + identityHash, ResourceID: resourceID, ClaimKind: "external_process", ProcessIdentity: &identity, Evidence: evidence, AttemptID: lineage.AttemptID, Ancestors: lineage.Ancestors})
 		}
 	}
 	for uuid, bytes := range used {

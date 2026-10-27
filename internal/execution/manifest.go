@@ -51,10 +51,13 @@ type ExclusiveRequest struct {
 }
 
 type CapacityRequest struct {
-	CPUMillis int64         `toml:"cpu_millis" json:"cpu_millis"`
-	RAMBytes  int64         `toml:"ram_bytes" json:"ram_bytes"`
-	Strength  string        `toml:"strength" json:"strength"`
-	Disks     []DiskRequest `toml:"disks" json:"disks"`
+	CPUMillis int64 `toml:"cpu_millis" json:"cpu_millis"`
+	// CPUMillisMin is the least of CPUMillis the execution keeps: executions
+	// of no higher priority may be admitted on the rest, slowing it down.
+	CPUMillisMin int64         `toml:"cpu_millis_min" json:"cpu_millis_min,omitempty"`
+	RAMBytes     int64         `toml:"ram_bytes" json:"ram_bytes"`
+	Strength     string        `toml:"strength" json:"strength"`
+	Disks        []DiskRequest `toml:"disks" json:"disks"`
 }
 
 type DiskRequest struct {
@@ -148,6 +151,9 @@ func normalizeAndValidate(m *Manifest) error {
 	}
 	if m.Capacity.CPUMillis < 0 || m.Capacity.RAMBytes < 0 {
 		return errors.New("capacity cannot be negative")
+	}
+	if m.Capacity.CPUMillisMin < 0 || m.Capacity.CPUMillisMin > m.Capacity.CPUMillis {
+		return errors.New("cpu_millis_min must be between 0 and cpu_millis")
 	}
 	for _, disk := range m.Capacity.Disks {
 		if strings.TrimSpace(disk.Filesystem) == "" || disk.ReserveBytes < 0 || disk.MinFreeAfterBytes < 0 {

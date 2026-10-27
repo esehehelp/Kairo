@@ -56,4 +56,10 @@ type ExternalClaim struct {
 	FirstObservedAt string          `json:"first_observed_at"`
 	LastObservedAt  string          `json:"last_observed_at"`
 	ClearedAt       *string         `json:"cleared_at,omitempty"`
+	// AttemptID and Ancestors are a provider's report of what ties the
+	// process to an attempt: the KAIRO_ATTEMPT_ID it carries and the
+	// identities of its living ancestors, nearest first. They decide whether
+	// the claim is recorded (ApplyObservationBatch) and are not stored.
+	AttemptID string   `json:"attempt_id,omitempty"`
+	Ancestors []string `json:"ancestors,omitempty"`
 }
