@@ -194,6 +194,28 @@ func renderAttempt(w io.Writer, a attemptInfo) {
 	for _, p := range a.LogProblems {
 		line("log issue", "%s", logProblemText(p))
 	}
+	if a.Energy != nil {
+		line("energy", "%s", energyText(*a.Energy))
+	}
+}
+
+// energyText is what an attempt's GPUs used: "GPU 1.23 kWh", "GPU 37.5 Wh
+// (partial)", or "GPU not measured" when no interval of its run could be
+// integrated.
+func energyText(e store.AttemptEnergy) string {
+	var text string
+	switch kWh := e.GPUJoules / 3.6e6; {
+	case e.GPUSecondsCovered == 0:
+		text = "GPU not measured"
+	case kWh >= 1:
+		text = fmt.Sprintf("GPU %.2f kWh", kWh)
+	default:
+		text = fmt.Sprintf("GPU %.1f Wh", kWh*1000)
+	}
+	if e.Partial && e.GPUSecondsCovered > 0 {
+		text += " (partial)"
+	}
+	return text
 }
 
 // logProblemText makes a problem with an attempt's logs readable:

@@ -206,8 +206,8 @@ func serve(args []string) error {
 		}
 	}()
 	// Resource observations describe the present; only each resource's
-	// latest one is ever read. Prune the rest periodically (observe-only
-	// daemons record observations too).
+	// latest one is ever read. Device samples are kept for a few days. Prune
+	// the rest periodically (observe-only daemons record both too).
 	go func() {
 		ticker := time.NewTicker(10 * time.Minute)
 		defer ticker.Stop()
@@ -217,6 +217,12 @@ func serve(args []string) error {
 				logger.Error("observation pruning failed", "error", err)
 			} else if removed > 0 {
 				logger.Info("pruned resource observations", "rows", removed)
+			}
+			removed, err = st.PruneDeviceSamples(ctx, store.DeviceSampleRetention)
+			if err != nil && ctx.Err() == nil {
+				logger.Error("device sample pruning failed", "error", err)
+			} else if removed > 0 {
+				logger.Info("pruned device samples", "rows", removed)
 			}
 			select {
 			case <-ctx.Done():

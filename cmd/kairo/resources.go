@@ -43,8 +43,9 @@ func printResources(client *apiClient, asJSON bool) error {
 var kindOrder = map[string]int{"gpu": 0, "cpu": 1, "ram": 2, "disk": 3}
 
 // renderResources is one row per resource, by node: its state, total, free
-// (as last observed), what live leases reserve of it and who holds it; then
-// the external claims and the GPUs reported but not declared.
+// (as last observed), what live leases reserve of it, its device's latest
+// power and clocks (deviceText) and who holds it; then the external claims
+// and the GPUs reported but not declared.
 func renderResources(w io.Writer, s resourceStatus) error {
 	if len(s.Resources) == 0 {
 		fmt.Fprintln(w, "no resources registered")
@@ -68,14 +69,15 @@ func renderResources(w io.Writer, s resourceStatus) error {
 			}
 			return a.StableIdentity < b.StableIdentity
 		})
-		rows := []string{"NODE\tKIND\tRESOURCE\tSTATE\tTOTAL\tFREE\tRESERVED\tHELD BY"}
+		rows := []string{"NODE\tKIND\tRESOURCE\tSTATE\tTOTAL\tFREE\tRESERVED\tPOWER\tCLOCKS\tHELD BY"}
 		for _, r := range resources {
 			state := r.DerivedState
 			if r.QuarantineReason != nil && *r.QuarantineReason != "" {
 				state += " (" + *r.QuarantineReason + ")"
 			}
 			total, free, reserved := resourceAmounts(r)
-			rows = append(rows, strings.Join([]string{r.NodeID, r.Kind, r.StableIdentity, state, total, free, reserved, dash(holdersText(r.Holders))}, "\t"))
+			power, clocks := deviceText(r.Device)
+			rows = append(rows, strings.Join([]string{r.NodeID, r.Kind, r.StableIdentity, state, total, free, reserved, power, clocks, dash(holdersText(r.Holders))}, "\t"))
 		}
 		if err := writeTable(w, rows); err != nil {
 			return err
@@ -135,6 +137,58 @@ func resourceAmounts(r api.ResourceStatusEntry) (total, free, reserved string) {
 		reserved = format(r.Reserved)
 	}
 	return total, free, reserved
+}
+
+// eventReasonNames are short names of NVML's clocks event reasons, by bit.
+var eventReasonNames = []struct {
+	bit  int64
+	name string
+}{
+	{0x1, "idle"}, {0x2, "app-clocks"}, {0x4, "sw-power"}, {0x8, "hw-slowdown"}, {0x10, "sync-boost"},
+	{0x20, "sw-thermal"}, {0x40, "hw-thermal"}, {0x80, "power-brake"}, {0x100, "display-clocks"},
+}
+
+// eventReasonsText names the bits of a clocks event reasons mask, "idle" or
+// "sw-power,hw-thermal"; bits without a name are shown in hex.
+func eventReasonsText(mask int64) string {
+	var names []string
+	for _, r := range eventReasonNames {
+		if mask&r.bit != 0 {
+			names = append(names, r.name)
+			mask &^= r.bit
+		}
+	}
+	if mask != 0 {
+		names = append(names, fmt.Sprintf("0x%x", mask))
+	}
+	return strings.Join(names, ",")
+}
+
+// deviceText is a device's latest sample for the table: its power ("111/320
+// W": draw and the limit in force) and clocks ("1800 MHz P2 idle": SM clock,
+// P-state and the active clocks event reasons).
+func deviceText(d *store.DeviceReading) (power, clocks string) {
+	if d == nil {
+		return "-", "-"
+	}
+	power = "-"
+	switch {
+	case d.PowerW != nil && d.PowerLimitW != nil:
+		power = fmt.Sprintf("%.0f/%.0f W", *d.PowerW, *d.PowerLimitW)
+	case d.PowerW != nil:
+		power = fmt.Sprintf("%.0f W", *d.PowerW)
+	}
+	var parts []string
+	if d.SMClockMHz != nil {
+		parts = append(parts, fmt.Sprintf("%d MHz", *d.SMClockMHz))
+	}
+	if d.PState != nil {
+		parts = append(parts, *d.PState)
+	}
+	if d.EventReasons != nil && *d.EventReasons != 0 {
+		parts = append(parts, eventReasonsText(*d.EventReasons))
+	}
+	return power, dash(strings.Join(parts, " "))
 }
 
 // holdersText names the tasks of a resource's live leases: "p/q/t", with

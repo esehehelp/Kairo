@@ -21,19 +21,19 @@ type Executor struct {
 }
 
 type ResourceInstance struct {
-	ID                    string          `json:"id"`
-	NodeID                string          `json:"node_id"`
-	ProviderID            string          `json:"provider_id"`
-	Kind                  string          `json:"kind"`
-	StableIdentity        string          `json:"stable_identity"`
-	Binding               json.RawMessage `json:"binding"`
-	Attributes            json.RawMessage `json:"attributes"`
-	AdminState            string          `json:"admin_state"`
-	QuarantineReason      *string         `json:"quarantine_reason,omitempty"`
+	ID               string          `json:"id"`
+	NodeID           string          `json:"node_id"`
+	ProviderID       string          `json:"provider_id"`
+	Kind             string          `json:"kind"`
+	StableIdentity   string          `json:"stable_identity"`
+	Binding          json.RawMessage `json:"binding"`
+	Attributes       json.RawMessage `json:"attributes"`
+	AdminState       string          `json:"admin_state"`
+	QuarantineReason *string         `json:"quarantine_reason,omitempty"`
 	// DeclaredNodeID is the node a GPU is declared for (kairo machine apply).
-	DeclaredNodeID        *string         `json:"declared_node_id,omitempty"`
-	DerivedState          string          `json:"derived_state"`
-	ObservationAgeSeconds *float64        `json:"observation_age_seconds,omitempty"`
+	DeclaredNodeID        *string  `json:"declared_node_id,omitempty"`
+	DerivedState          string   `json:"derived_state"`
+	ObservationAgeSeconds *float64 `json:"observation_age_seconds,omitempty"`
 }
 
 type Observation struct {
@@ -45,6 +45,10 @@ type Observation struct {
 	Utilization  *float64        `json:"utilization,omitempty"`
 	TemperatureC *float64        `json:"temperature_c,omitempty"`
 	Evidence     json.RawMessage `json:"evidence"`
+	// Device is the device's power and operating point as read with this
+	// observation, when its provider reads them (ApplyObservationBatch keeps
+	// it in device_samples).
+	Device *DeviceSample `json:"device,omitempty"`
 }
 
 type ExternalClaim struct {

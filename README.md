@@ -125,17 +125,21 @@ deployment mode on a host with unmanaged training processes.
 `kairo resource status` prints one row per resource, by node (GPUs, then
 cpu, ram and disk): its state (with a quarantine's reason), total and free as
 last observed (a GPU's memory and utilization; a cpu's cores), what live
-leases reserve of a cpu, ram or disk, and the tasks holding it (with the lease
+leases reserve of a cpu, ram or disk, the latest power sample (POWER: a GPU's
+draw and the power limit in force, `289/320 W`, a cpu's CPU package draw;
+CLOCKS: a GPU's SM clock, P-state and active clock event reasons, `1905 MHz
+P2 sw-power`; see Power and energy) and the tasks holding it (with the lease
 state unless `active`); then the external claims with their evidence, and the
 GPUs reported but not declared for their node. `--json` prints the response of
 `GET /api/resources` instead, whose resources also carry `total_bytes`,
-`free_bytes`, `utilization`, `reserved` and `holders`. `kairo doctor` ends with
-the same table.
+`free_bytes`, `utilization`, `reserved`, `holders` and `device` (the latest
+sample). `kairo doctor` ends with the same table.
 
 Resource observations describe the present: only each resource's latest one
-is used, and the daemon prunes the others once they are an hour old.
-`kairo db compact --config kairo.toml` (with the daemon stopped) prunes them
-at once and runs `VACUUM`.
+is used, and the daemon prunes the others once they are an hour old. Device
+samples are kept for 72 hours (each device's latest always). `kairo db
+compact --config kairo.toml` (with the daemon stopped) prunes both at once and
+runs `VACUUM`.
 
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
 limits (see Admission for how they are counted). GPU exclusion is a coordination guarantee among Kairo participants;
@@ -150,7 +154,7 @@ be left out of task commands for Tasks declared by a ProjectSpec.
 | Command | What it prints |
 |---|---|
 | `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress or pause) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
-| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, log paths and sizes, log issues, gang ranks, and why a waiting execution waits |
+| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, log paths and sizes, log issues, the energy its GPUs used (`energy: GPU 1.23 kWh (partial)`), gang ranks, and why a waiting execution waits |
 | `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | the last N lines (default 50, `0` all) of the latest attempt's logs, also for attempts on agent nodes; `-f` follows until the attempt has exited and its logs stopped growing |
 | `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | one line per state change (`10:01:33 hello running -> succeeded`), `DOWN`/`UP` while the daemon is unreachable, `STALL` when a running Task's logs stop growing for D; exits 0 when all succeeded (or started), 1 when one ended otherwise, 2 on timeout, 3 on a usage or lookup error |
 | `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | state changes, progress (once a minute per Task) and a summary every 10 min; with `--exit-when-idle` it exits when nothing is pending or running (1 if a watched Task did not succeed) |
@@ -317,7 +321,7 @@ attempt, executor, timestamps and latest progress without `detail`.
 `GET /api/projects/{project}/tasks/{task}` adds the declaration (`spec`),
 dependencies, dependants, scope gates (a closed one with `closed_by` and
 `closed_at`, from the pause operation that closed it), and per execution its
-attempts (with log paths and sizes and `log_problems`), gang ranks and
+attempts (with log paths and sizes, `log_problems` and `energy`), gang ranks and
 `waiting` reasons. A live Task held back by a closed gate has `paused`, the
 innermost such gate. Apply answers
 `{"project", "spec_digest", "idempotent", "created", "unchanged"}`. Cancel
@@ -506,6 +510,51 @@ Each problem is a coordination event (`attempt_log_problem`,
 `attempt_log_problem_resolved`) and a `log issue:` line of the attempt in
 `task show` (`log_problems` in the API), such as `log issue: stderr not
 shipped to the daemon: ... (10-27 10:01 to 10-27 10:04, caught up)`.
+
+### Power and energy
+
+Providers record what a device draws and how it runs, with the time they read
+it; Kairo keeps these facts and judges none of them against a specification.
+It only reads: no power limit or clock is ever set.
+
+- GPU: each `nvidia-smi` poll also reads the board power
+  (`power.draw.average`, else `power.draw`), the power limit in force
+  (`enforced.power.limit`), the SM and memory clocks, the P-state, the active
+  clock event reasons (a bitmask: `0x1` idle, `0x4` software power cap, `0x40`
+  hardware thermal slowdown, ...), the PCIe generation and width, memory
+  utilization and fan speed, and, kept once per GPU, its default, least and
+  greatest power limit, its greatest clocks and its greatest PCIe link. A
+  field a GPU does not report (`[N/A]`, `[Not Supported]`) is left out, never
+  an error. A driver that rejects these fields is asked by their older names
+  (`clocks_throttle_reasons.active`, `pcie.link.gen.current`), then for the
+  inventory alone.
+- CPU package: a node's host provider reads the power of its CPU packages,
+  averaged since its previous poll: on Windows the `\Energy Meter(*)\Power`
+  performance counter (instances `rapl_package*_pkg`; no elevation needed),
+  on Linux the RAPL counters `/sys/class/powercap/*-rapl:N/energy_uj`
+  (wraps handled with `max_energy_range_uj`). Where they cannot be read (an
+  unprivileged container, WSL, a CPU without them) the node reports none,
+  silently. The reader is `internal/cpupower`.
+
+Samples are kept per physical device (a GPU by its UUID), so the providers of
+a shared GPU add to one series. As each GPU sample arrives, the energy since
+the device's previous sample, the trapezoid of their power, is added to the
+attempts whose lease holds that GPU (on any node's row of it), cut at the
+attempt's start and at its exit, its lease's release or its lease going
+stale; a GPU is counted once whichever provider reports it. An interval the
+samples do not vouch for is not integrated and makes the attempt's total
+`partial`: a gap longer than the earlier sample's validity
+(`observation_ttl_seconds`, default 15 s), a sample without power, a run that
+began before the GPU's first sample or went on after its lease went stale.
+`task show` prints `energy: GPU 1.23 kWh (partial)` per attempt (`energy`
+with `gpu_joules`, `gpu_seconds_covered`, device-seconds, and `partial` in the
+API). A CPU package is shared by whatever runs on its node, so its power is
+kept for the node only.
+
+The samples are the tables `device_samples` and `device_properties`, the
+totals `attempt_energy`. Samples are kept for 72 hours (about 5 MB a day per
+GPU and provider reporting it at the default 5 s poll); the totals are kept
+with their attempts.
 
 ### Machine declaration
 
@@ -932,11 +981,15 @@ wait.
 
 Replace the agents together with the daemon: an agent older than the daemon
 starts attempts without their declared `env`, and a daemon older than the
-agent refuses its log problem reports (the agent logs them). A daemon opening an older
-database migrates it in place (the `cancelled` task state, reruns, the `env`
-column, the machine declaration, which starts out declaring every registered
-GPU for the node it is registered on, and its (uuid, node) key for shared GPUs, the attempt log problems, the admission tables, the hosts and device settings, which start out empty); keep the backup, since an older binary would read a rerun Task's
-earlier execution as its outcome again.
+agent refuses its log problem reports (the agent logs them) and its
+observations, which carry power samples (its resources then go stale). A
+daemon opening an older database migrates it in place (the `cancelled` task
+state, reruns, the `env` column, the machine declaration, which starts out
+declaring every registered GPU for the node it is registered on, and its
+(uuid, node) key for shared GPUs, the attempt log problems, the admission
+tables, the power and energy tables, the hosts and device settings, which
+start out empty); keep the backup, since an older binary would read a rerun
+Task's earlier execution as its outcome again.
 
 ## Verification
 

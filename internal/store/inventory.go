@@ -98,7 +98,8 @@ func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 // activity without a process this node sees are dropped while another node's
 // row of the device is leased - that node's processes, which this one cannot
 // see (they are that lease's own). A process claim that is the lease holder's
-// own work (leaseHoldersProcessTx) is not recorded.
+// own work (leaseHoldersProcessTx) is not recorded. An observation's device
+// sample is recorded for the device (recordDeviceSampleTx).
 func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, resources []ResourceInstance, observations []Observation, claims []ExternalClaim) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -184,6 +185,11 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		_, err = tx.ExecContext(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES(?,?,?,?,?,?,?,?)`, observation.ResourceID, observation.ObservedAt, observation.ValidUntil, observation.TotalBytes, observation.FreeBytes, observation.Utilization, observation.TemperatureC, validJSON(observation.Evidence))
 		if err != nil {
 			return err
+		}
+		if observation.Device != nil {
+			if err = recordDeviceSampleTx(ctx, tx, observation.ResourceID, observation.ObservedAt, observation.ValidUntil, *observation.Device); err != nil {
+				return err
+			}
 		}
 	}
 	seen := map[string]bool{}

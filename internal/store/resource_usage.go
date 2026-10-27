@@ -18,6 +18,9 @@ type ResourceUsage struct {
 	// (millicores or bytes); Holders are those leases' executions.
 	Reserved int64            `json:"reserved,omitempty"`
 	Holders  []ResourceHolder `json:"holders,omitempty"`
+	// Device is the device's latest power and operating point sample (a
+	// GPU's, a node's CPU package for its cpu), when its provider reads them.
+	Device *DeviceReading `json:"device,omitempty"`
 }
 
 // ResourceHolder is a live lease on a resource: its execution and that
@@ -66,5 +69,17 @@ func (s *Store) ListResourceUsage(ctx context.Context) (map[string]ResourceUsage
 		out[resourceID] = u
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	readings, err := s.deviceReadings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for id, reading := range readings {
+		u := out[id]
+		u.Device = &reading
+		out[id] = u
+	}
+	return out, nil
 }
