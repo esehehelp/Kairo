@@ -185,7 +185,11 @@ func (p *NVIDIA) Prepare(ctx context.Context, r store.ResourceInstance) error {
 		return err
 	}
 	for i, item := range snap.Resources {
-		if item.ID == r.ID {
+		// The store qualifies a shared GPU's resource ID with @node to avoid
+		// collisions. Observe still returns the provider-local ID; match the
+		// physical UUID within this node/provider instead of that store key.
+		if item.StableIdentity == r.StableIdentity && item.NodeID == r.NodeID &&
+			item.ProviderID == r.ProviderID && item.Kind == r.Kind {
 			obs := snap.Observations[i]
 			deadline, _ := time.Parse(time.RFC3339Nano, obs.ValidUntil)
 			if deadline.After(time.Now().UTC()) {
