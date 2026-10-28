@@ -144,3 +144,42 @@ func TestNVIDIAClaimsCarryTheProcessLineage(t *testing.T) {
 		t.Fatalf("claim of an unidentified process: %+v", unknown)
 	}
 }
+
+// A GPU that drives a desktop shows the desktop's processes as graphics
+// (C+G) with no per-process memory under WDDM: on Windows their memory is not
+// unattributed activity, elsewhere it still fails closed.
+func TestNVIDIADesktopGraphicsExplainVRAMOnlyWhereAsked(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		explain   bool
+		wantClaim bool
+	}{{"windows", true, false}, {"linux", false, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			explain := tc.explain
+			p := &NVIDIA{ProviderID: "p", NodeID: "n", GraphicsExplainVRAM: &explain,
+				ProcessIdentity: func(int) (string, error) { return "", errors.New("unused") },
+				Command: func(_ context.Context, args ...string) ([]byte, error) {
+					if args[0] == "pmon" {
+						return []byte("# gpu pid type fb ccpm command\n# Idx # C/G MB MB name\n    0  14628  C+G  0  0  explorer.exe\n    0  17248  C+G  0  0  NVIDIA Overlay.\n"), nil
+					}
+					return queryAnswer(args, inventory("GPU-a, 0, 10240, 8900, 4, 41")), nil
+				}}
+			snap, err := p.Observe(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := false
+			for _, c := range snap.Claims {
+				if c.ClaimKind == "unattributed_activity" {
+					got = true
+				}
+				if c.ClaimKind == "external_process" {
+					t.Fatalf("a desktop process is not a compute claim: %+v", c)
+				}
+			}
+			if got != tc.wantClaim {
+				t.Fatalf("unattributed claim = %v, want %v: %+v", got, tc.wantClaim, snap.Claims)
+			}
+		})
+	}
+}

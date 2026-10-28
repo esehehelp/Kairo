@@ -148,6 +148,13 @@ may run alongside the daemon (PostgreSQL's autovacuum does the same in time).
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
 limits (see Admission for how they are counted). GPU exclusion is a coordination guarantee among Kairo participants;
 external processes are observed and excluded but cannot be physically fenced.
+A compute process on a GPU that no attempt started is an `external_claim`;
+more than 1 GiB of GPU memory with no compute process to account for it is
+`unattributed_activity` (on Linux that is what another container's work
+looks like). On Windows, memory on a GPU that shows graphics processes (`G`
+or `C+G` in `nvidia-smi pmon`: the compositor, a browser, the desktop of a
+display GPU) is theirs and not unattributed, since WDDM reports no
+per-process memory to tell them apart.
 
 ## Following tasks from the CLI
 

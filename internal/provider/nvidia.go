@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -33,6 +34,13 @@ type NVIDIA struct {
 	// ProcessLineage ties a GPU process (pid, identity) to the attempt that
 	// started it; nil means processidentity.LineageOf.
 	ProcessLineage func(int, string) processidentity.Lineage
+	// GraphicsExplainVRAM: memory on a GPU that shows graphics processes
+	// (pmon type G or C+G) is theirs, not unattributed activity. nil means
+	// true on Windows, where the desktop's own processes (the compositor, a
+	// browser) hold that memory and WDDM reports no per-process figure, and
+	// false elsewhere, where memory without a visible process is what another
+	// container's work looks like.
+	GraphicsExplainVRAM *bool
 
 	query atomic.Int32 // the index in nvidiaQueries of the query this driver accepts
 }
@@ -234,6 +242,8 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("nvidia-smi pmon: %w", processErr)
 	}
 	seenProcess := map[string]bool{}
+	// graphics: GPUs on which a graphics process was seen (see GraphicsExplainVRAM).
+	graphics := map[string]bool{}
 	if processErr == nil {
 		for _, line := range strings.Split(string(processes), "\n") {
 			fields := strings.Fields(line)
@@ -245,6 +255,9 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 			processType := fields[2]
 			name := fields[len(fields)-1]
 			fb, _ := strconv.Atoi(fields[3])
+			if ok && parseErr == nil && pid > 0 && strings.Contains(processType, "G") {
+				graphics[entry.uuid] = true
+			}
 			if !ok || parseErr != nil || pid <= 0 || !isComputeProcess(processType, name, fb) {
 				continue
 			}
@@ -285,7 +298,7 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		// Exclusive scheduling must fail closed even while a compute process is
 		// between kernels (and therefore reports 0% utilization). Operators can
 		// explicitly allow unattributed activity in the manifest when desired.
-		if bytes > 1024*1024*1024 && !seenProcess[uuid] {
+		if bytes > 1024*1024*1024 && !seenProcess[uuid] && !(graphics[uuid] && p.graphicsExplainVRAM()) {
 			resourceID := ""
 			for _, entry := range byIndex {
 				if entry.uuid == uuid {
@@ -298,6 +311,13 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		}
 	}
 	return snap, nil
+}
+
+func (p *NVIDIA) graphicsExplainVRAM() bool {
+	if p.GraphicsExplainVRAM != nil {
+		return *p.GraphicsExplainVRAM
+	}
+	return runtime.GOOS == "windows"
 }
 
 func isComputeProcess(processType, name string, framebufferMiB int) bool {
