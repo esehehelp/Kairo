@@ -81,7 +81,7 @@ func (s *Store) CreateAPIToken(ctx context.Context, name, role, nodeID string) (
 		value.NodeID = &nodeID
 	}
 	_, err = s.exec(ctx, `INSERT INTO api_tokens(id,name,role,node_id,token_hash,created_at) VALUES($1,$2,$3,$4,$5,$6)`, value.ID, value.Name, value.Role, value.NodeID, hash, value.CreatedAt)
-	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
+	if uniqueViolation(err) {
 		return APIToken{}, "", fmt.Errorf("an active token named %q already exists", name)
 	}
 	if err != nil {

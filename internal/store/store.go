@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -261,4 +262,10 @@ func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
 func bind(args *[]any, v any) string {
 	*args = append(*args, v)
 	return "$" + strconv.Itoa(len(*args))
+}
+
+// uniqueViolation reports whether err is a unique constraint's refusal.
+func uniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
 }
