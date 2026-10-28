@@ -1399,7 +1399,9 @@ schema.
 
 The Go tests need a PostgreSQL 17 server where they may create databases:
 each test gets a database of its own (random name, collation C), dropped
-when it ends, so tests run in parallel and leave nothing behind.
+when it ends, so tests run in parallel and leave nothing behind (the
+databases of a run that could not clean up, `kairo_test_*`, are dropped by a
+run six hours later).
 `KAIRO_TEST_PG` names the server, by default the local test container below
 (`fsync` off: tests only). A test fails, it is not skipped, when the server
 cannot be reached.

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -118,6 +119,41 @@ func BenchmarkListExecutions(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		if list, err := c.store.ListExecutions(c.ctx, ExecutionFilter{State: "waiting", Limit: 100}); err != nil || len(list) != 100 {
 			b.Fatalf("listed %d, err %v", len(list), err)
+		}
+	}
+	perOp(b, counter, before)
+}
+
+// BenchmarkObservationBatch: one provider poll of a node (cpu, ram, disk
+// and two GPUs with power samples), as a node agent reports it.
+func BenchmarkObservationBatch(b *testing.B) {
+	c, _, counter := benchCluster(b)
+	resources, err := c.store.ListResourceStatus(c.ctx)
+	if err != nil {
+		b.Fatal(err)
+	}
+	var mine []ResourceInstance
+	for _, r := range resources {
+		if r.NodeID == "n1" {
+			mine = append(mine, r)
+		}
+	}
+	power := 250.0
+	before := counter.n.Load()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		stamp := time.Now().UTC()
+		var observations []Observation
+		for _, r := range mine {
+			total, free := int64(24*gib), int64(20*gib)
+			o := Observation{ResourceID: r.ID, ObservedAt: stamp.Format(time.RFC3339Nano), ValidUntil: stamp.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &free}
+			if r.Kind == "gpu" {
+				o.Device = &DeviceSample{PowerW: &power}
+			}
+			observations = append(observations, o)
+		}
+		if err := c.store.ApplyObservationBatch(c.ctx, "n1-host", mine, observations, nil); err != nil {
+			b.Fatal(err)
 		}
 	}
 	perOp(b, counter, before)

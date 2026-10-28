@@ -1,6 +1,9 @@
 // Package pgtest gives each test a database of its own on a PostgreSQL test
 // server, so tests run in parallel and leave nothing behind.
 //
+// A run that cannot clean up (a panic, a killed test binary) leaves its
+// databases; the next run drops those older than six hours.
+//
 // The server is KAIRO_TEST_PG (a postgres:// URL or key=value connection
 // string of a role that may create databases), by default the local Docker
 // server of the README. A test fails, it is not skipped, when the server
@@ -15,6 +18,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -46,10 +50,44 @@ func adminDB() (*sql.DB, error) {
 		if adminErr == nil {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 			defer cancel()
-			adminErr = admin.PingContext(ctx)
+			if adminErr = admin.PingContext(ctx); adminErr == nil {
+				sweep(ctx, admin)
+			}
 		}
 	})
 	return admin, adminErr
+}
+
+// staleAfter: a test database this old was left by a run that never
+// cleaned up (a panic, a killed test binary) and is dropped.
+const staleAfter = 6 * time.Hour
+
+// sweep drops the stale test databases (their names carry their creation
+// time); a failure only leaves them for the next run.
+func sweep(ctx context.Context, db *sql.DB) {
+	rows, err := db.QueryContext(ctx, `SELECT datname FROM pg_database WHERE datname LIKE 'kairo\_test\_%'`)
+	if err != nil {
+		return
+	}
+	var stale []string
+	for rows.Next() {
+		var name string
+		if rows.Scan(&name) != nil {
+			break
+		}
+		parts := strings.Split(name, "_")
+		if len(parts) != 4 {
+			continue
+		}
+		created, err := strconv.ParseInt(parts[2], 10, 64)
+		if err == nil && time.Since(time.Unix(created, 0)) > staleAfter {
+			stale = append(stale, name)
+		}
+	}
+	rows.Close()
+	for _, name := range stale {
+		_, _ = db.ExecContext(ctx, `DROP DATABASE IF EXISTS `+name+` WITH (FORCE)`)
+	}
 }
 
 // DSN creates an empty database for t (UTF-8, collation C, as Kairo needs)
@@ -70,13 +108,14 @@ func DSN(t testing.TB) string {
 	return WithDatabase(Server(), name)
 }
 
-// NewName returns a random database name for a test.
+// NewName returns a random database name for a test, with its creation
+// time (kairo_test_<unix seconds>_<random>).
 func NewName() string {
-	var b [8]byte
+	var b [6]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		panic(err)
 	}
-	return "kairo_test_" + hex.EncodeToString(b[:])
+	return "kairo_test_" + strconv.FormatInt(time.Now().Unix(), 10) + "_" + hex.EncodeToString(b[:])
 }
 
 // Drop drops a test database, ending its connections.

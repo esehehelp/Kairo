@@ -22,7 +22,7 @@ type Config struct {
 	DatabasePasswordFile string `toml:"database_password_file"`
 	Listen               string `toml:"listen"`
 	AdvertiseURL         string `toml:"advertise_url"`
-	LogDirectory string `toml:"log_directory"`
+	LogDirectory         string `toml:"log_directory"`
 	// LogMinFreeMiB is the free space (MiB) the filesystem holding
 	// log_directory must have for an executor to launch (0: 1024).
 	LogMinFreeMiB              int  `toml:"log_min_free_mib"`
