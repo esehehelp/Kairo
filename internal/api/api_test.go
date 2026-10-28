@@ -7,16 +7,16 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
+	"kairo/internal/pgtest"
 	"kairo/internal/store"
 )
 
 type testDaemon struct {
 	store  *store.Store
-	path   string // the database file
+	dsn    string // the database
 	server *httptest.Server
 	admin  string
 	logs   string // the daemon's log directory
@@ -24,8 +24,8 @@ type testDaemon struct {
 
 func newTestDaemon(t *testing.T, observeOnly bool) *testDaemon {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "api.db")
-	st, err := store.Open(path)
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func newTestDaemon(t *testing.T, observeOnly bool) *testDaemon {
 		server.Close()
 		st.Close()
 	})
-	return &testDaemon{store: st, path: path, server: server, admin: admin, logs: logs}
+	return &testDaemon{store: st, dsn: dsn, server: server, admin: admin, logs: logs}
 }
 
 func (d *testDaemon) token(t *testing.T, name, role, node string) string {

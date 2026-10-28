@@ -14,9 +14,14 @@ import (
 )
 
 type Config struct {
-	DatabasePath string `toml:"database_path"`
-	Listen       string `toml:"listen"`
-	AdvertiseURL string `toml:"advertise_url"`
+	// DatabaseURL is the PostgreSQL database (a postgres:// URL or a
+	// key=value connection string); KAIRO_DATABASE_URL may give it instead.
+	DatabaseURL string `toml:"database_url"`
+	// DatabasePasswordFile holds the database password (its first line),
+	// for a DatabaseURL without one.
+	DatabasePasswordFile string `toml:"database_password_file"`
+	Listen               string `toml:"listen"`
+	AdvertiseURL         string `toml:"advertise_url"`
 	LogDirectory string `toml:"log_directory"`
 	// LogMinFreeMiB is the free space (MiB) the filesystem holding
 	// log_directory must have for an executor to launch (0: 1024).
@@ -75,6 +80,84 @@ func (b Bench) Attributes(labels map[string]string) map[string]any {
 		out["bench"] = bench
 	}
 	return out
+}
+
+// DatabaseURLEnv names the environment variable that may give the database
+// instead of database_url (so its password need not be in the file).
+const DatabaseURLEnv = "KAIRO_DATABASE_URL"
+
+// Database returns the connection string of the daemon's database: the
+// configured database_url or KAIRO_DATABASE_URL (not both), with the
+// password of database_password_file when one is set.
+func (c Config) Database() (string, error) {
+	dsn := c.DatabaseURL
+	if env := os.Getenv(DatabaseURLEnv); env != "" {
+		if dsn != "" {
+			return "", fmt.Errorf("the database is given twice: set database_url or %s, not both", DatabaseURLEnv)
+		}
+		dsn = env
+	}
+	if dsn == "" {
+		return "", fmt.Errorf("no database: set database_url (or %s) to the PostgreSQL database", DatabaseURLEnv)
+	}
+	if c.DatabasePasswordFile == "" {
+		return dsn, nil
+	}
+	body, err := os.ReadFile(c.DatabasePasswordFile)
+	if err != nil {
+		return "", fmt.Errorf("database_password_file: %w", err)
+	}
+	password, _, _ := strings.Cut(string(body), "\n")
+	return WithPassword(dsn, strings.TrimRight(password, "\r"))
+}
+
+// WithPassword returns the connection string dsn with password, which it
+// must not have already.
+func WithPassword(dsn, password string) (string, error) {
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", fmt.Errorf("database url: %w", err)
+		}
+		if u.User == nil {
+			return "", errors.New("the database url names no user to give database_password_file's password to")
+		}
+		if _, set := u.User.Password(); set {
+			return "", errors.New("the database url has a password and database_password_file gives another")
+		}
+		u.User = url.UserPassword(u.User.Username(), password)
+		return u.String(), nil
+	}
+	for _, field := range strings.Fields(dsn) {
+		if strings.HasPrefix(field, "password=") {
+			return "", errors.New("the database connection string has a password and database_password_file gives another")
+		}
+	}
+	quoted := strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(password)
+	return dsn + " password='" + quoted + "'", nil
+}
+
+// RedactDatabase returns a connection string for logs and messages: its
+// password replaced by xxxxx.
+func RedactDatabase(dsn string) string {
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		if u, err := url.Parse(dsn); err == nil {
+			return u.Redacted()
+		}
+		return "(unparsable database url)"
+	}
+	fields := strings.Fields(dsn)
+	for i, field := range fields {
+		if strings.HasPrefix(field, "password=") {
+			fields[i] = "password=xxxxx"
+			// A quoted password may hold spaces: drop the rest of it.
+			if strings.HasPrefix(field, "password='") && (len(field) == len("password='") || !strings.HasSuffix(field, "'")) {
+				fields = fields[:i+1]
+				break
+			}
+		}
+	}
+	return strings.Join(fields, " ")
 }
 
 // TLS reports whether the daemon serves HTTPS.
@@ -179,9 +262,6 @@ func loopback(listen string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 func defaults(c *Config) {
-	if c.DatabasePath == "" {
-		c.DatabasePath = "local/kairo-v3.db"
-	}
 	if c.Listen == "" {
 		c.Listen = "127.0.0.1:7474"
 	}

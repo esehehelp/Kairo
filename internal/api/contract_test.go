@@ -8,11 +8,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
+	"kairo/internal/pgtest"
 	"kairo/internal/store"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // These tests pin what the SDK worker scenarios (sdk/conformance) assume of
@@ -125,7 +127,7 @@ func TestWorkerTokenIsFencedWhenTheExecutorIsUnknown(t *testing.T) {
 func TestDatabaseFailureIsInternal(t *testing.T) {
 	d := newTestDaemon(t, false)
 	token := d.workerToken(t)
-	db, err := sql.Open("sqlite", d.path)
+	db, err := sql.Open("pgx", d.dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,38 +139,49 @@ func TestDatabaseFailureIsInternal(t *testing.T) {
 	expectError(t, "poll with a broken database", status, payload, http.StatusInternalServerError, "internal")
 }
 
-// busyError returns a real SQLITE_BUSY: a second connection that will not
-// wait tries to write while another holds the write lock.
-func busyError(t *testing.T) error {
+// lockTimeoutError returns a real PostgreSQL lock_not_available (55P03): a
+// second connection that will not wait asks for a lock another holds.
+func lockTimeoutError(t *testing.T) error {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "busy.db")
-	open := func() *sql.Conn {
-		db, err := sql.Open("sqlite", path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { db.Close() })
-		conn, err := db.Conn(t.Context())
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { conn.Close() })
-		if _, err = conn.ExecContext(t.Context(), `PRAGMA busy_timeout = 0`); err != nil {
-			t.Fatal(err)
-		}
-		return conn
-	}
-	holder, waiter := open(), open()
-	if _, err := holder.ExecContext(t.Context(), `CREATE TABLE t(x)`); err != nil {
+	db, err := sql.Open("pgx", pgtest.DSN(t))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := holder.ExecContext(t.Context(), `BEGIN IMMEDIATE`); err != nil {
+	t.Cleanup(func() { db.Close() })
+	holder, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { holder.ExecContext(context.Background(), `ROLLBACK`) })
-	_, err := waiter.ExecContext(t.Context(), `INSERT INTO t VALUES(1)`)
+	t.Cleanup(func() { holder.Rollback() })
+	if _, err = holder.Exec(`SELECT pg_advisory_xact_lock(1)`); err != nil {
+		t.Fatal(err)
+	}
+	waiter, err := db.BeginTx(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { waiter.Rollback() })
+	if _, err = waiter.Exec(`SET LOCAL lock_timeout = '10ms'`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = waiter.Exec(`SELECT pg_advisory_xact_lock(1)`)
 	if err == nil {
-		t.Fatal("write under another connection's write lock succeeded")
+		t.Fatal("a lock held by another transaction was granted")
+	}
+	return err
+}
+
+// unreachableError returns a real connection failure: nothing listens.
+func unreachableError(t *testing.T) error {
+	t.Helper()
+	db, err := sql.Open("pgx", "postgres://kairo@127.0.0.1:1/kairo?connect_timeout=2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	err = db.PingContext(t.Context())
+	if err == nil {
+		t.Fatal("connected to a port nothing listens on")
 	}
 	return err
 }
@@ -182,7 +195,9 @@ func TestErrorStatusClassification(t *testing.T) {
 	}{
 		{"store sentinel", fmt.Errorf("ack: %w", store.ErrNotFound), http.StatusNotFound, "not_found"},
 		{"validation", errors.New("invalid command acknowledgement phase"), http.StatusBadRequest, "bad_request"},
-		{"sqlite busy", fmt.Errorf("poll: %w", busyError(t)), http.StatusServiceUnavailable, "internal"},
+		{"lock timeout", fmt.Errorf("poll: %w", lockTimeoutError(t)), http.StatusServiceUnavailable, "internal"},
+		{"database unreachable", fmt.Errorf("poll: %w", unreachableError(t)), http.StatusServiceUnavailable, "internal"},
+		{"database error", fmt.Errorf("poll: %w", &pgconn.PgError{Code: "42P01", Message: "relation does not exist"}), http.StatusInternalServerError, "internal"},
 		{"deadline", fmt.Errorf("poll: %w", context.DeadlineExceeded), http.StatusServiceUnavailable, "internal"},
 		{"canceled", context.Canceled, http.StatusServiceUnavailable, "internal"},
 		{"transaction done", sql.ErrTxDone, http.StatusInternalServerError, "internal"},

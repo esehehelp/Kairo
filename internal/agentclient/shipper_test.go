@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"kairo/internal/api"
+	"kairo/internal/pgtest"
 	"kairo/internal/store"
 )
 
@@ -178,7 +179,7 @@ func TestShipAttemptShipsBothLogsOfTheAttempt(t *testing.T) {
 // A daemon that cannot write its copy of a log (a full disk) answers with a
 // daemon-side failure, which the agent retries, not a bad request.
 func TestDaemonLogDirectoryFailureIsInternal(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
+	st, err := store.Open(pgtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}

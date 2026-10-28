@@ -244,9 +244,9 @@ func init() {
 			args: "--config CONTROLLER.toml", help: "keep this host's controlled devices at their desired settings (elevated / root)"},
 		{name: "token", summary: "create, list or revoke API tokens (direct database access)", group: &commandGroup{
 			subs: []command{
-				{"create", "(--config DAEMON.toml | --db PATH) --name NAME --role admin|read|node [--node NODE_ID] [--save | --out FILE] [--force]", "create a token", bind(tokenAction, "create")},
-				{"list", "(--config DAEMON.toml | --db PATH)", "list active tokens", bind(tokenAction, "list")},
-				{"revoke", "(--config DAEMON.toml | --db PATH) ID_OR_NAME", "revoke a token", bind(tokenAction, "revoke")},
+				{"create", "(--config DAEMON.toml | --database-url URL) --name NAME --role admin|read|node [--node NODE_ID] [--save | --out FILE] [--force]", "create a token", bind(tokenAction, "create")},
+				{"list", "(--config DAEMON.toml | --database-url URL)", "list active tokens", bind(tokenAction, "list")},
+				{"revoke", "(--config DAEMON.toml | --database-url URL) ID_OR_NAME", "revoke a token", bind(tokenAction, "revoke")},
 			},
 			aliases: map[string]string{"new": "create", "add": "create", "ls": "list", "rm": "revoke", "delete": "revoke"},
 		}},
@@ -256,9 +256,10 @@ func init() {
 				{"issue", "--dir DIR --host HOST [--host HOST ...]", "re-issue the server certificate from the existing CA", bind(tlsAction, "issue")},
 			},
 		}},
-		{name: "db", summary: "database maintenance (compact)", group: &commandGroup{
+		{name: "db", summary: "database maintenance (compact, import-sqlite)", group: &commandGroup{
 			subs: []command{
-				{"compact", "(--config DAEMON.toml | --db PATH)", "prune resource observations and VACUUM the database", dbCompact},
+				{"compact", "(--config DAEMON.toml | --database-url URL)", "prune resource observations and device samples and vacuum their tables", dbCompact},
+				{"import-sqlite", "--from KAIRO.db (--config DAEMON.toml | --to URL)", "copy a SQLite Kairo database into an empty PostgreSQL one and verify every table", dbImportSQLite},
 			},
 			aliases: map[string]string{"vacuum": "compact"},
 		}},

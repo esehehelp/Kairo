@@ -378,7 +378,7 @@ func (s *Store) ListQuiescenceCandidates(ctx context.Context, executorID string)
 }
 
 func (s *Store) ListAttemptProcesses(ctx context.Context, attemptID string, liveOnly bool) ([]AttemptProcess, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at,exited_at FROM attempt_processes WHERE attempt_id=$1 AND ($2=0 OR exited_at IS NULL) ORDER BY role,rank`, attemptID, liveOnly)
+	rows, err := s.db.QueryContext(ctx, `SELECT attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at,exited_at FROM attempt_processes WHERE attempt_id=$1 AND (NOT $2::boolean OR exited_at IS NULL) ORDER BY role,rank`, attemptID, liveOnly)
 	if err != nil {
 		return nil, err
 	}

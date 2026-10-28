@@ -3,7 +3,6 @@ package devicecontrol
 import (
 	"context"
 	"net/http/httptest"
-	"path/filepath"
 	"slices"
 	"testing"
 	"time"
@@ -11,6 +10,7 @@ import (
 	"kairo/internal/agentclient"
 	"kairo/internal/api"
 	"kairo/internal/machine"
+	"kairo/internal/pgtest"
 	"kairo/internal/store"
 )
 
@@ -19,7 +19,7 @@ import (
 // setting and returns the device to its defaults when it stops.
 func TestControllerAgainstTheDaemon(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
+	st, err := store.Open(pgtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}

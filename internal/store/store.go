@@ -51,10 +51,11 @@ var (
 // lock and run concurrently.
 const decisionLock int64 = 0x4b4149524f // "KAIRO"
 
-// lockStatement makes a transaction writable (connections default to
+// LockStatement makes a transaction writable (connections default to
 // read-only, so a write outside beginWrite fails) and takes the decision
-// lock, in one round trip.
-var lockStatement = "SET TRANSACTION READ WRITE; SELECT pg_advisory_xact_lock(" + strconv.FormatInt(decisionLock, 10) + ")"
+// lock, in one round trip. Tools that write with a connection of their own
+// (the SQLite import) begin with it too.
+var LockStatement = "SET TRANSACTION READ WRITE; SELECT pg_advisory_xact_lock(" + strconv.FormatInt(decisionLock, 10) + ")"
 
 // maxConns bounds the pool. Writers wait for each other on the decision
 // lock, so more connections only serve more concurrent reads.
@@ -133,7 +134,7 @@ func Migrations() ([]string, error) {
 // transaction under the decision lock (two daemons starting at once migrate
 // one after the other).
 func migrate(ctx context.Context, db *sql.DB, create bool) error {
-	tx, err := BeginWrite(ctx, db)
+	tx, err := beginWriteDB(ctx, db)
 	if err != nil {
 		return fmt.Errorf("connect to the database: %w", err)
 	}
@@ -152,7 +153,7 @@ func CreateSchema(ctx context.Context, tx *sql.Tx) error {
 		return err
 	}
 	if versioned {
-		return ErrForeignDatabase
+		return errors.New("the database already holds a Kairo schema; use an empty database")
 	}
 	return migrateTx(ctx, tx, true)
 }
@@ -216,15 +217,15 @@ func checkDatabase(ctx context.Context, tx *sql.Tx) error {
 
 // beginWrite begins a transaction that may write: the only way to write.
 // It takes the decision lock first, so writing transactions never overlap.
-func (s *Store) beginWrite(ctx context.Context) (*sql.Tx, error) { return BeginWrite(ctx, s.db) }
+func (s *Store) beginWrite(ctx context.Context) (*sql.Tx, error) { return beginWriteDB(ctx, s.db) }
 
-// BeginWrite is beginWrite on a pool of the caller's (the import tool's).
-func BeginWrite(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
+// beginWriteDB is beginWrite on a pool (Open migrates through it).
+func beginWriteDB(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, lockStatement); err != nil {
+	if _, err = tx.ExecContext(ctx, LockStatement); err != nil {
 		tx.Rollback()
 		return nil, err
 	}

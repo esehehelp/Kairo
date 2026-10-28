@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -10,21 +11,22 @@ import (
 	"testing"
 
 	"kairo/internal/api"
+	"kairo/internal/pgtest"
 	"kairo/internal/store"
 )
 
-// tokenDB creates an empty Kairo database and returns its path.
+// tokenDB creates an empty Kairo database and returns its connection string.
 func tokenDB(t *testing.T) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "kairo.db")
-	st, err := store.Open(path)
+	dsn := pgtest.DSN(t)
+	st, err := store.Open(dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := st.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return path
+	return dsn
 }
 
 func authenticate(t *testing.T, db, token string) error {
@@ -42,7 +44,7 @@ func TestTokenCreateListRevoke(t *testing.T) {
 	isolateClientEnv(t)
 	db := tokenDB(t)
 	out, err := captureStdout(t, func() error {
-		return run([]string{"token", "create", "--db", db, "--name", "operator", "--role", "admin"})
+		return run([]string{"token", "create", "--database-url", db, "--name", "operator", "--role", "admin"})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -55,7 +57,7 @@ func TestTokenCreateListRevoke(t *testing.T) {
 		t.Fatalf("created token does not authenticate: %v", err)
 	}
 
-	out, err = captureStdout(t, func() error { return run([]string{"token", "list", "--db", db}) })
+	out, err = captureStdout(t, func() error { return run([]string{"token", "list", "--database-url", db}) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,13 +66,13 @@ func TestTokenCreateListRevoke(t *testing.T) {
 	}
 
 	// flags after the positional argument are parsed too
-	if _, err := captureStdout(t, func() error { return run([]string{"token", "revoke", "operator", "--db", db}) }); err != nil {
+	if _, err := captureStdout(t, func() error { return run([]string{"token", "revoke", "operator", "--database-url", db}) }); err != nil {
 		t.Fatal(err)
 	}
 	if err := authenticate(t, db, token); err == nil {
 		t.Fatal("revoked token still authenticates")
 	}
-	if _, err := captureStdout(t, func() error { return run([]string{"token", "revoke", "--db", db, "operator"}) }); err == nil {
+	if _, err := captureStdout(t, func() error { return run([]string{"token", "revoke", "--database-url", db, "operator"}) }); err == nil {
 		t.Fatal("revoking an already revoked token succeeded")
 	}
 }
@@ -80,7 +82,7 @@ func TestTokenCreateOutWritesAPrivateFileOnce(t *testing.T) {
 	db := tokenDB(t)
 	file := filepath.Join(t.TempDir(), "secrets", "token")
 	out, err := captureStdout(t, func() error {
-		return run([]string{"token", "create", "--db", db, "--name", "reader", "--role", "read", "--out", file})
+		return run([]string{"token", "create", "--database-url", db, "--name", "reader", "--role", "read", "--out", file})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -109,17 +111,17 @@ func TestTokenCreateOutWritesAPrivateFileOnce(t *testing.T) {
 		}
 	}
 	_, err = captureStdout(t, func() error {
-		return run([]string{"token", "create", "--db", db, "--name", "second", "--role", "read", "--out", file})
+		return run([]string{"token", "create", "--database-url", db, "--name", "second", "--role", "read", "--out", file})
 	})
 	if err == nil || !strings.Contains(err.Error(), "--force") {
 		t.Fatalf("overwrite without --force: %v", err)
 	}
-	listed, _ := captureStdout(t, func() error { return run([]string{"token", "list", "--db", db}) })
+	listed, _ := captureStdout(t, func() error { return run([]string{"token", "list", "--database-url", db}) })
 	if strings.Contains(listed, "second") {
 		t.Fatalf("a refused create left a token behind:\n%s", listed)
 	}
 	if _, err := captureStdout(t, func() error {
-		return run([]string{"token", "create", "--db", db, "--name", "second", "--role", "read", "--out", file, "--force"})
+		return run([]string{"token", "create", "--database-url", db, "--name", "second", "--role", "read", "--out", file, "--force"})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -132,7 +134,7 @@ func TestTokenCreateSaveFeedsTheClient(t *testing.T) {
 	dir := isolateClientEnv(t)
 	db := tokenDB(t)
 	out, err := captureStdout(t, func() error {
-		return run([]string{"token", "create", "--db", db, "--name", "operator", "--role", "admin", "--save"})
+		return run([]string{"token", "create", "--database-url", db, "--name", "operator", "--role", "admin", "--save"})
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -164,29 +166,30 @@ func TestTokenCreateSaveFeedsTheClient(t *testing.T) {
 func TestTokenCreateValidation(t *testing.T) {
 	isolateClientEnv(t)
 	db := tokenDB(t)
+	empty := pgtest.DSN(t) // a database without the Kairo schema
 	for _, args := range [][]string{
-		{"create", "--db", db, "--name", "agent", "--role", "node"},
-		{"create", "--db", db, "--name", "x", "--role", "admin", "--node", "pve0"},
-		{"create", "--db", db, "--name", "x", "--role", "root"},
-		{"create", "--db", db, "--role", "admin"},
+		{"create", "--database-url", db, "--name", "agent", "--role", "node"},
+		{"create", "--database-url", db, "--name", "x", "--role", "admin", "--node", "pve0"},
+		{"create", "--database-url", db, "--name", "x", "--role", "root"},
+		{"create", "--database-url", db, "--role", "admin"},
 		{"create", "--name", "x", "--role", "admin"},
-		{"create", "--db", db, "--config", "kairo.toml", "--name", "x", "--role", "admin"},
-		{"create", "--db", filepath.Join(t.TempDir(), "missing.db"), "--name", "x", "--role", "admin"},
-		{"create", "--db", db, "--name", "x", "--role", "admin", "--save", "--out", "f"},
-		{"create", "--db", db, "--name", "x", "--role", "admin", "--force"},
-		{"list", "--db", db, "extra"},
-		{"revoke", "--db", db},
-		{"rotate", "--db", db},
+		{"create", "--database-url", db, "--config", "kairo.toml", "--name", "x", "--role", "admin"},
+		{"create", "--database-url", empty, "--name", "x", "--role", "admin"},
+		{"create", "--database-url", db, "--name", "x", "--role", "admin", "--save", "--out", "f"},
+		{"create", "--database-url", db, "--name", "x", "--role", "admin", "--force"},
+		{"list", "--database-url", db, "extra"},
+		{"revoke", "--database-url", db},
+		{"rotate", "--database-url", db},
 	} {
 		if _, err := captureStdout(t, func() error { return run(append([]string{"token"}, args...)) }); err == nil {
 			t.Fatalf("token %v was accepted", args)
 		}
 	}
-	if _, err := os.Stat(filepath.Join(filepath.Dir(db), "missing.db")); err == nil {
-		t.Fatal("token create created a database")
+	if _, err := store.OpenExisting(empty); !errors.Is(err, store.ErrNoSchema) {
+		t.Fatalf("token create created a schema: %v", err)
 	}
 	out, err := captureStdout(t, func() error {
-		return run([]string{"token", "create", "--db", db, "--name", "agent", "--role", "node", "--node", "pve0"})
+		return run([]string{"token", "create", "--database-url", db, "--name", "agent", "--role", "node", "--node", "pve0"})
 	})
 	if err != nil || !strings.HasPrefix(strings.TrimSpace(out), "kairo_node_") {
 		t.Fatalf("node token: %v %q", err, out)
