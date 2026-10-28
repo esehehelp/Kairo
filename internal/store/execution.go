@@ -271,7 +271,7 @@ func (s *Store) SubmitExecution(ctx context.Context, input ExecutionSpec) (Execu
 	if err != nil {
 		return ExecutionRequest{}, false, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return ExecutionRequest{}, false, err
 	}
@@ -296,7 +296,7 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 		return "", false, err
 	}
 	var existingID, existingDigest string
-	err = tx.QueryRowContext(ctx, `SELECT id,spec_digest FROM execution_requests WHERE project_scope_id=? AND client_request_id=?`, project.ID, spec.ClientRequestID).Scan(&existingID, &existingDigest)
+	err = tx.QueryRowContext(ctx, `SELECT id,spec_digest FROM execution_requests WHERE project_scope_id=$1 AND client_request_id=$2`, project.ID, spec.ClientRequestID).Scan(&existingID, &existingDigest)
 	if err == nil {
 		if existingDigest != digest {
 			return "", false, ErrIdempotencyConflict
@@ -332,7 +332,7 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 			env = &value
 		}
 		executionID, stamp := id.New("exe"), now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json) VALUES(?,?,?,?,?,?,'waiting',?,?,?,?,?,?,?,?,?)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env); err != nil {
 			return "", err
 		}
 		if err = insertExecutionResourcesTx(ctx, tx, executionID, spec); err != nil {
@@ -352,10 +352,10 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 		// Members carry the leader's request ID and digest with their rank, so a
 		// resubmitted gang is idempotent through its leader alone.
 		gangID, stamp := id.New("gng"), now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_gangs(id,leader_execution_id,size,port,created_at) VALUES(?,?,?,?,?)`, gangID, executionID, spec.Gang.Size, spec.Gang.Port, stamp); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_gangs(id,leader_execution_id,size,port,created_at) VALUES($1,$2,$3,$4,$5)`, gangID, executionID, spec.Gang.Size, spec.Gang.Port, stamp); err != nil {
 			return "", false, err
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_members(gang_id,rank,execution_id) VALUES(?,0,?)`, gangID, executionID); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_members(gang_id,rank,execution_id) VALUES($1,0,$2)`, gangID, executionID); err != nil {
 			return "", false, err
 		}
 		for rank := 1; rank < spec.Gang.Size; rank++ {
@@ -363,7 +363,7 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 			if err != nil {
 				return "", false, err
 			}
-			if _, err = tx.ExecContext(ctx, `INSERT INTO gang_members(gang_id,rank,execution_id) VALUES(?,?,?)`, gangID, rank, memberID); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO gang_members(gang_id,rank,execution_id) VALUES($1,$2,$3)`, gangID, rank, memberID); err != nil {
 				return "", false, err
 			}
 		}
@@ -385,7 +385,7 @@ func insertExecutionResourcesTx(ctx context.Context, tx *sql.Tx, executionID str
 		if err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,constraints_json,policy_json) VALUES(?,?,'exclusive',?,?,?,?)`, id.New("req"), executionID, request.Kind, request.Count, string(constraints), string(policy)); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,constraints_json,policy_json) VALUES($1,$2,'exclusive',$3,$4,$5,$6)`, id.New("req"), executionID, request.Kind, request.Count, string(constraints), string(policy)); err != nil {
 			return err
 		}
 	}
@@ -395,12 +395,12 @@ func insertExecutionResourcesTx(ctx context.Context, tx *sql.Tx, executionID str
 		if spec.Capacity.CPUMillisMin > 0 {
 			constraints = fmt.Sprintf(`{"min_quantity":%d}`, spec.Capacity.CPUMillisMin)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,strength,constraints_json) VALUES(?,?,'capacity','cpu',?,?,?)`, id.New("req"), executionID, spec.Capacity.CPUMillis, strength, constraints); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,strength,constraints_json) VALUES($1,$2,'capacity','cpu',$3,$4,$5)`, id.New("req"), executionID, spec.Capacity.CPUMillis, strength, constraints); err != nil {
 			return err
 		}
 	}
 	if spec.Capacity.RAMBytes > 0 {
-		if _, err := tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,strength) VALUES(?,?,'capacity','ram',?,?)`, id.New("req"), executionID, spec.Capacity.RAMBytes, strength); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,strength) VALUES($1,$2,'capacity','ram',$3,$4)`, id.New("req"), executionID, spec.Capacity.RAMBytes, strength); err != nil {
 			return err
 		}
 	}
@@ -409,7 +409,7 @@ func insertExecutionResourcesTx(ctx context.Context, tx *sql.Tx, executionID str
 		if err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,filesystem,constraints_json,strength) VALUES(?,?,'capacity','disk',?,?,?,?)`, id.New("req"), executionID, disk.ReserveBytes, disk.Filesystem, string(constraints), strength); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO resource_requests(id,execution_id,request_type,kind,quantity,filesystem,constraints_json,strength) VALUES($1,$2,'capacity','disk',$3,$4,$5,$6)`, id.New("req"), executionID, disk.ReserveBytes, disk.Filesystem, string(constraints), strength); err != nil {
 			return err
 		}
 	}
@@ -449,7 +449,7 @@ func decodeEnv(column sql.NullString) (map[string]string, error) {
 const executionSelect = `SELECT id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,terminal_cause,submitted_at,authorized_at,started_at,terminal_at,env_json FROM execution_requests`
 
 func (s *Store) GetExecution(ctx context.Context, executionID string) (ExecutionRequest, error) {
-	execution, err := scanExecution(s.db.QueryRowContext(ctx, executionSelect+` WHERE id=?`, executionID))
+	execution, err := scanExecution(s.db.QueryRowContext(ctx, executionSelect+` WHERE id=$1`, executionID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return ExecutionRequest{}, ErrNotFound
 	}
@@ -465,21 +465,19 @@ func (s *Store) ListExecutions(ctx context.Context, filter ExecutionFilter) ([]E
 	conditions := make([]string, 0, 3)
 	args := make([]any, 0, 4)
 	if filter.ProjectScopeID != "" {
-		conditions = append(conditions, `project_scope_id=?`)
-		args = append(args, filter.ProjectScopeID)
+		conditions = append(conditions, `project_scope_id=`+bind(&args, filter.ProjectScopeID))
 	}
 	if filter.ScopeID != "" {
-		conditions = append(conditions, `(project_scope_id IN (WITH RECURSIVE d(id) AS (SELECT ? UNION ALL SELECT s.id FROM coordination_scopes s JOIN d ON s.parent_id=d.id) SELECT id FROM d) OR queue_scope_id IN (WITH RECURSIVE d(id) AS (SELECT ? UNION ALL SELECT s.id FROM coordination_scopes s JOIN d ON s.parent_id=d.id) SELECT id FROM d) OR task_scope_id IN (WITH RECURSIVE d(id) AS (SELECT ? UNION ALL SELECT s.id FROM coordination_scopes s JOIN d ON s.parent_id=d.id) SELECT id FROM d))`)
-		args = append(args, filter.ScopeID, filter.ScopeID, filter.ScopeID)
+		within := `(WITH RECURSIVE d(id) AS (SELECT ` + bind(&args, filter.ScopeID) + `::text UNION ALL SELECT s.id FROM coordination_scopes s JOIN d ON s.parent_id=d.id) SELECT id FROM d)`
+		conditions = append(conditions, `(project_scope_id IN `+within+` OR queue_scope_id IN `+within+` OR task_scope_id IN `+within+`)`)
 	}
 	if filter.State != "" {
-		conditions = append(conditions, `state=?`)
-		args = append(args, filter.State)
+		conditions = append(conditions, `state=`+bind(&args, filter.State))
 	}
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	query += ` ORDER BY submitted_at,id LIMIT ?`
+	query += ` ORDER BY submitted_at,id LIMIT `
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = 100
@@ -487,7 +485,7 @@ func (s *Store) ListExecutions(ctx context.Context, filter ExecutionFilter) ([]E
 	if limit > 1000 {
 		limit = 1000
 	}
-	args = append(args, limit)
+	query += bind(&args, limit)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -516,7 +514,7 @@ func (s *Store) ListExecutions(ctx context.Context, filter ExecutionFilter) ([]E
 }
 
 func (s *Store) listExecutionResources(ctx context.Context, executionID string) ([]ResourceRequest, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,execution_id,request_type,kind,quantity,filesystem,constraints_json,policy_json,strength FROM resource_requests WHERE execution_id=? ORDER BY request_type,kind,id`, executionID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,execution_id,request_type,kind,quantity,filesystem,constraints_json,policy_json,strength FROM resource_requests WHERE execution_id=$1 ORDER BY request_type,kind,id`, executionID)
 	if err != nil {
 		return nil, err
 	}
@@ -536,7 +534,7 @@ func (s *Store) listExecutionResources(ctx context.Context, executionID string) 
 }
 
 func (s *Store) WithdrawExecution(ctx context.Context, executionID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -553,7 +551,7 @@ func (s *Store) WithdrawExecution(ctx context.Context, executionID string) error
 func withdrawExecutionTx(ctx context.Context, tx *sql.Tx, executionID string) (bool, error) {
 	var state, projectID string
 	var startedAt, terminalCause sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT state,project_scope_id,started_at,terminal_cause FROM execution_requests WHERE id=?`, executionID).Scan(&state, &projectID, &startedAt, &terminalCause); errors.Is(err, sql.ErrNoRows) {
+	if err := tx.QueryRowContext(ctx, `SELECT state,project_scope_id,started_at,terminal_cause FROM execution_requests WHERE id=$1`, executionID).Scan(&state, &projectID, &startedAt, &terminalCause); errors.Is(err, sql.ErrNoRows) {
 		return false, ErrNotFound
 	} else if err != nil {
 		return false, err
@@ -568,15 +566,15 @@ func withdrawExecutionTx(ctx context.Context, tx *sql.Tx, executionID string) (b
 		return false, nil
 	}
 	t := now()
-	if _, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='withdrawn_before_start',terminal_at=? WHERE id=?`, t, executionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='withdrawn_before_start',terminal_at=$1 WHERE id=$2`, t, executionID); err != nil {
 		return false, err
 	}
 	if state == "authorized" {
-		if _, err := tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=? WHERE attempt_id=(SELECT id FROM attempts WHERE execution_id=?) AND state='issued'`, t, executionID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=$1 WHERE attempt_id=(SELECT id FROM attempts WHERE execution_id=$2) AND state='issued'`, t, executionID); err != nil {
 			return false, err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE leases SET state='revocation_requested',revocation_requested_at=? WHERE execution_id=? AND state IN('reserved','prepared')`, t, executionID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE leases SET state='revocation_requested',revocation_requested_at=$1 WHERE execution_id=$2 AND state IN('reserved','prepared')`, t, executionID); err != nil {
 		return false, err
 	}
 	if err := appendCoordinationEventTx(ctx, tx, "execution_withdrawn", &projectID, "execution", executionID, nil, map[string]string{"cause": "withdrawn_before_start"}); err != nil {

@@ -57,7 +57,7 @@ func intp(v int) *int { return &v }
 func eventCount(t *testing.T, store *Store, eventType string) int {
 	t.Helper()
 	var n int
-	if err := store.db.QueryRow(`SELECT COUNT(*) FROM coordination_events WHERE event_type=?`, eventType).Scan(&n); err != nil {
+	if err := store.db.QueryRow(`SELECT COUNT(*) FROM coordination_events WHERE event_type=$1`, eventType).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	return n
@@ -248,7 +248,7 @@ func TestAPollClearsTheSettingsOfAnyReleasedLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	// released by a path that does not clear (none should exist)
-	if _, err := store.db.Exec(`UPDATE leases SET state='released',released_at=? WHERE id=?`, now(), launch.Lease.ID); err != nil {
+	if _, err := store.testExec(`UPDATE leases SET state='released',released_at=$1 WHERE id=$2`, now(), launch.Lease.ID); err != nil {
 		t.Fatal(err)
 	}
 	if got := polled(t, store, "GPU-S"); got.Owner != nil {

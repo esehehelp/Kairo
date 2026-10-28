@@ -70,7 +70,7 @@ type gangMember struct {
 // gangOfExecutionTx returns the gang an execution belongs to ("" if none), its
 // rank and the gang's leader.
 func gangOfExecutionTx(ctx context.Context, q queryer, executionID string) (gangID string, rank int, leaderID string, err error) {
-	err = q.QueryRowContext(ctx, `SELECT m.gang_id,m.rank,g.leader_execution_id FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id WHERE m.execution_id=?`, executionID).Scan(&gangID, &rank, &leaderID)
+	err = q.QueryRowContext(ctx, `SELECT m.gang_id,m.rank,g.leader_execution_id FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id WHERE m.execution_id=$1`, executionID).Scan(&gangID, &rank, &leaderID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", 0, "", nil
 	}
@@ -85,12 +85,12 @@ type queryer interface {
 func loadCandidateTx(ctx context.Context, tx *sql.Tx, executionID string) (executionCandidate, error) {
 	var c executionCandidate
 	err := tx.QueryRowContext(ctx, `SELECT e.id,e.project_scope_id,e.queue_scope_id,e.task_scope_id,e.client_request_id,e.spec_digest,e.state,e.argv_json,e.cwd,e.executor_selector_json,e.priority,e.checkpointable,e.preemptible,e.input_continuation_ref,e.terminal_cause,e.submitted_at,e.authorized_at,e.started_at,e.terminal_at
-		FROM execution_requests e WHERE e.id=?`, executionID).Scan(&c.execution.ID, &c.execution.ProjectScopeID, &c.execution.QueueScopeID, &c.execution.TaskScopeID, &c.execution.ClientRequestID, &c.execution.SpecDigest, &c.execution.State, &c.argvJSON, &c.execution.CWD, &c.selectorJSON, &c.execution.Priority, &c.execution.Checkpointable, &c.execution.Preemptible, &c.execution.InputContinuationRef, &c.execution.TerminalCause, &c.execution.SubmittedAt, &c.execution.AuthorizedAt, &c.execution.StartedAt, &c.execution.TerminalAt)
+		FROM execution_requests e WHERE e.id=$1`, executionID).Scan(&c.execution.ID, &c.execution.ProjectScopeID, &c.execution.QueueScopeID, &c.execution.TaskScopeID, &c.execution.ClientRequestID, &c.execution.SpecDigest, &c.execution.State, &c.argvJSON, &c.execution.CWD, &c.selectorJSON, &c.execution.Priority, &c.execution.Checkpointable, &c.execution.Preemptible, &c.execution.InputContinuationRef, &c.execution.TerminalCause, &c.execution.SubmittedAt, &c.execution.AuthorizedAt, &c.execution.StartedAt, &c.execution.TerminalAt)
 	return c, err
 }
 
 func gangMembersTx(ctx context.Context, tx *sql.Tx, gangID string) ([]gangMember, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT rank,execution_id FROM gang_members WHERE gang_id=? ORDER BY rank`, gangID)
+	rows, err := tx.QueryContext(ctx, `SELECT rank,execution_id FROM gang_members WHERE gang_id=$1 ORDER BY rank`, gangID)
 	if err != nil {
 		return nil, err
 	}
@@ -128,7 +128,7 @@ func gangMembersTx(ctx context.Context, tx *sql.Tx, gangID string) ([]gangMember
 // cannot be reserved). It reports whether the gang was placed.
 func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlot) (bool, error) {
 	var size, port int
-	if err := tx.QueryRowContext(ctx, `SELECT size,port FROM execution_gangs WHERE id=?`, gangID).Scan(&size, &port); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT size,port FROM execution_gangs WHERE id=$1`, gangID).Scan(&size, &port); err != nil {
 		return false, err
 	}
 	members, err := gangMembersTx(ctx, tx, gangID)
@@ -140,7 +140,7 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 	}
 	for _, m := range members {
 		var live int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases WHERE execution_id=? AND state!='released'`, m.candidate.execution.ID).Scan(&live); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases WHERE execution_id=$1 AND state!='released'`, m.candidate.execution.ID).Scan(&live); err != nil {
 			return false, err
 		}
 		if m.candidate.execution.State != "waiting" || live != 0 {
@@ -192,12 +192,12 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 		}
 	}
 	placementID, stamp := id.New("gpl"), now()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placements(id,gang_id,state,master_addr,master_port,master_node_id,created_at,updated_at) VALUES(?,?,'placed',?,?,?,?,?)`, placementID, gangID, master.attribute("interconnect_addr"), port, master.nodeID, stamp, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placements(id,gang_id,state,master_addr,master_port,master_node_id,created_at,updated_at) VALUES($1,$2,'placed',$3,$4,$5,$6,$7)`, placementID, gangID, master.attribute("interconnect_addr"), port, master.nodeID, stamp, stamp); err != nil {
 		_, _ = abandon()
 		return false, err
 	}
 	for _, a := range placed {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placement_leases(placement_id,rank,lease_id,execution_id,executor_id,node_id) VALUES(?,?,?,?,?,?)`, placementID, a.rank, a.leaseID, a.executionID, a.executor.id, a.executor.nodeID); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placement_leases(placement_id,rank,lease_id,execution_id,executor_id,node_id) VALUES($1,$2,$3,$4,$5,$6)`, placementID, a.rank, a.leaseID, a.executionID, a.executor.id, a.executor.nodeID); err != nil {
 			_, _ = abandon()
 			return false, err
 		}
@@ -214,7 +214,7 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 }
 
 func freeGangPortTx(ctx context.Context, tx *sql.Tx, nodeID string) (int, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT gp.master_port FROM gang_placements gp WHERE gp.master_node_id=? AND gp.state IN('placed','launched')
+	rows, err := tx.QueryContext(ctx, `SELECT gp.master_port FROM gang_placements gp WHERE gp.master_node_id=$1 AND gp.state IN('placed','launched')
 		AND EXISTS(SELECT 1 FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=gp.id AND l.state!='released')`, nodeID)
 	if err != nil {
 		return 0, err
@@ -246,7 +246,7 @@ func gangLaunchTx(ctx context.Context, q queryer, leaseID string) (*GangLaunch, 
 	var state string
 	err := q.QueryRowContext(ctx, `SELECT gp.gang_id,gp.id,gpl.rank,eg.size,gp.master_addr,gp.master_port,gp.state
 		FROM gang_placement_leases gpl JOIN gang_placements gp ON gp.id=gpl.placement_id JOIN execution_gangs eg ON eg.id=gp.gang_id
-		WHERE gpl.lease_id=?`, leaseID).Scan(&g.GangID, &g.PlacementID, &g.Rank, &g.Size, &g.MasterAddr, &g.MasterPort, &state)
+		WHERE gpl.lease_id=$1`, leaseID).Scan(&g.GangID, &g.PlacementID, &g.Rank, &g.Size, &g.MasterAddr, &g.MasterPort, &state)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", nil
 	}
@@ -259,7 +259,7 @@ func gangLaunchTx(ctx context.Context, q queryer, leaseID string) (*GangLaunch, 
 // deliverGangLease hands executorID the oldest gang rank lease placed for it
 // that it has not received yet, as an ordinary reservation.
 func (s *Store) deliverGangLease(ctx context.Context, executorID string) (*Reservation, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -267,7 +267,7 @@ func (s *Store) deliverGangLease(ctx context.Context, executorID string) (*Reser
 	var leaseID, executionID string
 	err = tx.QueryRowContext(ctx, `SELECT gpl.lease_id,gpl.execution_id FROM gang_placement_leases gpl
 		JOIN gang_placements gp ON gp.id=gpl.placement_id JOIN leases l ON l.id=gpl.lease_id
-		WHERE gpl.executor_id=? AND gpl.delivered_at IS NULL AND gp.state='placed' AND l.state='reserved'
+		WHERE gpl.executor_id=$1 AND gpl.delivered_at IS NULL AND gp.state='placed' AND l.state='reserved'
 		ORDER BY gp.created_at,gpl.rank LIMIT 1`, executorID).Scan(&leaseID, &executionID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
@@ -285,7 +285,7 @@ func (s *Store) deliverGangLease(ctx context.Context, executorID string) (*Reser
 	candidate.execution.ExecutorSelector = json.RawMessage(candidate.selectorJSON)
 	var lease Lease
 	var expires sql.NullString
-	if err = tx.QueryRowContext(ctx, `SELECT id,execution_id,executor_id,coordination_epoch,state,created_at,expires_at FROM leases WHERE id=?`, leaseID).Scan(&lease.ID, &lease.ExecutionID, &lease.ExecutorID, &lease.CoordinationEpoch, &lease.State, &lease.CreatedAt, &expires); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT id,execution_id,executor_id,coordination_epoch,state,created_at,expires_at FROM leases WHERE id=$1`, leaseID).Scan(&lease.ID, &lease.ExecutionID, &lease.ExecutorID, &lease.CoordinationEpoch, &lease.State, &lease.CreatedAt, &expires); err != nil {
 		return nil, err
 	}
 	if expires.Valid {
@@ -296,7 +296,7 @@ func (s *Store) deliverGangLease(ctx context.Context, executorID string) (*Reser
 		return nil, err
 	}
 	gates := map[string]int64{}
-	rows, err := tx.QueryContext(ctx, `SELECT scope_id,generation FROM lease_gate_snapshots WHERE lease_id=?`, leaseID)
+	rows, err := tx.QueryContext(ctx, `SELECT scope_id,generation FROM lease_gate_snapshots WHERE lease_id=$1`, leaseID)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +316,7 @@ func (s *Store) deliverGangLease(ctx context.Context, executorID string) (*Reser
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE gang_placement_leases SET delivered_at=? WHERE lease_id=?`, now(), leaseID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE gang_placement_leases SET delivered_at=$1 WHERE lease_id=$2`, now(), leaseID); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {
@@ -327,7 +327,7 @@ func (s *Store) deliverGangLease(ctx context.Context, executorID string) (*Reser
 
 func leaseResourcesTx(ctx context.Context, q queryer, leaseID string) ([]ResourceInstance, error) {
 	rows, err := q.QueryContext(ctx, `SELECT r.id,r.node_id,r.provider_id,r.kind,r.stable_identity,r.binding_json,r.attributes_json,r.admin_state,r.quarantine_reason
-		FROM lease_items li JOIN resource_instances r ON r.id=li.resource_id WHERE li.lease_id=? AND li.kind='gpu' ORDER BY r.id`, leaseID)
+		FROM lease_items li JOIN resource_instances r ON r.id=li.resource_id WHERE li.lease_id=$1 AND li.kind='gpu' ORDER BY r.id`, leaseID)
 	if err != nil {
 		return nil, err
 	}
@@ -359,9 +359,9 @@ func gangLaunchGateTx(ctx context.Context, tx *sql.Tx, leaseID string) (*GangLau
 	}
 	var total, prepared, lost int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),
-		COALESCE(SUM(l.state IN('prepared','active','releasing')),0),
-		COALESCE(SUM(l.state IN('released','stale','revocation_requested')),0)
-		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=?`, gang.PlacementID).Scan(&total, &prepared, &lost); err != nil {
+		COUNT(*) FILTER (WHERE l.state IN('prepared','active','releasing')),
+		COUNT(*) FILTER (WHERE l.state IN('released','stale','revocation_requested'))
+		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=$1`, gang.PlacementID).Scan(&total, &prepared, &lost); err != nil {
 		return nil, err
 	}
 	if lost != 0 && state == "placed" {
@@ -371,7 +371,7 @@ func gangLaunchGateTx(ctx context.Context, tx *sql.Tx, leaseID string) (*GangLau
 		return nil, ErrGangNotReady
 	}
 	if state == "placed" {
-		if _, err = tx.ExecContext(ctx, `UPDATE gang_placements SET state='launched',updated_at=? WHERE id=? AND state='placed'`, now(), gang.PlacementID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE gang_placements SET state='launched',updated_at=$1 WHERE id=$2 AND state='placed'`, now(), gang.PlacementID); err != nil {
 			return nil, err
 		}
 	}
@@ -444,7 +444,7 @@ func (s *Store) abortStalePlacements(ctx context.Context) error {
 func (s *Store) gangRankDetail(ctx context.Context, placementID string) (string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT gpl.rank,gpl.executor_id,l.state,gpl.delivered_at IS NOT NULL,x.last_seen_at
 		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id LEFT JOIN executors x ON x.id=gpl.executor_id
-		WHERE gpl.placement_id=? ORDER BY gpl.rank`, placementID)
+		WHERE gpl.placement_id=$1 ORDER BY gpl.rank`, placementID)
 	if err != nil {
 		return "", err
 	}
@@ -475,25 +475,25 @@ func (s *Store) gangRankDetail(ctx context.Context, placementID string) (string,
 // by its executor, which learns of the abort from AuthorizeLaunch. It reports
 // whether the placement was still placed, and so was aborted now.
 func (s *Store) abortPlacement(ctx context.Context, placementID, reason string) (bool, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return false, err
 	}
 	defer tx.Rollback()
 	stamp := now()
-	res, err := tx.ExecContext(ctx, `UPDATE gang_placements SET state='aborted',abort_reason=?,updated_at=? WHERE id=? AND state='placed'`, reason, stamp, placementID)
+	res, err := tx.ExecContext(ctx, `UPDATE gang_placements SET state='aborted',abort_reason=$1,updated_at=$2 WHERE id=$3 AND state='placed'`, reason, stamp, placementID)
 	if err != nil {
 		return false, err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return false, tx.Commit()
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=? WHERE state IN('reserved','revocation_requested') AND id IN(
-		SELECT lease_id FROM gang_placement_leases WHERE placement_id=? AND delivered_at IS NULL)`, stamp, placementID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=$1 WHERE state IN('reserved','revocation_requested') AND id IN(
+		SELECT lease_id FROM gang_placement_leases WHERE placement_id=$2 AND delivered_at IS NULL)`, stamp, placementID); err != nil {
 		return false, err
 	}
 	var gangID, projectID string
-	if err = tx.QueryRowContext(ctx, `SELECT gp.gang_id,e.project_scope_id FROM gang_placements gp JOIN execution_gangs g ON g.id=gp.gang_id JOIN execution_requests e ON e.id=g.leader_execution_id WHERE gp.id=?`, placementID).Scan(&gangID, &projectID); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT gp.gang_id,e.project_scope_id FROM gang_placements gp JOIN execution_gangs g ON g.id=gp.gang_id JOIN execution_requests e ON e.id=g.leader_execution_id WHERE gp.id=$1`, placementID).Scan(&gangID, &projectID); err != nil {
 		return false, err
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "gang_placement_aborted", &projectID, "gang", gangID, nil, map[string]any{"placement_id": placementID, "reason": reason}); err != nil {
@@ -600,7 +600,7 @@ func (s *Store) gangRankStates(ctx context.Context, placementID string) ([]gangR
 		EXISTS(SELECT 1 FROM gang_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM force_stops t WHERE t.attempt_id=a.id)
 		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id JOIN execution_requests e ON e.id=gpl.execution_id
 		LEFT JOIN attempts a ON a.id=l.attempt_id
-		WHERE gpl.placement_id=? ORDER BY gpl.rank`, placementID)
+		WHERE gpl.placement_id=$1 ORDER BY gpl.rank`, placementID)
 	if err != nil {
 		return nil, err
 	}
@@ -617,12 +617,12 @@ func (s *Store) gangRankStates(ctx context.Context, placementID string) ([]gangR
 }
 
 func (s *Store) requestGangTermination(ctx context.Context, r gangRankState, gangID, reason string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `INSERT INTO gang_terminations(attempt_id,execution_id,executor_id,gang_id,reason,state,requested_at) VALUES(?,?,?,?,?,'pending',?) ON CONFLICT(attempt_id) DO NOTHING`, r.attemptID.String, r.executionID, r.executorID, gangID, reason, now())
+	res, err := tx.ExecContext(ctx, `INSERT INTO gang_terminations(attempt_id,execution_id,executor_id,gang_id,reason,state,requested_at) VALUES($1,$2,$3,$4,$5,'pending',$6) ON CONFLICT(attempt_id) DO NOTHING`, r.attemptID.String, r.executionID, r.executorID, gangID, reason, now())
 	if err != nil {
 		return err
 	}
@@ -663,7 +663,7 @@ func gangAggregateTx(ctx context.Context, tx *sql.Tx, current *currentTaskExecut
 		(SELECT l.state FROM leases l WHERE l.execution_id=e.id ORDER BY l.created_at DESC LIMIT 1),
 		EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id AND t.state='terminated')
 		FROM gang_members m JOIN execution_requests e ON e.id=m.execution_id LEFT JOIN attempts a ON a.execution_id=e.id
-		WHERE m.gang_id=? ORDER BY m.rank`, gangID)
+		WHERE m.gang_id=$1 ORDER BY m.rank`, gangID)
 	if err != nil {
 		return out, err
 	}

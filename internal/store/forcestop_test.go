@@ -2,10 +2,8 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 )
@@ -201,7 +199,7 @@ func TestForcePauseDoesNotWaitForACheckpoint(t *testing.T) {
 	}
 	reconcilePauses(t, store)
 	var commandID string
-	if err := store.db.QueryRow(`SELECT id FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&commandID); err != nil {
+	if err := store.db.QueryRow(`SELECT id FROM commands WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&commandID); err != nil {
 		t.Fatal(err)
 	}
 	epoch := launch.Lease.CoordinationEpoch
@@ -385,36 +383,6 @@ func TestForcePauseStopsEveryGangRank(t *testing.T) {
 	task := gangTaskState(t, store)
 	if task.State != "stopped" || len(task.Executions) != 1 {
 		t.Fatalf("gang task: %+v", task)
-	}
-}
-
-func TestOpenWidensTaskStatesOfAnOlderDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.db")
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = widenCheck(db, "orchestration_tasks", "state IN('pending','running','succeeded','failed','blocked','stopped','cancelled')", "state IN('pending','running','succeeded','failed','blocked')"); err != nil {
-		t.Fatal(err)
-	}
-	db.Close()
-	st, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	var ddl string
-	if err = st.db.QueryRow(`SELECT sql FROM sqlite_master WHERE name='orchestration_tasks'`).Scan(&ddl); err != nil || !contains(ddl, "'stopped'") {
-		t.Fatalf("not widened: %s %v", ddl, err)
-	}
-	var tables int
-	if err = st.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN('force_stops','force_stop_operations')`).Scan(&tables); err != nil || tables != 2 {
-		t.Fatalf("force stop tables: %d %v", tables, err)
 	}
 }
 

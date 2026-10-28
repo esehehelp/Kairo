@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -225,7 +224,7 @@ func TestPreemptionReachesAVictimOnAnotherNodeOfASharedGPU(t *testing.T) {
 		t.Fatalf("preemption commands=%v err=%v", commands, err)
 	}
 	var attemptID, origin string
-	if err = store.db.QueryRow(`SELECT attempt_id,origin FROM commands WHERE id=?`, commands[0]).Scan(&attemptID, &origin); err != nil {
+	if err = store.db.QueryRow(`SELECT attempt_id,origin FROM commands WHERE id=$1`, commands[0]).Scan(&attemptID, &origin); err != nil {
 		t.Fatal(err)
 	}
 	if attemptID != victim.Attempt.ID || origin != "priority_preemption" {
@@ -262,43 +261,5 @@ func TestMachineApplyKeepsALeasedSharedGPUOnItsNode(t *testing.T) {
 	machines, _ := store.ListMachines(ctx)
 	if len(machines.GPUs) != 1 || machines.GPUs[0].NodeID != "b" || machines.GPUs[0].State != "observed" {
 		t.Fatalf("machines: %+v", machines)
-	}
-}
-
-func TestOpenWidensTheMachineDeclarationKey(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "kairo.db")
-	store, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	setupSchedulerInventory(t, store)
-	// a table from before shared GPUs: uuid alone is the key
-	for _, statement := range []string{
-		`DROP TABLE machine_gpus`,
-		`CREATE TABLE machine_gpus(uuid TEXT PRIMARY KEY, node_id TEXT NOT NULL REFERENCES nodes(id), declared_at TEXT NOT NULL)`,
-		`INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES('GPU-0','node','2026-01-01T00:00:00Z')`,
-	} {
-		if _, err = store.db.Exec(statement); err != nil {
-			t.Fatal(err)
-		}
-	}
-	store.Close()
-	if store, err = Open(path); err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	var ddl string
-	if err = store.db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='machine_gpus'`).Scan(&ddl); err != nil || !strings.Contains(ddl, "PRIMARY KEY(uuid,node_id)") {
-		t.Fatalf("key not widened: %q %v", ddl, err)
-	}
-	machines, err := store.ListMachines(context.Background())
-	if err != nil || len(machines.GPUs) != 1 || machines.GPUs[0].UUID != "GPU-0" || machines.GPUs[0].NodeID != "node" {
-		t.Fatalf("declaration kept: %+v %v", machines, err)
-	}
-	if err = store.UpsertNode(context.Background(), Node{ID: "other", Name: "other", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = store.ApplyMachines(context.Background(), machine.Spec{Nodes: []machine.Node{{ID: "node", GPUs: []string{"GPU-0"}}, {ID: "other", GPUs: []string{"GPU-0"}}}}, false); err != nil {
-		t.Fatalf("shared declaration after the widening: %v", err)
 	}
 }

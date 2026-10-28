@@ -34,7 +34,7 @@ func TestPruneObservationsKeepsEachResourcesLatest(t *testing.T) {
 
 	count := func(resource string) int {
 		var n int
-		if err := store.db.QueryRow(`SELECT COUNT(*) FROM resource_observations WHERE resource_id=?`, resource).Scan(&n); err != nil {
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM resource_observations WHERE resource_id=$1`, resource).Scan(&n); err != nil {
 			t.Fatal(err)
 		}
 		return n
@@ -73,30 +73,20 @@ func TestPruneObservationsKeepsEachResourcesLatest(t *testing.T) {
 	}
 }
 
-func TestCompactShrinksTheFileAndKeepsTheLatest(t *testing.T) {
+func TestCompactPrunesInBatchesAndKeepsTheLatest(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)
 	ctx := context.Background()
 	old := time.Now().UTC().Add(-3 * time.Hour)
-	for i := 0; i < 20000; i++ {
-		at := old.Add(time.Duration(i) * time.Millisecond)
-		if err := store.RecordObservation(ctx, Observation{ResourceID: "gpu-0", ObservedAt: at.Format(time.RFC3339Nano), ValidUntil: at.Add(15 * time.Second).Format(time.RFC3339Nano), Evidence: []byte(`{"padding":"` + strings.Repeat("x", 200) + `"}`)}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	pages := func() int {
-		var n int
-		if err := store.db.QueryRow(`PRAGMA page_count`).Scan(&n); err != nil {
-			t.Fatal(err)
-		}
-		return n
-	}
-	before := pages()
-	if _, err := store.Compact(ctx); err != nil {
+	// More old rows than one prune batch, in observation order.
+	if _, err := store.testExec(`INSERT INTO resource_observations(resource_id,observed_at,valid_until,evidence_json)
+		SELECT 'gpu-0',to_char(($1::timestamptz+i*interval '1 millisecond') AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.MS"Z"'),$1,$2
+		FROM generate_series(0,2*$3::int) i ORDER BY i`, old.Format(time.RFC3339Nano), `{"padding":"`+strings.Repeat("x", 200)+`"}`, pruneBatch); err != nil {
 		t.Fatal(err)
 	}
-	if after := pages(); after*2 > before {
-		t.Fatalf("pages %d -> %d: not compacted", before, after)
+	removed, err := store.Compact(ctx)
+	if err != nil || removed != 2*pruneBatch {
+		t.Fatalf("compact removed %d: %v", removed, err)
 	}
 	var n int
 	// The fresh row from setupSchedulerInventory and the latest (highest id) old one.

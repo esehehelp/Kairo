@@ -2,12 +2,8 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
-	"path/filepath"
 	"testing"
-
-	_ "modernc.org/sqlite"
 )
 
 // quarantineProject declares one task; checkpointable decides how a node
@@ -193,7 +189,7 @@ func TestQuarantineSuspendsCheckpointableAndContinues(t *testing.T) {
 		t.Fatalf("checkpointable attempt must not be terminated: %+v", terms)
 	}
 	var commandID, origin string
-	if err := store.db.QueryRowContext(ctx, `SELECT id,origin FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&commandID, &origin); err != nil || origin != "node_quarantine" {
+	if err := store.db.QueryRowContext(ctx, `SELECT id,origin FROM commands WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&commandID, &origin); err != nil || origin != "node_quarantine" {
 		t.Fatalf("suspend: %s %s %v", commandID, origin, err)
 	}
 	epoch := launch.Lease.CoordinationEpoch
@@ -212,50 +208,6 @@ func TestQuarantineSuspendsCheckpointableAndContinues(t *testing.T) {
 	project, _ := store.GetProjectStatus(ctx, "orchestrated")
 	if ex := project.Tasks[0].Executions; len(ex) != 2 || ex[1].Reason != "continuation" {
 		t.Fatalf("no continuation: %+v", project.Tasks[0])
-	}
-}
-
-func TestOpenWidensChecksOfAnOlderDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.db")
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	st.Close()
-	// rewind the two CHECKs to their pre-quarantine form
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, w := range []struct{ table, from, to string }{
-		{"commands", "origin IN('scope_pause','priority_preemption','node_quarantine')", "origin IN('scope_pause','priority_preemption')"},
-		{"orchestration_decisions", "reason IN('initial','continuation','quarantine_restart','gang_restart','rerun')", "reason IN('initial','continuation')"},
-	} {
-		if err = widenCheck(db, w.table, w.from, w.to); err != nil { // same procedure, narrowing
-			t.Fatal(err)
-		}
-	}
-	db.Close()
-	st, err = Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	for _, table := range []string{"commands", "orchestration_decisions"} {
-		var ddl string
-		if err = st.db.QueryRow(`SELECT sql FROM sqlite_master WHERE name=?`, table).Scan(&ddl); err != nil {
-			t.Fatal(err)
-		}
-		if want := map[string]string{"commands": "node_quarantine", "orchestration_decisions": "quarantine_restart"}[table]; !contains(ddl, want) {
-			t.Fatalf("%s not widened: %s", table, ddl)
-		}
-		if table == "orchestration_decisions" && !contains(ddl, "gang_restart") {
-			t.Fatalf("%s not widened for gangs: %s", table, ddl)
-		}
-	}
-	var indexes int
-	if err = st.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN('one_live_suspend_per_attempt','commands_attempt_idx','orchestration_decisions_state_idx')`).Scan(&indexes); err != nil || indexes != 3 {
-		t.Fatalf("indexes lost: %d %v", indexes, err)
 	}
 }
 

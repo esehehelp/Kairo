@@ -102,7 +102,7 @@ func TestSchedulerOneShotExecutionLifecycle(t *testing.T) {
 	}
 	var role, namespace string
 	var rank int
-	if err = store.db.QueryRow(`SELECT role,namespace,rank FROM attempt_processes WHERE attempt_id=?`, launch.Attempt.ID).Scan(&role, &namespace, &rank); err != nil {
+	if err = store.db.QueryRow(`SELECT role,namespace,rank FROM attempt_processes WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&role, &namespace, &rank); err != nil {
 		t.Fatal(err)
 	}
 	if role != "launcher" || namespace != "host" || rank != -1 {
@@ -179,7 +179,7 @@ func TestSchedulerGateFencesActivationWithoutConsumingAuthorization(t *testing.T
 		t.Fatalf("closed gate did not fence activation: %v", err)
 	}
 	var authorizationState string
-	if err = store.db.QueryRow(`SELECT state FROM launch_authorizations WHERE id=?`, launch.AuthorizationID).Scan(&authorizationState); err != nil {
+	if err = store.db.QueryRow(`SELECT state FROM launch_authorizations WHERE id=$1`, launch.AuthorizationID).Scan(&authorizationState); err != nil {
 		t.Fatal(err)
 	}
 	if authorizationState != "issued" {
@@ -291,7 +291,7 @@ func TestSchedulerNeverSelectsOneResourceTwiceWithinGang(t *testing.T) {
 		t.Fatalf("gang reused a physical resource: %+v", reservation.Resources)
 	}
 	var itemCount int
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM lease_items WHERE lease_id=? AND kind='gpu'`, reservation.Lease.ID).Scan(&itemCount); err != nil || itemCount != 2 {
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM lease_items WHERE lease_id=$1 AND kind='gpu'`, reservation.Lease.ID).Scan(&itemCount); err != nil || itemCount != 2 {
 		t.Fatalf("gpu lease items=%d err=%v", itemCount, err)
 	}
 }

@@ -62,7 +62,7 @@ func TestSuspendCheckpointExitAndQuiescenceAreDistinctFacts(t *testing.T) {
 	}
 	for _, eventType := range []string{"suspend_requested", "checkpoint_published"} {
 		var payloadJSON string
-		if err = store.db.QueryRow(`SELECT payload_json FROM coordination_events WHERE event_type=? AND aggregate_id=?`, eventType, map[string]string{"suspend_requested": commandID, "checkpoint_published": launch.Attempt.ID}[eventType]).Scan(&payloadJSON); err != nil {
+		if err = store.db.QueryRow(`SELECT payload_json FROM coordination_events WHERE event_type=$1 AND aggregate_id=$2`, eventType, map[string]string{"suspend_requested": commandID, "checkpoint_published": launch.Attempt.ID}[eventType]).Scan(&payloadJSON); err != nil {
 			t.Fatal(err)
 		}
 		var payload map[string]any
@@ -82,7 +82,7 @@ func TestSuspendCheckpointExitAndQuiescenceAreDistinctFacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	var attemptState, leaseState, continuation string
-	if err = store.db.QueryRow(`SELECT a.state,l.state,a.continuation_ref FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=?`, launch.Attempt.ID).Scan(&attemptState, &leaseState, &continuation); err != nil {
+	if err = store.db.QueryRow(`SELECT a.state,l.state,a.continuation_ref FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=$1`, launch.Attempt.ID).Scan(&attemptState, &leaseState, &continuation); err != nil {
 		t.Fatal(err)
 	}
 	if attemptState != "quiescing" || leaseState != "releasing" || continuation != "checkpoint://first" {
@@ -109,7 +109,7 @@ func TestSuspendCheckpointExitAndQuiescenceAreDistinctFacts(t *testing.T) {
 	if err = store.FinalizeQuiescence(ctx, launch.Attempt.ID, launch.Lease.ID, epoch); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.db.QueryRow(`SELECT a.state,l.state FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=?`, launch.Attempt.ID).Scan(&attemptState, &leaseState); err != nil {
+	if err = store.db.QueryRow(`SELECT a.state,l.state FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=$1`, launch.Attempt.ID).Scan(&attemptState, &leaseState); err != nil {
 		t.Fatal(err)
 	}
 	if attemptState != "quiesced" || leaseState != "released" {
@@ -201,7 +201,7 @@ func TestDelayedCheckpointAckCannotRegressExitedAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	var attemptState, leaseState, continuation string
-	if err = store.db.QueryRow(`SELECT a.state,l.state,a.continuation_ref FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=?`, launch.Attempt.ID).Scan(&attemptState, &leaseState, &continuation); err != nil {
+	if err = store.db.QueryRow(`SELECT a.state,l.state,a.continuation_ref FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=$1`, launch.Attempt.ID).Scan(&attemptState, &leaseState, &continuation); err != nil {
 		t.Fatal(err)
 	}
 	if attemptState != "exited" || leaseState != "releasing" || continuation != "checkpoint://late" {
@@ -231,7 +231,7 @@ func TestDelayedRejectedAckCannotReactivateExitedLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	var attemptState, leaseState string
-	if err = store.db.QueryRow(`SELECT a.state,l.state FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=?`, launch.Attempt.ID).Scan(&attemptState, &leaseState); err != nil {
+	if err = store.db.QueryRow(`SELECT a.state,l.state FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=$1`, launch.Attempt.ID).Scan(&attemptState, &leaseState); err != nil {
 		t.Fatal(err)
 	}
 	if attemptState != "exited" || leaseState != "releasing" {

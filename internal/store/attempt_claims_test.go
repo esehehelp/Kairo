@@ -56,7 +56,7 @@ func TestTheLeaseHoldersProcessTreeIsNotAClaim(t *testing.T) {
 		t.Fatalf("claims: %+v", got)
 	}
 	// a quiescing attempt still owns its tree
-	if _, err := store.db.Exec(`UPDATE attempts SET state='quiescing' WHERE id=?`, launch.Attempt.ID); err != nil {
+	if _, err := store.testExec(`UPDATE attempts SET state='quiescing' WHERE id=$1`, launch.Attempt.ID); err != nil {
 		t.Fatal(err)
 	}
 	processPoll(t, store, "gpu-provider", "node", "gpu-0", "GPU-0", processClaim("gpu-0", "maya:101", "", "launcher:100"))
@@ -72,7 +72,7 @@ func TestAProcessOfAnotherAttemptStaysAClaim(t *testing.T) {
 	if err := store.UpsertResourceInstance(ctx, ResourceInstance{ID: "gpu-1", NodeID: "node", ProviderID: "gpu-provider", Kind: "gpu", StableIdentity: "GPU-1", Binding: json.RawMessage(`{"index":1}`), AdminState: "enabled"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES('GPU-1','node',?)`, now()); err != nil {
+	if _, err := store.testExec(`INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES('GPU-1','node',$1)`, now()); err != nil {
 		t.Fatal(err)
 	}
 	processPoll(t, store, "gpu-provider", "node", "gpu-1", "GPU-1")
@@ -139,7 +139,7 @@ func TestADescendantOutlivingItsAttemptKeepsTheLease(t *testing.T) {
 		t.Fatal("lease released while a descendant of its attempt still uses the GPU")
 	}
 	var leaseState string
-	if err := store.db.QueryRow(`SELECT state FROM leases WHERE id=?`, launch.Lease.ID).Scan(&leaseState); err != nil || leaseState != "releasing" {
+	if err := store.db.QueryRow(`SELECT state FROM leases WHERE id=$1`, launch.Lease.ID).Scan(&leaseState); err != nil || leaseState != "releasing" {
 		t.Fatalf("lease state %q, %v", leaseState, err)
 	}
 	processPoll(t, store, "gpu-provider", "node", "gpu-0", "GPU-0")

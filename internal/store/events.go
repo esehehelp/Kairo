@@ -11,7 +11,7 @@ func appendCoordinationEventTx(ctx context.Context, tx *sql.Tx, eventType string
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO coordination_events(event_type,project_scope_id,aggregate_type,aggregate_id,coordination_epoch,payload_json,created_at) VALUES(?,?,?,?,?,?,?)`, eventType, projectScopeID, aggregateType, aggregateID, epoch, string(body), now())
+	_, err = tx.ExecContext(ctx, `INSERT INTO coordination_events(event_type,project_scope_id,aggregate_type,aggregate_id,coordination_epoch,payload_json,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, eventType, projectScopeID, aggregateType, aggregateID, epoch, string(body), now())
 	return err
 }
 
@@ -23,7 +23,7 @@ func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]Coordinat
 	if limit > 1000 {
 		limit = 1000
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT sequence,event_type,project_scope_id,aggregate_type,aggregate_id,coordination_epoch,payload_json,created_at FROM coordination_events WHERE sequence>? AND (?='' OR project_scope_id=?) ORDER BY sequence LIMIT ?`, filter.AfterSequence, filter.ProjectScopeID, filter.ProjectScopeID, limit)
+	rows, err := s.db.QueryContext(ctx, `SELECT sequence,event_type,project_scope_id,aggregate_type,aggregate_id,coordination_epoch,payload_json,created_at FROM coordination_events WHERE sequence>$1 AND ($2='' OR project_scope_id=$3) ORDER BY sequence LIMIT $4`, filter.AfterSequence, filter.ProjectScopeID, filter.ProjectScopeID, limit)
 	if err != nil {
 		return nil, err
 	}

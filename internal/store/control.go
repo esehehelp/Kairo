@@ -95,7 +95,7 @@ func (s *Store) reconcilePauseOperation(ctx context.Context, operation PauseOper
 	// lease release, which only proves the registered processes gone).
 	if operation.Force != nil && state == "quiesced" {
 		var confirming int
-		if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM force_stops WHERE operation_id=? AND state='signalled'`, operation.ID).Scan(&confirming); err != nil {
+		if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM force_stops WHERE operation_id=$1 AND state='signalled'`, operation.ID).Scan(&confirming); err != nil {
 			return err
 		}
 		if confirming > 0 {
@@ -278,19 +278,19 @@ func (s *Store) forceStopTarget(ctx context.Context, operation PauseOperation, t
 
 func (s *Store) loadPauseTargetFacts(ctx context.Context, target PauseTarget) (pauseTargetFacts, error) {
 	var facts pauseTargetFacts
-	var checkpointable int
-	err := s.db.QueryRowContext(ctx, `SELECT checkpointable FROM execution_requests WHERE id=?`, target.ExecutionID).Scan(&checkpointable)
+	var checkpointable bool
+	err := s.db.QueryRowContext(ctx, `SELECT checkpointable FROM execution_requests WHERE id=$1`, target.ExecutionID).Scan(&checkpointable)
 	if errors.Is(err, sql.ErrNoRows) {
 		return facts, ErrNotFound
 	}
 	if err != nil {
 		return facts, err
 	}
-	facts.checkpointable = checkpointable != 0
+	facts.checkpointable = checkpointable
 	var leaseAttempt sql.NullString
 	if target.LeaseID != nil {
 		var leaseID, leaseState string
-		err = s.db.QueryRowContext(ctx, `SELECT id,state,attempt_id FROM leases WHERE id=? AND execution_id=?`, *target.LeaseID, target.ExecutionID).Scan(&leaseID, &leaseState, &leaseAttempt)
+		err = s.db.QueryRowContext(ctx, `SELECT id,state,attempt_id FROM leases WHERE id=$1 AND execution_id=$2`, *target.LeaseID, target.ExecutionID).Scan(&leaseID, &leaseState, &leaseAttempt)
 		if errors.Is(err, sql.ErrNoRows) {
 			return facts, ErrNotFound
 		}
@@ -309,7 +309,7 @@ func (s *Store) loadPauseTargetFacts(ctx context.Context, target PauseTarget) (p
 		err = s.db.QueryRowContext(ctx, `SELECT a.state,la.state,
 			COALESCE((SELECT COUNT(*) FROM attempt_processes ap WHERE ap.attempt_id=a.id AND ap.exited_at IS NULL),0)
 			FROM attempts a LEFT JOIN launch_authorizations la ON la.attempt_id=a.id
-			WHERE a.id=? AND a.execution_id=?`, *attemptID, target.ExecutionID).Scan(&attemptState, &authorization, &facts.liveProcesses)
+			WHERE a.id=$1 AND a.execution_id=$2`, *attemptID, target.ExecutionID).Scan(&attemptState, &authorization, &facts.liveProcesses)
 		if errors.Is(err, sql.ErrNoRows) {
 			return facts, ErrNotFound
 		}
@@ -330,7 +330,7 @@ func (s *Store) revokeUnlaunchedPauseTarget(ctx context.Context, operation Pause
 	if target.LeaseID == nil {
 		return false, nil
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return false, err
 	}
@@ -341,7 +341,7 @@ func (s *Store) revokeUnlaunchedPauseTarget(ctx context.Context, operation Pause
 		FROM leases l
 		LEFT JOIN attempts a ON a.id=l.attempt_id
 		LEFT JOIN launch_authorizations la ON la.attempt_id=a.id
-		WHERE l.id=? AND l.execution_id=? AND l.state!='released'`, *target.LeaseID, target.ExecutionID).Scan(&leaseID, &leaseState, &attemptID, &attemptState, &authorization)
+		WHERE l.id=$1 AND l.execution_id=$2 AND l.state!='released'`, *target.LeaseID, target.ExecutionID).Scan(&leaseID, &leaseState, &attemptID, &attemptState, &authorization)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -356,7 +356,7 @@ func (s *Store) revokeUnlaunchedPauseTarget(ctx context.Context, operation Pause
 	}
 	if attemptID.Valid {
 		var live int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes WHERE attempt_id=? AND exited_at IS NULL`, attemptID.String).Scan(&live); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes WHERE attempt_id=$1 AND exited_at IS NULL`, attemptID.String).Scan(&live); err != nil {
 			return false, err
 		}
 		if live != 0 || (attemptState.Valid && attemptState.String != "authorized") {
@@ -364,22 +364,22 @@ func (s *Store) revokeUnlaunchedPauseTarget(ctx context.Context, operation Pause
 		}
 	}
 	t := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='revocation_requested',revocation_requested_at=COALESCE(revocation_requested_at,?) WHERE id=? AND state IN('reserved','prepared','revocation_requested')`, t, leaseID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='revocation_requested',revocation_requested_at=COALESCE(revocation_requested_at,$1) WHERE id=$2 AND state IN('reserved','prepared','revocation_requested')`, t, leaseID); err != nil {
 		return false, err
 	}
 	if attemptID.Valid {
-		if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=COALESCE(revoked_at,?) WHERE attempt_id=? AND state='issued'`, t, attemptID.String); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=COALESCE(revoked_at,$1) WHERE attempt_id=$2 AND state='issued'`, t, attemptID.String); err != nil {
 			return false, err
 		}
 	}
 	var projectID string
-	if err = tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=?`, target.ExecutionID).Scan(&projectID); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=$1`, target.ExecutionID).Scan(&projectID); err != nil {
 		return false, err
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "coordination_revocation_requested", &projectID, "execution", target.ExecutionID, nil, map[string]any{"pause_operation_id": operation.ID, "lease_id": leaseID, "attempt_id": nullStringPointer(attemptID)}); err != nil {
 		return false, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET attempt_id=COALESCE(?,attempt_id),lease_id=?,state='revoking',blocker_reason=NULL,updated_at=? WHERE operation_id=? AND execution_id=?`, nullableNullString(attemptID), leaseID, t, operation.ID, target.ExecutionID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET attempt_id=COALESCE($1,attempt_id),lease_id=$2,state='revoking',blocker_reason=NULL,updated_at=$3 WHERE operation_id=$4 AND execution_id=$5`, nullableNullString(attemptID), leaseID, t, operation.ID, target.ExecutionID); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()

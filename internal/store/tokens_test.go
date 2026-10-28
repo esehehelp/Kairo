@@ -24,7 +24,7 @@ func TestAPITokenLifecycle(t *testing.T) {
 		t.Fatalf("authenticate: %+v %v", got, err)
 	}
 	var stored string
-	if err = store.db.QueryRow(`SELECT token_hash FROM api_tokens WHERE id=?`, admin.ID).Scan(&stored); err != nil {
+	if err = store.db.QueryRow(`SELECT token_hash FROM api_tokens WHERE id=$1`, admin.ID).Scan(&stored); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(stored, plain) || stored != hashToken(plain) {

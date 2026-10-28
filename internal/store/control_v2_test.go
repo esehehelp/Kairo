@@ -7,21 +7,17 @@ import (
 
 func insertPauseTestRunning(t *testing.T, store *Store, execution ExecutionRequest, checkpointable bool) {
 	t.Helper()
-	checkpoint := 0
-	if checkpointable {
-		checkpoint = 1
-	}
 	statements := []struct {
 		query string
 		args  []any
 	}{
-		{`UPDATE execution_requests SET state='started',checkpointable=?,authorized_at='now',started_at='now' WHERE id=?`, []any{checkpoint, execution.ID}},
-		{`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at,started_at) VALUES('att-running',?,'running','executor',1,'now','now')`, []any{execution.ID}},
-		{`INSERT INTO leases(id,execution_id,attempt_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-active',?,'att-running','executor',1,'active','now')`, []any{execution.ID}},
+		{`UPDATE execution_requests SET state='started',checkpointable=$1,authorized_at='now',started_at='now' WHERE id=$2`, []any{checkpointable, execution.ID}},
+		{`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at,started_at) VALUES('att-running',$1,'running','executor',1,'now','now')`, []any{execution.ID}},
+		{`INSERT INTO leases(id,execution_id,attempt_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-active',$1,'att-running','executor',1,'active','now')`, []any{execution.ID}},
 		{`INSERT INTO attempt_processes(attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at) VALUES('att-running','launcher','host',-1,42,'host:42','now','now')`, nil},
 	}
 	for _, statement := range statements {
-		if _, err := store.db.Exec(statement.query, statement.args...); err != nil {
+		if _, err := store.testExec(statement.query, statement.args...); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -109,7 +105,7 @@ func TestPauseReconcilerEnqueuesSuspendAndResumeDoesNotRecallIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	var commandState string
-	if err = store.db.QueryRow(`SELECT state FROM commands WHERE id=?`, commandID).Scan(&commandState); err != nil || commandState != "pending" {
+	if err = store.db.QueryRow(`SELECT state FROM commands WHERE id=$1`, commandID).Scan(&commandState); err != nil || commandState != "pending" {
 		t.Fatalf("resume recalled command: state=%q err=%v", commandState, err)
 	}
 }
@@ -128,7 +124,7 @@ func TestResumedPauseDoesNotCaptureNewExecution(t *testing.T) {
 	if _, _, err := store.SubmitExecution(ctx, testExecutionSpec("after-resume")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at)
+	if _, err := store.testExec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at)
 		SELECT 'lease-after-resume',id,'executor',1,'reserved','now' FROM execution_requests WHERE client_request_id='after-resume'`); err != nil {
 		t.Fatal(err)
 	}
@@ -141,7 +137,7 @@ func TestResumedPauseDoesNotCaptureNewExecution(t *testing.T) {
 	}
 	for _, target := range targets {
 		var requestID string
-		if err := store.db.QueryRow(`SELECT client_request_id FROM execution_requests WHERE id=?`, target.ExecutionID).Scan(&requestID); err != nil {
+		if err := store.db.QueryRow(`SELECT client_request_id FROM execution_requests WHERE id=$1`, target.ExecutionID).Scan(&requestID); err != nil {
 			t.Fatal(err)
 		}
 		if requestID == "after-resume" {
@@ -157,18 +153,18 @@ func TestPauseTargetNeverSwitchesToPostResumeLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-before',?,'executor',1,'reserved','now')`, execution.ID); err != nil {
+	if _, err = store.testExec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-before',$1,'executor',1,'reserved','now')`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
 	operation := pauseProjectForTest(t, store, "pause-generation")
-	if _, err = store.db.Exec(`UPDATE leases SET state='released',released_at='now' WHERE id='lease-before'`); err != nil {
+	if _, err = store.testExec(`UPDATE leases SET state='released',released_at='now' WHERE id='lease-before'`); err != nil {
 		t.Fatal(err)
 	}
 	scopes, _ := store.GetScopeByPath(ctx, ScopePath{Project: "llm-develop"})
 	if _, err = store.ResumeScope(ctx, scopes.Project.ID, "operator"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-after',?,'executor',2,'reserved','later')`, execution.ID); err != nil {
+	if _, err = store.testExec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-after',$1,'executor',2,'reserved','later')`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err = store.ReconcilePauseOperations(ctx, true); err != nil {
@@ -191,7 +187,7 @@ func TestPauseReconcilerObserveOnlyDoesNotRevokeReservation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-reserved',?,'executor',1,'reserved','now')`, execution.ID); err != nil {
+	if _, err = store.testExec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-reserved',$1,'executor',1,'reserved','now')`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
 	operation := pauseProjectForTest(t, store, "pause-reserved")
@@ -215,7 +211,7 @@ func TestPauseReconcilerRequestsRevocationUntilExecutorCleansUp(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-reserved',?,'executor',1,'prepared','now')`, execution.ID); err != nil {
+	if _, err = store.testExec(`INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-reserved',$1,'executor',1,'prepared','now')`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
 	operation := pauseProjectForTest(t, store, "pause-reserved")
@@ -233,7 +229,7 @@ func TestPauseReconcilerRequestsRevocationUntilExecutorCleansUp(t *testing.T) {
 	if err = store.ReleaseReservation(ctx, "lease-reserved", 1, "scope pause"); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.db.QueryRow(`SELECT state FROM execution_requests WHERE id=?`, execution.ID).Scan(&executionState); err != nil || executionState != "waiting" {
+	if err = store.db.QueryRow(`SELECT state FROM execution_requests WHERE id=$1`, execution.ID).Scan(&executionState); err != nil || executionState != "waiting" {
 		t.Fatalf("pre-authorization pause consumed project request: state=%s err=%v", executionState, err)
 	}
 	if err = store.ReconcilePauseOperations(ctx, true); err != nil {
@@ -274,7 +270,7 @@ func TestPauseReconcilerRequiresAttemptQuiescedAndLeaseReleased(t *testing.T) {
 		t.Fatal(err)
 	}
 	insertPauseTestRunning(t, store, execution, true)
-	if _, err = store.db.Exec(`UPDATE leases SET state='released',released_at='now' WHERE id='lease-active'`); err != nil {
+	if _, err = store.testExec(`UPDATE leases SET state='released',released_at='now' WHERE id='lease-active'`); err != nil {
 		t.Fatal(err)
 	}
 	operation := pauseProjectForTest(t, store, "pause-inconsistent-release")
@@ -295,7 +291,7 @@ func TestPauseReconcilerDoesNotReleaseUnknownCoordination(t *testing.T) {
 		t.Fatal(err)
 	}
 	insertPauseTestRunning(t, store, execution, true)
-	if _, err = store.db.Exec(`UPDATE attempts SET state='lost' WHERE id='att-running'; UPDATE leases SET state='stale',stale_at='now' WHERE id='lease-active'`); err != nil {
+	if _, err = store.testExec(`UPDATE attempts SET state='lost' WHERE id='att-running'; UPDATE leases SET state='stale',stale_at='now' WHERE id='lease-active'`); err != nil {
 		t.Fatal(err)
 	}
 	operation := pauseProjectForTest(t, store, "pause-lost")

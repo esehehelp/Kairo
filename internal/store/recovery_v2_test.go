@@ -23,7 +23,7 @@ func TestExecutorRestartMakesOrphanReservationStale(t *testing.T) {
 	}
 	var state string
 	var epoch int64
-	if err = store.db.QueryRow(`SELECT state,coordination_epoch FROM leases WHERE id=?`, reservation.Lease.ID).Scan(&state, &epoch); err != nil {
+	if err = store.db.QueryRow(`SELECT state,coordination_epoch FROM leases WHERE id=$1`, reservation.Lease.ID).Scan(&state, &epoch); err != nil {
 		t.Fatal(err)
 	}
 	if state != "stale" || epoch != reservation.Lease.CoordinationEpoch+1 {

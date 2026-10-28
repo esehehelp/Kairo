@@ -256,7 +256,7 @@ func loadPlanModel(ctx context.Context, tx *sql.Tx, policy SchedulingPolicy, cal
 
 func (m *planModel) loadExecutors(ctx context.Context, tx *sql.Tx, callerID string) error {
 	rows, err := tx.QueryContext(ctx, `SELECT x.id,x.node_id,x.attributes_json,n.attributes_json,x.last_seen_at FROM executors x JOIN nodes n ON n.id=x.node_id
-		WHERE x.enabled=1 AND n.enabled=1 AND NOT EXISTS(SELECT 1 FROM node_quarantines q WHERE q.node_id IN(x.node_id,'*'))
+		WHERE x.enabled AND n.enabled AND NOT EXISTS(SELECT 1 FROM node_quarantines q WHERE q.node_id IN(x.node_id,'*'))
 		ORDER BY x.id`)
 	if err != nil {
 		return err
@@ -360,10 +360,10 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT l.id,l.execution_id,COALESCE(l.attempt_id,''),l.executor_id,x.node_id,x.enabled,l.state,l.coordination_epoch,COALESCE(a.state,''),
 		e.priority,e.checkpointable,e.preemptible,e.state,e.project_scope_id,COALESCE(e.task_scope_id,e.queue_scope_id,e.project_scope_id),COALESCE(e.started_at,''),
 		EXISTS(SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id),
-		COALESCE((SELECT MIN(CASE WHEN COALESCE(json_extract(rr.policy_json,'$.on_unattributed_activity'),'wait')='allow' THEN 1 ELSE 0 END)
+		COALESCE((SELECT MIN(CASE WHEN COALESCE(rr.policy_json::jsonb->>'on_unattributed_activity','wait')='allow' THEN 1 ELSE 0 END)
 			FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='exclusive' AND rr.kind='gpu'),0),
 		u.ram_bytes,u.disk_written_bytes,u.observed_at,
-		COALESCE((SELECT rr.quantity-json_extract(rr.constraints_json,'$.min_quantity') FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='capacity' AND rr.kind='cpu' AND json_extract(rr.constraints_json,'$.min_quantity') IS NOT NULL),0)
+		COALESCE((SELECT rr.quantity-(rr.constraints_json::jsonb->>'min_quantity')::bigint FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='capacity' AND rr.kind='cpu' AND rr.constraints_json::jsonb->>'min_quantity' IS NOT NULL),0)
 		FROM leases l JOIN executors x ON x.id=l.executor_id JOIN execution_requests e ON e.id=l.execution_id
 		LEFT JOIN attempts a ON a.id=l.attempt_id LEFT JOIN attempt_usage u ON u.attempt_id=l.attempt_id
 		WHERE l.state IN `+liveLeaseStates+` ORDER BY l.id`)
@@ -1256,7 +1256,7 @@ func saveWaitsTx(ctx context.Context, tx *sql.Tx, waits map[string]planWait, com
 	stamp := now()
 	for executionID := range existing {
 		if _, still := waits[executionID]; complete && !still {
-			if _, err = tx.ExecContext(ctx, `DELETE FROM admission_waits WHERE execution_id=?`, executionID); err != nil {
+			if _, err = tx.ExecContext(ctx, `DELETE FROM admission_waits WHERE execution_id=$1`, executionID); err != nil {
 				return err
 			}
 		}
@@ -1272,11 +1272,11 @@ func saveWaitsTx(ctx context.Context, tx *sql.Tx, waits map[string]planWait, com
 		}
 		since := stamp
 		if old, ok := existing[executionID]; ok && old.reason == w.reason {
-			if err = tx.QueryRowContext(ctx, `SELECT since FROM admission_waits WHERE execution_id=?`, executionID).Scan(&since); err != nil {
+			if err = tx.QueryRowContext(ctx, `SELECT since FROM admission_waits WHERE execution_id=$1`, executionID).Scan(&since); err != nil {
 				return err
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO admission_waits(execution_id,reason_code,node_id,detail_json,since,updated_at) VALUES(?,?,?,?,?,?)
+		if _, err = tx.ExecContext(ctx, `INSERT INTO admission_waits(execution_id,reason_code,node_id,detail_json,since,updated_at) VALUES($1,$2,$3,$4,$5,$6)
 			ON CONFLICT(execution_id) DO UPDATE SET reason_code=excluded.reason_code,node_id=excluded.node_id,detail_json=excluded.detail_json,since=excluded.since,updated_at=excluded.updated_at`,
 			executionID, w.reason, node, string(detail), since, stamp); err != nil {
 			return err
@@ -1316,7 +1316,7 @@ func saveNodeAlertsTx(ctx context.Context, tx *sql.Tx, m *planModel) error {
 		if _, still := current[k]; still {
 			continue
 		}
-		if _, err = tx.ExecContext(ctx, `DELETE FROM node_alerts WHERE node_id=? AND kind='disk_low_watermark' AND subject=?`, k[0], k[1]); err != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM node_alerts WHERE node_id=$1 AND kind='disk_low_watermark' AND subject=$2`, k[0], k[1]); err != nil {
 			return err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "disk_watermark_cleared", nil, "node", k[0], nil, map[string]string{"filesystem": k[1]}); err != nil {
@@ -1328,7 +1328,7 @@ func saveNodeAlertsTx(ctx context.Context, tx *sql.Tx, m *planModel) error {
 			continue
 		}
 		detail, _ := json.Marshal(map[string]string{"message": message})
-		if _, err = tx.ExecContext(ctx, `INSERT INTO node_alerts(node_id,kind,subject,detail_json,since) VALUES(?,'disk_low_watermark',?,?,?)`, k[0], k[1], string(detail), stamp); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO node_alerts(node_id,kind,subject,detail_json,since) VALUES($1,'disk_low_watermark',$2,$3,$4)`, k[0], k[1], string(detail), stamp); err != nil {
 			return err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "disk_low_watermark", nil, "node", k[0], nil, map[string]string{"filesystem": k[1], "message": message}); err != nil {
@@ -1341,7 +1341,7 @@ func saveNodeAlertsTx(ctx context.Context, tx *sql.Tx, m *planModel) error {
 // RecordAttemptUsage stores what an attempt's process tree uses now. A nil
 // field is not known.
 func (s *Store) RecordAttemptUsage(ctx context.Context, attemptID string, ramBytes, diskWrittenBytes *int64) error {
-	result, err := s.db.ExecContext(ctx, `INSERT INTO attempt_usage(attempt_id,ram_bytes,disk_written_bytes,observed_at) SELECT id,?,?,? FROM attempts WHERE id=?
+	result, err := s.exec(ctx, `INSERT INTO attempt_usage(attempt_id,ram_bytes,disk_written_bytes,observed_at) SELECT id,$1,$2,$3 FROM attempts WHERE id=$4
 		ON CONFLICT(attempt_id) DO UPDATE SET ram_bytes=excluded.ram_bytes,disk_written_bytes=excluded.disk_written_bytes,observed_at=excluded.observed_at`,
 		ramBytes, diskWrittenBytes, now(), attemptID)
 	if err != nil {
@@ -1369,7 +1369,7 @@ func (s *Store) AdmissionWaits(ctx context.Context, executionIDs []string) (map[
 	for _, executionID := range executionIDs {
 		var w AdmissionWait
 		var detail string
-		err := s.db.QueryRowContext(ctx, `SELECT execution_id,reason_code,node_id,detail_json,since FROM admission_waits WHERE execution_id=?`, executionID).Scan(&w.ExecutionID, &w.Reason, &w.NodeID, &detail, &w.Since)
+		err := s.db.QueryRowContext(ctx, `SELECT execution_id,reason_code,node_id,detail_json,since FROM admission_waits WHERE execution_id=$1`, executionID).Scan(&w.ExecutionID, &w.Reason, &w.NodeID, &detail, &w.Since)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
 		}

@@ -46,7 +46,7 @@ type taskRow struct {
 
 func loadTaskTx(ctx context.Context, q queryer, project, name string) (taskRow, error) {
 	var t taskRow
-	err := q.QueryRowContext(ctx, `SELECT t.task_scope_id,t.project_scope_id,ts.parent_id,p.external_key,t.queue_name,t.name,t.state,t.spec_json,t.result_json FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id JOIN coordination_scopes ts ON ts.id=t.task_scope_id WHERE p.kind='project' AND p.external_key=? AND t.name=?`, project, name).Scan(&t.scopeID, &t.projectID, &t.queueScopeID, &t.project, &t.queue, &t.name, &t.state, &t.spec, &t.result)
+	err := q.QueryRowContext(ctx, `SELECT t.task_scope_id,t.project_scope_id,ts.parent_id,p.external_key,t.queue_name,t.name,t.state,t.spec_json,t.result_json FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id JOIN coordination_scopes ts ON ts.id=t.task_scope_id WHERE p.kind='project' AND p.external_key=$1 AND t.name=$2`, project, name).Scan(&t.scopeID, &t.projectID, &t.queueScopeID, &t.project, &t.queue, &t.name, &t.state, &t.spec, &t.result)
 	if errors.Is(err, sql.ErrNoRows) {
 		return taskRow{}, ErrNotFound
 	}
@@ -61,7 +61,7 @@ type liveExecution struct {
 // liveTaskExecutionsTx lists the executions of a task's scope that are not
 // terminal, every gang rank included.
 func liveTaskExecutionsTx(ctx context.Context, tx *sql.Tx, task taskRow) ([]liveExecution, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id,state,started_at IS NOT NULL FROM execution_requests WHERE task_scope_id=? AND state!='terminal' ORDER BY submitted_at,id`, task.scopeID)
+	rows, err := tx.QueryContext(ctx, `SELECT id,state,started_at IS NOT NULL FROM execution_requests WHERE task_scope_id=$1 AND state!='terminal' ORDER BY submitted_at,id`, task.scopeID)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +82,7 @@ func liveTaskExecutionsTx(ctx context.Context, tx *sql.Tx, task taskRow) ([]live
 // but not submitted is ever submitted (submitOrchestrationDecision checks it
 // in the transaction that would submit it).
 func abandonPlannedDecisionsTx(ctx context.Context, tx *sql.Tx, taskScopeID string) error {
-	_, err := tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='abandoned' WHERE task_scope_id=? AND state='planned'`, taskScopeID)
+	_, err := tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='abandoned' WHERE task_scope_id=$1 AND state='planned'`, taskScopeID)
 	return err
 }
 
@@ -93,7 +93,7 @@ func abandonPlannedDecisionsTx(ctx context.Context, tx *sql.Tx, taskScopeID stri
 // refuses while an execution of the task is started and not terminal. A dry
 // run reports what would be withdrawn and changes nothing.
 func (s *Store) CancelTask(ctx context.Context, project, name, actor string, dryRun bool) (CancelResult, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return CancelResult{}, err
 	}
@@ -161,7 +161,7 @@ func (s *Store) CancelTask(ctx context.Context, project, name, actor string, dry
 // still unsuccessful). A repeated request ID is answered with the first
 // answer and reruns nothing.
 func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID string) (RerunResult, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return RerunResult{}, err
 	}
@@ -172,7 +172,7 @@ func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID s
 	}
 	if requestID != "" {
 		var previous string
-		err = tx.QueryRowContext(ctx, `SELECT response_json FROM orchestration_task_reruns WHERE task_scope_id=? AND request_id=? AND response_json IS NOT NULL`, task.scopeID, requestID).Scan(&previous)
+		err = tx.QueryRowContext(ctx, `SELECT response_json FROM orchestration_task_reruns WHERE task_scope_id=$1 AND request_id=$2 AND response_json IS NOT NULL`, task.scopeID, requestID).Scan(&previous)
 		if err == nil {
 			var out RerunResult
 			return out, json.Unmarshal([]byte(previous), &out)
@@ -201,12 +201,12 @@ func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID s
 	}
 	out := RerunResult{Task: name, State: "pending", Ordinal: ordinal, Unblocked: []string{}}
 	dependents, err := tx.QueryContext(ctx, `WITH RECURSIVE dependents(id) AS (
-	 SELECT task_scope_id FROM orchestration_task_dependencies WHERE dependency_task_scope_id=?
+	 SELECT task_scope_id FROM orchestration_task_dependencies WHERE dependency_task_scope_id=$1
 	 UNION SELECT d.task_scope_id FROM orchestration_task_dependencies d JOIN dependents ON d.dependency_task_scope_id=dependents.id
 	)
-	SELECT t.task_scope_id,t.name
+	SELECT t.task_scope_id,t.name,t.result_json
 	FROM orchestration_tasks t JOIN dependents ON dependents.id=t.task_scope_id
-	WHERE t.state='blocked' AND json_valid(t.result_json) AND json_extract(t.result_json,'$.reason')='dependency did not succeed'
+	WHERE t.state='blocked'
 	ORDER BY t.name`, task.scopeID)
 	if err != nil {
 		return RerunResult{}, err
@@ -218,11 +218,17 @@ func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID s
 	var unblock []dependent
 	for dependents.Next() {
 		var d dependent
-		if err = dependents.Scan(&d.scopeID, &d.name); err != nil {
+		var result sql.NullString
+		if err = dependents.Scan(&d.scopeID, &d.name, &result); err != nil {
 			dependents.Close()
 			return RerunResult{}, err
 		}
-		unblock = append(unblock, d)
+		var blocked struct {
+			Reason string `json:"reason"`
+		}
+		if result.Valid && json.Unmarshal([]byte(result.String), &blocked) == nil && blocked.Reason == "dependency did not succeed" {
+			unblock = append(unblock, d)
+		}
 	}
 	if err = dependents.Close(); err != nil {
 		return RerunResult{}, err
@@ -237,7 +243,7 @@ func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID s
 	if err != nil {
 		return RerunResult{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_task_reruns SET response_json=? WHERE task_scope_id=? AND execution_ordinal=?`, string(response), task.scopeID, ordinal); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_task_reruns SET response_json=$1 WHERE task_scope_id=$2 AND execution_ordinal=$3`, string(response), task.scopeID, ordinal); err != nil {
 		return RerunResult{}, err
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "task_rerun", &task.projectID, "task", task.scopeID, nil, map[string]any{"task": name, "actor": actor, "request_id": requestID, "ordinal": ordinal, "unblocked": out.Unblocked}); err != nil {
@@ -251,11 +257,11 @@ func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID s
 // included, so the decision is new and nothing earlier is read as its outcome.
 func markTaskRerunTx(ctx context.Context, tx *sql.Tx, taskScopeID, requestID, actor string) (int, error) {
 	var ordinal int
-	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(execution_ordinal)+1,0) FROM orchestration_decisions WHERE task_scope_id=?`, taskScopeID).Scan(&ordinal); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(execution_ordinal)+1,0) FROM orchestration_decisions WHERE task_scope_id=$1`, taskScopeID).Scan(&ordinal); err != nil {
 		return 0, err
 	}
 	var predecessor sql.NullString
-	err := tx.QueryRowContext(ctx, `SELECT execution_id FROM orchestration_task_executions WHERE task_scope_id=? ORDER BY execution_ordinal DESC LIMIT 1`, taskScopeID).Scan(&predecessor)
+	err := tx.QueryRowContext(ctx, `SELECT execution_id FROM orchestration_task_executions WHERE task_scope_id=$1 ORDER BY execution_ordinal DESC LIMIT 1`, taskScopeID).Scan(&predecessor)
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return 0, err
 	}
@@ -263,10 +269,10 @@ func markTaskRerunTx(ctx context.Context, tx *sql.Tx, taskScopeID, requestID, ac
 		return 0, err
 	}
 	stamp := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state='pending',result_json=NULL,rerun_ordinal=?,updated_at=? WHERE task_scope_id=?`, ordinal, stamp, taskScopeID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state='pending',result_json=NULL,rerun_ordinal=$1,updated_at=$2 WHERE task_scope_id=$3`, ordinal, stamp, taskScopeID); err != nil {
 		return 0, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_reruns(task_scope_id,execution_ordinal,request_id,actor,predecessor_execution_id,created_at) VALUES(?,?,?,?,?,?)`, taskScopeID, ordinal, requestID, actor, predecessor, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_reruns(task_scope_id,execution_ordinal,request_id,actor,predecessor_execution_id,created_at) VALUES($1,$2,$3,$4,$5,$6)`, taskScopeID, ordinal, requestID, actor, predecessor, stamp); err != nil {
 		return 0, err
 	}
 	return ordinal, nil
@@ -277,7 +283,7 @@ func markTaskRerunTx(ctx context.Context, tx *sql.Tx, taskScopeID, requestID, ac
 func rerunTriggerTx(ctx context.Context, tx *sql.Tx, taskScopeID string, ordinal int) (map[string]any, error) {
 	var requestID string
 	var predecessor sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT request_id,predecessor_execution_id FROM orchestration_task_reruns WHERE task_scope_id=? AND execution_ordinal=?`, taskScopeID, ordinal).Scan(&requestID, &predecessor); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT request_id,predecessor_execution_id FROM orchestration_task_reruns WHERE task_scope_id=$1 AND execution_ordinal=$2`, taskScopeID, ordinal).Scan(&requestID, &predecessor); err != nil {
 		return nil, err
 	}
 	trigger := map[string]any{"request_id": requestID}

@@ -91,7 +91,7 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	if err := spec.Validate(); err != nil {
 		return MachineApplyResult{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return MachineApplyResult{}, err
 	}
@@ -99,7 +99,7 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	var unknown []string
 	for _, nodeID := range spec.NodeIDs() {
 		var found int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE id=?`, nodeID).Scan(&found); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE id=$1`, nodeID).Scan(&found); err != nil {
 			return MachineApplyResult{}, err
 		}
 		if found == 0 {
@@ -146,7 +146,7 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 		// a live lease on the GPU's row of a node it would no longer be declared for
 		var holders int
 		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_instances r JOIN lease_items li ON li.resource_id=r.id JOIN leases l ON l.id=li.lease_id
-			WHERE r.kind='gpu' AND r.stable_identity=? AND instr(','||?||',',','||r.node_id||',')=0 AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, change.UUID, change.To).Scan(&holders); err != nil {
+			WHERE r.kind='gpu' AND r.stable_identity=$1 AND strpos(','||$2||',',','||r.node_id||',')=0 AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, change.UUID, change.To).Scan(&holders); err != nil {
 			return MachineApplyResult{}, err
 		}
 		if holders != 0 {
@@ -168,15 +168,15 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	}
 	t := now()
 	for _, change := range result.Changes {
-		if _, err = tx.ExecContext(ctx, `DELETE FROM machine_gpus WHERE uuid=? AND instr(','||?||',',','||node_id||',')=0`, change.UUID, change.To); err != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM machine_gpus WHERE uuid=$1 AND strpos(','||$2||',',','||node_id||',')=0`, change.UUID, change.To); err != nil {
 			return MachineApplyResult{}, err
 		}
 		for _, to := range declared[change.UUID] {
-			if _, err = tx.ExecContext(ctx, `INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES(?,?,?) ON CONFLICT(uuid,node_id) DO NOTHING`, change.UUID, to, t); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES($1,$2,$3) ON CONFLICT(uuid,node_id) DO NOTHING`, change.UUID, to, t); err != nil {
 				return MachineApplyResult{}, err
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=? WHERE cleared_at IS NULL AND resource_id IN(SELECT id FROM resource_instances WHERE kind='gpu' AND stable_identity=? AND instr(','||?||',',','||node_id||',')=0)`, t, change.UUID, change.To); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=$1 WHERE cleared_at IS NULL AND resource_id IN(SELECT id FROM resource_instances WHERE kind='gpu' AND stable_identity=$2 AND strpos(','||$3||',',','||node_id||',')=0)`, t, change.UUID, change.To); err != nil {
 			return MachineApplyResult{}, err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "gpu_declaration_changed", nil, "gpu", change.UUID, nil, change); err != nil {
@@ -243,7 +243,7 @@ func (s *Store) ListMachines(ctx context.Context) (Machines, error) {
 		return out, err
 	}
 	rows, err = s.db.QueryContext(ctx, `SELECT u.uuid,u.node_id,u.provider_id,
-		(SELECT group_concat(node_id) FROM (SELECT d.node_id FROM machine_gpus d WHERE d.uuid=u.uuid ORDER BY d.node_id)),
+		(SELECT string_agg(d.node_id,',' ORDER BY d.node_id) FROM machine_gpus d WHERE d.uuid=u.uuid),
 		u.first_observed_at,u.last_observed_at
 		FROM undeclared_gpus u ORDER BY u.node_id,u.uuid`)
 	if err != nil {
@@ -269,7 +269,7 @@ func (s *Store) ListMachines(ctx context.Context) (Machines, error) {
 // taken over (the GPU moved), unless a live lease holds it.
 func registerGPUTx(ctx context.Context, tx *sql.Tx, resource ResourceInstance, nodeID, t string) (string, bool, error) {
 	var declared int
-	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_gpus WHERE uuid=? AND node_id=?`, resource.StableIdentity, nodeID).Scan(&declared); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_gpus WHERE uuid=$1 AND node_id=$2`, resource.StableIdentity, nodeID).Scan(&declared); err != nil {
 		return "", false, err
 	}
 	if declared == 0 {
@@ -277,23 +277,23 @@ func registerGPUTx(ctx context.Context, tx *sql.Tx, resource ResourceInstance, n
 	}
 	takeOver := func(id, fromNode string) error {
 		var holders int
-		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=? AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, id).Scan(&holders); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=$1 AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, id).Scan(&holders); err != nil {
 			return err
 		}
 		if holders != 0 {
 			return fmt.Errorf("%w: gpu %s is declared for node %s but still leased on node %s", ErrOwnershipConflict, id, nodeID, fromNode)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE resource_instances SET node_id=?,provider_id=?,updated_at=? WHERE id=?`, resource.NodeID, resource.ProviderID, t, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE resource_instances SET node_id=$1,provider_id=$2,updated_at=$3 WHERE id=$4`, resource.NodeID, resource.ProviderID, t, id); err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=? WHERE resource_id=? AND cleared_at IS NULL`, t, id); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=$1 WHERE resource_id=$2 AND cleared_at IS NULL`, t, id); err != nil {
 			return err
 		}
 		return appendCoordinationEventTx(ctx, tx, "gpu_ownership_transferred", nil, "resource", id, nil, map[string]string{"uuid": resource.StableIdentity, "from_node": fromNode, "to_node": resource.NodeID, "provider_id": resource.ProviderID})
 	}
 	// this node's row of the GPU (the provider's own id first)
 	var ownID, ownProvider string
-	err := tx.QueryRowContext(ctx, `SELECT id,provider_id FROM resource_instances WHERE kind='gpu' AND stable_identity=? AND node_id=? ORDER BY id<>? LIMIT 1`, resource.StableIdentity, nodeID, resource.ID).Scan(&ownID, &ownProvider)
+	err := tx.QueryRowContext(ctx, `SELECT id,provider_id FROM resource_instances WHERE kind='gpu' AND stable_identity=$1 AND node_id=$2 ORDER BY id<>$3 LIMIT 1`, resource.StableIdentity, nodeID, resource.ID).Scan(&ownID, &ownProvider)
 	if err == nil {
 		if ownProvider == resource.ProviderID {
 			return ownID, true, nil
@@ -304,7 +304,7 @@ func registerGPUTx(ctx context.Context, tx *sql.Tx, resource ResourceInstance, n
 		return "", false, err
 	}
 	var fromNode string
-	err = tx.QueryRowContext(ctx, `SELECT node_id FROM resource_instances WHERE id=?`, resource.ID).Scan(&fromNode)
+	err = tx.QueryRowContext(ctx, `SELECT node_id FROM resource_instances WHERE id=$1`, resource.ID).Scan(&fromNode)
 	if errors.Is(err, sql.ErrNoRows) {
 		return resource.ID, true, nil
 	}
@@ -312,7 +312,7 @@ func registerGPUTx(ctx context.Context, tx *sql.Tx, resource ResourceInstance, n
 		return "", false, err
 	}
 	var shared int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_gpus WHERE uuid=? AND node_id=?`, resource.StableIdentity, fromNode).Scan(&shared); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_gpus WHERE uuid=$1 AND node_id=$2`, resource.StableIdentity, fromNode).Scan(&shared); err != nil {
 		return "", false, err
 	}
 	if shared != 0 {
@@ -327,11 +327,11 @@ func recordUndeclaredGPUsTx(ctx context.Context, tx *sql.Tx, providerID, nodeID 
 	keep := map[string]bool{}
 	for _, uuid := range uuids {
 		keep[uuid] = true
-		if _, err := tx.ExecContext(ctx, `INSERT INTO undeclared_gpus(provider_id,uuid,node_id,first_observed_at,last_observed_at) VALUES(?,?,?,?,?) ON CONFLICT(provider_id,uuid) DO UPDATE SET node_id=excluded.node_id,last_observed_at=excluded.last_observed_at`, providerID, uuid, nodeID, t, t); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO undeclared_gpus(provider_id,uuid,node_id,first_observed_at,last_observed_at) VALUES($1,$2,$3,$4,$5) ON CONFLICT(provider_id,uuid) DO UPDATE SET node_id=excluded.node_id,last_observed_at=excluded.last_observed_at`, providerID, uuid, nodeID, t, t); err != nil {
 			return err
 		}
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT uuid FROM undeclared_gpus WHERE provider_id=?`, providerID)
+	rows, err := tx.QueryContext(ctx, `SELECT uuid FROM undeclared_gpus WHERE provider_id=$1`, providerID)
 	if err != nil {
 		return err
 	}
@@ -351,7 +351,7 @@ func recordUndeclaredGPUsTx(ctx context.Context, tx *sql.Tx, providerID, nodeID 
 		return err
 	}
 	for _, uuid := range gone {
-		if _, err = tx.ExecContext(ctx, `DELETE FROM undeclared_gpus WHERE provider_id=? AND uuid=?`, providerID, uuid); err != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM undeclared_gpus WHERE provider_id=$1 AND uuid=$2`, providerID, uuid); err != nil {
 			return err
 		}
 	}

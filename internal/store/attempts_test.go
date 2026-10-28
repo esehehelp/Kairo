@@ -13,7 +13,7 @@ func TestListAttemptsCarriesProgressAndLogPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at,started_at,progress_json,stderr_path) VALUES('att-1',?,'running','executor',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{"unit":"step","current":5}','/logs/att-1.stderr.log')`, execution.ID); err != nil {
+	if _, err = store.testExec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at,started_at,progress_json,stderr_path) VALUES('att-1',$1,'running','executor',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','{"unit":"step","current":5}','/logs/att-1.stderr.log')`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
 	all, err := store.ListAttempts(ctx, AttemptFilter{ProjectScopeID: execution.ProjectScopeID})
@@ -37,7 +37,7 @@ func TestAttemptLogPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at,started_at) VALUES('att-1',?,'running','executor',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, execution.ID); err != nil {
+	if _, err = store.testExec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at,started_at) VALUES('att-1',$1,'running','executor',1,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
 	if stdout, stderr, err := store.AttemptLogPaths(ctx, "att-1"); err != nil || stdout != "" || stderr != "" {

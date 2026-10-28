@@ -21,7 +21,7 @@ import (
 // suspend command for an attempt. This method only coordinates transfer of
 // execution rights. It never requeues an execution or interprets its exit.
 func (s *Store) EnsurePriorityPreemption(ctx context.Context, executorID string) ([]string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +76,7 @@ func enqueuePrioritySuspendsTx(ctx context.Context, tx *sql.Tx, waiting Executio
 	for _, attemptID := range attemptIDs {
 		victim := victims[attemptID]
 		var existingID, existingOrigin, existingState string
-		err := tx.QueryRowContext(ctx, `SELECT id,origin,state FROM commands WHERE attempt_id=? ORDER BY created_at LIMIT 1`, attemptID).Scan(&existingID, &existingOrigin, &existingState)
+		err := tx.QueryRowContext(ctx, `SELECT id,origin,state FROM commands WHERE attempt_id=$1 ORDER BY created_at LIMIT 1`, attemptID).Scan(&existingID, &existingOrigin, &existingState)
 		if err == nil {
 			if existingOrigin == "priority_preemption" && existingState != "rejected" {
 				commandIDs = append(commandIDs, existingID)
@@ -88,7 +88,7 @@ func enqueuePrioritySuspendsTx(ctx context.Context, tx *sql.Tx, waiting Executio
 		}
 		commandID, stamp := id.New("cmd"), now()
 		reason := "higher-priority execution waiting: " + waiting.ID
-		if _, err = tx.ExecContext(ctx, `INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at) VALUES(?,?,?,?,?,'suspend','priority_preemption',?,'pending',?,?)`, commandID, victim.executionID, victim.attemptID, victim.leaseID, victim.epoch, reason, stamp, stamp); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'suspend','priority_preemption',$6,'pending',$7,$8)`, commandID, victim.executionID, victim.attemptID, victim.leaseID, victim.epoch, reason, stamp, stamp); err != nil {
 			return nil, err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "suspend_requested", &victim.projectID, "command", commandID, &victim.epoch, map[string]any{"execution_id": victim.executionID, "attempt_id": victim.attemptID, "lease_id": victim.leaseID, "origin": "priority_preemption", "reason": reason, "waiting_execution_id": waiting.ID}); err != nil {

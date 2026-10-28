@@ -96,7 +96,7 @@ func sameHost(a, b machine.Host) bool {
 func applyHostsTx(ctx context.Context, tx *sql.Tx, changes []HostChange, t string) error {
 	for _, change := range changes {
 		if change.To == nil {
-			if _, err := tx.ExecContext(ctx, `DELETE FROM machine_hosts WHERE id=?`, change.Host); err != nil {
+			if _, err := tx.ExecContext(ctx, `DELETE FROM machine_hosts WHERE id=$1`, change.Host); err != nil {
 				return err
 			}
 		} else {
@@ -104,7 +104,7 @@ func applyHostsTx(ctx context.Context, tx *sql.Tx, changes []HostChange, t strin
 			if err != nil {
 				return err
 			}
-			if _, err = tx.ExecContext(ctx, `INSERT INTO machine_hosts(id,declaration_json,declared_at) VALUES(?,?,?) ON CONFLICT(id) DO UPDATE SET declaration_json=excluded.declaration_json,declared_at=excluded.declared_at`, change.Host, string(body), t); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO machine_hosts(id,declaration_json,declared_at) VALUES($1,$2,$3) ON CONFLICT(id) DO UPDATE SET declaration_json=excluded.declaration_json,declared_at=excluded.declared_at`, change.Host, string(body), t); err != nil {
 				return err
 			}
 		}

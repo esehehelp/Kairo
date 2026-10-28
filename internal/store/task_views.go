@@ -37,35 +37,28 @@ func (f TaskFilter) validate() error {
 	return nil
 }
 
-// where returns the conditions of the filter on orchestration_tasks alias o.
-func (f TaskFilter) where() (string, []any) {
+// where returns the conditions of the filter on orchestration_tasks alias o,
+// for a query whose $1 is the project's scope id, and the query's arguments.
+func (f TaskFilter) where(projectID string) (string, []any) {
 	var conditions []string
-	var args []any
-	in := func(column string, values []string) {
-		conditions = append(conditions, column+` IN(`+strings.TrimSuffix(strings.Repeat("?,", len(values)), ",")+`)`)
-		for _, v := range values {
-			args = append(args, v)
-		}
-	}
+	args := []any{projectID}
 	if len(f.Names) > 0 {
-		in("o.name", f.Names)
+		conditions = append(conditions, `o.name=ANY(`+bind(&args, f.Names)+`::text[])`)
 	}
 	if f.Prefix != "" {
-		conditions = append(conditions, `substr(o.name,1,?)=?`)
-		args = append(args, utf8.RuneCountInString(f.Prefix), f.Prefix)
+		conditions = append(conditions, `substr(o.name,1,`+bind(&args, utf8.RuneCountInString(f.Prefix))+`)=`+bind(&args, f.Prefix))
 	}
 	if len(f.States) > 0 {
-		in("o.state", f.States)
+		conditions = append(conditions, `o.state=ANY(`+bind(&args, f.States)+`::text[])`)
 	}
 	if f.Live {
 		conditions = append(conditions, `o.state IN('pending','running')`)
 	}
 	if !f.Since.IsZero() {
-		conditions = append(conditions, `julianday(o.updated_at)>=julianday(?)`)
-		args = append(args, f.Since.UTC().Format(time.RFC3339Nano))
+		conditions = append(conditions, `o.updated_at::timestamptz>=`+bind(&args, f.Since.UTC().Format(time.RFC3339Nano))+`::timestamptz`)
 	}
 	if len(conditions) == 0 {
-		return "", nil
+		return "", args
 	}
 	return ` AND ` + strings.Join(conditions, ` AND `), args
 }
@@ -85,7 +78,7 @@ const latestLeaseJoin = ` LEFT JOIN leases l ON l.id=(SELECT id FROM leases WHER
 const taskExecutionColumns = `te.execution_ordinal,te.execution_id,te.reason,e.state,e.terminal_cause,a.exit_code,a.exit_signal,a.id,
  COALESCE(a.executor_id,l.executor_id),
  e.submitted_at,e.started_at,e.terminal_at,a.started_at,a.exited_at,
- CASE WHEN NOT json_valid(a.progress_json) THEN NULL WHEN json_type(a.progress_json)='object' THEN json_remove(a.progress_json,'$.detail') ELSE a.progress_json END,
+ a.progress_json,
  (SELECT w.reason_code FROM admission_waits w WHERE w.execution_id=e.id AND e.state='waiting')`
 
 func scanTaskExecution(rows *sql.Rows, extra ...any) (TaskExecution, error) {
@@ -95,10 +88,32 @@ func scanTaskExecution(rows *sql.Rows, extra ...any) (TaskExecution, error) {
 	if err := rows.Scan(dest...); err != nil {
 		return TaskExecution{}, err
 	}
-	if progress.Valid && progress.String != "{}" {
-		v.Progress = json.RawMessage(progress.String)
+	if progress.Valid {
+		if summary := progressSummary(progress.String); summary != nil && string(summary) != "{}" {
+			v.Progress = summary
+		}
 	}
 	return v, nil
+}
+
+// progressSummary is an attempt's progress without its detail: an object
+// loses its "detail" member (compacted, the other members in their order);
+// anything else valid is kept as it is; invalid JSON is nil.
+func progressSummary(progress string) json.RawMessage {
+	if !json.Valid([]byte(progress)) {
+		return nil
+	}
+	members, ok := jsonObject([]byte(progress))
+	if !ok {
+		return json.RawMessage(progress)
+	}
+	kept := members[:0]
+	for _, m := range members {
+		if m.key != "detail" {
+			kept = append(kept, m)
+		}
+	}
+	return writeJSONObject(kept)
 }
 
 // eachRow runs a query and calls scan on each of its rows.
@@ -132,7 +147,7 @@ func (s *Store) QueryProjectStatus(ctx context.Context, project string, filter T
 	}
 	projectID := scopes.Project.ID
 	status := ProjectStatus{Name: project, SpecDigests: []string{}, StateCounts: map[string]int{}}
-	err = eachRow(ctx, s.db, `SELECT spec_digest FROM project_declarations WHERE project_scope_id=? ORDER BY applied_at,spec_digest`, []any{projectID}, func(rows *sql.Rows) error {
+	err = eachRow(ctx, s.db, `SELECT spec_digest FROM project_declarations WHERE project_scope_id=$1 ORDER BY applied_at,spec_digest`, []any{projectID}, func(rows *sql.Rows) error {
 		var digest string
 		if err := rows.Scan(&digest); err != nil {
 			return err
@@ -146,7 +161,7 @@ func (s *Store) QueryProjectStatus(ctx context.Context, project string, filter T
 	if len(status.SpecDigests) == 0 {
 		return ProjectStatus{}, ErrNotFound
 	}
-	err = eachRow(ctx, s.db, `SELECT state,COUNT(*) FROM orchestration_tasks WHERE project_scope_id=? GROUP BY state`, []any{projectID}, func(rows *sql.Rows) error {
+	err = eachRow(ctx, s.db, `SELECT state,COUNT(*) FROM orchestration_tasks WHERE project_scope_id=$1 GROUP BY state`, []any{projectID}, func(rows *sql.Rows) error {
 		var state string
 		var n int
 		if err := rows.Scan(&state, &n); err != nil {
@@ -167,11 +182,10 @@ func (s *Store) QueryProjectStatus(ctx context.Context, project string, filter T
 // taskStatuses reads the tasks of a project that the filter selects, with
 // their dependencies and executions.
 func (s *Store) taskStatuses(ctx context.Context, projectID string, filter TaskFilter) ([]TaskStatus, error) {
-	where, args := filter.where()
-	args = append([]any{projectID}, args...)
+	where, args := filter.where(projectID)
 	tasks := []TaskStatus{}
 	index := map[string]int{}
-	err := eachRow(ctx, s.db, `SELECT o.task_scope_id,o.name,o.queue_name,o.policy_id,o.policy_version,o.state,o.spec_digest,o.result_json,o.created_at,o.updated_at FROM orchestration_tasks o WHERE o.project_scope_id=?`+where+` ORDER BY o.name`, args, func(rows *sql.Rows) error {
+	err := eachRow(ctx, s.db, `SELECT o.task_scope_id,o.name,o.queue_name,o.policy_id,o.policy_version,o.state,o.spec_digest,o.result_json,o.created_at,o.updated_at FROM orchestration_tasks o WHERE o.project_scope_id=$1`+where+` ORDER BY o.name`, args, func(rows *sql.Rows) error {
 		var task TaskStatus
 		var scopeID, policyID string
 		var policyVersion int
@@ -191,7 +205,7 @@ func (s *Store) taskStatuses(ctx context.Context, projectID string, filter TaskF
 	if err != nil || len(tasks) == 0 {
 		return tasks, err
 	}
-	err = eachRow(ctx, s.db, `SELECT d.task_scope_id,t.name FROM orchestration_tasks o JOIN orchestration_task_dependencies d ON d.task_scope_id=o.task_scope_id JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE o.project_scope_id=?`+where+` ORDER BY t.name`, args, func(rows *sql.Rows) error {
+	err = eachRow(ctx, s.db, `SELECT d.task_scope_id,t.name FROM orchestration_tasks o JOIN orchestration_task_dependencies d ON d.task_scope_id=o.task_scope_id JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE o.project_scope_id=$1`+where+` ORDER BY t.name`, args, func(rows *sql.Rows) error {
 		var scopeID, name string
 		if err := rows.Scan(&scopeID, &name); err != nil {
 			return err
@@ -208,7 +222,7 @@ func (s *Store) taskStatuses(ctx context.Context, projectID string, filter TaskF
 	// queue, task) is closed; the innermost closed one is reported.
 	err = eachRow(ctx, s.db, `SELECT o.task_scope_id,s.kind,`+gateCloserColumns+` FROM orchestration_tasks o JOIN coordination_scopes ts ON ts.id=o.task_scope_id
 		JOIN coordination_scopes s ON s.id IN(o.project_scope_id,ts.parent_id,o.task_scope_id) JOIN admission_gates g ON g.scope_id=s.id AND g.state='closed'
-		WHERE o.project_scope_id=? AND o.state IN('pending','running')`+where+` ORDER BY o.task_scope_id,CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, args, func(rows *sql.Rows) error {
+		WHERE o.project_scope_id=$1 AND o.state IN('pending','running')`+where+` ORDER BY o.task_scope_id,CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, args, func(rows *sql.Rows) error {
 		var scopeID string
 		gate := TaskGate{State: "closed"}
 		var closedBy, closedAt sql.NullString
@@ -224,7 +238,7 @@ func (s *Store) taskStatuses(ctx context.Context, projectID string, filter TaskF
 	if err != nil {
 		return nil, err
 	}
-	err = eachRow(ctx, s.db, `SELECT te.task_scope_id,`+taskExecutionColumns+` FROM orchestration_tasks o JOIN orchestration_task_executions te ON te.task_scope_id=o.task_scope_id JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+` WHERE o.project_scope_id=?`+where+` ORDER BY te.task_scope_id,te.execution_ordinal`, args, func(rows *sql.Rows) error {
+	err = eachRow(ctx, s.db, `SELECT te.task_scope_id,`+taskExecutionColumns+` FROM orchestration_tasks o JOIN orchestration_task_executions te ON te.task_scope_id=o.task_scope_id JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+` WHERE o.project_scope_id=$1`+where+` ORDER BY te.task_scope_id,te.execution_ordinal`, args, func(rows *sql.Rows) error {
 		var scopeID string
 		execution, err := scanTaskExecution(rows, &scopeID)
 		if err != nil {
@@ -323,13 +337,13 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 		return TaskDetail{}, ErrNotFound
 	}
 	detail := TaskDetail{TaskStatus: tasks[0], Spec: json.RawMessage(task.spec), Executions: []TaskExecutionDetail{}, Gates: []TaskGate{}}
-	if detail.Dependencies, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE d.task_scope_id=? ORDER BY t.name`, task.scopeID); err != nil {
+	if detail.Dependencies, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE d.task_scope_id=$1 ORDER BY t.name`, task.scopeID); err != nil {
 		return TaskDetail{}, err
 	}
-	if detail.Dependents, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.dependency_task_scope_id=? ORDER BY t.name`, task.scopeID); err != nil {
+	if detail.Dependents, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.dependency_task_scope_id=$1 ORDER BY t.name`, task.scopeID); err != nil {
 		return TaskDetail{}, err
 	}
-	err = eachRow(ctx, s.db, `SELECT s.kind,COALESCE(g.state,'open'),`+gateCloserColumns+` FROM coordination_scopes s LEFT JOIN admission_gates g ON g.scope_id=s.id WHERE s.id IN(?,?,?) ORDER BY CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, []any{task.projectID, task.queueScopeID, task.scopeID}, func(rows *sql.Rows) error {
+	err = eachRow(ctx, s.db, `SELECT s.kind,COALESCE(g.state,'open'),`+gateCloserColumns+` FROM coordination_scopes s LEFT JOIN admission_gates g ON g.scope_id=s.id WHERE s.id IN($1,$2,$3) ORDER BY CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, []any{task.projectID, task.queueScopeID, task.scopeID}, func(rows *sql.Rows) error {
 		var gate TaskGate
 		var closedBy, closedAt sql.NullString
 		if err := rows.Scan(&gate.Scope, &gate.State, &closedBy, &closedAt); err != nil {
@@ -411,7 +425,7 @@ func (s *Store) taskRefs(ctx context.Context, query, taskScopeID string) ([]Task
 // taskAttemptDetails lists the attempts of a task's executions by execution.
 func (s *Store) taskAttemptDetails(ctx context.Context, taskScopeID string) (map[string][]AttemptDetail, error) {
 	out := map[string][]AttemptDetail{}
-	err := eachRow(ctx, s.db, `SELECT x.node_id,`+attemptColumns+` FROM orchestration_task_executions te JOIN attempts a ON a.execution_id=te.execution_id LEFT JOIN executors x ON x.id=a.executor_id WHERE te.task_scope_id=? ORDER BY COALESCE(a.authorized_at,a.started_at),a.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
+	err := eachRow(ctx, s.db, `SELECT x.node_id,`+attemptColumns+` FROM orchestration_task_executions te JOIN attempts a ON a.execution_id=te.execution_id LEFT JOIN executors x ON x.id=a.executor_id WHERE te.task_scope_id=$1 ORDER BY COALESCE(a.authorized_at,a.started_at) NULLS FIRST,a.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var nodeID *string
 		v, err := scanAttempt(rows, &nodeID)
 		if err != nil {
@@ -429,7 +443,7 @@ func (s *Store) taskGangRanks(ctx context.Context, taskScopeID string) (map[stri
 	out := map[string][]TaskGangRank{}
 	err := eachRow(ctx, s.db, `SELECT g.leader_execution_id,m.rank,m.execution_id,e.state,a.id,COALESCE(a.executor_id,l.executor_id),x.node_id
 		FROM orchestration_task_executions te JOIN execution_gangs g ON g.leader_execution_id=te.execution_id JOIN gang_members m ON m.gang_id=g.id JOIN execution_requests e ON e.id=m.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+`
-		LEFT JOIN executors x ON x.id=COALESCE(a.executor_id,l.executor_id) WHERE te.task_scope_id=? ORDER BY m.rank`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		LEFT JOIN executors x ON x.id=COALESCE(a.executor_id,l.executor_id) WHERE te.task_scope_id=$1 ORDER BY m.rank`, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var leaderID string
 		var r TaskGangRank
 		if err := rows.Scan(&leaderID, &r.Rank, &r.ExecutionID, &r.State, &r.AttemptID, &r.ExecutorID, &r.NodeID); err != nil {
@@ -446,10 +460,10 @@ func (s *Store) taskGangRanks(ctx context.Context, taskScopeID string) (map[stri
 func (s *Store) taskAdmissionBlocks(ctx context.Context, taskScopeID string) (map[string][]WaitReason, error) {
 	out := map[string][]WaitReason{}
 	err := eachRow(ctx, s.db, `SELECT b.execution_id,b.reason_code,b.detail_json,b.created_at FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id JOIN admission_blocks b ON b.execution_id=e.id
-		WHERE te.task_scope_id=? AND e.state IN('waiting','authorized') AND b.cleared_at IS NULL
+		WHERE te.task_scope_id=$1 AND e.state IN('waiting','authorized') AND b.cleared_at IS NULL
 		UNION ALL
 		SELECT w.execution_id,w.reason_code,w.detail_json,w.since FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id JOIN admission_waits w ON w.execution_id=e.id
-		WHERE te.task_scope_id=? AND e.state='waiting'
+		WHERE te.task_scope_id=$2 AND e.state='waiting'
 		ORDER BY 4`, []any{taskScopeID, taskScopeID}, func(rows *sql.Rows) error {
 		var executionID, detail string
 		var w WaitReason

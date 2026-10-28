@@ -107,7 +107,7 @@ type ApplyResult struct {
 }
 
 func (s *Store) ApplyProject(ctx context.Context, spec orchestration.Validated) (ApplyResult, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -116,7 +116,7 @@ func (s *Store) ApplyProject(ctx context.Context, spec orchestration.Validated) 
 	if err != nil {
 		return ApplyResult{}, err
 	}
-	result, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO project_declarations(project_scope_id,spec_digest,spec_json,applied_at) VALUES(?,?,?,?)`, projectScope.ID, spec.Digest, string(spec.Normalized), now())
+	result, err := tx.ExecContext(ctx, `INSERT INTO project_declarations(project_scope_id,spec_digest,spec_json,applied_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`, projectScope.ID, spec.Digest, string(spec.Normalized), now())
 	if err != nil {
 		return ApplyResult{}, err
 	}
@@ -143,7 +143,7 @@ func (s *Store) ApplyProject(ctx context.Context, spec orchestration.Validated) 
 			return ApplyResult{}, err
 		}
 		var existingDigest, existingScopeID string
-		err = tx.QueryRowContext(ctx, `SELECT spec_digest,task_scope_id FROM orchestration_tasks WHERE project_scope_id=? AND name=?`, projectScope.ID, task.Name).Scan(&existingDigest, &existingScopeID)
+		err = tx.QueryRowContext(ctx, `SELECT spec_digest,task_scope_id FROM orchestration_tasks WHERE project_scope_id=$1 AND name=$2`, projectScope.ID, task.Name).Scan(&existingDigest, &existingScopeID)
 		if err == nil {
 			if existingDigest != spec.TaskDigests[task.Name] || existingScopeID != scopes.Task.ID {
 				conflicts = append(conflicts, spec.Manifest.Project.Name+"/"+task.Name)
@@ -156,7 +156,7 @@ func (s *Store) ApplyProject(ctx context.Context, spec orchestration.Validated) 
 			return ApplyResult{}, err
 		}
 		stamp := now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_tasks(task_scope_id,project_scope_id,name,queue_name,policy_id,policy_version,spec_digest,spec_json,execution_template_json,state,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?,?,'pending',?,?)`, scopes.Task.ID, projectScope.ID, task.Name, task.Queue, "RunToCompletion", spec.TaskDigests[task.Name], string(taskBody), string(executionBody), stamp, stamp); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_tasks(task_scope_id,project_scope_id,name,queue_name,policy_id,policy_version,spec_digest,spec_json,execution_template_json,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,'pending',$9,$10)`, scopes.Task.ID, projectScope.ID, task.Name, task.Queue, "RunToCompletion", spec.TaskDigests[task.Name], string(taskBody), string(executionBody), stamp, stamp); err != nil {
 			return ApplyResult{}, err
 		}
 		applied.Created = append(applied.Created, task.Name)
@@ -167,7 +167,7 @@ func (s *Store) ApplyProject(ctx context.Context, spec orchestration.Validated) 
 	}
 	for _, task := range spec.Manifest.Tasks {
 		for _, dependency := range task.DependsOn {
-			if _, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO orchestration_task_dependencies(task_scope_id,dependency_task_scope_id) VALUES(?,?)`, taskScopes[task.Name], taskScopes[dependency]); err != nil {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_dependencies(task_scope_id,dependency_task_scope_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, taskScopes[task.Name], taskScopes[dependency]); err != nil {
 				return ApplyResult{}, err
 			}
 		}
@@ -196,7 +196,7 @@ func (s *Store) ReconcileProjectTasks(ctx context.Context) error {
 }
 
 func (s *Store) planProjectTasks(ctx context.Context) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -363,7 +363,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 }
 
 func taskDependenciesReady(ctx context.Context, tx *sql.Tx, taskScopeID string) (bool, bool, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE d.task_scope_id=?`, taskScopeID)
+	rows, err := tx.QueryContext(ctx, `SELECT t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE d.task_scope_id=$1`, taskScopeID)
 	if err != nil {
 		return false, false, err
 	}
@@ -386,13 +386,13 @@ func taskDependenciesReady(ctx context.Context, tx *sql.Tx, taskScopeID string) 
 
 func loadCurrentTaskExecution(ctx context.Context, tx *sql.Tx, taskScopeID string) (currentTaskExecution, error) {
 	var value currentTaskExecution
-	err := tx.QueryRowContext(ctx, `SELECT te.execution_ordinal,e.id,e.state,e.terminal_cause,a.id,a.state,a.exit_code,a.exit_signal,a.continuation_ref,l.state FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+` WHERE te.task_scope_id=? ORDER BY te.execution_ordinal DESC LIMIT 1`, taskScopeID).Scan(&value.Ordinal, &value.ExecutionID, &value.ExecutionState, &value.TerminalCause, &value.AttemptID, &value.AttemptState, &value.ExitCode, &value.ExitSignal, &value.ContinuationRef, &value.LeaseState)
+	err := tx.QueryRowContext(ctx, `SELECT te.execution_ordinal,e.id,e.state,e.terminal_cause,a.id,a.state,a.exit_code,a.exit_signal,a.continuation_ref,l.state FROM orchestration_task_executions te JOIN execution_requests e ON e.id=te.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+` WHERE te.task_scope_id=$1 ORDER BY te.execution_ordinal DESC LIMIT 1`, taskScopeID).Scan(&value.Ordinal, &value.ExecutionID, &value.ExecutionState, &value.TerminalCause, &value.AttemptID, &value.AttemptState, &value.ExitCode, &value.ExitSignal, &value.ContinuationRef, &value.LeaseState)
 	return value, err
 }
 
 func latestAttemptCommand(ctx context.Context, tx *sql.Tx, attemptID string) (string, string, string, error) {
 	var id, origin, state string
-	err := tx.QueryRowContext(ctx, `SELECT id,origin,state FROM commands WHERE attempt_id=? ORDER BY created_at DESC LIMIT 1`, attemptID).Scan(&id, &origin, &state)
+	err := tx.QueryRowContext(ctx, `SELECT id,origin,state FROM commands WHERE attempt_id=$1 ORDER BY created_at DESC LIMIT 1`, attemptID).Scan(&id, &origin, &state)
 	return id, origin, state, err
 }
 
@@ -449,7 +449,7 @@ func planTaskExecution(ctx context.Context, tx *sql.Tx, task orchestrationTaskRo
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO orchestration_decisions(decision_key,task_scope_id,execution_ordinal,reason,trigger_json,execution_spec_json,state,created_at) VALUES(?,?,?,?,?,?,'planned',?)`, decisionKey, task.taskScopeID, ordinal, reason, string(triggerBody), string(specBody), now())
+	_, err = tx.ExecContext(ctx, `INSERT INTO orchestration_decisions(decision_key,task_scope_id,execution_ordinal,reason,trigger_json,execution_spec_json,state,created_at) VALUES($1,$2,$3,$4,$5,$6,'planned',$7) ON CONFLICT DO NOTHING`, decisionKey, task.taskScopeID, ordinal, reason, string(triggerBody), string(specBody), now())
 	return err
 }
 
@@ -484,13 +484,13 @@ func (s *Store) submitOrchestrationDecision(ctx context.Context, decision planne
 	if err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var state, taskState string
-	if err = tx.QueryRowContext(ctx, `SELECT d.state,t.state FROM orchestration_decisions d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.decision_key=?`, decision.DecisionKey).Scan(&state, &taskState); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT d.state,t.state FROM orchestration_decisions d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.decision_key=$1`, decision.DecisionKey).Scan(&state, &taskState); err != nil {
 		return err
 	}
 	if state != "planned" || taskState == "cancelled" {
@@ -501,13 +501,13 @@ func (s *Store) submitOrchestrationDecision(ctx context.Context, decision planne
 		return err
 	}
 	stamp := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='submitted',execution_id=?,submitted_at=? WHERE decision_key=?`, executionID, stamp, decision.DecisionKey); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='submitted',execution_id=$1,submitted_at=$2 WHERE decision_key=$3`, executionID, stamp, decision.DecisionKey); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_executions(task_scope_id,execution_ordinal,execution_id,decision_key,reason,created_at) VALUES(?,?,?,?,?,?)`, decision.TaskScopeID, decision.Ordinal, executionID, decision.DecisionKey, decision.Reason, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_executions(task_scope_id,execution_ordinal,execution_id,decision_key,reason,created_at) VALUES($1,$2,$3,$4,$5,$6)`, decision.TaskScopeID, decision.Ordinal, executionID, decision.DecisionKey, decision.Reason, stamp); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state='running',result_json=NULL,updated_at=? WHERE task_scope_id=?`, stamp, decision.TaskScopeID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state='running',result_json=NULL,updated_at=$1 WHERE task_scope_id=$2`, stamp, decision.TaskScopeID); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -522,7 +522,7 @@ func updateTaskState(ctx context.Context, tx *sql.Tx, taskScopeID, state string,
 		}
 		body = string(encoded)
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state=?,result_json=?,updated_at=? WHERE task_scope_id=? AND (state!=? OR COALESCE(result_json,'')!=COALESCE(?,''))`, state, body, now(), taskScopeID, state, body)
+	_, err := tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state=$1,result_json=$2,updated_at=$3 WHERE task_scope_id=$4 AND (state!=$5 OR COALESCE(result_json,'')!=COALESCE($6,''))`, state, body, now(), taskScopeID, state, body)
 	return err
 }
 

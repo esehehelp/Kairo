@@ -99,7 +99,7 @@ const deviceKey = `CASE WHEN r.kind='gpu' THEN r.stable_identity ELSE r.id END`
 // used since its previous sample to the attempts holding it.
 func recordDeviceSampleTx(ctx context.Context, tx *sql.Tx, resourceID, observedAt, validUntil string, sample DeviceSample) error {
 	var device, kind string
-	if err := tx.QueryRowContext(ctx, `SELECT `+deviceKey+`,r.kind FROM resource_instances r WHERE r.id=?`, resourceID).Scan(&device, &kind); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT `+deviceKey+`,r.kind FROM resource_instances r WHERE r.id=$1`, resourceID).Scan(&device, &kind); err != nil {
 		return err
 	}
 	at, err := time.Parse(time.RFC3339Nano, observedAt)
@@ -116,12 +116,12 @@ func recordDeviceSampleTx(ctx context.Context, tx *sql.Tx, resourceID, observedA
 		}
 	}
 	stamp := sampleStamp(at)
-	if _, err = tx.ExecContext(ctx, `INSERT INTO device_samples(device,resource_id,observed_at,valid_until,power_w,power_limit_w,sm_clock_mhz,mem_clock_mhz,pstate,event_reasons,mem_util,fan_pct,pcie_gen,pcie_width) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+	if _, err = tx.ExecContext(ctx, `INSERT INTO device_samples(device,resource_id,observed_at,valid_until,power_w,power_limit_w,sm_clock_mhz,mem_clock_mhz,pstate,event_reasons,mem_util,fan_pct,pcie_gen,pcie_width) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		device, resourceID, stamp, sampleStamp(until), sample.PowerW, sample.PowerLimitW, sample.SMClockMHz, sample.MemClockMHz, sample.PState, sample.EventReasons, sample.MemUtilization, sample.FanPercent, sample.PCIeGen, sample.PCIeWidth); err != nil {
 		return err
 	}
 	if p := sample.DeviceProperties; !p.empty() {
-		_, err = tx.ExecContext(ctx, `INSERT INTO device_properties(device,default_power_limit_w,min_power_limit_w,max_power_limit_w,max_sm_clock_mhz,max_mem_clock_mhz,pcie_gen_max,pcie_width_max,observed_at) VALUES(?,?,?,?,?,?,?,?,?)
+		_, err = tx.ExecContext(ctx, `INSERT INTO device_properties(device,default_power_limit_w,min_power_limit_w,max_power_limit_w,max_sm_clock_mhz,max_mem_clock_mhz,pcie_gen_max,pcie_width_max,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			ON CONFLICT(device) DO UPDATE SET default_power_limit_w=excluded.default_power_limit_w,min_power_limit_w=excluded.min_power_limit_w,max_power_limit_w=excluded.max_power_limit_w,
 			max_sm_clock_mhz=excluded.max_sm_clock_mhz,max_mem_clock_mhz=excluded.max_mem_clock_mhz,pcie_gen_max=excluded.pcie_gen_max,pcie_width_max=excluded.pcie_width_max,observed_at=excluded.observed_at
 			WHERE excluded.observed_at>=device_properties.observed_at`,
@@ -147,7 +147,7 @@ func recordDeviceSampleTx(ctx context.Context, tx *sql.Tx, resourceID, observedA
 func accrueAttemptEnergyTx(ctx context.Context, tx *sql.Tx, device string, t1 time.Time, p1 *float64) error {
 	stamp1 := sampleStamp(t1)
 	var counted bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM device_samples WHERE device=? AND observed_at>=?)`, device, stamp1).Scan(&counted); err != nil || counted {
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM device_samples WHERE device=$1 AND observed_at>=$2)`, device, stamp1).Scan(&counted); err != nil || counted {
 		return err
 	}
 	var t0 time.Time // zero: the device has no earlier sample
@@ -155,7 +155,7 @@ func accrueAttemptEnergyTx(ctx context.Context, tx *sql.Tx, device string, t1 ti
 	var p0 float64
 	var at0, until0 string
 	var power0 sql.NullFloat64
-	err := tx.QueryRowContext(ctx, `SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=? ORDER BY observed_at DESC LIMIT 1`, device).Scan(&at0, &until0, &power0)
+	err := tx.QueryRowContext(ctx, `SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=$1 ORDER BY observed_at DESC LIMIT 1`, device).Scan(&at0, &until0, &power0)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
@@ -179,8 +179,8 @@ func accrueAttemptEnergyTx(ctx context.Context, tx *sql.Tx, device string, t1 ti
 	var holders []holder
 	err = eachRow(ctx, tx, `SELECT DISTINCT a.id,a.started_at,a.exited_at,l.released_at,l.stale_at FROM resource_instances r
 		JOIN lease_items li ON li.resource_id=r.id JOIN leases l ON l.id=li.lease_id JOIN attempts a ON a.id=l.attempt_id
-		WHERE r.kind='gpu' AND r.stable_identity=? AND a.started_at IS NOT NULL AND julianday(a.started_at)<julianday(?)
-		AND (a.exited_at IS NULL OR julianday(a.exited_at)>julianday(?)) AND (l.released_at IS NULL OR julianday(l.released_at)>julianday(?))`,
+		WHERE r.kind='gpu' AND r.stable_identity=$1 AND a.started_at IS NOT NULL AND (a.started_at)::timestamptz<($2)::timestamptz
+		AND (a.exited_at IS NULL OR (a.exited_at)::timestamptz>($3)::timestamptz) AND (l.released_at IS NULL OR (l.released_at)::timestamptz>($4)::timestamptz)`,
 		[]any{device, stamp1, sampleStamp(t0), sampleStamp(t0)}, func(rows *sql.Rows) error {
 			var h holder
 			var started string
@@ -234,9 +234,9 @@ func accrueAttemptEnergyTx(ctx context.Context, tx *sql.Tx, device string, t1 ti
 			seconds = to.Sub(from).Seconds()
 			joules = seconds * (powerAt(from) + powerAt(to)) / 2
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO attempt_energy(attempt_id,gpu_joules,gpu_seconds_covered,partial,updated_at) VALUES(?,?,?,?,?)
-			ON CONFLICT(attempt_id) DO UPDATE SET gpu_joules=gpu_joules+excluded.gpu_joules,gpu_seconds_covered=gpu_seconds_covered+excluded.gpu_seconds_covered,
-			partial=MAX(partial,excluded.partial),updated_at=excluded.updated_at`, h.id, joules, seconds, partial, updated); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO attempt_energy(attempt_id,gpu_joules,gpu_seconds_covered,partial,updated_at) VALUES($1,$2,$3,$4,$5)
+			ON CONFLICT(attempt_id) DO UPDATE SET gpu_joules=attempt_energy.gpu_joules+excluded.gpu_joules,gpu_seconds_covered=attempt_energy.gpu_seconds_covered+excluded.gpu_seconds_covered,
+			partial=attempt_energy.partial OR excluded.partial,updated_at=excluded.updated_at`, h.id, joules, seconds, partial, updated); err != nil {
 			return err
 		}
 	}
@@ -268,7 +268,7 @@ func (s *Store) taskAttemptEnergy(ctx context.Context, taskScopeID string) (map[
 	out := map[string]AttemptEnergy{}
 	err := eachRow(ctx, s.db, `SELECT ae.attempt_id,ae.gpu_joules,ae.gpu_seconds_covered,ae.partial,ae.policy_seconds,ae.policy_saved_joules,ae.policy_unestimated_seconds,ae.updated_at
 		FROM orchestration_task_executions te JOIN attempts a ON a.execution_id=te.execution_id JOIN attempt_energy ae ON ae.attempt_id=a.id
-		WHERE te.task_scope_id=?`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		WHERE te.task_scope_id=$1`, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var attemptID string
 		var e AttemptEnergy
 		if err := rows.Scan(&attemptID, &e.GPUJoules, &e.GPUSecondsCovered, &e.Partial, &e.PolicySeconds, &e.PolicySavedJoules, &e.PolicyUnestimatedSeconds, &e.UpdatedAt); err != nil {
@@ -297,7 +297,7 @@ type ControllerSample struct {
 // devices (only "cpu" is read) into the host's series. A controller that no
 // host names records nothing; the samples it sent are returned as skipped.
 func (s *Store) RecordControllerSamples(ctx context.Context, nodeID string, samples []ControllerSample) ([]string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -326,7 +326,7 @@ func (s *Store) RecordControllerSamples(ctx context.Context, nodeID string, samp
 		if err != nil {
 			return nil, fmt.Errorf("controller sample: valid_until: %w", err)
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO device_samples(device,resource_id,observed_at,valid_until,power_w) VALUES(?,NULL,?,?,?)`,
+		if _, err = tx.ExecContext(ctx, `INSERT INTO device_samples(device,resource_id,observed_at,valid_until,power_w) VALUES($1,NULL,$2,$3,$4)`,
 			HostCPUDevice(hostID), sampleStamp(at), sampleStamp(until), sample.PowerW); err != nil {
 			return nil, err
 		}
@@ -369,7 +369,7 @@ func (s *Store) HostCPUEnergy(ctx context.Context, hostID string, from, to time.
 			continue
 		}
 		for _, node := range host.Nodes {
-			err := eachRow(ctx, s.db, `SELECT id FROM resource_instances WHERE node_id=? AND kind='cpu' ORDER BY id`, []any{node}, func(rows *sql.Rows) error {
+			err := eachRow(ctx, s.db, `SELECT id FROM resource_instances WHERE node_id=$1 AND kind='cpu' ORDER BY id`, []any{node}, func(rows *sql.Rows) error {
 				var id string
 				if err := rows.Scan(&id); err != nil {
 					return err
@@ -408,8 +408,8 @@ func (s *Store) seriesEnergy(ctx context.Context, device string, from, to time.T
 	}
 	var samples []sample
 	// The sample before the window starts the first span.
-	err := eachRow(ctx, s.db, `SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=? AND observed_at<? ORDER BY observed_at DESC LIMIT 1)
-		UNION ALL SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=? AND observed_at>=? ORDER BY observed_at)
+	err := eachRow(ctx, s.db, `SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=$1 AND observed_at<$2 ORDER BY observed_at DESC LIMIT 1)
+		UNION ALL SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=$3 AND observed_at>=$4 ORDER BY observed_at)
 		ORDER BY observed_at`,
 		[]any{device, sampleStamp(from), device, sampleStamp(from)}, func(rows *sql.Rows) error {
 			var at, until string

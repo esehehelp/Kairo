@@ -11,7 +11,7 @@ import (
 )
 
 func (s *Store) Heartbeat(ctx context.Context, attemptID, leaseID string, epoch int64, progress json.RawMessage) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -26,7 +26,7 @@ func (s *Store) Heartbeat(ctx context.Context, attemptID, leaseID string, epoch 
 		return errors.New("progress must be valid JSON")
 	}
 	t := now()
-	res, err := tx.ExecContext(ctx, `UPDATE attempts SET last_heartbeat_at=?,progress_json=? WHERE id=? AND state IN('running','quiescing')`, t, string(progress), attemptID)
+	res, err := tx.ExecContext(ctx, `UPDATE attempts SET last_heartbeat_at=$1,progress_json=$2 WHERE id=$3 AND state IN('running','quiescing')`, t, string(progress), attemptID)
 	if err != nil {
 		return err
 	}
@@ -40,7 +40,7 @@ func (s *Store) RegisterProcess(ctx context.Context, attemptID, leaseID string, 
 	if rank < 0 || pid <= 0 || identity == "" {
 		return errors.New("worker rank, PID, and process identity are required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -49,7 +49,7 @@ func (s *Store) RegisterProcess(ctx context.Context, attemptID, leaseID string, 
 		return err
 	}
 	var attemptState, leaseState string
-	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=? AND l.attempt_id=a.id WHERE a.id=?`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=$1 AND l.attempt_id=a.id WHERE a.id=$2`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
 		return err
 	}
 	if (attemptState != "running" && attemptState != "quiescing") || (leaseState != "active" && leaseState != "releasing") {
@@ -58,7 +58,7 @@ func (s *Store) RegisterProcess(ctx context.Context, attemptID, leaseID string, 
 	var registeredPID int
 	var registeredIdentity string
 	var registeredExited sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT pid,process_identity,exited_at FROM attempt_processes WHERE attempt_id=? AND role='worker' AND rank=?`, attemptID, rank).Scan(&registeredPID, &registeredIdentity, &registeredExited)
+	err = tx.QueryRowContext(ctx, `SELECT pid,process_identity,exited_at FROM attempt_processes WHERE attempt_id=$1 AND role='worker' AND rank=$2`, attemptID, rank).Scan(&registeredPID, &registeredIdentity, &registeredExited)
 	if err == nil && (registeredPID != pid || registeredIdentity != identity || registeredExited.Valid) {
 		return errors.New("worker rank is already bound to a different or exited process identity")
 	}
@@ -67,7 +67,7 @@ func (s *Store) RegisterProcess(ctx context.Context, attemptID, leaseID string, 
 	}
 	t := now()
 	_, err = tx.ExecContext(ctx, `INSERT INTO attempt_processes(attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at)
-	 VALUES(?,'worker','executor',?,?,?,?,?)
+	 VALUES($1,'worker','executor',$2,$3,$4,$5,$6)
 	 ON CONFLICT(attempt_id,role,rank) DO UPDATE SET last_seen_at=excluded.last_seen_at`, attemptID, rank, pid, identity, t, t)
 	if err != nil {
 		return err
@@ -76,7 +76,7 @@ func (s *Store) RegisterProcess(ctx context.Context, attemptID, leaseID string, 
 }
 
 func (s *Store) PollCommands(ctx context.Context, attemptID, leaseID string, epoch int64) ([]Command, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -85,14 +85,14 @@ func (s *Store) PollCommands(ctx context.Context, attemptID, leaseID string, epo
 		return nil, err
 	}
 	var attemptState, leaseState string
-	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=? AND l.attempt_id=a.id WHERE a.id=?`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=$1 AND l.attempt_id=a.id WHERE a.id=$2`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
 		return nil, err
 	}
 	if (attemptState != "running" && attemptState != "quiescing") || (leaseState != "active" && leaseState != "releasing") {
 		return nil, ErrStaleEpoch
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,execution_id,attempt_id,kind,origin,reason,state,delivery_count,created_at,payload_json
-	 FROM commands WHERE attempt_id=? AND state IN('pending','accepted','checkpointing') ORDER BY created_at,id`, attemptID)
+	 FROM commands WHERE attempt_id=$1 AND state IN('pending','accepted','checkpointing') ORDER BY created_at,id`, attemptID)
 	if err != nil {
 		return nil, err
 	}
@@ -113,10 +113,10 @@ func (s *Store) PollCommands(ctx context.Context, attemptID, leaseID string, epo
 	t := now()
 	for i := range commands {
 		commands[i].DeliveryCount++
-		if _, err = tx.ExecContext(ctx, `UPDATE commands SET delivery_count=delivery_count+1,updated_at=? WHERE id=?`, t, commands[i].ID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE commands SET delivery_count=delivery_count+1,updated_at=$1 WHERE id=$2`, t, commands[i].ID); err != nil {
 			return nil, err
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO command_deliveries(command_id,attempt_id,coordination_epoch,delivered_at) VALUES(?,?,?,?)`, commands[i].ID, attemptID, epoch, t); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO command_deliveries(command_id,attempt_id,coordination_epoch,delivered_at) VALUES($1,$2,$3,$4)`, commands[i].ID, attemptID, epoch, t); err != nil {
 			return nil, err
 		}
 	}
@@ -133,7 +133,7 @@ func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch
 	if !json.Valid(payload) {
 		return errors.New("command acknowledgement payload must be valid JSON")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -142,13 +142,13 @@ func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch
 		return err
 	}
 	var executionID, state string
-	if err = tx.QueryRowContext(ctx, `SELECT execution_id,state FROM commands WHERE id=? AND attempt_id=? AND lease_id=? AND coordination_epoch=? AND kind='suspend'`, commandID, attemptID, leaseID, epoch).Scan(&executionID, &state); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT execution_id,state FROM commands WHERE id=$1 AND attempt_id=$2 AND lease_id=$3 AND coordination_epoch=$4 AND kind='suspend'`, commandID, attemptID, leaseID, epoch).Scan(&executionID, &state); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
 	}
 	t := now()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO command_acks(command_id,attempt_id,coordination_epoch,phase,payload_json,created_at) VALUES(?,?,?,?,?,?)`, commandID, attemptID, epoch, phase, string(payload), t); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO command_acks(command_id,attempt_id,coordination_epoch,phase,payload_json,created_at) VALUES($1,$2,$3,$4,$5,$6)`, commandID, attemptID, epoch, phase, string(payload), t); err != nil {
 		return err
 	}
 	advance := false
@@ -160,30 +160,30 @@ func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch
 		}
 	}
 	if advance {
-		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state=?,payload_json=?,updated_at=? WHERE id=?`, phase, string(payload), t, commandID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state=$1,payload_json=$2,updated_at=$3 WHERE id=$4`, phase, string(payload), t, commandID); err != nil {
 			return err
 		}
 	}
 	if phase == "rejected" && advance {
-		result, updateErr := tx.ExecContext(ctx, `UPDATE attempts SET state='running' WHERE id=? AND state='quiescing'`, attemptID)
+		result, updateErr := tx.ExecContext(ctx, `UPDATE attempts SET state='running' WHERE id=$1 AND state='quiescing'`, attemptID)
 		if updateErr != nil {
 			return updateErr
 		}
 		restored, _ := result.RowsAffected()
 		if restored == 1 {
-			if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='active',releasing_at=NULL WHERE id=? AND state='releasing'`, leaseID); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='active',releasing_at=NULL WHERE id=$1 AND state='releasing'`, leaseID); err != nil {
 				return err
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='blocked',blocker_reason='checkpoint_rejected',updated_at=? WHERE command_id=? AND state!='quiesced'`, t, commandID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='blocked',blocker_reason='checkpoint_rejected',updated_at=$1 WHERE command_id=$2 AND state!='quiesced'`, t, commandID); err != nil {
 			return err
 		}
 	}
 	if (phase == "accepted" || phase == "checkpointing") && state != "checkpointed" && state != "rejected" {
-		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiescing' WHERE id=? AND state='running'`, attemptID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiescing' WHERE id=$1 AND state='running'`, attemptID); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,?) WHERE id=? AND state='active'`, t, leaseID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,$1) WHERE id=$2 AND state='active'`, t, leaseID); err != nil {
 			return err
 		}
 	}
@@ -194,13 +194,13 @@ func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch
 		if err = json.Unmarshal(payload, &body); err != nil || body.ContinuationRef == "" {
 			return errors.New("checkpointed acknowledgement requires continuation_ref")
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state=CASE WHEN state IN('running','quiescing') THEN 'quiescing' ELSE state END,checkpointed_at=?,continuation_ref=? WHERE id=?`, t, body.ContinuationRef, attemptID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state=CASE WHEN state IN('running','quiescing') THEN 'quiescing' ELSE state END,checkpointed_at=$1,continuation_ref=$2 WHERE id=$3`, t, body.ContinuationRef, attemptID); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,?) WHERE id=? AND state='active'`, t, leaseID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,$1) WHERE id=$2 AND state='active'`, t, leaseID); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiescing',updated_at=? WHERE command_id=? AND state!='quiesced'`, t, commandID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiescing',updated_at=$1 WHERE command_id=$2 AND state!='quiesced'`, t, commandID); err != nil {
 			return err
 		}
 		projectID, projectErr := executionProjectIDTx(ctx, tx, executionID)
@@ -218,14 +218,14 @@ func (s *Store) EnqueueSuspend(ctx context.Context, attemptID, origin, reason st
 	if origin != "scope_pause" && origin != "priority_preemption" && origin != "node_quarantine" {
 		return "", errors.New("invalid suspend origin")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
 	var executionID, leaseID, attemptState, leaseState string
 	var epoch int64
-	if err = tx.QueryRowContext(ctx, `SELECT a.execution_id,l.id,a.coordination_epoch,a.state,l.state FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=?`, attemptID).Scan(&executionID, &leaseID, &epoch, &attemptState, &leaseState); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT a.execution_id,l.id,a.coordination_epoch,a.state,l.state FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=$1`, attemptID).Scan(&executionID, &leaseID, &epoch, &attemptState, &leaseState); errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	} else if err != nil {
 		return "", err
@@ -237,13 +237,13 @@ func (s *Store) EnqueueSuspend(ctx context.Context, attemptID, origin, reason st
 		return "", fmt.Errorf("lease is not suspendable from state %s", leaseState)
 	}
 	var existing string
-	if err = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=? AND state!='rejected' LIMIT 1`, attemptID).Scan(&existing); err == nil {
+	if err = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=$1 AND state!='rejected' LIMIT 1`, attemptID).Scan(&existing); err == nil {
 		return existing, tx.Commit()
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
 	commandID, t := id.New("cmd"), now()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at) VALUES(?,?,?,?,?,'suspend',?,?,'pending',?,?)`, commandID, executionID, attemptID, leaseID, epoch, origin, reason, t, t); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'suspend',$6,$7,'pending',$8,$9)`, commandID, executionID, attemptID, leaseID, epoch, origin, reason, t, t); err != nil {
 		return "", err
 	}
 	projectID, err := executionProjectIDTx(ctx, tx, executionID)
@@ -258,7 +258,7 @@ func (s *Store) EnqueueSuspend(ctx context.Context, attemptID, origin, reason st
 
 func executionProjectIDTx(ctx context.Context, tx *sql.Tx, executionID string) (string, error) {
 	var projectID string
-	err := tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=?`, executionID).Scan(&projectID)
+	err := tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=$1`, executionID).Scan(&projectID)
 	return projectID, err
 }
 
@@ -266,7 +266,7 @@ func executionProjectIDTx(ctx context.Context, tx *sql.Tx, executionID string) (
 // classify success, failure, or retryability. Process absence is finalized
 // separately by FinalizeQuiescence.
 func (s *Store) RecordTerminal(ctx context.Context, attemptID, leaseID string, epoch int64, exitCode int, exitSignal string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -275,7 +275,7 @@ func (s *Store) RecordTerminal(ctx context.Context, attemptID, leaseID string, e
 		return err
 	}
 	var executionID, state string
-	if err = tx.QueryRowContext(ctx, `SELECT execution_id,state FROM attempts WHERE id=?`, attemptID).Scan(&executionID, &state); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT execution_id,state FROM attempts WHERE id=$1`, attemptID).Scan(&executionID, &state); err != nil {
 		return err
 	}
 	if state == "quiesced" || state == "exited" {
@@ -285,26 +285,26 @@ func (s *Store) RecordTerminal(ctx context.Context, attemptID, leaseID string, e
 		return errors.New("lost attempt requires reconciliation")
 	}
 	t := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='exited',exit_code=?,exit_signal=?,exited_at=? WHERE id=?`, exitCode, nullable(exitSignal), t, attemptID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='exited',exit_code=$1,exit_signal=$2,exited_at=$3 WHERE id=$4`, exitCode, nullable(exitSignal), t, attemptID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=?,last_seen_at=? WHERE attempt_id=? AND role='launcher' AND exited_at IS NULL`, t, t, attemptID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=$1,last_seen_at=$2 WHERE attempt_id=$3 AND role='launcher' AND exited_at IS NULL`, t, t, attemptID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,?) WHERE id=? AND state IN('prepared','active')`, t, leaseID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='releasing',releasing_at=COALESCE(releasing_at,$1) WHERE id=$2 AND state IN('prepared','active')`, t, leaseID); err != nil {
 		return err
 	}
 	// An exit recorded after a force stop was requested is that force stop's
 	// doing (or at least superseded by it): the execution ends force_stopped.
 	cause := "process_exit"
 	var forced int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM force_stops WHERE execution_id=? AND state IN('pending','signalled','terminated')`, executionID).Scan(&forced); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM force_stops WHERE execution_id=$1 AND state IN('pending','signalled','terminated')`, executionID).Scan(&forced); err != nil {
 		return err
 	}
 	if forced > 0 {
 		cause = "force_stopped"
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause=?,terminal_at=? WHERE id=? AND state IN('authorized','started')`, cause, t, executionID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause=$1,terminal_at=$2 WHERE id=$3 AND state IN('authorized','started')`, cause, t, executionID); err != nil {
 		return err
 	}
 	projectID, err := executionProjectIDTx(ctx, tx, executionID)
@@ -318,7 +318,7 @@ func (s *Store) RecordTerminal(ctx context.Context, attemptID, leaseID string, e
 }
 
 func (s *Store) SetAttemptLogPaths(ctx context.Context, attemptID string, epoch int64, stdoutPath, stderrPath string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE attempts SET stdout_path=?,stderr_path=? WHERE id=? AND coordination_epoch=?`, stdoutPath, stderrPath, attemptID, epoch)
+	res, err := s.exec(ctx, `UPDATE attempts SET stdout_path=$1,stderr_path=$2 WHERE id=$3 AND coordination_epoch=$4`, stdoutPath, stderrPath, attemptID, epoch)
 	if err != nil {
 		return err
 	}
@@ -343,7 +343,7 @@ func (s *Store) ListQuiescenceCandidates(ctx context.Context, executorID string)
 	}
 	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.execution_id,a.state,a.executor_id,a.coordination_epoch,a.pid,a.process_identity,a.exit_code,a.exit_signal,a.continuation_ref,a.progress_json,a.started_at,a.last_heartbeat_at,a.checkpointed_at,a.exited_at,a.quiesced_at,
 	 l.id,l.execution_id,l.attempt_id,l.executor_id,l.coordination_epoch,l.state,l.created_at,l.expires_at
-	 FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=? AND a.state='exited' AND l.state='releasing' ORDER BY a.exited_at`, executorID)
+	 FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=$1 AND a.state='exited' AND l.state='releasing' ORDER BY a.exited_at`, executorID)
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +378,7 @@ func (s *Store) ListQuiescenceCandidates(ctx context.Context, executorID string)
 }
 
 func (s *Store) ListAttemptProcesses(ctx context.Context, attemptID string, liveOnly bool) ([]AttemptProcess, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at,exited_at FROM attempt_processes WHERE attempt_id=? AND (?=0 OR exited_at IS NULL) ORDER BY role,rank`, attemptID, liveOnly)
+	rows, err := s.db.QueryContext(ctx, `SELECT attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at,exited_at FROM attempt_processes WHERE attempt_id=$1 AND ($2=0 OR exited_at IS NULL) ORDER BY role,rank`, attemptID, liveOnly)
 	if err != nil {
 		return nil, err
 	}
@@ -395,13 +395,13 @@ func (s *Store) ListAttemptProcesses(ctx context.Context, attemptID string, live
 }
 
 func (s *Store) MarkAttemptProcessExited(ctx context.Context, attemptID, role string, rank int, identity string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=?,last_seen_at=? WHERE attempt_id=? AND role=? AND rank=? AND process_identity=? AND exited_at IS NULL`, now(), now(), attemptID, role, rank, identity)
+	res, err := s.exec(ctx, `UPDATE attempt_processes SET exited_at=$1,last_seen_at=$2 WHERE attempt_id=$3 AND role=$4 AND rank=$5 AND process_identity=$6 AND exited_at IS NULL`, now(), now(), attemptID, role, rank, identity)
 	if err != nil {
 		return err
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		var exited sql.NullString
-		if scanErr := s.db.QueryRowContext(ctx, `SELECT exited_at FROM attempt_processes WHERE attempt_id=? AND role=? AND rank=? AND process_identity=?`, attemptID, role, rank, identity).Scan(&exited); scanErr != nil || !exited.Valid {
+		if scanErr := s.db.QueryRowContext(ctx, `SELECT exited_at FROM attempt_processes WHERE attempt_id=$1 AND role=$2 AND rank=$3 AND process_identity=$4`, attemptID, role, rank, identity).Scan(&exited); scanErr != nil || !exited.Valid {
 			return ErrNotFound
 		}
 	}
@@ -410,7 +410,7 @@ func (s *Store) MarkAttemptProcessExited(ctx context.Context, attemptID, role st
 
 func (s *Store) listLeaseResources(ctx context.Context, leaseID string) ([]ResourceInstance, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT r.id,r.node_id,r.provider_id,r.kind,r.stable_identity,r.binding_json,r.attributes_json,r.admin_state,r.quarantine_reason
-	 FROM lease_items li JOIN resource_instances r ON r.id=li.resource_id WHERE li.lease_id=? AND li.resource_id IS NOT NULL ORDER BY r.id`, leaseID)
+	 FROM lease_items li JOIN resource_instances r ON r.id=li.resource_id WHERE li.lease_id=$1 AND li.resource_id IS NOT NULL ORDER BY r.id`, leaseID)
 	if err != nil {
 		return nil, err
 	}
@@ -430,7 +430,7 @@ func (s *Store) listLeaseResources(ctx context.Context, leaseID string) ([]Resou
 }
 
 func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID string, epoch int64) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -439,7 +439,7 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 		return err
 	}
 	var executionID, attemptState, leaseState string
-	if err = tx.QueryRowContext(ctx, `SELECT a.execution_id,a.state,l.state FROM attempts a JOIN leases l ON l.id=? AND l.attempt_id=a.id WHERE a.id=?`, leaseID, attemptID).Scan(&executionID, &attemptState, &leaseState); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT a.execution_id,a.state,l.state FROM attempts a JOIN leases l ON l.id=$1 AND l.attempt_id=a.id WHERE a.id=$2`, leaseID, attemptID).Scan(&executionID, &attemptState, &leaseState); err != nil {
 		return err
 	}
 	if attemptState == "quiesced" && leaseState == "released" {
@@ -449,7 +449,7 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 		return fmt.Errorf("attempt/lease not ready for quiescence: %s/%s", attemptState, leaseState)
 	}
 	var live int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes WHERE attempt_id=? AND exited_at IS NULL`, attemptID).Scan(&live); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes WHERE attempt_id=$1 AND exited_at IS NULL`, attemptID).Scan(&live); err != nil {
 		return err
 	}
 	if live != 0 {
@@ -462,13 +462,13 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 	var unsafe int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li
 	 LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
-	 WHERE li.lease_id=? AND li.kind='gpu' AND li.resource_id IS NOT NULL AND
-	 (o.id IS NULL OR julianday(o.valid_until)<=julianday(?)
-	 OR julianday(o.observed_at)<=julianday((SELECT exited_at FROM attempts WHERE id=?))
-	 OR EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=? AND julianday(o.observed_at)<=julianday(ap.exited_at))
+	 WHERE li.lease_id=$1 AND li.kind='gpu' AND li.resource_id IS NOT NULL AND
+	 (o.id IS NULL OR (o.valid_until)::timestamptz<=($2)::timestamptz
+	 OR (o.observed_at)::timestamptz<=((SELECT exited_at FROM attempts WHERE id=$3))::timestamptz
+	 OR EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=$4 AND (o.observed_at)::timestamptz<=(ap.exited_at)::timestamptz)
 	 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL
 	   AND (c.claim_kind='external_process' OR c.claim_kind='unattributed_activity' AND COALESCE(
-	     (SELECT json_extract(rr.policy_json,'$.on_unattributed_activity') FROM resource_requests rr
+	     (SELECT rr.policy_json::jsonb->>'on_unattributed_activity' FROM resource_requests rr
 	      JOIN leases policy_lease ON policy_lease.execution_id=rr.execution_id
 	      WHERE policy_lease.id=li.lease_id AND rr.request_type='exclusive' AND rr.kind=li.kind LIMIT 1),
 	     'wait')!='allow'))
@@ -479,13 +479,13 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 		return errors.New("leased GPU still lacks a fresh observation allowed by its conflict policy")
 	}
 	t := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',quiesced_at=? WHERE id=? AND state='exited'`, t, attemptID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',quiesced_at=$1 WHERE id=$2 AND state='exited'`, t, attemptID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=? WHERE id=? AND state='releasing'`, t, leaseID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=$1 WHERE id=$2 AND state='releasing'`, t, leaseID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',updated_at=? WHERE execution_id=? AND attempt_id=?`, t, executionID, attemptID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',updated_at=$1 WHERE execution_id=$2 AND attempt_id=$3`, t, executionID, attemptID); err != nil {
 		return err
 	}
 	projectID, err := executionProjectIDTx(ctx, tx, executionID)
@@ -505,12 +505,12 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 }
 
 func (s *Store) MarkExecutorUnknown(ctx context.Context, executorID string) (int, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.execution_id,a.coordination_epoch,l.id FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=? AND a.state IN('authorized','running','quiescing') AND l.state IN('prepared','active','releasing','revocation_requested')`, executorID)
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.execution_id,a.coordination_epoch,l.id FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=$1 AND a.state IN('authorized','running','quiescing') AND l.state IN('prepared','active','releasing','revocation_requested')`, executorID)
 	if err != nil {
 		return 0, err
 	}
@@ -534,7 +534,7 @@ func (s *Store) MarkExecutorUnknown(ctx context.Context, executorID string) (int
 	// before it creates an attempt. Those leases are equally in-doubt and must
 	// block allocation until provider/OS reconciliation proves them free.
 	orphanRows, err := tx.QueryContext(ctx, `SELECT l.id,l.execution_id,l.coordination_epoch
-		FROM leases l WHERE l.executor_id=? AND l.attempt_id IS NULL
+		FROM leases l WHERE l.executor_id=$1 AND l.attempt_id IS NULL
 		AND l.state IN('reserved','prepared','revocation_requested')`, executorID)
 	if err != nil {
 		return 0, err
@@ -557,16 +557,16 @@ func (s *Store) MarkExecutorUnknown(ctx context.Context, executorID string) (int
 	}
 	t := now()
 	for _, value := range values {
-		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='lost',coordination_epoch=coordination_epoch+1 WHERE id=?`, value.attempt); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='lost',coordination_epoch=coordination_epoch+1 WHERE id=$1`, value.attempt); err != nil {
 			return 0, err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='stale',stale_at=?,coordination_epoch=coordination_epoch+1 WHERE id=?`, t, value.lease); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='stale',stale_at=$1,coordination_epoch=coordination_epoch+1 WHERE id=$2`, t, value.lease); err != nil {
 			return 0, err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=? WHERE attempt_id=? AND state='issued'`, t, value.attempt); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=$1 WHERE attempt_id=$2 AND state='issued'`, t, value.attempt); err != nil {
 			return 0, err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='executor_identity_lost',terminal_at=? WHERE id=? AND state!='terminal'`, t, value.execution); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='executor_identity_lost',terminal_at=$1 WHERE id=$2 AND state!='terminal'`, t, value.execution); err != nil {
 			return 0, err
 		}
 		projectID, projectErr := executionProjectIDTx(ctx, tx, value.execution)
@@ -578,7 +578,7 @@ func (s *Store) MarkExecutorUnknown(ctx context.Context, executorID string) (int
 		}
 	}
 	for _, value := range orphans {
-		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='stale',stale_at=?,coordination_epoch=coordination_epoch+1 WHERE id=?`, t, value.lease); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='stale',stale_at=$1,coordination_epoch=coordination_epoch+1 WHERE id=$2`, t, value.lease); err != nil {
 			return 0, err
 		}
 		projectID, projectErr := executionProjectIDTx(ctx, tx, value.execution)

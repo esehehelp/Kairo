@@ -3,51 +3,24 @@ package store
 import (
 	"context"
 	"database/sql"
-	_ "embed"
+	"embed"
 	"errors"
 	"fmt"
-	"regexp"
+	"path"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
-//go:embed schema.sql
-var schema string
-
-//go:embed orchestration_schema.sql
-var orchestrationSchema string
-
-//go:embed quarantine_schema.sql
-var quarantineSchema string
-
-//go:embed gang_schema.sql
-var gangSchema string
-
-//go:embed force_stop_schema.sql
-var forceStopSchema string
-
-//go:embed auth_schema.sql
-var authSchema string
-
-//go:embed planner_schema.sql
-var plannerSchema string
-
-//go:embed machine_schema.sql
-var machineSchema string
-
-//go:embed log_problem_schema.sql
-var logProblemSchema string
-
-//go:embed device_schema.sql
-var deviceSchema string
-
-//go:embed device_samples_schema.sql
-var deviceSamplesSchema string
-
-//go:embed hardware_bench_schema.sql
-var hardwareBenchSchema string
+// migrations are the schema's numbered steps (NNNN_name.sql), applied in
+// order; schema_version records the ones a database has.
+//
+//go:embed migrations/*.sql
+var migrationFiles embed.FS
 
 var (
 	ErrNotFound              = errors.New("not found")
@@ -56,7 +29,10 @@ var (
 	ErrExecutionStarted      = errors.New("execution has already started")
 	ErrStaleEpoch            = errors.New("stale coordination epoch")
 	ErrOrchestrationConflict = errors.New("logical task was already declared with different immutable content")
-	ErrLegacySchema          = errors.New("legacy Kairo database detected; archive it and create a fresh V3 coordination database")
+	// ErrNoSchema: OpenExisting found no Kairo schema in the database.
+	ErrNoSchema = errors.New("the database holds no Kairo schema")
+	// ErrForeignDatabase: the database has tables but no Kairo schema.
+	ErrForeignDatabase = errors.New("the database is not empty and holds no Kairo schema; use an empty database")
 	// ErrGangNotReady: a gang rank is prepared but not every rank is yet; the
 	// executor keeps its prepared reservation and asks again.
 	ErrGangNotReady = errors.New("gang placement is not prepared on every rank yet")
@@ -65,328 +41,223 @@ var (
 	ErrGangAborted = errors.New("gang placement was aborted")
 )
 
+// decisionLock is the key of the transaction-scoped advisory lock that every
+// writing transaction takes before anything else (beginWrite). Kairo's
+// decisions (admission, leases, launch, gates, preemption, quarantine,
+// commands, device settings, machine apply, orchestration) read state and
+// write what follows from it; holding one lock for the whole transaction runs
+// them one at a time, as if there were a single connection, whatever the
+// pool size and however many processes share the database. Reads take no
+// lock and run concurrently.
+const decisionLock int64 = 0x4b4149524f // "KAIRO"
+
+// lockStatement makes a transaction writable (connections default to
+// read-only, so a write outside beginWrite fails) and takes the decision
+// lock, in one round trip.
+var lockStatement = "SET TRANSACTION READ WRITE; SELECT pg_advisory_xact_lock(" + strconv.FormatInt(decisionLock, 10) + ")"
+
+// maxConns bounds the pool. Writers wait for each other on the decision
+// lock, so more connections only serve more concurrent reads.
+const maxConns = 16
+
 type Store struct {
+	// db is the pool. Its connections are read-only by default
+	// (default_transaction_read_only): read through it directly or with
+	// beginRead; write only through beginWrite or exec.
 	db     *sql.DB
 	policy SchedulingPolicy
 }
 
-func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+// Open connects to the PostgreSQL database dsn (a postgres:// URL or a
+// key=value connection string). An empty database gets the schema; a Kairo
+// database gets the migrations it lacks.
+func Open(dsn string) (*Store, error) { return open(dsn, true, nil) }
+
+// OpenExisting is Open for tools that must not create a database of their
+// own (a token in a database the daemon does not use would never
+// authenticate): it fails with ErrNoSchema when the database holds no Kairo
+// schema.
+func OpenExisting(dsn string) (*Store, error) { return open(dsn, false, nil) }
+
+func open(dsn string, create bool, tracer pgx.QueryTracer) (*Store, error) {
+	config, err := pgx.ParseConfig(dsn)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("database url: %w", err)
 	}
-	db.SetMaxOpenConns(1)
-	for _, pragma := range []string{
-		"PRAGMA journal_mode = WAL",
-		"PRAGMA foreign_keys = ON",
-		"PRAGMA busy_timeout = 5000",
-	} {
-		if _, err := db.Exec(pragma); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("%s: %w", pragma, err)
-		}
+	config.RuntimeParams["default_transaction_read_only"] = "on"
+	if config.RuntimeParams["application_name"] == "" {
+		config.RuntimeParams["application_name"] = "kairo"
 	}
-	var migrated int
-	err = db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='schema_migrations'`).Scan(&migrated)
-	if err != nil {
+	config.Tracer = tracer
+	db := stdlib.OpenDB(*config)
+	db.SetMaxOpenConns(maxConns)
+	db.SetMaxIdleConns(maxConns)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	if err := migrate(ctx, db, create); err != nil {
 		db.Close()
 		return nil, err
-	}
-	if migrated == 0 {
-		var userTables int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`).Scan(&userTables); err != nil {
-			db.Close()
-			return nil, err
-		}
-		if userTables != 0 {
-			db.Close()
-			return nil, ErrLegacySchema
-		}
-		if _, err := db.Exec(schema); err != nil {
-			db.Close()
-			return nil, fmt.Errorf("apply schema: %w", err)
-		}
-	} else {
-		var version int
-		if err := db.QueryRow(`SELECT COALESCE(MAX(version),0) FROM schema_migrations`).Scan(&version); err != nil {
-			db.Close()
-			return nil, err
-		}
-		if version == 1 || version == 2 {
-			db.Close()
-			return nil, ErrLegacySchema
-		}
-		if version != 3 {
-			db.Close()
-			return nil, fmt.Errorf("unsupported schema version %d", version)
-		}
-	}
-	var orchestrationMigrated int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='orchestration_schema_migrations'`).Scan(&orchestrationMigrated); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if orchestrationMigrated != 0 {
-		var version int
-		if err := db.QueryRow(`SELECT COALESCE(MAX(version),0) FROM orchestration_schema_migrations`).Scan(&version); err != nil {
-			db.Close()
-			return nil, err
-		}
-		if version != 1 {
-			db.Close()
-			return nil, fmt.Errorf("unsupported orchestration schema version %d", version)
-		}
-	}
-	if _, err := db.Exec(orchestrationSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply orchestration schema: %w", err)
-	}
-	// Node quarantine adds a suspend origin and an orchestration reason.
-	for _, w := range []struct{ table, old, new string }{
-		{"commands", "origin IN('scope_pause','priority_preemption')", "origin IN('scope_pause','priority_preemption','node_quarantine')"},
-		{"orchestration_decisions", "reason IN('initial','continuation')", "reason IN('initial','continuation','quarantine_restart')"},
-	} {
-		if err := widenCheck(db, w.table, w.old, w.new); err != nil {
-			db.Close()
-			return nil, err
-		}
-	}
-	if _, err := db.Exec(quarantineSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply quarantine schema: %w", err)
-	}
-	// Gangs add an orchestration reason: a gang stopped because one rank stopped.
-	if err := widenCheck(db, "orchestration_decisions", "reason IN('initial','continuation','quarantine_restart')", "reason IN('initial','continuation','quarantine_restart','gang_restart')"); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if _, err := db.Exec(gangSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply gang schema: %w", err)
-	}
-	// Force stop adds a terminal task state: the task was ended by `pause --force`.
-	if err := widenCheck(db, "orchestration_tasks", "state IN('pending','running','succeeded','failed','blocked')", "state IN('pending','running','succeeded','failed','blocked','stopped')"); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if _, err := db.Exec(forceStopSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply force stop schema: %w", err)
-	}
-	if _, err := db.Exec(authSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply auth schema: %w", err)
-	}
-	// Executions declare env: execution_requests.env_json, NULL when none.
-	if err := addColumnIfMissing(db, "execution_requests", "env_json", "TEXT"); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := migrateTasks(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if err := applyMachineSchema(db); err != nil {
-		db.Close()
-		return nil, err
-	}
-	if _, err := db.Exec(plannerSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply planner schema: %w", err)
-	}
-	if _, err := db.Exec(logProblemSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply log problem schema: %w", err)
-	}
-	if _, err := db.Exec(deviceSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply device schema: %w", err)
-	}
-	if _, err := db.Exec(deviceSamplesSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply device samples schema: %w", err)
-	}
-	if _, err := db.Exec(hardwareBenchSchema); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("apply hardware bench schema: %w", err)
 	}
 	return &Store{db: db, policy: SchedulingPolicy{DiskMinFreeBytes: DefaultDiskMinFreeBytes}}, nil
 }
 
-// applyMachineSchema creates the machine declaration tables. A database that
-// predates them gets every registered GPU declared for the node it is
-// registered on, so GPU scheduling goes on unchanged after the upgrade.
-func applyMachineSchema(db *sql.DB) error {
-	var existed int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='machine_gpus'`).Scan(&existed); err != nil {
-		return err
+// Migrations returns the schema's numbered steps in order (the import tool
+// creates the schema with them).
+func Migrations() ([]string, error) {
+	names, err := migrationFiles.ReadDir("migrations")
+	if err != nil {
+		return nil, err
 	}
-	if _, err := db.Exec(machineSchema); err != nil {
-		return fmt.Errorf("apply machine schema: %w", err)
+	var files []string
+	for _, entry := range names {
+		files = append(files, entry.Name())
 	}
-	if existed != 0 {
-		return widenMachineKey(db)
+	sort.Strings(files)
+	out := make([]string, 0, len(files))
+	for i, name := range files {
+		number, _, ok := strings.Cut(name, "_")
+		if n, err := strconv.Atoi(number); !ok || err != nil || n != i+1 {
+			return nil, fmt.Errorf("migration %s is out of sequence", name)
+		}
+		body, err := migrationFiles.ReadFile(path.Join("migrations", name))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, string(body))
 	}
-	if _, err := db.Exec(`INSERT OR IGNORE INTO machine_gpus(uuid,node_id,declared_at) SELECT stable_identity,node_id,? FROM resource_instances WHERE kind='gpu'`, now()); err != nil {
-		return fmt.Errorf("seed machine declaration: %w", err)
-	}
-	return nil
+	return out, nil
 }
 
-// widenMachineKey rebuilds a machine_gpus table keyed by uuid alone (from
-// before shared GPUs) with the (uuid, node_id) key, keeping its rows. Nothing
-// references the table, so a copy and a rename in one transaction suffice.
-func widenMachineKey(db *sql.DB) error {
-	var ddl string
-	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name='machine_gpus'`).Scan(&ddl); err != nil {
-		return err
-	}
-	if strings.Contains(ddl, "PRIMARY KEY(uuid,node_id)") {
-		return nil
-	}
-	tx, err := db.Begin()
+// migrate checks the database and brings its schema up to date, in one
+// transaction under the decision lock (two daemons starting at once migrate
+// one after the other).
+func migrate(ctx context.Context, db *sql.DB, create bool) error {
+	tx, err := BeginWrite(ctx, db)
 	if err != nil {
-		return err
+		return fmt.Errorf("connect to the database: %w", err)
 	}
 	defer tx.Rollback()
-	for _, statement := range []string{
-		`CREATE TABLE machine_gpus_shared(uuid TEXT NOT NULL,node_id TEXT NOT NULL REFERENCES nodes(id),declared_at TEXT NOT NULL,PRIMARY KEY(uuid,node_id))`,
-		`INSERT INTO machine_gpus_shared(uuid,node_id,declared_at) SELECT uuid,node_id,declared_at FROM machine_gpus`,
-		`DROP TABLE machine_gpus`,
-		`ALTER TABLE machine_gpus_shared RENAME TO machine_gpus`,
-	} {
-		if _, err = tx.Exec(statement); err != nil {
-			return fmt.Errorf("widen the machine declaration's key: %w", err)
-		}
+	if err := migrateTx(ctx, tx, create); err != nil {
+		return err
 	}
 	return tx.Commit()
 }
 
-// widenCheck adds a value to a CHECK(... IN(...)) list of an existing table,
-// for databases created before the value existed. SQLite cannot alter a
-// CHECK, so the table is rebuilt in one transaction with foreign keys off
-// (the documented procedure); its indexes are recreated and foreign keys are
-// verified before committing. A table that already allows the value is left
-// alone.
-func widenCheck(db *sql.DB, table, oldList, newList string) error {
-	return widenChecks(db, table, [2]string{oldList, newList})
-}
-
-// widenChecks is widenCheck for several lists of one table ({old, new} each),
-// with a single rebuild for all the lists that need widening.
-func widenChecks(db *sql.DB, table string, lists ...[2]string) error {
-	var ddl string
-	if err := db.QueryRow(`SELECT sql FROM sqlite_master WHERE type='table' AND name=?`, table).Scan(&ddl); err != nil {
+// CreateSchema creates the schema in an empty database within tx, which
+// must be writable (the import tool's transaction).
+func CreateSchema(ctx context.Context, tx *sql.Tx) error {
+	var versioned bool
+	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('schema_version') IS NOT NULL`).Scan(&versioned); err != nil {
 		return err
 	}
-	quoted := regexp.MustCompile(`'[^']*'`)
-	var pending [][2]string
-	for _, list := range lists {
-		oldList, newList := list[0], list[1]
-		if strings.Contains(ddl, newList) {
-			continue
-		}
-		// A later widening of the same list has already added these values.
-		added := 0
-		for _, value := range quoted.FindAllString(newList, -1) {
-			if !strings.Contains(oldList, value) {
-				added++
-				if !strings.Contains(ddl, value) {
-					added = -1
-					break
-				}
-			}
-		}
-		if added > 0 {
-			continue
-		}
-		if !strings.Contains(ddl, oldList) {
-			return fmt.Errorf("unexpected %s definition: %s", table, ddl)
-		}
-		pending = append(pending, list)
+	if versioned {
+		return ErrForeignDatabase
 	}
-	if len(pending) == 0 {
-		return nil
-	}
-	ctx := context.Background()
-	rows, err := db.QueryContext(ctx, `SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name=? AND sql IS NOT NULL`, table)
+	return migrateTx(ctx, tx, true)
+}
+
+func migrateTx(ctx context.Context, tx *sql.Tx, create bool) error {
+	steps, err := Migrations()
 	if err != nil {
 		return err
 	}
-	var indexes []string
-	for rows.Next() {
-		var ix string
-		if err = rows.Scan(&ix); err != nil {
-			rows.Close()
+	if err := checkDatabase(ctx, tx); err != nil {
+		return err
+	}
+	var versioned bool
+	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('schema_version') IS NOT NULL`).Scan(&versioned); err != nil {
+		return err
+	}
+	version := 0
+	if versioned {
+		if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(version),0) FROM schema_version`).Scan(&version); err != nil {
 			return err
 		}
-		indexes = append(indexes, ix)
-	}
-	if err = rows.Close(); err != nil {
-		return err
-	}
-	conn, err := db.Conn(ctx)
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-	if _, err = conn.ExecContext(ctx, `PRAGMA foreign_keys = OFF`); err != nil {
-		return err
-	}
-	defer conn.ExecContext(ctx, `PRAGMA foreign_keys = ON`)
-	tx, err := conn.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	widened := table + "_widened"
-	// The stored DDL names the table plainly, or quoted after a rename.
-	head := regexp.MustCompile(`(?i)^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?("` + regexp.QuoteMeta(table) + `"|` + regexp.QuoteMeta(table) + `)\s*\(`)
-	loc := head.FindStringIndex(ddl)
-	if loc == nil {
-		return fmt.Errorf("unexpected %s definition: %s", table, ddl)
-	}
-	newDDL := "CREATE TABLE " + widened + "(" + ddl[loc[1]:]
-	for _, list := range pending {
-		newDDL = strings.Replace(newDDL, list[0], list[1], 1)
-	}
-	stmts := []string{newDDL, `INSERT INTO ` + widened + ` SELECT * FROM ` + table, `DROP TABLE ` + table, `ALTER TABLE ` + widened + ` RENAME TO ` + table}
-	stmts = append(stmts, indexes...)
-	for _, stmt := range stmts {
-		if _, err = tx.ExecContext(ctx, stmt); err != nil {
-			return fmt.Errorf("widen %s: %s: %w", table, strings.SplitN(stmt, "(", 2)[0], err)
+	} else {
+		if !create {
+			return ErrNoSchema
+		}
+		var tables int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM pg_tables WHERE schemaname=current_schema()`).Scan(&tables); err != nil {
+			return err
+		}
+		if tables != 0 {
+			return ErrForeignDatabase
 		}
 	}
-	check, err := tx.QueryContext(ctx, `PRAGMA foreign_key_check`)
-	if err != nil {
-		return err
+	if version > len(steps) {
+		return fmt.Errorf("the database schema is version %d, newer than this Kairo knows (%d)", version, len(steps))
 	}
-	violation := check.Next()
-	if err = check.Close(); err != nil {
-		return err
-	}
-	if violation {
-		return fmt.Errorf("foreign key check failed after rebuilding %s", table)
-	}
-	return tx.Commit()
-}
-
-// addColumnIfMissing adds a column to an existing table, for databases
-// created before it existed. A table that has the column is left alone.
-func addColumnIfMissing(db *sql.DB, table, column, decl string) error {
-	var found bool
-	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM pragma_table_info(?) WHERE name=?)`, table, column).Scan(&found); err != nil {
-		return err
-	}
-	if found {
-		return nil
-	}
-	if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column + ` ` + decl); err != nil {
-		return fmt.Errorf("add %s.%s: %w", table, column, err)
+	for v := version + 1; v <= len(steps); v++ {
+		if _, err := tx.ExecContext(ctx, steps[v-1]); err != nil {
+			return fmt.Errorf("apply schema migration %d: %w", v, err)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO schema_version(version,applied_at) VALUES($1,$2)`, v, now()); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// checkDatabase refuses a database whose text does not compare byte by byte
+// (times and identifiers are compared as text) or is not UTF-8.
+func checkDatabase(ctx context.Context, tx *sql.Tx) error {
+	var encoding string
+	var bytewise bool
+	if err := tx.QueryRowContext(ctx, `SELECT pg_encoding_to_char(encoding),'B'<'a' AND 'a-z'<'a.b' AND 'Z'<'_' AND '9Z'<'9_' FROM pg_database WHERE datname=current_database()`).Scan(&encoding, &bytewise); err != nil {
+		return err
+	}
+	if encoding != "UTF8" || !bytewise {
+		return fmt.Errorf("the database must use encoding UTF8 and collation C (it has %s, and its collation does not compare text byte by byte); create it with CREATE DATABASE ... TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C'", encoding)
+	}
+	return nil
+}
+
+// beginWrite begins a transaction that may write: the only way to write.
+// It takes the decision lock first, so writing transactions never overlap.
+func (s *Store) beginWrite(ctx context.Context) (*sql.Tx, error) { return BeginWrite(ctx, s.db) }
+
+// BeginWrite is beginWrite on a pool of the caller's (the import tool's).
+func BeginWrite(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, lockStatement); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
+}
+
+// beginRead begins a read-only transaction whose statements all see one
+// snapshot; it takes no lock.
+func (s *Store) beginRead(ctx context.Context) (*sql.Tx, error) {
+	return s.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+}
+
+// exec runs one writing statement in its own transaction (beginWrite).
+func (s *Store) exec(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	result, err := tx.ExecContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	return result, tx.Commit()
 }
 
 func (s *Store) Close() error { return s.db.Close() }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+// bind appends v to args and returns its placeholder ($n), for a query built
+// piece by piece.
+func bind(args *[]any, v any) string {
+	*args = append(*args, v)
+	return "$" + strconv.Itoa(len(*args))
+}

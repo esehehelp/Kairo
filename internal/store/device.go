@@ -315,7 +315,7 @@ type HardwareDevice struct {
 // (HostPolicyRef). Another lease's bench or policy setting is
 // ErrDeviceSettingConflict: the owner clears its own first.
 func (s *Store) SetDeviceSetting(ctx context.Context, hostID, deviceID string, owner DeviceOwner, settings DeviceSettings, actor string) (DeviceSettingResult, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return DeviceSettingResult{}, err
 	}
@@ -339,7 +339,7 @@ func (s *Store) SetDeviceSetting(ctx context.Context, hostID, deviceID string, o
 		}
 	}
 	var capsJSON sql.NullString
-	if err = tx.QueryRowContext(ctx, `SELECT capabilities_json FROM device_state WHERE host_id=? AND device_id=?`, hostID, deviceID).Scan(&capsJSON); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT capabilities_json FROM device_state WHERE host_id=$1 AND device_id=$2`, hostID, deviceID).Scan(&capsJSON); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return DeviceSettingResult{}, err
 	}
 	if !capsJSON.Valid {
@@ -371,7 +371,7 @@ func (s *Store) SetDeviceSetting(ctx context.Context, hostID, deviceID string, o
 			leaseID = owner.Ref
 		}
 		var current string
-		err = tx.QueryRowContext(ctx, `SELECT owner_ref FROM device_settings WHERE host_id=? AND device_id=? AND owner_kind=?`, hostID, deviceID, owner.Kind).Scan(&current)
+		err = tx.QueryRowContext(ctx, `SELECT owner_ref FROM device_settings WHERE host_id=$1 AND device_id=$2 AND owner_kind=$3`, hostID, deviceID, owner.Kind).Scan(&current)
 		if err == nil && current != owner.Ref {
 			return DeviceSettingResult{}, fmt.Errorf("%w: device %s of host %s has a %s setting of lease %s", ErrDeviceSettingConflict, deviceID, hostID, owner.Kind, current)
 		}
@@ -389,7 +389,7 @@ func (s *Store) SetDeviceSetting(ctx context.Context, hostID, deviceID string, o
 	if err != nil {
 		return DeviceSettingResult{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO device_settings(host_id,device_id,owner_kind,owner_ref,lease_id,settings_json,requested_by,requested_at) VALUES(?,?,?,?,?,?,?,?)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO device_settings(host_id,device_id,owner_kind,owner_ref,lease_id,settings_json,requested_by,requested_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)
 		ON CONFLICT(host_id,device_id,owner_kind) DO UPDATE SET owner_ref=excluded.owner_ref,lease_id=excluded.lease_id,settings_json=excluded.settings_json,requested_by=excluded.requested_by,requested_at=excluded.requested_at`,
 		hostID, deviceID, owner.Kind, owner.Ref, leaseID, string(body), actor, now()); err != nil {
 		return DeviceSettingResult{}, err
@@ -409,7 +409,7 @@ func (s *Store) SetDeviceSetting(ctx context.Context, hostID, deviceID string, o
 // bench or policy owner with a Ref, only that lease's), so the device follows
 // the next owner's setting, or returns to its defaults.
 func (s *Store) ClearDeviceSetting(ctx context.Context, hostID, deviceID string, owner DeviceOwner, actor string) (DeviceSettingResult, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return DeviceSettingResult{}, err
 	}
@@ -450,7 +450,7 @@ func checkSettingLeaseTx(ctx context.Context, tx *sql.Tx, policy machine.DeviceP
 		return errors.New("a bench or policy setting names the lease it belongs to")
 	}
 	var state, nodeID string
-	err := tx.QueryRowContext(ctx, `SELECT l.state,x.node_id FROM leases l JOIN executors x ON x.id=l.executor_id WHERE l.id=?`, leaseID).Scan(&state, &nodeID)
+	err := tx.QueryRowContext(ctx, `SELECT l.state,x.node_id FROM leases l JOIN executors x ON x.id=l.executor_id WHERE l.id=$1`, leaseID).Scan(&state, &nodeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: lease %s", ErrNotFound, leaseID)
 	}
@@ -467,7 +467,7 @@ func checkSettingLeaseTx(ctx context.Context, tx *sql.Tx, policy machine.DeviceP
 		return nil
 	}
 	var holds int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN resource_instances r ON r.id=li.resource_id WHERE li.lease_id=? AND r.kind='gpu' AND r.stable_identity=?`, leaseID, policy.DeviceID).Scan(&holds); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN resource_instances r ON r.id=li.resource_id WHERE li.lease_id=$1 AND r.kind='gpu' AND r.stable_identity=$2`, leaseID, policy.DeviceID).Scan(&holds); err != nil {
 		return err
 	}
 	if holds == 0 {
@@ -479,7 +479,7 @@ func checkSettingLeaseTx(ctx context.Context, tx *sql.Tx, policy machine.DeviceP
 // deviceSettingsTx are a device's settings by precedence (the first is in
 // effect).
 func deviceSettingsTx(ctx context.Context, q queryer, hostID, deviceID string) ([]DeviceSetting, error) {
-	rows, err := q.QueryContext(ctx, `SELECT owner_kind,owner_ref,settings_json,requested_by,requested_at FROM device_settings WHERE host_id=? AND device_id=?
+	rows, err := q.QueryContext(ctx, `SELECT owner_kind,owner_ref,settings_json,requested_by,requested_at FROM device_settings WHERE host_id=$1 AND device_id=$2
 		ORDER BY CASE owner_kind WHEN 'manual' THEN 0 WHEN 'bench' THEN 1 ELSE 2 END`, hostID, deviceID)
 	if err != nil {
 		return nil, err
@@ -522,7 +522,7 @@ func settingChangedTx(ctx context.Context, tx *sql.Tx, hostID, deviceID string, 
 		return DeviceSettingResult{}, err
 	}
 	if !sameEffective(effectiveOf(before), effectiveOf(after)) {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO device_state(host_id,device_id,generation) VALUES(?,?,1) ON CONFLICT(host_id,device_id) DO UPDATE SET generation=generation+1`, hostID, deviceID); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO device_state(host_id,device_id,generation) VALUES($1,$2,1) ON CONFLICT(host_id,device_id) DO UPDATE SET generation=device_state.generation+1`, hostID, deviceID); err != nil {
 			return DeviceSettingResult{}, err
 		}
 	}
@@ -536,7 +536,7 @@ func deviceResultTx(ctx context.Context, tx *sql.Tx, hostID, deviceID string) (D
 		return result, err
 	}
 	result.Effective = effectiveOf(settings)
-	if err = tx.QueryRowContext(ctx, `SELECT generation FROM device_state WHERE host_id=? AND device_id=?`, hostID, deviceID).Scan(&result.Generation); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT generation FROM device_state WHERE host_id=$1 AND device_id=$2`, hostID, deviceID).Scan(&result.Generation); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return result, err
 	}
 	return result, nil
@@ -549,7 +549,7 @@ func deleteDeviceSettingTx(ctx context.Context, tx *sql.Tx, setting DeviceSettin
 	if err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `DELETE FROM device_settings WHERE host_id=? AND device_id=? AND owner_kind=?`, setting.HostID, setting.DeviceID, setting.Owner.Kind); err != nil {
+	if _, err = tx.ExecContext(ctx, `DELETE FROM device_settings WHERE host_id=$1 AND device_id=$2 AND owner_kind=$3`, setting.HostID, setting.DeviceID, setting.Owner.Kind); err != nil {
 		return err
 	}
 	result, err := settingChangedTx(ctx, tx, setting.HostID, setting.DeviceID, before)
@@ -684,7 +684,7 @@ func pruneDeviceStateTx(ctx context.Context, tx *sql.Tx, policies []machine.Devi
 		return err
 	}
 	for _, device := range gone {
-		if _, err = tx.ExecContext(ctx, `DELETE FROM device_state WHERE host_id=? AND device_id=?`, device[0], device[1]); err != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM device_state WHERE host_id=$1 AND device_id=$2`, device[0], device[1]); err != nil {
 			return err
 		}
 	}
@@ -700,16 +700,16 @@ func (s *Store) RegisterDeviceController(ctx context.Context, node Node, version
 		return errors.New("node id, name, os, and architecture are required")
 	}
 	t := now()
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO nodes(id,name,os,architecture,attributes_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?) ON CONFLICT(id) DO NOTHING`,
+	if _, err = tx.ExecContext(ctx, `INSERT INTO nodes(id,name,os,architecture,attributes_json,enabled,created_at,updated_at) VALUES($1,$2,$3,$4,$5,TRUE,$6,$7) ON CONFLICT(id) DO NOTHING`,
 		node.ID, node.Name, node.OS, node.Architecture, validJSON(node.Attributes), t, t); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO device_controllers(node_id,version,started_at,last_seen_at) VALUES(?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET version=excluded.version,started_at=excluded.started_at,last_seen_at=excluded.last_seen_at`,
+	if _, err = tx.ExecContext(ctx, `INSERT INTO device_controllers(node_id,version,started_at,last_seen_at) VALUES($1,$2,$3,$4) ON CONFLICT(node_id) DO UPDATE SET version=excluded.version,started_at=excluded.started_at,last_seen_at=excluded.last_seen_at`,
 		node.ID, version, t, t); err != nil {
 		return err
 	}
@@ -720,7 +720,7 @@ func (s *Store) RegisterDeviceController(ctx context.Context, node Node, version
 // node controls (control = true on the host naming it) with the setting each
 // is to have. Settings of released leases are removed first.
 func (s *Store) PollDeviceSettings(ctx context.Context, nodeID string) ([]ControlledDevice, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -729,7 +729,7 @@ func (s *Store) PollDeviceSettings(ctx context.Context, nodeID string) ([]Contro
 		return nil, err
 	}
 	t := now()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO device_controllers(node_id,started_at,last_seen_at) VALUES(?,?,?) ON CONFLICT(node_id) DO UPDATE SET last_seen_at=excluded.last_seen_at`, nodeID, t, t); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO device_controllers(node_id,started_at,last_seen_at) VALUES($1,$2,$3) ON CONFLICT(node_id) DO UPDATE SET last_seen_at=excluded.last_seen_at`, nodeID, t, t); err != nil {
 		return nil, err
 	}
 	spec, err := declaredSpec(ctx, tx)
@@ -759,7 +759,7 @@ func (s *Store) PollDeviceSettings(ctx context.Context, nodeID string) ([]Contro
 // (events device_setting_applied and device_setting_failed). A report of a
 // device node does not control is skipped and returned.
 func (s *Store) ReportDevices(ctx context.Context, nodeID string, reports []DeviceReport) ([]string, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -787,12 +787,12 @@ func (s *Store) ReportDevices(ctx context.Context, nodeID string, reports []Devi
 }
 
 func recordDeviceReportTx(ctx context.Context, tx *sql.Tx, report DeviceReport, t string) error {
-	if _, err := tx.ExecContext(ctx, `INSERT INTO device_state(host_id,device_id) VALUES(?,?) ON CONFLICT(host_id,device_id) DO NOTHING`, report.HostID, report.DeviceID); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO device_state(host_id,device_id) VALUES($1,$2) ON CONFLICT(host_id,device_id) DO NOTHING`, report.HostID, report.DeviceID); err != nil {
 		return err
 	}
 	var appliedGeneration sql.NullInt64
 	var appliedJSON, lastError sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT applied_generation,applied_json,last_error FROM device_state WHERE host_id=? AND device_id=?`, report.HostID, report.DeviceID).
+	if err := tx.QueryRowContext(ctx, `SELECT applied_generation,applied_json,last_error FROM device_state WHERE host_id=$1 AND device_id=$2`, report.HostID, report.DeviceID).
 		Scan(&appliedGeneration, &appliedJSON, &lastError); err != nil {
 		return err
 	}
@@ -802,7 +802,7 @@ func recordDeviceReportTx(ctx context.Context, tx *sql.Tx, report DeviceReport, 
 		if err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE device_state SET capabilities_json=?,capabilities_at=? WHERE host_id=? AND device_id=?`, string(body), t, report.HostID, report.DeviceID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE device_state SET capabilities_json=$1,capabilities_at=$2 WHERE host_id=$3 AND device_id=$4`, string(body), t, report.HostID, report.DeviceID); err != nil {
 			return err
 		}
 	}
@@ -817,12 +817,12 @@ func recordDeviceReportTx(ctx context.Context, tx *sql.Tx, report DeviceReport, 
 		}
 		changed := !appliedJSON.Valid || appliedJSON.String != string(body) || appliedGeneration.Valid != (report.AppliedGeneration != nil) ||
 			report.AppliedGeneration != nil && appliedGeneration.Int64 != *report.AppliedGeneration
-		if _, err = tx.ExecContext(ctx, `UPDATE device_state SET applied_generation=?,applied_json=?,applied_note=? WHERE host_id=? AND device_id=?`,
+		if _, err = tx.ExecContext(ctx, `UPDATE device_state SET applied_generation=$1,applied_json=$2,applied_note=$3 WHERE host_id=$4 AND device_id=$5`,
 			generation, string(body), nullable(report.Note), report.HostID, report.DeviceID); err != nil {
 			return err
 		}
 		if changed {
-			if _, err = tx.ExecContext(ctx, `UPDATE device_state SET applied_at=? WHERE host_id=? AND device_id=?`, t, report.HostID, report.DeviceID); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE device_state SET applied_at=$1 WHERE host_id=$2 AND device_id=$3`, t, report.HostID, report.DeviceID); err != nil {
 				return err
 			}
 			if err = appendCoordinationEventTx(ctx, tx, "device_setting_applied", nil, "device", aggregate, nil, map[string]any{
@@ -838,23 +838,23 @@ func recordDeviceReportTx(ctx context.Context, tx *sql.Tx, report DeviceReport, 
 				"host_id": report.HostID, "device_id": report.DeviceID, "error": report.Error}); err != nil {
 				return err
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE device_state SET last_error=?,last_error_at=? WHERE host_id=? AND device_id=?`, report.Error, t, report.HostID, report.DeviceID); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE device_state SET last_error=$1,last_error_at=$2 WHERE host_id=$3 AND device_id=$4`, report.Error, t, report.HostID, report.DeviceID); err != nil {
 				return err
 			}
 		}
 	case report.Applied != nil:
-		if _, err := tx.ExecContext(ctx, `UPDATE device_state SET last_error=NULL,last_error_at=NULL WHERE host_id=? AND device_id=?`, report.HostID, report.DeviceID); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE device_state SET last_error=NULL,last_error_at=NULL WHERE host_id=$1 AND device_id=$2`, report.HostID, report.DeviceID); err != nil {
 			return err
 		}
 	}
-	_, err := tx.ExecContext(ctx, `UPDATE device_state SET reported_at=? WHERE host_id=? AND device_id=?`, t, report.HostID, report.DeviceID)
+	_, err := tx.ExecContext(ctx, `UPDATE device_state SET reported_at=$1 WHERE host_id=$2 AND device_id=$3`, t, report.HostID, report.DeviceID)
 	return err
 }
 
 // ListHardware is every declared host (or only hostID) with its controller
 // and its devices' policies, settings and what the controller reports.
 func (s *Store) ListHardware(ctx context.Context, hostID string) ([]HardwareHost, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -872,7 +872,7 @@ func (s *Store) ListHardware(ctx context.Context, hostID string) ([]HardwareHost
 		entry := HardwareHost{ID: host.ID, Nodes: host.Nodes, MaxSlowdown: host.MaxSlowdown, Devices: []HardwareDevice{}}
 		if host.Controller != "" {
 			entry.Controller = &host.Controller
-			err = tx.QueryRowContext(ctx, `SELECT started_at,last_seen_at,version FROM device_controllers WHERE node_id=?`, host.Controller).
+			err = tx.QueryRowContext(ctx, `SELECT started_at,last_seen_at,version FROM device_controllers WHERE node_id=$1`, host.Controller).
 				Scan(&entry.ControllerStartedAt, &entry.ControllerLastSeenAt, &entry.ControllerVersion)
 			if err != nil && !errors.Is(err, sql.ErrNoRows) {
 				return nil, err
@@ -912,7 +912,7 @@ func hardwareDeviceTx(ctx context.Context, tx *sql.Tx, policy machine.DevicePoli
 		device.Effective = &device.Settings[0]
 	}
 	var appliedJSON, capsJSON sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT generation,applied_generation,applied_json,applied_note,applied_at,last_error,last_error_at,capabilities_json,capabilities_at,reported_at FROM device_state WHERE host_id=? AND device_id=?`, policy.HostID, policy.DeviceID).
+	err = tx.QueryRowContext(ctx, `SELECT generation,applied_generation,applied_json,applied_note,applied_at,last_error,last_error_at,capabilities_json,capabilities_at,reported_at FROM device_state WHERE host_id=$1 AND device_id=$2`, policy.HostID, policy.DeviceID).
 		Scan(&device.Generation, &device.AppliedGeneration, &appliedJSON, &device.AppliedNote, &device.AppliedAt, &device.LastError, &device.LastErrorAt, &capsJSON, &device.CapabilitiesAt, &device.ReportedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return device, nil
