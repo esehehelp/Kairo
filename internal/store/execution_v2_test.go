@@ -11,7 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-func openCoordinationStore(t *testing.T) *Store {
+func openCoordinationStore(t testing.TB) *Store {
 	t.Helper()
 	store, err := Open(filepath.Join(t.TempDir(), "kairo-v3.db"))
 	if err != nil {

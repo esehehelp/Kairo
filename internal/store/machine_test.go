@@ -12,7 +12,7 @@ import (
 )
 
 // declareTestGPU declares one GPU for a node, keeping the other declarations.
-func declareTestGPU(t *testing.T, store *Store, uuid, nodeID string) {
+func declareTestGPU(t testing.TB, store *Store, uuid, nodeID string) {
 	t.Helper()
 	if _, err := store.db.Exec(`DELETE FROM machine_gpus WHERE uuid=?`, uuid); err != nil {
 		t.Fatal(err)

@@ -12,7 +12,7 @@ import (
 // planCluster is a test installation: nodes with an executor each (labels
 // site=<node>, pool=all), CPU, RAM, a "/" filesystem and GPUs.
 type planCluster struct {
-	t     *testing.T
+	t     testing.TB
 	store *Store
 	ctx   context.Context
 }
