@@ -29,11 +29,15 @@ or cleanup language.
 
 ## Start
 
+The daemon keeps its state in a PostgreSQL database (see Database below);
+create it once, empty, then point `database_url` (or `KAIRO_DATABASE_URL`) at
+it.
+
 ```powershell
 # TLS material: a private CA and a server certificate for every address
 # clients use to reach the daemon (kairo tls issue re-issues it later).
 go run ./cmd/kairo tls init --dir local/tls --host 127.0.0.1 --host localhost --host 192.168.1.12
-go run ./cmd/kairo serve --config examples/kairo.toml     # creates the database
+go run ./cmd/kairo serve --config examples/kairo.toml     # creates the schema
 # In another terminal: an operator token, saved where the CLI looks for it.
 go run ./cmd/kairo token create --config examples/kairo.toml --name operator --role admin --save
 go run ./cmd/kairo doctor
@@ -138,8 +142,8 @@ sample). `kairo doctor` ends with the same table.
 Resource observations describe the present: only each resource's latest one
 is used, and the daemon prunes the others once they are an hour old. Device
 samples are kept for 72 hours (each device's latest always). `kairo db
-compact --config kairo.toml` (with the daemon stopped) prunes both at once and
-runs `VACUUM`.
+compact --config kairo.toml` prunes both at once and vacuums their tables; it
+may run alongside the daemon (PostgreSQL's autovacuum does the same in time).
 
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
 limits (see Admission for how they are counted). GPU exclusion is a coordination guarantee among Kairo participants;
@@ -189,9 +193,11 @@ stored only as SHA-256 hashes; revocation takes effect immediately.
 | `node` | `/api/agent/*`, for one node | a node agent, a host's controller |
 | worker | `/api/worker/*`, for one attempt | the processes of an attempt |
 
-Operator and node tokens are managed on the daemon host by opening its
-database directly (local file access is the root of trust; the daemon may be
-running):
+Operator and node tokens are managed by opening the daemon's database
+directly (database access is the root of trust; the daemon may be running).
+`--config` reads the database from the daemon's configuration; `--database-url
+URL` names it instead. Neither creates a schema: a token in a database the
+daemon does not use would never authenticate.
 
 ```powershell
 kairo token create --config kairo.toml --name operator --role admin --save
@@ -236,8 +242,8 @@ every `--host`, IP or DNS name). `kairo tls issue --dir DIR --host H...`
 re-issues the server certificate from the same CA, for a new address. Keep
 `ca-key.pem` on the daemon host only. Private keys and token files written by
 `kairo` are restricted to the current user, and the daemon restricts its
-database (and WAL) the same way at start: anyone who can write the database
-can mint tokens. On Windows, where file modes are ignored, this replaces the
+`database_password_file` the same way at start: anyone who can write the
+database can mint tokens, so its credentials are kept like a private key. On Windows, where file modes are ignored, this replaces the
 inherited ACL with one granting only the user and SYSTEM.
 
 The daemon refuses to start when its certificate does not chain to
@@ -352,8 +358,8 @@ Clients follow the contract in `sdk/conformance` (how to find the daemon, when
 a token may be sent, how to classify each error); every SDK's tests replay it.
 Codes: `unauthorized` 401, `forbidden` 403, `not_found` 404, `stale_epoch` and
 other conflicts 409, `gate_closed`/`observe_only` 423, `bad_request` 400 (fix
-the request), and `internal` 500/503 (a daemon-side failure such as a busy
-database: transient, retry). `GET /health` returns `{"ok": true, "api": 1}`;
+the request), and `internal` 500/503 (a daemon-side failure; 503 when the
+database is unreachable, overloaded or gave up on a lock: transient, retry). `GET /health` returns `{"ok": true, "api": 1}`;
 `api` is the contract version and changes only on a breaking change.
 
 ## Coordination model
@@ -1313,14 +1319,70 @@ statically. The driver must support the toolkit it was built with.
   0); a very long op (gemm at n=32768 is ~2 s) delays the stop by up to two
   ops.
 
+## Database
+
+The daemon's state is one PostgreSQL database (PostgreSQL 17; another host
+is fine, over a LAN). The daemon configuration names it:
+
+```toml
+database_url = "postgres://kairo@pve1:5432/kairo?sslmode=require"
+database_password_file = "local/kairo-db-password"   # optional: its first line
+```
+
+`database_url` is a `postgres://` URL or a `key=value` connection string;
+`KAIRO_DATABASE_URL` may give it instead (not both), so the password need not
+be in the file. Without a password in either, `database_password_file`, then
+the usual `PGPASSWORD` and `.pgpass` are used. Logs show the URL with the
+password masked.
+
+The database must be UTF-8 with the `C` collation: times and identifiers are
+compared as text, byte by byte, and the daemon refuses another collation.
+Create it once, empty:
+
+```sql
+CREATE ROLE kairo LOGIN PASSWORD '...';
+CREATE DATABASE kairo OWNER kairo TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C';
+```
+
+The first `kairo serve` creates the schema; a later one applies the numbered
+migrations it lacks (`schema_version`), and refuses a database that has
+tables but no Kairo schema, or a schema newer than itself.
+
+Writes are serialized: every transaction that writes (a planning pass, a
+lease reservation, a launch, a pause, a heartbeat, an observation batch, a
+token) first takes one transaction-scoped advisory lock, so Kairo's
+decisions run one at a time, as if there were a single connection, however
+many connections the daemon's pool holds and however many processes (the
+daemon, `kairo token`, `kairo db`) share the database. Reads (status, lists,
+logs) take no lock and run alongside. Connections are read-only unless such
+a transaction makes them writable, so a write that bypasses the lock fails.
+Each statement is a round trip to the server: a planning pass costs a fixed
+20 or so whatever the number of waiting executions, a heartbeat 5.
+
+Back up with `pg_dump` (the database holds the token hashes: keep the dump
+like the password). A database of the SQLite era (`kairo-v3.db`) is moved
+over once, with the daemon and agents stopped:
+
+```powershell
+kairo db import-sqlite --from local/kairo-v3.db --config kairo.toml   # or --to URL
+```
+
+It opens the file read-only (copy it with its `-wal` and `-shm` files first
+to import a snapshot of a running daemon's), needs an empty target, creates
+the schema and copies every table in one transaction. Before committing it
+checks every table: the row count and a SHA-256 over the rows in key order
+(values normalized by column type: flags, integers, reals, text) computed
+the same way from both databases. It prints one row per table and imports
+nothing when any table differs. The file must have been opened by the last
+SQLite Kairo, so its schema is complete.
+
 ## Upgrading a running installation
 
 A daemon (or node agent) that starts marks the attempts its executors had
 running as lost: it cannot vouch for processes a previous incarnation
 launched. Drain before replacing either binary: pause the projects, wait
 until no attempt is authorized, running or quiescing, then stop the agents
-and the daemon, back up the database (with its `-wal` and `-shm` files),
-replace the binaries and configurations, start the daemon, then the agents,
+and the daemon, back up the database (`pg_dump`), replace the binaries and configurations, start the daemon, then the agents,
 check `kairo doctor` and `kairo resource status`, and resume. Code that queued
 executions will load (scripts, the editable SDK) must not change while they
 wait.
@@ -1329,18 +1391,22 @@ Replace the agents together with the daemon: an agent older than the daemon
 starts attempts without their declared `env`, and a daemon older than the
 agent refuses its log problem reports (the agent logs them) and its
 observations, which carry power samples (its resources then go stale). A
-daemon opening an older database migrates it in place (the `cancelled` task
-state, reruns, the `env` column, the machine declaration, which starts out
-declaring every registered GPU for the node it is registered on, and its
-(uuid, node) key for shared GPUs, the attempt log problems, the admission
-tables, the power and energy tables, the hosts and device settings, the bench
-runs and policy decisions, which start out empty); keep the backup, since an
-older binary would read a rerun
-Task's earlier execution as its outcome again.
+daemon opening an older database applies the schema migrations it lacks
+(see Database); keep the backup, since an older binary refuses the newer
+schema.
 
 ## Verification
 
+The Go tests need a PostgreSQL 17 server where they may create databases:
+each test gets a database of its own (random name, collation C), dropped
+when it ends, so tests run in parallel and leave nothing behind.
+`KAIRO_TEST_PG` names the server, by default the local test container below
+(`fsync` off: tests only). A test fails, it is not skipped, when the server
+cannot be reached.
+
 ```powershell
+docker run -d --name kairo-pg-test -p 127.0.0.1:55432:5432 -e POSTGRES_USER=kairo -e POSTGRES_PASSWORD=kairo-test -e POSTGRES_DB=kairo postgres:17 -c fsync=off -c full_page_writes=off -c synchronous_commit=off
+$env:KAIRO_TEST_PG = "postgres://kairo:kairo-test@127.0.0.1:55432/kairo?sslmode=disable"   # the default
 go test ./...
 go test -race ./...
 go vet ./...
