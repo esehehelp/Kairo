@@ -5,14 +5,32 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 
 	"kairo/internal/pgtest"
 )
 
 // openCoordinationStore opens a store on a fresh database of the test
-// server (pgtest), dropped when the test ends.
+// server (pgtest), dropped when the test ends. The test runs in parallel
+// with the others (each has its own database).
 func openCoordinationStore(t testing.TB) *Store {
+	t.Helper()
+	if test, ok := t.(*testing.T); ok {
+		if _, already := parallelTests.LoadOrStore(test, true); !already {
+			test.Parallel()
+		}
+	}
+	return openSerialStore(t)
+}
+
+// parallelTests are the tests openCoordinationStore made parallel (a test
+// may open several stores).
+var parallelTests sync.Map
+
+// openSerialStore is openCoordinationStore for a test that changes a package
+// setting and so must not run alongside the others.
+func openSerialStore(t testing.TB) *Store {
 	t.Helper()
 	store, err := Open(pgtest.DSN(t))
 	if err != nil {

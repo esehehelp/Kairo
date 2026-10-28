@@ -298,7 +298,7 @@ func TestForceStopNotPickedUpIsReported(t *testing.T) {
 	saved := ForceStopPickupTimeout
 	ForceStopPickupTimeout = 50 * time.Millisecond
 	t.Cleanup(func() { ForceStopPickupTimeout = saved })
-	store := openCoordinationStore(t)
+	store := openSerialStore(t)
 	setupSchedulerInventory(t, store)
 	forceProject(t, store, false)
 	ctx := context.Background()
