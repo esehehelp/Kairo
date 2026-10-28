@@ -80,8 +80,8 @@ func (s *Store) CreateAPIToken(ctx context.Context, name, role, nodeID string) (
 	if nodeID != "" {
 		value.NodeID = &nodeID
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO api_tokens(id,name,role,node_id,token_hash,created_at) VALUES(?,?,?,?,?,?)`, value.ID, value.Name, value.Role, value.NodeID, hash, value.CreatedAt)
-	if err != nil && strings.Contains(err.Error(), "UNIQUE") {
+	_, err = s.exec(ctx, `INSERT INTO api_tokens(id,name,role,node_id,token_hash,created_at) VALUES($1,$2,$3,$4,$5,$6)`, value.ID, value.Name, value.Role, value.NodeID, hash, value.CreatedAt)
+	if uniqueViolation(err) {
 		return APIToken{}, "", fmt.Errorf("an active token named %q already exists", name)
 	}
 	if err != nil {
@@ -91,7 +91,7 @@ func (s *Store) CreateAPIToken(ctx context.Context, name, role, nodeID string) (
 }
 
 func (s *Store) ListAPITokens(ctx context.Context) ([]APIToken, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,name,role,node_id,created_at,last_used_at,revoked_at FROM api_tokens ORDER BY created_at,rowid`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,name,role,node_id,created_at,last_used_at,revoked_at FROM api_tokens ORDER BY created_at,id`)
 	if err != nil {
 		return nil, err
 	}
@@ -109,7 +109,7 @@ func (s *Store) ListAPITokens(ctx context.Context) ([]APIToken, error) {
 
 // RevokeAPIToken revokes the active token with this id or name.
 func (s *Store) RevokeAPIToken(ctx context.Context, idOrName string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE api_tokens SET revoked_at=? WHERE (id=? OR name=?) AND revoked_at IS NULL`, now(), idOrName, idOrName)
+	result, err := s.exec(ctx, `UPDATE api_tokens SET revoked_at=$1 WHERE (id=$2 OR name=$3) AND revoked_at IS NULL`, now(), idOrName, idOrName)
 	if err != nil {
 		return err
 	}
@@ -126,7 +126,7 @@ func (s *Store) AuthenticateAPIToken(ctx context.Context, token string) (APIToke
 		return APIToken{}, ErrUnauthorized
 	}
 	var value APIToken
-	err := s.db.QueryRowContext(ctx, `SELECT id,name,role,node_id,created_at,last_used_at FROM api_tokens WHERE token_hash=? AND revoked_at IS NULL`, hashToken(token)).Scan(&value.ID, &value.Name, &value.Role, &value.NodeID, &value.CreatedAt, &value.LastUsedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT id,name,role,node_id,created_at,last_used_at FROM api_tokens WHERE token_hash=$1 AND revoked_at IS NULL`, hashToken(token)).Scan(&value.ID, &value.Name, &value.Role, &value.NodeID, &value.CreatedAt, &value.LastUsedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return APIToken{}, ErrUnauthorized
 	}
@@ -135,7 +135,7 @@ func (s *Store) AuthenticateAPIToken(ctx context.Context, token string) (APIToke
 	}
 	// last_used_at is informational; write it at most once a minute.
 	t := time.Now().UTC()
-	if _, err = s.db.ExecContext(ctx, `UPDATE api_tokens SET last_used_at=? WHERE id=? AND (last_used_at IS NULL OR julianday(last_used_at)<julianday(?))`, t.Format(time.RFC3339Nano), value.ID, t.Add(-time.Minute).Format(time.RFC3339Nano)); err != nil {
+	if _, err = s.exec(ctx, `UPDATE api_tokens SET last_used_at=$1 WHERE id=$2 AND (last_used_at IS NULL OR (last_used_at)::timestamptz<($3)::timestamptz)`, t.Format(time.RFC3339Nano), value.ID, t.Add(-time.Minute).Format(time.RFC3339Nano)); err != nil {
 		return APIToken{}, err
 	}
 	return value, nil
@@ -151,7 +151,7 @@ func (s *Store) AuthenticateWorkerToken(ctx context.Context, token string) (Work
 	var value WorkerIdentity
 	var state string
 	var attemptEpoch int64
-	err := s.db.QueryRowContext(ctx, `SELECT t.attempt_id,t.lease_id,t.coordination_epoch,a.state,a.coordination_epoch FROM attempt_tokens t JOIN attempts a ON a.id=t.attempt_id WHERE t.token_hash=?`, hashToken(token)).Scan(&value.AttemptID, &value.LeaseID, &value.Epoch, &state, &attemptEpoch)
+	err := s.db.QueryRowContext(ctx, `SELECT t.attempt_id,t.lease_id,t.coordination_epoch,a.state,a.coordination_epoch FROM attempt_tokens t JOIN attempts a ON a.id=t.attempt_id WHERE t.token_hash=$1`, hashToken(token)).Scan(&value.AttemptID, &value.LeaseID, &value.Epoch, &state, &attemptEpoch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return WorkerIdentity{}, ErrUnauthorized
 	}
@@ -168,19 +168,19 @@ func (s *Store) AuthenticateWorkerToken(ctx context.Context, token string) (Work
 // Each returns ErrNotFound for an unknown object.
 
 func (s *Store) ExecutorNode(ctx context.Context, executorID string) (string, error) {
-	return s.nodeOf(ctx, `SELECT node_id FROM executors WHERE id=?`, executorID)
+	return s.nodeOf(ctx, `SELECT node_id FROM executors WHERE id=$1`, executorID)
 }
 
 func (s *Store) ProviderNode(ctx context.Context, providerID string) (string, error) {
-	return s.nodeOf(ctx, `SELECT node_id FROM resource_providers WHERE id=?`, providerID)
+	return s.nodeOf(ctx, `SELECT node_id FROM resource_providers WHERE id=$1`, providerID)
 }
 
 func (s *Store) LeaseNode(ctx context.Context, leaseID string) (string, error) {
-	return s.nodeOf(ctx, `SELECT x.node_id FROM leases l JOIN executors x ON x.id=l.executor_id WHERE l.id=?`, leaseID)
+	return s.nodeOf(ctx, `SELECT x.node_id FROM leases l JOIN executors x ON x.id=l.executor_id WHERE l.id=$1`, leaseID)
 }
 
 func (s *Store) AttemptNode(ctx context.Context, attemptID string) (string, error) {
-	return s.nodeOf(ctx, `SELECT x.node_id FROM attempts a JOIN executors x ON x.id=a.executor_id WHERE a.id=?`, attemptID)
+	return s.nodeOf(ctx, `SELECT x.node_id FROM attempts a JOIN executors x ON x.id=a.executor_id WHERE a.id=$1`, attemptID)
 }
 
 func (s *Store) nodeOf(ctx context.Context, query, key string) (string, error) {

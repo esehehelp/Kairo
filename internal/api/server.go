@@ -3,18 +3,20 @@ package api
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
-
-	"modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
 
 	"kairo/internal/buildinfo"
 	"kairo/internal/store"
+
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // APIVersion is the version of the API contract, reported by GET /health. It
@@ -111,20 +113,38 @@ func errorStatus(err error) (int, string) {
 			return c.status, c.code
 		}
 	}
-	var sqliteErr *sqlite.Error
+	var pgErr *pgconn.PgError
+	var connectErr *pgconn.ConnectError
+	var netErr net.Error
 	switch {
-	case errors.As(err, &sqliteErr):
-		// Extended result codes keep the primary code in the low byte.
-		if primary := sqliteErr.Code() & 0xff; primary == sqlite3.SQLITE_BUSY || primary == sqlite3.SQLITE_LOCKED {
+	case errors.As(err, &pgErr):
+		if transientDatabaseError(pgErr.Code) {
 			return http.StatusServiceUnavailable, codeInternal
 		}
 		return http.StatusInternalServerError, codeInternal
+	case errors.As(err, &connectErr), errors.As(err, &netErr), errors.Is(err, driver.ErrBadConn), pgconn.Timeout(err):
+		// The database cannot be reached (now): the request may be retried.
+		return http.StatusServiceUnavailable, codeInternal
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return http.StatusServiceUnavailable, codeInternal
 	case errors.Is(err, sql.ErrConnDone), errors.Is(err, sql.ErrTxDone):
 		return http.StatusInternalServerError, codeInternal
 	}
 	return http.StatusBadRequest, "bad_request"
+}
+
+// transientDatabaseError reports whether a PostgreSQL error code says the
+// request may succeed when retried: the connection failed, the server is
+// short of resources or shutting down, or a lock or serialization conflict
+// gave up.
+func transientDatabaseError(code string) bool {
+	switch {
+	case strings.HasPrefix(code, "08"), strings.HasPrefix(code, "53"), strings.HasPrefix(code, "57P"):
+		return true
+	case code == "40001", code == "40P01", code == "55P03":
+		return true
+	}
+	return false
 }
 
 func decode(r *http.Request, target any) error {

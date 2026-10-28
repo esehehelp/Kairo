@@ -41,7 +41,7 @@ var ForceStopPickupTimeout = 30 * time.Second
 // that has not started, recording each as withdrawn by the force stop.
 func (s *Store) forceSweepWithdrawals(ctx context.Context, operation PauseOperation) error {
 	rows, err := s.db.QueryContext(ctx, `WITH RECURSIVE descendants(id) AS (
-	 SELECT ? UNION ALL SELECT s.id FROM coordination_scopes s JOIN descendants d ON s.parent_id=d.id
+	 SELECT $1 UNION ALL SELECT s.id FROM coordination_scopes s JOIN descendants d ON s.parent_id=d.id
 	)
 	SELECT e.id FROM execution_requests e
 	WHERE e.state IN('waiting','authorized')
@@ -71,7 +71,7 @@ func (s *Store) forceSweepWithdrawals(ctx context.Context, operation PauseOperat
 }
 
 func (s *Store) forceWithdraw(ctx context.Context, operation PauseOperation, executionID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -83,7 +83,7 @@ func (s *Store) forceWithdraw(ctx context.Context, operation PauseOperation, exe
 	if !withdrawn {
 		return tx.Commit()
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO force_stops(execution_id,operation_id,grace_seconds,state,requested_at) VALUES(?,?,?,'withdrawn',?) ON CONFLICT(execution_id) DO NOTHING`, executionID, operation.ID, operation.Force.GraceSeconds, now()); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO force_stops(execution_id,operation_id,grace_seconds,state,requested_at) VALUES($1,$2,$3,'withdrawn',$4) ON CONFLICT(execution_id) DO NOTHING`, executionID, operation.ID, operation.Force.GraceSeconds, now()); err != nil {
 		return err
 	}
 	projectID, err := executionProjectIDTx(ctx, tx, executionID)
@@ -99,18 +99,18 @@ func (s *Store) forceWithdraw(ctx context.Context, operation PauseOperation, exe
 // requestForceStop records that the attempt's process tree must be stopped by
 // its executor. Idempotent: an execution keeps its first force stop.
 func (s *Store) requestForceStop(ctx context.Context, operation PauseOperation, executionID, attemptID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var executorID string
-	if err = tx.QueryRowContext(ctx, `SELECT executor_id FROM attempts WHERE id=? AND execution_id=?`, attemptID, executionID).Scan(&executorID); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT executor_id FROM attempts WHERE id=$1 AND execution_id=$2`, attemptID, executionID).Scan(&executorID); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `INSERT INTO force_stops(execution_id,operation_id,attempt_id,executor_id,grace_seconds,state,requested_at) VALUES(?,?,?,?,?,'pending',?) ON CONFLICT(execution_id) DO NOTHING`, executionID, operation.ID, attemptID, executorID, operation.Force.GraceSeconds, now())
+	res, err := tx.ExecContext(ctx, `INSERT INTO force_stops(execution_id,operation_id,attempt_id,executor_id,grace_seconds,state,requested_at) VALUES($1,$2,$3,$4,$5,'pending',$6) ON CONFLICT(execution_id) DO NOTHING`, executionID, operation.ID, attemptID, executorID, operation.Force.GraceSeconds, now())
 	if err != nil {
 		return err
 	}
@@ -131,7 +131,7 @@ func (s *Store) requestForceStop(ctx context.Context, operation PauseOperation, 
 func (s *Store) forceStopBlocker(ctx context.Context, executionID string) (*string, error) {
 	var state, requested string
 	var lastSeen sql.NullString
-	err := s.db.QueryRowContext(ctx, `SELECT f.state,f.requested_at,x.last_seen_at FROM force_stops f LEFT JOIN executors x ON x.id=f.executor_id WHERE f.execution_id=?`, executionID).Scan(&state, &requested, &lastSeen)
+	err := s.db.QueryRowContext(ctx, `SELECT f.state,f.requested_at,x.last_seen_at FROM force_stops f LEFT JOIN executors x ON x.id=f.executor_id WHERE f.execution_id=$1`, executionID).Scan(&state, &requested, &lastSeen)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -156,7 +156,7 @@ func (s *Store) forceStopBlocker(ctx context.Context, executionID string) (*stri
 // touchExecutor records that an executor is polling (at most every few seconds).
 func (s *Store) touchExecutor(ctx context.Context, executorID string) error {
 	t := time.Now().UTC()
-	_, err := s.db.ExecContext(ctx, `UPDATE executors SET last_seen_at=? WHERE id=? AND (last_seen_at IS NULL OR julianday(last_seen_at)<julianday(?))`, t.Format(time.RFC3339Nano), executorID, t.Add(-5*time.Second).Format(time.RFC3339Nano))
+	_, err := s.exec(ctx, `UPDATE executors SET last_seen_at=$1 WHERE id=$2 AND (last_seen_at IS NULL OR (last_seen_at)::timestamptz<($3)::timestamptz)`, t.Format(time.RFC3339Nano), executorID, t.Add(-5*time.Second).Format(time.RFC3339Nano))
 	return err
 }
 
@@ -164,7 +164,7 @@ func (s *Store) touchExecutor(ctx context.Context, executorID string) error {
 func (s *Store) ForceStopOrders(ctx context.Context, executorID string) ([]ForceStopOrder, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT f.attempt_id,f.execution_id,a.pid,a.process_identity,f.state,f.grace_seconds,f.signalled_at
 		FROM force_stops f JOIN attempts a ON a.id=f.attempt_id
-		WHERE f.executor_id=? AND f.state IN('pending','signalled') ORDER BY f.requested_at,f.execution_id`, executorID)
+		WHERE f.executor_id=$1 AND f.state IN('pending','signalled') ORDER BY f.requested_at,f.execution_id`, executorID)
 	if err != nil {
 		return nil, err
 	}
@@ -209,23 +209,24 @@ func (s *Store) AckForceStop(ctx context.Context, attemptID, phase string, detai
 	if !json.Valid(detail) {
 		return errors.New("force stop detail must be valid JSON")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var executionID string
-	if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM force_stops WHERE attempt_id=?`, attemptID).Scan(&executionID); errors.Is(err, sql.ErrNoRows) {
+	var executionID, recorded string
+	if err = tx.QueryRowContext(ctx, `SELECT execution_id,detail_json FROM force_stops WHERE attempt_id=$1`, attemptID).Scan(&executionID, &recorded); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
 	}
+	merged := string(jsonMergePatch([]byte(recorded), detail))
 	t := now()
 	var res sql.Result
 	if phase == "signalled" {
-		res, err = tx.ExecContext(ctx, `UPDATE force_stops SET state='signalled',signalled_at=?,detail_json=json_patch(detail_json,?) WHERE attempt_id=? AND state='pending'`, t, string(detail), attemptID)
+		res, err = tx.ExecContext(ctx, `UPDATE force_stops SET state='signalled',signalled_at=$1,detail_json=$2 WHERE attempt_id=$3 AND state='pending'`, t, merged, attemptID)
 	} else {
-		res, err = tx.ExecContext(ctx, `UPDATE force_stops SET state='terminated',signalled_at=COALESCE(signalled_at,?),terminated_at=?,detail_json=json_patch(detail_json,?) WHERE attempt_id=? AND state IN('pending','signalled')`, t, t, string(detail), attemptID)
+		res, err = tx.ExecContext(ctx, `UPDATE force_stops SET state='terminated',signalled_at=COALESCE(signalled_at,$1),terminated_at=$2,detail_json=$3 WHERE attempt_id=$4 AND state IN('pending','signalled')`, t, t, merged, attemptID)
 	}
 	if err != nil {
 		return err
@@ -244,7 +245,7 @@ func (s *Store) AckForceStop(ctx context.Context, attemptID, phase string, detai
 
 // ListForceStops returns the force stops of a pause operation.
 func (s *Store) ListForceStops(ctx context.Context, operationID string) ([]ForceStop, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT execution_id,operation_id,attempt_id,executor_id,grace_seconds,state,detail_json,requested_at,signalled_at,terminated_at FROM force_stops WHERE operation_id=? ORDER BY execution_id`, operationID)
+	rows, err := s.db.QueryContext(ctx, `SELECT execution_id,operation_id,attempt_id,executor_id,grace_seconds,state,detail_json,requested_at,signalled_at,terminated_at FROM force_stops WHERE operation_id=$1 ORDER BY execution_id`, operationID)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +271,7 @@ func forceStoppedTx(ctx context.Context, tx *sql.Tx, executionID string) (map[st
 	err := tx.QueryRowContext(ctx, `SELECT e.id,f.operation_id,p.actor,COALESCE(o.reason,'')
 		FROM execution_requests e JOIN force_stops f ON f.execution_id=e.id
 		JOIN pause_operations p ON p.id=f.operation_id LEFT JOIN force_stop_operations o ON o.operation_id=f.operation_id
-		WHERE (e.id=? OR e.id IN(SELECT m.execution_id FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id WHERE g.leader_execution_id=?))
+		WHERE (e.id=$1 OR e.id IN(SELECT m.execution_id FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id WHERE g.leader_execution_id=$2))
 		AND (e.terminal_cause='force_stopped' OR f.state='withdrawn')
 		ORDER BY e.id LIMIT 1`, executionID, executionID).Scan(&stopped, &operationID, &actor, &reason)
 	if errors.Is(err, sql.ErrNoRows) {

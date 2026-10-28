@@ -45,14 +45,14 @@ func (s *Store) QuarantineNode(ctx context.Context, nodeID, actor, reason string
 	if strings.TrimSpace(reason) == "" {
 		reason = "operator request"
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return NodeQuarantine{}, err
 	}
 	defer tx.Rollback()
 	if nodeID != AllNodes {
 		var exists int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE id=?`, nodeID).Scan(&exists); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM nodes WHERE id=$1`, nodeID).Scan(&exists); err != nil {
 			return NodeQuarantine{}, err
 		}
 		if exists == 0 {
@@ -60,7 +60,7 @@ func (s *Store) QuarantineNode(ctx context.Context, nodeID, actor, reason string
 		}
 	}
 	t := now()
-	res, err := tx.ExecContext(ctx, `INSERT INTO node_quarantines(node_id,actor,reason,created_at) VALUES(?,?,?,?) ON CONFLICT(node_id) DO NOTHING`, nodeID, actor, reason, t)
+	res, err := tx.ExecContext(ctx, `INSERT INTO node_quarantines(node_id,actor,reason,created_at) VALUES($1,$2,$3,$4) ON CONFLICT(node_id) DO NOTHING`, nodeID, actor, reason, t)
 	if err != nil {
 		return NodeQuarantine{}, err
 	}
@@ -80,12 +80,12 @@ func (s *Store) ReleaseNodeQuarantine(ctx context.Context, nodeID, actor string)
 	if strings.TrimSpace(actor) == "" {
 		actor = "operator"
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `DELETE FROM node_quarantines WHERE node_id=?`, nodeID)
+	res, err := tx.ExecContext(ctx, `DELETE FROM node_quarantines WHERE node_id=$1`, nodeID)
 	if err != nil {
 		return err
 	}
@@ -132,10 +132,10 @@ func (s *Store) ListNodeQuarantines(ctx context.Context) ([]NodeQuarantine, erro
 	}
 	for i := range out {
 		if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempts a JOIN executors x ON x.id=a.executor_id
-			WHERE a.state IN('authorized','running','quiescing','exited') AND (?='*' OR x.node_id=?)`, out[i].NodeID, out[i].NodeID).Scan(&out[i].LiveAttempts); err != nil {
+			WHERE a.state IN('authorized','running','quiescing','exited') AND ($1='*' OR x.node_id=$2)`, out[i].NodeID, out[i].NodeID).Scan(&out[i].LiveAttempts); err != nil {
 			return nil, err
 		}
-		if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations WHERE state='pending' AND (?='*' OR node_id=?)`, out[i].NodeID, out[i].NodeID).Scan(&out[i].PendingTerminations); err != nil {
+		if err = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations WHERE state='pending' AND ($1='*' OR node_id=$2)`, out[i].NodeID, out[i].NodeID).Scan(&out[i].PendingTerminations); err != nil {
 			return nil, err
 		}
 	}
@@ -144,7 +144,7 @@ func (s *Store) ListNodeQuarantines(ctx context.Context) ([]NodeQuarantine, erro
 
 func nodeQuarantinedTx(ctx context.Context, tx *sql.Tx, nodeID string) (bool, error) {
 	var n int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_quarantines WHERE node_id IN(?,'*')`, nodeID).Scan(&n)
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM node_quarantines WHERE node_id IN($1,'*')`, nodeID).Scan(&n)
 	return n > 0, err
 }
 
@@ -196,12 +196,12 @@ func (s *Store) ReconcileNodeQuarantines(ctx context.Context) error {
 }
 
 func (s *Store) requestQuarantineTermination(ctx context.Context, attemptID, executionID, executorID, nodeID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `INSERT INTO quarantine_terminations(attempt_id,execution_id,executor_id,node_id,state,requested_at) VALUES(?,?,?,?,'pending',?) ON CONFLICT(attempt_id) DO NOTHING`, attemptID, executionID, executorID, nodeID, now())
+	res, err := tx.ExecContext(ctx, `INSERT INTO quarantine_terminations(attempt_id,execution_id,executor_id,node_id,state,requested_at) VALUES($1,$2,$3,$4,'pending',$5) ON CONFLICT(attempt_id) DO NOTHING`, attemptID, executionID, executorID, nodeID, now())
 	if err != nil {
 		return err
 	}
@@ -221,8 +221,8 @@ func (s *Store) requestQuarantineTermination(ctx context.Context, attemptID, exe
 // carry out, with the attempt's launcher process: those of a node quarantine
 // and those of a gang one of whose ranks stopped (gang.go).
 func (s *Store) ListQuarantineTerminations(ctx context.Context, executorID string) ([]QuarantineTermination, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity,t.requested_at FROM quarantine_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=? AND t.state='pending'
-		UNION ALL SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity,t.requested_at FROM gang_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=? AND t.state='pending'
+	rows, err := s.db.QueryContext(ctx, `SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity,t.requested_at FROM quarantine_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=$1 AND t.state='pending'
+		UNION ALL SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity,t.requested_at FROM gang_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=$2 AND t.state='pending'
 		ORDER BY 5`, executorID, executorID)
 	if err != nil {
 		return nil, err
@@ -253,24 +253,24 @@ func (s *Store) ListQuarantineTerminations(ctx context.Context, executorID strin
 // processes (or found them already gone). Quiescence itself is still proven by
 // the executor's process-absence check before the lease is released.
 func (s *Store) MarkQuarantineTerminated(ctx context.Context, attemptID string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	table, event := "quarantine_terminations", "quarantine_terminated"
 	var executionID string
-	err = tx.QueryRowContext(ctx, `SELECT execution_id FROM quarantine_terminations WHERE attempt_id=?`, attemptID).Scan(&executionID)
+	err = tx.QueryRowContext(ctx, `SELECT execution_id FROM quarantine_terminations WHERE attempt_id=$1`, attemptID).Scan(&executionID)
 	if errors.Is(err, sql.ErrNoRows) {
 		table, event = "gang_terminations", "gang_terminated"
-		err = tx.QueryRowContext(ctx, `SELECT execution_id FROM gang_terminations WHERE attempt_id=?`, attemptID).Scan(&executionID)
+		err = tx.QueryRowContext(ctx, `SELECT execution_id FROM gang_terminations WHERE attempt_id=$1`, attemptID).Scan(&executionID)
 	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE `+table+` SET state='terminated',terminated_at=? WHERE attempt_id=? AND state='pending'`, now(), attemptID)
+	res, err := tx.ExecContext(ctx, `UPDATE `+table+` SET state='terminated',terminated_at=$1 WHERE attempt_id=$2 AND state='pending'`, now(), attemptID)
 	if err != nil {
 		return err
 	}
@@ -288,6 +288,6 @@ func (s *Store) MarkQuarantineTerminated(ctx context.Context, attemptID string) 
 
 func quarantineTerminatedTx(ctx context.Context, tx *sql.Tx, attemptID string) (bool, error) {
 	var n int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations WHERE attempt_id=? AND state='terminated'`, attemptID).Scan(&n)
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations WHERE attempt_id=$1 AND state='terminated'`, attemptID).Scan(&n)
 	return n > 0, err
 }

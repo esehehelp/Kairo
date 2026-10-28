@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -84,23 +83,22 @@ func serve(args []string) error {
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
-	if dir := filepath.Dir(daemonConfig.DatabasePath); dir != "." {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return err
-		}
+	// Anyone who can write the database can mint tokens: keep its password
+	// to this user.
+	if err := secfile.RestrictExisting(daemonConfig.DatabasePasswordFile); err != nil {
+		return fmt.Errorf("restrict the database password file to its owner: %w", err)
 	}
-	st, err := store.Open(daemonConfig.DatabasePath)
+	dsn, err := daemonConfig.Database()
 	if err != nil {
 		return err
+	}
+	st, err := store.Open(dsn)
+	if err != nil {
+		return fmt.Errorf("open the database: %w", err)
 	}
 	defer st.Close()
 	if daemonConfig.Scheduler.DiskMinFreeBytes != nil {
 		st.SetSchedulingPolicy(store.SchedulingPolicy{DiskMinFreeBytes: *daemonConfig.Scheduler.DiskMinFreeBytes})
-	}
-	// Anyone who can write the database can mint tokens: keep it (and its
-	// WAL, which holds recent pages) to this user.
-	if err := secfile.RestrictExisting(daemonConfig.DatabasePath, daemonConfig.DatabasePath+"-wal", daemonConfig.DatabasePath+"-shm"); err != nil {
-		return fmt.Errorf("restrict database to its owner: %w", err)
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
@@ -180,7 +178,7 @@ func serve(args []string) error {
 	}
 	errCh := make(chan error, 1+len(daemonConfig.Executors))
 	go func() {
-		logger.Info("control plane listening", "address", daemonConfig.Listen, "tls", daemonConfig.TLS(), "database", daemonConfig.DatabasePath)
+		logger.Info("control plane listening", "address", daemonConfig.Listen, "tls", daemonConfig.TLS(), "database", config.RedactDatabase(dsn))
 		serve := server.ListenAndServe
 		if daemonConfig.TLS() {
 			serve = func() error { return server.ListenAndServeTLS("", "") }

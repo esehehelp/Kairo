@@ -88,7 +88,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	if reservation, err := s.deliverGangLease(ctx, executorID); reservation != nil || err != nil {
 		return reservation, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -145,7 +145,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 		err = saveNodeAlertsTx(ctx, tx, m)
 	}
 	if err == nil && reservation != nil {
-		_, err = tx.ExecContext(ctx, `DELETE FROM admission_waits WHERE execution_id=?`, reservation.Execution.ID)
+		_, err = tx.ExecContext(ctx, `DELETE FROM admission_waits WHERE execution_id=$1`, reservation.Execution.ID)
 	}
 	if err != nil {
 		return nil, err
@@ -165,7 +165,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 func callerMayPlanTx(ctx context.Context, tx *sql.Tx, executorID string) (bool, error) {
 	var nodeID string
 	var enabled bool
-	err := tx.QueryRowContext(ctx, `SELECT node_id,enabled FROM executors WHERE id=?`, executorID).Scan(&nodeID, &enabled)
+	err := tx.QueryRowContext(ctx, `SELECT node_id,enabled FROM executors WHERE id=$1`, executorID).Scan(&nodeID, &enabled)
 	if errors.Is(err, sql.ErrNoRows) || err == nil && !enabled {
 		return false, nil
 	}
@@ -190,7 +190,7 @@ func writeReservationTx(ctx context.Context, tx *sql.Tx, executorID string, cand
 	}
 	epoch := int64(1)
 	var previous sql.NullInt64
-	if err = tx.QueryRowContext(ctx, `SELECT MAX(coordination_epoch) FROM leases WHERE execution_id=?`, candidate.execution.ID).Scan(&previous); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT MAX(coordination_epoch) FROM leases WHERE execution_id=$1`, candidate.execution.ID).Scan(&previous); err != nil {
 		return nil, err
 	}
 	if previous.Valid {
@@ -198,13 +198,13 @@ func writeReservationTx(ctx context.Context, tx *sql.Tx, executorID string, cand
 	}
 	leaseID, stamp := id.New("lea"), now()
 	expires := time.Now().UTC().Add(30 * time.Second).Format(time.RFC3339Nano)
-	if _, err = tx.ExecContext(ctx, `INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,expires_at,created_at) VALUES(?,?,?,?,'reserved',?,?)`, leaseID, candidate.execution.ID, executorID, epoch, expires, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO leases(id,execution_id,executor_id,coordination_epoch,state,expires_at,created_at) VALUES($1,$2,$3,$4,'reserved',$5,$6)`, leaseID, candidate.execution.ID, executorID, epoch, expires, stamp); err != nil {
 		return nil, err
 	}
 	gateGenerations := make(map[string]int64, len(gates))
 	for _, gate := range gates {
 		gateGenerations[gate.ScopeID] = gate.Generation
-		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_gate_snapshots(lease_id,scope_id,generation) VALUES(?,?,?)`, leaseID, gate.ScopeID, gate.Generation); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_gate_snapshots(lease_id,scope_id,generation) VALUES($1,$2,$3)`, leaseID, gate.ScopeID, gate.Generation); err != nil {
 			return nil, err
 		}
 	}
@@ -212,17 +212,17 @@ func writeReservationTx(ctx context.Context, tx *sql.Tx, executorID string, cand
 	for _, resourceID := range fit.gpus {
 		var r ResourceInstance
 		var binding, attributes string
-		if err = tx.QueryRowContext(ctx, `SELECT id,node_id,provider_id,kind,stable_identity,binding_json,attributes_json,admin_state,quarantine_reason FROM resource_instances WHERE id=?`, resourceID).Scan(&r.ID, &r.NodeID, &r.ProviderID, &r.Kind, &r.StableIdentity, &binding, &attributes, &r.AdminState, &r.QuarantineReason); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT id,node_id,provider_id,kind,stable_identity,binding_json,attributes_json,admin_state,quarantine_reason FROM resource_instances WHERE id=$1`, resourceID).Scan(&r.ID, &r.NodeID, &r.ProviderID, &r.Kind, &r.StableIdentity, &binding, &attributes, &r.AdminState, &r.QuarantineReason); err != nil {
 			return nil, err
 		}
 		r.Binding, r.Attributes = json.RawMessage(binding), json.RawMessage(attributes)
 		resources = append(resources, r)
-		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_items(lease_id,resource_id,kind,quantity,filesystem) VALUES(?,?,'gpu',1,'')`, leaseID, resourceID); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_items(lease_id,resource_id,kind,quantity,filesystem) VALUES($1,$2,'gpu',1,'')`, leaseID, resourceID); err != nil {
 			return nil, err
 		}
 	}
 	for _, c := range fit.capacity {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_items(lease_id,resource_id,kind,quantity,filesystem) VALUES(?,?,?,?,?)`, leaseID, c.resourceID, c.key.kind, c.quantity, c.key.filesystem); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO lease_items(lease_id,resource_id,kind,quantity,filesystem) VALUES($1,$2,$3,$4,$5)`, leaseID, c.resourceID, c.key.kind, c.quantity, c.key.filesystem); err != nil {
 			return nil, err
 		}
 	}
@@ -262,7 +262,7 @@ func selectorMatches(selectorJSON, nodeID, executorJSON string) bool {
 }
 
 func loadResourceRequestsTx(ctx context.Context, tx *sql.Tx, executionID string) ([]requestRow, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT id,request_type,kind,quantity,filesystem,constraints_json,policy_json FROM resource_requests WHERE execution_id=? ORDER BY request_type DESC,id`, executionID)
+	rows, err := tx.QueryContext(ctx, `SELECT id,request_type,kind,quantity,filesystem,constraints_json,policy_json FROM resource_requests WHERE execution_id=$1 ORDER BY request_type DESC,id`, executionID)
 	if err != nil {
 		return nil, err
 	}
@@ -281,11 +281,11 @@ func loadResourceRequestsTx(ctx context.Context, tx *sql.Tx, executionID string)
 func terminalizeAdmissionTx(ctx context.Context, tx *sql.Tx, execution ExecutionRequest, reason string) error {
 	stamp := now()
 	detail, _ := json.Marshal(map[string]string{"reason": reason})
-	if _, err := tx.ExecContext(ctx, `INSERT INTO admission_blocks(id,execution_id,reason_code,detail_json,created_at) VALUES(?,?,?,?,?)`, id.New("blk"), execution.ID, reason, string(detail), stamp); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO admission_blocks(id,execution_id,reason_code,detail_json,created_at) VALUES($1,$2,$3,$4,$5)`, id.New("blk"), execution.ID, reason, string(detail), stamp); err != nil {
 		return err
 	}
 	cause := "admission_" + reason
-	result, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause=?,terminal_at=? WHERE id=? AND state='waiting'`, cause, stamp, execution.ID)
+	result, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause=$1,terminal_at=$2 WHERE id=$3 AND state='waiting'`, cause, stamp, execution.ID)
 	if err != nil {
 		return err
 	}
@@ -296,7 +296,7 @@ func terminalizeAdmissionTx(ctx context.Context, tx *sql.Tx, execution Execution
 }
 
 func executionGatesTx(ctx context.Context, tx *sql.Tx, executionID string) ([]AdmissionGate, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT g.scope_id,g.state,g.generation,g.updated_at FROM execution_requests e JOIN admission_gates g ON g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) WHERE e.id=? ORDER BY g.scope_id`, executionID)
+	rows, err := tx.QueryContext(ctx, `SELECT g.scope_id,g.state,g.generation,g.updated_at FROM execution_requests e JOIN admission_gates g ON g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) WHERE e.id=$1 ORDER BY g.scope_id`, executionID)
 	if err != nil {
 		return nil, err
 	}
@@ -320,15 +320,15 @@ func executionGatesTx(ctx context.Context, tx *sql.Tx, executionID string) ([]Ad
 
 func validateLeaseGatesTx(ctx context.Context, tx *sql.Tx, leaseID string) error {
 	var mismatches int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_gate_snapshots s LEFT JOIN admission_gates g ON g.scope_id=s.scope_id WHERE s.lease_id=? AND (g.scope_id IS NULL OR g.state!='open' OR g.generation!=s.generation)`, leaseID).Scan(&mismatches)
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_gate_snapshots s LEFT JOIN admission_gates g ON g.scope_id=s.scope_id WHERE s.lease_id=$1 AND (g.scope_id IS NULL OR g.state!='open' OR g.generation!=s.generation)`, leaseID).Scan(&mismatches)
 	if err != nil {
 		return err
 	}
 	var captured, expected int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_gate_snapshots WHERE lease_id=?`, leaseID).Scan(&captured); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_gate_snapshots WHERE lease_id=$1`, leaseID).Scan(&captured); err != nil {
 		return err
 	}
-	if err = tx.QueryRowContext(ctx, `SELECT 1+(e.queue_scope_id IS NOT NULL)+(e.task_scope_id IS NOT NULL) FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=?`, leaseID).Scan(&expected); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT 1+(e.queue_scope_id IS NOT NULL)::int+(e.task_scope_id IS NOT NULL)::int FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1`, leaseID).Scan(&expected); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
@@ -342,13 +342,13 @@ func validateLeaseGatesTx(ctx context.Context, tx *sql.Tx, leaseID string) error
 // ValidateReservation re-observes the lease's exclusive resources and fences
 // any pause/resume generation change since reservation.
 func (s *Store) ValidateReservation(ctx context.Context, leaseID string, epoch int64) error {
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.beginRead(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var executionID, state string
-	if err = tx.QueryRowContext(ctx, `SELECT execution_id,state FROM leases WHERE id=? AND coordination_epoch=?`, leaseID, epoch).Scan(&executionID, &state); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT execution_id,state FROM leases WHERE id=$1 AND coordination_epoch=$2`, leaseID, epoch).Scan(&executionID, &state); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
@@ -363,9 +363,9 @@ func (s *Store) ValidateReservation(ctx context.Context, leaseID string, epoch i
 		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
 		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity')
 		FROM lease_items li
-		JOIN resource_requests rr ON rr.execution_id=? AND rr.request_type='exclusive' AND rr.kind=li.kind
+		JOIN resource_requests rr ON rr.execution_id=$1 AND rr.request_type='exclusive' AND rr.kind=li.kind
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
-		WHERE li.lease_id=? AND li.resource_id IS NOT NULL AND li.kind='gpu'`, executionID, leaseID)
+		WHERE li.lease_id=$2 AND li.resource_id IS NOT NULL AND li.kind='gpu'`, executionID, leaseID)
 	if err != nil {
 		return err
 	}
@@ -400,7 +400,7 @@ func (s *Store) ValidateReservation(ctx context.Context, leaseID string, epoch i
 }
 
 func (s *Store) MarkLeasePrepared(ctx context.Context, leaseID string, epoch int64) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -408,18 +408,18 @@ func (s *Store) MarkLeasePrepared(ctx context.Context, leaseID string, epoch int
 	if err = validateLeaseGatesTx(ctx, tx, leaseID); err != nil {
 		return err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE leases SET state='prepared',prepared_at=? WHERE id=? AND coordination_epoch=? AND state='reserved'`, now(), leaseID, epoch)
+	result, err := tx.ExecContext(ctx, `UPDATE leases SET state='prepared',prepared_at=$1 WHERE id=$2 AND coordination_epoch=$3 AND state='reserved'`, now(), leaseID, epoch)
 	if err != nil {
 		return err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
 		return fmt.Errorf("%w: lease is not reserved at this epoch", ErrStaleEpoch)
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE lease_items SET prepared=1 WHERE lease_id=?`, leaseID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE lease_items SET prepared=TRUE WHERE lease_id=$1`, leaseID); err != nil {
 		return err
 	}
 	var projectID string
-	if err = tx.QueryRowContext(ctx, `SELECT e.project_scope_id FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=?`, leaseID).Scan(&projectID); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT e.project_scope_id FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1`, leaseID).Scan(&projectID); err != nil {
 		return err
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "lease_prepared", &projectID, "lease", leaseID, &epoch, nil); err != nil {
@@ -432,14 +432,14 @@ func (s *Store) MarkLeasePrepared(ctx context.Context, leaseID string, epoch int
 // already been issued, the one-shot execution becomes terminal; before that,
 // it remains waiting and may receive a new reservation epoch.
 func (s *Store) ReleaseReservation(ctx context.Context, leaseID string, epoch int64, reason string) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var executionID, projectID, state string
 	var attemptID sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,l.attempt_id FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=? AND l.coordination_epoch=?`, leaseID, epoch).Scan(&executionID, &projectID, &state, &attemptID)
+	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,l.attempt_id FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1 AND l.coordination_epoch=$2`, leaseID, epoch).Scan(&executionID, &projectID, &state, &attemptID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -456,11 +456,11 @@ func (s *Store) ReleaseReservation(ctx context.Context, leaseID string, epoch in
 	var unsafeExclusive int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
-		WHERE li.lease_id=? AND li.kind='gpu' AND li.resource_id IS NOT NULL AND
-		(o.id IS NULL OR julianday(o.valid_until)<=julianday(?) OR julianday(o.observed_at)<=julianday((SELECT created_at FROM leases WHERE id=?))
+		WHERE li.lease_id=$1 AND li.kind='gpu' AND li.resource_id IS NOT NULL AND
+		(o.id IS NULL OR (o.valid_until)::timestamptz<=($2)::timestamptz OR (o.observed_at)::timestamptz<=((SELECT created_at FROM leases WHERE id=$3))::timestamptz
 		 OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL
 		   AND (c.claim_kind='external_process' OR c.claim_kind='unattributed_activity' AND COALESCE(
-		     (SELECT json_extract(rr.policy_json,'$.on_unattributed_activity') FROM resource_requests rr
+		     (SELECT rr.policy_json::jsonb->>'on_unattributed_activity' FROM resource_requests rr
 		      JOIN leases policy_lease ON policy_lease.execution_id=rr.execution_id
 		      WHERE policy_lease.id=li.lease_id AND rr.request_type='exclusive' AND rr.kind=li.kind LIMIT 1),
 		     'wait')!='allow')))`, leaseID, stamp, leaseID).Scan(&unsafeExclusive); err != nil {
@@ -471,10 +471,10 @@ func (s *Store) ReleaseReservation(ctx context.Context, leaseID string, epoch in
 	}
 	revokedByPause := state == "revocation_requested"
 	if attemptID.Valid {
-		if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=? WHERE attempt_id=? AND state='issued'`, stamp, attemptID.String); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=$1 WHERE attempt_id=$2 AND state='issued'`, stamp, attemptID.String); err != nil {
 			return err
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',exited_at=COALESCE(exited_at,?),quiesced_at=? WHERE id=? AND state='authorized'`, stamp, stamp, attemptID.String); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',exited_at=COALESCE(exited_at,$1),quiesced_at=$2 WHERE id=$3 AND state='authorized'`, stamp, stamp, attemptID.String); err != nil {
 			return err
 		}
 		cause := "launch_aborted"
@@ -483,11 +483,11 @@ func (s *Store) ReleaseReservation(ctx context.Context, leaseID string, epoch in
 		} else if reason != "" {
 			cause = "launch_aborted: " + reason
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause=?,terminal_at=? WHERE id=? AND state='authorized'`, cause, stamp, executionID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause=$1,terminal_at=$2 WHERE id=$3 AND state='authorized'`, cause, stamp, executionID); err != nil {
 			return err
 		}
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=? WHERE id=? AND coordination_epoch=? AND state IN('reserved','prepared','revocation_requested')`, stamp, leaseID, epoch)
+	result, err := tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=$1 WHERE id=$2 AND coordination_epoch=$3 AND state IN('reserved','prepared','revocation_requested')`, stamp, leaseID, epoch)
 	if err != nil {
 		return err
 	}
@@ -495,7 +495,7 @@ func (s *Store) ReleaseReservation(ctx context.Context, leaseID string, epoch in
 		return fmt.Errorf("%w: lease cannot be released at this epoch", ErrStaleEpoch)
 	}
 	if revokedByPause {
-		if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',blocker_reason=NULL,updated_at=? WHERE execution_id=? AND lease_id=? AND state='revoking'`, stamp, executionID, leaseID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',blocker_reason=NULL,updated_at=$1 WHERE execution_id=$2 AND lease_id=$3 AND state='revoking'`, stamp, executionID, leaseID); err != nil {
 			return err
 		}
 	}
@@ -512,7 +512,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if reservation == nil {
 		return nil, errors.New("reservation is required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -520,7 +520,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	var executionID, projectID, leaseState, executionState, executorID string
 	var leaseEpoch int64
 	var envJSON sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch,e.env_json FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=?`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch, &envJSON)
+	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch,e.env_json FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch, &envJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -546,10 +546,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		return nil, err
 	}
 	attemptID, stamp := id.New("att"), now()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at) VALUES(?,?,'authorized',?,?,?)`, attemptID, executionID, executorID, leaseEpoch, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at) VALUES($1,$2,'authorized',$3,$4,$5)`, attemptID, executionID, executorID, leaseEpoch, stamp); err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE leases SET attempt_id=? WHERE id=? AND attempt_id IS NULL`, attemptID, reservation.Lease.ID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE leases SET attempt_id=$1 WHERE id=$2 AND attempt_id IS NULL`, attemptID, reservation.Lease.ID); err != nil {
 		return nil, err
 	}
 	token, tokenHash, err := newSecret("")
@@ -557,17 +557,17 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		return nil, err
 	}
 	authorizationID := id.New("auth")
-	if _, err = tx.ExecContext(ctx, `INSERT INTO launch_authorizations(id,lease_id,attempt_id,coordination_epoch,token_hash,state,issued_at) VALUES(?,?,?,?,?,'issued',?)`, authorizationID, reservation.Lease.ID, attemptID, leaseEpoch, tokenHash, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO launch_authorizations(id,lease_id,attempt_id,coordination_epoch,token_hash,state,issued_at) VALUES($1,$2,$3,$4,$5,'issued',$6)`, authorizationID, reservation.Lease.ID, attemptID, leaseEpoch, tokenHash, stamp); err != nil {
 		return nil, err
 	}
 	workerToken, workerTokenHash, err := newSecret("kairo_worker_")
 	if err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO attempt_tokens(attempt_id,lease_id,coordination_epoch,token_hash,issued_at) VALUES(?,?,?,?,?)`, attemptID, reservation.Lease.ID, leaseEpoch, workerTokenHash, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO attempt_tokens(attempt_id,lease_id,coordination_epoch,token_hash,issued_at) VALUES($1,$2,$3,$4,$5)`, attemptID, reservation.Lease.ID, leaseEpoch, workerTokenHash, stamp); err != nil {
 		return nil, err
 	}
-	result, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='authorized',authorized_at=? WHERE id=? AND state='waiting'`, stamp, executionID)
+	result, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='authorized',authorized_at=$1 WHERE id=$2 AND state='waiting'`, stamp, executionID)
 	if err != nil {
 		return nil, err
 	}
@@ -606,7 +606,7 @@ func (s *Store) ActivateLaunch(ctx context.Context, attemptID, leaseID string, e
 	if pid <= 0 || processIdentity == "" {
 		return errors.New("launcher pid and process identity are required")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -620,7 +620,7 @@ func (s *Store) ActivateLaunch(ctx context.Context, attemptID, leaseID string, e
 	var authorizationID, executionID, projectID string
 	err = tx.QueryRowContext(ctx, `SELECT a.id,l.execution_id,e.project_scope_id
 		FROM launch_authorizations a JOIN leases l ON l.id=a.lease_id JOIN execution_requests e ON e.id=l.execution_id
-		WHERE a.attempt_id=? AND a.lease_id=? AND a.coordination_epoch=? AND a.token_hash=? AND a.state='issued'`, attemptID, leaseID, epoch, hashToken(token)).Scan(&authorizationID, &executionID, &projectID)
+		WHERE a.attempt_id=$1 AND a.lease_id=$2 AND a.coordination_epoch=$3 AND a.token_hash=$4 AND a.state='issued'`, attemptID, leaseID, epoch, hashToken(token)).Scan(&authorizationID, &executionID, &projectID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return errors.New("invalid or consumed launch authorization")
 	}
@@ -628,35 +628,35 @@ func (s *Store) ActivateLaunch(ctx context.Context, attemptID, leaseID string, e
 		return err
 	}
 	stamp := now()
-	result, err := tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='consumed',consumed_at=? WHERE id=? AND state='issued'`, stamp, authorizationID)
+	result, err := tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='consumed',consumed_at=$1 WHERE id=$2 AND state='issued'`, stamp, authorizationID)
 	if err != nil {
 		return err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
 		return errors.New("invalid or consumed launch authorization")
 	}
-	result, err = tx.ExecContext(ctx, `UPDATE attempts SET state='running',pid=?,process_identity=?,started_at=?,last_heartbeat_at=? WHERE id=? AND state='authorized'`, pid, processIdentity, stamp, stamp, attemptID)
+	result, err = tx.ExecContext(ctx, `UPDATE attempts SET state='running',pid=$1,process_identity=$2,started_at=$3,last_heartbeat_at=$4 WHERE id=$5 AND state='authorized'`, pid, processIdentity, stamp, stamp, attemptID)
 	if err != nil {
 		return err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
 		return ErrExecutionStarted
 	}
-	result, err = tx.ExecContext(ctx, `UPDATE leases SET state='active',activated_at=? WHERE id=? AND coordination_epoch=? AND state='prepared'`, stamp, leaseID, epoch)
+	result, err = tx.ExecContext(ctx, `UPDATE leases SET state='active',activated_at=$1 WHERE id=$2 AND coordination_epoch=$3 AND state='prepared'`, stamp, leaseID, epoch)
 	if err != nil {
 		return err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
 		return fmt.Errorf("%w: lease is not prepared", ErrStaleEpoch)
 	}
-	result, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='started',started_at=? WHERE id=? AND state='authorized'`, stamp, executionID)
+	result, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='started',started_at=$1 WHERE id=$2 AND state='authorized'`, stamp, executionID)
 	if err != nil {
 		return err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
 		return ErrExecutionStarted
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO attempt_processes(attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at) VALUES(?,'launcher','host',-1,?,?,?,?)`, attemptID, pid, processIdentity, stamp, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO attempt_processes(attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at) VALUES($1,'launcher','host',-1,$2,$3,$4,$5)`, attemptID, pid, processIdentity, stamp, stamp); err != nil {
 		return err
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "execution_started", &projectID, "attempt", attemptID, &epoch, map[string]any{"execution_id": executionID, "lease_id": leaseID, "pid": pid, "process_identity": processIdentity}); err != nil {

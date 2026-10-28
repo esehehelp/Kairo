@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -12,12 +11,12 @@ import (
 )
 
 // declareTestGPU declares one GPU for a node, keeping the other declarations.
-func declareTestGPU(t *testing.T, store *Store, uuid, nodeID string) {
+func declareTestGPU(t testing.TB, store *Store, uuid, nodeID string) {
 	t.Helper()
-	if _, err := store.db.Exec(`DELETE FROM machine_gpus WHERE uuid=?`, uuid); err != nil {
+	if _, err := store.testExec(`DELETE FROM machine_gpus WHERE uuid=$1`, uuid); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.db.Exec(`INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES(?,?,?)`, uuid, nodeID, now()); err != nil {
+	if _, err := store.testExec(`INSERT INTO machine_gpus(uuid,node_id,declared_at) VALUES($1,$2,$3)`, uuid, nodeID, now()); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -235,27 +234,5 @@ func TestSchedulerSkipsAnUndeclaredGPU(t *testing.T) {
 	refreshSchedulerGPU(t, store)
 	if reservation, err := store.ReserveNext(ctx, "executor"); err != nil || reservation == nil {
 		t.Fatalf("declared GPU was not reserved: %+v %v", reservation, err)
-	}
-}
-
-func TestOpenDeclaresTheGPUsRegisteredBeforeMachineDeclarations(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "kairo.db")
-	store, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	setupSchedulerInventory(t, store)
-	// A database from before machine declarations: no machine tables.
-	if _, err = store.db.Exec(`DROP TABLE machine_gpus; DROP TABLE undeclared_gpus`); err != nil {
-		t.Fatal(err)
-	}
-	store.Close()
-	if store, err = Open(path); err != nil {
-		t.Fatal(err)
-	}
-	defer store.Close()
-	machines, err := store.ListMachines(context.Background())
-	if err != nil || len(machines.GPUs) != 1 || machines.GPUs[0].UUID != "GPU-0" || machines.GPUs[0].NodeID != "node" {
-		t.Fatalf("seeded declaration: %+v %v", machines, err)
 	}
 }

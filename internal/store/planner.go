@@ -37,7 +37,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"math"
 	"slices"
@@ -256,7 +255,7 @@ func loadPlanModel(ctx context.Context, tx *sql.Tx, policy SchedulingPolicy, cal
 
 func (m *planModel) loadExecutors(ctx context.Context, tx *sql.Tx, callerID string) error {
 	rows, err := tx.QueryContext(ctx, `SELECT x.id,x.node_id,x.attributes_json,n.attributes_json,x.last_seen_at FROM executors x JOIN nodes n ON n.id=x.node_id
-		WHERE x.enabled=1 AND n.enabled=1 AND NOT EXISTS(SELECT 1 FROM node_quarantines q WHERE q.node_id IN(x.node_id,'*'))
+		WHERE x.enabled AND n.enabled AND NOT EXISTS(SELECT 1 FROM node_quarantines q WHERE q.node_id IN(x.node_id,'*'))
 		ORDER BY x.id`)
 	if err != nil {
 		return err
@@ -360,10 +359,10 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT l.id,l.execution_id,COALESCE(l.attempt_id,''),l.executor_id,x.node_id,x.enabled,l.state,l.coordination_epoch,COALESCE(a.state,''),
 		e.priority,e.checkpointable,e.preemptible,e.state,e.project_scope_id,COALESCE(e.task_scope_id,e.queue_scope_id,e.project_scope_id),COALESCE(e.started_at,''),
 		EXISTS(SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id),
-		COALESCE((SELECT MIN(CASE WHEN COALESCE(json_extract(rr.policy_json,'$.on_unattributed_activity'),'wait')='allow' THEN 1 ELSE 0 END)
+		COALESCE((SELECT MIN(CASE WHEN COALESCE(rr.policy_json::jsonb->>'on_unattributed_activity','wait')='allow' THEN 1 ELSE 0 END)
 			FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='exclusive' AND rr.kind='gpu'),0),
 		u.ram_bytes,u.disk_written_bytes,u.observed_at,
-		COALESCE((SELECT rr.quantity-json_extract(rr.constraints_json,'$.min_quantity') FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='capacity' AND rr.kind='cpu' AND json_extract(rr.constraints_json,'$.min_quantity') IS NOT NULL),0)
+		COALESCE((SELECT rr.quantity-(rr.constraints_json::jsonb->>'min_quantity')::bigint FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='capacity' AND rr.kind='cpu' AND rr.constraints_json::jsonb->>'min_quantity' IS NOT NULL),0)
 		FROM leases l JOIN executors x ON x.id=l.executor_id JOIN execution_requests e ON e.id=l.execution_id
 		LEFT JOIN attempts a ON a.id=l.attempt_id LEFT JOIN attempt_usage u ON u.attempt_id=l.attempt_id
 		WHERE l.state IN `+liveLeaseStates+` ORDER BY l.id`)
@@ -1124,30 +1123,64 @@ func (p *planner) reaches(l *planLease, nodes map[string]bool) bool {
 
 // loadPlanCandidates returns every waiting execution that may be admitted
 // now (its scope chain open, no live lease; a gang by its leader).
+//
+// It costs a fixed number of queries whatever the number of candidates (one
+// round trip each, which matters with the database across a network): the
+// candidates with their gangs, the members of those gangs, and the resource
+// requests of all of them.
 func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planCandidate, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT e.id,e.project_scope_id,e.queue_scope_id,e.task_scope_id,e.client_request_id,e.spec_digest,e.state,e.argv_json,e.cwd,e.executor_selector_json,e.priority,e.checkpointable,e.preemptible,e.input_continuation_ref,e.terminal_cause,e.submitted_at,e.authorized_at,e.started_at,e.terminal_at
-		FROM execution_requests e
+	var candidates []*planCandidate
+	var gangIDs []string
+	err := eachRow(ctx, tx, `SELECT `+candidateColumns+`,COALESCE(gm.gang_id,'')
+		FROM execution_requests e LEFT JOIN gang_members gm ON gm.execution_id=e.id
 		WHERE e.state='waiting'
 		AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.execution_id=e.id AND l.state!='released')
 		AND NOT EXISTS (
 			SELECT 1 FROM admission_gates g
 			WHERE g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) AND g.state!='open'
 		)
-		AND NOT EXISTS (SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id AND gm.rank>0)
-		ORDER BY e.priority DESC,e.submitted_at,e.id`)
+		AND (gm.rank IS NULL OR gm.rank=0)
+		ORDER BY e.priority DESC,e.submitted_at,e.id`, nil, func(rows *sql.Rows) error {
+		c := &planCandidate{}
+		if err := scanCandidate(rows, &c.executionCandidate, &c.gangID); err != nil {
+			return err
+		}
+		if c.gangID != "" {
+			gangIDs = append(gangIDs, c.gangID)
+		}
+		candidates = append(candidates, c)
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	var candidates []*planCandidate
-	for rows.Next() {
-		c := &planCandidate{}
-		if err = rows.Scan(&c.execution.ID, &c.execution.ProjectScopeID, &c.execution.QueueScopeID, &c.execution.TaskScopeID, &c.execution.ClientRequestID, &c.execution.SpecDigest, &c.execution.State, &c.argvJSON, &c.execution.CWD, &c.selectorJSON, &c.execution.Priority, &c.execution.Checkpointable, &c.execution.Preemptible, &c.execution.InputContinuationRef, &c.execution.TerminalCause, &c.execution.SubmittedAt, &c.execution.AuthorizedAt, &c.execution.StartedAt, &c.execution.TerminalAt); err != nil {
-			rows.Close()
+	members := map[string][]gangMember{}
+	if len(gangIDs) > 0 {
+		err = eachRow(ctx, tx, `SELECT `+candidateColumns+`,gm.gang_id,gm.rank FROM gang_members gm JOIN execution_requests e ON e.id=gm.execution_id
+			WHERE gm.gang_id=ANY($1::text[]) ORDER BY gm.gang_id,gm.rank`, []any{gangIDs}, func(rows *sql.Rows) error {
+			var member gangMember
+			var gangID string
+			if err := scanCandidate(rows, &member.candidate, &gangID, &member.rank); err != nil {
+				return err
+			}
+			members[gangID] = append(members[gangID], member)
+			return nil
+		})
+		if err != nil {
 			return nil, err
 		}
-		candidates = append(candidates, c)
 	}
-	if err = rows.Close(); err != nil {
+	ids := make([]string, 0, len(candidates))
+	for _, c := range candidates {
+		ids = append(ids, c.execution.ID)
+	}
+	for _, gang := range members {
+		for _, member := range gang {
+			ids = append(ids, member.candidate.execution.ID)
+		}
+	}
+	demands, err := loadDemandsTx(ctx, tx, ids)
+	if err != nil {
 		return nil, err
 	}
 	for _, c := range candidates {
@@ -1156,27 +1189,10 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 			task = *c.execution.TaskScopeID
 		}
 		c.label = m.labels[c.execution.ProjectScopeID] + "/" + m.labels[task]
-		if c.demand, err = loadDemandTx(ctx, tx, c.execution.ID); err != nil {
-			return nil, err
-		}
+		c.demand = demands[c.execution.ID]
 		c.demand.priority = c.execution.Priority
-		gangID, _, _, gangErr := gangOfExecutionTx(ctx, tx, c.execution.ID)
-		if gangErr != nil {
-			return nil, gangErr
-		}
-		if gangID == "" {
-			continue
-		}
-		c.gangID = gangID
-		members, membersErr := gangMembersTx(ctx, tx, gangID)
-		if membersErr != nil {
-			return nil, membersErr
-		}
-		for _, member := range members {
-			demand, demandErr := loadDemandTx(ctx, tx, member.candidate.execution.ID)
-			if demandErr != nil {
-				return nil, demandErr
-			}
+		for _, member := range members[c.gangID] {
+			demand := demands[member.candidate.execution.ID]
 			demand.priority = c.execution.Priority
 			c.ranks = append(c.ranks, planRank{rank: member.rank, candidate: member.candidate, demand: demand})
 		}
@@ -1184,13 +1200,34 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 	return candidates, nil
 }
 
-// loadDemandTx groups an execution's resource requests: exclusive requests
-// one by one, capacity requests summed per kind and filesystem.
-func loadDemandTx(ctx context.Context, tx *sql.Tx, executionID string) (planDemand, error) {
-	requests, err := loadResourceRequestsTx(ctx, tx, executionID)
+// loadDemandsTx returns the demand of each execution (demandOf), in one
+// query.
+func loadDemandsTx(ctx context.Context, tx *sql.Tx, executionIDs []string) (map[string]planDemand, error) {
+	requests := map[string][]requestRow{}
+	err := eachRow(ctx, tx, `SELECT execution_id,id,request_type,kind,quantity,filesystem,constraints_json,policy_json FROM resource_requests
+		WHERE execution_id=ANY($1::text[]) ORDER BY execution_id,request_type DESC,id`, []any{executionIDs}, func(rows *sql.Rows) error {
+		var executionID string
+		var r requestRow
+		if err := rows.Scan(&executionID, &r.ID, &r.Type, &r.Kind, &r.Quantity, &r.Filesystem, &r.Constraints, &r.Policy); err != nil {
+			return err
+		}
+		requests[executionID] = append(requests[executionID], r)
+		return nil
+	})
 	if err != nil {
-		return planDemand{}, err
+		return nil, err
 	}
+	demands := make(map[string]planDemand, len(executionIDs))
+	for _, id := range executionIDs {
+		demands[id] = demandOf(requests[id])
+	}
+	return demands, nil
+}
+
+// demandOf groups an execution's resource requests (in loadResourceRequestsTx
+// order): exclusive requests one by one, capacity requests summed per kind
+// and filesystem.
+func demandOf(requests []requestRow) planDemand {
 	var d planDemand
 	groups := map[string]int{}
 	for _, r := range requests {
@@ -1218,7 +1255,7 @@ func loadDemandTx(ctx context.Context, tx *sql.Tx, executionID string) (planDema
 		}
 		return d.capacity[i].filesystem < d.capacity[j].filesystem
 	})
-	return d, nil
+	return d
 }
 
 // waitRefresh: a wait whose reason and node stay the same is rewritten (for
@@ -1256,7 +1293,7 @@ func saveWaitsTx(ctx context.Context, tx *sql.Tx, waits map[string]planWait, com
 	stamp := now()
 	for executionID := range existing {
 		if _, still := waits[executionID]; complete && !still {
-			if _, err = tx.ExecContext(ctx, `DELETE FROM admission_waits WHERE execution_id=?`, executionID); err != nil {
+			if _, err = tx.ExecContext(ctx, `DELETE FROM admission_waits WHERE execution_id=$1`, executionID); err != nil {
 				return err
 			}
 		}
@@ -1272,11 +1309,11 @@ func saveWaitsTx(ctx context.Context, tx *sql.Tx, waits map[string]planWait, com
 		}
 		since := stamp
 		if old, ok := existing[executionID]; ok && old.reason == w.reason {
-			if err = tx.QueryRowContext(ctx, `SELECT since FROM admission_waits WHERE execution_id=?`, executionID).Scan(&since); err != nil {
+			if err = tx.QueryRowContext(ctx, `SELECT since FROM admission_waits WHERE execution_id=$1`, executionID).Scan(&since); err != nil {
 				return err
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO admission_waits(execution_id,reason_code,node_id,detail_json,since,updated_at) VALUES(?,?,?,?,?,?)
+		if _, err = tx.ExecContext(ctx, `INSERT INTO admission_waits(execution_id,reason_code,node_id,detail_json,since,updated_at) VALUES($1,$2,$3,$4,$5,$6)
 			ON CONFLICT(execution_id) DO UPDATE SET reason_code=excluded.reason_code,node_id=excluded.node_id,detail_json=excluded.detail_json,since=excluded.since,updated_at=excluded.updated_at`,
 			executionID, w.reason, node, string(detail), since, stamp); err != nil {
 			return err
@@ -1316,7 +1353,7 @@ func saveNodeAlertsTx(ctx context.Context, tx *sql.Tx, m *planModel) error {
 		if _, still := current[k]; still {
 			continue
 		}
-		if _, err = tx.ExecContext(ctx, `DELETE FROM node_alerts WHERE node_id=? AND kind='disk_low_watermark' AND subject=?`, k[0], k[1]); err != nil {
+		if _, err = tx.ExecContext(ctx, `DELETE FROM node_alerts WHERE node_id=$1 AND kind='disk_low_watermark' AND subject=$2`, k[0], k[1]); err != nil {
 			return err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "disk_watermark_cleared", nil, "node", k[0], nil, map[string]string{"filesystem": k[1]}); err != nil {
@@ -1328,7 +1365,7 @@ func saveNodeAlertsTx(ctx context.Context, tx *sql.Tx, m *planModel) error {
 			continue
 		}
 		detail, _ := json.Marshal(map[string]string{"message": message})
-		if _, err = tx.ExecContext(ctx, `INSERT INTO node_alerts(node_id,kind,subject,detail_json,since) VALUES(?,'disk_low_watermark',?,?,?)`, k[0], k[1], string(detail), stamp); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO node_alerts(node_id,kind,subject,detail_json,since) VALUES($1,'disk_low_watermark',$2,$3,$4)`, k[0], k[1], string(detail), stamp); err != nil {
 			return err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "disk_low_watermark", nil, "node", k[0], nil, map[string]string{"filesystem": k[1], "message": message}); err != nil {
@@ -1341,7 +1378,7 @@ func saveNodeAlertsTx(ctx context.Context, tx *sql.Tx, m *planModel) error {
 // RecordAttemptUsage stores what an attempt's process tree uses now. A nil
 // field is not known.
 func (s *Store) RecordAttemptUsage(ctx context.Context, attemptID string, ramBytes, diskWrittenBytes *int64) error {
-	result, err := s.db.ExecContext(ctx, `INSERT INTO attempt_usage(attempt_id,ram_bytes,disk_written_bytes,observed_at) SELECT id,?,?,? FROM attempts WHERE id=?
+	result, err := s.exec(ctx, `INSERT INTO attempt_usage(attempt_id,ram_bytes,disk_written_bytes,observed_at) SELECT id,$1,$2,$3 FROM attempts WHERE id=$4
 		ON CONFLICT(attempt_id) DO UPDATE SET ram_bytes=excluded.ram_bytes,disk_written_bytes=excluded.disk_written_bytes,observed_at=excluded.observed_at`,
 		ramBytes, diskWrittenBytes, now(), attemptID)
 	if err != nil {
@@ -1366,22 +1403,19 @@ type AdmissionWait struct {
 // one.
 func (s *Store) AdmissionWaits(ctx context.Context, executionIDs []string) (map[string]AdmissionWait, error) {
 	waits := map[string]AdmissionWait{}
-	for _, executionID := range executionIDs {
+	err := eachRow(ctx, s.db, `SELECT execution_id,reason_code,node_id,detail_json,since FROM admission_waits WHERE execution_id=ANY($1::text[])`, []any{executionIDs}, func(rows *sql.Rows) error {
 		var w AdmissionWait
 		var detail string
-		err := s.db.QueryRowContext(ctx, `SELECT execution_id,reason_code,node_id,detail_json,since FROM admission_waits WHERE execution_id=?`, executionID).Scan(&w.ExecutionID, &w.Reason, &w.NodeID, &detail, &w.Since)
-		if errors.Is(err, sql.ErrNoRows) {
-			continue
-		}
-		if err != nil {
-			return nil, err
+		if err := rows.Scan(&w.ExecutionID, &w.Reason, &w.NodeID, &detail, &w.Since); err != nil {
+			return err
 		}
 		var d map[string]string
 		_ = json.Unmarshal([]byte(detail), &d)
 		w.Message = d["message"]
-		waits[executionID] = w
-	}
-	return waits, nil
+		waits[w.ExecutionID] = w
+		return nil
+	})
+	return waits, err
 }
 
 func formatBytes(n int64) string {

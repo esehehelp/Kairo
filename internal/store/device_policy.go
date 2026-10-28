@@ -122,7 +122,7 @@ func (d PolicyDevice) PolicySetting() *DeviceSetting {
 // PolicyDevices are every declared device with its settings, the lease
 // holding it and what it was observed doing over the last window.
 func (s *Store) PolicyDevices(ctx context.Context, window time.Duration) ([]PolicyDevice, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -150,7 +150,7 @@ func (s *Store) PolicyDevices(ctx context.Context, window time.Duration) ([]Poli
 		var attempt, activated sql.NullString
 		err = tx.QueryRowContext(ctx, `SELECT l.id,l.attempt_id,a.started_at,EXISTS(SELECT 1 FROM bench_run_executions b WHERE b.execution_id=l.execution_id)
 			FROM resource_instances r JOIN lease_items li ON li.resource_id=r.id JOIN leases l ON l.id=li.lease_id LEFT JOIN attempts a ON a.id=l.attempt_id
-			WHERE r.kind='gpu' AND r.stable_identity=? AND l.state IN('reserved','prepared','active') ORDER BY l.created_at DESC LIMIT 1`, policy.DeviceID).
+			WHERE r.kind='gpu' AND r.stable_identity=$1 AND l.state IN('reserved','prepared','active') ORDER BY l.created_at DESC LIMIT 1`, policy.DeviceID).
 			Scan(&lease.LeaseID, &attempt, &activated, &lease.Bench)
 		switch {
 		case errors.Is(err, sql.ErrNoRows):
@@ -178,14 +178,14 @@ func (s *Store) PolicyDevices(ctx context.Context, window time.Duration) ([]Poli
 func hostCPUBenchTx(ctx context.Context, tx *sql.Tx, hostID string) (bool, error) {
 	var n int
 	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM bench_runs b JOIN bench_run_executions e ON e.run_id=b.id JOIN leases l ON l.execution_id=e.execution_id
-		WHERE b.host_id=? AND b.class='cpu' AND l.state IN`+liveLeaseStates, hostID).Scan(&n)
+		WHERE b.host_id=$1 AND b.class='cpu' AND l.state IN`+liveLeaseStates, hostID).Scan(&n)
 	return n != 0, err
 }
 
 func gpuUsageTx(ctx context.Context, tx *sql.Tx, uuid string, from time.Time) (PolicyUsage, error) {
 	usage := PolicyUsage{UtilGPUPct: []float64{}, UtilMemPct: []float64{}}
 	err := eachRow(ctx, tx, `SELECT o.utilization FROM resource_instances r JOIN resource_observations o ON o.resource_id=r.id
-		WHERE r.kind='gpu' AND r.stable_identity=? AND o.utilization IS NOT NULL AND julianday(o.observed_at)>=julianday(?) ORDER BY o.observed_at`,
+		WHERE r.kind='gpu' AND r.stable_identity=$1 AND o.utilization IS NOT NULL AND (o.observed_at)::timestamptz>=($2)::timestamptz ORDER BY o.observed_at`,
 		[]any{uuid, from.UTC().Format(time.RFC3339Nano)}, func(rows *sql.Rows) error {
 			var v float64
 			if err := rows.Scan(&v); err != nil {
@@ -197,7 +197,7 @@ func gpuUsageTx(ctx context.Context, tx *sql.Tx, uuid string, from time.Time) (P
 	if err != nil {
 		return usage, err
 	}
-	err = eachRow(ctx, tx, `SELECT mem_util FROM device_samples WHERE device=? AND observed_at>=? AND mem_util IS NOT NULL ORDER BY observed_at`,
+	err = eachRow(ctx, tx, `SELECT mem_util FROM device_samples WHERE device=$1 AND observed_at>=$2 AND mem_util IS NOT NULL ORDER BY observed_at`,
 		[]any{uuid, sampleStamp(from)}, func(rows *sql.Rows) error {
 			var v float64
 			if err := rows.Scan(&v); err != nil {
@@ -219,12 +219,12 @@ func (s *Store) RecordPolicyDecision(ctx context.Context, d PolicyDecision) erro
 	if err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO device_policy(host_id,device_id,decision_json,decided_at) VALUES(?,?,?,?)
+	if _, err = tx.ExecContext(ctx, `INSERT INTO device_policy(host_id,device_id,decision_json,decided_at) VALUES($1,$2,$3,$4)
 		ON CONFLICT(host_id,device_id) DO UPDATE SET decision_json=excluded.decision_json,decided_at=excluded.decided_at`, d.HostID, d.DeviceID, string(body), d.DecidedAt); err != nil {
 		return err
 	}
@@ -242,9 +242,9 @@ func (s *Store) AccruePolicySavings(ctx context.Context, attemptID string, secon
 	if savedJoules != nil {
 		saved, unestimated = *savedJoules, 0
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO attempt_energy(attempt_id,policy_seconds,policy_saved_joules,policy_unestimated_seconds,updated_at) VALUES(?,?,?,?,?)
-		ON CONFLICT(attempt_id) DO UPDATE SET policy_seconds=policy_seconds+excluded.policy_seconds,policy_saved_joules=policy_saved_joules+excluded.policy_saved_joules,
-		policy_unestimated_seconds=policy_unestimated_seconds+excluded.policy_unestimated_seconds,updated_at=excluded.updated_at`,
+	_, err := s.exec(ctx, `INSERT INTO attempt_energy(attempt_id,policy_seconds,policy_saved_joules,policy_unestimated_seconds,updated_at) VALUES($1,$2,$3,$4,$5)
+		ON CONFLICT(attempt_id) DO UPDATE SET policy_seconds=attempt_energy.policy_seconds+excluded.policy_seconds,policy_saved_joules=attempt_energy.policy_saved_joules+excluded.policy_saved_joules,
+		policy_unestimated_seconds=attempt_energy.policy_unestimated_seconds+excluded.policy_unestimated_seconds,updated_at=excluded.updated_at`,
 		attemptID, seconds, saved, unestimated, now())
 	return err
 }
@@ -252,7 +252,7 @@ func (s *Store) AccruePolicySavings(ctx context.Context, attemptID string, secon
 // devicePolicyDecisionTx is a device's latest policy decision (nil: none).
 func devicePolicyDecisionTx(ctx context.Context, q queryer, hostID, deviceID string) (*PolicyDecision, error) {
 	var body string
-	err := q.QueryRowContext(ctx, `SELECT decision_json FROM device_policy WHERE host_id=? AND device_id=?`, hostID, deviceID).Scan(&body)
+	err := q.QueryRowContext(ctx, `SELECT decision_json FROM device_policy WHERE host_id=$1 AND device_id=$2`, hostID, deviceID).Scan(&body)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -268,7 +268,7 @@ func devicePolicyDecisionTx(ctx context.Context, q queryer, hostID, deviceID str
 
 // latestBenchRunTx is a device's latest bench (nil: none), without points.
 func latestBenchRunTx(ctx context.Context, q queryer, hostID, deviceID string) (*BenchRun, error) {
-	run, err := scanBenchRun(q.QueryRowContext(ctx, `SELECT `+benchRunColumns+` FROM bench_runs WHERE host_id=? AND device_id=? ORDER BY created_at DESC,id DESC LIMIT 1`, hostID, deviceID))
+	run, err := scanBenchRun(q.QueryRowContext(ctx, `SELECT `+benchRunColumns+` FROM bench_runs WHERE host_id=$1 AND device_id=$2 ORDER BY created_at DESC,id DESC LIMIT 1`, hostID, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

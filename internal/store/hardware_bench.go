@@ -344,7 +344,7 @@ func scanBenchRun(row interface{ Scan(...any) error }) (BenchRun, error) {
 // a storage or network bench measures the defaults and needs no controller.
 // One live run per device.
 func (s *Store) CreateBenchRun(ctx context.Context, req BenchRequest) (BenchPlan, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return BenchPlan{}, err
 	}
@@ -368,15 +368,15 @@ func (s *Store) CreateBenchRun(ctx context.Context, req BenchRequest) (BenchPlan
 	if err != nil {
 		return BenchPlan{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_runs(id,host_id,device_id,class,kinds_json,node_id,peer_node_id,target,execution_id,state,requested_by,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_runs(id,host_id,device_id,class,kinds_json,node_id,peer_node_id,target,execution_id,state,requested_by,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		run.ID, run.HostID, run.DeviceID, run.Class, string(kinds), run.NodeID, run.PeerNodeID, run.Target, executionID, run.State, run.RequestedBy, run.CreatedAt); err != nil {
 		return BenchPlan{}, err
 	}
 	// The run's executions: its own, and a gang's members.
-	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) VALUES(?,?,0)`, executionID, run.ID); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) VALUES($1,$2,0)`, executionID, run.ID); err != nil {
 		return BenchPlan{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) SELECT m.execution_id,?,m.rank FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id WHERE g.leader_execution_id=? AND m.rank>0`, run.ID, executionID); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) SELECT m.execution_id,$1,m.rank FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id WHERE g.leader_execution_id=$2 AND m.rank>0`, run.ID, executionID); err != nil {
 		return BenchPlan{}, err
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "hardware_bench_requested", nil, "bench_run", run.ID, nil, map[string]any{
@@ -422,7 +422,7 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 		return BenchPlan{}, fmt.Errorf("node %s is not on host %s (its nodes: %s)", req.Node, host.ID, strings.Join(host.Nodes, ", "))
 	}
 	var live int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM bench_runs WHERE host_id=? AND device_id=? AND state IN('waiting','running')`, req.HostID, req.DeviceID).Scan(&live); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM bench_runs WHERE host_id=$1 AND device_id=$2 AND state IN('waiting','running')`, req.HostID, req.DeviceID).Scan(&live); err != nil {
 		return BenchPlan{}, err
 	}
 	if live != 0 {
@@ -469,7 +469,7 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 			return BenchPlan{}, fmt.Errorf("host %s declares no controller: a %s bench sweeps settings, which only a controller carries out", req.HostID, class)
 		}
 		var caps sql.NullString
-		if err = tx.QueryRowContext(ctx, `SELECT capabilities_json FROM device_state WHERE host_id=? AND device_id=?`, req.HostID, req.DeviceID).Scan(&caps); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err = tx.QueryRowContext(ctx, `SELECT capabilities_json FROM device_state WHERE host_id=$1 AND device_id=$2`, req.HostID, req.DeviceID).Scan(&caps); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return BenchPlan{}, err
 		}
 		if !caps.Valid {
@@ -491,7 +491,7 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 	case BenchGPU:
 		nodes, configs, err = candidates(func(nodeID string, bench NodeBench) (bool, error) {
 			var declared int
-			err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_gpus WHERE uuid=? AND node_id=?`, req.DeviceID, nodeID).Scan(&declared)
+			err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_gpus WHERE uuid=$1 AND node_id=$2`, req.DeviceID, nodeID).Scan(&declared)
 			return declared != 0 && bench.GPU != "", err
 		})
 		if err != nil {
@@ -525,7 +525,7 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 		filesystem := strings.TrimPrefix(req.DeviceID, BenchDiskPrefix)
 		nodes, configs, err = candidates(func(nodeID string, _ NodeBench) (bool, error) {
 			var registered int
-			err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_instances WHERE node_id=? AND kind='disk' AND stable_identity=?`, nodeID, filesystem).Scan(&registered)
+			err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_instances WHERE node_id=$1 AND kind='disk' AND stable_identity=$2`, nodeID, filesystem).Scan(&registered)
 			return registered != 0, err
 		})
 		if err != nil {
@@ -606,7 +606,7 @@ func benchSelector(nodeID string, bench NodeBench) json.RawMessage {
 // nodeBenchTx is the bench configuration a node reports (none: zero).
 func nodeBenchTx(ctx context.Context, q queryer, nodeID string) (NodeBench, error) {
 	var attributes string
-	err := q.QueryRowContext(ctx, `SELECT attributes_json FROM nodes WHERE id=?`, nodeID).Scan(&attributes)
+	err := q.QueryRowContext(ctx, `SELECT attributes_json FROM nodes WHERE id=$1`, nodeID).Scan(&attributes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return NodeBench{}, fmt.Errorf("%w: node %s", ErrNotFound, nodeID)
 	}
@@ -624,7 +624,7 @@ func nodeBenchTx(ctx context.Context, q queryer, nodeID string) (NodeBench, erro
 func nodeCPUMillisTx(ctx context.Context, q queryer, nodeID string) (int64, error) {
 	var total sql.NullInt64
 	err := q.QueryRowContext(ctx, `SELECT o.total_bytes FROM resource_instances r JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=r.id ORDER BY id DESC LIMIT 1)
-		WHERE r.node_id=? AND r.kind='cpu' ORDER BY r.id LIMIT 1`, nodeID).Scan(&total)
+		WHERE r.node_id=$1 AND r.kind='cpu' ORDER BY r.id LIMIT 1`, nodeID).Scan(&total)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, nil
 	}
@@ -639,7 +639,7 @@ func gangSpanningTx(ctx context.Context, q queryer, nodeA, nodeB, except string)
 		JOIN gang_placement_leases a ON a.placement_id=gp.id JOIN leases la ON la.id=a.lease_id
 		JOIN gang_placement_leases b ON b.placement_id=gp.id JOIN leases lb ON lb.id=b.lease_id
 		JOIN execution_gangs g ON g.id=gp.gang_id
-		WHERE gp.state IN('placed','launched') AND a.node_id=? AND b.node_id=? AND la.state IN`+liveLeaseStates+` AND lb.state IN`+liveLeaseStates+` AND g.leader_execution_id<>?
+		WHERE gp.state IN('placed','launched') AND a.node_id=$1 AND b.node_id=$2 AND la.state IN`+liveLeaseStates+` AND lb.state IN`+liveLeaseStates+` AND g.leader_execution_id<>$3
 		LIMIT 1`, nodeA, nodeB, except).Scan(&gang)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
@@ -650,11 +650,10 @@ func gangSpanningTx(ctx context.Context, q queryer, nodeA, nodeB, except string)
 // ListBenchRuns is every bench of host (of deviceID when given), oldest
 // first, with their points when points is set.
 func (s *Store) ListBenchRuns(ctx context.Context, hostID, deviceID string, points bool) ([]BenchRun, error) {
-	query := `SELECT ` + benchRunColumns + ` FROM bench_runs WHERE host_id=?`
+	query := `SELECT ` + benchRunColumns + ` FROM bench_runs WHERE host_id=$1`
 	args := []any{hostID}
 	if deviceID != "" {
-		query += ` AND device_id=?`
-		args = append(args, deviceID)
+		query += ` AND device_id=` + bind(&args, deviceID)
 	}
 	runs := []BenchRun{}
 	if err := eachRow(ctx, s.db, query+` ORDER BY created_at,id`, args, func(rows *sql.Rows) error {
@@ -680,7 +679,7 @@ func (s *Store) ListBenchRuns(ctx context.Context, hostID, deviceID string, poin
 
 // GetBenchRun is one run with its points.
 func (s *Store) GetBenchRun(ctx context.Context, runID string) (BenchRun, error) {
-	run, err := scanBenchRun(s.db.QueryRowContext(ctx, `SELECT `+benchRunColumns+` FROM bench_runs WHERE id=?`, runID))
+	run, err := scanBenchRun(s.db.QueryRowContext(ctx, `SELECT `+benchRunColumns+` FROM bench_runs WHERE id=$1`, runID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return run, fmt.Errorf("%w: bench run %s", ErrNotFound, runID)
 	}
@@ -693,7 +692,7 @@ func (s *Store) GetBenchRun(ctx context.Context, runID string) (BenchRun, error)
 
 func benchPoints(ctx context.Context, q queryer, runID string) ([]BenchPoint, error) {
 	out := []BenchPoint{}
-	err := eachRow(ctx, q, `SELECT seq,kind,phase,settings_json,metrics_json,valid,flags_json,measured_at FROM bench_points WHERE run_id=? ORDER BY seq`, []any{runID}, func(rows *sql.Rows) error {
+	err := eachRow(ctx, q, `SELECT seq,kind,phase,settings_json,metrics_json,valid,flags_json,measured_at FROM bench_points WHERE run_id=$1 ORDER BY seq`, []any{runID}, func(rows *sql.Rows) error {
 		var p BenchPoint
 		var settings, metrics, flags string
 		if err := rows.Scan(&p.Seq, &p.Kind, &p.Phase, &settings, &metrics, &p.Valid, &flags, &p.MeasuredAt); err != nil {
@@ -718,14 +717,14 @@ func benchPoints(ctx context.Context, q queryer, runID string) ([]BenchPoint, er
 func (s *Store) BenchOfAttempt(ctx context.Context, attemptID string) (BenchRun, int, error) {
 	var runID string
 	var rank int
-	err := s.db.QueryRowContext(ctx, `SELECT e.run_id,e.rank FROM attempts a JOIN bench_run_executions e ON e.execution_id=a.execution_id WHERE a.id=?`, attemptID).Scan(&runID, &rank)
+	err := s.db.QueryRowContext(ctx, `SELECT e.run_id,e.rank FROM attempts a JOIN bench_run_executions e ON e.execution_id=a.execution_id WHERE a.id=$1`, attemptID).Scan(&runID, &rank)
 	if errors.Is(err, sql.ErrNoRows) {
 		return BenchRun{}, 0, fmt.Errorf("%w: attempt %s carries out no hardware bench", ErrNotFound, attemptID)
 	}
 	if err != nil {
 		return BenchRun{}, 0, err
 	}
-	run, err := scanBenchRun(s.db.QueryRowContext(ctx, `SELECT `+benchRunColumns+` FROM bench_runs WHERE id=?`, runID))
+	run, err := scanBenchRun(s.db.QueryRowContext(ctx, `SELECT `+benchRunColumns+` FROM bench_runs WHERE id=$1`, runID))
 	return run, rank, err
 }
 
@@ -767,7 +766,7 @@ func (s *Store) BenchStatusOf(ctx context.Context, attemptID, leaseID string) (B
 		return BenchStatus{}, err
 	}
 	status := BenchStatus{Run: run, Rank: rank, LeaseID: leaseID, OtherWork: []string{}}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return status, err
 	}
@@ -804,12 +803,12 @@ func (s *Store) BenchStatusOf(ctx context.Context, attemptID, leaseID string) (B
 	}
 	switch run.Class {
 	case BenchGPU:
-		err = add(`SELECT DISTINCT c.claim_kind||' on '||r.node_id||COALESCE(' (pid '||json_extract(c.evidence_json,'$.pid')||')','') FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id
-			WHERE c.cleared_at IS NULL AND r.kind='gpu' AND r.stable_identity=?`, run.DeviceID)
+		err = add(`SELECT DISTINCT c.claim_kind||' on '||r.node_id||COALESCE(' (pid '||(c.evidence_json::jsonb->>'pid')||')','') FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id
+			WHERE c.cleared_at IS NULL AND r.kind='gpu' AND r.stable_identity=$1`, run.DeviceID)
 		if err == nil {
 			var temperature sql.NullFloat64
 			err = tx.QueryRowContext(ctx, `SELECT o.temperature_c FROM resource_instances r JOIN resource_observations o ON o.resource_id=r.id
-				WHERE r.kind='gpu' AND r.stable_identity=? AND o.temperature_c IS NOT NULL ORDER BY o.observed_at DESC LIMIT 1`, run.DeviceID).Scan(&temperature)
+				WHERE r.kind='gpu' AND r.stable_identity=$1 AND o.temperature_c IS NOT NULL ORDER BY o.observed_at DESC LIMIT 1`, run.DeviceID).Scan(&temperature)
 			if errors.Is(err, sql.ErrNoRows) {
 				err = nil
 			}
@@ -830,13 +829,13 @@ func (s *Store) BenchStatusOf(ctx context.Context, attemptID, leaseID string) (B
 		}
 		for _, node := range nodes {
 			if err = add(`SELECT DISTINCT 'lease '||l.id||' on '||x.node_id FROM leases l JOIN executors x ON x.id=l.executor_id JOIN lease_items li ON li.lease_id=l.id
-				WHERE x.node_id=? AND l.state IN`+liveLeaseStates+` AND l.id<>? AND li.kind='cpu' AND li.quantity>0`, node, leaseID); err != nil {
+				WHERE x.node_id=$1 AND l.state IN`+liveLeaseStates+` AND l.id<>$2 AND li.kind='cpu' AND li.quantity>0`, node, leaseID); err != nil {
 				break
 			}
 		}
 	case BenchStorage:
 		err = add(`SELECT DISTINCT 'lease '||l.id||' reserves '||li.filesystem FROM leases l JOIN executors x ON x.id=l.executor_id JOIN lease_items li ON li.lease_id=l.id
-			WHERE x.node_id=? AND l.state IN`+liveLeaseStates+` AND l.id<>? AND li.kind='disk' AND li.filesystem=?`, run.NodeID, leaseID, run.Target)
+			WHERE x.node_id=$1 AND l.state IN`+liveLeaseStates+` AND l.id<>$2 AND li.kind='disk' AND li.filesystem=$3`, run.NodeID, leaseID, run.Target)
 	case BenchNetwork:
 		var gang string
 		if gang, err = gangSpanningTx(ctx, tx, run.NodeID, run.Target, run.ExecutionID); err == nil && gang != "" {
@@ -906,14 +905,14 @@ func (s *Store) StartBenchRun(ctx context.Context, attemptID string, start Bench
 		return err
 	}
 	device := sql.NullString{String: string(start.Device), Valid: len(start.Device) != 0 && json.Valid(start.Device)}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	t := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE bench_runs SET state='running',started_at=COALESCE(started_at,?),driver_build=?,versions_json=?,driver_version=COALESCE(?,driver_version),
-		device_json=COALESCE(?,device_json),idle_temperature_c=COALESCE(idle_temperature_c,?) WHERE id=?`,
+	if _, err = tx.ExecContext(ctx, `UPDATE bench_runs SET state='running',started_at=COALESCE(started_at,$1),driver_build=$2,versions_json=$3,driver_version=COALESCE($4,driver_version),
+		device_json=COALESCE($5,device_json),idle_temperature_c=COALESCE(idle_temperature_c,$6) WHERE id=$7`,
 		t, start.DriverBuild, string(body), nullable(start.DriverVersion), device, start.IdleTemperatureC, run.ID); err != nil {
 		return err
 	}
@@ -936,7 +935,7 @@ func (s *Store) AddBenchPoints(ctx context.Context, attemptID string, points []B
 	if run.State != "running" {
 		return fmt.Errorf("%w: bench run %s is %s", ErrBenchConflict, run.ID, run.State)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -960,7 +959,7 @@ func (s *Store) AddBenchPoints(ctx context.Context, attemptID string, points []B
 				return err
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO bench_points(run_id,seq,kind,phase,settings_json,metrics_json,valid,flags_json,measured_at) VALUES(?,?,?,?,?,?,?,?,?)
+		if _, err = tx.ExecContext(ctx, `INSERT INTO bench_points(run_id,seq,kind,phase,settings_json,metrics_json,valid,flags_json,measured_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			ON CONFLICT(run_id,seq) DO UPDATE SET kind=excluded.kind,phase=excluded.phase,settings_json=excluded.settings_json,metrics_json=excluded.metrics_json,
 			valid=excluded.valid,flags_json=excluded.flags_json,measured_at=excluded.measured_at`,
 			run.ID, p.Seq, p.Kind, p.Phase, string(bodies[0]), string(bodies[1]), p.Valid, string(bodies[2]), p.MeasuredAt); err != nil {
@@ -993,7 +992,7 @@ func (s *Store) FinishBenchRun(ctx context.Context, attemptID, leaseID string, f
 	if err != nil {
 		return err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -1002,7 +1001,7 @@ func (s *Store) FinishBenchRun(ctx context.Context, attemptID, leaseID string, f
 	if !finish.Valid {
 		state = "invalid"
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE bench_runs SET state=?,ended_at=?,references_json=?,valid=?,reason=? WHERE id=?`, state, now(), string(references), finish.Valid, nullable(finish.Reason), run.ID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE bench_runs SET state=$1,ended_at=$2,references_json=$3,valid=$4,reason=$5 WHERE id=$6`, state, now(), string(references), finish.Valid, nullable(finish.Reason), run.ID); err != nil {
 		return err
 	}
 	if run.Class == BenchGPU || run.Class == BenchCPU {
@@ -1048,7 +1047,7 @@ func (s *Store) ReconcileBenchRuns(ctx context.Context) error {
 		return err
 	}
 	for _, r := range runs {
-		tx, err := s.db.BeginTx(ctx, nil)
+		tx, err := s.beginWrite(ctx)
 		if err != nil {
 			return err
 		}
@@ -1056,7 +1055,7 @@ func (s *Store) ReconcileBenchRuns(ctx context.Context) error {
 		if r.cause != "" {
 			reason += " (" + r.cause + ")"
 		}
-		result, err := tx.ExecContext(ctx, `UPDATE bench_runs SET state='failed',ended_at=?,valid=0,reason=? WHERE id=? AND state IN('waiting','running')`, now(), reason, r.id)
+		result, err := tx.ExecContext(ctx, `UPDATE bench_runs SET state='failed',ended_at=$1,valid=FALSE,reason=$2 WHERE id=$3 AND state IN('waiting','running')`, now(), reason, r.id)
 		if err == nil {
 			if n, _ := result.RowsAffected(); n == 1 {
 				err = appendCoordinationEventTx(ctx, tx, "hardware_bench_invalid", nil, "bench_run", r.id, nil, map[string]any{"host_id": r.host, "device_id": r.device, "valid": false, "reason": reason})

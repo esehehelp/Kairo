@@ -157,3 +157,47 @@ func TestLogMinFreeDefaultsAndRefusesNegative(t *testing.T) {
 		t.Fatalf("negative agent setting: %v", err)
 	}
 }
+
+func TestDatabaseFromTheFileTheEnvironmentAndAPasswordFile(t *testing.T) {
+	t.Setenv(DatabaseURLEnv, "")
+	password := filepath.Join(t.TempDir(), "db-password")
+	if err := os.WriteFile(password, []byte("s3cr'et\r\nignored\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		name, url, env, passwordFile, want, wantErr string
+	}{
+		{"none", "", "", "", "", "no database"},
+		{"file", "postgres://kairo@db:5432/kairo", "", "", "postgres://kairo@db:5432/kairo", ""},
+		{"environment", "", "postgres://kairo:pw@db/kairo", "", "postgres://kairo:pw@db/kairo", ""},
+		{"both", "postgres://a@db/kairo", "postgres://b@db/kairo", "", "", "not both"},
+		{"url with password file", "postgres://kairo@db/kairo?sslmode=require", "", password, "postgres://kairo:s3cr%27et@db/kairo?sslmode=require", ""},
+		{"key=value with password file", "host=db user=kairo dbname=kairo", "", password, `host=db user=kairo dbname=kairo password='s3cr\'et'`, ""},
+		{"two passwords", "postgres://kairo:pw@db/kairo", "", password, "", "has a password"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv(DatabaseURLEnv, c.env)
+			body := daemonBase
+			if c.url != "" {
+				body = "database_url = '" + c.url + "'\n" + body
+			}
+			if c.passwordFile != "" {
+				body = "database_password_file = '" + c.passwordFile + "'\n" + body
+			}
+			cfg, err := Load(writeConfig(t, body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := cfg.Database()
+			if c.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), c.wantErr) {
+					t.Fatalf("got %q, %v; want error %q", got, err, c.wantErr)
+				}
+				return
+			}
+			if err != nil || got != c.want {
+				t.Fatalf("got %q, %v; want %q", got, err, c.want)
+			}
+		})
+	}
+}

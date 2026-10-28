@@ -65,14 +65,14 @@ func TestPriorityPreemptionEnqueuesOneIdempotentSuspendWithoutWorkflowTransition
 		t.Fatalf("preemption was not idempotent: first=%v second=%v err=%v", commandIDs, second, err)
 	}
 	var origin, attemptID, reason string
-	if err = store.db.QueryRow(`SELECT origin,attempt_id,reason FROM commands WHERE id=?`, commandIDs[0]).Scan(&origin, &attemptID, &reason); err != nil {
+	if err = store.db.QueryRow(`SELECT origin,attempt_id,reason FROM commands WHERE id=$1`, commandIDs[0]).Scan(&origin, &attemptID, &reason); err != nil {
 		t.Fatal(err)
 	}
 	if origin != "priority_preemption" || attemptID != launch.Attempt.ID || reason == "" {
 		t.Fatalf("wrong suspend command: origin=%q attempt=%q reason=%q", origin, attemptID, reason)
 	}
 	var eventPayloadJSON string
-	if err = store.db.QueryRow(`SELECT payload_json FROM coordination_events WHERE event_type='suspend_requested' AND aggregate_id=?`, commandIDs[0]).Scan(&eventPayloadJSON); err != nil {
+	if err = store.db.QueryRow(`SELECT payload_json FROM coordination_events WHERE event_type='suspend_requested' AND aggregate_id=$1`, commandIDs[0]).Scan(&eventPayloadJSON); err != nil {
 		t.Fatal(err)
 	}
 	var eventPayload map[string]any
@@ -83,7 +83,7 @@ func TestPriorityPreemptionEnqueuesOneIdempotentSuspendWithoutWorkflowTransition
 		t.Fatalf("priority suspend event lacks exact execution chain: %s", eventPayloadJSON)
 	}
 	var commandCount int
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&commandCount); err != nil || commandCount != 1 {
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&commandCount); err != nil || commandCount != 1 {
 		t.Fatalf("command count=%d err=%v", commandCount, err)
 	}
 	if err = store.AckCommand(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, commandIDs[0], "rejected", json.RawMessage(`{"reason":"not at safe point"}`)); err != nil {
@@ -93,7 +93,7 @@ func TestPriorityPreemptionEnqueuesOneIdempotentSuspendWithoutWorkflowTransition
 	if err != nil || len(afterRejection) != 0 {
 		t.Fatalf("rejected suspend was automatically retried: commands=%v err=%v", afterRejection, err)
 	}
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&commandCount); err != nil || commandCount != 1 {
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&commandCount); err != nil || commandCount != 1 {
 		t.Fatalf("rejection created replacement commands: count=%d err=%v", commandCount, err)
 	}
 	gotVictim, _ := store.GetExecution(context.Background(), victim.ID)
@@ -125,7 +125,7 @@ func TestPriorityPreemptionRequiresCooperativeLowerPriorityVictim(t *testing.T) 
 				t.Fatalf("unsafe preemption commands=%v err=%v", commands, err)
 			}
 			var count int
-			_ = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&count)
+			_ = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&count)
 			if count != 0 {
 				t.Fatalf("created %d suspend commands", count)
 			}
@@ -173,7 +173,7 @@ func TestPriorityPreemptionRejectsUnsafeGPUEvidence(t *testing.T) {
 				t.Fatalf("unsafe evidence allowed preemption: commands=%v err=%v", commands, err)
 			}
 			var count int
-			_ = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&count)
+			_ = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&count)
 			if count != 0 {
 				t.Fatalf("created %d suspend commands", count)
 			}
@@ -232,7 +232,7 @@ func TestPriorityPreemptionHonorsVictimUnattributedPolicy(t *testing.T) {
 				t.Fatalf("policy=%s commands=%v err=%v", test.policy, commands, err)
 			}
 			var count int
-			if err = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&count); err != nil || count != test.wantLength {
+			if err = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&count); err != nil || count != test.wantLength {
 				t.Fatalf("policy=%s command count=%d err=%v", test.policy, count, err)
 			}
 		})
@@ -363,7 +363,7 @@ func TestPriorityPreemptionRequiresOpenWaitingScope(t *testing.T) {
 		t.Fatalf("closed scope allowed preemption for %s: commands=%v err=%v", waiter.ID, commands, err)
 	}
 	var count int
-	_ = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=?`, launch.Attempt.ID).Scan(&count)
+	_ = store.db.QueryRow(`SELECT COUNT(*) FROM commands WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&count)
 	if count != 0 {
 		t.Fatalf("created %d commands through closed gate", count)
 	}

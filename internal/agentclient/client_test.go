@@ -18,6 +18,7 @@ import (
 	"kairo/internal/api"
 	"kairo/internal/executor"
 	"kairo/internal/machine"
+	"kairo/internal/pgtest"
 	"kairo/internal/provider"
 	"kairo/internal/store"
 	"kairo/internal/tlsutil"
@@ -99,7 +100,7 @@ func (p *fakeGPU) Release(context.Context, store.ResourceInstance) error { retur
 // newDaemon serves the API with a node token for node "remote".
 func newDaemon(t *testing.T) (*store.Store, *httptest.Server, string, string) {
 	t.Helper()
-	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
+	st, err := store.Open(pgtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +388,7 @@ func TestForceStopCallsRoundTrip(t *testing.T) {
 // Against an observe-only daemon an agent's polls find nothing to do and
 // actuation is refused, as for an in-process executor that only observes.
 func TestObserveOnlyDaemonGivesAgentsNothingToDo(t *testing.T) {
-	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
+	st, err := store.Open(pgtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}

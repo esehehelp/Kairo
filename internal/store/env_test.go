@@ -2,11 +2,9 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"maps"
-	"path/filepath"
 	"testing"
 )
 
@@ -136,33 +134,5 @@ env = { NCCL_DEBUG = "INFO", GLOO_LOG = "1" }
 	member, err := store.GetExecution(ctx, rank1.launch.Execution.ID)
 	if err != nil || member.Env["NCCL_DEBUG"] != "INFO" {
 		t.Fatalf("rank 1 execution: %+v %v", member, err)
-	}
-}
-
-// A database created before env existed gains the column when opened, and
-// opening it again leaves it alone.
-func TestOpenAddsTheEnvColumnToAnExistingDatabase(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "kairo-v3.db")
-	store, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err = store.SubmitExecution(context.Background(), testExecutionSpec("before")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err = store.db.Exec(`ALTER TABLE execution_requests DROP COLUMN env_json`); err != nil {
-		t.Fatal(err)
-	}
-	store.Close()
-	for range 2 {
-		store, err = Open(path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var env sql.NullString
-		if err = store.db.QueryRow(`SELECT env_json FROM execution_requests`).Scan(&env); err != nil || env.Valid {
-			t.Fatalf("env_json after migration: %v %v", env, err)
-		}
-		store.Close()
 	}
 }

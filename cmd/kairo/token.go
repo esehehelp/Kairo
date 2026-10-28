@@ -17,8 +17,8 @@ import (
 
 func tokenAction(action string, args []string) error {
 	fs := newFlags("token " + action)
-	configPath := fs.String("config", "", "daemon TOML configuration (its database_path is used)")
-	dbPath := fs.String("db", "", "daemon database path")
+	configPath := fs.String("config", "", "daemon TOML configuration (its database is used)")
+	databaseURL := fs.String("database-url", "", "the daemon's PostgreSQL database")
 	var name, role, node, out *string
 	var save, force *bool
 	if action == "create" {
@@ -68,7 +68,7 @@ func tokenAction(action string, args []string) error {
 			}
 		}
 	}
-	st, err := openTokenStore(*configPath, *dbPath)
+	st, err := openTokenStore(*configPath, *databaseURL)
 	if err != nil {
 		return err
 	}
@@ -112,23 +112,28 @@ func parseInterleaved(fs *flag.FlagSet, args []string) ([]string, error) {
 	}
 }
 
-func openTokenStore(configPath, dbPath string) (*store.Store, error) {
-	if (configPath == "") == (dbPath == "") {
-		return nil, errors.New("need exactly one of --config or --db")
+// openTokenStore opens the daemon's database, named by its configuration
+// or directly.
+func openTokenStore(configPath, databaseURL string) (*store.Store, error) {
+	if (configPath == "") == (databaseURL == "") {
+		return nil, errors.New("need exactly one of --config or --database-url")
 	}
 	if configPath != "" {
 		daemonConfig, err := config.Load(configPath)
 		if err != nil {
 			return nil, fmt.Errorf("load config: %w", err)
 		}
-		dbPath = daemonConfig.DatabasePath
+		if databaseURL, err = daemonConfig.Database(); err != nil {
+			return nil, err
+		}
 	}
-	// Never create a database here: a token in a database the daemon does not
+	// Never create a schema here: a token in a database the daemon does not
 	// use would never authenticate.
-	if _, err := os.Stat(dbPath); err != nil {
-		return nil, fmt.Errorf("no Kairo database at %s (run `kairo serve` once to create it; a relative database_path is relative to the current directory): %w", dbPath, err)
+	st, err := store.OpenExisting(databaseURL)
+	if errors.Is(err, store.ErrNoSchema) {
+		return nil, fmt.Errorf("no Kairo database at %s (run `kairo serve` once to create it): %w", config.RedactDatabase(databaseURL), err)
 	}
-	return store.Open(dbPath)
+	return st, err
 }
 
 func tokenCreate(ctx context.Context, st *store.Store, name, role, node, target string, force bool) error {

@@ -50,13 +50,13 @@ func (s *Store) RecordAttemptLogProblem(ctx context.Context, attemptID string, p
 	if p.Stream != "" && p.Stream != "stdout" && p.Stream != "stderr" {
 		return fmt.Errorf("log stream must be stdout, stderr or empty, not %q", p.Stream)
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var projectID string
-	err = tx.QueryRowContext(ctx, `SELECT e.project_scope_id FROM attempts a JOIN execution_requests e ON e.id=a.execution_id WHERE a.id=?`, attemptID).Scan(&projectID)
+	err = tx.QueryRowContext(ctx, `SELECT e.project_scope_id FROM attempts a JOIN execution_requests e ON e.id=a.execution_id WHERE a.id=$1`, attemptID).Scan(&projectID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -64,7 +64,7 @@ func (s *Store) RecordAttemptLogProblem(ctx context.Context, attemptID string, p
 		return err
 	}
 	var wasResolved sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT resolved_at FROM attempt_log_problems WHERE attempt_id=? AND problem=? AND stream=?`, attemptID, p.Problem, p.Stream).Scan(&wasResolved)
+	err = tx.QueryRowContext(ctx, `SELECT resolved_at FROM attempt_log_problems WHERE attempt_id=$1 AND problem=$2 AND stream=$3`, attemptID, p.Problem, p.Stream).Scan(&wasResolved)
 	existed := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
@@ -78,9 +78,9 @@ func (s *Store) RecordAttemptLogProblem(ctx context.Context, attemptID string, p
 		if wasResolved.Valid && p.Resolved {
 			resolvedAt = wasResolved.String
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE attempt_log_problems SET detail=CASE WHEN ?='' THEN detail ELSE ? END,occurrences=occurrences+1,last_seen_at=?,resolved_at=? WHERE attempt_id=? AND problem=? AND stream=?`, p.Detail, p.Detail, t, resolvedAt, attemptID, p.Problem, p.Stream)
+		_, err = tx.ExecContext(ctx, `UPDATE attempt_log_problems SET detail=CASE WHEN $1='' THEN detail ELSE $2 END,occurrences=occurrences+1,last_seen_at=$3,resolved_at=$4 WHERE attempt_id=$5 AND problem=$6 AND stream=$7`, p.Detail, p.Detail, t, resolvedAt, attemptID, p.Problem, p.Stream)
 	} else {
-		_, err = tx.ExecContext(ctx, `INSERT INTO attempt_log_problems(attempt_id,problem,stream,detail,first_seen_at,last_seen_at,resolved_at) VALUES(?,?,?,?,?,?,?)`, attemptID, p.Problem, p.Stream, p.Detail, t, t, resolvedAt)
+		_, err = tx.ExecContext(ctx, `INSERT INTO attempt_log_problems(attempt_id,problem,stream,detail,first_seen_at,last_seen_at,resolved_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, attemptID, p.Problem, p.Stream, p.Detail, t, t, resolvedAt)
 	}
 	if err != nil {
 		return err
@@ -110,7 +110,7 @@ func (s *Store) taskLogProblems(ctx context.Context, taskScopeID string) (map[st
 	out := map[string][]LogProblem{}
 	err := eachRow(ctx, s.db, `SELECT p.attempt_id,p.problem,p.stream,p.detail,p.occurrences,p.first_seen_at,p.last_seen_at,p.resolved_at
 		FROM orchestration_task_executions te JOIN attempts a ON a.execution_id=te.execution_id JOIN attempt_log_problems p ON p.attempt_id=a.id
-		WHERE te.task_scope_id=? ORDER BY p.first_seen_at,p.problem,p.stream`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		WHERE te.task_scope_id=$1 ORDER BY p.first_seen_at,p.problem,p.stream`, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var attemptID string
 		var p LogProblem
 		if err := rows.Scan(&attemptID, &p.Problem, &p.Stream, &p.Detail, &p.Occurrences, &p.FirstSeenAt, &p.LastSeenAt, &p.ResolvedAt); err != nil {

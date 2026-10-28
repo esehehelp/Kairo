@@ -2,10 +2,8 @@ package store
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -161,10 +159,10 @@ func TestCancelWithdrawsAnAuthorizedExecutionAndRevokesItsLease(t *testing.T) {
 		t.Fatalf("cancel: %+v %v", result, err)
 	}
 	var lease, authorization string
-	if err = store.db.QueryRow(`SELECT state FROM leases WHERE id=?`, reservation.Lease.ID).Scan(&lease); err != nil || lease != "revocation_requested" {
+	if err = store.db.QueryRow(`SELECT state FROM leases WHERE id=$1`, reservation.Lease.ID).Scan(&lease); err != nil || lease != "revocation_requested" {
 		t.Fatalf("lease: %s %v", lease, err)
 	}
-	if err = store.db.QueryRow(`SELECT state FROM launch_authorizations WHERE lease_id=?`, reservation.Lease.ID).Scan(&authorization); err != nil || authorization != "revoked" {
+	if err = store.db.QueryRow(`SELECT state FROM launch_authorizations WHERE lease_id=$1`, reservation.Lease.ID).Scan(&authorization); err != nil || authorization != "revoked" {
 		t.Fatalf("authorization: %s %v", authorization, err)
 	}
 }
@@ -227,7 +225,7 @@ func TestCancelRacingTheReconcilerNeverRevivesTheTask(t *testing.T) {
 		}
 		tasks := projectTasks(t, store, "orchestrated")
 		var state string
-		if err = store.db.QueryRow(`SELECT state FROM orchestration_decisions WHERE decision_key=?`, decisions[0].DecisionKey).Scan(&state); err != nil {
+		if err = store.db.QueryRow(`SELECT state FROM orchestration_decisions WHERE decision_key=$1`, decisions[0].DecisionKey).Scan(&state); err != nil {
 			t.Fatal(err)
 		}
 		if !cancelAfterSubmit {
@@ -263,69 +261,6 @@ func TestWithdrawnExecutionCancelsTheTask(t *testing.T) {
 	}
 	if tasks = projectTasks(t, store, "orchestrated"); tasks["train"].State != "blocked" {
 		t.Fatalf("train: %+v", tasks["train"])
-	}
-}
-
-func TestOpenMigratesAnOlderDatabaseForCancelAndRerun(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "old.db")
-	st, err := Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cpuProject(t, st)
-	st.Close()
-	// Rewind to the schema before cancel and rerun, with two historic failures.
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, w := range []struct{ table, from, to string }{
-		{"orchestration_tasks", "state IN('pending','running','succeeded','failed','blocked','stopped','cancelled')", "state IN('pending','running','succeeded','failed','blocked','stopped')"},
-		{"orchestration_decisions", "reason IN('initial','continuation','quarantine_restart','gang_restart','rerun')", "reason IN('initial','continuation','quarantine_restart','gang_restart')"},
-		{"orchestration_decisions", "state IN('planned','submitted','abandoned')", "state IN('planned','submitted')"},
-	} {
-		if err = widenCheck(db, w.table, w.from, w.to); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for _, stmt := range []string{
-		`DROP TABLE orchestration_task_reruns`,
-		`ALTER TABLE orchestration_tasks DROP COLUMN rerun_ordinal`,
-		`UPDATE orchestration_tasks SET state='failed',result_json='{"execution_id":"exe_old","reason":"execution terminal before attempt","terminal_cause":"withdrawn_before_start"}' WHERE name='prepare'`,
-		`UPDATE orchestration_tasks SET state='failed',result_json='{"execution_id":"exe_other","reason":"execution terminal before attempt","terminal_cause":"admission_fail"}' WHERE name='train'`,
-	} {
-		if _, err = db.Exec(stmt); err != nil {
-			t.Fatalf("%s: %v", stmt, err)
-		}
-	}
-	db.Close()
-	for range 2 { // the migration is idempotent
-		if st, err = Open(path); err != nil {
-			t.Fatal(err)
-		}
-		status, err := st.GetProjectStatus(context.Background(), "orchestrated")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if status.Tasks[0].Name != "prepare" || status.Tasks[0].State != "cancelled" || string(status.Tasks[0].Result) != `{"reason":"withdrawn before start","execution_id":"exe_old","migrated":true}` {
-			t.Fatalf("prepare: %+v %s", status.Tasks[0], status.Tasks[0].Result)
-		}
-		if status.Tasks[2].Name != "train" || status.Tasks[2].State != "failed" {
-			t.Fatalf("train: %+v", status.Tasks[2])
-		}
-		for _, w := range []struct{ table, want string }{{"orchestration_tasks", "'cancelled'"}, {"orchestration_decisions", "'abandoned'"}, {"orchestration_decisions", "'rerun'"}} {
-			var ddl string
-			if err = st.db.QueryRow(`SELECT sql FROM sqlite_master WHERE name=?`, w.table).Scan(&ddl); err != nil || !strings.Contains(ddl, w.want) {
-				t.Fatalf("%s not widened: %s %v", w.table, ddl, err)
-			}
-		}
-		for _, index := range []string{"orchestration_task_dependents_idx", "executions_task_idx"} {
-			var n int
-			if err = st.db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name=?`, index).Scan(&n); err != nil || n != 1 {
-				t.Fatalf("index %s: %d %v", index, n, err)
-			}
-		}
-		st.Close()
 	}
 }
 
@@ -370,7 +305,7 @@ func TestRerunFailedTaskRunsANewExecutionAndItsDependents(t *testing.T) {
 		t.Fatalf("train: %+v", tasks["train"])
 	}
 	var trigger string
-	if err = store.db.QueryRow(`SELECT trigger_json FROM orchestration_decisions WHERE reason='rerun' AND execution_id=?`, prepare.Executions[1].ExecutionID).Scan(&trigger); err != nil || trigger != `{"predecessor_execution_id":"`+first.ID+`","request_id":"rerun-1"}` {
+	if err = store.db.QueryRow(`SELECT trigger_json FROM orchestration_decisions WHERE reason='rerun' AND execution_id=$1`, prepare.Executions[1].ExecutionID).Scan(&trigger); err != nil || trigger != `{"predecessor_execution_id":"`+first.ID+`","request_id":"rerun-1"}` {
 		t.Fatalf("trigger: %s %v", trigger, err)
 	}
 	completeNextOrchestrationExecution(t, store, 0)

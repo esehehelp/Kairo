@@ -5,20 +5,45 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"path/filepath"
+	"sync"
 	"testing"
 
-	_ "modernc.org/sqlite"
+	"kairo/internal/pgtest"
 )
 
-func openCoordinationStore(t *testing.T) *Store {
+// openCoordinationStore opens a store on a fresh database of the test
+// server (pgtest), dropped when the test ends. The test runs in parallel
+// with the others (each has its own database).
+func openCoordinationStore(t testing.TB) *Store {
 	t.Helper()
-	store, err := Open(filepath.Join(t.TempDir(), "kairo-v3.db"))
+	if test, ok := t.(*testing.T); ok {
+		if _, already := parallelTests.LoadOrStore(test, true); !already {
+			test.Parallel()
+		}
+	}
+	return openSerialStore(t)
+}
+
+// parallelTests are the tests openCoordinationStore made parallel (a test
+// may open several stores).
+var parallelTests sync.Map
+
+// openSerialStore is openCoordinationStore for a test that changes a package
+// setting and so must not run alongside the others.
+func openSerialStore(t testing.TB) *Store {
+	t.Helper()
+	store, err := Open(pgtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = store.Close() })
 	return store
+}
+
+// testExec runs a writing statement of a test (a fixture or a fault) in a
+// transaction of its own, under the decision lock like every write.
+func (s *Store) testExec(query string, args ...any) (sql.Result, error) {
+	return s.exec(context.Background(), query, args...)
 }
 
 func testExecutionSpec(requestID string) ExecutionSpec {
@@ -116,13 +141,13 @@ func TestPauseDiscoversLiveExecutionOnce(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at,started_at) VALUES('att-1',?,'running','executor',1,'now','now')`, execution.ID); err != nil {
+	if _, err = store.testExec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at,started_at) VALUES('att-1',$1,'running','executor',1,'now','now')`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO leases(id,execution_id,attempt_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-1',?,'att-1','executor',1,'active','now')`, execution.ID); err != nil {
+	if _, err = store.testExec(`INSERT INTO leases(id,execution_id,attempt_id,executor_id,coordination_epoch,state,created_at) VALUES('lease-1',$1,'att-1','executor',1,'active','now')`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`UPDATE execution_requests SET state='started',authorized_at='now',started_at='now' WHERE id=?`, execution.ID); err != nil {
+	if _, err = store.testExec(`UPDATE execution_requests SET state='started',authorized_at='now',started_at='now' WHERE id=$1`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
 	scopes, err := store.GetScopeByPath(ctx, ScopePath{Project: "llm-develop"})
@@ -162,21 +187,6 @@ func TestWithdrawExecutionIsOneShot(t *testing.T) {
 	}
 }
 
-func TestOpenRejectsLegacySchema(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "legacy.db")
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err = db.Exec(`CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT NOT NULL); INSERT INTO schema_migrations VALUES(2,'now')`); err != nil {
-		t.Fatal(err)
-	}
-	_ = db.Close()
-	if _, err = Open(path); !errors.Is(err, ErrLegacySchema) {
-		t.Fatalf("legacy schema was not rejected: %v", err)
-	}
-}
-
 func TestAttemptIsOneShotAndProcessRolesDoNotCollide(t *testing.T) {
 	store := openCoordinationStore(t)
 	ctx := context.Background()
@@ -184,17 +194,17 @@ func TestAttemptIsOneShotAndProcessRolesDoNotCollide(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at) VALUES('att-1',?,'authorized','executor',1,'now')`, execution.ID); err != nil {
+	if _, err = store.testExec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at) VALUES('att-1',$1,'authorized','executor',1,'now')`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at) VALUES('att-2',?,'authorized','executor',1,'now')`, execution.ID); err == nil {
+	if _, err = store.testExec(`INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at) VALUES('att-2',$1,'authorized','executor',1,'now')`, execution.ID); err == nil {
 		t.Fatal("a second authorized attempt was accepted")
 	}
 	for _, statement := range []string{
 		`INSERT INTO attempt_processes(attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at) VALUES('att-1','launcher','host',-1,10,'host:10','now','now')`,
 		`INSERT INTO attempt_processes(attempt_id,role,namespace,rank,pid,process_identity,registered_at,last_seen_at) VALUES('att-1','worker','executor',0,10,'executor:10','now','now')`,
 	} {
-		if _, err = store.db.Exec(statement); err != nil {
+		if _, err = store.testExec(statement); err != nil {
 			t.Fatal(err)
 		}
 	}

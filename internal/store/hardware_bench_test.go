@@ -391,7 +391,7 @@ func TestPolicyDevicesShowTheLeaseAndItsUsage(t *testing.T) {
 		t.Fatal(err)
 	}
 	var seconds, saved, unestimated float64
-	if err = store.db.QueryRow(`SELECT policy_seconds,policy_saved_joules,policy_unestimated_seconds FROM attempt_energy WHERE attempt_id=?`, launch.Attempt.ID).Scan(&seconds, &saved, &unestimated); err != nil ||
+	if err = store.db.QueryRow(`SELECT policy_seconds,policy_saved_joules,policy_unestimated_seconds FROM attempt_energy WHERE attempt_id=$1`, launch.Attempt.ID).Scan(&seconds, &saved, &unestimated); err != nil ||
 		seconds != 120 || saved != 3000 || unestimated != 60 {
 		t.Fatalf("savings: %v %v %v %v", seconds, saved, unestimated, err)
 	}
@@ -442,7 +442,7 @@ func TestStorageAndNetworkBenchesNeedNoControllerAndHoldTheirDevice(t *testing.T
 	}
 	// Both ranks' executions belong to the run.
 	var n int
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM bench_run_executions WHERE run_id=?`, plan.Run.ID).Scan(&n); err != nil || n != 2 {
+	if err = store.db.QueryRow(`SELECT COUNT(*) FROM bench_run_executions WHERE run_id=$1`, plan.Run.ID).Scan(&n); err != nil || n != 2 {
 		t.Fatalf("run executions: %d %v", n, err)
 	}
 	if _, err = store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:a", Node: "a"}); err == nil {

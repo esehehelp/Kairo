@@ -29,7 +29,7 @@ func deviceSample(t *testing.T, store *Store, providerID, nodeID, uuid string, a
 func attemptEnergy(t *testing.T, store *Store, attemptID string) (AttemptEnergy, bool) {
 	t.Helper()
 	var e AttemptEnergy
-	err := store.db.QueryRow(`SELECT gpu_joules,gpu_seconds_covered,partial,updated_at FROM attempt_energy WHERE attempt_id=?`, attemptID).Scan(&e.GPUJoules, &e.GPUSecondsCovered, &e.Partial, &e.UpdatedAt)
+	err := store.db.QueryRow(`SELECT gpu_joules,gpu_seconds_covered,partial,updated_at FROM attempt_energy WHERE attempt_id=$1`, attemptID).Scan(&e.GPUJoules, &e.GPUSecondsCovered, &e.Partial, &e.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return AttemptEnergy{}, false
 	}
@@ -43,14 +43,14 @@ func attemptEnergy(t *testing.T, store *Store, attemptID string) (AttemptEnergy,
 // its lease was released (the samples of these tests are back-dated).
 func setAttemptTimes(t *testing.T, store *Store, launch *Launch, started, ended time.Time) {
 	t.Helper()
-	if _, err := store.db.Exec(`UPDATE attempts SET started_at=? WHERE id=?`, started.Format(time.RFC3339Nano), launch.Attempt.ID); err != nil {
+	if _, err := store.testExec(`UPDATE attempts SET started_at=$1 WHERE id=$2`, started.Format(time.RFC3339Nano), launch.Attempt.ID); err != nil {
 		t.Fatal(err)
 	}
 	if !ended.IsZero() {
-		if _, err := store.db.Exec(`UPDATE attempts SET exited_at=? WHERE id=?`, ended.Format(time.RFC3339Nano), launch.Attempt.ID); err != nil {
+		if _, err := store.testExec(`UPDATE attempts SET exited_at=$1 WHERE id=$2`, ended.Format(time.RFC3339Nano), launch.Attempt.ID); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.db.Exec(`UPDATE leases SET released_at=? WHERE id=? AND released_at IS NOT NULL`, ended.Add(time.Second).Format(time.RFC3339Nano), launch.Lease.ID); err != nil {
+		if _, err := store.testExec(`UPDATE leases SET released_at=$1 WHERE id=$2 AND released_at IS NOT NULL`, ended.Add(time.Second).Format(time.RFC3339Nano), launch.Lease.ID); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -127,7 +127,7 @@ func TestAttemptEnergyIsPartialAcrossWhatIsNotSampled(t *testing.T) {
 	sample(40, watts(300))
 	wantEnergy(t, store, launch.Attempt.ID, 500+1000, 10, true)
 	// A lease that went stale ends what is known of the run.
-	if _, err := store.db.Exec(`UPDATE leases SET state='stale',stale_at=? WHERE id=?`, at(42).Format(time.RFC3339Nano), launch.Lease.ID); err != nil {
+	if _, err := store.testExec(`UPDATE leases SET state='stale',stale_at=$1 WHERE id=$2`, at(42).Format(time.RFC3339Nano), launch.Lease.ID); err != nil {
 		t.Fatal(err)
 	}
 	sample(45, watts(300)) // [40, 42] at 300 W
@@ -155,7 +155,7 @@ func TestSharedGPUEnergyIsCountedOnce(t *testing.T) {
 	}
 	wantEnergy(t, store, launch.Attempt.ID, 750, 7.5, false)
 	var samples, fromB int
-	if err := store.db.QueryRow(`SELECT COUNT(*),SUM(resource_id='gpu-GPU-S@b') FROM device_samples WHERE device='GPU-S' AND observed_at>=?`, sampleStamp(base)).Scan(&samples, &fromB); err != nil {
+	if err := store.db.QueryRow(`SELECT COUNT(*),COUNT(*) FILTER (WHERE resource_id='gpu-GPU-S@b') FROM device_samples WHERE device='GPU-S' AND observed_at>=$1`, sampleStamp(base)).Scan(&samples, &fromB); err != nil {
 		t.Fatal(err)
 	}
 	if samples != 6 || fromB != 4 {
@@ -191,7 +191,7 @@ func TestPruneDeviceSamplesKeepsEachDevicesLatest(t *testing.T) {
 		t.Fatal(err)
 	}
 	count := func(device string) (n int, latest string) {
-		if err := store.db.QueryRow(`SELECT COUNT(*),MAX(observed_at) FROM device_samples WHERE device=?`, device).Scan(&n, &latest); err != nil {
+		if err := store.db.QueryRow(`SELECT COUNT(*),MAX(observed_at) FROM device_samples WHERE device=$1`, device).Scan(&n, &latest); err != nil {
 			t.Fatal(err)
 		}
 		return n, latest

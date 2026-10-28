@@ -4,16 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"log/slog"
-	"path/filepath"
-	"strings"
 	"io"
+	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"kairo/internal/machine"
+	"kairo/internal/pgtest"
 	"kairo/internal/provider"
 	"kairo/internal/store"
 )
@@ -35,7 +35,7 @@ func (p *observationProvider) Release(context.Context, store.ResourceInstance) e
 
 func TestObserveOnlyRecordsExternalActivityWithoutAllocating(t *testing.T) {
 	ctx := context.Background()
-	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
+	st, err := store.Open(pgtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func (p *hangingProvider) Release(context.Context, store.ResourceInstance) error
 func openProviderStore(t *testing.T) *store.Store {
 	t.Helper()
 	ctx := context.Background()
-	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
+	st, err := store.Open(pgtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}

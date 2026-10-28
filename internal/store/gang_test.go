@@ -252,10 +252,10 @@ func TestGangAbortNamesEachRankExecutorDeliveryAndLastPoll(t *testing.T) {
 		t.Fatal(err)
 	}
 	// exec-b polls; exec-a never received its rank, so it has not polled.
-	if _, err = store.db.Exec(`UPDATE executors SET last_seen_at=? WHERE id='exec-b'`, "2026-10-06T19:23:00Z"); err != nil {
+	if _, err = store.testExec(`UPDATE executors SET last_seen_at=$1 WHERE id='exec-b'`, "2026-10-06T19:23:00Z"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.db.Exec(`UPDATE gang_placements SET created_at=?`, time.Now().UTC().Add(-2*GangPrepareTimeout).Format(time.RFC3339Nano)); err != nil {
+	if _, err = store.testExec(`UPDATE gang_placements SET created_at=$1`, time.Now().UTC().Add(-2*GangPrepareTimeout).Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 	if err = store.ReconcileGangs(ctx); err != nil {
@@ -286,7 +286,7 @@ func TestGangPlacementNotPreparedInTimeIsAbortedAndPlacedAgain(t *testing.T) {
 		t.Fatal(err)
 	}
 	// exec-a never shows up
-	if _, err = store.db.Exec(`UPDATE gang_placements SET created_at=?`, time.Now().UTC().Add(-2*GangPrepareTimeout).Format(time.RFC3339Nano)); err != nil {
+	if _, err = store.testExec(`UPDATE gang_placements SET created_at=$1`, time.Now().UTC().Add(-2*GangPrepareTimeout).Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 	if err = store.ReconcileGangs(ctx); err != nil {

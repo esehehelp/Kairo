@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"kairo/internal/api"
+	"kairo/internal/pgtest"
 	"kairo/internal/store"
 )
 
@@ -16,7 +17,7 @@ import (
 // cancel a task waiting for its dependency, wait, rerun.
 func TestTaskCommandsAgainstTheRealAPI(t *testing.T) {
 	isolateClientEnv(t)
-	st, err := store.Open(filepath.Join(t.TempDir(), "kairo.db"))
+	st, err := store.Open(pgtest.DSN(t))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -23,11 +23,7 @@ func (s *Store) UpsertNode(ctx context.Context, n Node) error {
 		return errors.New("node id, name, os, and architecture are required")
 	}
 	t := now()
-	enabled := 0
-	if n.Enabled {
-		enabled = 1
-	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO nodes(id,name,os,architecture,attributes_json,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,os=excluded.os,architecture=excluded.architecture,attributes_json=excluded.attributes_json,enabled=excluded.enabled,updated_at=excluded.updated_at`, n.ID, n.Name, n.OS, n.Architecture, validJSON(n.Attributes), enabled, t, t)
+	_, err := s.exec(ctx, `INSERT INTO nodes(id,name,os,architecture,attributes_json,enabled,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,os=excluded.os,architecture=excluded.architecture,attributes_json=excluded.attributes_json,enabled=excluded.enabled,updated_at=excluded.updated_at`, n.ID, n.Name, n.OS, n.Architecture, validJSON(n.Attributes), n.Enabled, t, t)
 	return err
 }
 func (s *Store) UpsertExecutor(ctx context.Context, e Executor) error {
@@ -35,27 +31,21 @@ func (s *Store) UpsertExecutor(ctx context.Context, e Executor) error {
 		return errors.New("executor id, node id, and kind are required")
 	}
 	t := now()
-	enabled := 0
-	if e.Enabled {
-		enabled = 1
-	}
 	// An executor never moves to another node: a node agent cannot take over
 	// another node's executor (and with it, that node's attempts).
-	result, err := s.db.ExecContext(ctx, `INSERT INTO executors(id,node_id,kind,attributes_json,enabled,last_seen_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,attributes_json=excluded.attributes_json,enabled=excluded.enabled,last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at WHERE executors.node_id=excluded.node_id`, e.ID, e.NodeID, e.Kind, validJSON(e.Attributes), enabled, e.LastSeenAt, t, t)
+	result, err := s.exec(ctx, `INSERT INTO executors(id,node_id,kind,attributes_json,enabled,last_seen_at,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,attributes_json=excluded.attributes_json,enabled=excluded.enabled,last_seen_at=excluded.last_seen_at,updated_at=excluded.updated_at WHERE executors.node_id=excluded.node_id`, e.ID, e.NodeID, e.Kind, validJSON(e.Attributes), e.Enabled, e.LastSeenAt, t, t)
 	return ownedUpsert(result, err, "executor", e.ID)
 }
 func (s *Store) UpsertProvider(ctx context.Context, providerID, nodeID, kind string, config json.RawMessage) error {
 	t := now()
-	result, err := s.db.ExecContext(ctx, `INSERT INTO resource_providers(id,node_id,kind,config_json,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,config_json=excluded.config_json,updated_at=excluded.updated_at WHERE resource_providers.node_id=excluded.node_id`, providerID, nodeID, kind, validJSON(config), t, t)
+	result, err := s.exec(ctx, `INSERT INTO resource_providers(id,node_id,kind,config_json,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,config_json=excluded.config_json,updated_at=excluded.updated_at WHERE resource_providers.node_id=excluded.node_id`, providerID, nodeID, kind, validJSON(config), t, t)
 	return ownedUpsert(result, err, "provider", providerID)
 }
 
 // upsertResourceTx inserts or refreshes a resource; a resource never moves to
 // another node or provider.
-func upsertResourceTx(ctx context.Context, q interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}, r ResourceInstance, t string) error {
-	result, err := q.ExecContext(ctx, `INSERT INTO resource_instances(id,node_id,provider_id,kind,stable_identity,binding_json,attributes_json,admin_state,quarantine_reason,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,stable_identity=excluded.stable_identity,binding_json=excluded.binding_json,attributes_json=excluded.attributes_json,updated_at=excluded.updated_at WHERE resource_instances.node_id=excluded.node_id AND resource_instances.provider_id=excluded.provider_id`, r.ID, r.NodeID, r.ProviderID, r.Kind, r.StableIdentity, validJSON(r.Binding), validJSON(r.Attributes), r.AdminState, r.QuarantineReason, t, t)
+func upsertResourceTx(ctx context.Context, tx *sql.Tx, r ResourceInstance, t string) error {
+	result, err := tx.ExecContext(ctx, `INSERT INTO resource_instances(id,node_id,provider_id,kind,stable_identity,binding_json,attributes_json,admin_state,quarantine_reason,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,stable_identity=excluded.stable_identity,binding_json=excluded.binding_json,attributes_json=excluded.attributes_json,updated_at=excluded.updated_at WHERE resource_instances.node_id=excluded.node_id AND resource_instances.provider_id=excluded.provider_id`, r.ID, r.NodeID, r.ProviderID, r.Kind, r.StableIdentity, validJSON(r.Binding), validJSON(r.Attributes), r.AdminState, r.QuarantineReason, t, t)
 	return ownedUpsert(result, err, "resource", r.ID)
 }
 
@@ -77,13 +67,21 @@ func (s *Store) UpsertResourceInstance(ctx context.Context, r ResourceInstance) 
 	if r.AdminState == "" {
 		r.AdminState = "enabled"
 	}
-	return upsertResourceTx(ctx, s.db, r, now())
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = upsertResourceTx(ctx, tx, r, now()); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 	if o.ResourceID == "" || o.ObservedAt == "" || o.ValidUntil == "" {
 		return errors.New("resource_id, observed_at, and valid_until are required")
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES(?,?,?,?,?,?,?,?)`, o.ResourceID, o.ObservedAt, o.ValidUntil, o.TotalBytes, o.FreeBytes, o.Utilization, o.TemperatureC, validJSON(o.Evidence))
+	_, err := s.exec(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, o.ResourceID, o.ObservedAt, o.ValidUntil, o.TotalBytes, o.FreeBytes, o.Utilization, o.TemperatureC, validJSON(o.Evidence))
 	return err
 }
 
@@ -101,13 +99,13 @@ func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 // own work (leaseHoldersProcessTx) is not recorded. An observation's device
 // sample is recorded for the device (recordDeviceSampleTx).
 func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, resources []ResourceInstance, observations []Observation, claims []ExternalClaim) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var providerNode string
-	if err = tx.QueryRowContext(ctx, `SELECT node_id FROM resource_providers WHERE id=?`, providerID).Scan(&providerNode); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT node_id FROM resource_providers WHERE id=$1`, providerID).Scan(&providerNode); errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: provider %s", ErrNotFound, providerID)
 	} else if err != nil {
 		return err
@@ -118,7 +116,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 			return nil
 		}
 		var provider string
-		if err := tx.QueryRowContext(ctx, `SELECT provider_id FROM resource_instances WHERE id=?`, resourceID).Scan(&provider); errors.Is(err, sql.ErrNoRows) {
+		if err := tx.QueryRowContext(ctx, `SELECT provider_id FROM resource_instances WHERE id=$1`, resourceID).Scan(&provider); errors.Is(err, sql.ErrNoRows) {
 			return fmt.Errorf("%w: resource %s", ErrNotFound, resourceID)
 		} else if err != nil {
 			return err
@@ -182,7 +180,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		if err = ownedByProvider(observation.ResourceID); err != nil {
 			return err
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES(?,?,?,?,?,?,?,?)`, observation.ResourceID, observation.ObservedAt, observation.ValidUntil, observation.TotalBytes, observation.FreeBytes, observation.Utilization, observation.TemperatureC, validJSON(observation.Evidence))
+		_, err = tx.ExecContext(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, observation.ResourceID, observation.ObservedAt, observation.ValidUntil, observation.TotalBytes, observation.FreeBytes, observation.Utilization, observation.TemperatureC, validJSON(observation.Evidence))
 		if err != nil {
 			return err
 		}
@@ -214,7 +212,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 			var elsewhere int
 			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_instances self JOIN resource_instances sib ON sib.kind='gpu' AND sib.stable_identity=self.stable_identity AND sib.id<>self.id
 				JOIN lease_items li ON li.resource_id=sib.id JOIN leases l ON l.id=li.lease_id
-				WHERE self.id=? AND self.kind='gpu' AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, claim.ResourceID).Scan(&elsewhere); err != nil {
+				WHERE self.id=$1 AND self.kind='gpu' AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, claim.ResourceID).Scan(&elsewhere); err != nil {
 				return err
 			}
 			if elsewhere > 0 {
@@ -237,7 +235,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		if claim.LastObservedAt == "" {
 			claim.LastObservedAt = t
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,cleared_at=NULL`, claim.ID, claim.ResourceID, claim.ClaimKind, claim.ProcessIdentity, validJSON(claim.Evidence), claim.FirstObservedAt, claim.LastObservedAt)
+		_, err = tx.ExecContext(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,cleared_at=NULL`, claim.ID, claim.ResourceID, claim.ClaimKind, claim.ProcessIdentity, validJSON(claim.Evidence), claim.FirstObservedAt, claim.LastObservedAt)
 		if err != nil {
 			return err
 		}
@@ -250,7 +248,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		}
 		observed[o.ResourceID] = !undeclared[o.ResourceID]
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.resource_id FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id WHERE r.provider_id=? AND c.cleared_at IS NULL`, providerID)
+	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.resource_id FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id WHERE r.provider_id=$1 AND c.cleared_at IS NULL`, providerID)
 	if err != nil {
 		return err
 	}
@@ -267,7 +265,7 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 	rows.Close()
 	for _, claim := range activeClaims {
 		if observed[claim.resource] && !seen[claim.id] {
-			if _, err := tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=? WHERE id=? AND cleared_at IS NULL`, t, claim.id); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=$1 WHERE id=$2 AND cleared_at IS NULL`, t, claim.id); err != nil {
 				return err
 			}
 		}
@@ -285,15 +283,12 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 // again, and the lease is not released while it runs. Anything else, a
 // process of another attempt included, stays a claim.
 func leaseHoldersProcessTx(ctx context.Context, tx *sql.Tx, claim ExternalClaim) (bool, error) {
-	identities, err := json.Marshal(append([]string{*claim.ProcessIdentity}, claim.Ancestors...))
-	if err != nil {
-		return false, err
-	}
+	identities := append([]string{*claim.ProcessIdentity}, claim.Ancestors...)
 	var holders bool
-	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM leases l JOIN lease_items li ON li.lease_id=l.id JOIN attempts a ON a.id=l.attempt_id
-		WHERE li.resource_id IN `+sameDevice("?")+` AND l.state IN('active','releasing') AND a.state IN('running','quiescing')
+	err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM leases l JOIN lease_items li ON li.lease_id=l.id JOIN attempts a ON a.id=l.attempt_id
+		WHERE li.resource_id IN `+sameDevice("$1")+` AND l.state IN('active','releasing') AND a.state IN('running','quiescing')
 		AND EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=a.id AND ap.exited_at IS NULL
-			AND (a.id=? OR ap.process_identity IN(SELECT value FROM json_each(?)))))`, claim.ResourceID, claim.ResourceID, claim.AttemptID, string(identities)).Scan(&holders)
+			AND (a.id=$2 OR ap.process_identity=ANY($3::text[]))))`, claim.ResourceID, claim.AttemptID, identities).Scan(&holders)
 	return holders, err
 }
 
@@ -311,11 +306,11 @@ func (s *Store) ObserveClaim(ctx context.Context, c ExternalClaim) error {
 	if c.LastObservedAt == "" {
 		c.LastObservedAt = t
 	}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,cleared_at=NULL`, c.ID, c.ResourceID, c.ClaimKind, c.ProcessIdentity, validJSON(c.Evidence), c.FirstObservedAt, c.LastObservedAt)
+	_, err := s.exec(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,cleared_at=NULL`, c.ID, c.ResourceID, c.ClaimKind, c.ProcessIdentity, validJSON(c.Evidence), c.FirstObservedAt, c.LastObservedAt)
 	return err
 }
 func (s *Store) ClearClaim(ctx context.Context, claimID string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE external_claims SET cleared_at=? WHERE id=? AND cleared_at IS NULL`, now(), claimID)
+	res, err := s.exec(ctx, `UPDATE external_claims SET cleared_at=$1 WHERE id=$2 AND cleared_at IS NULL`, now(), claimID)
 	if err != nil {
 		return err
 	}
@@ -329,7 +324,7 @@ func (s *Store) SetResourceAdminState(ctx context.Context, resourceID, state, re
 	if state != "enabled" && state != "disabled" && state != "quarantined" {
 		return errors.New("invalid resource admin state")
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE resource_instances SET admin_state=?,quarantine_reason=?,updated_at=? WHERE id=?`, state, nullable(reason), now(), resourceID)
+	res, err := s.exec(ctx, `UPDATE resource_instances SET admin_state=$1,quarantine_reason=$2,updated_at=$3 WHERE id=$4`, state, nullable(reason), now(), resourceID)
 	if err != nil {
 		return err
 	}
@@ -348,7 +343,7 @@ func (s *Store) ListResourceStatus(ctx context.Context) ([]ResourceInstance, err
 	 EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("r.id")+` AND c.cleared_at IS NULL),
 	 CASE WHEN r.kind='gpu' THEN COALESCE(
 			(SELECT d.node_id FROM machine_gpus d WHERE d.uuid=r.stable_identity AND d.node_id=r.node_id),
-			(SELECT group_concat(node_id) FROM (SELECT d.node_id FROM machine_gpus d WHERE d.uuid=r.stable_identity ORDER BY d.node_id))) END
+			(SELECT string_agg(d.node_id,',' ORDER BY d.node_id) FROM machine_gpus d WHERE d.uuid=r.stable_identity)) END
 	 FROM resource_instances r ORDER BY r.node_id,r.kind,r.id`)
 	if err != nil {
 		return nil, err
@@ -417,7 +412,7 @@ func (s *Store) ListClaims(ctx context.Context) ([]ExternalClaim, error) {
 func validateEpochTx(ctx context.Context, tx *sql.Tx, attemptID, leaseID string, epoch int64) error {
 	var attemptEpoch, leaseEpoch int64
 	var actualLease string
-	err := tx.QueryRowContext(ctx, `SELECT a.coordination_epoch,l.id,l.coordination_epoch FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=?`, attemptID).Scan(&attemptEpoch, &actualLease, &leaseEpoch)
+	err := tx.QueryRowContext(ctx, `SELECT a.coordination_epoch,l.id,l.coordination_epoch FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.id=$1`, attemptID).Scan(&attemptEpoch, &actualLease, &leaseEpoch)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -434,12 +429,12 @@ func validateEpochTx(ctx context.Context, tx *sql.Tx, attemptID, leaseID string,
 // evidence shows every resource in the lease unclaimed and no registered
 // process remains. Lease expiry alone is intentionally insufficient.
 func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confirmProcessAbsent ...bool) error {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT l.id,l.attempt_id,l.coordination_epoch FROM leases l JOIN lease_items li ON li.lease_id=l.id WHERE li.resource_id=? AND l.state='stale'`, resourceID)
+	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT l.id,l.attempt_id,l.coordination_epoch FROM leases l JOIN lease_items li ON li.lease_id=l.id WHERE li.resource_id=$1 AND l.state='stale'`, resourceID)
 	if err != nil {
 		return err
 	}
@@ -464,7 +459,7 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 	t := now()
 	for _, x := range leases {
 		var unsafe int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1) WHERE li.lease_id=? AND li.resource_id IS NOT NULL AND (o.id IS NULL OR julianday(o.valid_until)<=julianday(?) OR julianday(o.observed_at)<=julianday(l.stale_at) OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL))`, x.lease, t).Scan(&unsafe); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1) WHERE li.lease_id=$1 AND li.resource_id IS NOT NULL AND (o.id IS NULL OR (o.valid_until)::timestamptz<=($2)::timestamptz OR (o.observed_at)::timestamptz<=(l.stale_at)::timestamptz OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL))`, x.lease, t).Scan(&unsafe); err != nil {
 			return err
 		}
 		if unsafe > 0 {
@@ -475,33 +470,33 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 				return fmt.Errorf("stale attempt %s requires explicit process-absence confirmation", x.attempt.String)
 			}
 			var processes int
-			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes WHERE attempt_id=? AND exited_at IS NULL`, x.attempt.String).Scan(&processes); err != nil {
+			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes WHERE attempt_id=$1 AND exited_at IS NULL`, x.attempt.String).Scan(&processes); err != nil {
 				return err
 			}
 			if processes > 0 {
-				if _, err = tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=?,last_seen_at=? WHERE attempt_id=? AND exited_at IS NULL`, t, t, x.attempt.String); err != nil {
+				if _, err = tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=$1,last_seen_at=$2 WHERE attempt_id=$3 AND exited_at IS NULL`, t, t, x.attempt.String); err != nil {
 					return err
 				}
 			}
 		}
-		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=? WHERE id=? AND state='stale'`, t, x.lease); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=$1 WHERE id=$2 AND state='stale'`, t, x.lease); err != nil {
 			return err
 		}
 		var executionID, projectID string
 		if x.attempt.Valid {
-			if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',quiesced_at=?,exited_at=COALESCE(exited_at,?) WHERE id=? AND state='lost'`, t, t, x.attempt.String); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',quiesced_at=$1,exited_at=COALESCE(exited_at,$2) WHERE id=$3 AND state='lost'`, t, t, x.attempt.String); err != nil {
 				return err
 			}
-			if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM attempts WHERE id=?`, x.attempt.String).Scan(&executionID); err != nil {
+			if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM attempts WHERE id=$1`, x.attempt.String).Scan(&executionID); err != nil {
 				return err
 			}
-			if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',blocker_reason=NULL,updated_at=? WHERE execution_id=? AND attempt_id=?`, t, executionID, x.attempt.String); err != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',blocker_reason=NULL,updated_at=$1 WHERE execution_id=$2 AND attempt_id=$3`, t, executionID, x.attempt.String); err != nil {
 				return err
 			}
-		} else if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM leases WHERE id=?`, x.lease).Scan(&executionID); err != nil {
+		} else if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM leases WHERE id=$1`, x.lease).Scan(&executionID); err != nil {
 			return err
 		}
-		if err = tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=?`, executionID).Scan(&projectID); err != nil {
+		if err = tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=$1`, executionID).Scan(&projectID); err != nil {
 			return err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "stale_lease_reconciled", &projectID, "lease", x.lease, &x.epoch, map[string]string{"resource_id": resourceID, "execution_id": executionID}); err != nil {

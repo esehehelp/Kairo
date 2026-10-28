@@ -15,8 +15,8 @@ import (
 // resource are kept (for looking back at a recent incident).
 var ObservationRetention = time.Hour
 
-// pruneBatch bounds one delete so the single database connection is never
-// held for long while a large backlog is removed.
+// pruneBatch bounds one delete so the decision lock (every write takes it)
+// is never held for long while a large backlog is removed.
 const pruneBatch = 2000
 
 // PruneObservations deletes observations older than olderThan, always keeping
@@ -26,11 +26,11 @@ func (s *Store) PruneObservations(ctx context.Context, olderThan time.Duration) 
 	cutoff := time.Now().UTC().Add(-olderThan).Format(time.RFC3339Nano)
 	removed := 0
 	for {
-		result, err := s.db.ExecContext(ctx, `DELETE FROM resource_observations WHERE id IN (
+		result, err := s.exec(ctx, `DELETE FROM resource_observations WHERE id IN (
 		 SELECT o.id FROM resource_observations o
-		 WHERE julianday(o.observed_at) < julianday(?)
+		 WHERE (o.observed_at)::timestamptz < ($1)::timestamptz
 		 AND o.id < (SELECT MAX(x.id) FROM resource_observations x WHERE x.resource_id=o.resource_id)
-		 LIMIT ?)`, cutoff, pruneBatch)
+		 LIMIT $2)`, cutoff, pruneBatch)
 		if err != nil {
 			return removed, err
 		}
@@ -85,7 +85,7 @@ func (s *Store) PruneDeviceSamples(ctx context.Context, olderThan time.Duration)
 	removed := 0
 	for _, b := range bounds {
 		for {
-			result, err := s.db.ExecContext(ctx, `DELETE FROM device_samples WHERE id IN (SELECT id FROM device_samples WHERE device=? AND observed_at<? LIMIT ?)`, b.device, b.before, pruneBatch)
+			result, err := s.exec(ctx, `DELETE FROM device_samples WHERE id IN (SELECT id FROM device_samples WHERE device=$1 AND observed_at<$2 LIMIT $3)`, b.device, b.before, pruneBatch)
 			if err != nil {
 				return removed, err
 			}
@@ -107,10 +107,10 @@ func (s *Store) PruneDeviceSamples(ctx context.Context, olderThan time.Duration)
 	return removed, nil
 }
 
-// Compact prunes observations and device samples and rewrites the database
-// file to release the space deleted rows left behind. VACUUM needs the
-// database to itself: run it with the daemon stopped (it fails with "database
-// is locked" otherwise).
+// Compact prunes observations and device samples and vacuums their tables,
+// so the space of the deleted rows is reused and the planner's statistics
+// are fresh. It runs alongside the daemon (autovacuum does the same in
+// time).
 func (s *Store) Compact(ctx context.Context) (int, error) {
 	removed, err := s.PruneObservations(ctx, ObservationRetention)
 	if err != nil {
@@ -121,6 +121,7 @@ func (s *Store) Compact(ctx context.Context) (int, error) {
 	if err != nil {
 		return removed, err
 	}
-	_, err = s.db.ExecContext(ctx, `VACUUM`)
+	// VACUUM runs outside a transaction, and changes no row.
+	_, err = s.db.ExecContext(ctx, `VACUUM (ANALYZE) resource_observations, device_samples`)
 	return removed, err
 }

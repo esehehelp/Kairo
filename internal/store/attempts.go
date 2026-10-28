@@ -47,21 +47,18 @@ func (s *Store) ListAttempts(ctx context.Context, filter AttemptFilter) ([]Attem
 	conditions := make([]string, 0, 3)
 	args := make([]any, 0, 4)
 	if filter.ProjectScopeID != "" {
-		conditions = append(conditions, `e.project_scope_id=?`)
-		args = append(args, filter.ProjectScopeID)
+		conditions = append(conditions, `e.project_scope_id=`+bind(&args, filter.ProjectScopeID))
 	}
 	if filter.ExecutionID != "" {
-		conditions = append(conditions, `a.execution_id=?`)
-		args = append(args, filter.ExecutionID)
+		conditions = append(conditions, `a.execution_id=`+bind(&args, filter.ExecutionID))
 	}
 	if filter.State != "" {
-		conditions = append(conditions, `a.state=?`)
-		args = append(args, filter.State)
+		conditions = append(conditions, `a.state=`+bind(&args, filter.State))
 	}
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	query += ` ORDER BY COALESCE(a.authorized_at,a.started_at) DESC,a.id LIMIT ?`
+	query += ` ORDER BY COALESCE(a.authorized_at,a.started_at) DESC NULLS LAST,a.id LIMIT `
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = 100
@@ -69,7 +66,7 @@ func (s *Store) ListAttempts(ctx context.Context, filter AttemptFilter) ([]Attem
 	if limit > 1000 {
 		limit = 1000
 	}
-	args = append(args, limit)
+	query += bind(&args, limit)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -91,7 +88,7 @@ func (s *Store) ListAttempts(ctx context.Context, filter AttemptFilter) ([]Attem
 // ErrNotFound for an unknown attempt.
 func (s *Store) AttemptLogPaths(ctx context.Context, attemptID string) (stdout, stderr string, err error) {
 	var out, errPath sql.NullString
-	err = s.db.QueryRowContext(ctx, `SELECT stdout_path,stderr_path FROM attempts WHERE id=?`, attemptID).Scan(&out, &errPath)
+	err = s.db.QueryRowContext(ctx, `SELECT stdout_path,stderr_path FROM attempts WHERE id=$1`, attemptID).Scan(&out, &errPath)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", "", ErrNotFound
 	}

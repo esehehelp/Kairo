@@ -1,4 +1,6 @@
-database_path = "local/kairo-v3.db"
+# The PostgreSQL database (README "Database"). KAIRO_DATABASE_URL may give it
+# instead, and database_password_file its password.
+database_url = "postgres://kairo@127.0.0.1:5432/kairo?sslmode=disable"
 listen = "127.0.0.1:7474"
 advertise_url = "http://127.0.0.1:7474"
 log_directory = "local/attempts-v3"

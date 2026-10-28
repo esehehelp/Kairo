@@ -12,7 +12,7 @@ import (
 // planCluster is a test installation: nodes with an executor each (labels
 // site=<node>, pool=all), CPU, RAM, a "/" filesystem and GPUs.
 type planCluster struct {
-	t     *testing.T
+	t     testing.TB
 	store *Store
 	ctx   context.Context
 }
@@ -202,7 +202,7 @@ func TestPlannerSkipsAnExecutorThatStoppedPolling(t *testing.T) {
 	c := newPlanCluster(t)
 	c.node("a", 0, 16000, 64, 500)
 	c.node("b", 1, 16000, 64, 500)
-	if _, err := c.store.db.Exec(`UPDATE executors SET last_seen_at=? WHERE id='exec-a'`, time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339Nano)); err != nil {
+	if _, err := c.store.testExec(`UPDATE executors SET last_seen_at=$1 WHERE id='exec-a'`, time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
 	cpu := c.submit(planSpec("cpu", "p1", 0, 0, 2000, 4))
@@ -257,7 +257,7 @@ func TestPlannerPreemptsForCapacity(t *testing.T) {
 		t.Fatalf("commands=%v err=%v", commands, err)
 	}
 	var attemptID string
-	if err = c.store.db.QueryRow(`SELECT attempt_id FROM commands WHERE id=?`, commands[0]).Scan(&attemptID); err != nil || attemptID != victim.Attempt.ID {
+	if err = c.store.db.QueryRow(`SELECT attempt_id FROM commands WHERE id=$1`, commands[0]).Scan(&attemptID); err != nil || attemptID != victim.Attempt.ID {
 		t.Fatalf("suspended %s, want %s (%v)", attemptID, victim.Attempt.ID, err)
 	}
 	again, err := c.store.EnsurePriorityPreemption(c.ctx, "exec-a")

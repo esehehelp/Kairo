@@ -29,7 +29,7 @@ func (s *Store) EnsureScopePath(ctx context.Context, path ScopePath) (ScopeSet, 
 	if err != nil {
 		return ScopeSet{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return ScopeSet{}, err
 	}
@@ -76,10 +76,10 @@ func ensureScopeTx(ctx context.Context, tx *sql.Tx, kind string, parentID *strin
 	}
 	t := now()
 	scope = Scope{ID: id.New("scp"), Kind: kind, ParentID: parentID, ExternalKey: key, Admission: "open", Generation: 1, CreatedAt: t, UpdatedAt: t}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO coordination_scopes(id,kind,parent_id,external_key,created_at,updated_at) VALUES(?,?,?,?,?,?)`, scope.ID, kind, parentID, key, t, t); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO coordination_scopes(id,kind,parent_id,external_key,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6)`, scope.ID, kind, parentID, key, t, t); err != nil {
 		return Scope{}, false, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO admission_gates(scope_id,state,generation,updated_at) VALUES(?,'open',1,?)`, scope.ID, t); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO admission_gates(scope_id,state,generation,updated_at) VALUES($1,'open',1,$2)`, scope.ID, t); err != nil {
 		return Scope{}, false, err
 	}
 	projectID := scope.ID
@@ -97,13 +97,13 @@ func ensureScopeTx(ctx context.Context, tx *sql.Tx, kind string, parentID *strin
 
 func getScopeByKeyTx(ctx context.Context, tx *sql.Tx, kind string, parentID *string, key string) (Scope, error) {
 	var scope Scope
-	err := tx.QueryRowContext(ctx, `SELECT s.id,s.kind,s.parent_id,s.external_key,g.state,g.generation,s.created_at,g.updated_at FROM coordination_scopes s JOIN admission_gates g ON g.scope_id=s.id WHERE s.kind=? AND ((? IS NULL AND s.parent_id IS NULL) OR s.parent_id=?) AND s.external_key=?`, kind, parentID, parentID, key).Scan(&scope.ID, &scope.Kind, &scope.ParentID, &scope.ExternalKey, &scope.Admission, &scope.Generation, &scope.CreatedAt, &scope.UpdatedAt)
+	err := tx.QueryRowContext(ctx, `SELECT s.id,s.kind,s.parent_id,s.external_key,g.state,g.generation,s.created_at,g.updated_at FROM coordination_scopes s JOIN admission_gates g ON g.scope_id=s.id WHERE s.kind=$1 AND (($2::text IS NULL AND s.parent_id IS NULL) OR s.parent_id=$2) AND s.external_key=$3`, kind, parentID, key).Scan(&scope.ID, &scope.Kind, &scope.ParentID, &scope.ExternalKey, &scope.Admission, &scope.Generation, &scope.CreatedAt, &scope.UpdatedAt)
 	return scope, err
 }
 
 func (s *Store) GetScope(ctx context.Context, scopeID string) (Scope, error) {
 	var scope Scope
-	err := s.db.QueryRowContext(ctx, `SELECT s.id,s.kind,s.parent_id,s.external_key,g.state,g.generation,s.created_at,g.updated_at FROM coordination_scopes s JOIN admission_gates g ON g.scope_id=s.id WHERE s.id=?`, scopeID).Scan(&scope.ID, &scope.Kind, &scope.ParentID, &scope.ExternalKey, &scope.Admission, &scope.Generation, &scope.CreatedAt, &scope.UpdatedAt)
+	err := s.db.QueryRowContext(ctx, `SELECT s.id,s.kind,s.parent_id,s.external_key,g.state,g.generation,s.created_at,g.updated_at FROM coordination_scopes s JOIN admission_gates g ON g.scope_id=s.id WHERE s.id=$1`, scopeID).Scan(&scope.ID, &scope.Kind, &scope.ParentID, &scope.ExternalKey, &scope.Admission, &scope.Generation, &scope.CreatedAt, &scope.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = ErrNotFound
 	}
@@ -115,7 +115,7 @@ func (s *Store) GetScopeByPath(ctx context.Context, path ScopePath) (ScopeSet, e
 	if err != nil {
 		return ScopeSet{}, err
 	}
-	tx, err := s.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	tx, err := s.beginRead(ctx)
 	if err != nil {
 		return ScopeSet{}, err
 	}
@@ -152,20 +152,18 @@ func (s *Store) GetScopeByPath(ctx context.Context, path ScopePath) (ScopeSet, e
 }
 
 func (s *Store) ListScopes(ctx context.Context, filter ScopeFilter) ([]Scope, error) {
-	query := `SELECT DISTINCT s.id,s.kind,s.parent_id,s.external_key,g.state,g.generation,s.created_at,g.updated_at FROM coordination_scopes s JOIN admission_gates g ON g.scope_id=s.id`
+	// (Each scope joins at most one project: project keys are unique.)
+	query := `SELECT s.id,s.kind,s.parent_id,s.external_key,g.state,g.generation,s.created_at,g.updated_at FROM coordination_scopes s JOIN admission_gates g ON g.scope_id=s.id`
 	args := make([]any, 0, 3)
 	conditions := make([]string, 0, 3)
 	if filter.Project != "" {
-		query += ` JOIN coordination_scopes p ON p.kind='project' AND p.external_key=? AND (s.id=p.id OR s.parent_id=p.id OR s.parent_id IN(SELECT id FROM coordination_scopes WHERE parent_id=p.id))`
-		args = append(args, filter.Project)
+		query += ` JOIN coordination_scopes p ON p.kind='project' AND p.external_key=` + bind(&args, filter.Project) + ` AND (s.id=p.id OR s.parent_id=p.id OR s.parent_id IN(SELECT id FROM coordination_scopes WHERE parent_id=p.id))`
 	}
 	if filter.Kind != "" {
-		conditions = append(conditions, `s.kind=?`)
-		args = append(args, filter.Kind)
+		conditions = append(conditions, `s.kind=`+bind(&args, filter.Kind))
 	}
 	if filter.ParentID != "" {
-		conditions = append(conditions, `s.parent_id=?`)
-		args = append(args, filter.ParentID)
+		conditions = append(conditions, `s.parent_id=`+bind(&args, filter.ParentID))
 	}
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
@@ -194,7 +192,7 @@ func (s *Store) ExecutionAdmission(ctx context.Context, executionID string) (boo
 	rows, err := s.db.QueryContext(ctx, `SELECT g.scope_id,g.state,g.generation,g.updated_at
 	FROM execution_requests e
 	JOIN admission_gates g ON g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id)
-	WHERE e.id=? ORDER BY g.scope_id`, executionID)
+	WHERE e.id=$1 ORDER BY g.scope_id`, executionID)
 	if err != nil {
 		return false, nil, err
 	}
@@ -225,7 +223,7 @@ func projectScopeIDTx(ctx context.Context, tx *sql.Tx, scopeID string) (string, 
 	for depth := 0; depth < 3; depth++ {
 		var kind string
 		var parent sql.NullString
-		if err := tx.QueryRowContext(ctx, `SELECT kind,parent_id FROM coordination_scopes WHERE id=?`, current).Scan(&kind, &parent); err != nil {
+		if err := tx.QueryRowContext(ctx, `SELECT kind,parent_id FROM coordination_scopes WHERE id=$1`, current).Scan(&kind, &parent); err != nil {
 			return "", err
 		}
 		if kind == "project" {
@@ -271,7 +269,7 @@ func (s *Store) pauseScope(ctx context.Context, scopeID, actor, requestID string
 	if actor == "" {
 		actor = "unknown"
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return PauseOperation{}, err
 	}
@@ -285,7 +283,7 @@ func (s *Store) pauseScope(ctx context.Context, scopeID, actor, requestID string
 		return PauseOperation{}, err
 	}
 	var gate AdmissionGate
-	if err = tx.QueryRowContext(ctx, `SELECT scope_id,state,generation,updated_at FROM admission_gates WHERE scope_id=?`, scopeID).Scan(&gate.ScopeID, &gate.State, &gate.Generation, &gate.UpdatedAt); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT scope_id,state,generation,updated_at FROM admission_gates WHERE scope_id=$1`, scopeID).Scan(&gate.ScopeID, &gate.State, &gate.Generation, &gate.UpdatedAt); errors.Is(err, sql.ErrNoRows) {
 		return PauseOperation{}, ErrNotFound
 	} else if err != nil {
 		return PauseOperation{}, err
@@ -296,16 +294,16 @@ func (s *Store) pauseScope(ctx context.Context, scopeID, actor, requestID string
 		gate.State = "closed"
 		gate.Generation++
 		gate.UpdatedAt = t
-		if _, err = tx.ExecContext(ctx, `UPDATE admission_gates SET state='closed',generation=?,updated_at=? WHERE scope_id=?`, gate.Generation, t, scopeID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE admission_gates SET state='closed',generation=$1,updated_at=$2 WHERE scope_id=$3`, gate.Generation, t, scopeID); err != nil {
 			return PauseOperation{}, err
 		}
 	}
 	operation := PauseOperation{ID: id.New("pop"), ScopeID: scopeID, ScopeGeneration: gate.Generation, RequestID: requestID, Actor: actor, State: "requested", Detail: json.RawMessage(`{}`), CreatedAt: t, UpdatedAt: t, Force: force}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO pause_operations(id,scope_id,scope_generation,request_id,actor,state,detail_json,created_at,updated_at) VALUES(?,?,?,?,?,'requested','{}',?,?)`, operation.ID, scopeID, gate.Generation, requestID, actor, t, t); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO pause_operations(id,scope_id,scope_generation,request_id,actor,state,detail_json,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'requested','{}',$6,$7)`, operation.ID, scopeID, gate.Generation, requestID, actor, t, t); err != nil {
 		return PauseOperation{}, err
 	}
 	if force != nil {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO force_stop_operations(operation_id,grace_seconds,reason) VALUES(?,?,?)`, operation.ID, force.GraceSeconds, force.Reason); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO force_stop_operations(operation_id,grace_seconds,reason) VALUES($1,$2,$3)`, operation.ID, force.GraceSeconds, force.Reason); err != nil {
 			return PauseOperation{}, err
 		}
 	}
@@ -343,13 +341,13 @@ func (s *Store) ResumeScope(ctx context.Context, scopeID, actor string) (Admissi
 	if actor == "" {
 		actor = "unknown"
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return AdmissionGate{}, err
 	}
 	defer tx.Rollback()
 	var gate AdmissionGate
-	if err = tx.QueryRowContext(ctx, `SELECT scope_id,state,generation,updated_at FROM admission_gates WHERE scope_id=?`, scopeID).Scan(&gate.ScopeID, &gate.State, &gate.Generation, &gate.UpdatedAt); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT scope_id,state,generation,updated_at FROM admission_gates WHERE scope_id=$1`, scopeID).Scan(&gate.ScopeID, &gate.State, &gate.Generation, &gate.UpdatedAt); errors.Is(err, sql.ErrNoRows) {
 		return AdmissionGate{}, ErrNotFound
 	} else if err != nil {
 		return AdmissionGate{}, err
@@ -358,7 +356,7 @@ func (s *Store) ResumeScope(ctx context.Context, scopeID, actor string) (Admissi
 		gate.State = "open"
 		gate.Generation++
 		gate.UpdatedAt = now()
-		if _, err = tx.ExecContext(ctx, `UPDATE admission_gates SET state='open',generation=?,updated_at=? WHERE scope_id=?`, gate.Generation, gate.UpdatedAt, scopeID); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE admission_gates SET state='open',generation=$1,updated_at=$2 WHERE scope_id=$3`, gate.Generation, gate.UpdatedAt, scopeID); err != nil {
 			return AdmissionGate{}, err
 		}
 		projectID, projectErr := projectScopeIDTx(ctx, tx, scopeID)
@@ -374,10 +372,10 @@ func (s *Store) ResumeScope(ctx context.Context, scopeID, actor string) (Admissi
 
 func discoverPauseTargetsTx(ctx context.Context, tx *sql.Tx, operationID, scopeID, stamp string) error {
 	_, err := tx.ExecContext(ctx, `WITH RECURSIVE descendants(id) AS (
-	 SELECT ? UNION ALL SELECT s.id FROM coordination_scopes s JOIN descendants d ON s.parent_id=d.id
+	 SELECT $1 UNION ALL SELECT s.id FROM coordination_scopes s JOIN descendants d ON s.parent_id=d.id
 	)
 	INSERT INTO pause_targets(operation_id,execution_id,attempt_id,lease_id,state,updated_at)
-	SELECT ?,e.id,a.id,l.id,'pending',?
+	SELECT $2,e.id,a.id,l.id,'pending',$3
 	FROM execution_requests e
 	LEFT JOIN attempts a ON a.execution_id=e.id AND a.state!='quiesced'
 	LEFT JOIN leases l ON l.execution_id=e.id AND l.state!='released'
@@ -388,13 +386,13 @@ func discoverPauseTargetsTx(ctx context.Context, tx *sql.Tx, operationID, scopeI
 }
 
 func (s *Store) DiscoverPauseTargets(ctx context.Context, operationID string) ([]PauseTarget, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback()
 	var scopeID string
-	if err = tx.QueryRowContext(ctx, `SELECT scope_id FROM pause_operations WHERE id=?`, operationID).Scan(&scopeID); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT scope_id FROM pause_operations WHERE id=$1`, operationID).Scan(&scopeID); errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	} else if err != nil {
 		return nil, err
@@ -432,11 +430,11 @@ func scanPauseOperation(row rowScanner) (PauseOperation, error) {
 }
 
 func getPauseOperationByRequestTx(ctx context.Context, tx *sql.Tx, scopeID, requestID string) (PauseOperation, error) {
-	return scanPauseOperation(tx.QueryRowContext(ctx, pauseOperationSelect+` WHERE p.scope_id=? AND p.request_id=?`, scopeID, requestID))
+	return scanPauseOperation(tx.QueryRowContext(ctx, pauseOperationSelect+` WHERE p.scope_id=$1 AND p.request_id=$2`, scopeID, requestID))
 }
 
 func (s *Store) GetPauseOperation(ctx context.Context, operationID string) (PauseOperation, error) {
-	operation, err := scanPauseOperation(s.db.QueryRowContext(ctx, pauseOperationSelect+` WHERE p.id=?`, operationID))
+	operation, err := scanPauseOperation(s.db.QueryRowContext(ctx, pauseOperationSelect+` WHERE p.id=$1`, operationID))
 	if errors.Is(err, sql.ErrNoRows) {
 		return PauseOperation{}, ErrNotFound
 	}
@@ -448,8 +446,7 @@ func (s *Store) ListPauseOperations(ctx context.Context, filter PauseOperationFi
 	conditions := make([]string, 0, 2)
 	args := make([]any, 0, 3)
 	if filter.ScopeID != "" {
-		conditions = append(conditions, `p.scope_id=?`)
-		args = append(args, filter.ScopeID)
+		conditions = append(conditions, `p.scope_id=`+bind(&args, filter.ScopeID))
 	}
 	if filter.Unfinished {
 		conditions = append(conditions, `p.state IN('requested','quiescing','blocked')`)
@@ -464,8 +461,8 @@ func (s *Store) ListPauseOperations(ctx context.Context, filter PauseOperationFi
 	if limit > 1000 {
 		limit = 1000
 	}
-	query += ` ORDER BY p.created_at,p.id LIMIT ?`
-	args = append(args, limit)
+	query += ` ORDER BY p.created_at,p.id LIMIT `
+	query += bind(&args, limit)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
 		return nil, err
@@ -483,7 +480,7 @@ func (s *Store) ListPauseOperations(ctx context.Context, filter PauseOperationFi
 }
 
 func (s *Store) ListPauseTargets(ctx context.Context, operationID string) ([]PauseTarget, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT operation_id,execution_id,attempt_id,lease_id,command_id,state,blocker_reason,updated_at FROM pause_targets WHERE operation_id=? ORDER BY execution_id`, operationID)
+	rows, err := s.db.QueryContext(ctx, `SELECT operation_id,execution_id,attempt_id,lease_id,command_id,state,blocker_reason,updated_at FROM pause_targets WHERE operation_id=$1 ORDER BY execution_id`, operationID)
 	if err != nil {
 		return nil, err
 	}
@@ -509,13 +506,13 @@ func (s *Store) SetPauseOperationState(ctx context.Context, operationID, state s
 	if !json.Valid(detail) {
 		return errors.New("pause operation detail must be valid JSON")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var current, currentDetail, scopeID string
-	if err = tx.QueryRowContext(ctx, `SELECT state,detail_json,scope_id FROM pause_operations WHERE id=?`, operationID).Scan(&current, &currentDetail, &scopeID); errors.Is(err, sql.ErrNoRows) {
+	if err = tx.QueryRowContext(ctx, `SELECT state,detail_json,scope_id FROM pause_operations WHERE id=$1`, operationID).Scan(&current, &currentDetail, &scopeID); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
@@ -523,7 +520,7 @@ func (s *Store) SetPauseOperationState(ctx context.Context, operationID, state s
 	if current == state && currentDetail == string(detail) {
 		return tx.Commit()
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE pause_operations SET state=?,detail_json=?,updated_at=? WHERE id=?`, state, string(detail), now(), operationID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE pause_operations SET state=$1,detail_json=$2,updated_at=$3 WHERE id=$4`, state, string(detail), now(), operationID); err != nil {
 		return err
 	}
 	if current != state {
@@ -542,12 +539,12 @@ func (s *Store) SetPauseTarget(ctx context.Context, operationID, executionID str
 	if !stringIn(update.State, "pending", "revoking", "quiescing", "quiesced", "blocked") {
 		return errors.New("invalid pause target state")
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE pause_targets SET attempt_id=COALESCE(?,attempt_id),lease_id=COALESCE(?,lease_id),command_id=COALESCE(?,command_id),state=?,blocker_reason=?,updated_at=? WHERE operation_id=? AND execution_id=?`, update.AttemptID, update.LeaseID, update.CommandID, update.State, update.BlockerReason, now(), operationID, executionID)
+	res, err := tx.ExecContext(ctx, `UPDATE pause_targets SET attempt_id=COALESCE($1,attempt_id),lease_id=COALESCE($2,lease_id),command_id=COALESCE($3,command_id),state=$4,blocker_reason=$5,updated_at=$6 WHERE operation_id=$7 AND execution_id=$8`, update.AttemptID, update.LeaseID, update.CommandID, update.State, update.BlockerReason, now(), operationID, executionID)
 	if err != nil {
 		return err
 	}
@@ -555,7 +552,7 @@ func (s *Store) SetPauseTarget(ctx context.Context, operationID, executionID str
 		return ErrNotFound
 	}
 	var projectID string
-	if err = tx.QueryRowContext(ctx, `SELECT e.project_scope_id FROM execution_requests e WHERE e.id=?`, executionID).Scan(&projectID); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT e.project_scope_id FROM execution_requests e WHERE e.id=$1`, executionID).Scan(&projectID); err != nil {
 		return err
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "pause_target_"+update.State, &projectID, "execution", executionID, nil, map[string]any{"pause_operation_id": operationID, "attempt_id": update.AttemptID, "lease_id": update.LeaseID, "command_id": update.CommandID, "blocker_reason": update.BlockerReason}); err != nil {
