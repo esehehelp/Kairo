@@ -504,33 +504,44 @@ func (s *Store) ListExecutions(ctx context.Context, filter ExecutionFilter) ([]E
 		return nil, err
 	}
 	rows.Close()
+	ids := make([]string, len(out))
 	for i := range out {
-		out[i].Resources, err = s.listExecutionResources(ctx, out[i].ID)
-		if err != nil {
-			return nil, err
-		}
+		ids[i] = out[i].ID
+	}
+	resources, err := s.executionResources(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		out[i].Resources = resources[out[i].ID]
 	}
 	return out, nil
 }
 
 func (s *Store) listExecutionResources(ctx context.Context, executionID string) ([]ResourceRequest, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,execution_id,request_type,kind,quantity,filesystem,constraints_json,policy_json,strength FROM resource_requests WHERE execution_id=$1 ORDER BY request_type,kind,id`, executionID)
-	if err != nil {
-		return nil, err
+	resources, err := s.executionResources(ctx, []string{executionID})
+	return resources[executionID], err
+}
+
+// executionResources returns the resource requests of each execution (an
+// empty list for one without any), in one query.
+func (s *Store) executionResources(ctx context.Context, executionIDs []string) (map[string][]ResourceRequest, error) {
+	out := make(map[string][]ResourceRequest, len(executionIDs))
+	for _, id := range executionIDs {
+		out[id] = []ResourceRequest{}
 	}
-	defer rows.Close()
-	out := make([]ResourceRequest, 0)
-	for rows.Next() {
+	err := eachRow(ctx, s.db, `SELECT id,execution_id,request_type,kind,quantity,filesystem,constraints_json,policy_json,strength FROM resource_requests WHERE execution_id=ANY($1::text[]) ORDER BY execution_id,request_type,kind,id`, []any{executionIDs}, func(rows *sql.Rows) error {
 		var request ResourceRequest
 		var constraints, policy string
 		if err := rows.Scan(&request.ID, &request.ExecutionID, &request.RequestType, &request.Kind, &request.Quantity, &request.Filesystem, &constraints, &policy, &request.Strength); err != nil {
-			return nil, err
+			return err
 		}
 		request.Constraints = json.RawMessage(constraints)
 		request.Policy = json.RawMessage(policy)
-		out = append(out, request)
-	}
-	return out, rows.Err()
+		out[request.ExecutionID] = append(out[request.ExecutionID], request)
+		return nil
+	})
+	return out, err
 }
 
 func (s *Store) WithdrawExecution(ctx context.Context, executionID string) error {
