@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -724,6 +725,23 @@ func (e *Local) command(launch *store.Launch) *exec.Cmd {
 	return cmd
 }
 
+// openAttemptLog opens an attempt's log for its process to write, after
+// whatever the file already holds. Not with O_APPEND: on Windows that opens
+// the file with append-only access (no FILE_WRITE_DATA), and MSYS/Cygwin
+// programs such as Git Bash then fail every write, silently and with exit 1
+// (2026-10-28).
+func openAttemptLog(path string) (*os.File, error) {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = f.Seek(0, io.SeekEnd); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 func (e *Local) start(launch *store.Launch) error {
 	// Output written to a full filesystem goes nowhere: refuse the launch
 	// rather than start a process nobody can follow.
@@ -734,11 +752,11 @@ func (e *Local) start(launch *store.Launch) error {
 	prepareProcessTree(cmd)
 	outPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stdout.log")
 	errPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stderr.log")
-	stdout, err := os.OpenFile(outPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	stdout, err := openAttemptLog(outPath)
 	if err != nil {
 		return err
 	}
-	stderr, err := os.OpenFile(errPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	stderr, err := openAttemptLog(errPath)
 	if err != nil {
 		stdout.Close()
 		return err
