@@ -21,6 +21,10 @@ import (
 // suspend command for an attempt. This method only coordinates transfer of
 // execution rights. It never requeues an execution or interprets its exit.
 func (s *Store) EnsurePriorityPreemption(ctx context.Context, executorID string) ([]string, error) {
+	// Nothing waiting: nothing to make room for.
+	if work, err := s.planWork(ctx); err != nil || !work {
+		return nil, err
+	}
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err

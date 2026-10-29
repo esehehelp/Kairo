@@ -231,19 +231,11 @@ func loadPlanModel(ctx context.Context, tx *sql.Tx, policy SchedulingPolicy, cal
 	if err := m.loadLeases(ctx, tx); err != nil {
 		return nil, err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT id,external_key FROM coordination_scopes`)
-	if err != nil {
-		return nil, err
+	var scopes []string
+	for _, l := range m.leases {
+		scopes = append(scopes, l.projectID, l.label)
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var scopeID, name string
-		if err = rows.Scan(&scopeID, &name); err != nil {
-			return nil, err
-		}
-		m.labels[scopeID] = name
-	}
-	if err = rows.Err(); err != nil {
+	if err := m.loadLabels(ctx, tx, scopes); err != nil {
 		return nil, err
 	}
 	for _, l := range m.leases {
@@ -251,6 +243,30 @@ func loadPlanModel(ctx context.Context, tx *sql.Tx, policy SchedulingPolicy, cal
 	}
 	m.findLowDisk()
 	return m, nil
+}
+
+// loadLabels adds the names of scopes not named yet: only those of leases and
+// candidates are read, not every scope there is (a pass runs several times a
+// second per executor, and scopes only grow).
+func (m *planModel) loadLabels(ctx context.Context, tx *sql.Tx, scopeIDs []string) error {
+	var missing []string
+	for _, scopeID := range scopeIDs {
+		if _, ok := m.labels[scopeID]; !ok && scopeID != "" {
+			m.labels[scopeID] = ""
+			missing = append(missing, scopeID)
+		}
+	}
+	if len(missing) == 0 {
+		return nil
+	}
+	return eachRow(ctx, tx, `SELECT id,external_key FROM coordination_scopes WHERE id=ANY($1::text[])`, []any{missing}, func(rows *sql.Rows) error {
+		var scopeID, name string
+		if err := rows.Scan(&scopeID, &name); err != nil {
+			return err
+		}
+		m.labels[scopeID] = name
+		return nil
+	})
 }
 
 func (m *planModel) loadExecutors(ctx context.Context, tx *sql.Tx, callerID string) error {
@@ -1181,6 +1197,16 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 	}
 	demands, err := loadDemandsTx(ctx, tx, ids)
 	if err != nil {
+		return nil, err
+	}
+	var scopes []string
+	for _, c := range candidates {
+		scopes = append(scopes, c.execution.ProjectScopeID)
+		if c.execution.TaskScopeID != nil {
+			scopes = append(scopes, *c.execution.TaskScopeID)
+		}
+	}
+	if err = m.loadLabels(ctx, tx, scopes); err != nil {
 		return nil, err
 	}
 	for _, c := range candidates {

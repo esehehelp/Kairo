@@ -301,6 +301,16 @@ func TestPlannerStopsAdmissionUnderTheDiskWatermark(t *testing.T) {
 	}
 	c.observe("a-disk", 100*gib, 50*gib)
 	c.expectReserved("exec-a", job)
+	// Nothing waits now: a poll right after a whole pass plans nothing (and
+	// leaves the alert); the next whole pass, idlePassInterval later, clears it.
+	if r := c.reserve("exec-a"); r != nil {
+		t.Fatalf("unexpected %+v", r)
+	}
+	_ = c.store.db.QueryRow(`SELECT COUNT(*) FROM node_alerts WHERE node_id='a'`).Scan(&alerts)
+	if alerts != 1 {
+		t.Fatalf("an idle poll ran a pass: alerts=%d", alerts)
+	}
+	c.store.lastPass.Add(-int64(idlePassInterval))
 	if r := c.reserve("exec-a"); r != nil {
 		t.Fatalf("unexpected %+v", r)
 	}

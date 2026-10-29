@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -68,6 +69,9 @@ type Store struct {
 	// beginRead; write only through beginWrite or exec.
 	db     *sql.DB
 	policy SchedulingPolicy
+	// lastPass is when ReserveNext last completed a whole planning pass
+	// (UnixNano; 0: never), which lets a poll with nothing to plan skip one.
+	lastPass atomic.Int64
 }
 
 // Open connects to the PostgreSQL database dsn (a postgres:// URL or a

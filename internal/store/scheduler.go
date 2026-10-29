@@ -88,6 +88,12 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	if reservation, err := s.deliverGangLease(ctx, executorID); reservation != nil || err != nil {
 		return reservation, err
 	}
+	if time.Since(time.Unix(0, s.lastPass.Load())) < idlePassInterval {
+		if work, err := s.planWork(ctx); err != nil || !work {
+			return nil, err
+		}
+	}
+	started := time.Now()
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
@@ -153,10 +159,33 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
+	if complete {
+		s.lastPass.Store(started.UnixNano())
+	}
 	if gangPlaced {
 		return s.deliverGangLease(ctx, executorID)
 	}
 	return reservation, nil
+}
+
+// idlePassInterval: with nothing to plan, ReserveNext still runs a whole pass
+// this often, which keeps the node alerts (the disk watermark) current.
+const idlePassInterval = 10 * time.Second
+
+// planWork reports whether a planning pass has anything to do: an execution
+// waiting to be placed (what loadPlanCandidates reads) or a wait reason left
+// to clear. Executors poll several times a second each, and a pass takes the
+// decision lock and reads the whole model; this read takes neither. A request
+// submitted just after it is planned at the next poll.
+func (s *Store) planWork(ctx context.Context) (bool, error) {
+	var work bool
+	err := s.db.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM execution_requests e WHERE e.state='waiting'
+		AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.execution_id=e.id AND l.state!='released')
+		AND NOT EXISTS (
+			SELECT 1 FROM admission_gates g
+			WHERE g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) AND g.state!='open'
+		)) OR EXISTS(SELECT 1 FROM admission_waits)`).Scan(&work)
+	return work, err
 }
 
 // callerMayPlanTx reports whether executorID may take work: it exists, is

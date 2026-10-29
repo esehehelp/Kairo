@@ -414,6 +414,9 @@ node with an executor that has polled in the last minute (or not yet), every
 lease and claim. Each executor's reserve and preemption call runs the same
 pass, and the pass, not the executor that polls first, chooses; an execution
 placed on another node waits for that node's executor (`awaiting_executor`).
+When no execution waits and no wait reason is left to clear, a poll runs no
+pass (a read without the lock tells), except one every 10 s, which keeps the
+disk watermark alerts current.
 Executors of one node share its resources, so any of them that matches the
 labels may take what is placed there.
 
@@ -1406,7 +1409,10 @@ daemon, `kairo token`, `kairo db`) share the database. Reads (status, lists,
 logs) take no lock and run alongside. Connections are read-only unless such
 a transaction makes them writable, so a write that bypasses the lock fails.
 Each statement is a round trip to the server: a planning pass costs a fixed
-20 or so whatever the number of waiting executions, a heartbeat 5.
+20 or so whatever the number of waiting executions (it reads the names of
+the scopes its leases and candidates are in, not of every scope), a
+heartbeat 5. Executors poll four times a second each, so an idle
+installation skips the pass (see Admission).
 
 Back up with `pg_dump` (the database holds the token hashes: keep the dump
 like the password). A database of the SQLite era (`kairo-v3.db`) is moved
