@@ -81,11 +81,18 @@ type GangRank struct {
 
 type ExecutorSelector struct {
 	Labels map[string]string `toml:"labels" json:"labels"`
+	// Node pins the task to the executors of one node (a hardware bench of
+	// that node's device). Absent from the JSON when unset, so existing task
+	// digests do not change.
+	Node string `toml:"node" json:"node,omitempty"`
 }
 
 type ExclusiveRequest struct {
-	Kind                       string `toml:"kind" json:"kind"`
-	Count                      int    `toml:"count" json:"count"`
+	Kind  string `toml:"kind" json:"kind"`
+	Count int    `toml:"count" json:"count"`
+	// Device pins the request to one GPU by its UUID (count 1). Absent from
+	// the JSON when unset, so existing task digests do not change.
+	Device                     string `toml:"device" json:"device,omitempty"`
 	SameNode                   bool   `toml:"same_node" json:"same_node"`
 	MinTotalMemoryBytes        int64  `toml:"min_total_memory_bytes" json:"min_total_memory_bytes"`
 	MinObservedFreeMemoryBytes int64  `toml:"min_observed_free_memory_bytes" json:"min_observed_free_memory_bytes"`
@@ -290,6 +297,7 @@ func normalizeExecution(value *Execution) error {
 	if value.Executor.Labels == nil {
 		value.Executor.Labels = map[string]string{}
 	}
+	value.Executor.Node = strings.TrimSpace(value.Executor.Node)
 	var err error
 	if value.Exclusive, err = normalizeExclusive(value.Exclusive); err != nil {
 		return err
@@ -332,8 +340,12 @@ func normalizeExclusive(requests []ExclusiveRequest) ([]ExclusiveRequest, error)
 	for i := range requests {
 		request := &requests[i]
 		request.Kind = strings.TrimSpace(request.Kind)
+		request.Device = strings.TrimSpace(request.Device)
 		if request.Kind != "gpu" || request.Count < 1 {
 			return nil, fmt.Errorf("exclusive request %d must be a positive GPU request", i)
+		}
+		if request.Device != "" && request.Count != 1 {
+			return nil, fmt.Errorf("exclusive request %d names device %s: its count must be 1", i, request.Device)
 		}
 		if request.MinTotalMemoryBytes < 0 || request.MinObservedFreeMemoryBytes < 0 {
 			return nil, fmt.Errorf("exclusive request %d has negative memory", i)
@@ -419,8 +431,11 @@ func normalizeGang(gang *Gang) error {
 		if len(r.Argv) != 0 && strings.TrimSpace(r.Argv[0]) == "" {
 			return fmt.Errorf("gang rank %d has an empty argv", r.Rank)
 		}
-		if r.Executor != nil && r.Executor.Labels == nil {
-			r.Executor.Labels = map[string]string{}
+		if r.Executor != nil {
+			if r.Executor.Labels == nil {
+				r.Executor.Labels = map[string]string{}
+			}
+			r.Executor.Node = strings.TrimSpace(r.Executor.Node)
 		}
 		if r.Exclusive != nil {
 			exclusive, err := normalizeExclusive(*r.Exclusive)

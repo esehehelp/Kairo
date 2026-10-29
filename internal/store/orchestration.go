@@ -112,6 +112,16 @@ func (s *Store) ApplyProject(ctx context.Context, spec orchestration.Validated) 
 		return ApplyResult{}, err
 	}
 	defer tx.Rollback()
+	applied, err := applyProjectTx(ctx, tx, spec)
+	if err != nil {
+		return ApplyResult{}, err
+	}
+	return applied, tx.Commit()
+}
+
+// applyProjectTx is ApplyProject within tx (a hardware bench declares its
+// task in the transaction that creates its run).
+func applyProjectTx(ctx context.Context, tx *sql.Tx, spec orchestration.Validated) (ApplyResult, error) {
 	projectScope, _, err := ensureScopeTx(ctx, tx, "project", nil, spec.Manifest.Project.Name)
 	if err != nil {
 		return ApplyResult{}, err
@@ -171,9 +181,6 @@ func (s *Store) ApplyProject(ctx context.Context, spec orchestration.Validated) 
 				return ApplyResult{}, err
 			}
 		}
-	}
-	if err = tx.Commit(); err != nil {
-		return ApplyResult{}, err
 	}
 	applied.Idempotent = inserted == 0
 	return applied, nil
@@ -397,22 +404,43 @@ func latestAttemptCommand(ctx context.Context, tx *sql.Tx, attemptID string) (st
 }
 
 func planTaskExecution(ctx context.Context, tx *sql.Tx, task orchestrationTaskRow, ordinal int, reason string, trigger map[string]any, continuation *string) error {
+	_, err := planTaskExecutionDecision(ctx, tx, task, ordinal, reason, trigger, continuation)
+	return err
+}
+
+// planTaskExecutionDecision is planTaskExecution, returning the decision it
+// planned (or found already planned).
+func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrationTaskRow, ordinal int, reason string, trigger map[string]any, continuation *string) (plannedOrchestrationDecision, error) {
 	triggerBody, err := json.Marshal(trigger)
 	if err != nil {
-		return err
+		return plannedOrchestrationDecision{}, err
 	}
 	decisionKey := orchestrationDecisionKey(task.taskScopeID, ordinal, reason, string(triggerBody))
 	var template orchestration.Execution
 	if err := json.Unmarshal([]byte(task.template), &template); err != nil {
-		return err
+		return plannedOrchestrationDecision{}, err
 	}
+	spec, err := taskExecutionSpec(ScopePath{Project: task.project, Queue: task.queue, Task: task.name}, template, orchestrationClientRequestID(decisionKey), continuation)
+	if err != nil {
+		return plannedOrchestrationDecision{}, err
+	}
+	specBody, err := json.Marshal(spec)
+	if err != nil {
+		return plannedOrchestrationDecision{}, err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO orchestration_decisions(decision_key,task_scope_id,execution_ordinal,reason,trigger_json,execution_spec_json,state,created_at) VALUES($1,$2,$3,$4,$5,$6,'planned',$7) ON CONFLICT DO NOTHING`, decisionKey, task.taskScopeID, ordinal, reason, string(triggerBody), string(specBody), now())
+	return plannedOrchestrationDecision{DecisionKey: decisionKey, TaskScopeID: task.taskScopeID, Ordinal: ordinal, Reason: reason, Spec: spec}, err
+}
+
+// taskExecutionSpec is the execution a task's template declares.
+func taskExecutionSpec(scope ScopePath, template orchestration.Execution, clientRequestID string, continuation *string) (ExecutionSpec, error) {
 	executor, err := json.Marshal(template.Executor)
 	if err != nil {
-		return err
+		return ExecutionSpec{}, err
 	}
 	spec := ExecutionSpec{
-		ClientRequestID:      orchestrationClientRequestID(decisionKey),
-		Scope:                ScopePath{Project: task.project, Queue: task.queue, Task: task.name},
+		ClientRequestID:      clientRequestID,
+		Scope:                scope,
 		Argv:                 template.Argv,
 		CWD:                  template.CWD,
 		ExecutorSelector:     executor,
@@ -430,7 +458,7 @@ func planTaskExecution(ctx context.Context, tx *sql.Tx, task orchestrationTaskRo
 			rank := GangRank{Rank: r.Rank, Argv: r.Argv, CWD: r.CWD, Env: r.Env}
 			if r.Executor != nil {
 				if rank.ExecutorSelector, err = json.Marshal(r.Executor); err != nil {
-					return err
+					return ExecutionSpec{}, err
 				}
 			}
 			if r.Exclusive != nil {
@@ -445,12 +473,7 @@ func planTaskExecution(ctx context.Context, tx *sql.Tx, task orchestrationTaskRo
 		}
 		spec.Gang = &gang
 	}
-	specBody, err := json.Marshal(spec)
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO orchestration_decisions(decision_key,task_scope_id,execution_ordinal,reason,trigger_json,execution_spec_json,state,created_at) VALUES($1,$2,$3,$4,$5,$6,'planned',$7) ON CONFLICT DO NOTHING`, decisionKey, task.taskScopeID, ordinal, reason, string(triggerBody), string(specBody), now())
-	return err
+	return spec, nil
 }
 
 func (s *Store) pendingOrchestrationDecisions(ctx context.Context) ([]plannedOrchestrationDecision, error) {
@@ -480,37 +503,48 @@ func (s *Store) pendingOrchestrationDecisions(ctx context.Context) ([]plannedOrc
 // never submitted, and a cancel committed after the submission finds the
 // execution live and withdraws it.
 func (s *Store) submitOrchestrationDecision(ctx context.Context, decision plannedOrchestrationDecision) error {
-	spec, _, digest, err := normalizeExecutionSpec(decision.Spec)
-	if err != nil {
-		return err
-	}
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var state, taskState string
-	if err = tx.QueryRowContext(ctx, `SELECT d.state,t.state FROM orchestration_decisions d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.decision_key=$1`, decision.DecisionKey).Scan(&state, &taskState); err != nil {
-		return err
-	}
-	if state != "planned" || taskState == "cancelled" {
-		return nil
-	}
-	executionID, _, err := submitExecutionTx(ctx, tx, spec, digest)
-	if err != nil {
-		return err
-	}
-	stamp := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='submitted',execution_id=$1,submitted_at=$2 WHERE decision_key=$3`, executionID, stamp, decision.DecisionKey); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_executions(task_scope_id,execution_ordinal,execution_id,decision_key,reason,created_at) VALUES($1,$2,$3,$4,$5,$6)`, decision.TaskScopeID, decision.Ordinal, executionID, decision.DecisionKey, decision.Reason, stamp); err != nil {
-		return err
-	}
-	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state='running',result_json=NULL,updated_at=$1 WHERE task_scope_id=$2`, stamp, decision.TaskScopeID); err != nil {
+	if _, _, err = submitOrchestrationDecisionTx(ctx, tx, decision); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// submitOrchestrationDecisionTx is submitOrchestrationDecision within tx: the
+// execution as submitted and its id ("" when the decision is no longer to be
+// submitted).
+func submitOrchestrationDecisionTx(ctx context.Context, tx *sql.Tx, decision plannedOrchestrationDecision) (ExecutionSpec, string, error) {
+	spec, _, digest, err := normalizeExecutionSpec(decision.Spec)
+	if err != nil {
+		return spec, "", err
+	}
+	var state, taskState string
+	if err = tx.QueryRowContext(ctx, `SELECT d.state,t.state FROM orchestration_decisions d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.decision_key=$1`, decision.DecisionKey).Scan(&state, &taskState); err != nil {
+		return spec, "", err
+	}
+	if state != "planned" || taskState == "cancelled" {
+		return spec, "", nil
+	}
+	executionID, _, err := submitExecutionTx(ctx, tx, spec, digest)
+	if err != nil {
+		return spec, "", err
+	}
+	stamp := now()
+	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='submitted',execution_id=$1,submitted_at=$2 WHERE decision_key=$3`, executionID, stamp, decision.DecisionKey); err != nil {
+		return spec, "", err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_executions(task_scope_id,execution_ordinal,execution_id,decision_key,reason,created_at) VALUES($1,$2,$3,$4,$5,$6)`, decision.TaskScopeID, decision.Ordinal, executionID, decision.DecisionKey, decision.Reason, stamp); err != nil {
+		return spec, "", err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET state='running',result_json=NULL,updated_at=$1 WHERE task_scope_id=$2`, stamp, decision.TaskScopeID); err != nil {
+		return spec, "", err
+	}
+	// A hardware bench's task: its run carries on in the new execution.
+	return spec, executionID, benchTaskExecutionTx(ctx, tx, decision.TaskScopeID, executionID, decision.Reason)
 }
 
 func updateTaskState(ctx context.Context, tx *sql.Tx, taskScopeID, state string, result any) error {
@@ -542,7 +576,7 @@ func stableDigest(value string) string {
 func convertExclusive(values []orchestration.ExclusiveRequest) []ExclusiveRequest {
 	result := make([]ExclusiveRequest, len(values))
 	for i, value := range values {
-		result[i] = ExclusiveRequest{Kind: value.Kind, Count: value.Count, SameNode: value.SameNode, MinTotalMemoryBytes: value.MinTotalMemoryBytes,
+		result[i] = ExclusiveRequest{Kind: value.Kind, Count: value.Count, Device: value.Device, SameNode: value.SameNode, MinTotalMemoryBytes: value.MinTotalMemoryBytes,
 			MinObservedFreeMemoryBytes: value.MinObservedFreeMemoryBytes, OnExternalClaim: value.OnExternalClaim,
 			OnUnattributedActivity: value.OnUnattributedActivity, OnStaleObservation: value.OnStaleObservation}
 	}

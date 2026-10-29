@@ -163,6 +163,26 @@ func (s *Server) workerBenchPoints(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, okBody)
 }
 
+func (s *Server) workerBenchKind(w http.ResponseWriter, r *http.Request) {
+	worker, _, ok := s.benchWorker(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Kind      string               `json:"kind"`
+		Reference store.BenchReference `json:"reference"`
+	}
+	err := decode(r, &body)
+	if err == nil {
+		err = s.Store.RecordBenchKind(r.Context(), worker.AttemptID, body.Kind, body.Reference)
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, okBody)
+}
+
 func (s *Server) workerBenchFinish(w http.ResponseWriter, r *http.Request) {
 	worker, _, ok := s.benchWorker(w, r)
 	if !ok {

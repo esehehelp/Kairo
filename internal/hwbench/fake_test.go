@@ -31,6 +31,68 @@ type fakeDaemon struct {
 	finish    *store.BenchFinish
 	cpuPowerW float64
 	energies  int
+	// commands are the attempt's pending ones; onCommands may add some at
+	// each poll of them (commandPolls counts the polls).
+	commands     []store.Command
+	onCommands   func(polls int, d *fakeDaemon)
+	commandPolls int
+	acks         []fakeAck
+	recorded     []string
+}
+
+type fakeAck struct {
+	command, phase string
+	payload        map[string]any
+}
+
+func (d *fakeDaemon) RecordKind(_ context.Context, kind string, ref store.BenchReference) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.status.Run.State != "running" {
+		return fmt.Errorf("run is %s", d.status.Run.State)
+	}
+	if d.status.Run.References == nil {
+		d.status.Run.References = map[string]store.BenchReference{}
+	}
+	d.status.Run.References[kind] = ref
+	d.recorded = append(d.recorded, kind)
+	return nil
+}
+
+func (d *fakeDaemon) Commands(context.Context) ([]store.Command, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.commandPolls++
+	if d.onCommands != nil {
+		d.onCommands(d.commandPolls, d)
+	}
+	return slices.Clone(d.commands), nil
+}
+
+// Ack takes an acknowledgement as the store does: a command it does not have
+// is 404, and one acknowledged checkpointed or rejected is no longer pending.
+func (d *fakeDaemon) Ack(_ context.Context, commandID, phase string, payload map[string]any) error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	i := slices.IndexFunc(d.commands, func(c store.Command) bool { return c.ID == commandID })
+	if i < 0 {
+		return &APIError{Status: 404, Code: "not_found", Message: "command " + commandID}
+	}
+	d.acks = append(d.acks, fakeAck{commandID, phase, payload})
+	if phase == "checkpointed" || phase == "rejected" {
+		d.commands = slices.Delete(d.commands, i, i+1)
+	}
+	return nil
+}
+
+// suspendAt makes the attempt's command poll number n (and later) deliver a
+// suspend.
+func (d *fakeDaemon) suspendAt(n int) {
+	d.onCommands = func(polls int, d *fakeDaemon) {
+		if polls == n {
+			d.commands = append(d.commands, store.Command{ID: "cmd-1", Kind: "suspend", Origin: "priority_preemption", Reason: "test", State: "pending"})
+		}
+	}
 }
 
 func newFakeDaemon(run store.BenchRun, caps *store.DeviceCapabilities) *fakeDaemon {

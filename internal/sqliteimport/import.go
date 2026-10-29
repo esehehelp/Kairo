@@ -99,7 +99,7 @@ func Import(ctx context.Context, path, dsn string) ([]Result, error) {
 		return nil, fmt.Errorf("connect to the database: %w", err)
 	}
 	defer tx.Rollback()
-	if err := store.CreateSchema(ctx, tx); err != nil {
+	if err := store.CreateSchemaAt(ctx, tx, sqliteSchemaVersion); err != nil {
 		return nil, fmt.Errorf("create the schema: %w", err)
 	}
 	tables, err := targetTables(ctx, tx)
@@ -168,8 +168,17 @@ func Import(ctx context.Context, path, dsn string) ([]Result, error) {
 	if mismatch {
 		return results, ErrMismatch
 	}
+	// What was copied is verified: the later migrations apply to it as they
+	// would to a database the daemon had kept since.
+	if err := store.MigrateTx(ctx, tx); err != nil {
+		return nil, fmt.Errorf("migrate the schema: %w", err)
+	}
 	return results, tx.Commit()
 }
+
+// sqliteSchemaVersion is the PostgreSQL schema migration the last SQLite
+// Kairo's schema corresponds to: the copy is made into it.
+const sqliteSchemaVersion = 1
 
 // beginWriteOn begins the import's transaction on conn, under the decision
 // lock as every write (a daemon pointed at the database waits for it).
