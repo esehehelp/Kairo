@@ -146,20 +146,21 @@ func recordDeviceSampleTx(ctx context.Context, tx *sql.Tx, resourceID, observedA
 // much.
 func accrueAttemptEnergyTx(ctx context.Context, tx *sql.Tx, device string, t1 time.Time, p1 *float64) error {
 	stamp1 := sampleStamp(t1)
-	var counted bool
-	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM device_samples WHERE device=$1 AND observed_at>=$2)`, device, stamp1).Scan(&counted); err != nil || counted {
-		return err
-	}
 	var t0 time.Time // zero: the device has no earlier sample
 	covered := false
 	var p0 float64
 	var at0, until0 string
 	var power0 sql.NullFloat64
+	// The device's latest sample, read down its index. (`EXISTS(... WHERE
+	// observed_at>=$2)` was planned as a sequential scan that stops at the
+	// first match, and there is usually none: the whole table, every sample.)
 	err := tx.QueryRowContext(ctx, `SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=$1 ORDER BY observed_at DESC LIMIT 1`, device).Scan(&at0, &until0, &power0)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 	case err != nil:
 		return err
+	case at0 >= stamp1:
+		return nil // this sample's interval is counted already
 	default:
 		if t0, err = time.Parse(time.RFC3339Nano, at0); err != nil {
 			return err
