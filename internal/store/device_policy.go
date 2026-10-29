@@ -266,7 +266,8 @@ func devicePolicyDecisionTx(ctx context.Context, q queryer, hostID, deviceID str
 	return &d, nil
 }
 
-// latestBenchRunTx is a device's latest bench (nil: none), without points.
+// latestBenchRunTx is a device's latest bench (nil: none), with its kinds'
+// references (what a partial run's valid kinds are) but not its points.
 func latestBenchRunTx(ctx context.Context, q queryer, hostID, deviceID string) (*BenchRun, error) {
 	run, err := scanBenchRun(q.QueryRowContext(ctx, `SELECT `+benchRunColumns+` FROM bench_runs WHERE host_id=$1 AND device_id=$2 ORDER BY created_at DESC,id DESC LIMIT 1`, hostID, deviceID))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -275,6 +276,5 @@ func latestBenchRunTx(ctx context.Context, q queryer, hostID, deviceID string) (
 	if err != nil {
 		return nil, err
 	}
-	run.References = nil
 	return &run, nil
 }
