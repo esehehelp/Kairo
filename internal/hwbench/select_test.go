@@ -91,6 +91,15 @@ func TestCurvesComeFromTheLatestRunWithValidReferences(t *testing.T) {
 	if curves["gemm"].RunID != "new" || len(curves["gemm"].Points) != 1 || curves["copy"].RunID != "old" {
 		t.Fatalf("curves: %+v", curves)
 	}
+	// A partially valid run gives its valid kinds; a failed one nothing, even
+	// for the kinds it recorded before its task ended.
+	runs = append(runs,
+		store.BenchRun{ID: "partial", State: store.BenchPartial, References: map[string]store.BenchReference{"gemm": {Valid: false}, "copy": {Valid: true}}},
+		store.BenchRun{ID: "failed", State: store.BenchFailed, References: map[string]store.BenchReference{"gemm": {Valid: true}, "copy": {Valid: true}}})
+	curves = Curves(runs)
+	if curves["gemm"].RunID != "new" || curves["copy"].RunID != "partial" {
+		t.Fatalf("curves with a partial and a failed run: %+v", curves)
+	}
 }
 
 func TestFallbackLosesAtMostTheToleranceOfClock(t *testing.T) {

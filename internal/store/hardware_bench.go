@@ -2,15 +2,18 @@ package store
 
 // Hardware benches: `kairo hardware bench HOST DEVICE` measures how a device
 // performs, and what energy it uses, at each setting of a grid, against
-// references at its defaults. A run is an ordinary execution of the
-// Kairo-owned project "kairo" (queue "hardware-bench") at the lowest
-// priority, holding the device exclusively: it never displaces work, and work
-// never runs beside it. Its argv is the bench driver (`kairo hardware
-// bench-run`), which asks for its settings and reports its measurements
-// through the worker API with its attempt token; it can reach only its own
-// run (BenchOfAttempt) and set only its own lease's bench setting, which goes
-// with the lease. What a run measures are facts about this device, compared
-// only with its own references and earlier runs.
+// references at its defaults. A run is an ordinary Task of the Kairo-owned
+// project "kairo" (queue "hardware-bench", named after the run) at the lowest
+// priority, preemptible and checkpointable, holding the device exclusively:
+// it never displaces work, work never runs beside it, and work that needs
+// the device suspends it at its next point. The task's continuation carries
+// on the same run (benchTaskExecutionTx): the kinds it finished stay, the one
+// it was measuring is measured again. Its argv is the bench driver (`kairo
+// hardware bench-run`), which asks for its settings and reports its
+// measurements through the worker API with its attempt token; it can reach
+// only its own run (BenchOfAttempt) and set only its own lease's bench
+// setting, which goes with the lease. What a run measures are facts about
+// this device, compared only with its own references and earlier runs.
 
 import (
 	"context"
@@ -24,14 +27,16 @@ import (
 
 	"kairo/internal/id"
 	"kairo/internal/machine"
+	"kairo/internal/orchestration"
 )
 
-// Bench executions run in this project and queue, at BenchPriority.
+// Bench tasks run in this project and queue, at BenchPriority.
 const (
 	BenchProject = "kairo"
 	BenchQueue   = "hardware-bench"
 	// BenchPriority is below anything an operator would submit: a bench waits
-	// for every other execution and is never a reason to suspend one.
+	// for every other execution, is never a reason to suspend one, and is
+	// suspended for any of them that needs its device.
 	BenchPriority = -1_000_000
 )
 
@@ -263,7 +268,22 @@ const (
 	PhaseMeasure   = "measure"
 )
 
-// BenchRun is one bench of a device.
+// Bench run states: waiting (for its first execution to start, or, once
+// suspended, for its continuation), running, then finished (every kind
+// valid), partial (some kinds valid: their curves are used, Reason gives the
+// others'), invalid (no kind valid) or failed (the task ended without the
+// driver finishing the run).
+const (
+	BenchWaiting  = "waiting"
+	BenchRunning  = "running"
+	BenchFinished = "finished"
+	BenchPartial  = "partial"
+	BenchInvalid  = "invalid"
+	BenchFailed   = "failed"
+)
+
+// BenchRun is one bench of a device. ExecutionID is its latest execution;
+// References are each kind's, recorded as the kind is done.
 type BenchRun struct {
 	ID          string   `json:"id"`
 	HostID      string   `json:"host_id"`
@@ -293,10 +313,16 @@ type BenchRun struct {
 }
 
 // Live reports whether the run has not ended.
-func (r BenchRun) Live() bool { return r.State == "waiting" || r.State == "running" }
+func (r BenchRun) Live() bool { return r.State == BenchWaiting || r.State == BenchRunning }
+
+// Ended reports whether the run ended with results (finished, partial or
+// invalid), not failed or live.
+func (r BenchRun) Ended() bool {
+	return r.State == BenchFinished || r.State == BenchPartial || r.State == BenchInvalid
+}
 
 // BenchPlan is a created (or, for a dry run, planned) bench: the run and the
-// execution that carries it out.
+// execution of its task that carries it out first.
 type BenchPlan struct {
 	Run       BenchRun      `json:"run"`
 	Execution ExecutionSpec `json:"execution"`
@@ -343,40 +369,56 @@ func scanBenchRun(row interface{ Scan(...any) error }) (BenchRun, error) {
 // controller that has reported what it supports) and have no manual setting;
 // a storage or network bench measures the defaults and needs no controller.
 // One live run per device.
+//
+// The run's task (project kairo, queue hardware-bench, named after the run)
+// is declared as `project apply` declares one, and its first execution
+// submitted at once, in the transaction that creates the run.
 func (s *Store) CreateBenchRun(ctx context.Context, req BenchRequest) (BenchPlan, error) {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return BenchPlan{}, err
 	}
 	defer tx.Rollback()
-	plan, err := planBenchTx(ctx, tx, req)
+	plan, declaration, err := planBenchTx(ctx, tx, req)
 	if err != nil || req.DryRun {
 		return plan, err
 	}
-	normalized, _, digest, err := normalizeExecutionSpec(plan.Execution)
+	run := &plan.Run
+	if _, err = applyProjectTx(ctx, tx, declaration); err != nil {
+		return BenchPlan{}, err
+	}
+	scopes, err := ensureScopePathTx(ctx, tx, ScopePath{Project: BenchProject, Queue: BenchQueue, Task: run.ID})
 	if err != nil {
 		return BenchPlan{}, err
 	}
-	executionID, _, err := submitExecutionTx(ctx, tx, normalized, digest)
+	template, err := json.Marshal(declaration.Manifest.Tasks[0].Execution)
+	if err != nil {
+		return BenchPlan{}, err
+	}
+	task := orchestrationTaskRow{taskScopeID: scopes.Task.ID, name: run.ID, queue: BenchQueue, policyID: "RunToCompletion", policyVersion: 1, template: string(template), project: BenchProject}
+	// The decision the task's reconciliation would plan for it.
+	decision, err := planTaskExecutionDecision(ctx, tx, task, 0, "initial", map[string]any{"dependencies_succeeded": true}, nil)
+	if err != nil {
+		return BenchPlan{}, err
+	}
+	normalized, executionID, err := submitOrchestrationDecisionTx(ctx, tx, decision)
+	if err == nil && executionID == "" {
+		err = fmt.Errorf("%w: the task of bench run %s was already submitted", ErrBenchConflict, run.ID)
+	}
 	if err != nil {
 		return BenchPlan{}, err
 	}
 	plan.Execution = normalized
-	run := &plan.Run
-	run.ExecutionID, run.State, run.CreatedAt = executionID, "waiting", now()
+	run.ExecutionID, run.State, run.CreatedAt = executionID, BenchWaiting, now()
 	kinds, err := json.Marshal(run.Kinds)
 	if err != nil {
 		return BenchPlan{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_runs(id,host_id,device_id,class,kinds_json,node_id,peer_node_id,target,execution_id,state,requested_by,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-		run.ID, run.HostID, run.DeviceID, run.Class, string(kinds), run.NodeID, run.PeerNodeID, run.Target, executionID, run.State, run.RequestedBy, run.CreatedAt); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_runs(id,host_id,device_id,class,kinds_json,node_id,peer_node_id,target,execution_id,state,requested_by,created_at,task_scope_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		run.ID, run.HostID, run.DeviceID, run.Class, string(kinds), run.NodeID, run.PeerNodeID, run.Target, executionID, run.State, run.RequestedBy, run.CreatedAt, scopes.Task.ID); err != nil {
 		return BenchPlan{}, err
 	}
-	// The run's executions: its own, and a gang's members.
-	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) VALUES($1,$2,0)`, executionID, run.ID); err != nil {
-		return BenchPlan{}, err
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) SELECT m.execution_id,$1,m.rank FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id WHERE g.leader_execution_id=$2 AND m.rank>0`, run.ID, executionID); err != nil {
+	if err = linkBenchExecutionsTx(ctx, tx, run.ID, executionID); err != nil {
 		return BenchPlan{}, err
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "hardware_bench_requested", nil, "bench_run", run.ID, nil, map[string]any{
@@ -384,6 +426,61 @@ func (s *Store) CreateBenchRun(ctx context.Context, req BenchRequest) (BenchPlan
 		return BenchPlan{}, err
 	}
 	return plan, tx.Commit()
+}
+
+// linkBenchExecutionsTx records an execution of a run: the leader's, and a
+// gang's members.
+func linkBenchExecutionsTx(ctx context.Context, tx *sql.Tx, runID, executionID string) error {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) VALUES($1,$2,0) ON CONFLICT DO NOTHING`, executionID, runID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) SELECT m.execution_id,$1,m.rank FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id
+		WHERE g.leader_execution_id=$2 AND m.rank>0 ON CONFLICT DO NOTHING`, runID, executionID)
+	return err
+}
+
+// benchTaskExecutionTx: an execution was submitted for task taskScopeID (its
+// continuation, or a restart); when that is a bench run's task, the run
+// carries on in it. A live run waits for it: the kinds it has a reference of
+// are done, and the points of the others (the kind its previous attempt was
+// measuring when it was suspended) are dropped, since that kind is measured
+// again from the start (event hardware_bench_continued). An ended run is not
+// carried on: its driver finds it ended.
+func benchTaskExecutionTx(ctx context.Context, tx *sql.Tx, taskScopeID, executionID, reason string) error {
+	run, err := scanBenchRun(tx.QueryRowContext(ctx, `SELECT `+benchRunColumns+` FROM bench_runs WHERE task_scope_id=$1`, taskScopeID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if err = linkBenchExecutionsTx(ctx, tx, run.ID, executionID); err != nil || !run.Live() || run.ExecutionID == executionID {
+		return err
+	}
+	done := run.doneKinds()
+	body, err := json.Marshal(done)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE bench_runs SET execution_id=$1,state=$2 WHERE id=$3`, executionID, BenchWaiting, run.ID); err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM bench_points WHERE run_id=$1 AND kind NOT IN(SELECT jsonb_array_elements_text(($2)::jsonb))`, run.ID, string(body)); err != nil {
+		return err
+	}
+	return appendCoordinationEventTx(ctx, tx, "hardware_bench_continued", nil, "bench_run", run.ID, nil, map[string]any{
+		"host_id": run.HostID, "device_id": run.DeviceID, "execution_id": executionID, "previous_execution_id": run.ExecutionID, "reason": reason, "kinds_done": done})
+}
+
+// doneKinds are the run's kinds it has a reference of, in its order.
+func (r BenchRun) doneKinds() []string {
+	done := []string{}
+	for _, kind := range r.Kinds {
+		if _, ok := r.References[kind]; ok {
+			done = append(done, kind)
+		}
+	}
+	return done
 }
 
 // benchClass is the class a device id names on a host.
@@ -399,10 +496,30 @@ func benchClass(deviceID string) string {
 	return BenchGPU
 }
 
-func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, error) {
+// planBenchTx is the run a request asks for, its task's declaration, and the
+// execution that declaration submits first.
+func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, orchestration.Validated, error) {
+	run, template, err := planBenchRunTx(ctx, tx, req)
+	if err != nil {
+		return BenchPlan{}, orchestration.Validated{}, err
+	}
+	declaration, err := orchestration.Normalize(orchestration.Manifest{SchemaVersion: orchestration.SchemaVersion, Project: orchestration.Project{Name: BenchProject},
+		Tasks: []orchestration.Task{{Name: run.ID, Queue: BenchQueue, DependsOn: []string{}, Policy: orchestration.PolicyRunToCompletion, Execution: template}}})
+	if err != nil {
+		return BenchPlan{}, orchestration.Validated{}, fmt.Errorf("bench task: %w", err)
+	}
+	execution, err := taskExecutionSpec(ScopePath{Project: BenchProject, Queue: BenchQueue, Task: run.ID}, declaration.Manifest.Tasks[0].Execution, run.ID, nil)
+	if err != nil {
+		return BenchPlan{}, orchestration.Validated{}, err
+	}
+	return BenchPlan{Run: run, Execution: execution, DryRun: req.DryRun}, declaration, nil
+}
+
+// planBenchRunTx is the run a request asks for and its task's execution.
+func planBenchRunTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchRun, orchestration.Execution, error) {
 	spec, err := declaredSpec(ctx, tx)
 	if err != nil {
-		return BenchPlan{}, err
+		return BenchRun{}, orchestration.Execution{}, err
 	}
 	var host *machine.Host
 	for i := range spec.Hosts {
@@ -411,25 +528,27 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 		}
 	}
 	if host == nil {
-		return BenchPlan{}, fmt.Errorf("%w: host %s is not declared", ErrNotFound, req.HostID)
+		return BenchRun{}, orchestration.Execution{}, fmt.Errorf("%w: host %s is not declared", ErrNotFound, req.HostID)
 	}
 	class := benchClass(req.DeviceID)
 	kinds, err := selectBenchKinds(class, req.Kinds)
 	if err != nil {
-		return BenchPlan{}, err
+		return BenchRun{}, orchestration.Execution{}, err
 	}
 	if req.Node != "" && !slices.Contains(host.Nodes, req.Node) {
-		return BenchPlan{}, fmt.Errorf("node %s is not on host %s (its nodes: %s)", req.Node, host.ID, strings.Join(host.Nodes, ", "))
+		return BenchRun{}, orchestration.Execution{}, fmt.Errorf("node %s is not on host %s (its nodes: %s)", req.Node, host.ID, strings.Join(host.Nodes, ", "))
 	}
 	var live int
 	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM bench_runs WHERE host_id=$1 AND device_id=$2 AND state IN('waiting','running')`, req.HostID, req.DeviceID).Scan(&live); err != nil {
-		return BenchPlan{}, err
+		return BenchRun{}, orchestration.Execution{}, err
 	}
 	if live != 0 {
-		return BenchPlan{}, fmt.Errorf("%w: device %s of host %s has a bench waiting or running (kairo hardware profile %s)", ErrBenchConflict, req.DeviceID, req.HostID, req.HostID)
+		return BenchRun{}, orchestration.Execution{}, fmt.Errorf("%w: device %s of host %s has a bench waiting or running (kairo hardware profile %s)", ErrBenchConflict, req.DeviceID, req.HostID, req.HostID)
 	}
 	run := BenchRun{ID: id.New("bnc"), HostID: req.HostID, DeviceID: req.DeviceID, Class: class, Kinds: kinds, RequestedBy: req.Actor}
-	execution := ExecutionSpec{ClientRequestID: run.ID, Scope: ScopePath{Project: BenchProject, Queue: BenchQueue}, Priority: BenchPriority}
+	// Suspended for any other work (at its next point), it resumes from the
+	// kind it was measuring.
+	execution := orchestration.Execution{SchemaVersion: 2, Priority: BenchPriority, Checkpointable: true, Preemptible: true}
 	// candidates: the host's nodes that can run the bench, in declared order.
 	candidates := func(need func(nodeID string, bench NodeBench) (bool, error)) ([]string, map[string]NodeBench, error) {
 		var nodes []string
@@ -460,28 +579,28 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 	case BenchGPU, BenchCPU:
 		policy, _, err := devicePolicyTx(ctx, tx, req.HostID, req.DeviceID)
 		if err != nil {
-			return BenchPlan{}, err
+			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if !policy.Control {
-			return BenchPlan{}, fmt.Errorf("device %s of host %s is declared control = false: it is never benched", req.DeviceID, req.HostID)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("device %s of host %s is declared control = false: it is never benched", req.DeviceID, req.HostID)
 		}
 		if policy.Controller == nil {
-			return BenchPlan{}, fmt.Errorf("host %s declares no controller: a %s bench sweeps settings, which only a controller carries out", req.HostID, class)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("host %s declares no controller: a %s bench sweeps settings, which only a controller carries out", req.HostID, class)
 		}
 		var caps sql.NullString
 		if err = tx.QueryRowContext(ctx, `SELECT capabilities_json FROM device_state WHERE host_id=$1 AND device_id=$2`, req.HostID, req.DeviceID).Scan(&caps); err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return BenchPlan{}, err
+			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if !caps.Valid {
-			return BenchPlan{}, fmt.Errorf("the controller of host %s (%s) has not reported what device %s supports yet: start it (kairo controller) first", req.HostID, *policy.Controller, req.DeviceID)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("the controller of host %s (%s) has not reported what device %s supports yet: start it (kairo controller) first", req.HostID, *policy.Controller, req.DeviceID)
 		}
 		settings, err := deviceSettingsTx(ctx, tx, req.HostID, req.DeviceID)
 		if err != nil {
-			return BenchPlan{}, err
+			return BenchRun{}, orchestration.Execution{}, err
 		}
 		for _, setting := range settings {
 			if setting.Owner.Kind == OwnerManual {
-				return BenchPlan{}, fmt.Errorf("device %s of host %s has a manual setting (%s): a bench measures the device's own settings; kairo hardware reset %s %s first", req.DeviceID, req.HostID, setting.Settings, req.HostID, req.DeviceID)
+				return BenchRun{}, orchestration.Execution{}, fmt.Errorf("device %s of host %s has a manual setting (%s): a bench measures the device's own settings; kairo hardware reset %s %s first", req.DeviceID, req.HostID, setting.Settings, req.HostID, req.DeviceID)
 			}
 		}
 	}
@@ -495,14 +614,14 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 			return declared != 0 && bench.GPU != "", err
 		})
 		if err != nil {
-			return BenchPlan{}, err
+			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if len(nodes) == 0 {
-			return BenchPlan{}, fmt.Errorf("no node of host %s that holds %s reports a GPU bench binary and kairo ([bench] gpu_binary and kairo_binary of its agent)", req.HostID, req.DeviceID)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s that holds %s reports a GPU bench binary and kairo ([bench] gpu_binary and kairo_binary of its agent)", req.HostID, req.DeviceID)
 		}
 		run.NodeID = nodes[0]
-		execution.Exclusive = []ExclusiveRequest{{Kind: "gpu", Count: 1, Device: req.DeviceID}}
-		execution.Capacity = CapacityRequest{CPUMillis: 1000, RAMBytes: 2 << 30}
+		execution.Exclusive = []orchestration.ExclusiveRequest{{Kind: "gpu", Count: 1, Device: req.DeviceID}}
+		execution.Capacity = orchestration.CapacityRequest{CPUMillis: 1000, RAMBytes: 2 << 30}
 	case BenchCPU:
 		var cpuMillis int64
 		nodes, configs, err = candidates(func(nodeID string, _ NodeBench) (bool, error) {
@@ -513,14 +632,14 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 			return millis > 0, err
 		})
 		if err != nil {
-			return BenchPlan{}, err
+			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if len(nodes) == 0 {
-			return BenchPlan{}, fmt.Errorf("no node of host %s reports kairo ([bench] kairo_binary of its agent) and its CPU", req.HostID)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s reports kairo ([bench] kairo_binary of its agent) and its CPU", req.HostID)
 		}
 		run.NodeID = nodes[0]
 		// The whole node's CPU, none of it lent: nothing else runs beside it.
-		execution.Capacity = CapacityRequest{CPUMillis: cpuMillis, CPUMillisMin: cpuMillis, RAMBytes: 4 << 30}
+		execution.Capacity = orchestration.CapacityRequest{CPUMillis: cpuMillis, CPUMillisMin: cpuMillis, RAMBytes: 4 << 30}
 	case BenchStorage:
 		filesystem := strings.TrimPrefix(req.DeviceID, BenchDiskPrefix)
 		nodes, configs, err = candidates(func(nodeID string, _ NodeBench) (bool, error) {
@@ -529,51 +648,52 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 			return registered != 0, err
 		})
 		if err != nil {
-			return BenchPlan{}, err
+			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if len(nodes) == 0 {
-			return BenchPlan{}, fmt.Errorf("no node of host %s reports kairo ([bench] kairo_binary of its agent) and the filesystem %s (a filesystem provider's path)", req.HostID, filesystem)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s reports kairo ([bench] kairo_binary of its agent) and the filesystem %s (a filesystem provider's path)", req.HostID, filesystem)
 		}
 		run.NodeID, run.Target = nodes[0], filesystem
 		// The test files (disk-sustained's is 8 GiB) on the filesystem tested.
-		execution.Capacity = CapacityRequest{CPUMillis: 1000, RAMBytes: 512 << 20, Disks: []DiskRequest{{Filesystem: filesystem, ReserveBytes: 9 << 30}}}
+		execution.Capacity = orchestration.CapacityRequest{CPUMillis: 1000, RAMBytes: 512 << 20, Disks: []orchestration.DiskRequest{{Filesystem: filesystem, ReserveBytes: 9 << 30}}}
 	case BenchNetwork:
 		peer := strings.TrimPrefix(req.DeviceID, BenchNetPrefix)
 		nodes, configs, err = candidates(func(nodeID string, _ NodeBench) (bool, error) { return nodeID != peer, nil })
 		if err != nil {
-			return BenchPlan{}, err
+			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if len(nodes) == 0 {
-			return BenchPlan{}, fmt.Errorf("no node of host %s other than %s reports kairo ([bench] kairo_binary of its agent)", req.HostID, peer)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s other than %s reports kairo ([bench] kairo_binary of its agent)", req.HostID, peer)
 		}
 		peerBench, err := nodeBenchTx(ctx, tx, peer)
 		if errors.Is(err, ErrNotFound) {
-			return BenchPlan{}, fmt.Errorf("%w: peer node %s", ErrNotFound, peer)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("%w: peer node %s", ErrNotFound, peer)
 		}
 		if err != nil {
-			return BenchPlan{}, err
+			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if peerBench.Kairo == "" {
-			return BenchPlan{}, fmt.Errorf("peer node %s reports no kairo binary ([bench] kairo_binary of its agent)", peer)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("peer node %s reports no kairo binary ([bench] kairo_binary of its agent)", peer)
 		}
 		run.NodeID, run.PeerNodeID, run.Target = nodes[0], &peer, peer
 		if gang, err := gangSpanningTx(ctx, tx, run.NodeID, peer, ""); err != nil || gang != "" {
 			if err == nil {
 				err = fmt.Errorf("%w: gang %s spans nodes %s and %s: the network between them is in use", ErrBenchConflict, gang, run.NodeID, peer)
 			}
-			return BenchPlan{}, err
+			return BenchRun{}, orchestration.Execution{}, err
 		}
 		configs[peer] = peerBench
-		execution.Capacity = CapacityRequest{CPUMillis: 1000, RAMBytes: 512 << 20}
+		execution.Capacity = orchestration.CapacityRequest{CPUMillis: 1000, RAMBytes: 512 << 20}
 		// Rank 0 (the server) on the host's node, rank 1 (the client) on the peer.
-		execution.Gang = &GangSpec{Size: 2, Ranks: []GangRank{
-			{Rank: 0, Argv: benchArgv(configs[run.NodeID], run.ID), CWD: benchCWD(configs[run.NodeID]), ExecutorSelector: benchSelector(run.NodeID, configs[run.NodeID])},
-			{Rank: 1, Argv: benchArgv(peerBench, run.ID), CWD: benchCWD(peerBench), ExecutorSelector: benchSelector(peer, peerBench)},
+		server, client := benchSelector(run.NodeID, configs[run.NodeID]), benchSelector(peer, peerBench)
+		execution.Gang = &orchestration.Gang{Size: 2, Ranks: []orchestration.GangRank{
+			{Rank: 0, Argv: benchArgv(configs[run.NodeID], run.ID), CWD: benchCWD(configs[run.NodeID]), Executor: &server},
+			{Rank: 1, Argv: benchArgv(peerBench, run.ID), CWD: benchCWD(peerBench), Executor: &client},
 		}}
 	}
 	bench := configs[run.NodeID]
-	execution.Argv, execution.CWD, execution.ExecutorSelector = benchArgv(bench, run.ID), benchCWD(bench), benchSelector(run.NodeID, bench)
-	return BenchPlan{Run: run, Execution: execution, DryRun: req.DryRun}, nil
+	execution.Argv, execution.CWD, execution.Executor = benchArgv(bench, run.ID), benchCWD(bench), benchSelector(run.NodeID, bench)
+	return run, execution, nil
 }
 
 func benchArgv(bench NodeBench, runID string) []string {
@@ -594,13 +714,12 @@ func benchCWD(bench NodeBench) string {
 	return "."
 }
 
-func benchSelector(nodeID string, bench NodeBench) json.RawMessage {
+func benchSelector(nodeID string, bench NodeBench) orchestration.ExecutorSelector {
 	labels := bench.ExecutorLabels
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	body, _ := json.Marshal(map[string]any{"node": nodeID, "labels": labels})
-	return body
+	return orchestration.ExecutorSelector{Labels: labels, Node: nodeID}
 }
 
 // nodeBenchTx is the bench configuration a node reports (none: zero).
@@ -751,6 +870,9 @@ type BenchStatus struct {
 	OtherWork []string `json:"other_work"`
 	// TemperatureC is the GPU's latest observed temperature.
 	TemperatureC *float64 `json:"temperature_c,omitempty"`
+	// NextSeq is the seq the run's next point takes: past the points an
+	// earlier attempt of a resumed run left.
+	NextSeq int `json:"next_seq"`
 }
 
 // Applies reports whether the device is known to hold what is in effect now:
@@ -776,6 +898,9 @@ func (s *Store) BenchStatusOf(ctx context.Context, attemptID, leaseID string) (B
 		node = *run.PeerNodeID
 	}
 	if status.Programs, err = nodeBenchTx(ctx, tx, node); err != nil {
+		return status, err
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq)+1,0) FROM bench_points WHERE run_id=$1`, run.ID).Scan(&status.NextSeq); err != nil {
 		return status, err
 	}
 	if run.Class == BenchGPU || run.Class == BenchCPU {
@@ -883,8 +1008,9 @@ type BenchStart struct {
 }
 
 // StartBenchRun marks the run attemptID carries out running and records what
-// its driver found (event hardware_bench_started). Starting again (a driver
-// that retried) adds the versions it now knows.
+// its driver found (event hardware_bench_started, or hardware_bench_resumed
+// for a run that ran before). Starting again (a driver that retried, or
+// starts another kind) adds the versions it now knows.
 func (s *Store) StartBenchRun(ctx context.Context, attemptID string, start BenchStart) error {
 	run, _, err := s.BenchOfAttempt(ctx, attemptID)
 	if err != nil {
@@ -916,13 +1042,68 @@ func (s *Store) StartBenchRun(ctx context.Context, attemptID string, start Bench
 		t, start.DriverBuild, string(body), nullable(start.DriverVersion), device, start.IdleTemperatureC, run.ID); err != nil {
 		return err
 	}
-	if run.State == "waiting" {
-		if err = appendCoordinationEventTx(ctx, tx, "hardware_bench_started", nil, "bench_run", run.ID, nil, map[string]any{
-			"host_id": run.HostID, "device_id": run.DeviceID, "kinds": run.Kinds, "driver_build": start.DriverBuild, "idle_temperature_c": start.IdleTemperatureC}); err != nil {
+	if run.State == BenchWaiting {
+		event := "hardware_bench_started"
+		if run.StartedAt != nil {
+			event = "hardware_bench_resumed"
+		}
+		if err = appendCoordinationEventTx(ctx, tx, event, nil, "bench_run", run.ID, nil, map[string]any{
+			"host_id": run.HostID, "device_id": run.DeviceID, "kinds": run.Kinds, "kinds_done": run.doneKinds(), "driver_build": start.DriverBuild, "idle_temperature_c": start.IdleTemperatureC}); err != nil {
 			return err
 		}
 	}
 	return tx.Commit()
+}
+
+// RecordBenchKind records the reference of a kind the run attemptID carries
+// out is done with: a resumed run does not measure it again.
+func (s *Store) RecordBenchKind(ctx context.Context, attemptID, kind string, ref BenchReference) error {
+	run, _, err := s.BenchOfAttempt(ctx, attemptID)
+	if err != nil {
+		return err
+	}
+	if run.State != BenchRunning {
+		return fmt.Errorf("%w: bench run %s is %s", ErrBenchConflict, run.ID, run.State)
+	}
+	if !slices.Contains(run.Kinds, kind) {
+		return fmt.Errorf("%q is not a kind of run %s", kind, run.ID)
+	}
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	references, err := benchReferencesTx(ctx, tx, run.ID)
+	if err != nil {
+		return err
+	}
+	references[kind] = ref
+	body, err := json.Marshal(references)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE bench_runs SET references_json=$1 WHERE id=$2`, string(body), run.ID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// benchReferencesTx are the references a run has recorded (none: empty).
+func benchReferencesTx(ctx context.Context, tx *sql.Tx, runID string) (map[string]BenchReference, error) {
+	var body sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT references_json FROM bench_runs WHERE id=$1`, runID).Scan(&body); err != nil {
+		return nil, err
+	}
+	references := map[string]BenchReference{}
+	if body.Valid {
+		if err := json.Unmarshal([]byte(body.String), &references); err != nil {
+			return nil, err
+		}
+	}
+	if references == nil {
+		references = map[string]BenchReference{}
+	}
+	return references, nil
 }
 
 // AddBenchPoints records measurements of the run attemptID carries out; a
@@ -969,39 +1150,72 @@ func (s *Store) AddBenchPoints(ctx context.Context, attemptID string, points []B
 	return tx.Commit()
 }
 
-// BenchFinish is a run's outcome: each kind's references, and whether the
-// run as a whole is valid (Reason: why not).
+// BenchFinish is a run's outcome: each kind's references (those recorded as
+// each kind was done are kept), and whether the run as a whole is valid
+// (Reason: why not, by kind).
 type BenchFinish struct {
 	References map[string]BenchReference `json:"references"`
 	Valid      bool                      `json:"valid"`
 	Reason     string                    `json:"reason,omitempty"`
 }
 
+// benchOutcome is the state a run ends in: finished when it is valid and so
+// is every kind, partial when some kinds are, else invalid; and why not
+// every kind is valid when the driver did not say.
+func benchOutcome(kinds []string, references map[string]BenchReference, finish BenchFinish) (string, bool, string) {
+	valid, reasons := 0, []string{}
+	for _, kind := range kinds {
+		switch ref, ok := references[kind]; {
+		case !ok:
+			reasons = append(reasons, kind+": not measured")
+		case ref.Valid:
+			valid++
+		default:
+			reasons = append(reasons, kind+": "+ref.Reason)
+		}
+	}
+	reason := finish.Reason
+	if reason == "" {
+		reason = strings.Join(reasons, "; ")
+	}
+	switch {
+	case finish.Valid && valid == len(kinds):
+		return BenchFinished, true, ""
+	case valid > 0:
+		return BenchPartial, false, reason
+	}
+	return BenchInvalid, false, reason
+}
+
 // FinishBenchRun ends the run attemptID carries out (events
-// hardware_bench_finished, and hardware_bench_invalid when it is not valid)
+// hardware_bench_finished, and hardware_bench_invalid when no kind is valid)
 // and clears its bench setting.
 func (s *Store) FinishBenchRun(ctx context.Context, attemptID, leaseID string, finish BenchFinish) error {
 	run, _, err := s.BenchOfAttempt(ctx, attemptID)
 	if err != nil {
 		return err
 	}
-	if run.State != "running" {
+	if run.State != BenchRunning {
 		return fmt.Errorf("%w: bench run %s is %s", ErrBenchConflict, run.ID, run.State)
-	}
-	references, err := json.Marshal(finish.References)
-	if err != nil {
-		return err
 	}
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	state := "finished"
-	if !finish.Valid {
-		state = "invalid"
+	merged, err := benchReferencesTx(ctx, tx, run.ID)
+	if err != nil {
+		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE bench_runs SET state=$1,ended_at=$2,references_json=$3,valid=$4,reason=$5 WHERE id=$6`, state, now(), string(references), finish.Valid, nullable(finish.Reason), run.ID); err != nil {
+	for kind, ref := range finish.References {
+		merged[kind] = ref
+	}
+	references, err := json.Marshal(merged)
+	if err != nil {
+		return err
+	}
+	state, valid, reason := benchOutcome(run.Kinds, merged, finish)
+	if _, err = tx.ExecContext(ctx, `UPDATE bench_runs SET state=$1,ended_at=$2,references_json=$3,valid=$4,reason=$5 WHERE id=$6`, state, now(), string(references), valid, nullable(reason), run.ID); err != nil {
 		return err
 	}
 	if run.Class == BenchGPU || run.Class == BenchCPU {
@@ -1017,11 +1231,17 @@ func (s *Store) FinishBenchRun(ctx context.Context, attemptID, leaseID string, f
 			}
 		}
 	}
-	payload := map[string]any{"host_id": run.HostID, "device_id": run.DeviceID, "kinds": run.Kinds, "valid": finish.Valid, "reason": finish.Reason}
+	validKinds := []string{}
+	for _, kind := range run.Kinds {
+		if merged[kind].Valid {
+			validKinds = append(validKinds, kind)
+		}
+	}
+	payload := map[string]any{"host_id": run.HostID, "device_id": run.DeviceID, "kinds": run.Kinds, "state": state, "valid": valid, "valid_kinds": validKinds, "reason": reason}
 	if err = appendCoordinationEventTx(ctx, tx, "hardware_bench_finished", nil, "bench_run", run.ID, nil, payload); err != nil {
 		return err
 	}
-	if !finish.Valid {
+	if state == BenchInvalid {
 		if err = appendCoordinationEventTx(ctx, tx, "hardware_bench_invalid", nil, "bench_run", run.ID, nil, payload); err != nil {
 			return err
 		}
@@ -1029,14 +1249,17 @@ func (s *Store) FinishBenchRun(ctx context.Context, attemptID, leaseID string, f
 	return tx.Commit()
 }
 
-// ReconcileBenchRuns fails the runs whose execution ended without the driver
+// ReconcileBenchRuns fails the runs whose task ended without the driver
 // finishing them (event hardware_bench_invalid): the driver crashed, was
-// stopped, or never started.
+// force-stopped, or never started. A suspended run's task goes on (its
+// continuation carries on the run), so its run does too. A run from before
+// benches were tasks fails once its one execution ended.
 func (s *Store) ReconcileBenchRuns(ctx context.Context) error {
 	type ended struct{ id, host, device, cause string }
 	var runs []ended
 	if err := eachRow(ctx, s.db, `SELECT b.id,b.host_id,b.device_id,COALESCE(e.terminal_cause,'') FROM bench_runs b JOIN execution_requests e ON e.id=b.execution_id
-		WHERE b.state IN('waiting','running') AND e.state='terminal'`, nil, func(rows *sql.Rows) error {
+		LEFT JOIN orchestration_tasks t ON t.task_scope_id=b.task_scope_id
+		WHERE b.state IN('waiting','running') AND (b.task_scope_id IS NULL AND e.state='terminal' OR t.state IN('succeeded','failed','blocked','stopped','cancelled'))`, nil, func(rows *sql.Rows) error {
 		var r ended
 		if err := rows.Scan(&r.id, &r.host, &r.device, &r.cause); err != nil {
 			return err

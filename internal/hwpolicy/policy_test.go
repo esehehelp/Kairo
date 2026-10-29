@@ -291,3 +291,31 @@ func TestDecideFallsBackWithoutAConfidentProfile(t *testing.T) {
 		t.Fatalf("no range: %+v", decision)
 	}
 }
+
+func TestAPartiallyValidRunGivesItsValidKindsCurves(t *testing.T) {
+	d := gpuDevice(0.1)
+	// gemm's references spread too much; copy's agree.
+	run := profileRun("bnc_1", map[string][2][2]float64{"gemm": {{0.98, 250}, {0.93, 200}}, "copy": {{0.999, 280}, {0.92, 230}}},
+		map[string]store.Fingerprint{"gemm": {UtilGPUPct: 99, UtilMemPct: 40}, "copy": {UtilGPUPct: 99, UtilMemPct: 95}})
+	run.State = store.BenchPartial
+	gemm := run.References["gemm"]
+	gemm.Valid, gemm.Reason = false, "references spread 2.3% (more than 1%)"
+	run.References["gemm"] = gemm
+	// Copy-like work: copy's curve is used.
+	d.Usage = store.PolicyUsage{UtilGPUPct: []float64{99, 99, 99, 99, 99}, UtilMemPct: []float64{95, 94, 96, 95, 95}}
+	decision := Decide(d, []store.BenchRun{run})
+	if decision.Basis != store.BasisProfile || !slices.Equal(decision.Candidates, []string{"copy"}) || *decision.Settings.GraphicsClockMaxMHz != 1500 || !slices.Equal(decision.RunIDs, []string{"bnc_1"}) {
+		t.Fatalf("copy-like work: %+v", decision)
+	}
+	// Gemm-like work matches no valid curve: the fallback.
+	d.Usage.UtilMemPct = []float64{40, 41, 39, 40, 40}
+	if decision = Decide(d, []store.BenchRun{run}); decision.Basis != store.BasisFallback || decision.Reason != "no benched kind matches the workload's usage" {
+		t.Fatalf("gemm-like work: %+v", decision)
+	}
+	// A run that failed (its task ended without its results) gives nothing.
+	run.State = store.BenchFailed
+	d.Usage.UtilMemPct = []float64{95, 94, 96, 95, 95}
+	if decision = Decide(d, []store.BenchRun{run}); decision.Basis != store.BasisFallback || decision.Reason != "no valid bench profile" {
+		t.Fatalf("failed run: %+v", decision)
+	}
+}

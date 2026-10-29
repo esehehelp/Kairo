@@ -149,6 +149,13 @@ func migrate(ctx context.Context, db *sql.DB, create bool) error {
 // CreateSchema creates the schema in an empty database within tx, which
 // must be writable (the import tool's transaction).
 func CreateSchema(ctx context.Context, tx *sql.Tx) error {
+	return CreateSchemaAt(ctx, tx, 0)
+}
+
+// CreateSchemaAt is CreateSchema up to migration version (0: every one):
+// the import tool copies into the schema its source had, then migrates it
+// (MigrateTx) as a daemon would.
+func CreateSchemaAt(ctx context.Context, tx *sql.Tx, version int) error {
 	var versioned bool
 	if err := tx.QueryRowContext(ctx, `SELECT to_regclass('schema_version') IS NOT NULL`).Scan(&versioned); err != nil {
 		return err
@@ -156,13 +163,27 @@ func CreateSchema(ctx context.Context, tx *sql.Tx) error {
 	if versioned {
 		return errors.New("the database already holds a Kairo schema; use an empty database")
 	}
-	return migrateTx(ctx, tx, true)
+	return migrateTo(ctx, tx, true, version)
+}
+
+// MigrateTx brings the schema of tx's database up to date.
+func MigrateTx(ctx context.Context, tx *sql.Tx) error {
+	return migrateTx(ctx, tx, false)
 }
 
 func migrateTx(ctx context.Context, tx *sql.Tx, create bool) error {
+	return migrateTo(ctx, tx, create, 0)
+}
+
+// migrateTo applies the migrations the database lacks up to target (0:
+// every one).
+func migrateTo(ctx context.Context, tx *sql.Tx, create bool, target int) error {
 	steps, err := Migrations()
 	if err != nil {
 		return err
+	}
+	if target > 0 && target < len(steps) {
+		steps = steps[:target]
 	}
 	if err := checkDatabase(ctx, tx); err != nil {
 		return err

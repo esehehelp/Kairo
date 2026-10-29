@@ -26,11 +26,14 @@ type Curve struct {
 }
 
 // Curves are the profile of a device by kind, from its runs (oldest first):
-// for each kind the latest finished run in which it has valid references.
+// for each kind the latest ended run (finished, partially valid or invalid)
+// in which it has valid references; another kind's invalid references do not
+// matter. A failed run (its task ended without finishing it) and a live one
+// count for nothing, whatever kinds they recorded.
 func Curves(runs []store.BenchRun) map[string]Curve {
 	out := map[string]Curve{}
 	for _, run := range runs {
-		if run.State != "finished" && run.State != "invalid" {
+		if !run.Ended() {
 			continue
 		}
 		for kind, ref := range run.References {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -85,10 +86,14 @@ func renderBenchPlan(w io.Writer, plan store.BenchPlan) error {
 	if e.Gang != nil {
 		holds = append(holds, fmt.Sprintf("a %d-rank gang", e.Gang.Size))
 	}
-	fmt.Fprintf(w, "  holds %s, at priority %d in %s/%s (never preempted; waits for every other execution)\n", strings.Join(holds, ", "), e.Priority, e.Scope.Project, e.Scope.Queue)
+	yields := "never preempted; waits for every other execution"
+	if e.Preemptible {
+		yields = "waits for every other execution; preemptible: suspended at its next point for work that needs the device, it resumes with the kinds not done"
+	}
+	fmt.Fprintf(w, "  holds %s, at priority %d in %s/%s (%s)\n", strings.Join(holds, ", "), e.Priority, e.Scope.Project, e.Scope.Queue, yields)
 	fmt.Fprintf(w, "  argv %s (cwd %s)\n", strings.Join(e.Argv, " "), e.CWD)
 	if !plan.DryRun {
-		fmt.Fprintf(w, "  follow it with kairo hardware profile %s %s\n", run.HostID, run.DeviceID)
+		fmt.Fprintf(w, "  follow it with kairo hardware profile %s %s (its task: kairo task show %s %s %s)\n", run.HostID, run.DeviceID, e.Scope.Project, e.Scope.Queue, run.ID)
 	}
 	return nil
 }
@@ -117,9 +122,8 @@ func hardwareBenchRun(args []string) error {
 	if *runID == "" || len(positional) != 0 {
 		return usageError("hardware bench-run requires --run RUN_ID and no arguments (it runs inside a bench's attempt)")
 	}
-	ctx, stop := signalContext()
-	defer stop()
-	return hwbench.Main(ctx, *runID)
+	// The driver handles its stop signals itself: the first leaves the run.
+	return hwbench.Main(context.Background(), *runID)
 }
 
 // hardwareProfile: kairo hardware profile HOST [DEVICE] [--json].
@@ -243,9 +247,15 @@ func benchKindOrder(kind string) int {
 }
 
 // benchRunText is "bnc_1 finished 10-27 10:01-12:10, valid; GPU driver
-// 560.35, idle 34 °C".
+// 560.35, idle 34 °C"; a partially valid run is "partial ..., valid for 7
+// of 8 kinds: gemm: references spread ...", a suspended one "bnc_1
+// suspended since 10-27 10:01, 3 of 8 kinds done".
 func benchRunText(run store.BenchRun) string {
-	text := run.ID + " " + run.State
+	state := run.State
+	if run.State == store.BenchWaiting && run.StartedAt != nil {
+		state = "suspended" // waiting for its continuation
+	}
+	text := run.ID + " " + state
 	switch {
 	case run.StartedAt != nil && run.EndedAt != nil:
 		text += " " + shortStamp(run.StartedAt) + " to " + shortStamp(run.EndedAt)
@@ -254,12 +264,24 @@ func benchRunText(run store.BenchRun) string {
 	default:
 		text += " (requested " + shortStamp(&run.CreatedAt) + ")"
 	}
-	if run.Valid != nil {
-		if *run.Valid {
-			text += ", valid"
-		} else {
-			text += ", invalid"
+	done, valid := 0, 0
+	for _, kind := range run.Kinds {
+		if ref, ok := run.References[kind]; ok {
+			done++
+			if ref.Valid {
+				valid++
+			}
 		}
+	}
+	switch {
+	case run.State == store.BenchPartial:
+		text += fmt.Sprintf(", valid for %d of %d kinds", valid, len(run.Kinds))
+	case run.Valid != nil && *run.Valid:
+		text += ", valid"
+	case run.Valid != nil:
+		text += ", invalid"
+	case run.Live() && done > 0:
+		text += fmt.Sprintf(", %d of %d kinds done", done, len(run.Kinds))
 	}
 	if run.Reason != nil {
 		text += ": " + *run.Reason

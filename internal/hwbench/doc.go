@@ -14,6 +14,12 @@
 // its lease, so the lease's release returns the device to its defaults even
 // when the driver does not get to clear it.
 //
+// A run is a preemptible task: before every point the driver polls its
+// attempt's commands, as an SDK's safe point does, and leaves at a suspend
+// with a checkpoint naming the kinds it is done with (Continuation); the
+// task's continuation resumes the run with the others. A stop signal (the
+// graceful phase of a force stop) leaves at once, publishing nothing.
+//
 // Selection (select.go) is pure: from a device's curves it picks, for a
 // tolerance, the setting that keeps every candidate kind within it for the
 // least energy per unit of work, and gives the fallback that holds without a

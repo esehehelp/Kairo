@@ -72,7 +72,7 @@ func TestRenderProfileMarksThePointForMaxSlowdownAndDrift(t *testing.T) {
 func TestRenderBenchPlan(t *testing.T) {
 	plan := store.BenchPlan{
 		Run: store.BenchRun{ID: "bnc_1", HostID: "pve0", DeviceID: "GPU-a", Class: "gpu", Kinds: []string{"gemm", "copy"}, NodeID: "pve0-train", ExecutionID: "exe_1"},
-		Execution: store.ExecutionSpec{Scope: store.ScopePath{Project: store.BenchProject, Queue: store.BenchQueue}, Priority: store.BenchPriority,
+		Execution: store.ExecutionSpec{Scope: store.ScopePath{Project: store.BenchProject, Queue: store.BenchQueue, Task: "bnc_1"}, Priority: store.BenchPriority, Checkpointable: true, Preemptible: true,
 			Argv: []string{"/opt/kairo", "hardware", "bench-run", "--run", "bnc_1"}, CWD: "/opt",
 			Exclusive: []store.ExclusiveRequest{{Kind: "gpu", Count: 1, Device: "GPU-a"}}, Capacity: store.CapacityRequest{CPUMillis: 1000, RAMBytes: 2 << 30}},
 	}
@@ -82,13 +82,30 @@ func TestRenderBenchPlan(t *testing.T) {
 	}
 	for _, want := range []string{
 		"bench bnc_1 of pve0/GPU-a (gpu: gemm, copy) on pve0-train: execution exe_1",
-		"holds GPU GPU-a, 1 CPU, 2 GiB RAM, at priority -1000000 in kairo/hardware-bench",
+		"holds GPU GPU-a, 1 CPU, 2 GiB RAM, at priority -1000000 in kairo/hardware-bench (waits for every other execution; preemptible: suspended at its next point",
 		"argv /opt/kairo hardware bench-run --run bnc_1 (cwd /opt)",
-		"kairo hardware profile pve0 GPU-a",
+		"kairo hardware profile pve0 GPU-a (its task: kairo task show kairo hardware-bench bnc_1)",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("plan lacks %q:\n%s", want, out.String())
 		}
+	}
+	if strings.Contains(out.String(), "never preempted") {
+		t.Fatalf("a preemptible bench said otherwise:\n%s", out.String())
+	}
+}
+
+func TestBenchRunTextShowsPartialAndSuspendedRuns(t *testing.T) {
+	started, ended, valid := "2026-10-27T10:01:00Z", "2026-10-27T12:10:00Z", false
+	reason := "gemm: references spread 2.3% (more than 1%)"
+	refs := map[string]store.BenchReference{"gemm": {Valid: false, Reason: "references spread 2.3% (more than 1%)"}, "copy": {Valid: true}, "gemv-b1": {Valid: true}}
+	partial := store.BenchRun{ID: "bnc_1", State: store.BenchPartial, Kinds: []string{"gemm", "copy", "gemv-b1"}, StartedAt: &started, EndedAt: &ended, Valid: &valid, Reason: &reason, References: refs}
+	if got := benchRunText(partial); !strings.HasPrefix(got, "bnc_1 partial 10-27") || !strings.Contains(got, ", valid for 2 of 3 kinds: gemm: references spread 2.3%") {
+		t.Fatalf("partial: %q", got)
+	}
+	suspended := store.BenchRun{ID: "bnc_2", State: store.BenchWaiting, Kinds: []string{"gemm", "copy", "gemv-b1"}, StartedAt: &started, References: map[string]store.BenchReference{"gemm": {Valid: true}}}
+	if got := benchRunText(suspended); !strings.HasPrefix(got, "bnc_2 suspended since 10-27") || !strings.Contains(got, ", 1 of 3 kinds done") {
+		t.Fatalf("suspended: %q", got)
 	}
 }
 

@@ -32,7 +32,14 @@ type Daemon interface {
 	CPUEnergy(ctx context.Context, from, to time.Time) (store.CPUEnergy, error)
 	Start(ctx context.Context, start store.BenchStart) error
 	AddPoints(ctx context.Context, points []store.BenchPoint) error
+	// RecordKind records a kind's reference as soon as the kind is done: a
+	// resumed run does not measure it again.
+	RecordKind(ctx context.Context, kind string, ref store.BenchReference) error
 	Finish(ctx context.Context, finish store.BenchFinish) error
+	// Commands are the attempt's pending commands (the worker API's, as an
+	// SDK's safe point polls them); Ack acknowledges one.
+	Commands(ctx context.Context) ([]store.Command, error)
+	Ack(ctx context.Context, commandID, phase string, payload map[string]any) error
 }
 
 // Process is a running primitive.
@@ -70,6 +77,9 @@ type Timing struct {
 	OtherWorkWait, Poll time.Duration
 	// ServerWait is how long a network client waits for its server.
 	ServerWait time.Duration
+	// CommandPoll is how often (stream seconds) the warm-up looks for a
+	// suspend; every point looks once before it starts.
+	CommandPoll float64
 }
 
 // DefaultTiming is the agreed procedure: 20 s settle, 30 s measurement, 60 s
@@ -77,7 +87,7 @@ type Timing struct {
 // changes by less than 0.5 °C/min over 60 s.
 func DefaultTiming() Timing {
 	return Timing{Settle: 20, ShortSettle: 5, Measure: 30, ApplyTimeout: 60, SteadyWindow: 60, SteadyMax: 300,
-		OtherWorkWait: 10 * time.Minute, Poll: 5 * time.Second, ServerWait: 2 * time.Minute}
+		OtherWorkWait: 10 * time.Minute, Poll: 5 * time.Second, ServerWait: 2 * time.Minute, CommandPoll: 15}
 }
 
 // Driver carries out one bench run from inside its attempt.
@@ -92,11 +102,57 @@ type Driver struct {
 	// (tests replace them).
 	Sleep func(ctx context.Context, d time.Duration) error
 	Dial  func(ctx context.Context, addr string) error
+	// Continuation is KAIRO_CONTINUATION_REF: what the attempt this one
+	// resumes published when it was suspended (a Continuation).
+	Continuation string
+	// Stopping reports whether a stop signal came (SIGTERM, CTRL_BREAK: the
+	// graceful phase of a force stop); nil: none comes.
+	Stopping func() bool
 
 	status   store.BenchStatus
 	seq      int
 	versions map[string]store.BenchVersion
 	started  bool
+	// recorded are the kinds this attempt recorded as done.
+	recorded map[string]bool
+	// checkpoints are the continuations published, by command: a command
+	// delivered again gets the same one.
+	checkpoints map[string]string
+}
+
+// Continuation is the continuation_ref a suspended run publishes: the run,
+// and the kinds it is done with (their references are in the store). The
+// attempt that resumes it measures the others, the interrupted one from the
+// start.
+type Continuation struct {
+	Run  string   `json:"run"`
+	Done []string `json:"done"`
+}
+
+func (c Continuation) String() string {
+	body, _ := json.Marshal(c)
+	return string(body)
+}
+
+// ParseContinuation reads a Continuation.
+func ParseContinuation(ref string) (Continuation, error) {
+	var c Continuation
+	if err := json.Unmarshal([]byte(ref), &c); err != nil || c.Run == "" {
+		return c, fmt.Errorf("%q is not a bench continuation", ref)
+	}
+	return c, nil
+}
+
+// interrupted leaves the run before it is done: a suspend command, which is
+// acknowledged with a checkpoint once the workload is stopped, or (no
+// command) a stop signal.
+type interrupted struct{ command *store.Command }
+
+func (e interrupted) Error() string {
+	if e.command == nil {
+		return "stopped by a signal"
+	}
+	return "suspended (" + e.command.Origin + ")"
 }
 
 // daemonError is a failure to talk to the daemon, which ends the run: what
@@ -163,12 +219,15 @@ func (d *Driver) controlled() bool {
 	return d.status.Run.Class == store.BenchGPU || d.status.Run.Class == store.BenchCPU
 }
 
-// Run carries out the run runID: the token's run, which runID must name.
+// Run carries out the run runID: the token's run, which runID must name. A
+// resumed run (its earlier attempt suspended) measures only the kinds it is
+// not done with. Suspended or stopped by a signal, Run leaves at the next
+// point with nil (the attempt exits 0); see safePoint.
 func (d *Driver) Run(ctx context.Context, runID string) error {
 	if d.Timing == (Timing{}) {
 		d.Timing = DefaultTiming()
 	}
-	d.versions = map[string]store.BenchVersion{}
+	d.versions, d.recorded, d.checkpoints = map[string]store.BenchVersion{}, map[string]bool{}, map[string]string{}
 	status, err := d.refresh(ctx)
 	if err != nil {
 		return err
@@ -182,7 +241,27 @@ func (d *Driver) Run(ctx context.Context, runID string) error {
 	if !status.Run.Live() {
 		return fmt.Errorf("bench run %s is %s", runID, status.Run.State)
 	}
+	d.seq = status.NextSeq
 	log := d.logger().With("run", runID, "host", status.Run.HostID, "device", status.Run.DeviceID)
+	// The kinds an earlier attempt finished, as the store has them.
+	references := map[string]store.BenchReference{}
+	for kind, ref := range status.Run.References {
+		references[kind] = ref
+	}
+	if d.Continuation != "" {
+		c, err := ParseContinuation(d.Continuation)
+		switch {
+		case err != nil || c.Run != runID:
+			log.Warn("the continuation is not this run's; resuming from what the run recorded", "continuation", d.Continuation)
+		default:
+			for _, kind := range c.Done {
+				if _, ok := references[kind]; !ok {
+					log.Warn("a kind the continuation says is done has no reference recorded: measuring it again", "kind", kind)
+				}
+			}
+		}
+		log.Info("resuming the bench run", "done", d.doneKinds())
+	}
 	// Whatever else uses the device (a process Kairo did not start, a gang
 	// across the nodes) is waited out, for a while.
 	for deadline := time.Now().Add(d.Timing.OtherWorkWait); len(d.status.OtherWork) != 0; {
@@ -192,9 +271,12 @@ func (d *Driver) Run(ctx context.Context, runID string) error {
 			if err = d.start(ctx, store.BenchStart{}); err != nil {
 				return err
 			}
-			return d.finish(ctx, map[string]store.BenchReference{}, reason)
+			return d.finish(ctx, references, reason)
 		}
 		log.Info("waiting for other work on the device to end", "other_work", d.status.OtherWork)
+		if err = d.safePoint(ctx); err != nil {
+			return d.leave(ctx, err)
+		}
 		if err = d.sleep(ctx, d.Timing.Poll); err != nil {
 			return err
 		}
@@ -205,11 +287,22 @@ func (d *Driver) Run(ctx context.Context, runID string) error {
 	if err = d.start(ctx, store.BenchStart{IdleTemperatureC: d.status.TemperatureC}); err != nil {
 		return err
 	}
-	references := map[string]store.BenchReference{}
-	var reasons []string
 	for _, kind := range status.Run.Kinds {
+		if _, done := references[kind]; done {
+			log.Info("bench kind done before the run was suspended", "kind", kind)
+			continue
+		}
+		if err = d.safePoint(ctx); err != nil {
+			return d.leave(ctx, err)
+		}
 		log.Info("bench kind starting", "kind", kind)
 		ref, err := d.runKind(ctx, kind)
+		var intr interrupted
+		if errors.As(err, &intr) || err != nil && d.stopping() {
+			// (a stop signal reaches the primitive too, which then ends)
+			log.Info("leaving the bench run", "kind", kind, "error", err)
+			return d.leave(ctx, intr)
+		}
 		var de daemonError
 		if errors.As(err, &de) || ctx.Err() != nil {
 			return errors.Join(err, ctx.Err())
@@ -222,12 +315,127 @@ func (d *Driver) Run(ctx context.Context, runID string) error {
 			}
 		}
 		references[kind] = ref
-		if !ref.Valid {
-			reasons = append(reasons, kind+": "+ref.Reason)
-		}
+		d.recordKind(ctx, kind, ref)
 		log.Info("bench kind done", "kind", kind, "valid", ref.Valid, "work_per_second", ref.Mean, "spread", ref.Spread, "reason", ref.Reason)
 	}
+	var reasons []string
+	for _, kind := range status.Run.Kinds {
+		if ref := references[kind]; !ref.Valid {
+			reasons = append(reasons, kind+": "+ref.Reason)
+		}
+	}
 	return d.finish(ctx, references, strings.Join(reasons, "; "))
+}
+
+func (d *Driver) stopping() bool { return d.Stopping != nil && d.Stopping() }
+
+// recordKind records a kind as done. A daemon that cannot (one from before
+// runs were resumed) only makes a resumed run measure the kind again.
+func (d *Driver) recordKind(ctx context.Context, kind string, ref store.BenchReference) {
+	if err := d.call(ctx, "record kind", func() error { return d.Daemon.RecordKind(ctx, kind, ref) }); err != nil {
+		d.logger().Warn("cannot record the kind as done; a resumed run measures it again", "kind", kind, "error", err)
+		return
+	}
+	d.recorded[kind] = true
+}
+
+// doneKinds are the run's kinds the store has a reference of.
+func (d *Driver) doneKinds() []string {
+	var done []string
+	for _, kind := range d.status.Run.Kinds {
+		if _, ok := d.status.Run.References[kind]; ok || d.recorded[kind] {
+			done = append(done, kind)
+		}
+	}
+	return done
+}
+
+// gone: the daemon no longer has what the request names (a command
+// withdrawn meanwhile).
+func gone(err error) bool {
+	var apiErr *APIError
+	return errors.As(err, &apiErr) && apiErr.Status == 404
+}
+
+// safePoint is where the run may be left, as an SDK's safe point: before
+// every point (and kind), every CommandPoll seconds of a warm-up, and while
+// waiting for other work. A stop signal leaves at once. A suspend command is
+// acknowledged accepted and checkpointing and leaves (leave publishes the
+// checkpoint once the workload is stopped); one withdrawn meanwhile is
+// skipped, as are other kinds of command. Commands that cannot be polled are
+// looked for at the next safe point.
+func (d *Driver) safePoint(ctx context.Context) error {
+	if d.stopping() {
+		return interrupted{}
+	}
+	var commands []store.Command
+	if err := d.call(ctx, "commands", func() error {
+		var err error
+		commands, err = d.Daemon.Commands(ctx)
+		return err
+	}); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		d.logger().Warn("cannot poll the attempt's commands; looking again at the next point", "error", err)
+		return nil
+	}
+	for _, command := range commands {
+		if command.Kind != "suspend" {
+			d.logger().Debug("skipping a command of an unknown kind", "command", command.ID, "kind", command.Kind)
+			continue
+		}
+		err := d.ack(ctx, command.ID, "accepted", nil)
+		if err == nil {
+			err = d.ack(ctx, command.ID, "checkpointing", nil)
+		}
+		if gone(err) {
+			d.logger().Info("the suspend was withdrawn", "command", command.ID)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		d.logger().Info("suspend received: leaving the run at this point", "command", command.ID, "origin", command.Origin, "reason", command.Reason)
+		return interrupted{command: &command}
+	}
+	return nil
+}
+
+func (d *Driver) ack(ctx context.Context, commandID, phase string, payload map[string]any) error {
+	return d.call(ctx, "ack "+phase, func() error { return d.Daemon.Ack(ctx, commandID, phase, payload) })
+}
+
+// leave ends the attempt at an interruption (err, from safePoint; any other
+// error is returned as it is), its workload stopped: the bench setting is
+// cleared (the lease's release would anyway, returning the device to its
+// defaults), and a suspend is acknowledged checkpointed with the run's
+// Continuation, the same for a command delivered again. A stop signal
+// publishes nothing: a force stop plans no continuation, and its run fails.
+func (d *Driver) leave(ctx context.Context, err error) error {
+	var intr interrupted
+	if !errors.As(err, &intr) {
+		return err
+	}
+	if d.controlled() {
+		if err := d.call(ctx, "clear setting", func() error { _, err := d.Daemon.SetSetting(ctx, store.DeviceSettings{}); return err }); err != nil {
+			d.logger().Warn("cannot clear the bench setting; the lease's release will", "error", err)
+		}
+	}
+	if intr.command == nil {
+		d.logger().Info("stop signal: left the bench run", "done", d.doneKinds())
+		return nil
+	}
+	ref, ok := d.checkpoints[intr.command.ID]
+	if !ok {
+		ref = Continuation{Run: d.status.Run.ID, Done: d.doneKinds()}.String()
+		d.checkpoints[intr.command.ID] = ref
+	}
+	if err := d.ack(ctx, intr.command.ID, "checkpointed", map[string]any{"continuation_ref": ref}); err != nil {
+		return err
+	}
+	d.logger().Info("suspended: checkpoint published", "command", intr.command.ID, "continuation", ref)
+	return nil
 }
 
 func (d *Driver) start(ctx context.Context, start store.BenchStart) error {
@@ -328,6 +536,16 @@ type kindRun struct {
 	firstRef float64
 }
 
+// next is the stream's next interval, unless a stop signal came: the run is
+// left within a second of it (a force stop's grace period is short), the
+// point it was measuring dropped.
+func (k *kindRun) next() (Record, error) {
+	if k.d.stopping() {
+		return Record{}, interrupted{}
+	}
+	return k.s.next()
+}
+
 // seconds bounds a kind's primitive run: the whole procedure with every wait
 // at its longest, and a margin.
 func (d *Driver) seconds(kind store.BenchKind, w workload, points int) int {
@@ -419,8 +637,8 @@ func (k *kindRun) sweep(ctx context.Context, grid []store.DeviceSettings) (store
 	}
 	var notes []string
 	warm := Steady{Window: d.Timing.SteadyWindow}
-	for begin := k.s.at; ; {
-		r, err := k.s.next()
+	for begin, polled := k.s.at, k.s.at; ; {
+		r, err := k.next()
 		if err != nil {
 			return store.BenchReference{Reason: "warm-up: " + err.Error()}, err
 		}
@@ -431,6 +649,13 @@ func (k *kindRun) sweep(ctx context.Context, grid []store.DeviceSettings) (store
 		if k.s.at-begin >= d.Timing.SteadyMax {
 			notes = append(notes, fmt.Sprintf("%s after %.0f s", FlagNotSteady, k.s.at-begin))
 			break
+		}
+		// A warm-up may take minutes: a suspend need not wait for it.
+		if k.s.at-polled >= d.Timing.CommandPoll {
+			polled = k.s.at
+			if err = d.safePoint(ctx); err != nil {
+				return store.BenchReference{}, err
+			}
 		}
 	}
 	d.logger().Info("warmed up", "kind", k.kind.Name, "seconds", k.s.at, "notes", notes)
@@ -456,6 +681,11 @@ func (k *kindRun) sweep(ctx context.Context, grid []store.DeviceSettings) (store
 		if stepErr = step(); stepErr != nil {
 			break
 		}
+	}
+	// Left part-way: the kind is measured again from the start, and its
+	// points so far go.
+	if intr := (interrupted{}); errors.As(stepErr, &intr) || stepErr != nil && d.stopping() {
+		return store.BenchReference{}, stepErr
 	}
 	ref := k.reference(refs)
 	if stepErr != nil {
@@ -567,6 +797,10 @@ func holds(status store.BenchStatus, want store.DeviceSettings) bool {
 // error that ended the kind before anything was measured.
 func (k *kindRun) point(ctx context.Context, phase string, want store.DeviceSettings, settle float64, notes []string) (*store.BenchPoint, error) {
 	d := k.d
+	// Between points the run may be left (suspended, or stopped).
+	if err := d.safePoint(ctx); err != nil {
+		return nil, err
+	}
 	flags := append([]string{}, notes...)
 	otherWork := func(status store.BenchStatus) {
 		for _, w := range status.OtherWork {
@@ -604,7 +838,7 @@ func (k *kindRun) point(ctx context.Context, phase string, want store.DeviceSett
 				}
 				break
 			}
-			r, err := k.s.next()
+			r, err := k.next()
 			if err != nil {
 				return nil, err
 			}
@@ -616,7 +850,7 @@ func (k *kindRun) point(ctx context.Context, phase string, want store.DeviceSett
 	otherWork(d.status)
 	var ended error
 	for settled := 0.0; settled < settle; {
-		r, err := k.s.next()
+		r, err := k.next()
 		if err != nil {
 			return nil, err
 		}
@@ -624,7 +858,7 @@ func (k *kindRun) point(ctx context.Context, phase string, want store.DeviceSett
 	}
 	win := &window{unit: k.s.unit, start: k.s.wall}
 	for k.work.untilEnd || win.seconds() < d.Timing.Measure {
-		r, err := k.s.next()
+		r, err := k.next()
 		if err != nil {
 			ended = err
 			break
@@ -720,7 +954,9 @@ func (d *Driver) waitServer(ctx context.Context, addr string) error {
 }
 
 // serve is rank 0 of a network bench: it serves the client rank until the
-// run ends, or the server exits by itself (idle).
+// run ends, or the server exits by itself (idle). Suspended (the gang's
+// every rank is), it publishes the run's checkpoint: the leader's is the
+// one the task's continuation follows.
 func (d *Driver) serve(ctx context.Context) error {
 	args, err := serveArgv(d.status, d.peer())
 	if err != nil {
@@ -755,6 +991,9 @@ func (d *Driver) serve(ctx context.Context) error {
 		}
 		if status, err := d.refresh(ctx); err != nil || !status.Run.Live() {
 			return err
+		}
+		if err := d.safePoint(ctx); err != nil {
+			return d.leave(ctx, err)
 		}
 	}
 }

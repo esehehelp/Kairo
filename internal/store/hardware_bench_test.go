@@ -103,17 +103,36 @@ func TestGPUBenchIsAnExclusiveLowestPriorityExecutionOfItsOwnRun(t *testing.T) {
 	}
 	want := []string{"gemm", "pcie-h2d", "pcie-d2h", "pcie-h2d-latency", "pcie-d2h-latency"}
 	e := plan.Execution
-	if !slices.Equal(plan.Run.Kinds, want) || plan.Run.NodeID != "a" || e.Priority != BenchPriority || e.Scope.Project != BenchProject || e.Scope.Queue != BenchQueue ||
-		len(e.Exclusive) != 1 || e.Exclusive[0].Device != "GPU-S" || e.Preemptible || strings.Join(e.Argv, " ") != "/opt/kairo/kairo hardware bench-run --run "+plan.Run.ID ||
+	if !slices.Equal(plan.Run.Kinds, want) || plan.Run.NodeID != "a" || e.Priority != BenchPriority || e.Scope.Project != BenchProject || e.Scope.Queue != BenchQueue || e.Scope.Task != plan.Run.ID ||
+		len(e.Exclusive) != 1 || e.Exclusive[0].Device != "GPU-S" || !e.Preemptible || !e.Checkpointable || strings.Join(e.Argv, " ") != "/opt/kairo/kairo hardware bench-run --run "+plan.Run.ID ||
 		e.CWD != "/opt/kairo" || !strings.Contains(string(e.ExecutorSelector), `"node":"a"`) {
 		t.Fatalf("plan: %+v", plan)
 	}
 	if runs, _ := store.ListBenchRuns(ctx, "h", "", false); len(runs) != 0 {
 		t.Fatalf("a dry run created %+v", runs)
 	}
+	if status, err := store.GetProjectStatus(ctx, BenchProject); err == nil && len(status.Tasks) != 0 {
+		t.Fatalf("a dry run declared %+v", status.Tasks)
+	}
 	plan, err = store.CreateBenchRun(ctx, req)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// The run is a task of project kairo, its first execution submitted.
+	project, err := store.GetProjectStatus(ctx, BenchProject)
+	if err != nil || len(project.Tasks) != 1 || project.Tasks[0].Name != plan.Run.ID || project.Tasks[0].Queue != BenchQueue || project.Tasks[0].State != "running" ||
+		len(project.Tasks[0].Executions) != 1 || project.Tasks[0].Executions[0].ExecutionID != plan.Run.ExecutionID || project.Tasks[0].Executions[0].Reason != "initial" {
+		t.Fatalf("bench task: %+v %v", project, err)
+	}
+	if execution, err := store.GetExecution(ctx, plan.Run.ExecutionID); err != nil || !execution.Checkpointable || !execution.Preemptible || execution.Priority != BenchPriority {
+		t.Fatalf("bench execution: %+v %v", execution, err)
+	}
+	// Reconciling the task plans nothing more.
+	if err = store.ReconcileProjectTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if project, _ = store.GetProjectStatus(ctx, BenchProject); len(project.Tasks[0].Executions) != 1 {
+		t.Fatalf("reconciled bench task: %+v", project.Tasks[0])
 	}
 	if _, err = store.CreateBenchRun(ctx, req); !errors.Is(err, ErrBenchConflict) {
 		t.Fatalf("a second bench of the device: %v", err)
@@ -156,13 +175,22 @@ func TestGPUBenchIsAnExclusiveLowestPriorityExecutionOfItsOwnRun(t *testing.T) {
 	if err = store.AddBenchPoints(ctx, launch.Attempt.ID, []BenchPoint{point}); err != nil {
 		t.Fatal(err)
 	}
-	refs := map[string]BenchReference{"gemm": {Unit: "flop", WorkPerSecond: []float64{6.2e13, 6.2e13, 6.21e13}, Mean: 6.2e13, Valid: true}}
+	// A kind done is recorded as it is done; the finish adds the others.
+	if err = store.RecordBenchKind(ctx, launch.Attempt.ID, "gemm", BenchReference{Unit: "flop", WorkPerSecond: []float64{6.2e13, 6.2e13, 6.21e13}, Mean: 6.2e13, Valid: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordBenchKind(ctx, launch.Attempt.ID, "cpu-compute", BenchReference{Valid: true}); err == nil {
+		t.Fatal("a kind the run does not measure was recorded")
+	}
+	refs := map[string]BenchReference{"pcie-h2d": {Unit: "byte", WorkPerSecond: []float64{2.4e10}, Mean: 2.4e10, Reason: "references disagree"}}
 	if err = store.FinishBenchRun(ctx, launch.Attempt.ID, launch.Lease.ID, BenchFinish{References: refs, Valid: false, Reason: "pcie-h2d: references disagree"}); err != nil {
 		t.Fatal(err)
 	}
+	// Some kinds valid: partially valid, their curves used.
 	run, err = store.GetBenchRun(ctx, plan.Run.ID)
-	if err != nil || run.State != "invalid" || run.Valid == nil || *run.Valid || len(run.Points) != 1 || !run.Points[0].Valid || *run.IdleTemperatureC != 34 ||
-		*run.DriverVersion != "560.35" || run.Versions["gemm"].Program != "kairo-bench-gpu" || !run.References["gemm"].Valid {
+	if err != nil || run.State != BenchPartial || run.Valid == nil || *run.Valid || len(run.Points) != 1 || !run.Points[0].Valid || *run.IdleTemperatureC != 34 ||
+		*run.DriverVersion != "560.35" || run.Versions["gemm"].Program != "kairo-bench-gpu" || !run.References["gemm"].Valid || run.References["pcie-h2d"].Valid ||
+		run.Reason == nil || *run.Reason != "pcie-h2d: references disagree" {
 		t.Fatalf("finished run: %+v %v", run, err)
 	}
 	// Its setting went with the finish; the run takes nothing more.
@@ -172,10 +200,13 @@ func TestGPUBenchIsAnExclusiveLowestPriorityExecutionOfItsOwnRun(t *testing.T) {
 	if err = store.AddBenchPoints(ctx, launch.Attempt.ID, []BenchPoint{point}); !errors.Is(err, ErrBenchConflict) {
 		t.Fatalf("a point after the finish: %v", err)
 	}
-	for _, event := range []string{"hardware_bench_requested", "hardware_bench_started", "hardware_bench_finished", "hardware_bench_invalid"} {
+	for _, event := range []string{"hardware_bench_requested", "hardware_bench_started", "hardware_bench_finished"} {
 		if eventCount(t, store, event) != 1 {
 			t.Fatalf("%s events: %d", event, eventCount(t, store, event))
 		}
+	}
+	if eventCount(t, store, "hardware_bench_invalid") != 0 {
+		t.Fatal("a partially valid run was announced invalid")
 	}
 	// Another attempt carries out no bench.
 	if _, _, err = store.BenchOfAttempt(ctx, "att_none"); !errors.Is(err, ErrNotFound) {
@@ -268,6 +299,17 @@ func TestReconcileBenchRunsFailsARunWhoseExecutionEnded(t *testing.T) {
 		t.Fatalf("a waiting run was ended: %+v", run)
 	}
 	if err = store.WithdrawExecution(ctx, plan.Run.ExecutionID); err != nil {
+		t.Fatal(err)
+	}
+	// Until its task is reconciled, the run's task goes on (as it does after
+	// a suspend, until the continuation).
+	if err = store.ReconcileBenchRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if run, _ := store.GetBenchRun(ctx, plan.Run.ID); run.State != "waiting" {
+		t.Fatalf("the run of a live task was ended: %+v", run)
+	}
+	if err = store.ReconcileProjectTasks(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if err = store.ReconcileBenchRuns(ctx); err != nil {

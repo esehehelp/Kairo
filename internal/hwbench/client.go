@@ -11,7 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"kairo/internal/store"
@@ -149,13 +152,35 @@ func (c *Client) AddPoints(ctx context.Context, points []store.BenchPoint) error
 	return c.do(ctx, http.MethodPost, "/api/worker/bench/points", nil, map[string]any{"points": points}, nil)
 }
 
+func (c *Client) RecordKind(ctx context.Context, kind string, ref store.BenchReference) error {
+	return c.do(ctx, http.MethodPost, "/api/worker/bench/kinds", nil, map[string]any{"kind": kind, "reference": ref}, nil)
+}
+
 func (c *Client) Finish(ctx context.Context, finish store.BenchFinish) error {
 	return c.do(ctx, http.MethodPost, "/api/worker/bench/finish", nil, finish, nil)
 }
 
+func (c *Client) Commands(ctx context.Context) ([]store.Command, error) {
+	var body struct {
+		Commands []store.Command `json:"commands"`
+	}
+	err := c.do(ctx, http.MethodGet, "/api/worker/commands", nil, nil, &body)
+	return body.Commands, err
+}
+
+func (c *Client) Ack(ctx context.Context, commandID, phase string, payload map[string]any) error {
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	return c.do(ctx, http.MethodPost, "/api/worker/commands/"+url.PathEscape(commandID)+"/acks", nil, map[string]any{"phase": phase, "payload": payload}, nil)
+}
+
 // Main is `kairo hardware bench-run --run ID` inside a bench's attempt: the
-// daemon from KAIRO_API_URL, KAIRO_API_CA and KAIRO_ATTEMPT_TOKEN, the
-// programs from what the node reports, progress on stderr.
+// daemon from KAIRO_API_URL, KAIRO_API_CA and KAIRO_ATTEMPT_TOKEN, the run
+// it resumes from KAIRO_CONTINUATION_REF, the programs from what the node
+// reports, progress on stderr. The first SIGTERM or CTRL_BREAK / Ctrl-C
+// (the graceful phase of a force stop) leaves the run at once, the workload
+// stopped; a second one cancels whatever the driver is doing.
 func Main(ctx context.Context, runID string) error {
 	apiURL, token := os.Getenv("KAIRO_API_URL"), os.Getenv("KAIRO_ATTEMPT_TOKEN")
 	if apiURL == "" || token == "" {
@@ -165,6 +190,23 @@ func Main(ctx context.Context, runID string) error {
 	if err != nil {
 		return err
 	}
-	d := &Driver{Daemon: client, Runner: ExecRunner{Stderr: os.Stderr}, Logger: slog.New(slog.NewTextHandler(os.Stderr, nil)), Env: os.Getenv, Timing: DefaultTiming()}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	var stopping atomic.Bool
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(signals)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	go func() {
+		for s := range signals {
+			if stopping.Swap(true) {
+				cancel()
+				return
+			}
+			logger.Info("stop signal: leaving the bench run", "signal", s.String())
+		}
+	}()
+	d := &Driver{Daemon: client, Runner: ExecRunner{Stderr: os.Stderr}, Logger: logger, Env: os.Getenv, Timing: DefaultTiming(),
+		Continuation: os.Getenv("KAIRO_CONTINUATION_REF"), Stopping: stopping.Load}
 	return d.Run(ctx, runID)
 }

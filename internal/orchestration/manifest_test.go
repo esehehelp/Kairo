@@ -1,10 +1,34 @@
 package orchestration
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
 )
+
+func TestParseNodeAndDevicePinsKeepOtherDigests(t *testing.T) {
+	before, err := Parse([]byte(validManifest()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A task that pins nothing has the JSON (and digest) it had before pins.
+	if body, _ := json.Marshal(before.Manifest.Tasks[1].Execution); strings.Contains(string(body), `"node"`) || strings.Contains(string(body), `"device"`) {
+		t.Fatalf("an unpinned task's JSON names a pin: %s", body)
+	}
+	pinned := strings.Replace(validManifest(), "kind = \"gpu\"\ncount = 1\n", "kind = \"gpu\"\ncount = %d\ndevice = \" GPU-1 \"\n[tasks.execution.executor]\nnode = \" a \"\n", 1)
+	parsed, err := Parse([]byte(fmt.Sprintf(pinned, 1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	execution := parsed.Manifest.Tasks[1].Execution
+	if execution.Executor.Node != "a" || execution.Exclusive[0].Device != "GPU-1" || parsed.TaskDigests["train"] == before.TaskDigests["train"] || parsed.TaskDigests["prepare"] != before.TaskDigests["prepare"] {
+		t.Fatalf("pinned: %+v", execution)
+	}
+	if _, err = Parse([]byte(fmt.Sprintf(pinned, 2))); err == nil || !strings.Contains(err.Error(), "count must be 1") {
+		t.Fatalf("a device of two GPUs: %v", err)
+	}
+}
 
 func validManifest() string {
 	return `schema_version = 1

@@ -80,6 +80,10 @@ a zero exit, Attempt quiescence, and Lease release. A checkpointed cooperative
 suspend with an opaque continuation creates the next immutable Execution.
 Lost Attempt identity blocks the Task, and an unsuccessful dependency blocks
 its dependants. See `examples/project-spec.toml` for the declaration format.
+Besides `labels`, `[tasks.execution.executor]` may name a `node` (only that
+node's executors take the task), and an `[[tasks.execution.exclusive]]`
+request a `device` (one GPU by its UUID, `count = 1`), as the tasks of
+`kairo hardware bench` do.
 A top-level `[defaults]` table (`queue`, `policy`, `execution`) is merged into
 every Task by the CLI before validation: the Task's own value wins, tables
 merge key by key, arrays and scalars are replaced, and an omitted `depends_on`
@@ -325,7 +329,7 @@ controller (`kairo controller`, see Hardware settings) connects the same way.
 | GET | `/api/worker/commands` | worker |
 | POST | `/api/worker/commands/{command}/acks` | worker |
 | GET | `/api/worker/bench`, `/api/worker/bench/cpu-energy` | worker (a bench's attempt) |
-| POST | `/api/worker/bench/settings`, `/start`, `/points`, `/finish` | worker (a bench's attempt) |
+| POST | `/api/worker/bench/settings`, `/start`, `/points`, `/kinds`, `/finish` | worker (a bench's attempt) |
 
 Errors are `{"error": ..., "code": ...}`. An empty `actor` in a pause, resume,
 quarantine, cancel or rerun request is recorded as the token's name.
@@ -811,7 +815,9 @@ controller may change whose `max_slowdown` s is above 0, and asks for the
 setting that keeps performance within s for the least energy as the device's
 `policy` setting. It never holds back admission or waits for anything: a
 setting the controller does not apply is only a fact, and the next
-evaluation goes on.
+evaluation goes on. A device's profile is, per kind, the curve of its latest
+ended bench run (finished, partial or invalid) with valid references of that
+kind: an invalid kind of a run leaves its other kinds' curves in use.
 
 - A GPU's policy setting belongs to the lease holding it (not a bench's
   lease, which sets its own; not one whose attempt has not started). The
@@ -1061,10 +1067,13 @@ pilot.
 (admin) measures how a device performs, and what energy it uses, at each
 setting of a grid. DEVICE is a GPU UUID, `cpu`, `disk:FILESYSTEM` (a
 filesystem provider's path on one of the host's nodes) or `net:NODE` (the
-network from the host's node to NODE). The run is an ordinary execution of
-the Kairo-owned project `kairo`, queue `hardware-bench`, at priority -1000000:
-it waits for every other execution, never preempts one, is not preemptible,
-and holds its device alone:
+network from the host's node to NODE). The run is an ordinary Task of the
+Kairo-owned project `kairo`, queue `hardware-bench`, named after the run
+(`kairo task show kairo hardware-bench bnc_...`), declared as `project apply`
+declares one (`RunToCompletion@v1`, its first execution submitted at once),
+at priority -1000000, checkpointable and preemptible: it waits for every
+other execution, never preempts one, holds its device alone, and is
+suspended for work that needs its device (see Suspend and resume below):
 
 | Device | Lease | Kinds (swept, else at the defaults) |
 |---|---|---|
@@ -1133,20 +1142,53 @@ own interval stream:
    gang across the two nodes), a manual or policy setting was in effect, or
    the primitive did no work or ended early. A kind whose three references
    spread more than 1% ((max - min) / mean), or with an invalid reference, is
-   invalid as a whole: its curve is not used. A kind measured once is its own
-   reference. `disk-sustained` measures until its write limit.
+   invalid as a whole: its curve is not used, the other kinds' are. A kind
+   measured once is its own reference. `disk-sustained` measures until its
+   write limit. Each kind's reference is recorded as soon as the kind is done
+   (`POST /api/worker/bench/kinds`).
 6. Clears its setting (the lease's release would anyway) and finishes the run:
-   `finished` when every kind is valid, else `invalid` with the reasons. A run
-   whose execution ends without finishing is `failed`.
+   `finished` when every kind is valid, `partial` when some are (the policy
+   and the profile use their curves; the reason names the other kinds and
+   why), `invalid` when none is. A run whose task ends without the driver
+   finishing it (force-stopped, crashed, cancelled) is `failed`, with `the
+   bench execution ended without its results (CAUSE)`: what it recorded is
+   kept but never used.
+
+Suspend and resume: the driver is a cooperative worker, as with the SDKs'
+`safe_point`. Before every kind and every point, every 15 s of a warm-up and
+while it waits for other work, it polls the attempt's commands (`GET
+/api/worker/commands`); a `suspend` (a preemption, a `pause`, a node
+quarantine) is acknowledged `accepted` and `checkpointing`, the primitive is
+stopped, the bench setting cleared (the lease's release returns the device
+to its defaults anyway), and `checkpointed` with the continuation
+`{"run":"bnc_...","done":["pcie-h2d",...]}` (the same for a command delivered
+again); the attempt exits 0. A suspend withdrawn meanwhile (404) is skipped,
+other kinds of command too. The task's continuation execution carries on the
+same run (event `hardware_bench_continued`): the run waits again (`hardware
+profile` shows it `suspended`, with the kinds done), the points of the kind
+that was interrupted are dropped, and the new attempt (`hardware_bench_resumed`
+when it starts) skips the kinds done and measures the others, the
+interrupted one from the start (its warm-up and references included), asking
+for its settings under its own lease. Suspended and resumed, a run ends like
+any other. The graceful phase of a force stop (SIGTERM, CTRL_BREAK, Ctrl-C)
+makes the driver leave within a second, the primitive stopped (it gets the
+signal too) and the setting cleared, publishing nothing: the task is
+`stopped` and the run `failed`. A second signal cancels what it is doing. A
+`task rerun` of a bench's task does not revive its failed run (the driver
+finds it ended and fails): ask for a new bench.
 
 The primitives' own safety limits apply as they are (free space, the 20 GiB
 written per primitive run, memory). Runs and points are kept indefinitely
 (`bench_runs`, `bench_points`); events `hardware_bench_requested`,
-`hardware_bench_started`, `hardware_bench_finished` and
-`hardware_bench_invalid` (also for a failed run).
+`hardware_bench_started`, `hardware_bench_continued`,
+`hardware_bench_resumed`, `hardware_bench_finished` (with its `state` and
+`valid_kinds`) and `hardware_bench_invalid` (a run with no valid kind, and a
+failed run).
 
 `kairo hardware profile HOST [DEVICE] [--json]` prints per device its latest
-runs and, per kind, the curve of the latest run with valid references of it:
+runs (a partial one `valid for 7 of 8 kinds: gemm: references spread ...`, a
+suspended one `suspended since ..., 3 of 8 kinds done`) and, per kind, the
+curve of the latest ended run with valid references of it:
 each point's setting, relative performance, power, energy per unit of work,
 clock, temperature and validity, the point the policy would choose for the
 device's `max_slowdown` marked `*`, and the drift from the device's own
@@ -1376,10 +1418,11 @@ kairo db import-sqlite --from local/kairo-v3.db --config kairo.toml   # or --to 
 
 It opens the file read-only (copy it with its `-wal` and `-shm` files first
 to import a snapshot of a running daemon's), needs an empty target, creates
-the schema and copies every table in one transaction. Before committing it
-checks every table: the row count and a SHA-256 over the rows in key order
-(values normalized by column type: flags, integers, reals, text) computed
-the same way from both databases. It prints one row per table and imports
+the schema of the last SQLite Kairo (migration 1) and copies every table in
+one transaction. Before committing it checks every table: the row count and
+a SHA-256 over the rows in key order (values normalized by column type:
+flags, integers, reals, text) computed the same way from both databases,
+then applies the later migrations. It prints one row per table and imports
 nothing when any table differs. The file must have been opened by the last
 SQLite Kairo, so its schema is complete.
 
@@ -1401,6 +1444,13 @@ observations, which carry power samples (its resources then go stale). A
 daemon opening an older database applies the schema migrations it lacks
 (see Database); keep the backup, since an older binary refuses the newer
 schema.
+
+A bench's driver is the kairo of the node that runs it (`[bench]
+kairo_binary`). One from before benches were tasks does not poll commands:
+it never acknowledges a suspend, so what would preempt it, or a pause of it,
+waits until it finishes as it did before (a force stop still ends it), and
+its run still finishes normally. A daemon from before submits benches as
+executions that are never suspended, which a newer driver runs as before.
 
 ## Verification
 

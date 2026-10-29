@@ -62,6 +62,7 @@ func (s *Server) routes() []route {
 		{"GET", "/api/worker/bench/cpu-energy", roleWorker, s.workerBenchCPUEnergy},
 		{"POST", "/api/worker/bench/start", roleWorker, s.workerBenchStart},
 		{"POST", "/api/worker/bench/points", roleWorker, s.workerBenchPoints},
+		{"POST", "/api/worker/bench/kinds", roleWorker, s.workerBenchKind},
 		{"POST", "/api/worker/bench/finish", roleWorker, s.workerBenchFinish},
 
 		{"POST", "/api/agent/logs", roleNode, s.agentLogAppend},

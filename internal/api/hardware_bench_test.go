@@ -126,14 +126,22 @@ func TestBenchAttemptReachesOnlyItsOwnRun(t *testing.T) {
 	if status, body = d.call(t, "POST", "/api/worker/bench/points", token, map[string]any{"points": []store.BenchPoint{{Seq: 1, Kind: "cpu-compute", Phase: store.PhaseReference, Valid: true}}}); status != http.StatusOK {
 		t.Fatalf("points: %d %s", status, body)
 	}
-	if status, body = d.call(t, "POST", "/api/worker/bench/finish", token, store.BenchFinish{Valid: true, References: map[string]store.BenchReference{"cpu-compute": {Valid: true}}}); status != http.StatusOK {
+	// A kind done is recorded at once (a resumed run skips it).
+	if status, body = d.call(t, "POST", "/api/worker/bench/kinds", token, map[string]any{"kind": "gemm", "reference": store.BenchReference{Valid: true}}); status != http.StatusBadRequest {
+		t.Fatalf("a kind the run does not measure: %d %s", status, body)
+	}
+	if status, body = d.call(t, "POST", "/api/worker/bench/kinds", token, map[string]any{"kind": "cpu-compute", "reference": store.BenchReference{Valid: true, Mean: 2e9}}); status != http.StatusOK {
+		t.Fatalf("kind: %d %s", status, body)
+	}
+	if status, body = d.call(t, "POST", "/api/worker/bench/finish", token, store.BenchFinish{Valid: true, References: map[string]store.BenchReference{}}); status != http.StatusOK {
 		t.Fatalf("finish: %d %s", status, body)
 	}
 	status, body = d.call(t, "GET", "/api/hardware/h/profile?device=cpu", d.admin, nil)
 	var profile struct {
 		Runs []store.BenchRun `json:"runs"`
 	}
-	if status != http.StatusOK || json.Unmarshal(body, &profile) != nil || len(profile.Runs) != 1 || profile.Runs[0].State != "finished" || len(profile.Runs[0].Points) != 1 {
+	if status != http.StatusOK || json.Unmarshal(body, &profile) != nil || len(profile.Runs) != 1 || profile.Runs[0].State != "finished" || len(profile.Runs[0].Points) != 1 ||
+		profile.Runs[0].References["cpu-compute"].Mean != 2e9 {
 		t.Fatalf("profile: %d %s", status, body)
 	}
 	// The finish cleared the bench setting.
