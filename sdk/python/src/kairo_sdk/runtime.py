@@ -383,6 +383,11 @@ class AttemptSession:
             if session.safe_point(checkpoint=checkpoint):
                 sys.exit(0)
 
+        A ``checkpoint`` command (``kairo task checkpoint``) runs the same
+        callback (``command.kind`` tells them apart) and is acknowledged the
+        same way, but ``False`` is returned: the worker carries on, and the
+        checkpoint it published is not a continuation.
+
         If the callback raises, the command is acknowledged ``rejected`` and
         the exception propagates; if it returns no ``continuation_ref``,
         ``rejected`` too, and :class:`~kairo_sdk.errors.NoContinuationError`
@@ -449,7 +454,7 @@ class AttemptSession:
             reason=str(raw.get("reason") or ""),
             delivery_count=int(raw.get("delivery_count") or 0),
         )
-        if context.kind != "suspend":
+        if context.kind not in ("suspend", "checkpoint"):
             _log.debug("skipping Kairo command %s of unknown kind %r", context.command_id, context.kind)
             return False
         try:
@@ -477,6 +482,8 @@ class AttemptSession:
                 raise
             _log.info("Kairo command %s was withdrawn: %s", context.command_id, error)
             return False
+        if context.kind == "checkpoint":
+            return False  # published; the worker carries on
         self.suspend_handled = True
         return True
 

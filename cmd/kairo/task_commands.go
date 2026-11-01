@@ -402,3 +402,82 @@ func taskRerun(args []string) error {
 	}
 	return nil
 }
+
+// taskCheckpoint: kairo task checkpoint PROJECT [QUEUE] TASK [--wait]
+// [--timeout D] asks every running attempt of a task to publish a checkpoint
+// at its next safe point and carry on (store.CheckpointTask). With --wait it
+// prints each published checkpoint (or the attempt's refusal) once
+// acknowledged; exit 2 on timeout.
+func taskCheckpoint(args []string) error {
+	fs := newFlags("task checkpoint")
+	api := apiFlag(fs)
+	wait := fs.Bool("wait", false, "wait until each attempt has published its checkpoint and print it")
+	timeout := fs.Duration("timeout", 30*time.Minute, "how long --wait waits")
+	actor := fs.String("actor", defaultActor(), "audit actor")
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	ref, err := parseTaskRef("task checkpoint", positional)
+	if err != nil {
+		return err
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	var result store.CheckpointResult
+	err = client.callJSON(http.MethodPost, ref.path()+"/checkpoint", map[string]any{"actor": *actor}, &result)
+	switch {
+	case routeMissing(err):
+		return fmt.Errorf("the daemon does not know task checkpoint: %s", olderDaemonHint())
+	case notFound(err):
+		return fmt.Errorf("%w (%v)", ref.notFound(), err)
+	case err != nil:
+		return err
+	}
+	for _, command := range result.Commands {
+		fmt.Println("checkpoint requested", command)
+	}
+	if !*wait {
+		return nil
+	}
+	deadline := time.Now().Add(*timeout)
+	pending := append([]string(nil), result.Commands...)
+	failed := false
+	for len(pending) > 0 {
+		var still []string
+		for _, commandID := range pending {
+			var command store.Command
+			if err := client.callJSON(http.MethodGet, "/api/commands/"+url.PathEscape(commandID), nil, &command); err != nil {
+				return err
+			}
+			switch command.State {
+			case "checkpointed":
+				var body struct {
+					ContinuationRef string `json:"continuation_ref"`
+				}
+				_ = json.Unmarshal(command.Payload, &body)
+				fmt.Println("checkpoint", commandID, body.ContinuationRef)
+			case "rejected":
+				fmt.Println("checkpoint rejected", commandID, string(command.Payload))
+				failed = true
+			default:
+				still = append(still, commandID)
+			}
+		}
+		pending = still
+		if len(pending) == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			fmt.Fprintln(os.Stderr, "kairo: timed out waiting for", strings.Join(pending, ", "))
+			os.Exit(2)
+		}
+		time.Sleep(2 * time.Second)
+	}
+	if failed {
+		return fmt.Errorf("an attempt refused the checkpoint")
+	}
+	return nil
+}

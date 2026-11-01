@@ -399,7 +399,7 @@ func loadCurrentTaskExecution(ctx context.Context, tx *sql.Tx, taskScopeID strin
 
 func latestAttemptCommand(ctx context.Context, tx *sql.Tx, attemptID string) (string, string, string, error) {
 	var id, origin, state string
-	err := tx.QueryRowContext(ctx, `SELECT id,origin,state FROM commands WHERE attempt_id=$1 ORDER BY created_at DESC LIMIT 1`, attemptID).Scan(&id, &origin, &state)
+	err := tx.QueryRowContext(ctx, `SELECT id,origin,state FROM commands WHERE attempt_id=$1 AND kind='suspend' ORDER BY created_at DESC LIMIT 1`, attemptID).Scan(&id, &origin, &state)
 	return id, origin, state, err
 }
 

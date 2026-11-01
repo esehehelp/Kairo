@@ -109,6 +109,9 @@ fn number(x: f64) -> Value {
 /// command id again and must be idempotent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SuspendRequest {
+    /// `suspend` (the worker stops after the callback) or `checkpoint` (it
+    /// carries on; `kairo task checkpoint`); `suspend` for a signal.
+    pub kind: String,
     /// The command id; empty for a stop requested by a signal.
     pub command_id: String,
     /// Why the daemon suspends the attempt (`scope_pause`,
@@ -361,7 +364,9 @@ impl Session {
     /// `suspend` is acknowledged `accepted` and `checkpointing`, the callback
     /// runs, and `checkpointed` publishes its continuation_ref with its
     /// payload. A failing callback, or one returning no continuation_ref, is
-    /// acknowledged `rejected`. Other command kinds are skipped without an
+    /// acknowledged `rejected`. A `checkpoint` command runs the same way but
+    /// returns `Ok(false)`: the worker carries on, and the checkpoint is not
+    /// a continuation. Other command kinds are skipped without an
     /// ack. A command withdrawn while acknowledged (404) means carry on.
     pub fn safe_point<E: fmt::Display>(
         &self,
@@ -377,13 +382,14 @@ impl Session {
         if sp.last_poll.is_none_or(|last| now.duration_since(last) >= self.inner.options.poll_interval) {
             sp.last_poll = Some(now);
             let commands = self.inner.client.poll_commands().map_err(|e| SafePointError::Kairo(self.observe(e)))?;
-            if let Some(command) = commands.into_iter().find(|c| c.kind == "suspend") {
+            if let Some(command) = commands.into_iter().find(|c| c.kind == "suspend" || c.kind == "checkpoint") {
                 return self.suspend(command, callback);
             }
         }
         if crate::signals::stop_requested() {
             if !sp.signal_handled {
                 let request = SuspendRequest {
+                    kind: "suspend".into(),
                     command_id: String::new(),
                     origin: "signal".into(),
                     reason: "stop_signal".into(),
@@ -415,6 +421,7 @@ impl Session {
             return Ok(false);
         }
         let request = SuspendRequest {
+            kind: command.kind.clone(),
             command_id: command.id.clone(),
             origin: command.origin.clone(),
             reason: command.reason.clone(),
@@ -440,7 +447,8 @@ impl Session {
         };
         let mut payload = result.payload;
         payload.insert("continuation_ref".into(), continuation_ref.into());
-        ack(Phase::Checkpointed, Some(&Value::Object(payload)))
+        // A checkpoint command is published and the worker carries on.
+        Ok(ack(Phase::Checkpointed, Some(&Value::Object(payload)))? && command.kind != "checkpoint")
     }
 
     /// Record a failed request: a retired or fenced attempt ends the

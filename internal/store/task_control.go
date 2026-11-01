@@ -292,3 +292,93 @@ func rerunTriggerTx(ctx context.Context, tx *sql.Tx, taskScopeID string, ordinal
 	}
 	return trigger, nil
 }
+
+type CheckpointResult struct {
+	Task     string   `json:"task"`
+	Commands []string `json:"commands"`
+}
+
+// CheckpointTask asks every running attempt of a task (every gang rank) to
+// publish a checkpoint at its next safe point and carry on: a checkpoint
+// command, which leaves the attempt running and its lease active (AckCommand)
+// and whose checkpoint is not the attempt's continuation. An attempt with a
+// checkpoint already in flight gets no second one; its command is returned.
+// It refuses a task none of whose executions is running, or whose executions
+// are not checkpointable (they implement no safe point).
+func (s *Store) CheckpointTask(ctx context.Context, project, name, actor string) (CheckpointResult, error) {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return CheckpointResult{}, err
+	}
+	defer tx.Rollback()
+	task, err := loadTaskTx(ctx, tx, project, name)
+	if err != nil {
+		return CheckpointResult{}, err
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT e.id,e.checkpointable,a.id,a.coordination_epoch,l.id FROM execution_requests e
+		JOIN attempts a ON a.execution_id=e.id AND a.state='running'
+		JOIN leases l ON l.attempt_id=a.id AND l.state='active'
+		WHERE e.task_scope_id=$1 AND e.state='started' ORDER BY e.submitted_at,e.id`, task.scopeID)
+	if err != nil {
+		return CheckpointResult{}, err
+	}
+	type target struct {
+		executionID, attemptID, leaseID string
+		checkpointable                  bool
+		epoch                           int64
+	}
+	var targets []target
+	for rows.Next() {
+		var t target
+		if err = rows.Scan(&t.executionID, &t.checkpointable, &t.attemptID, &t.epoch, &t.leaseID); err != nil {
+			rows.Close()
+			return CheckpointResult{}, err
+		}
+		targets = append(targets, t)
+	}
+	if err = rows.Close(); err != nil {
+		return CheckpointResult{}, err
+	}
+	if len(targets) == 0 {
+		return CheckpointResult{}, taskConflict{fmt.Sprintf("task %s/%s/%s has no running attempt to checkpoint", task.project, task.queue, task.name)}
+	}
+	out := CheckpointResult{Task: name, Commands: []string{}}
+	for _, t := range targets {
+		if !t.checkpointable {
+			return CheckpointResult{}, taskConflict{fmt.Sprintf("execution %s of %s/%s/%s is not checkpointable", t.executionID, task.project, task.queue, task.name)}
+		}
+		var existing string
+		err = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=$1 AND kind='checkpoint' AND state IN('pending','accepted','checkpointing')`, t.attemptID).Scan(&existing)
+		if err == nil {
+			out.Commands = append(out.Commands, existing)
+			continue
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return CheckpointResult{}, err
+		}
+		commandID, stamp := id.New("cmd"), now()
+		reason := "checkpoint requested by " + actor
+		if _, err = tx.ExecContext(ctx, `INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'checkpoint','operator_checkpoint',$6,'pending',$7,$8)`, commandID, t.executionID, t.attemptID, t.leaseID, t.epoch, reason, stamp, stamp); err != nil {
+			return CheckpointResult{}, err
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "checkpoint_requested", &task.projectID, "command", commandID, &t.epoch, map[string]any{"execution_id": t.executionID, "attempt_id": t.attemptID, "lease_id": t.leaseID, "task": name, "actor": actor}); err != nil {
+			return CheckpointResult{}, err
+		}
+		out.Commands = append(out.Commands, commandID)
+	}
+	return out, tx.Commit()
+}
+
+// GetCommand returns one command with the payload of its latest state (a
+// checkpointed checkpoint carries the published checkpoint_ref there as
+// continuation_ref).
+func (s *Store) GetCommand(ctx context.Context, commandID string) (Command, error) {
+	var c Command
+	var payload string
+	err := s.db.QueryRowContext(ctx, `SELECT id,execution_id,attempt_id,kind,origin,reason,state,delivery_count,created_at,payload_json FROM commands WHERE id=$1`, commandID).Scan(&c.ID, &c.ExecutionID, &c.AttemptID, &c.Kind, &c.Origin, &c.Reason, &c.State, &c.DeliveryCount, &c.CreatedAt, &payload)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Command{}, ErrNotFound
+	}
+	c.Payload = json.RawMessage(payload)
+	return c, err
+}

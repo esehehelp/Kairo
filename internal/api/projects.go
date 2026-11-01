@@ -142,3 +142,36 @@ func (s *Server) rerunTask(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, result)
 }
+
+// checkpointTask asks every running attempt of a task to publish a checkpoint
+// and carry on (store.CheckpointTask).
+func (s *Server) checkpointTask(w http.ResponseWriter, r *http.Request) {
+	if s.ObserveOnly {
+		writeError(w, errObserveOnly)
+		return
+	}
+	var body struct {
+		Actor string `json:"actor"`
+	}
+	if err := decodeOptional(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	result, err := s.Store.CheckpointTask(r.Context(), r.PathValue("project"), r.PathValue("task"), actorOr(r, body.Actor))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+// getCommand returns one command (store.GetCommand): its state and the
+// payload of its latest acknowledgement.
+func (s *Server) getCommand(w http.ResponseWriter, r *http.Request) {
+	command, err := s.Store.GetCommand(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, command)
+}

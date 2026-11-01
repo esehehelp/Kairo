@@ -142,7 +142,7 @@ func init() {
 				"monitor": "watch", "follow": "watch", "wait": "watch (or kairo task wait)",
 			},
 		}},
-		{name: "task", summary: "list, show, wait for, read logs of, pause, cancel or rerun tasks", group: &commandGroup{
+		{name: "task", summary: "list, show, wait for, read logs of, pause, checkpoint, cancel or rerun tasks", group: &commandGroup{
 			note: "QUEUE may be left out for tasks declared by a ProjectSpec: it is looked up.",
 			subs: []command{
 				{"list", "PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]", "tasks as a table (default: live and updated in the last 24h)", taskList},
@@ -153,6 +153,7 @@ func init() {
 				{"resume", "PROJECT [QUEUE] TASK", "resume a paused task", scope("task", "resume")},
 				{"cancel", "PROJECT [QUEUE] TASK [--dry-run]", "cancel a task that is not running (pause --force a running one)", taskCancel},
 				{"rerun", "PROJECT [QUEUE] TASK", "run a failed, blocked, stopped or cancelled task again", taskRerun},
+				{"checkpoint", "PROJECT [QUEUE] TASK [--wait] [--timeout D]", "have a running task publish a checkpoint and carry on", taskCheckpoint},
 			},
 			aliases: map[string]string{
 				"get": "show", "describe": "show", "info": "show", "inspect": "show", "status": "show", "detail": "show",
@@ -163,6 +164,7 @@ func init() {
 				"retry": "rerun", "restart": "rerun", "run": "rerun",
 				"watch": "wait (or kairo project watch)", "await": "wait", "monitor": "wait",
 				"suspend": "pause", "continue": "resume", "unpause": "resume",
+				"save": "checkpoint", "snapshot": "checkpoint",
 			},
 		}},
 		{name: "execution", summary: "submit, list, show, withdraw executions; their logs", group: &commandGroup{

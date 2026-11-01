@@ -15,6 +15,7 @@ from kairo_sdk import AttemptSession, DistributedAdapter
 
 
 class _ControlHandler(BaseHTTPRequestHandler):
+    kind = "suspend"
     gets: list[str] = []
     posts: list[tuple[str, dict]] = []
     authorizations: set[str] = set()
@@ -32,7 +33,7 @@ class _ControlHandler(BaseHTTPRequestHandler):
                 "commands": [
                     {
                         "id": "cmd_ddp",
-                        "kind": "suspend",
+                        "kind": type(self).kind,
                         "reason": "test",
                         "delivery_count": 1,
                     }
@@ -97,7 +98,9 @@ def _ddp_worker(
         dist.destroy_process_group()
 
 
-def test_two_rank_gloo_checkpoints_before_rank_zero_ack(tmp_path: Path):
+@pytest.mark.parametrize("kind", ["suspend", "checkpoint"])
+def test_two_rank_gloo_checkpoints_before_rank_zero_ack(tmp_path: Path, kind: str):
+    _ControlHandler.kind = kind
     _ControlHandler.gets = []
     _ControlHandler.posts = []
     _ControlHandler.authorizations = set()
@@ -117,8 +120,9 @@ def test_two_rank_gloo_checkpoints_before_rank_zero_ack(tmp_path: Path):
             nprocs=2,
             join=True,
         )
-        assert json.loads((tmp_path / "rank-0.json").read_text())["stopped"]
-        assert json.loads((tmp_path / "rank-1.json").read_text())["stopped"]
+        # A suspend stops every rank; a checkpoint is published and every rank carries on.
+        assert json.loads((tmp_path / "rank-0.json").read_text())["stopped"] is (kind == "suspend")
+        assert json.loads((tmp_path / "rank-1.json").read_text())["stopped"] is (kind == "suspend")
         assert (tmp_path / "rank-0.checkpointed").is_file()
         assert (tmp_path / "rank-1.checkpointed").is_file()
         # Only rank 0 talks to Kairo, and only over the token-scoped paths.

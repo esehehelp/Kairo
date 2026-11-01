@@ -1,5 +1,5 @@
 {
-  "$comment": "One safe point of a managed worker, after registration and with no heartbeat due (the harness starts the session with heartbeats disabled or just sent, and polling allowed). EXCHANGES is the exact sequence of requests the worker must send and the responses the fake daemon gives: method and path must match exactly, every request carries 'Authorization: Bearer <KAIRO_ATTEMPT_TOKEN>', and the expected body must be contained in the actual one (objects compared key by key, extra keys allowed; a missing body means no check). CALLBACK is what the checkpoint callback does when a suspend is handled: returns {continuation_ref, payload?} or raises. A suspend's command id is percent-encoded as one path segment. EXPECT: result (true: the worker must stop now, a continuation was published; false: carry on) or error (the class from classify.json, or 'callback' for the callback's own exception, or 'no_continuation'). After the last exchange the worker sends nothing more for this safe point.",
+  "$comment": "One safe point of a managed worker, after registration and with no heartbeat due (the harness starts the session with heartbeats disabled or just sent, and polling allowed). EXCHANGES is the exact sequence of requests the worker must send and the responses the fake daemon gives: method and path must match exactly, every request carries 'Authorization: Bearer <KAIRO_ATTEMPT_TOKEN>', and the expected body must be contained in the actual one (objects compared key by key, extra keys allowed; a missing body means no check). CALLBACK is what the checkpoint callback does when a suspend or a checkpoint command is handled: returns {continuation_ref, payload?} or raises. A suspend's command id is percent-encoded as one path segment. EXPECT: result (true: the worker must stop now, a continuation was published; false: carry on, also after a checkpoint command is published) or error (the class from classify.json, or 'callback' for the callback's own exception, or 'no_continuation'). After the last exchange the worker sends nothing more for this safe point.",
   "scenarios": [
     {
       "name": "no command",
@@ -19,6 +19,17 @@
         {"request": {"method": "POST", "path": "/api/worker/commands/cmd%2F1/acks", "body": {"phase": "checkpointed", "payload": {"continuation_ref": "ckpt://step-100", "step": 100}}}, "response": {"status": 202, "body": {"ok": true}}}
       ],
       "expect": {"result": true}
+    },
+    {
+      "name": "checkpoint published, the worker carries on",
+      "callback": {"returns": {"continuation_ref": "ckpt://step-200", "payload": {"step": 200}}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd_2", "kind": "checkpoint", "origin": "operator_checkpoint", "reason": "checkpoint requested by admin", "delivery_count": 1}]}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_2/acks", "body": {"phase": "accepted"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_2/acks", "body": {"phase": "checkpointing"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_2/acks", "body": {"phase": "checkpointed", "payload": {"continuation_ref": "ckpt://step-200", "step": 200}}}, "response": {"status": 202, "body": {"ok": true}}}
+      ],
+      "expect": {"result": false}
     },
     {
       "name": "redelivered suspend runs the callback again",

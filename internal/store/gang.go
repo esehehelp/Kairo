@@ -603,8 +603,8 @@ func nullableInt(v sql.NullInt64) any {
 
 func (s *Store) gangRankStates(ctx context.Context, placementID string) ([]gangRankState, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT gpl.rank,gpl.execution_id,gpl.executor_id,l.state,a.id,a.state,a.exit_code,e.checkpointable,
-		(SELECT c.origin FROM commands c WHERE c.attempt_id=a.id AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
-		(SELECT c.reason FROM commands c WHERE c.attempt_id=a.id AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
+		(SELECT c.origin FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
+		(SELECT c.reason FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
 		EXISTS(SELECT 1 FROM gang_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM force_stops t WHERE t.attempt_id=a.id)
 		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id JOIN execution_requests e ON e.id=gpl.execution_id
 		LEFT JOIN attempts a ON a.id=l.attempt_id

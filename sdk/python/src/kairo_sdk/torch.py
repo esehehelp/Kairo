@@ -171,7 +171,9 @@ class DistributedAdapter:
         (:func:`~kairo_sdk.runtime.install_stop_signals`), so every rank stops
         together. If the acknowledgement fails, training continues and the
         same command is delivered again at a later safe point; checkpoint
-        callbacks must consequently be idempotent by command ID.
+        callbacks must consequently be idempotent by command ID. A
+        ``checkpoint`` command (``kairo task checkpoint``) is checkpointed by
+        every rank the same way and returns ``False``: every rank carries on.
 
         The semantics follow :meth:`AttemptSession.safe_point`: unknown
         command kinds are skipped, a withdrawn command (HTTP 404) is dropped,
@@ -249,6 +251,8 @@ class DistributedAdapter:
             raise NoContinuationError(
                 f"rank 0 checkpoint returned no continuation_ref for command {context.command_id}"
             )
+        if context.kind == "checkpoint":
+            return False  # published (or redelivered after a failed acknowledgement); every rank carries on
         if outcome["ok"]:
             self.session.suspend_handled = True
         return bool(outcome["ok"])
@@ -301,7 +305,8 @@ class DistributedAdapter:
                 session.last_control_error = exc
                 commands = []
             for raw in commands:
-                if str(raw.get("kind") or "") != "suspend":
+                kind = str(raw.get("kind") or "")
+                if kind not in ("suspend", "checkpoint"):
                     _log.debug(
                         "skipping Kairo command %s of unknown kind %r", raw.get("id"), raw.get("kind")
                     )
@@ -319,7 +324,7 @@ class DistributedAdapter:
                 # terminal acknowledgement decides, and Kairo redelivers.
                 message["command"] = {
                     "command_id": command_id,
-                    "kind": "suspend",
+                    "kind": kind,
                     "reason": str(raw.get("reason") or ""),
                     "delivery_count": int(raw.get("delivery_count") or 0),
                 }

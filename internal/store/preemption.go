@@ -80,7 +80,7 @@ func enqueuePrioritySuspendsTx(ctx context.Context, tx *sql.Tx, waiting Executio
 	for _, attemptID := range attemptIDs {
 		victim := victims[attemptID]
 		var existingID, existingOrigin, existingState string
-		err := tx.QueryRowContext(ctx, `SELECT id,origin,state FROM commands WHERE attempt_id=$1 ORDER BY created_at LIMIT 1`, attemptID).Scan(&existingID, &existingOrigin, &existingState)
+		err := tx.QueryRowContext(ctx, `SELECT id,origin,state FROM commands WHERE attempt_id=$1 AND kind='suspend' ORDER BY created_at LIMIT 1`, attemptID).Scan(&existingID, &existingOrigin, &existingState)
 		if err == nil {
 			if existingOrigin == "priority_preemption" && existingState != "rejected" {
 				commandIDs = append(commandIDs, existingID)

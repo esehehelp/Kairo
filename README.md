@@ -117,6 +117,19 @@ not terminal (pause the Task first, or `task pause --force`) and leaves
 checkpoints and other outputs alone. An execution withdrawn with `execution
 withdraw` before it started also leaves its Task `cancelled`.
 
+`kairo task checkpoint [--wait] [--timeout 30m] PROJECT [QUEUE] TASK` asks
+every running attempt of a Task (every gang rank) to publish a checkpoint at
+its next safe point and carry on: a `checkpoint` command (origin
+`operator_checkpoint`), acknowledged like a suspend (`accepted`,
+`checkpointing`, then `checkpointed` with the path as `continuation_ref`), but
+the attempt stays `running`, its lease `active`, and the checkpoint is not the
+attempt's continuation (event `checkpoint_saved`, not `checkpoint_published`).
+An attempt has at most one checkpoint in flight; asking again returns it. It
+refuses a Task with no running attempt or whose execution is not
+checkpointable. `--wait` prints each published path (or the refusal) once
+acknowledged; `GET /api/commands/{id}` returns a command's state and payload.
+Workers whose SDK predates the command skip it, so it stays pending.
+
 `kairo task rerun PROJECT [QUEUE] TASK` runs the same declaration of a
 `failed`, `stopped`, `cancelled` or `blocked` Task again, as its next
 Execution (reason `rerun`), once all of its executions have ended. Dependants
@@ -307,7 +320,8 @@ controller (`kairo controller`, see Hardware settings) connects the same way.
 | POST | `/api/projects` (apply a ProjectSpec) | admin |
 | GET | `/api/projects/{project}` | read |
 | GET | `/api/projects/{project}/tasks/{task}` | read |
-| POST | `/api/projects/{project}/tasks/{task}/cancel`, `/rerun` | admin |
+| POST | `/api/projects/{project}/tasks/{task}/cancel`, `/rerun`, `/checkpoint` | admin |
+| GET | `/api/commands/{id}` | read |
 | POST, GET | `/api/executions` | admin, read |
 | GET | `/api/executions/{id}` | read |
 | POST | `/api/executions/{id}/withdraw` | admin |
@@ -983,7 +997,10 @@ distributed barrier. Commands may be redelivered, so checkpoint publication
 must remain idempotent by command ID.
 
 A safe point acknowledges a `suspend` `accepted` and `checkpointing`, runs the
-checkpoint callback, and publishes its continuation with `checkpointed`. A
+checkpoint callback, and publishes its continuation with `checkpointed`; a
+`checkpoint` command (`kairo task checkpoint`) runs the same callback
+(`command.kind` tells them apart) and is acknowledged the same way, but the
+safe point returns false and the worker carries on. A
 callback that fails, or returns no continuation, is acknowledged `rejected`;
 unknown command kinds are skipped. After `install_stop_signals()` a SIGTERM /
 CTRL_BREAK (the graceful phase of a force stop) makes the next safe point run

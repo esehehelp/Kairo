@@ -141,8 +141,8 @@ func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch
 	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
 		return err
 	}
-	var executionID, state string
-	if err = tx.QueryRowContext(ctx, `SELECT execution_id,state FROM commands WHERE id=$1 AND attempt_id=$2 AND lease_id=$3 AND coordination_epoch=$4 AND kind='suspend'`, commandID, attemptID, leaseID, epoch).Scan(&executionID, &state); errors.Is(err, sql.ErrNoRows) {
+	var executionID, kind, state string
+	if err = tx.QueryRowContext(ctx, `SELECT execution_id,kind,state FROM commands WHERE id=$1 AND attempt_id=$2 AND lease_id=$3 AND coordination_epoch=$4`, commandID, attemptID, leaseID, epoch).Scan(&executionID, &kind, &state); errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {
 		return err
@@ -163,6 +163,26 @@ func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch
 		if _, err = tx.ExecContext(ctx, `UPDATE commands SET state=$1,payload_json=$2,updated_at=$3 WHERE id=$4`, phase, string(payload), t, commandID); err != nil {
 			return err
 		}
+	}
+	if kind == "checkpoint" {
+		// The attempt carries on: neither it nor its lease moves, and the
+		// checkpoint is not its continuation.
+		if phase == "checkpointed" && advance {
+			var body struct {
+				ContinuationRef string `json:"continuation_ref"`
+			}
+			if err = json.Unmarshal(payload, &body); err != nil || body.ContinuationRef == "" {
+				return errors.New("checkpointed acknowledgement requires continuation_ref")
+			}
+			projectID, projectErr := executionProjectIDTx(ctx, tx, executionID)
+			if projectErr != nil {
+				return projectErr
+			}
+			if err = appendCoordinationEventTx(ctx, tx, "checkpoint_saved", &projectID, "attempt", attemptID, &epoch, map[string]any{"execution_id": executionID, "attempt_id": attemptID, "lease_id": leaseID, "command_id": commandID, "checkpoint_ref": body.ContinuationRef}); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
 	}
 	if phase == "rejected" && advance {
 		result, updateErr := tx.ExecContext(ctx, `UPDATE attempts SET state='running' WHERE id=$1 AND state='quiescing'`, attemptID)
@@ -237,7 +257,7 @@ func (s *Store) EnqueueSuspend(ctx context.Context, attemptID, origin, reason st
 		return "", fmt.Errorf("lease is not suspendable from state %s", leaseState)
 	}
 	var existing string
-	if err = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=$1 AND state!='rejected' LIMIT 1`, attemptID).Scan(&existing); err == nil {
+	if err = tx.QueryRowContext(ctx, `SELECT id FROM commands WHERE attempt_id=$1 AND kind='suspend' AND state!='rejected' LIMIT 1`, attemptID).Scan(&existing); err == nil {
 		return existing, tx.Commit()
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
