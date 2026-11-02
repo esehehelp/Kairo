@@ -388,44 +388,119 @@ func (s *Store) ValidateReservation(ctx context.Context, leaseID string, epoch i
 	if err = validateLeaseGatesTx(ctx, tx, leaseID); err != nil {
 		return err
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT li.resource_id,rr.constraints_json,rr.policy_json,o.valid_until,o.total_bytes,o.free_bytes,
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
-		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity')
-		FROM lease_items li
-		JOIN resource_requests rr ON rr.execution_id=$1 AND rr.request_type='exclusive' AND rr.kind=li.kind
-		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
-		WHERE li.lease_id=$2 AND li.resource_id IS NOT NULL AND li.kind='gpu'`, executionID, leaseID)
+	// Each leased GPU was chosen for one of the execution's GPU requests: the
+	// GPUs are checked against the requests as an assignment (every request
+	// gets its count of GPUs that meet it), not each against every request.
+	type gpuRequest struct {
+		constraints gpuConstraints
+		policy      conflictPolicy
+	}
+	var slots []gpuRequest
+	requestRows, err := tx.QueryContext(ctx, `SELECT quantity,constraints_json,policy_json FROM resource_requests WHERE execution_id=$1 AND request_type='exclusive' AND kind='gpu' ORDER BY id`, executionID)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var resourceID, constraintsJSON, policyJSON string
-		var valid sql.NullString
-		var total, free sql.NullInt64
-		var external, unattributed bool
-		if err = rows.Scan(&resourceID, &constraintsJSON, &policyJSON, &valid, &total, &free, &external, &unattributed); err != nil {
+	for requestRows.Next() {
+		var quantity int64
+		var constraintsJSON, policyJSON string
+		if err = requestRows.Scan(&quantity, &constraintsJSON, &policyJSON); err != nil {
+			requestRows.Close()
 			return err
 		}
-		var constraints gpuConstraints
-		var policy conflictPolicy
-		_ = json.Unmarshal([]byte(constraintsJSON), &constraints)
-		_ = json.Unmarshal([]byte(policyJSON), &policy)
-		deadline, parseErr := time.Parse(time.RFC3339Nano, valid.String)
-		if !valid.Valid || parseErr != nil || !deadline.After(time.Now().UTC()) {
-			return fmt.Errorf("resource %s has stale observation during prepare", resourceID)
-		}
-		if !total.Valid || total.Int64 < constraints.MinTotal || !free.Valid || free.Int64 < constraints.MinFree {
-			return fmt.Errorf("resource %s no longer meets memory constraints", resourceID)
-		}
-		if external {
-			return fmt.Errorf("resource %s acquired an external claim", resourceID)
-		}
-		if unattributed && policy.Unattributed != "allow" {
-			return fmt.Errorf("resource %s has unattributed activity", resourceID)
+		var r gpuRequest
+		_ = json.Unmarshal([]byte(constraintsJSON), &r.constraints)
+		_ = json.Unmarshal([]byte(policyJSON), &r.policy)
+		for i := int64(0); i < quantity; i++ {
+			slots = append(slots, r)
 		}
 	}
-	return rows.Err()
+	if err = requestRows.Close(); err != nil {
+		return err
+	}
+	if len(slots) == 0 {
+		return nil // no GPU request: nothing a GPU must meet
+	}
+	type leasedGPU struct {
+		resourceID, identity string
+		total, free          sql.NullInt64
+		unattributed         bool
+	}
+	var gpus []leasedGPU
+	rows, err := tx.QueryContext(ctx, `SELECT li.resource_id,r.stable_identity,o.valid_until,o.total_bytes,o.free_bytes,
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL AND c.claim_kind='external_process'),
+		EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL AND c.claim_kind='unattributed_activity')
+		FROM lease_items li JOIN resource_instances r ON r.id=li.resource_id
+		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1)
+		WHERE li.lease_id=$1 AND li.resource_id IS NOT NULL AND li.kind='gpu' ORDER BY li.resource_id`, leaseID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var g leasedGPU
+		var valid sql.NullString
+		var external bool
+		if err = rows.Scan(&g.resourceID, &g.identity, &valid, &g.total, &g.free, &external, &g.unattributed); err != nil {
+			rows.Close()
+			return err
+		}
+		deadline, parseErr := time.Parse(time.RFC3339Nano, valid.String)
+		if !valid.Valid || parseErr != nil || !deadline.After(time.Now().UTC()) {
+			rows.Close()
+			return fmt.Errorf("resource %s has stale observation during prepare", g.resourceID)
+		}
+		if external {
+			rows.Close()
+			return fmt.Errorf("resource %s acquired an external claim", g.resourceID)
+		}
+		gpus = append(gpus, g)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	meets := func(g leasedGPU, r gpuRequest) bool {
+		return g.total.Valid && g.total.Int64 >= r.constraints.MinTotal && g.free.Valid && g.free.Int64 >= r.constraints.MinFree &&
+			(r.constraints.Device == "" || r.constraints.Device == g.identity) &&
+			(!g.unattributed || r.policy.Unattributed == "allow")
+	}
+	for _, g := range gpus {
+		usable := false
+		for _, r := range slots {
+			usable = usable || meets(g, r)
+		}
+		switch {
+		case usable:
+		case g.unattributed:
+			return fmt.Errorf("resource %s has unattributed activity", g.resourceID)
+		default:
+			return fmt.Errorf("resource %s no longer meets memory constraints", g.resourceID)
+		}
+	}
+	// Each GPU to a distinct request slot (a small bipartite matching:
+	// augmenting paths, one per GPU).
+	owner := make([]int, len(slots))
+	for i := range owner {
+		owner[i] = -1
+	}
+	var assign func(g int, seen []bool) bool
+	assign = func(g int, seen []bool) bool {
+		for s := range slots {
+			if seen[s] || !meets(gpus[g], slots[s]) {
+				continue
+			}
+			seen[s] = true
+			if owner[s] < 0 || assign(owner[s], seen) {
+				owner[s] = g
+				return true
+			}
+		}
+		return false
+	}
+	for g := range gpus {
+		if !assign(g, make([]bool, len(slots))) {
+			return fmt.Errorf("the leased GPUs no longer meet the execution's GPU requests together (resource %s has no request left it meets)", gpus[g].resourceID)
+		}
+	}
+	return nil
 }
 
 func (s *Store) MarkLeasePrepared(ctx context.Context, leaseID string, epoch int64) error {
