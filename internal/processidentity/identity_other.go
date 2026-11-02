@@ -33,8 +33,11 @@ func readProcess(pid int) (process, error) {
 	return linuxProcessFromStat(pid, string(body))
 }
 
+// HostProcessLiveness distinguishes PID reuse and keeps observation errors
+// separate from positive proof of absence. A zombie (exited, not reaped yet)
+// is absent: it runs nothing and holds nothing.
 func HostProcessLiveness(pid int, expected string) (Liveness, error) {
-	actual, err := ForPID(pid)
+	actual, err := readProcess(pid)
 	if err != nil {
 		if os.IsNotExist(err) {
 			if _, procErr := os.Stat("/proc/self/stat"); procErr != nil {
@@ -44,7 +47,7 @@ func HostProcessLiveness(pid int, expected string) (Liveness, error) {
 		}
 		return LivenessUnknown, err
 	}
-	if actual == expected {
+	if actual.identity == expected && !actual.exited {
 		return LivenessAlive, nil
 	}
 	return LivenessAbsent, nil

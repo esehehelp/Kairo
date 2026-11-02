@@ -62,19 +62,33 @@ func readProcess(pid int) (process, error) {
 }
 
 // HostProcessLiveness distinguishes PID reuse and keeps observation errors
-// separate from positive proof of absence.
+// separate from positive proof of absence. A process that exited is absent
+// even while another process (a parent, a console host) keeps its object
+// open, which keeps its pid and creation time readable.
 func HostProcessLiveness(pid int, expected string) (Liveness, error) {
-	actual, err := ForPID(pid)
+	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
 	if err != nil {
 		if errors.Is(err, windows.ERROR_INVALID_PARAMETER) || errors.Is(err, windows.ERROR_NOT_FOUND) {
 			return LivenessAbsent, nil
 		}
 		return LivenessUnknown, err
 	}
-	if actual == expected {
-		return LivenessAlive, nil
+	defer windows.CloseHandle(handle)
+	var created, exited, kernel, user windows.Filetime
+	if err = windows.GetProcessTimes(handle, &created, &exited, &kernel, &user); err != nil {
+		return LivenessUnknown, err
 	}
-	return LivenessAbsent, nil
+	if WindowsIdentityFromFiletime(pid, uint64(created.HighDateTime)<<32|uint64(created.LowDateTime)) != expected {
+		return LivenessAbsent, nil
+	}
+	var code uint32
+	if err = windows.GetExitCodeProcess(handle, &code); err != nil {
+		return LivenessUnknown, err
+	}
+	if code != 259 { // STILL_ACTIVE
+		return LivenessAbsent, nil
+	}
+	return LivenessAlive, nil
 }
 
 // WSLProcessLiveness checks the Linux /proc start-time tick recorded by the
@@ -90,11 +104,11 @@ func WSLProcessLiveness(ctx context.Context, distro string, pid int, expected st
 		}
 		return LivenessUnknown, fmt.Errorf("query WSL process identity: %w (absence check: %v)", err, absentErr)
 	}
-	actual, err := LinuxIdentityFromStat(pid, string(out))
+	actual, err := linuxProcessFromStat(pid, string(out))
 	if err != nil {
 		return LivenessUnknown, fmt.Errorf("WSL: %w", err)
 	}
-	if actual == expected {
+	if actual.identity == expected && !actual.exited { // a zombie has exited
 		return LivenessAlive, nil
 	}
 	return LivenessAbsent, nil
