@@ -41,6 +41,10 @@ type NVIDIA struct {
 	// false elsewhere, where memory without a visible process is what another
 	// container's work looks like.
 	GraphicsExplainVRAM *bool
+	// GraphicsVRAMAllowance bounds what GraphicsExplainVRAM explains: GPU
+	// memory in use beyond it is unattributed activity although graphics
+	// processes show (zero: defaultGraphicsVRAMAllowance, 3 GiB).
+	GraphicsVRAMAllowance int64
 
 	query atomic.Int32 // the index in nvidiaQueries of the query this driver accepts
 }
@@ -298,7 +302,11 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		// Exclusive scheduling must fail closed even while a compute process is
 		// between kernels (and therefore reports 0% utilization). Operators can
 		// explicitly allow unattributed activity in the manifest when desired.
-		if bytes > 1024*1024*1024 && !seenProcess[uuid] && !(graphics[uuid] && p.graphicsExplainVRAM()) {
+		// Graphics processes explain a desktop's share of memory, not more:
+		// beyond the allowance the memory is someone's work (a game, a
+		// D3D/Vulkan compute job) that pmon shows only as graphics.
+		explained := graphics[uuid] && p.graphicsExplainVRAM() && bytes <= p.graphicsVRAMAllowance()
+		if bytes > 1024*1024*1024 && !seenProcess[uuid] && !explained {
 			resourceID := ""
 			for _, entry := range byIndex {
 				if entry.uuid == uuid {
@@ -311,6 +319,18 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		}
 	}
 	return snap, nil
+}
+
+// defaultGraphicsVRAMAllowance is the GPU memory graphics processes explain
+// when GraphicsVRAMAllowance is zero: a Windows desktop with browsers holds
+// 1-2 GiB.
+const defaultGraphicsVRAMAllowance = int64(3) << 30
+
+func (p *NVIDIA) graphicsVRAMAllowance() int64 {
+	if p.GraphicsVRAMAllowance > 0 {
+		return p.GraphicsVRAMAllowance
+	}
+	return defaultGraphicsVRAMAllowance
 }
 
 func (p *NVIDIA) graphicsExplainVRAM() bool {
