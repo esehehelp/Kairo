@@ -465,8 +465,8 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 			}
 		}
 	}
-	commands, err := tx.QueryContext(ctx, `SELECT c.attempt_id,c.origin,c.id FROM commands c JOIN leases l ON l.attempt_id=c.attempt_id
-		WHERE c.kind='suspend' AND c.state!='rejected' AND l.state IN `+liveLeaseStates+` ORDER BY c.created_at`)
+	commands, err := tx.QueryContext(ctx, `SELECT c.attempt_id,c.origin,c.id,c.state FROM commands c JOIN leases l ON l.attempt_id=c.attempt_id
+		WHERE c.kind='suspend' AND l.state IN `+liveLeaseStates+` ORDER BY c.created_at`)
 	if err != nil {
 		return err
 	}
@@ -477,19 +477,40 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 			byAttempt[l.attemptID] = l
 		}
 	}
+	refused := map[*planLease]bool{}
 	for commands.Next() {
-		var attemptID, origin, commandID string
-		if err = commands.Scan(&attemptID, &origin, &commandID); err != nil {
+		var attemptID, origin, commandID, state string
+		if err = commands.Scan(&attemptID, &origin, &commandID, &state); err != nil {
 			return err
 		}
-		if l := byAttempt[attemptID]; l != nil && !l.suspending {
+		l := byAttempt[attemptID]
+		if l == nil {
+			continue
+		}
+		if state == "rejected" {
+			refused[l] = true
+			continue
+		}
+		if !l.suspending {
 			l.suspending = true
 			if origin == "priority_preemption" {
 				l.preemptionCommand = commandID
 			}
 		}
 	}
-	return commands.Err()
+	if err = commands.Err(); err != nil {
+		return err
+	}
+	// An attempt that rejected a suspend is not suspended again by
+	// preemption (that rejection is the project's answer, and asking again
+	// would loop): it is no victim, so the planner looks for room elsewhere
+	// instead of choosing it every pass.
+	for l := range refused {
+		if !l.suspending {
+			l.victim = false
+		}
+	}
+	return nil
 }
 
 func (m *planModel) executor(executorID string) (planExecutor, bool) {
