@@ -408,11 +408,14 @@ func (s *Store) seriesEnergy(ctx context.Context, device string, from, to time.T
 		power     sql.NullFloat64
 	}
 	var samples []sample
-	// The sample before the window starts the first span.
+	// The sample before the window starts the first span, and the first one
+	// at or after its end closes the last: nothing later is read (a window
+	// in the past would otherwise read every sample since).
 	err := eachRow(ctx, s.db, `SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=$1 AND observed_at<$2 ORDER BY observed_at DESC LIMIT 1)
-		UNION ALL SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=$3 AND observed_at>=$4 ORDER BY observed_at)
+		UNION ALL SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=$3 AND observed_at>=$4 AND observed_at<$5 ORDER BY observed_at)
+		UNION ALL SELECT observed_at,valid_until,power_w FROM (SELECT observed_at,valid_until,power_w FROM device_samples WHERE device=$6 AND observed_at>=$7 ORDER BY observed_at LIMIT 1)
 		ORDER BY observed_at`,
-		[]any{device, sampleStamp(from), device, sampleStamp(from)}, func(rows *sql.Rows) error {
+		[]any{device, sampleStamp(from), device, sampleStamp(from), sampleStamp(to), device, sampleStamp(to)}, func(rows *sql.Rows) error {
 			var at, until string
 			var x sample
 			if err := rows.Scan(&at, &until, &x.power); err != nil {
