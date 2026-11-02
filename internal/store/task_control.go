@@ -195,6 +195,24 @@ func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID s
 	if len(live) > 0 {
 		return RerunResult{}, taskConflict{fmt.Sprintf("execution %s of %s/%s/%s is not terminal (%s); a task is rerun only once all of its executions ended", live[0].id, task.project, task.queue, task.name, live[0].state)}
 	}
+	// A terminal execution may still hold its lease: a lost attempt (its
+	// executor restarted) keeps a stale one whose processes may still run and
+	// write where a rerun would. The rerun waits until every lease is
+	// released (for a stale one: kairo resource reconcile once the processes
+	// are known to be gone).
+	var heldExecution, heldLease, heldState string
+	err = tx.QueryRowContext(ctx, `SELECT e.id,l.id,l.state FROM execution_requests e JOIN leases l ON l.execution_id=e.id
+		WHERE e.task_scope_id=$1 AND l.state!='released' ORDER BY e.submitted_at,e.id,l.id LIMIT 1`, task.scopeID).Scan(&heldExecution, &heldLease, &heldState)
+	if err == nil {
+		hint := "wait until it is released"
+		if heldState == "stale" {
+			hint = "its attempt's processes may still run: once they are gone, release it with kairo resource reconcile"
+		}
+		return RerunResult{}, taskConflict{fmt.Sprintf("execution %s of %s/%s/%s still holds lease %s (%s); %s", heldExecution, task.project, task.queue, task.name, heldLease, heldState, hint)}
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return RerunResult{}, err
+	}
 	ordinal, err := markTaskRerunTx(ctx, tx, task.scopeID, requestID, actor)
 	if err != nil {
 		return RerunResult{}, err
