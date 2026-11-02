@@ -568,11 +568,18 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 	return nil
 }
 
+// terminationGrace is how long a terminated attempt (node quarantine, gang)
+// gets between the graceful stop and the kill of what is left.
+const terminationGrace = 10 * time.Second
+
 // carryOutQuarantineTerminations terminates the process trees of this
 // executor's attempts that a node quarantine stopped and that cannot
-// checkpoint. The launcher is found through this executor's own handle, or
-// else through the recorded pid when its creation identity still matches (an
-// executor restarted since the launch). Quiescence is proven afterwards by
+// checkpoint, and of the running ranks of a gang one of whose ranks stopped.
+// The whole tree is reached as for a force stop (processTree): the job
+// object, the launcher's process group, and the processes carrying the
+// attempt's KAIRO_ATTEMPT_ID, inside WSL too. A graceful stop goes first, a
+// kill after terminationGrace, and the termination is recorded only once no
+// process of the tree is left. Quiescence is proven afterwards by
 // reconcileQuiescence as for any exit.
 func (e *Local) carryOutQuarantineTerminations(ctx context.Context) error {
 	terminations, err := e.Store.ListQuarantineTerminations(ctx, e.ID)
@@ -580,35 +587,44 @@ func (e *Local) carryOutQuarantineTerminations(ctx context.Context) error {
 		return err
 	}
 	for _, t := range terminations {
-		pid := 0
+		tree := e.attemptTree(store.ForceStopOrder{AttemptID: t.AttemptID, ExecutionID: t.ExecutionID, PID: t.PID, ProcessIdentity: t.ProcessIdentity})
+		alive, err := e.treeAlive(ctx, tree)
+		if err != nil {
+			e.Logger.Warn("termination: process liveness unknown; retrying", "attempt_id", t.AttemptID, "error", err)
+			continue
+		}
+		if alive {
+			e.mu.Lock()
+			if e.terminating == nil {
+				e.terminating = map[string]time.Time{}
+			}
+			since, signalled := e.terminating[t.AttemptID]
+			if !signalled {
+				e.terminating[t.AttemptID] = time.Now()
+			}
+			e.mu.Unlock()
+			switch {
+			case !signalled:
+				if err := e.stopTreeGracefully(ctx, tree); err != nil {
+					e.Logger.Warn("termination: graceful stop unavailable; killing the process tree", "attempt_id", t.AttemptID, "error", err)
+					if err := e.killTree(ctx, tree); err != nil {
+						e.Logger.Warn("termination: kill failed; retrying", "attempt_id", t.AttemptID, "error", err)
+					}
+				}
+			case time.Since(since) >= terminationGrace:
+				if err := e.killTree(ctx, tree); err != nil {
+					e.Logger.Warn("termination: kill failed; retrying", "attempt_id", t.AttemptID, "error", err)
+				}
+			}
+			continue
+		}
 		e.mu.Lock()
-		if cmd := e.running[t.AttemptID]; cmd != nil && cmd.Process != nil {
-			pid = cmd.Process.Pid
-		}
+		delete(e.terminating, t.AttemptID)
 		e.mu.Unlock()
-		if pid == 0 && t.PID != nil && t.ProcessIdentity != nil {
-			if liveness, _ := processidentity.HostProcessLiveness(*t.PID, *t.ProcessIdentity); liveness == processidentity.LivenessAlive {
-				pid = *t.PID
-			}
-		}
-		if pid != 0 {
-			if err := killProcessTree(pid); err != nil {
-				// taskkill / kill also fail when the process has just exited on its own.
-				gone := t.PID != nil && t.ProcessIdentity != nil
-				if gone {
-					liveness, _ := processidentity.HostProcessLiveness(*t.PID, *t.ProcessIdentity)
-					gone = liveness == processidentity.LivenessAbsent
-				}
-				if !gone {
-					e.Logger.Warn("quarantine termination failed; retrying", "attempt_id", t.AttemptID, "pid", pid, "error", err)
-					continue
-				}
-			}
-			e.Logger.Info("terminated attempt for node quarantine", "attempt_id", t.AttemptID, "pid", pid)
-		}
 		if err := e.Store.MarkQuarantineTerminated(ctx, t.AttemptID); err != nil && !errors.Is(err, store.ErrNotFound) {
 			return err
 		}
+		e.Logger.Info("terminated attempt", "attempt_id", t.AttemptID)
 	}
 	return nil
 }
