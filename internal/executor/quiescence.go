@@ -16,10 +16,17 @@ const leftBehindReportInterval = time.Minute
 // the processes carrying its KAIRO_ATTEMPT_ID (inside WSL too). Its launcher
 // has exited, so only those count.
 func (e *Local) leftBehind(ctx context.Context, attempt store.Attempt) (bool, error) {
-	e.mu.Lock()
-	handle := e.trees[attempt.ID]
-	e.mu.Unlock()
-	t := processTree{attemptID: attempt.ID, handle: handle, wsl: e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2", distro: e.Attributes["distro"]}
+	wsl := e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2"
+	var handle *treeHandle
+	if !wsl {
+		// For WSL the work is the Linux processes, found by their
+		// KAIRO_ATTEMPT_ID; the Windows side of wsl.exe is not counted (its
+		// helpers may outlive it without running anything of the attempt).
+		e.mu.Lock()
+		handle = e.trees[attempt.ID]
+		e.mu.Unlock()
+	}
+	t := processTree{attemptID: attempt.ID, handle: handle, wsl: wsl, distro: e.Attributes["distro"]}
 	left, err := e.treeAlive(ctx, t)
 	if err == nil && !left {
 		e.mu.Lock()
