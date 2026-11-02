@@ -563,6 +563,16 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err != nil {
 		return nil, err
 	}
+	if leaseState == "prepared" && executionState == "authorized" {
+		// Asked again: the executor never received the answer (a lost
+		// response). The authorization nobody consumed is issued anew.
+		launch, err := reissueLaunchTx(ctx, tx, reservation, projectID, executionID, executorID, leaseEpoch)
+		if err != nil {
+			return nil, err
+		}
+		launch.Env = env
+		return launch, tx.Commit()
+	}
 	if leaseState != "prepared" || executionState != "waiting" {
 		return nil, fmt.Errorf("%w: lease=%s execution=%s", ErrExecutionStarted, leaseState, executionState)
 	}
@@ -631,6 +641,78 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	return launch, nil
 }
 
+// reissueLaunchTx answers an AuthorizeLaunch repeated for a lease whose
+// attempt is authorized but whose authorization nobody consumed: the launch
+// and worker tokens are replaced (only their hashes are stored, so the first
+// answer's cannot be sent again) and the same attempt is handed over. Once
+// the authorization is consumed or revoked the repeat is refused.
+func reissueLaunchTx(ctx context.Context, tx *sql.Tx, reservation *Reservation, projectID, executionID, executorID string, epoch int64) (*Launch, error) {
+	leaseID := reservation.Lease.ID
+	var attemptID, attemptState, authorizationID, authorizationState string
+	err := tx.QueryRowContext(ctx, `SELECT a.id,a.state,la.id,la.state FROM leases l JOIN attempts a ON a.id=l.attempt_id
+		JOIN launch_authorizations la ON la.attempt_id=a.id WHERE l.id=$1`, leaseID).Scan(&attemptID, &attemptState, &authorizationID, &authorizationState)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: lease has no authorized attempt", ErrExecutionStarted)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if attemptState != "authorized" || authorizationState != "issued" {
+		return nil, fmt.Errorf("%w: attempt=%s authorization=%s", ErrExecutionStarted, attemptState, authorizationState)
+	}
+	if err = validateLeaseGatesTx(ctx, tx, leaseID); err != nil {
+		return nil, err
+	}
+	gang, placementState, err := gangLaunchTx(ctx, tx, leaseID)
+	if err != nil {
+		return nil, err
+	}
+	if gang != nil && placementState == "aborted" {
+		return nil, ErrGangAborted
+	}
+	token, tokenHash, err := newSecret("")
+	if err != nil {
+		return nil, err
+	}
+	workerToken, workerTokenHash, err := newSecret("kairo_worker_")
+	if err != nil {
+		return nil, err
+	}
+	stamp := now()
+	if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET token_hash=$1,issued_at=$2 WHERE id=$3 AND state='issued'`, tokenHash, stamp, authorizationID); err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE attempt_tokens SET token_hash=$1,issued_at=$2 WHERE attempt_id=$3`, workerTokenHash, stamp, attemptID); err != nil {
+		return nil, err
+	}
+	var authorizedAt sql.NullString
+	if err = tx.QueryRowContext(ctx, `SELECT authorized_at FROM execution_requests WHERE id=$1`, executionID).Scan(&authorizedAt); err != nil {
+		return nil, err
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "launch_reauthorized", &projectID, "attempt", attemptID, &epoch, map[string]string{"execution_id": executionID, "lease_id": leaseID, "authorization_id": authorizationID}); err != nil {
+		return nil, err
+	}
+	reservation.Lease.AttemptID = &attemptID
+	launch := &Launch{
+		Execution:            reservation.Execution,
+		Attempt:              Attempt{ID: attemptID, ExecutionID: executionID, State: "authorized", ExecutorID: executorID, CoordinationEpoch: epoch},
+		Lease:                reservation.Lease,
+		AuthorizationID:      authorizationID,
+		AuthorizationToken:   token,
+		WorkerToken:          workerToken,
+		Argv:                 append([]string(nil), reservation.Argv...),
+		CWD:                  reservation.CWD,
+		Resources:            append([]ResourceInstance(nil), reservation.Resources...),
+		InputContinuationRef: reservation.Execution.InputContinuationRef,
+		Gang:                 gang,
+	}
+	launch.Execution.State = "authorized"
+	if authorizedAt.Valid {
+		launch.Execution.AuthorizedAt = &authorizedAt.String
+	}
+	return launch, nil
+}
+
 func (s *Store) ActivateLaunch(ctx context.Context, attemptID, leaseID string, epoch int64, token string, pid int, processIdentity string) error {
 	if pid <= 0 || processIdentity == "" {
 		return errors.New("launcher pid and process identity are required")
@@ -642,6 +724,18 @@ func (s *Store) ActivateLaunch(ctx context.Context, attemptID, leaseID string, e
 	defer tx.Rollback()
 	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
 		return err
+	}
+	// A repeat of an activation that went through (the executor never got
+	// the answer) is answered the same, even after a gate has closed since:
+	// the process it names is the attempt's.
+	var activated bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM launch_authorizations la JOIN attempts a ON a.id=la.attempt_id
+		WHERE la.attempt_id=$1 AND la.lease_id=$2 AND la.coordination_epoch=$3 AND la.token_hash=$4 AND la.state='consumed'
+		AND a.pid=$5 AND a.process_identity=$6)`, attemptID, leaseID, epoch, hashToken(token), pid, processIdentity).Scan(&activated); err != nil {
+		return err
+	}
+	if activated {
+		return tx.Commit()
 	}
 	if err = validateLeaseGatesTx(ctx, tx, leaseID); err != nil {
 		return err

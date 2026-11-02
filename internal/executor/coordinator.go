@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"time"
 
 	"kairo/internal/store"
 )
@@ -26,6 +27,7 @@ type Coordinator interface {
 	ListQuiescenceCandidates(ctx context.Context, executorID string) ([]store.QuiescenceCandidate, error)
 	FinalizeQuiescence(ctx context.Context, attemptID, leaseID string, epoch int64) error
 	ReleaseReservation(ctx context.Context, leaseID string, epoch int64, reason string) error
+	ListUnlaunchedLeases(ctx context.Context, executorID string, olderThan time.Duration) ([]store.UnlaunchedLease, error)
 	ListQuarantineTerminations(ctx context.Context, executorID string) ([]store.QuarantineTermination, error)
 	MarkQuarantineTerminated(ctx context.Context, attemptID string) error
 	ForceStopOrders(ctx context.Context, executorID string) ([]store.ForceStopOrder, error)

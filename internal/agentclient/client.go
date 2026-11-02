@@ -49,6 +49,10 @@ type Error struct {
 
 func (e *Error) Error() string { return fmt.Sprintf("agent API %d: %s", e.Status, e.Message) }
 
+// HTTPStatus is the status of the daemon's answer: an executor asks again
+// after a 5xx (no answer from the store), never after a 4xx.
+func (e *Error) HTTPStatus() int { return e.Status }
+
 func (c *Client) call(ctx context.Context, op string, body, out any) error {
 	payload, err := json.Marshal(body)
 	if err != nil {
@@ -119,6 +123,17 @@ func (c *Client) EnsurePriorityPreemption(ctx context.Context, executorID string
 	}
 	err := c.call(ctx, "ensure-preemption", map[string]string{"executor_id": executorID}, &out)
 	return out.Commands, err
+}
+
+// ListUnlaunchedLeases asks for this executor's leases that never reached a
+// running attempt (store.ListUnlaunchedLeases). A daemon older than this
+// operation answers 404, as an unknown route.
+func (c *Client) ListUnlaunchedLeases(ctx context.Context, executorID string, olderThan time.Duration) ([]store.UnlaunchedLease, error) {
+	var out struct {
+		Leases []store.UnlaunchedLease `json:"leases"`
+	}
+	err := c.call(ctx, "unlaunched-leases", map[string]any{"executor_id": executorID, "older_than_seconds": olderThan.Seconds()}, &out)
+	return out.Leases, err
 }
 
 func (c *Client) ValidateReservation(ctx context.Context, leaseID string, epoch int64) error {

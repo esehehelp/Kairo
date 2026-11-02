@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 
 	"kairo/internal/store"
 )
@@ -40,6 +41,11 @@ type agentObservationRequest struct {
 
 type agentExecutorRequest struct {
 	ExecutorID string `json:"executor_id"`
+}
+
+type agentUnlaunchedRequest struct {
+	ExecutorID       string  `json:"executor_id"`
+	OlderThanSeconds float64 `json:"older_than_seconds"`
 }
 
 type agentLeaseRequest struct {
@@ -200,6 +206,14 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentExecutorRequest) (any, error) {
 				commands, err := s.Store.EnsurePriorityPreemption(ctx, b.ExecutorID)
 				return map[string]any{"commands": commands}, err
+			}),
+		newAgentOp(s, "unlaunched-leases", observeEmpty, map[string]any{"leases": []store.UnlaunchedLease{}},
+			func(ctx context.Context, b agentUnlaunchedRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentUnlaunchedRequest) (any, error) {
+				leases, err := s.Store.ListUnlaunchedLeases(ctx, b.ExecutorID, time.Duration(b.OlderThanSeconds*float64(time.Second)))
+				return map[string]any{"leases": leases}, err
 			}),
 		newAgentOp(s, "validate-reservation", observeRefused, nil, byLease,
 			func(ctx context.Context, b agentLeaseRequest) (any, error) {

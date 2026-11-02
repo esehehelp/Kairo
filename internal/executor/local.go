@@ -66,6 +66,21 @@ type Local struct {
 	// Prepared gang ranks waiting at the launch barrier, by lease ID.
 	pendingGang map[string]pendingGangRank
 
+	// Reservations given up whose lease could not be released yet, by lease
+	// ID (cleanup.go): retried at every tick, never forgotten. When the store
+	// was last asked for leases this instance does not hold, and whether that
+	// failed the last time.
+	pendingCleanups        map[string]pendingCleanup
+	lastUnlaunchedSweep    time.Time
+	unlaunchedSweepFailing bool
+	// RetryDelay is the first wait before a launch call whose answer did not
+	// arrive is made again (zero: 1 s; it doubles).
+	RetryDelay time.Duration
+
+	// Terminations of node quarantines and gangs being carried out: when the
+	// graceful stop was sent, by attempt.
+	terminating map[string]time.Time
+
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
 	trees              map[string]*treeHandle
@@ -164,6 +179,10 @@ func (e *Local) tick(ctx context.Context) error {
 	if err := e.inStep("gang-retry", func() error { return e.retryPendingGangRanks(ctx) }); err != nil {
 		return err
 	}
+	e.beginStep("cleanup-retry")
+	e.retryCleanups(ctx)
+	e.sweepUnlaunched(ctx)
+	e.endStep()
 	for {
 		reservation, err := e.reserveNext(ctx)
 		if err != nil || reservation == nil {
@@ -234,28 +253,24 @@ func (e *Local) prepareReservation(ctx context.Context, reservation *store.Reser
 		prepareErr = e.Store.ValidateReservation(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch)
 	}
 	if prepareErr != nil {
-		if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, prepareErr.Error()); cleanupErr != nil {
-			e.Logger.Error("reservation cleanup failed", "lease_id", reservation.Lease.ID, "error", cleanupErr)
-		}
 		e.Logger.Warn("lease prepare failed", "lease_id", reservation.Lease.ID, "error", prepareErr)
+		e.abandonReservation(reservation.Lease, prepared, prepareErr.Error(), "")
 		return false, nil
 	}
 	if err := e.Store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
-		if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, err.Error()); cleanupErr != nil {
-			return false, fmt.Errorf("mark lease prepared: %v; cleanup: %w", err, cleanupErr)
-		}
+		e.Logger.Warn("lease not marked prepared", "lease_id", reservation.Lease.ID, "error", err)
+		e.abandonReservation(reservation.Lease, prepared, err.Error(), "")
 		return false, nil
 	}
-	launch, err := e.Store.AuthorizeLaunch(ctx, reservation)
+	launch, err := e.authorize(ctx, reservation)
 	if errors.Is(err, store.ErrGangNotReady) {
 		// Hold the prepared rank at the barrier until every rank is prepared.
 		e.holdGangRank(reservation, prepared)
 		return true, nil
 	}
 	if err != nil {
-		if cleanupErr := e.cleanupReservation(context.Background(), reservation.Lease, prepared, err.Error()); cleanupErr != nil {
-			return false, fmt.Errorf("authorize launch: %v; cleanup: %w", err, cleanupErr)
-		}
+		e.Logger.Warn("launch not authorized", "lease_id", reservation.Lease.ID, "error", err)
+		e.abandonReservation(reservation.Lease, prepared, err.Error(), "")
 		return false, nil
 	}
 	e.launchAuthorized(launch)
@@ -400,9 +415,7 @@ func providerAction(ctx context.Context, e *Local, providerID string, action fun
 func (e *Local) launchAuthorized(launch *store.Launch) {
 	if err := e.start(launch); err != nil {
 		e.Logger.Error("attempt launch failed", "attempt_id", launch.Attempt.ID, "error", err)
-		if cleanupErr := e.cleanupReservation(context.Background(), launch.Lease, launch.Resources, "launch failed before activation: "+err.Error()); cleanupErr != nil {
-			e.Logger.Error("reservation cleanup failed", "lease_id", launch.Lease.ID, "error", cleanupErr)
-		}
+		e.abandonReservation(launch.Lease, launch.Resources, "launch failed before activation: "+err.Error(), launch.Attempt.ID)
 	}
 }
 
@@ -427,21 +440,22 @@ func (e *Local) retryPendingGangRanks(ctx context.Context) error {
 	}
 	e.mu.Unlock()
 	for _, p := range pending {
-		launch, err := e.Store.AuthorizeLaunch(ctx, p.reservation)
+		launch, err := e.authorize(ctx, p.reservation)
 		if errors.Is(err, store.ErrGangNotReady) {
 			continue
+		}
+		if err != nil {
+			e.Logger.Warn("gang rank not launched", "lease_id", p.reservation.Lease.ID, "error", err)
+			// Into the cleanups before leaving the barrier, so that the
+			// unlaunched-lease sweep never sees it held by nobody.
+			e.abandonReservation(p.reservation.Lease, p.prepared, err.Error(), "")
 		}
 		e.mu.Lock()
 		delete(e.pendingGang, p.reservation.Lease.ID)
 		e.mu.Unlock()
-		if err != nil {
-			e.Logger.Warn("gang rank not launched", "lease_id", p.reservation.Lease.ID, "error", err)
-			if cleanupErr := e.cleanupReservation(context.Background(), p.reservation.Lease, p.prepared, err.Error()); cleanupErr != nil {
-				return fmt.Errorf("gang rank cleanup: %w", cleanupErr)
-			}
-			continue
+		if err == nil {
+			e.launchAuthorized(launch)
 		}
-		e.launchAuthorized(launch)
 	}
 	return nil
 }
@@ -775,17 +789,18 @@ func (e *Local) start(launch *store.Launch) error {
 	}
 	identity, identityErr := processidentity.ForPID(cmd.Process.Pid)
 	if identityErr != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		tree.close()
+		e.killUnactivated(launch, cmd, tree, "")
 		stdout.Close()
 		stderr.Close()
 		return fmt.Errorf("read process creation identity: %w", identityErr)
 	}
-	if err = e.Store.ActivateLaunch(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, cmd.Process.Pid, identity); err != nil {
-		_ = cmd.Process.Kill()
-		_ = cmd.Wait()
-		tree.close()
+	// Asked again while no answer arrives: a repeat of an activation that
+	// went through is answered the same (store.ActivateLaunch).
+	err = e.retryUnanswered(context.Background(), func() error {
+		return e.Store.ActivateLaunch(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, cmd.Process.Pid, identity)
+	})
+	if err != nil {
+		e.killUnactivated(launch, cmd, tree, identity)
 		stdout.Close()
 		stderr.Close()
 		return err
