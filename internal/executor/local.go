@@ -80,6 +80,9 @@ type Local struct {
 	// Terminations of node quarantines and gangs being carried out: when the
 	// graceful stop was sent, by attempt.
 	terminating map[string]time.Time
+	// When an exited attempt whose lease is held for what it left running
+	// was last reported, by attempt (quiescence.go).
+	leftReported map[string]time.Time
 
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
@@ -536,6 +539,14 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 			}
 		}
 		if !allAbsent {
+			continue
+		}
+		// The registered processes are gone; so must be what they started
+		// without registering it (a DataLoader worker, a daemonised helper):
+		// the job object, the process group, the processes carrying the
+		// attempt's KAIRO_ATTEMPT_ID. Until then the lease stays.
+		if left, err := e.leftBehind(ctx, candidate.Attempt); err != nil || left {
+			e.warnLeftBehind(candidate.Attempt.ID, err)
 			continue
 		}
 		refreshed := make(map[string]bool)
