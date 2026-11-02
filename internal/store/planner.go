@@ -207,6 +207,10 @@ func (f *planFit) fail(reason, message string, terminal bool) {
 	}
 }
 
+// assignedRank holds, in an overlay, what assign gave a rank of the placement
+// it is building.
+const assignedRank = "(another rank of this placement)"
+
 func (o planOverlay) take(f planFit, executionID string) {
 	for _, d := range f.devices {
 		o.devices[d] = executionID
@@ -1035,7 +1039,10 @@ func (p *planner) assign(ranks []planRank, options [][]planExecutor, ov planOver
 		sort.SliceStable(fits, func(a, b int) bool { return p.m.better(fits[a].fit, fits[b].fit, ov) })
 		for _, s := range fits {
 			next := ov.clone()
-			next.take(s.fit, "")
+			// Taken for a rank of this placement: the other ranks must see
+			// its devices as held (a GPU shared by two nodes is one device,
+			// and an empty holder would not count as one).
+			next.take(s.fit, assignedRank)
 			used[s.executor.nodeID] = true
 			slots[i] = s
 			if walk(depth+1, next) {
