@@ -397,13 +397,34 @@ func (s *Store) DiscoverPauseTargets(ctx context.Context, operationID string) ([
 	} else if err != nil {
 		return nil, err
 	}
-	if err = discoverPauseTargetsTx(ctx, tx, operationID, scopeID, now()); err != nil {
+	// Only while the operation still owns its closed gate, checked in this
+	// transaction: a resume committed since the caller looked opened it at a
+	// new generation, and what runs after the resume is not this pause's.
+	owns, err := pauseOwnsGateTx(ctx, tx, operationID)
+	if err != nil {
 		return nil, err
+	}
+	if owns {
+		if err = discoverPauseTargetsTx(ctx, tx, operationID, scopeID, now()); err != nil {
+			return nil, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.ListPauseTargets(ctx, operationID)
+}
+
+// pauseOwnsGateTx reports whether a pause operation's scope gate is still
+// the one it closed: closed, at the generation the operation captured.
+func pauseOwnsGateTx(ctx context.Context, tx *sql.Tx, operationID string) (bool, error) {
+	var owns bool
+	err := tx.QueryRowContext(ctx, `SELECT g.state='closed' AND g.generation=p.scope_generation FROM pause_operations p
+		JOIN admission_gates g ON g.scope_id=p.scope_id WHERE p.id=$1`, operationID).Scan(&owns)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return owns, err
 }
 
 // pauseOperationSelect reads a pause operation with its force stop options.

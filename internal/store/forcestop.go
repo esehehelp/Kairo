@@ -76,6 +76,11 @@ func (s *Store) forceWithdraw(ctx context.Context, operation PauseOperation, exe
 		return err
 	}
 	defer tx.Rollback()
+	// The execution was listed before this transaction; a resume committed
+	// since then opened the gate, and what waits now is not this pause's.
+	if owns, err := pauseOwnsGateTx(ctx, tx, operation.ID); err != nil || !owns {
+		return err
+	}
 	withdrawn, err := withdrawExecutionTx(ctx, tx, executionID)
 	if err != nil {
 		return err
