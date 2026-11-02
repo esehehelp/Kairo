@@ -733,11 +733,17 @@ func gangAggregateTx(ctx context.Context, tx *sql.Tx, current *currentTaskExecut
 		other := "releasing"
 		current.LeaseState = &other
 	}
-	if allZero {
+	switch {
+	case allZero:
 		zero := 0
 		current.ExitCode, current.ExitSignal = &zero, nil
-	} else if firstNonZero != nil {
+	case firstNonZero != nil:
 		current.ExitCode = firstNonZero
+	default:
+		// Not every rank exited 0, yet none with another code: a rank has no
+		// exit (it never launched) or was signalled. The leader's 0 is not
+		// the gang's.
+		current.ExitCode = nil
 	}
 	return out, nil
 }
