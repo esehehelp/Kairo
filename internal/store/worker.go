@@ -75,7 +75,23 @@ func (s *Store) RegisterProcess(ctx context.Context, attemptID, leaseID string, 
 	return tx.Commit()
 }
 
+// deliveryHistory is how many deliveries of a command are each recorded in
+// command_deliveries; after that one in deliveryHistoryEvery is. A worker polls
+// about once a second, so a command it never acknowledges (an SDK that skips
+// its kind) would otherwise add a row a second for the attempt's lifetime.
+// delivery_count keeps the exact number.
+const (
+	deliveryHistory      = 10
+	deliveryHistoryEvery = 100
+)
+
 func (s *Store) PollCommands(ctx context.Context, attemptID, leaseID string, epoch int64) ([]Command, error) {
+	// Nearly every poll finds nothing: answer it from a read, which neither
+	// takes the decision lock nor waits for it.
+	pending, err := s.hasPollableCommands(ctx, attemptID, leaseID, epoch)
+	if err != nil || !pending {
+		return nil, err
+	}
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
@@ -116,11 +132,36 @@ func (s *Store) PollCommands(ctx context.Context, attemptID, leaseID string, epo
 		if _, err = tx.ExecContext(ctx, `UPDATE commands SET delivery_count=delivery_count+1,updated_at=$1 WHERE id=$2`, t, commands[i].ID); err != nil {
 			return nil, err
 		}
-		if _, err = tx.ExecContext(ctx, `INSERT INTO command_deliveries(command_id,attempt_id,coordination_epoch,delivered_at) VALUES($1,$2,$3,$4)`, commands[i].ID, attemptID, epoch, t); err != nil {
-			return nil, err
+		if n := commands[i].DeliveryCount; n <= deliveryHistory || n%deliveryHistoryEvery == 0 {
+			if _, err = tx.ExecContext(ctx, `INSERT INTO command_deliveries(command_id,attempt_id,coordination_epoch,delivered_at) VALUES($1,$2,$3,$4)`, commands[i].ID, attemptID, epoch, t); err != nil {
+				return nil, err
+			}
 		}
 	}
 	return commands, tx.Commit()
+}
+
+// hasPollableCommands is PollCommands' check, in a read: whether the attempt
+// (current at this epoch, running or quiescing) has a command to deliver.
+func (s *Store) hasPollableCommands(ctx context.Context, attemptID, leaseID string, epoch int64) (bool, error) {
+	tx, err := s.beginRead(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
+		return false, err
+	}
+	var attemptState, leaseState string
+	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=$1 AND l.attempt_id=a.id WHERE a.id=$2`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
+		return false, err
+	}
+	if (attemptState != "running" && attemptState != "quiescing") || (leaseState != "active" && leaseState != "releasing") {
+		return false, ErrStaleEpoch
+	}
+	var pending bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM commands WHERE attempt_id=$1 AND state IN('pending','accepted','checkpointing'))`, attemptID).Scan(&pending)
+	return pending, err
 }
 
 func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch int64, commandID, phase string, payload json.RawMessage) error {
