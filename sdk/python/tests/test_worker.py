@@ -142,17 +142,56 @@ def test_terminal_states_raise_and_stay_without_more_requests(response, error, f
         assert len(daemon.requests) == sent
 
 
-def test_transient_poll_failure_is_classified():
+def test_transient_poll_failure_is_no_command_and_is_recorded():
+    # A daemon restart or a network blip must not end the worker at its safe point.
     with serve(FakeDaemon(worker_routes({"GET /api/worker/commands": UNAVAILABLE}))) as daemon:
         session = session_for(daemon.url)
         session.heartbeat()
-        with pytest.raises(KairoAPIError) as raised:
-            session.safe_point(checkpoint=lambda _c: "x")
-    assert raised.value.classification == "transient"
-    assert raised.value.status == 503 and raised.value.code == "internal"
-    assert raised.value.message == "database is locked"
-    assert str(raised.value).startswith("Kairo API returned HTTP 503: ")
+        assert session.safe_point(checkpoint=lambda _c: "x") is False
+    error = session.last_control_error
+    assert isinstance(error, KairoAPIError) and error.classification == "transient"
+    assert error.status == 503 and error.code == "internal"
+    assert error.message == "database is locked"
+    assert str(error).startswith("Kairo API returned HTTP 503: ")
     assert not session.retired and not session.fenced
+
+
+def test_refused_connection_at_a_safe_point_is_no_command():
+    with serve(FakeDaemon(worker_routes())) as daemon:
+        url = daemon.url
+    session = session_for(url)  # the daemon is gone: every request is refused
+    assert session.safe_point(checkpoint=lambda _c: "x") is False
+    assert session.last_control_error is not None
+    assert not session.retired and not session.fenced
+
+
+def test_failed_checkpoint_command_is_rejected_and_the_worker_carries_on():
+    routes = worker_routes({"GET /api/worker/commands": suspend("cmd_c", kind="checkpoint"),
+                            "POST /api/worker/commands/cmd_c/acks": OK})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+
+        def checkpoint(_command):
+            raise OSError("disk full")
+
+        assert session.safe_point(checkpoint=checkpoint) is False
+    assert [body["phase"] for body in acks(daemon)] == ["accepted", "checkpointing", "rejected"]
+    assert isinstance(session.last_checkpoint_error, OSError)
+    assert not session.suspend_handled
+
+
+def test_gang_rank_acknowledges_its_own_command_like_rank_zero():
+    routes = worker_routes({"GET /api/worker/commands": suspend("cmd_rank1", kind="checkpoint"),
+                            "POST /api/worker/commands/cmd_rank1/acks": OK})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+        session.gang = GangContext("gang_1", 1, 2, "10.0.0.2", 29500)
+        adapter = DistributedAdapter(session)
+        adapter._mirror_on_own_attempt(1, "checkpoint", "ckpt://rank0", None)
+        adapter._mirror_on_own_attempt(0, "checkpoint", "ckpt://rank0", None)  # rank 0 acknowledged its own
+    phases = [body["phase"] for body in acks(daemon)]
+    assert phases == ["accepted", "checkpointing", "checkpointed"]
+    assert acks(daemon)[-1]["payload"]["continuation_ref"] == "ckpt://rank0"
 
 
 # --------------------------------------------------------------------------

@@ -186,6 +186,9 @@ class AttemptSession:
         self._stop = threading.Event()
         self._heartbeat_thread: threading.Thread | None = None
         self.last_control_error: BaseException | None = None
+        # The failure of the latest checkpoint command that could not be saved
+        # (the worker carried on).
+        self.last_checkpoint_error: BaseException | None = None
         self.retired = False
         self.fenced = False
         self._terminal_error: KairoAPIError | None = None
@@ -386,13 +389,22 @@ class AttemptSession:
         A ``checkpoint`` command (``kairo task checkpoint``) runs the same
         callback (``command.kind`` tells them apart) and is acknowledged the
         same way, but ``False`` is returned: the worker carries on, and the
-        checkpoint it published is not a continuation.
+        checkpoint it published is not a continuation. A checkpoint command
+        whose callback raises or returns no ``continuation_ref`` is
+        acknowledged ``rejected`` and the worker carries on too (the error
+        is logged and kept in :attr:`last_checkpoint_error`): it asked for a
+        copy, not for the run to end.
 
-        If the callback raises, the command is acknowledged ``rejected`` and
-        the exception propagates; if it returns no ``continuation_ref``,
-        ``rejected`` too, and :class:`~kairo_sdk.errors.NoContinuationError`
-        is raised. A command that disappeared meanwhile (HTTP 404) is dropped
-        and the worker carries on. Unknown command kinds are skipped.
+        If a suspend's callback raises, the command is acknowledged
+        ``rejected`` and the exception propagates; if it returns no
+        ``continuation_ref``, ``rejected`` too, and
+        :class:`~kairo_sdk.errors.NoContinuationError` is raised. A command
+        that disappeared meanwhile (HTTP 404) is dropped and the worker
+        carries on. Unknown command kinds are skipped. A daemon or network
+        briefly unavailable (a transient or retry-later failure of the poll,
+        a heartbeat or an acknowledgement) is no command this time, kept in
+        :attr:`last_control_error`; the command is delivered again at a
+        later safe point.
 
         After command handling, a stop signal (:func:`install_stop_signals`)
         also stops the worker: ``checkpoint`` runs once, with ``reason``
@@ -405,7 +417,7 @@ class AttemptSession:
         Raises :class:`~kairo_sdk.errors.AttemptRetired` /
         :class:`~kairo_sdk.errors.AttemptFenced` when the attempt is over,
         and :class:`~kairo_sdk.errors.KairoAPIError` (see its
-        ``classification``) or a transport error otherwise.
+        ``classification``) or a transport error that is not transient.
         """
         if progress is not None:
             self.set_progress(progress)
@@ -414,7 +426,11 @@ class AttemptSession:
         # behavior for compatibility.
         now = time.monotonic()
         if self.managed and self._heartbeat_thread is None and now - self._last_heartbeat >= self.heartbeat_interval_seconds:
-            self.heartbeat()
+            try:
+                self.heartbeat()
+            except Exception as error:
+                if not self._unavailable(error):
+                    raise
         stop_path = next((path for path in self.stop_paths if path.exists()), None)
         if stop_path is not None:
             context = CommandContext(
@@ -431,7 +447,13 @@ class AttemptSession:
             return True
         if self.managed and now - self._last_poll >= self.poll_interval_seconds:
             self._last_poll = now
-            for raw in self.poll_commands():
+            try:
+                commands = self.poll_commands()
+            except Exception as error:
+                if not self._unavailable(error):
+                    raise
+                commands = []
+            for raw in commands:
                 if self._handle_command(raw, checkpoint):
                     return True
         if stop_requested():
@@ -460,32 +482,60 @@ class AttemptSession:
         try:
             self._ack(context.command_id, "accepted")
             self._ack(context.command_id, "checkpointing")
-        except KairoAPIError as error:
-            if error.classification != errors.GONE:
-                raise
-            _log.info("Kairo command %s was withdrawn: %s", context.command_id, error)
-            return False
+        except Exception as error:
+            if self._withdrawn_or_unavailable(context.command_id, error):
+                return False
+            raise
         try:
             result = normalize_suspend_result(checkpoint(context))
-        except BaseException as error:
+        except Exception as error:
+            self._try_reject(context.command_id, f"{type(error).__name__}: {error}")
+            if context.kind == "checkpoint":
+                self.last_checkpoint_error = error
+                _log.warning("Kairo checkpoint %s failed; the worker carries on: %s", context.command_id, error)
+                return False
+            raise
+        except BaseException as error:  # KeyboardInterrupt, SystemExit: refused, then out
             self._try_reject(context.command_id, f"{type(error).__name__}: {error}")
             raise
         if not result.continuation_ref:
             self._try_reject(context.command_id, "no continuation_ref")
-            raise NoContinuationError(
-                f"checkpoint callback returned no continuation_ref for command {context.command_id}"
-            )
+            message = f"checkpoint callback returned no continuation_ref for command {context.command_id}"
+            if context.kind == "checkpoint":
+                self.last_checkpoint_error = NoContinuationError(message)
+                _log.warning("Kairo checkpoint %s published nothing; the worker carries on", context.command_id)
+                return False
+            raise NoContinuationError(message)
         try:
             self._ack(context.command_id, "checkpointed", suspend_payload(result))
-        except KairoAPIError as error:
-            if error.classification != errors.GONE:
-                raise
-            _log.info("Kairo command %s was withdrawn: %s", context.command_id, error)
-            return False
+        except Exception as error:
+            if self._withdrawn_or_unavailable(context.command_id, error):
+                return False
+            raise
         if context.kind == "checkpoint":
             return False  # published; the worker carries on
         self.suspend_handled = True
         return True
+
+    def _unavailable(self, error: BaseException) -> bool:
+        """Whether ``error`` says the daemon or the network is briefly
+        unavailable (transient or retry-later); it is then recorded in
+        :attr:`last_control_error` and the safe point carries on."""
+        if isinstance(error, (AttemptRetired, AttemptFenced)):
+            return False
+        if errors.classify(error) not in (errors.TRANSIENT, errors.RETRY_LATER):
+            return False
+        self.last_control_error = error
+        _log.warning("Kairo is unavailable at this safe point; carrying on: %s", error)
+        return True
+
+    def _withdrawn_or_unavailable(self, command_id: str, error: BaseException) -> bool:
+        """An acknowledgement failure that means carry on: the command was
+        withdrawn (404), or will be delivered again (unavailable)."""
+        if isinstance(error, KairoAPIError) and error.classification == errors.GONE:
+            _log.info("Kairo command %s was withdrawn: %s", command_id, error)
+            return True
+        return self._unavailable(error)
 
     def _try_reject(self, command_id: str, reason: str) -> None:
         try:

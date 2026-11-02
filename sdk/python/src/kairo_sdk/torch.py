@@ -62,6 +62,26 @@ class DistributedAdapter:
         else:
             registrations[0] = local
 
+        if self._own_attempts:
+            # A Kairo gang: every rank is an attempt of its own (on its own
+            # node), so each registers its process there and keeps its own
+            # heartbeat; its executor proves its quiescence from that.
+            local_error: str | None = None
+            try:
+                self.session.register_process(rank=rank, pid=local["pid"], process_identity=local["identity"])
+            except BaseException as exc:
+                self.session.last_control_error = exc
+                local_error = f"rank {rank}: Kairo process registration failed: {exc}"
+            errors_by_rank: list[Any] = [None] * world_size
+            if distributed:
+                dist.all_gather_object(errors_by_rank, local_error)
+            else:
+                errors_by_rank[0] = local_error
+            _raise_rank_errors(errors_by_rank)
+            self.session.start()
+            self._registered = True
+            return
+
         error: str | None = None
         if rank == 0:
             try:
@@ -83,10 +103,16 @@ class DistributedAdapter:
             self.session.start()
         self._registered = True
 
+    @property
+    def _own_attempts(self) -> bool:
+        """Whether every rank is an attempt of its own (a Kairo gang:
+        ``KAIRO_GANG_*``) rather than a process of rank 0's attempt."""
+        return self.session.gang is not None
+
     def close(self) -> None:
         dist, distributed = self._distribution()
         rank = dist.get_rank() if distributed else 0
-        if rank == 0:
+        if rank == 0 or self._own_attempts:
             self.session.close()
 
     def local_continuation(
@@ -173,13 +199,18 @@ class DistributedAdapter:
         same command is delivered again at a later safe point; checkpoint
         callbacks must consequently be idempotent by command ID. A
         ``checkpoint`` command (``kairo task checkpoint``) is checkpointed by
-        every rank the same way and returns ``False``: every rank carries on.
+        every rank the same way and returns ``False``: every rank carries on,
+        also when the checkpoint fails (it is acknowledged ``rejected``). In a
+        Kairo gang every rank is an attempt of its own: rank 0 polls and
+        decides, and every other rank then acknowledges its own command of
+        the same kind the same way.
 
         The semantics follow :meth:`AttemptSession.safe_point`: unknown
         command kinds are skipped, a withdrawn command (HTTP 404) is dropped,
-        rank 0 returning no ``continuation_ref`` is acknowledged ``rejected``
-        and raises :class:`~kairo_sdk.errors.NoContinuationError` on every
-        rank, and a retired or fenced attempt raises
+        rank 0 returning no ``continuation_ref`` for a suspend is
+        acknowledged ``rejected`` and raises
+        :class:`~kairo_sdk.errors.NoContinuationError` on every rank, and a
+        retired or fenced attempt raises
         :class:`~kairo_sdk.errors.AttemptRetired` /
         :class:`~kairo_sdk.errors.AttemptFenced` on every rank. Transient
         control-plane failures are reported as "no command" so a temporary
@@ -221,17 +252,21 @@ class DistributedAdapter:
             errors_by_rank[0] = local_error
         failures = [error for error in errors_by_rank if error is not None]
         if failures:
+            reason = "; ".join(failures)
             if rank == 0:
-                self._try_ack(
-                    context.command_id,
-                    "rejected",
-                    {"reason": "; ".join(failures)},
-                )
-            raise RuntimeError("; ".join(failures))
+                self._try_ack(context.command_id, "rejected", {"reason": reason})
+            self._mirror_on_own_attempt(rank, context.kind, None, reason)
+            if context.kind == "checkpoint":
+                # A checkpoint command asked for a copy, not for the run to
+                # end: refused, and every rank carries on.
+                self.session.last_checkpoint_error = RuntimeError(reason)
+                _log.warning("Kairo checkpoint %s failed; every rank carries on: %s", context.command_id, reason)
+                return False
+            raise RuntimeError(reason)
 
         if distributed:
             dist.barrier()
-        outcome: dict[str, Any] = {"ok": False, "no_continuation": False, "terminal": None}
+        outcome: dict[str, Any] = {"ok": False, "no_continuation": False, "terminal": None, "continuation_ref": None}
         if rank == 0:
             assert result is not None
             if not result.continuation_ref:
@@ -240,6 +275,7 @@ class DistributedAdapter:
             else:
                 status = self._try_ack(context.command_id, "checkpointed", suspend_payload(result))
                 outcome["ok"] = status == "ok"
+                outcome["continuation_ref"] = result.continuation_ref
                 if status == "terminal":
                     outcome["terminal"] = _terminal_message(self.session)
         acknowledgement = [outcome]
@@ -248,14 +284,51 @@ class DistributedAdapter:
         outcome = acknowledgement[0]
         _raise_terminal(self.session, outcome["terminal"])
         if outcome["no_continuation"]:
-            raise NoContinuationError(
-                f"rank 0 checkpoint returned no continuation_ref for command {context.command_id}"
-            )
+            self._mirror_on_own_attempt(rank, context.kind, None, "no continuation_ref")
+            message = f"rank 0 checkpoint returned no continuation_ref for command {context.command_id}"
+            if context.kind == "checkpoint":
+                self.session.last_checkpoint_error = NoContinuationError(message)
+                _log.warning("Kairo checkpoint %s published nothing; every rank carries on", context.command_id)
+                return False
+            raise NoContinuationError(message)
+        if outcome["ok"]:
+            self._mirror_on_own_attempt(rank, context.kind, outcome["continuation_ref"], None)
         if context.kind == "checkpoint":
             return False  # published (or redelivered after a failed acknowledgement); every rank carries on
         if outcome["ok"]:
             self.session.suspend_handled = True
         return bool(outcome["ok"])
+
+    def _mirror_on_own_attempt(
+        self, rank: int, kind: str, continuation_ref: str | None, rejection: str | None
+    ) -> None:
+        """In a Kairo gang, rank ``rank`` (not 0) acknowledges its own
+        attempt's command of the same kind the way rank 0's was: published
+        with rank 0's ``continuation_ref``, or rejected. Every rank got one
+        (a checkpoint, or the suspend a gang hands every rank) and only rank
+        0 polls, so without this a rank's command stayed pending. Best
+        effort, and no collective: a failure leaves it for the next round.
+        """
+        if rank == 0 or not self._own_attempts:
+            return
+        session = self.session
+        try:
+            commands = session.poll_commands()
+        except BaseException as exc:
+            session.last_control_error = exc
+            return
+        for raw in commands:
+            if str(raw.get("kind") or "") != kind:
+                continue
+            command_id = str(raw["id"])
+            for phase in ("accepted", "checkpointing"):
+                if self._try_ack(command_id, phase) != "ok":
+                    return
+            if rejection is not None:
+                self._try_ack(command_id, "rejected", {"reason": f"rank 0: {rejection}"})
+            elif continuation_ref:
+                self._try_ack(command_id, "checkpointed", {"continuation_ref": continuation_ref, "gang_rank": rank})
+            return
 
     def _checkpoint_for_stop_signal(self, checkpoint, dist, distributed: bool, rank: int) -> bool:
         """Rank 0 received a stop signal: every rank checkpoints once, then stops.

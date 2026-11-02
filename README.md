@@ -1001,8 +1001,16 @@ checkpoint callback, and publishes its continuation with `checkpointed`; a
 `checkpoint` command (`kairo task checkpoint`) runs the same callback
 (`command.kind` tells them apart) and is acknowledged the same way, but the
 safe point returns false and the worker carries on. A
-callback that fails, or returns no continuation, is acknowledged `rejected`;
-unknown command kinds are skipped. After `install_stop_signals()` a SIGTERM /
+callback that fails, or returns no continuation, is acknowledged `rejected`:
+for a suspend the error is raised, for a `checkpoint` command the worker
+carries on (it asked for a copy, not for the run to end). Unknown command
+kinds are skipped. A daemon or network briefly unavailable (a transient or
+retry-later failure of the poll, a heartbeat or an acknowledgement) is no
+command at that safe point: it carries on, keeps the error in
+`last_control_error`, and the command is delivered again. In a Kairo gang
+`DistributedAdapter` registers and heartbeats every rank in its own attempt;
+rank 0 polls and decides, and every other rank then acknowledges its own
+command the same way. After `install_stop_signals()` a SIGTERM /
 CTRL_BREAK (the graceful phase of a force stop) makes the next safe point run
 the callback once (reason `stop_signal`, no command id, nothing acknowledged)
 and return true, so the work can still be resumed by hand. A worker whose

@@ -233,6 +233,12 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// A failure that says the daemon or the network is briefly unavailable
+/// (transient or retry-later): a safe point carries on and asks again later.
+fn unavailable(e: &Error) -> bool {
+    matches!(e.kind, ErrorKind::Transient | ErrorKind::RetryLater)
+}
+
 impl Session {
     pub(crate) fn start(attempt: &Attempt, options: Options) -> Session {
         let inner = Arc::new(Inner {
@@ -366,8 +372,13 @@ impl Session {
     /// payload. A failing callback, or one returning no continuation_ref, is
     /// acknowledged `rejected`. A `checkpoint` command runs the same way but
     /// returns `Ok(false)`: the worker carries on, and the checkpoint is not
-    /// a continuation. Other command kinds are skipped without an
-    /// ack. A command withdrawn while acknowledged (404) means carry on.
+    /// a continuation; its callback failing, or returning no
+    /// continuation_ref, is acknowledged `rejected` and the worker carries
+    /// on too. Other command kinds are skipped without an ack. A command
+    /// withdrawn while acknowledged (404) means carry on, and so does a
+    /// daemon or network briefly unavailable (a transient or retry-later
+    /// failure of the poll or an ack): the command is delivered again at a
+    /// later safe point.
     pub fn safe_point<E: fmt::Display>(
         &self,
         callback: impl FnOnce(&SuspendRequest) -> Result<SuspendResult, E>,
@@ -381,7 +392,12 @@ impl Session {
         let now = Instant::now();
         if sp.last_poll.is_none_or(|last| now.duration_since(last) >= self.inner.options.poll_interval) {
             sp.last_poll = Some(now);
-            let commands = self.inner.client.poll_commands().map_err(|e| SafePointError::Kairo(self.observe(e)))?;
+            let commands = match self.inner.client.poll_commands() {
+                Ok(commands) => commands,
+                // No command this time: the next safe point polls again.
+                Err(e) if unavailable(&e) => Vec::new(),
+                Err(e) => return Err(SafePointError::Kairo(self.observe(e))),
+            };
             if let Some(command) = commands.into_iter().find(|c| c.kind == "suspend" || c.kind == "checkpoint") {
                 return self.suspend(command, callback);
             }
@@ -411,10 +427,11 @@ impl Session {
         callback: impl FnOnce(&SuspendRequest) -> Result<SuspendResult, E>,
     ) -> Result<bool, SafePointError<E>> {
         let client = &self.inner.client;
-        // Ok(false): the command was withdrawn (404), carry on.
+        // Ok(false): the command was withdrawn (404), or the daemon is briefly
+        // unavailable (it is delivered again): carry on.
         let ack = |phase: Phase, payload: Option<&Value>| match client.ack(&command.id, phase, payload) {
             Ok(()) => Ok(true),
-            Err(e) if e.kind == ErrorKind::Gone => Ok(false),
+            Err(e) if e.kind == ErrorKind::Gone || unavailable(&e) => Ok(false),
             Err(e) => Err(SafePointError::Kairo(self.observe(e))),
         };
         if !ack(Phase::Accepted, None)? || !ack(Phase::Checkpointing, None)? {
@@ -434,21 +451,30 @@ impl Session {
                 self.observe(e);
             }
         };
+        // A checkpoint command that cannot be saved is refused and the worker
+        // carries on: it asked for a copy, not for the run to end.
+        let checkpoint = command.kind == "checkpoint";
         let result = match callback(&request) {
             Ok(result) => result,
             Err(e) => {
                 reject(e.to_string());
+                if checkpoint {
+                    return Ok(false);
+                }
                 return Err(SafePointError::Callback(e));
             }
         };
         let Some(continuation_ref) = result.continuation_ref.filter(|r| !r.is_empty()) else {
             reject("no continuation_ref".into());
+            if checkpoint {
+                return Ok(false);
+            }
             return Err(SafePointError::NoContinuation);
         };
         let mut payload = result.payload;
         payload.insert("continuation_ref".into(), continuation_ref.into());
         // A checkpoint command is published and the worker carries on.
-        Ok(ack(Phase::Checkpointed, Some(&Value::Object(payload)))? && command.kind != "checkpoint")
+        Ok(ack(Phase::Checkpointed, Some(&Value::Object(payload)))? && !checkpoint)
     }
 
     /// Record a failed request: a retired or fenced attempt ends the

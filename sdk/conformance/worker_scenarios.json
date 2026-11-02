@@ -98,12 +98,43 @@
       "expect": {"result": false}
     },
     {
-      "name": "daemon briefly unavailable",
+      "name": "daemon briefly unavailable: no command this time, the worker carries on",
       "callback": {"returns": {"continuation_ref": "unused"}},
       "exchanges": [
         {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 503, "body": {"error": "database is locked", "code": "internal"}}}
       ],
-      "expect": {"error": "transient"}
+      "expect": {"result": false}
+    },
+    {
+      "name": "acknowledgement briefly unavailable: the command comes again, the worker carries on",
+      "callback": {"returns": {"continuation_ref": "unused"}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd_1", "kind": "suspend", "origin": "scope_pause", "reason": "paused", "delivery_count": 1}]}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_1/acks", "body": {"phase": "accepted"}}, "response": {"status": 503, "body": {"error": "database is locked", "code": "internal"}}}
+      ],
+      "expect": {"result": false}
+    },
+    {
+      "name": "checkpoint callback raises: rejected, the worker carries on",
+      "callback": {"raises": "disk full"},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd_3", "kind": "checkpoint", "origin": "operator_checkpoint", "reason": "checkpoint requested by admin", "delivery_count": 1}]}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_3/acks", "body": {"phase": "accepted"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_3/acks", "body": {"phase": "checkpointing"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_3/acks", "body": {"phase": "rejected"}}, "response": {"status": 202, "body": {"ok": true}}}
+      ],
+      "expect": {"result": false}
+    },
+    {
+      "name": "checkpoint without continuation_ref: rejected, the worker carries on",
+      "callback": {"returns": {}},
+      "exchanges": [
+        {"request": {"method": "GET", "path": "/api/worker/commands"}, "response": {"status": 200, "body": {"commands": [{"id": "cmd_4", "kind": "checkpoint", "origin": "operator_checkpoint", "reason": "checkpoint requested by admin", "delivery_count": 1}]}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_4/acks", "body": {"phase": "accepted"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_4/acks", "body": {"phase": "checkpointing"}}, "response": {"status": 202, "body": {"ok": true}}},
+        {"request": {"method": "POST", "path": "/api/worker/commands/cmd_4/acks", "body": {"phase": "rejected", "payload": {"reason": "no continuation_ref"}}}, "response": {"status": 202, "body": {"ok": true}}}
+      ],
+      "expect": {"result": false}
     }
   ]
 }
