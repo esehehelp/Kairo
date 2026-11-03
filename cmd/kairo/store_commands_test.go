@@ -11,12 +11,13 @@ import (
 
 func TestStoreStatusPrintsStoresAndKeptScratch(t *testing.T) {
 	gib := func(n int64) *int64 { v := n << 30; return &v }
-	problem, kept, reason := "root E:/kairo is not on filesystem E:", "2026-11-03T01:02:03Z", "exit 1"
+	problem, kept, reason, since := "root E:/kairo is not on filesystem E:", "2026-11-03T01:02:03Z", "exit 1", "2026-11-03T04:05:06Z"
 	stores := []store.StoreStatus{
 		{Store: machine.Store{ID: "e-durable", Class: "durable", Node: "win", Root: "E:/kairo", Filesystem: "E:"}, State: "unusable", Problem: &problem, Kept: []store.KeptScratch{}},
 		{Store: machine.Store{ID: "pool", Class: "volatile", Node: "pve0", Root: "/srv/kairo", Filesystem: "/"}, State: "ready",
 			TotalBytes: gib(300), FreeBytes: gib(100), ScratchActiveBytes: 2 << 30, ScratchKeptBytes: 1 << 30, ExternalBytes: gib(197),
-			Kept: []store.KeptScratch{{AttemptID: "att_1", ExecutionID: "exe_1", Task: "neo/train/run", Path: "/srv/kairo/scratch/att_1", Bytes: gib(1), KeptAt: &kept, Reason: &reason}}},
+			Kept:    []store.KeptScratch{{AttemptID: "att_1", ExecutionID: "exe_1", Task: "neo/train/run", Path: "/srv/kairo/scratch/att_1", Bytes: gib(1), KeptAt: &kept, Reason: &reason}},
+			Missing: []store.KeptScratch{{AttemptID: "att_2", ExecutionID: "exe_2", Task: "neo/train/gone", Path: "/srv/kairo/scratch/att_2", MissingAt: &since}}},
 		{Store: machine.Store{ID: "wsl", Class: "volatile", Node: "win", Executor: "ubuntu-wsl", Root: "/var/tmp/kairo", Filesystem: "D:"}, State: "unknown", Kept: []store.KeptScratch{}},
 	}
 	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -38,6 +39,8 @@ func TestStoreStatusPrintsStoresAndKeptScratch(t *testing.T) {
 		"e-durable: root E:/kairo is not on filesystem E:",
 		"kept scratch on pool:",
 		"att_1    neo/train/run  1 GiB  2026-11-03T01:02:03Z  exit 1  /srv/kairo/scratch/att_1",
+		"missing scratch on pool (no longer found under the root; Kairo did not delete it):",
+		"att_2    neo/train/gone  2026-11-03T04:05:06Z  /srv/kairo/scratch/att_2",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in:\n%s", want, out)

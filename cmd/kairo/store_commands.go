@@ -50,7 +50,7 @@ func storeStatus(args []string) error {
 
 // formatStores is one line a store (its filesystem's total and free, Kairo's
 // bytes by class and what else the filesystem holds), then each store's kept
-// scratch.
+// scratch and its missing scratch.
 func formatStores(stores []store.StoreStatus) string {
 	if len(stores) == 0 {
 		return "no stores declared ([[stores]] in kairo machine apply)\n"
@@ -85,6 +85,22 @@ func formatStores(stores []store.StoreStatus) string {
 				reason = *k.Reason
 			}
 			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\t%s\n", k.AttemptID, dash(k.Task), optionalSize(k.Bytes), kept, reason, k.Path)
+		}
+		w.Flush()
+	}
+	for _, s := range stores {
+		if len(s.Missing) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "\nmissing scratch on %s (no longer found under the root; Kairo did not delete it):\n", s.ID)
+		w = tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "  ATTEMPT\tTASK\tSINCE\tPATH")
+		for _, k := range s.Missing {
+			since := "-"
+			if k.MissingAt != nil {
+				since = *k.MissingAt
+			}
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", k.AttemptID, dash(k.Task), since, k.Path)
 		}
 		w.Flush()
 	}

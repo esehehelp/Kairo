@@ -225,8 +225,9 @@ func scratchAction(declared []machine.Store, nodeID, storeID, root, path, attemp
 	return ScratchKeep, reason
 }
 
-// ScratchToSettle is the active scratch of an executor's attempts that have
-// quiesced or were lost, each with what is to be done with it.
+// ScratchToSettle is the unsettled scratch (active, or missing before it was
+// settled) of an executor's attempts that have quiesced or were lost, each
+// with what is to be done with it.
 func (s *Store) ScratchToSettle(ctx context.Context, executorID string) ([]ScratchSettlement, error) {
 	tx, err := s.beginRead(ctx)
 	if err != nil {
@@ -240,7 +241,7 @@ func (s *Store) ScratchToSettle(ctx context.Context, executorID string) ([]Scrat
 	out := []ScratchSettlement{}
 	err = eachRow(ctx, tx, `SELECT k.attempt_id,k.store_id,k.root,k.path,x.node_id,`+scratchOutcomeColumns+`
 		FROM attempt_scratch k JOIN attempts a ON a.id=k.attempt_id JOIN execution_requests e ON e.id=a.execution_id JOIN executors x ON x.id=k.executor_id
-		WHERE k.executor_id=$1 AND k.state='active' AND a.state IN('quiesced','lost') ORDER BY k.created_at,k.attempt_id`, []any{executorID}, func(rows *sql.Rows) error {
+		WHERE k.executor_id=$1 AND k.state IN('active','missing') AND k.settled_at IS NULL AND a.state IN('quiesced','lost') ORDER BY k.created_at,k.attempt_id`, []any{executorID}, func(rows *sql.Rows) error {
 		var k ScratchSettlement
 		var nodeID string
 		var o scratchOutcome
@@ -268,11 +269,12 @@ func (s *Store) SettleScratch(ctx context.Context, settled ScratchSettled) error
 	}
 	defer tx.Rollback()
 	var current, storeID, root, path, nodeID, executionID string
+	var settledAt sql.NullString
 	var epoch int64
 	var o scratchOutcome
-	err = tx.QueryRowContext(ctx, `SELECT k.state,k.store_id,k.root,k.path,x.node_id,a.execution_id,a.coordination_epoch,`+scratchOutcomeColumns+`
+	err = tx.QueryRowContext(ctx, `SELECT k.state,k.settled_at,k.store_id,k.root,k.path,x.node_id,a.execution_id,a.coordination_epoch,`+scratchOutcomeColumns+`
 		FROM attempt_scratch k JOIN attempts a ON a.id=k.attempt_id JOIN execution_requests e ON e.id=a.execution_id JOIN executors x ON x.id=k.executor_id
-		WHERE k.attempt_id=$1`, settled.AttemptID).Scan(append([]any{&current, &storeID, &root, &path, &nodeID, &executionID, &epoch}, o.targets()...)...)
+		WHERE k.attempt_id=$1`, settled.AttemptID).Scan(append([]any{&current, &settledAt, &storeID, &root, &path, &nodeID, &executionID, &epoch}, o.targets()...)...)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -282,7 +284,8 @@ func (s *Store) SettleScratch(ctx context.Context, settled ScratchSettled) error
 	if current == settled.State {
 		return tx.Commit()
 	}
-	if current != "active" || o.attemptState != "quiesced" && o.attemptState != "lost" {
+	unsettled := current == "active" || current == "missing" && !settledAt.Valid
+	if !unsettled || o.attemptState != "quiesced" && o.attemptState != "lost" {
 		return fmt.Errorf("%w: scratch %s of an attempt %s cannot be settled", ErrStaleEpoch, current, o.attemptState)
 	}
 	declared, err := declaredStores(ctx, tx)
@@ -297,7 +300,7 @@ func (s *Store) SettleScratch(ctx context.Context, settled ScratchSettled) error
 		reason = settled.Reason
 	}
 	t := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE attempt_scratch SET state=$1,bytes=COALESCE($2,bytes),reason=$3,settled_at=$4,updated_at=$5 WHERE attempt_id=$6`,
+	if _, err = tx.ExecContext(ctx, `UPDATE attempt_scratch SET state=$1,bytes=COALESCE($2,bytes),reason=$3,settled_at=$4,updated_at=$5,missing_at=NULL WHERE attempt_id=$6`,
 		settled.State, settled.Bytes, reason, t, t, settled.AttemptID); err != nil {
 		return err
 	}

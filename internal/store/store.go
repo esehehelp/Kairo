@@ -241,9 +241,30 @@ func checkDatabase(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// beginWrite begins a transaction that may write: the only way to write.
-// It takes the decision lock first, so writing transactions never overlap.
+// beginWrite begins a transaction that may write: the way to write. It
+// takes the decision lock first, so writing transactions never overlap.
 func (s *Store) beginWrite(ctx context.Context) (*sql.Tx, error) { return beginWriteDB(ctx, s.db) }
+
+// beginUnlockedWrite begins a writing transaction without the decision
+// lock, for what agents observe of stores (RecordStoreObservation), which no
+// decision reads: admission, leases, launches and the rest never look at
+// store observations or at scratch bytes and presence, so a report need not
+// wait for a decision nor make one wait. The scratch records it shares with
+// decisions (recording and settling scratch, under the lock) it changes only
+// with single statements whose conditions PostgreSQL checks again under the
+// row lock, so neither side loses the other's change. Nothing else may use
+// it.
+func (s *Store) beginUnlockedWrite(ctx context.Context) (*sql.Tx, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, "SET TRANSACTION READ WRITE"); err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+	return tx, nil
+}
 
 // beginWriteDB is beginWrite on a pool (Open migrates through it).
 func beginWriteDB(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
