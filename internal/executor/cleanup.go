@@ -29,7 +29,10 @@ type pendingCleanup struct {
 	// out to be past release (the activation went through after all), the
 	// attempt is ended through RecordTerminal and the ordinary quiescence.
 	attemptID string
-	retryAt   time.Time
+	// tree is the process tree of a launch whose activation failed and which
+	// was not seen empty after the kill: nothing is released before it is.
+	tree    *processTree
+	retryAt time.Time
 }
 
 const (
@@ -46,10 +49,11 @@ const (
 )
 
 // abandonReservation returns what a reservation prepared and releases its
-// lease, or keeps it to retry (retryCleanups).
-func (e *Local) abandonReservation(lease store.Lease, resources []store.ResourceInstance, reason, attemptID string) {
-	c := pendingCleanup{lease: lease, resources: resources, reason: reason, attemptID: attemptID}
-	if e.tryCleanup(context.Background(), c) {
+// lease, or keeps it to retry (retryCleanups). tree, when set, is a process
+// tree that must be seen empty first.
+func (e *Local) abandonReservation(lease store.Lease, resources []store.ResourceInstance, reason, attemptID string, tree *processTree) {
+	c := pendingCleanup{lease: lease, resources: resources, reason: reason, attemptID: attemptID, tree: tree}
+	if e.tryCleanup(context.Background(), &c) {
 		return
 	}
 	c.retryAt = time.Now().Add(cleanupRetryInterval)
@@ -62,8 +66,21 @@ func (e *Local) abandonReservation(lease store.Lease, resources []store.Resource
 }
 
 // tryCleanup reports whether the cleanup is done: the lease released (now or
-// before), or the attempt of a lease past release ended.
-func (e *Local) tryCleanup(ctx context.Context, c pendingCleanup) bool {
+// before), or the attempt of a lease past release ended. A process tree left
+// by an unactivated launch is killed again until it is seen empty; until
+// then nothing is released.
+func (e *Local) tryCleanup(ctx context.Context, c *pendingCleanup) bool {
+	if c.tree != nil {
+		if alive, err := e.treeAlive(ctx, *c.tree); err != nil || alive {
+			if killErr := e.killTree(ctx, *c.tree); killErr != nil {
+				err = errors.Join(err, killErr)
+			}
+			e.Logger.Warn("unactivated launch still has processes; its reservation is kept", "lease_id", c.lease.ID, "attempt_id", c.attemptID, "error", err)
+			return false
+		}
+		c.tree.handle.close()
+		c.tree = nil
+	}
 	err := e.cleanupReservation(ctx, c.lease, c.resources, c.reason)
 	if err == nil {
 		return true
@@ -96,7 +113,7 @@ func (e *Local) retryCleanups(ctx context.Context) {
 	}
 	e.mu.Unlock()
 	for _, c := range due {
-		done := e.tryCleanup(ctx, c)
+		done := e.tryCleanup(ctx, &c)
 		e.mu.Lock()
 		if done {
 			delete(e.pendingCleanups, c.lease.ID)
@@ -134,7 +151,7 @@ func (e *Local) sweepUnlaunched(ctx context.Context) {
 			continue
 		}
 		e.Logger.Warn("releasing a reservation this executor does not hold (its answer never arrived)", "lease_id", u.Lease.ID, "execution_id", u.Lease.ExecutionID, "state", u.Lease.State)
-		e.abandonReservation(u.Lease, u.Resources, "reservation its executor never received", u.AttemptID)
+		e.abandonReservation(u.Lease, u.Resources, "reservation its executor never received", u.AttemptID, nil)
 	}
 }
 
@@ -191,12 +208,23 @@ func unanswered(err error) bool {
 	return false
 }
 
+// unactivatedKillWait is how long killUnactivated waits for the tree to be
+// seen empty before it leaves the rest to the cleanup's retries.
+const unactivatedKillWait = 10 * time.Second
+
 // killUnactivated ends a launcher whose activation failed together with
 // everything it started: its job object or process group, and the
 // processes carrying its KAIRO_ATTEMPT_ID (inside WSL too), not the launcher
-// alone, whose children would otherwise run on unmanaged.
+// alone, whose children would otherwise run on unmanaged. A signal sent is
+// not a process gone: the tree must be seen empty. If it is not within
+// unactivatedKillWait, the tree is kept (its handle open) for the launch's
+// cleanup, which releases nothing before it is empty (leftovers).
 func (e *Local) killUnactivated(launch *store.Launch, cmd *exec.Cmd, tree *treeHandle, identity string) {
-	t := processTree{attemptID: launch.Attempt.ID, pid: cmd.Process.Pid, identity: identity, handle: tree, wsl: e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2", distro: e.Attributes["distro"]}
+	wsl := e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2"
+	t := processTree{attemptID: launch.Attempt.ID, pid: cmd.Process.Pid, identity: identity, handle: tree, wsl: wsl, distro: e.Attributes["distro"]}
+	if !wsl {
+		t.group = cmd.Process.Pid
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if err := e.killTree(ctx, t); err != nil {
@@ -204,5 +232,37 @@ func (e *Local) killUnactivated(launch *store.Launch, cmd *exec.Cmd, tree *treeH
 	}
 	_ = cmd.Process.Kill()
 	_ = cmd.Wait()
-	tree.close()
+	t.pid = 0 // reaped: only what it left counts now
+	for deadline := time.Now().Add(unactivatedKillWait); ; {
+		alive, err := e.treeAlive(ctx, t)
+		if err == nil && !alive {
+			tree.close()
+			return
+		}
+		if time.Now().After(deadline) {
+			e.Logger.Warn("unactivated launch still has processes after the kill; its reservation is kept until they are gone", "attempt_id", launch.Attempt.ID, "error", err)
+			e.mu.Lock()
+			if e.leftovers == nil {
+				e.leftovers = map[string]processTree{}
+			}
+			e.leftovers[launch.Attempt.ID] = t
+			e.mu.Unlock()
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+		_ = e.killTree(ctx, t)
+	}
+}
+
+// takeLeftover returns, and forgets, the tree killUnactivated kept for an
+// attempt (nil when it was seen empty).
+func (e *Local) takeLeftover(attemptID string) *processTree {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	t, ok := e.leftovers[attemptID]
+	if !ok {
+		return nil
+	}
+	delete(e.leftovers, attemptID)
+	return &t
 }

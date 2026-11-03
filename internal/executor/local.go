@@ -73,6 +73,9 @@ type Local struct {
 	pendingCleanups        map[string]pendingCleanup
 	lastUnlaunchedSweep    time.Time
 	unlaunchedSweepFailing bool
+	// Process trees of launches whose activation failed that were not seen
+	// empty after the kill, by attempt, until their cleanup takes them.
+	leftovers map[string]processTree
 	// RetryDelay is the first wait before a launch call whose answer did not
 	// arrive is made again (zero: 1 s; it doubles).
 	RetryDelay time.Duration
@@ -257,12 +260,12 @@ func (e *Local) prepareReservation(ctx context.Context, reservation *store.Reser
 	}
 	if prepareErr != nil {
 		e.Logger.Warn("lease prepare failed", "lease_id", reservation.Lease.ID, "error", prepareErr)
-		e.abandonReservation(reservation.Lease, prepared, prepareErr.Error(), "")
+		e.abandonReservation(reservation.Lease, prepared, prepareErr.Error(), "", nil)
 		return false, nil
 	}
 	if err := e.Store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
 		e.Logger.Warn("lease not marked prepared", "lease_id", reservation.Lease.ID, "error", err)
-		e.abandonReservation(reservation.Lease, prepared, err.Error(), "")
+		e.abandonReservation(reservation.Lease, prepared, err.Error(), "", nil)
 		return false, nil
 	}
 	launch, err := e.authorize(ctx, reservation)
@@ -273,7 +276,7 @@ func (e *Local) prepareReservation(ctx context.Context, reservation *store.Reser
 	}
 	if err != nil {
 		e.Logger.Warn("launch not authorized", "lease_id", reservation.Lease.ID, "error", err)
-		e.abandonReservation(reservation.Lease, prepared, err.Error(), "")
+		e.abandonReservation(reservation.Lease, prepared, err.Error(), "", nil)
 		return false, nil
 	}
 	e.launchAuthorized(launch)
@@ -418,7 +421,7 @@ func providerAction(ctx context.Context, e *Local, providerID string, action fun
 func (e *Local) launchAuthorized(launch *store.Launch) {
 	if err := e.start(launch); err != nil {
 		e.Logger.Error("attempt launch failed", "attempt_id", launch.Attempt.ID, "error", err)
-		e.abandonReservation(launch.Lease, launch.Resources, "launch failed before activation: "+err.Error(), launch.Attempt.ID)
+		e.abandonReservation(launch.Lease, launch.Resources, "launch failed before activation: "+err.Error(), launch.Attempt.ID, e.takeLeftover(launch.Attempt.ID))
 	}
 }
 
@@ -451,7 +454,7 @@ func (e *Local) retryPendingGangRanks(ctx context.Context) error {
 			e.Logger.Warn("gang rank not launched", "lease_id", p.reservation.Lease.ID, "error", err)
 			// Into the cleanups before leaving the barrier, so that the
 			// unlaunched-lease sweep never sees it held by nobody.
-			e.abandonReservation(p.reservation.Lease, p.prepared, err.Error(), "")
+			e.abandonReservation(p.reservation.Lease, p.prepared, err.Error(), "", nil)
 		}
 		e.mu.Lock()
 		delete(e.pendingGang, p.reservation.Lease.ID)

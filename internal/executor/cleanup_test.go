@@ -70,7 +70,7 @@ func TestFailedReservationCleanupIsRetriedUntilTheLeaseIsReleased(t *testing.T) 
 	fake := &fakeReleases{failures: 2}
 	e := quietExecutor(fake)
 	lease := store.Lease{ID: "lea_1", CoordinationEpoch: 1, State: "reserved"}
-	e.abandonReservation(lease, nil, "prepare failed", "")
+	e.abandonReservation(lease, nil, "prepare failed", "", nil)
 	if len(fake.released()) != 0 || len(e.pendingCleanups) != 1 {
 		t.Fatalf("after the failed cleanup: released %v, pending %d", fake.released(), len(e.pendingCleanups))
 	}
@@ -91,7 +91,7 @@ func TestFailedReservationCleanupIsRetriedUntilTheLeaseIsReleased(t *testing.T) 
 func TestAbandonedLaunchPastReleaseIsEndedThroughItsAttempt(t *testing.T) {
 	fake := &fakeReleases{stale: true}
 	e := quietExecutor(fake)
-	e.abandonReservation(store.Lease{ID: "lea_2", CoordinationEpoch: 3}, nil, "launch failed", "att_2")
+	e.abandonReservation(store.Lease{ID: "lea_2", CoordinationEpoch: 3}, nil, "launch failed", "att_2", nil)
 	if len(e.pendingCleanups) != 0 || len(fake.terminals) != 1 || fake.terminals[0] != "att_2 -1 launch_failed" {
 		t.Fatalf("pending %d, terminals %v", len(e.pendingCleanups), fake.terminals)
 	}
@@ -198,5 +198,34 @@ func TestRefusedActivationKillsTheWholeProcessTree(t *testing.T) {
 			t.Fatalf("child %d of an unactivated launcher survived", child)
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// The cleanup of a launch whose activation failed releases nothing while a
+// process of its tree runs: it kills the tree again and waits until it is
+// seen empty.
+func TestCleanupOfAnUnactivatedLaunchWaitsForItsTreeToBeEmpty(t *testing.T) {
+	cmd, handle, child := startTestTree(t, helperTree)
+	fake := &fakeReleases{}
+	e := quietExecutor(fake)
+	tree := processTree{attemptID: "att-" + helperTree, pid: cmd.Process.Pid, handle: handle}
+	e.abandonReservation(store.Lease{ID: "lea_tree", CoordinationEpoch: 1}, nil, "activation refused", "att-"+helperTree, &tree)
+	if got := fake.released(); len(got) != 0 || len(e.pendingCleanups) != 1 {
+		t.Fatalf("released with its tree running: %v (pending %d)", got, len(e.pendingCleanups))
+	}
+	deadline := time.Now().Add(20 * time.Second)
+	for len(fake.released()) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("never released after the tree was killed")
+		}
+		time.Sleep(200 * time.Millisecond)
+		for id, c := range e.pendingCleanups {
+			c.retryAt = time.Time{}
+			e.pendingCleanups[id] = c
+		}
+		e.retryCleanups(context.Background())
+	}
+	if processAlive(child) {
+		t.Fatalf("child %d alive when the reservation was released", child)
 	}
 }
