@@ -129,9 +129,12 @@ func TestRecordAttemptScratchChecksTheLaunch(t *testing.T) {
 	if err := store.RecordAttemptScratch(ctx, stale); !errors.Is(err, ErrStaleEpoch) {
 		t.Fatalf("a stale epoch: %v", err)
 	}
-	// another spelling of the root and path is the same place
+	refused("at a drive-relative path", func(s *AttemptScratch) { s.Path = "D:kairo/scratch/" + s.AttemptID }, "is not the attempt's scratch directory")
+	// the root is spelled as declared (another spelling is taken as another
+	// root); the path may be spelled otherwise
+	refused("at the root spelled otherwise", func(s *AttemptScratch) { s.Root = `d:\KAIRO\` }, `has moved from d:\KAIRO\ to D:/kairo`)
 	spelled := scratch
-	spelled.Root, spelled.Path = `d:\KAIRO\`, `D:\kairo\scratch\`+scratch.AttemptID
+	spelled.Path = `D:\kairo\scratch\` + scratch.AttemptID
 	if err := store.RecordAttemptScratch(ctx, spelled); err != nil {
 		t.Fatal(err)
 	}
@@ -169,8 +172,8 @@ func TestScratchIsSettledByTheAttemptsOutcome(t *testing.T) {
 	ctx := context.Background()
 	kept := func(attemptID, reason string) {
 		t.Helper()
-		if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: attemptID, State: "deleted"}); !errors.Is(err, ErrScratchKept) {
-			t.Fatalf("a kept scratch was recorded deleted: %v", err)
+		if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: attemptID, State: ScratchDeleting}); !errors.Is(err, ErrScratchKept) {
+			t.Fatalf("a kept scratch was claimed for deletion: %v", err)
 		}
 		if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: attemptID, State: "kept"}); err != nil {
 			t.Fatal(err)
@@ -193,9 +196,10 @@ func TestScratchIsSettledByTheAttemptsOutcome(t *testing.T) {
 		t.Fatal(err)
 	}
 	settleExpect(t, store, map[string]ScratchSettlement{ok.Attempt.ID: {Action: ScratchDelete, Reason: "exit 0"}})
-	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: ok.Attempt.ID, State: "deleted"}); err != nil {
-		t.Fatal(err)
+	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: ok.Attempt.ID, State: "deleted"}); err == nil {
+		t.Fatal("a scratch recorded deleted before it was claimed")
 	}
+	settleDeleted(t, store, ok.Attempt.ID)
 	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: ok.Attempt.ID, State: "deleted"}); err != nil {
 		t.Fatalf("settled again: %v", err)
 	}
@@ -266,14 +270,12 @@ func TestScratchIsSettledByTheAttemptsOutcome(t *testing.T) {
 	}
 	finishLaunch(t, store, suspended, 143)
 	settleExpect(t, store, map[string]ScratchSettlement{suspended.Attempt.ID: {Action: ScratchDelete, Reason: "suspended with a published checkpoint"}})
-	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: suspended.Attempt.ID, State: "deleted"}); err != nil {
-		t.Fatal(err)
-	}
+	settleDeleted(t, store, suspended.Attempt.ID)
 
 	// an active scratch's bytes are counted as active, a kept one's as kept
 	active := startWithScratch(t, store, "active")
 	total, free := int64(100_000), int64(50_000)
-	if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-scratch", ExecutorID: "executor", Usable: true, TotalBytes: &total, FreeBytes: &free,
+	if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-scratch", ExecutorID: "executor", Root: "D:/kairo", Usable: true, TotalBytes: &total, FreeBytes: &free,
 		Scratch: map[string]int64{active.Attempt.ID: 300, failed.Attempt.ID: 5000}}); err != nil {
 		t.Fatal(err)
 	}
@@ -281,9 +283,7 @@ func TestScratchIsSettledByTheAttemptsOutcome(t *testing.T) {
 		t.Fatalf("classes: %+v %v", status, err)
 	}
 	finishLaunch(t, store, active, 0)
-	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: active.Attempt.ID, State: "deleted"}); err != nil {
-		t.Fatal(err)
-	}
+	settleDeleted(t, store, active.Attempt.ID)
 
 	// lost (its executor's identity went): kept, also once it is reconciled
 	// to quiesced
@@ -300,7 +300,7 @@ func TestScratchIsSettledByTheAttemptsOutcome(t *testing.T) {
 		t.Fatalf("reconciled attempt is %s", state)
 	}
 	settleExpect(t, store, map[string]ScratchSettlement{lost.Attempt.ID: {Action: ScratchKeep, Reason: "attempt lost"}})
-	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: lost.Attempt.ID, State: "deleted"}); !errors.Is(err, ErrScratchKept) {
+	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: lost.Attempt.ID, State: ScratchDeleting}); !errors.Is(err, ErrScratchKept) {
 		t.Fatalf("a lost attempt's scratch deleted: %v", err)
 	}
 	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: lost.Attempt.ID, State: "kept", Reason: "kept: lost"}); err != nil {
@@ -370,16 +370,80 @@ func TestScratchIsLeftAloneWhenTheDeclarationChanged(t *testing.T) {
 	} {
 		declareTestStore(t, store, c.stores...)
 		settleExpect(t, store, map[string]ScratchSettlement{ok.Attempt.ID: {Action: ScratchLeave, Reason: "exit 0; not touched: " + c.why}})
-		if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: ok.Attempt.ID, State: "deleted"}); !errors.Is(err, ErrScratchKept) {
-			t.Fatalf("deleted although %s: %v", c.why, err)
+		if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: ok.Attempt.ID, State: ScratchDeleting}); !errors.Is(err, ErrScratchKept) {
+			t.Fatalf("claimed for deletion although %s: %v", c.why, err)
 		}
 	}
 	// declared as it was, it is deleted after all
 	declareTestStore(t, store, volatile)
 	settleExpect(t, store, map[string]ScratchSettlement{ok.Attempt.ID: {Action: ScratchDelete, Reason: "exit 0"}})
+	settleDeleted(t, store, ok.Attempt.ID)
+}
+
+// settleDeleted claims a scratch for deletion and records it deleted, as its
+// executor does.
+func settleDeleted(t *testing.T, store *Store, attemptID string) {
+	t.Helper()
+	ctx := context.Background()
+	for _, state := range []string{ScratchDeleting, ScratchDeleting, "deleted"} {
+		if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: attemptID, State: state}); err != nil {
+			t.Fatalf("settle %s %s: %v", attemptID, state, err)
+		}
+	}
+}
+
+// Once its executor has claimed a scratch for deletion, the declaration
+// cannot change under it: a machine declaration under which it would not be
+// deleted (its store moved, made durable or dropped) is refused until it is
+// settled, deleted or kept; one that leaves it as it is goes through. A
+// claimed scratch stays to be deleted.
+func TestADeclarationCannotChangeUnderADeletion(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	addTestDisk(t, store, "node", "D:")
+	volatile := machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"}
+	declareTestStore(t, store, volatile)
+	ctx := context.Background()
+	ok := startWithScratch(t, store, "ok")
+	finishLaunch(t, store, ok, 0)
+	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: ok.Attempt.ID, State: ScratchDeleting}); err != nil {
+		t.Fatal(err)
+	}
+	if state, _, _ := scratchState(t, store, ok.Attempt.ID); state != ScratchDeleting {
+		t.Fatalf("claimed: %s", state)
+	}
+	moved, durable := volatile, volatile
+	moved.Root = "D:/moved"
+	durable.Class = machine.StoreDurable
+	for _, stores := range [][]machine.Store{{moved}, {durable}, {}} {
+		if _, err := store.ApplyMachines(ctx, storesSpec(stores...), false); !errors.Is(err, ErrMachineConflict) || !strings.Contains(err.Error(), "scratch being deleted") {
+			t.Fatalf("declared %+v under a deletion: %v", stores, err)
+		}
+		if _, err := store.ApplyMachines(ctx, storesSpec(stores...), true); !errors.Is(err, ErrMachineConflict) {
+			t.Fatalf("dry run of %+v under a deletion: %v", stores, err)
+		}
+	}
+	declareTestStore(t, store, volatile, machine.Store{ID: "d-durable", Class: machine.StoreDurable, Node: "node", Root: "D:/durable", Filesystem: "D:"})
+	settleExpect(t, store, map[string]ScratchSettlement{ok.Attempt.ID: {Action: ScratchDelete, Reason: "exit 0"}})
 	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: ok.Attempt.ID, State: "deleted"}); err != nil {
 		t.Fatal(err)
 	}
+	declareTestStore(t, store, durable)
+
+	// a claimed scratch whose deletion was refused for safety is kept
+	declareTestStore(t, store, volatile)
+	refused := startWithScratch(t, store, "refused")
+	finishLaunch(t, store, refused, 0)
+	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: refused.Attempt.ID, State: ScratchDeleting}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.SettleScratch(ctx, ScratchSettled{AttemptID: refused.Attempt.ID, State: "kept", Reason: "exit 0; not deleted: a link"}); err != nil {
+		t.Fatal(err)
+	}
+	if state, _, reason := scratchState(t, store, refused.Attempt.ID); state != "kept" || reason == nil || *reason != "exit 0; not deleted: a link" {
+		t.Fatalf("refused deletion: %s %v", state, reason)
+	}
+	declareTestStore(t, store, durable)
 }
 
 // scratch_tmpdir is part of the execution's digest (absent, the digest is

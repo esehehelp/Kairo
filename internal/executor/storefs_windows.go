@@ -82,11 +82,37 @@ func diskUsage(dir string) (int64, int64, error) {
 	return int64(total), int64(available), nil
 }
 
+// markerOpenFlags: nothing a marker's open could wait on can be put in its
+// place here.
+const markerOpenFlags = 0
+
+// checkFilesystemType checks that root is on NTFS, where Go deletes a file
+// ignoring its read-only attribute (FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE).
+// Elsewhere it clears the attribute first, which a hard link shares with
+// the file outside it points at.
+func checkFilesystemType(root string) error {
+	path, err := windows.UTF16PtrFromString(root)
+	if err != nil {
+		return err
+	}
+	volume := make([]uint16, windows.MAX_PATH+1)
+	if err = windows.GetVolumePathName(path, &volume[0], uint32(len(volume))); err != nil {
+		return fmt.Errorf("volume of %s: %w", root, err)
+	}
+	name := make([]uint16, windows.MAX_PATH+1)
+	if err = windows.GetVolumeInformation(&volume[0], nil, 0, nil, nil, nil, &name[0], uint32(len(name))); err != nil {
+		return fmt.Errorf("filesystem of %s: %w", root, err)
+	}
+	if fsName := windows.UTF16ToString(name); fsName != "NTFS" {
+		return fmt.Errorf("root %s is on %s, not NTFS (where files are deleted without clearing their read-only attribute)", root, fsName)
+	}
+	return nil
+}
+
+// placeOf: with checkResolvesTo a root's path is where it is, and roots are
+// compared by path when they are declared; there is no other place to tell.
+func placeOf(string) (string, error) { return "", nil }
+
 // mountsUnder: a volume mounted in a folder is a reparse point there, which
 // nothing enters or deletes through; there is no mount to look for.
 func mountsUnder(string) ([]string, error) { return nil, nil }
-
-// makeDirsWritable: deletion ignores the read-only attribute on Windows, so
-// nothing is ever made writable (an attribute changed on a hard link would
-// change the file outside too).
-func makeDirsWritable(*os.Root, string) bool { return false }

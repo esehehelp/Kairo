@@ -411,10 +411,18 @@ func TestDueScratchIsSettled(t *testing.T) {
 	}
 	checkKept(t, files)
 	got := map[string]store.ScratchSettled{}
+	claimed := map[string]bool{}
 	for _, s := range fake.settled {
+		if s.State == store.ScratchDeleting {
+			claimed[s.AttemptID] = true
+			continue
+		}
+		if s.State == "deleted" && !claimed[s.AttemptID] {
+			t.Fatalf("%s deleted before it was claimed", s.AttemptID)
+		}
 		got[s.AttemptID] = s
 	}
-	if len(got) != 7 {
+	if len(got) != 7 || len(claimed) != 3 || !claimed["att_ok"] || !claimed["att_foreign"] || !claimed["att_outside"] {
 		t.Fatalf("settled: %+v", fake.settled)
 	}
 	failedSize := 100 + int64(len("att_failed\n"))

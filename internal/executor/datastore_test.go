@@ -117,6 +117,36 @@ func TestStoresServedMadeAndChecked(t *testing.T) {
 	}
 }
 
+// placedFS is a storeFS whose roots are where places says.
+type placedFS struct {
+	storeFS
+	places map[string]string
+}
+
+func (p placedFS) Place(_ context.Context, root string) (string, error) { return p.places[root], nil }
+
+// A volatile store whose root is, on disk, another served store's (a bind
+// mount), or inside or around it, is not used; the other store is.
+func TestVolatileStoreSharingAPlaceIsRefused(t *testing.T) {
+	fs := placedFS{places: map[string]string{"/data/d": "8:2:/d", "/data/v": "8:2:/d", "/data/w": "8:2:/d/sub", "/srv/k": "8:1:/srv/k", "/elsewhere": ""}}
+	served := []servedStore{
+		{decl: machine.Store{ID: "durable", Class: machine.StoreDurable, Root: "/data/d"}, fs: fs, usable: true},
+		{decl: machine.Store{ID: "bound", Class: machine.StoreVolatile, Root: "/data/v"}, fs: fs, usable: true},
+		{decl: machine.Store{ID: "inside", Class: machine.StoreVolatile, Root: "/data/w"}, fs: fs, usable: true},
+		{decl: machine.Store{ID: "own", Class: machine.StoreVolatile, Root: "/srv/k"}, fs: fs, usable: true},
+		{decl: machine.Store{ID: "unknown", Class: machine.StoreVolatile, Root: "/elsewhere"}, fs: fs, usable: true},
+	}
+	refuseSharedPlaces(context.Background(), served)
+	for i, want := range []bool{true, false, false, true, true} {
+		if served[i].usable != want {
+			t.Fatalf("%s usable %v (%s)", served[i].decl.ID, served[i].usable, served[i].problem)
+		}
+	}
+	if !strings.Contains(served[1].problem, "where store durable's root /data/d is") {
+		t.Fatalf("problem: %s", served[1].problem)
+	}
+}
+
 // Scan counts only the directories Kairo made under <root>/scratch (their
 // marker names them), never through a link.
 func TestScanCountsOnlyKairosScratch(t *testing.T) {

@@ -142,6 +142,36 @@ func sameStore(a, b machine.Store) bool {
 	return bytes.Equal(x, y)
 }
 
+// checkScratchBeingDeletedTx refuses stores (the whole new declaration)
+// under which a scratch an executor has claimed for deletion would no longer
+// be its volatile store's scratch directory: it is being deleted under the
+// declaration as it is, which stays until the executor has settled it.
+func checkScratchBeingDeletedTx(ctx context.Context, tx *sql.Tx, stores []machine.Store) error {
+	next := make([]machine.Store, 0, len(stores))
+	for _, store := range stores {
+		next = append(next, store.Normalized())
+	}
+	var busy []string
+	err := eachRow(ctx, tx, `SELECT k.attempt_id,k.store_id,k.executor_id,k.root,k.path,x.node_id FROM attempt_scratch k JOIN executors x ON x.id=k.executor_id
+		WHERE k.state='deleting' ORDER BY k.attempt_id`, nil, func(rows *sql.Rows) error {
+		var attemptID, storeID, executorID, root, path, nodeID string
+		if err := rows.Scan(&attemptID, &storeID, &executorID, &root, &path, &nodeID); err != nil {
+			return err
+		}
+		if why := scratchOwnership(next, nodeID, storeID, root, path, attemptID); why != "" {
+			busy = append(busy, fmt.Sprintf("%s (attempt %s, executor %s: %s)", path, attemptID, executorID, why))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(busy) != 0 {
+		return fmt.Errorf("%w: scratch being deleted would no longer be a volatile store's: %s (apply again once its executor has settled it)", ErrMachineConflict, strings.Join(busy, "; "))
+	}
+	return nil
+}
+
 // applyStoresTx writes the store changes. A store no longer declared keeps
 // its scratch records (and its data): nothing is deleted with a declaration.
 func applyStoresTx(ctx context.Context, tx *sql.Tx, changes []StoreChange, t string) error {

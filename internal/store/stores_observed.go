@@ -4,25 +4,30 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"sort"
 	"time"
 
 	"kairo/internal/machine"
 )
 
-// StoreObservation is what the executor serving a store reports of it.
+// StoreObservation is what the executor serving a store reports of it, at
+// Root (the root as declared when the executor last read the declaration).
 // Usable is whether its root exists and is on the declared filesystem
 // (Problem says why not); TotalBytes and FreeBytes are the filesystem's.
 // Scratch is each Kairo scratch directory found under the root (one holding
 // the marker that names it), by attempt id, with its size, or -1 when it was
-// not measured this time: a running attempt's is measured at every report, a
-// kept one's once, when it is kept. ScratchScanned says the whole of
-// <root>/scratch was read; only then is a record whose directory was not
-// found taken as missing, and not one made during the scan (ScanSeconds
-// long). Only what is under the root and Kairo made is counted.
+// not measured this time (a running attempt's is measured at every report, a
+// kept one's once, when it is kept) or could not be read. ScratchScanned
+// says the whole of <root>/scratch was read; only then is a record at that
+// root whose directory was not found taken as missing, and not one made
+// during the scan (ScanSeconds long). Only what is under the root and Kairo
+// made is counted.
 type StoreObservation struct {
 	StoreID        string           `json:"store_id"`
 	ExecutorID     string           `json:"executor_id"`
+	Root           string           `json:"root"`
 	Usable         bool             `json:"usable"`
 	Problem        string           `json:"problem,omitempty"`
 	TotalBytes     *int64           `json:"total_bytes,omitempty"`
@@ -46,25 +51,37 @@ func (s *Store) StoreNode(ctx context.Context, storeID string) (string, error) {
 }
 
 // RecordStoreObservation keeps a store's latest observation and what it says
-// of the store's scratch records, each in one statement: a found directory's
-// measured bytes, a missing record found again (active again, or kept once
-// settled), and, after a whole scan, a record whose directory was not found
-// marked missing (bytes 0; Kairo did not delete it, so it is not deleted).
-// Bytes found under the root without a record (a scratch whose recording
-// failed) are kept as unrecorded. No decision reads any of this, so it is
-// written without the decision lock (beginUnlockedWrite).
+// of the store's scratch records at the observed root, each in one
+// statement: a found directory's measured bytes, a missing record found
+// again (active again, or kept once settled), and, after a whole scan, a
+// record whose directory was not found marked missing (bytes 0; Kairo did not
+// delete it, so it is not deleted). Bytes found under the root without any
+// record (a scratch whose recording failed) are kept as unrecorded. An
+// observation of a root the store is no longer declared at is refused. No
+// decision reads any of this, so it is written without the decision lock
+// (beginUnlockedWrite); the store's declaration row is locked instead, so
+// two reports of one store (by two executors of its node) go one after the
+// other.
 func (s *Store) RecordStoreObservation(ctx context.Context, obs StoreObservation) error {
 	tx, err := s.beginUnlockedWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var declared int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_stores WHERE id=$1`, obs.StoreID).Scan(&declared); err != nil {
+	var body string
+	err = tx.QueryRowContext(ctx, `SELECT declaration_json FROM machine_stores WHERE id=$1 FOR UPDATE`, obs.StoreID).Scan(&body)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrNotFound
+	}
+	if err != nil {
 		return err
 	}
-	if declared == 0 {
-		return ErrNotFound
+	var declared machine.Store
+	if err = json.Unmarshal([]byte(body), &declared); err != nil {
+		return fmt.Errorf("stored store declaration: %w", err)
+	}
+	if obs.Root != declared.Root {
+		return fmt.Errorf("%w: store %s is declared at %s, not at %s as observed", ErrStaleEpoch, obs.StoreID, declared.Root, obs.Root)
 	}
 	type found struct {
 		AttemptID string `json:"attempt_id"`
@@ -74,7 +91,7 @@ func (s *Store) RecordStoreObservation(ctx context.Context, obs StoreObservation
 	for attemptID, bytes := range obs.Scratch {
 		list = append(list, found{attemptID, bytes})
 	}
-	body, err := json.Marshal(list)
+	seen, err := json.Marshal(list)
 	if err != nil {
 		return err
 	}
@@ -83,25 +100,27 @@ func (s *Store) RecordStoreObservation(ctx context.Context, obs StoreObservation
 		state=CASE WHEN k.state<>'missing' THEN k.state WHEN k.settled_at IS NULL THEN 'active' ELSE 'kept' END,
 		missing_at=NULL,updated_at=$1
 		FROM jsonb_to_recordset(($2)::jsonb) AS r(attempt_id text,bytes bigint)
-		WHERE k.attempt_id=r.attempt_id AND k.store_id=$3 AND k.state IN('active','kept','missing')`, t, string(body), obs.StoreID); err != nil {
+		WHERE k.attempt_id=r.attempt_id AND k.store_id=$3 AND k.root=$4 AND k.state IN('active','kept','missing','deleting')`, t, string(seen), obs.StoreID, obs.Root); err != nil {
 		return err
 	}
 	if obs.ScratchScanned {
 		since := time.Now().UTC().Add(-time.Duration(obs.ScanSeconds*float64(time.Second)) - scratchScanMargin).Format(time.RFC3339Nano)
 		if _, err = tx.ExecContext(ctx, `UPDATE attempt_scratch k SET state='missing',bytes=0,missing_at=$1,updated_at=$2
-			WHERE k.store_id=$3 AND k.state IN('active','kept') AND (k.created_at)::timestamptz<($4)::timestamptz
-			AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(($5)::jsonb) AS r(attempt_id text,bytes bigint) WHERE r.attempt_id=k.attempt_id)`,
-			t, t, obs.StoreID, since, string(body)); err != nil {
+			WHERE k.store_id=$3 AND k.root=$4 AND k.state IN('active','kept') AND (k.created_at)::timestamptz<($5)::timestamptz
+			AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(($6)::jsonb) AS r(attempt_id text,bytes bigint) WHERE r.attempt_id=k.attempt_id)`,
+			t, t, obs.StoreID, obs.Root, since, string(seen)); err != nil {
 			return err
 		}
 	}
+	// Unrecorded: no record of any state (one deleted since this report was
+	// measured is not counted again).
 	var unrecorded, active, kept int64
 	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(r.bytes),0)::bigint FROM jsonb_to_recordset(($1)::jsonb) AS r(attempt_id text,bytes bigint)
-		WHERE r.bytes>0 AND NOT EXISTS(SELECT 1 FROM attempt_scratch k WHERE k.attempt_id=r.attempt_id AND k.store_id=$2 AND k.state IN('active','kept','missing'))`,
-		string(body), obs.StoreID).Scan(&unrecorded); err != nil {
+		WHERE r.bytes>0 AND NOT EXISTS(SELECT 1 FROM attempt_scratch k WHERE k.attempt_id=r.attempt_id AND k.store_id=$2)`,
+		string(seen), obs.StoreID).Scan(&unrecorded); err != nil {
 		return err
 	}
-	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(bytes) FILTER (WHERE state='active'),0)::bigint,COALESCE(SUM(bytes) FILTER (WHERE state='kept'),0)::bigint
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(bytes) FILTER (WHERE state IN('active','deleting')),0)::bigint,COALESCE(SUM(bytes) FILTER (WHERE state='kept'),0)::bigint
 		FROM attempt_scratch WHERE store_id=$1`, obs.StoreID).Scan(&active, &kept); err != nil {
 		return err
 	}
@@ -179,7 +198,7 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 	for _, d := range declared {
 		add(StoreStatus{Store: d, State: "unknown", Kept: []KeptScratch{}, Missing: []KeptScratch{}})
 	}
-	err = eachRow(ctx, tx, `SELECT store_id,COALESCE(SUM(bytes) FILTER (WHERE state='active'),0)::bigint,COALESCE(SUM(bytes) FILTER (WHERE state='kept'),0)::bigint
+	err = eachRow(ctx, tx, `SELECT store_id,COALESCE(SUM(bytes) FILTER (WHERE state IN('active','deleting')),0)::bigint,COALESCE(SUM(bytes) FILTER (WHERE state='kept'),0)::bigint
 		FROM attempt_scratch GROUP BY store_id`, nil, func(rows *sql.Rows) error {
 		var storeID string
 		var active, kept int64

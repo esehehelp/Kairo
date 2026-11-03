@@ -35,11 +35,11 @@ func TestStoreStatusFromObservations(t *testing.T) {
 		t.Fatalf("an undeclared store: %v", err)
 	}
 	total, free := int64(1000), int64(400)
-	if err = store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-scratch", ExecutorID: "executor", Usable: true, TotalBytes: &total, FreeBytes: &free,
+	if err = store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-scratch", ExecutorID: "executor", Root: "D:/kairo", Usable: true, TotalBytes: &total, FreeBytes: &free,
 		Scratch: map[string]int64{"att_unrecorded": 50}}); err != nil {
 		t.Fatal(err)
 	}
-	if err = store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-durable", ExecutorID: "executor", Usable: false, Problem: "root D:/durable is not on filesystem D:"}); err != nil {
+	if err = store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-durable", ExecutorID: "executor", Root: "D:/durable", Usable: false, Problem: "root D:/durable is not on filesystem D:"}); err != nil {
 		t.Fatal(err)
 	}
 	status, err = store.ListStoreStatus(ctx)
@@ -92,7 +92,7 @@ func TestScratchMissingFromTheReport(t *testing.T) {
 	report := func(scanned bool, seconds float64, scratch map[string]int64) {
 		t.Helper()
 		total, free := int64(10_000), int64(5_000)
-		if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-scratch", ExecutorID: "executor", Usable: true, TotalBytes: &total, FreeBytes: &free,
+		if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-scratch", ExecutorID: "executor", Root: "D:/kairo", Usable: true, TotalBytes: &total, FreeBytes: &free,
 			Scratch: scratch, ScratchScanned: scanned, ScanSeconds: seconds}); err != nil {
 			t.Fatal(err)
 		}
@@ -144,20 +144,36 @@ func TestScratchMissingFromTheReport(t *testing.T) {
 	expect(running.Attempt.ID, "missing", 0)
 	finishLaunch(t, store, running, 0)
 	settleExpect(t, store, map[string]ScratchSettlement{running.Attempt.ID: {Action: ScratchDelete, Reason: "exit 0"}})
-	if err = store.SettleScratch(ctx, ScratchSettled{AttemptID: running.Attempt.ID, State: "deleted"}); err != nil {
-		t.Fatal(err)
-	}
+	settleDeleted(t, store, running.Attempt.ID)
 	if state, _, _ := scratchState(t, store, running.Attempt.ID); state != "deleted" {
 		t.Fatalf("settled missing scratch: %s", state)
 	}
-	// a deleted record found again (the report raced the deletion) stays deleted
+	// a deleted record found again (the report was measured before the
+	// deletion) stays deleted, and its bytes are not counted as unrecorded
 	report(true, 1, map[string]int64{running.Attempt.ID: 10, failed.Attempt.ID: -1})
 	if state, _, _ := scratchState(t, store, running.Attempt.ID); state != "deleted" {
 		t.Fatalf("deleted scratch revived: %s", state)
 	}
+	if status, _ = store.ListStoreStatus(ctx); status[0].ScratchKeptBytes != 50 {
+		t.Fatalf("a deleted scratch counted again: %+v", status[0])
+	}
+
+	// a record at another root (the store's root before it moved) is not
+	// taken as missing by a scan of this one
+	if _, err := store.testExec(`UPDATE attempt_scratch SET root='D:/old',path='D:/old/scratch/'||attempt_id WHERE attempt_id=$1`, failed.Attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	report(true, 1, map[string]int64{})
+	expect(failed.Attempt.ID, "kept", 50)
+	// a report of a root the store is not declared at is refused
+	if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-scratch", ExecutorID: "executor", Root: "D:/old", Usable: true, ScratchScanned: true}); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("a report of another root: %v", err)
+	}
 }
 
-// A report does not wait for the decision lock: no decision reads it.
+// A report does not wait for the decision lock (no decision reads it), only
+// for another report of the same store: two at once would lock the same
+// records in different orders.
 func TestStoreReportsDoNotWaitForDecisions(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)
@@ -169,10 +185,9 @@ func TestStoreReportsDoNotWaitForDecisions(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer holder.Rollback()
+	obs := StoreObservation{StoreID: "d-scratch", ExecutorID: "executor", Root: "D:/kairo", Usable: true}
 	done := make(chan error, 1)
-	go func() {
-		done <- store.RecordStoreObservation(ctx, StoreObservation{StoreID: "d-scratch", ExecutorID: "executor", Usable: true})
-	}()
+	go func() { done <- store.RecordStoreObservation(ctx, obs) }()
 	select {
 	case err = <-done:
 		if err != nil {
@@ -180,5 +195,25 @@ func TestStoreReportsDoNotWaitForDecisions(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("a store report waited for the decision lock")
+	}
+
+	other, err := store.beginUnlockedWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = other.ExecContext(ctx, `SELECT 1 FROM machine_stores WHERE id='d-scratch' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	go func() { done <- store.RecordStoreObservation(ctx, obs) }()
+	select {
+	case err = <-done:
+		t.Fatalf("a report did not wait for another of its store: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err = other.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if err = <-done; err != nil {
+		t.Fatal(err)
 	}
 }

@@ -13,8 +13,8 @@ import (
 )
 
 // ErrMachineConflict: a machine declaration would move or drop a GPU that a
-// live lease holds.
-var ErrMachineConflict = errors.New("machine declaration conflicts with a leased GPU")
+// live lease holds, or change a store under a scratch being deleted.
+var ErrMachineConflict = errors.New("machine declaration conflicts with work in progress")
 
 // MachineChange is one GPU whose declared nodes change (a shared GPU's are
 // comma-separated, sorted): From is empty for a newly declared GPU, To for one
@@ -169,6 +169,11 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	}
 	if result.StoreChanges, result.UnchangedStores, err = storeChangesTx(ctx, tx, spec); err != nil {
 		return MachineApplyResult{}, err
+	}
+	if len(result.StoreChanges) != 0 {
+		if err = checkScratchBeingDeletedTx(ctx, tx, spec.Stores); err != nil {
+			return MachineApplyResult{}, err
+		}
 	}
 	policies := spec.DevicePolicies()
 	if result.ClearedSettings, err = uncontrollableSettingsTx(ctx, tx, policies); err != nil {

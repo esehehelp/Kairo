@@ -718,19 +718,32 @@ no component of the root's path is a link (a symlink, a junction or any
 other reparse point; on Windows the path the opened root resolves to, with
 its drive, must be the declared root, so no substituted drive or short 8.3
 name either; on Linux and in WSL the root must be its own real path) and that
-the root is on the declared filesystem (Windows: the root's drive; Linux: the
-same device as the filesystem's mount point; WSL: a root under `/mnt/<drive>`
-must be on that drive, a root on the distro's own disk is taken as declared).
+the root is on the declared filesystem (Windows: the root's drive, which must
+be NTFS; Linux: the same device as the filesystem's mount point; WSL: a root
+under `/mnt/<drive>` must be on that drive, a root on the distro's own disk is
+taken as declared). The root is opened, and a missing one made, one
+directory at a time from its volume's root, each through its parent's handle
+and checked to be the plain directory looked at, so nothing is made or
+reached through a link, not even one put there meanwhile (WSL: the existing
+part of the path is checked with `realpath` before anything is made). On
+Linux a volatile store whose root is, on disk, where another store this
+executor serves has its root, or inside or around it (a bind mount, which
+the declared paths cannot show; compared by device and path within the
+filesystem, from `/proc/self/mountinfo`), is not used either.
 A store that fails is not used and is reported unusable with the reason.
 Every 5 minutes, in the background, the executor reports each store
-(`store-observation`): the filesystem's total and free bytes and each Kairo
-scratch directory under the root (one whose marker names it) with its size:
-an attempt still running there is measured at every report, any other once
-per agent process (a kept scratch when it is kept), never through a link or
-into a mount point. A report that read the whole `<root>/scratch` marks a
-recorded scratch it did not find `missing` (bytes 0, listed by
+(`store-observation`, with the root as it last read the declaration; a report
+of a root the store is no longer declared at is refused, and two reports of
+one store are written one after the other): the filesystem's total and free
+bytes and each Kairo scratch directory under the root (one whose marker names
+it) with its size: an attempt still running there is measured at every
+report, any other once per agent process (a kept scratch when it is kept),
+never through a link or into a mount point, each directory read 1024 entries
+at a time. A report that read the whole `<root>/scratch` marks a recorded
+scratch at that root it did not find `missing` (bytes 0, listed by
 `kairo store status`, never taken as deleted: Kairo did not delete it) until
-it is found again.
+it is found again; a directory there whose marker cannot be read now (its
+mode, say) is not taken as missing.
 
 `kairo store status [--json]` (`GET /api/stores`, `{"stores": [...]}`) shows
 each store: class, node (and executor), `state` (`unknown`: never reported,
@@ -750,13 +763,15 @@ store (the first by id when there are several) gets a scratch directory
 there, `<root>/scratch/<attempt id>`, holding the marker file
 `.kairo-scratch` (the attempt id), made before the process starts and named
 by `KAIRO_SCRATCH`. It is recorded at the daemon (`attempt-scratch`, table
-`attempt_scratch`: attempt, store, root, path, `active`/`kept`/`deleted`,
-bytes, reason; events `scratch_created`, then `scratch_deleted` or
-`scratch_kept`) while the attempt is still authorized, and only on a
-volatile store of the attempt's node in its executor's namespace, at the
-store's declared root, at exactly `<root>/scratch/<attempt id>` and inside
-no other store of the node (compared as Machine declaration spells roots);
-if it cannot be made or recorded, the attempt starts without it. `TMPDIR`,
+`attempt_scratch`: attempt, store, root, path, `active`/`deleting`/`kept`/
+`deleted`/`missing`, bytes, reason; events `scratch_created`, then
+`scratch_deleted` or `scratch_kept`) while the attempt is still authorized,
+and only on a volatile store of the attempt's node in its executor's
+namespace, at the store's root spelled as declared, at exactly
+`<root>/scratch/<attempt id>` (an absolute path) and inside no other store of
+the node (compared as Machine declaration spells roots); if it cannot be made
+or recorded, the attempt starts without it (one made but not recorded is
+removed if it holds only its marker). `TMPDIR`,
 `TMP` and `TEMP` are left alone unless the task sets `scratch_tmpdir = true` in
 `[tasks.execution]` (or the execution TOML): then they name the scratch (a
 WSL attempt gets `TMPDIR` only, since its variables also reach `wsl.exe`),
@@ -772,36 +787,52 @@ deleted; after a failure (another exit, a signal, a launch that never ran)
 it is kept, empty or not; a lost attempt's (also once reconciled) is kept as
 it is, since its processes may still be writing. Only success deletes, and
 only while the declaration still makes the recorded path the scratch
-directory of that volatile store: once the store is dropped, moved, made
-durable or another store of the node holds the path, the scratch is left
-untouched (`leave`: kept, not even measured), and the daemon refuses to
-record it deleted. An observe-only daemon gives agents no stores (`stores`
-answers an empty list) and no scratch to settle, so they make no root and
-no scratch and delete nothing.
+directory of that volatile store: once the store is dropped, moved (its root
+spelled otherwise included), made durable or another store of the node holds
+the path, the scratch is left untouched (`leave`: kept, not even measured).
+Before deleting, the executor claims the scratch (`settle-scratch` with state
+`deleting`, taken only while it is to be deleted); from then until it is
+settled `deleted` (taken only once claimed), or `kept` when the deletion is
+refused for safety, `kairo machine apply` refuses a declaration under which
+it would not be deleted (409 `machine_conflict`, naming the scratch and its
+executor), so the declaration cannot change under a deletion. A claimed
+scratch stays to be deleted, also after an agent restart; if its executor
+never comes back, the conflict stays until the row is settled by hand. An
+observe-only daemon gives agents no stores (`stores` answers an empty list)
+and no scratch to settle, so they make no root and no scratch and delete
+nothing.
 Kept scratch stays where it is (moving it to a durable store comes with
 P1b) and is listed by `kairo store status` with its task, size and reason;
 nothing deletes it in P1a but an operator. Deleting is done by the executor
 itself, never by `os.RemoveAll` or `rm -rf` on a path it was given: the path
-must be exactly the recorded `<root>/scratch/<attempt id>` (anything else is
-refused), the root's path may hold no link, neither `<root>/scratch` nor the
-scratch directory may be a link, no mount point may be at or under the
-scratch directory (Linux, from `/proc/self/mountinfo`, bind mounts included),
-and its marker must name the attempt. Nothing is reached through a path
-opened again after it was checked: every operation below the root goes
+must be exactly the recorded `<root>/scratch/<attempt id>` of an absolute
+root (anything else is refused), the root's path may hold no link, neither
+`<root>/scratch` nor the scratch directory may be a link, `<root>/scratch`
+may not be a mount point and none may be at or under the scratch directory
+(Linux, from `/proc/self/mountinfo`, bind mounts included), and its marker
+must name the attempt. Nothing is reached through a path: the root is opened
+one directory at a time from its volume's root, every operation below it goes
 through `os.Root` handles (`openat`-style on Linux, handle-relative on
-Windows), a directory opened after it was checked must be the same file, and
-`os.Root.RemoveAll` removes a symlink, junction or other reparse point itself,
-never what it points at, entry by entry, the marker last, so a deletion cut
-short is resumed. Files are deleted without changing their attributes (a hard
-link to a file outside is unlinked, the file left as it was); only a
-subdirectory a task made unwritable is made writable again (Linux; a directory
-cannot be hard linked). The marker is created exclusively in the directory
-just made, never opened, so nothing put there meanwhile is written through.
-A deletion refused for any of these reasons keeps the scratch with the
-reason; one that failed otherwise (a file in use) is tried again. WSL stores
-are reached by one `sh` script run with `wsl.exe --exec` under the same rules
-(`realpath` for the root, `/proc/self/mountinfo`, the marker created with
-`noclobber`, `rm -r --one-file-system` on what the scratch directory holds). A daemon older than stores never gets scratch
+Windows), each directory opened must be the same file as the one checked
+(both identified through handles), and `os.Root.RemoveAll` removes a
+symlink, junction or other reparse point itself, never what it points at,
+entry by entry, the marker last, so a deletion cut short is resumed. Files
+are deleted without changing their attributes (a hard link to a file outside
+is unlinked, the file left as it was): on Windows this needs NTFS, where Go
+deletes ignoring the read-only attribute (elsewhere it clears it first, on
+the file a hard link shares), hence the NTFS check. Only a directory a task
+made unwritable (the scratch directory itself or one under it) is made
+writable again, on Linux, through an `O_PATH|O_NOFOLLOW|O_DIRECTORY` handle
+that can only be that directory, so a file put in its place keeps its mode.
+The marker is created exclusively in the directory just made, never opened,
+and read without blocking (a FIFO in its place does not hang the agent), so
+nothing put there meanwhile is written through. A deletion refused for any of
+these reasons keeps the scratch with the reason; one that failed otherwise (a
+file in use) is tried again. WSL stores are reached by one `sh` script run
+with `wsl.exe --exec` under the same rules as far as a shell can keep them
+(paths, not handles: `realpath` for the root, `/proc/self/mountinfo`, the
+marker created with `noclobber`, `rm -r --one-file-system` on what the
+scratch directory holds; the root is cleaned before it is compared). A daemon older than stores never gets scratch
 from a newer agent (it answers `stores` with 404, and the agent then neither
 makes scratch nor asks for any to settle).
 

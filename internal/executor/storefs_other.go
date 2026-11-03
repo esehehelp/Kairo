@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -15,6 +16,10 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+// markerOpenFlags: a marker is opened without waiting, so a FIFO put in its
+// place does not block the open.
+const markerOpenFlags = syscall.O_NONBLOCK
 
 // isLink reports whether fi (from Lstat) is a symbolic link.
 func isLink(fi os.FileInfo) bool { return fi.Mode()&os.ModeSymlink != 0 }
@@ -54,6 +59,10 @@ func checkResolvesTo(root string) error {
 	}
 	return nil
 }
+
+// checkFilesystemType: a file's mode does not matter to its deletion here, so
+// any filesystem will do.
+func checkFilesystemType(string) error { return nil }
 
 // diskUsage is the total and the free bytes (available to an unprivileged
 // writer) of the filesystem holding dir.
@@ -98,6 +107,54 @@ func parseMountsUnder(lines *bufio.Scanner, dir string) ([]string, error) {
 	return out, lines.Err()
 }
 
+// placeOf is where p (absolute, cleaned, without links) really is: the
+// device of the filesystem mounted over it and its path within that
+// filesystem, bind mounts undone ("8:1:/data/d" for /data/v bound from
+// /data/d), from /proc/self/mountinfo; "" where there is no /proc.
+func placeOf(p string) (string, error) {
+	f, err := os.Open("/proc/self/mountinfo")
+	if errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	return parsePlace(bufio.NewScanner(f), p)
+}
+
+// parsePlace reads mountinfo lines (the device is the third field, the
+// mounted directory of its filesystem the fourth, the mount point the fifth)
+// and places p under the mount that covers it: the longest mount point
+// holding it, the last of those (one mounted over another hides it).
+func parsePlace(lines *bufio.Scanner, p string) (string, error) {
+	lines.Buffer(make([]byte, 64*1024), 1024*1024)
+	best, place := -1, ""
+	for lines.Scan() {
+		fields := strings.Fields(lines.Text())
+		if len(fields) < 5 {
+			continue
+		}
+		point := filepath.Clean(unescapeMountField(fields[4]))
+		var rest string
+		switch {
+		case point == "/":
+			rest = p
+		case p == point:
+			rest = "/"
+		case strings.HasPrefix(p, point+"/"):
+			rest = p[len(point):]
+		default:
+			continue
+		}
+		if len(point) >= best {
+			best = len(point)
+			place = fields[2] + ":" + path.Join(unescapeMountField(fields[3]), rest)
+		}
+	}
+	return place, lines.Err()
+}
+
 // unescapeMountField undoes mountinfo's octal escapes (\040 for a space).
 func unescapeMountField(s string) string {
 	if !strings.Contains(s, `\`) {
@@ -115,29 +172,4 @@ func unescapeMountField(s string) string {
 		b.WriteByte(s[i])
 	}
 	return b.String()
-}
-
-// makeDirsWritable makes the directories at and under name in dir (through
-// dir's Root, links not followed) readable, writable and searchable by their
-// owner, so what they hold can be removed; it reports whether any was
-// changed. Only directories, which cannot be hard linked: a file's mode is
-// never changed (it may be shared with a file outside).
-func makeDirsWritable(dir *os.Root, name string) bool {
-	changed := false
-	_ = fs.WalkDir(dir.FS(), filepath.ToSlash(name), func(p string, d fs.DirEntry, err error) error {
-		if err != nil || d == nil || !d.IsDir() || d.Type()&fs.ModeSymlink != 0 {
-			return nil
-		}
-		info, err := d.Info()
-		if err != nil || isLink(info) {
-			return nil
-		}
-		if perm := info.Mode().Perm(); perm&0o700 != 0o700 {
-			if dir.Chmod(filepath.FromSlash(p), perm|0o700) == nil {
-				changed = true
-			}
-		}
-		return nil
-	})
-	return changed
 }

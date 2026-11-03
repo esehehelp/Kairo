@@ -17,7 +17,8 @@ import (
 // and TEMP). Without such a store, or when making or recording it fails,
 // the attempt starts without one. Once the attempt has quiesced or was lost
 // the executor settles its scratch as the daemon says
-// (store.ScratchToSettle): it deletes it (removeScratch's rules), keeps it
+// (store.ScratchToSettle): it deletes it (claimed first, then
+// removeScratch's rules), keeps it
 // (measured once), or leaves it untouched (kept, not even measured: the
 // declaration no longer makes its path a volatile store's scratch). A
 // deletion refused for safety (not the recorded directory, a link, a marker
@@ -65,9 +66,9 @@ func (e *Local) makeScratch(launch *store.Launch) {
 		StoreID: s.decl.ID, ExecutorID: e.ID, Root: s.decl.Root, Path: dir}
 	if err = e.retryUnanswered(ctx, func() error { return e.Store.RecordAttemptScratch(ctx, record) }); err != nil {
 		e.Logger.Warn("attempt starts without scratch: not recorded", "attempt_id", attemptID, "store_id", s.decl.ID, "error", err)
-		// Nothing has run in it: it goes now (and, were it recorded after
-		// all, its settlement finds it gone).
-		if removeErr := s.fs.Remove(ctx, s.decl.Root, dir, attemptID, false); removeErr != nil {
+		// Nothing has run in it: it goes now if it holds only its marker
+		// (and, were it recorded after all, its settlement finds it gone).
+		if removeErr := s.fs.Remove(ctx, s.decl.Root, dir, attemptID, true); removeErr != nil {
 			e.Logger.Warn("unrecorded scratch not removed", "attempt_id", attemptID, "path", dir, "error", removeErr)
 		}
 		return
@@ -153,7 +154,16 @@ func (e *Local) settleDueScratch(ctx context.Context) {
 	e.scratchProblem("", "", nil)
 	fs := e.fsForStores()
 	for _, k := range due {
-		settled, err := settleOnDisk(ctx, fs, k)
+		var err error
+		if k.Action == store.ScratchDelete {
+			// Claimed first: from then on the daemon refuses a declaration
+			// under which it would not be deleted, until it is settled.
+			err = e.Store.SettleScratch(ctx, store.ScratchSettled{AttemptID: k.AttemptID, State: store.ScratchDeleting})
+		}
+		var settled store.ScratchSettled
+		if err == nil {
+			settled, err = settleOnDisk(ctx, fs, k)
+		}
 		if err == nil {
 			err = e.Store.SettleScratch(ctx, settled)
 		}

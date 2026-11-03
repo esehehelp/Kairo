@@ -20,7 +20,11 @@ import (
 // until then it stays where it is). A scratch whose path is no longer the
 // scratch directory of a volatile store as declared now (the store was
 // dropped, moved or made durable, or another store now holds the path) is
-// left untouched.
+// left untouched. A scratch is deleted only once its executor has claimed it
+// (state deleting, taken only while the declaration says to delete it);
+// until it is settled, a machine declaration under which it would not be
+// deleted is refused (checkScratchBeingDeletedTx), so the declaration cannot
+// change under a deletion.
 
 // AttemptScratch is an attempt's scratch directory as its executor made it.
 type AttemptScratch struct {
@@ -46,6 +50,10 @@ const (
 	ScratchLeave = "leave"
 )
 
+// ScratchDeleting is the state an executor claims a scratch in before it
+// deletes it (ScratchSettled.State).
+const ScratchDeleting = "deleting"
+
 // ScratchSettlement is a scratch its executor is to settle now, what to do
 // with it (Action), and why.
 type ScratchSettlement struct {
@@ -59,7 +67,8 @@ type ScratchSettlement struct {
 
 // ScratchSettled is what an executor did with a scratch: State "deleted" or
 // "kept", with its Bytes when known, and a Reason that replaces the rules'
-// when given (a deletion the executor refused, say).
+// when given (a deletion the executor refused, say); or ScratchDeleting, the
+// claim it makes before deleting it.
 type ScratchSettled struct {
 	AttemptID string `json:"attempt_id"`
 	State     string `json:"state"`
@@ -73,8 +82,9 @@ var ErrScratchKept = errors.New("the scratch is kept, not deleted")
 // scratchOwnership says why path is not, as declared now, the scratch
 // directory of attemptID on the volatile store storeID of node nodeID with
 // root root ("" when it is): the store must still be declared, volatile, on
-// that node and at that root; the path must be <root>/scratch/<attempt id>;
-// and no other store of the node may hold it or lie inside it.
+// that node and at that root, spelled as declared; the path must be
+// <root>/scratch/<attempt id>, absolute; and no other store of the node may
+// hold it or lie inside it.
 func scratchOwnership(declared []machine.Store, nodeID, storeID, root, path, attemptID string) string {
 	var store *machine.Store
 	for i := range declared {
@@ -89,7 +99,7 @@ func scratchOwnership(declared []machine.Store, nodeID, storeID, root, path, att
 		return "store " + storeID + " is no longer volatile"
 	case store.Node != nodeID:
 		return "store " + storeID + " is no longer on node " + nodeID
-	case machine.StoreRootKey(store.Root) != machine.StoreRootKey(root):
+	case store.Root != root:
 		return "store " + storeID + " has moved from " + root + " to " + store.Root
 	case !machine.IsScratchDir(path, root, attemptID):
 		return path + " is not the attempt's scratch directory under " + root
@@ -225,9 +235,10 @@ func scratchAction(declared []machine.Store, nodeID, storeID, root, path, attemp
 	return ScratchKeep, reason
 }
 
-// ScratchToSettle is the unsettled scratch (active, or missing before it was
-// settled) of an executor's attempts that have quiesced or were lost, each
-// with what is to be done with it.
+// ScratchToSettle is the unsettled scratch (active, missing before it was
+// settled, or claimed for deletion) of an executor's attempts that have
+// quiesced or were lost, each with what is to be done with it (one claimed
+// is deleted: the declaration cannot have changed under it).
 func (s *Store) ScratchToSettle(ctx context.Context, executorID string) ([]ScratchSettlement, error) {
 	tx, err := s.beginRead(ctx)
 	if err != nil {
@@ -239,29 +250,35 @@ func (s *Store) ScratchToSettle(ctx context.Context, executorID string) ([]Scrat
 		return nil, err
 	}
 	out := []ScratchSettlement{}
-	err = eachRow(ctx, tx, `SELECT k.attempt_id,k.store_id,k.root,k.path,x.node_id,`+scratchOutcomeColumns+`
+	err = eachRow(ctx, tx, `SELECT k.attempt_id,k.store_id,k.root,k.path,k.state,x.node_id,`+scratchOutcomeColumns+`
 		FROM attempt_scratch k JOIN attempts a ON a.id=k.attempt_id JOIN execution_requests e ON e.id=a.execution_id JOIN executors x ON x.id=k.executor_id
-		WHERE k.executor_id=$1 AND k.state IN('active','missing') AND k.settled_at IS NULL AND a.state IN('quiesced','lost') ORDER BY k.created_at,k.attempt_id`, []any{executorID}, func(rows *sql.Rows) error {
+		WHERE k.executor_id=$1 AND k.state IN('active','missing','deleting') AND k.settled_at IS NULL AND a.state IN('quiesced','lost') ORDER BY k.created_at,k.attempt_id`, []any{executorID}, func(rows *sql.Rows) error {
 		var k ScratchSettlement
-		var nodeID string
+		var state, nodeID string
 		var o scratchOutcome
-		if err := rows.Scan(append([]any{&k.AttemptID, &k.StoreID, &k.Root, &k.Path, &nodeID}, o.targets()...)...); err != nil {
+		if err := rows.Scan(append([]any{&k.AttemptID, &k.StoreID, &k.Root, &k.Path, &state, &nodeID}, o.targets()...)...); err != nil {
 			return err
 		}
-		k.Action, k.Reason = scratchAction(declared, nodeID, k.StoreID, k.Root, k.Path, k.AttemptID, o)
+		if state == ScratchDeleting {
+			_, k.Reason = o.disposition()
+			k.Action = ScratchDelete
+		} else {
+			k.Action, k.Reason = scratchAction(declared, nodeID, k.StoreID, k.Root, k.Path, k.AttemptID, o)
+		}
 		out = append(out, k)
 		return nil
 	})
 	return out, err
 }
 
-// SettleScratch records what an executor did with an attempt's scratch:
-// "deleted" is taken only when the scratch is to be deleted now
-// (ScratchDelete), "kept" always. Settling it again the same way is no
-// error.
+// SettleScratch records what an executor did with an attempt's scratch, or
+// the claim it makes before deleting it. ScratchDeleting is taken only when
+// the scratch is to be deleted now (ScratchDelete); "deleted" only once it
+// was claimed; "kept" always (a deletion refused for safety, after its
+// claim). Settling it again the same way is no error.
 func (s *Store) SettleScratch(ctx context.Context, settled ScratchSettled) error {
-	if settled.State != "deleted" && settled.State != "kept" {
-		return fmt.Errorf("scratch is settled deleted or kept, not %q", settled.State)
+	if settled.State != "deleted" && settled.State != "kept" && settled.State != ScratchDeleting {
+		return fmt.Errorf("scratch is settled deleted or kept, or claimed deleting, not %q", settled.State)
 	}
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -284,22 +301,39 @@ func (s *Store) SettleScratch(ctx context.Context, settled ScratchSettled) error
 	if current == settled.State {
 		return tx.Commit()
 	}
+	claimed := current == ScratchDeleting
 	unsettled := current == "active" || current == "missing" && !settledAt.Valid
-	if !unsettled || o.attemptState != "quiesced" && o.attemptState != "lost" {
+	if !claimed && !unsettled || o.attemptState != "quiesced" && o.attemptState != "lost" {
 		return fmt.Errorf("%w: scratch %s of an attempt %s cannot be settled", ErrStaleEpoch, current, o.attemptState)
 	}
-	declared, err := declaredStores(ctx, tx)
-	if err != nil {
-		return err
+	var reason string
+	if claimed {
+		// claimed for deletion under the declaration as it still is
+		_, reason = o.disposition()
+	} else {
+		declared, err := declaredStores(ctx, tx)
+		if err != nil {
+			return err
+		}
+		var action string
+		action, reason = scratchAction(declared, nodeID, storeID, root, path, settled.AttemptID, o)
+		switch {
+		case settled.State == ScratchDeleting && action != ScratchDelete:
+			return fmt.Errorf("%w (%s)", ErrScratchKept, reason)
+		case settled.State == "deleted":
+			return fmt.Errorf("scratch of attempt %s is deleted only once claimed (%s)", settled.AttemptID, ScratchDeleting)
+		}
 	}
-	action, reason := scratchAction(declared, nodeID, storeID, root, path, settled.AttemptID, o)
-	if settled.State == "deleted" && action != ScratchDelete {
-		return fmt.Errorf("%w (%s)", ErrScratchKept, reason)
+	t := now()
+	if settled.State == ScratchDeleting {
+		if _, err = tx.ExecContext(ctx, `UPDATE attempt_scratch SET state=$1,updated_at=$2,missing_at=NULL WHERE attempt_id=$3`, ScratchDeleting, t, settled.AttemptID); err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 	if settled.Reason != "" {
 		reason = settled.Reason
 	}
-	t := now()
 	if _, err = tx.ExecContext(ctx, `UPDATE attempt_scratch SET state=$1,bytes=COALESCE($2,bytes),reason=$3,settled_at=$4,updated_at=$5,missing_at=NULL WHERE attempt_id=$6`,
 		settled.State, settled.Bytes, reason, t, t, settled.AttemptID); err != nil {
 		return err

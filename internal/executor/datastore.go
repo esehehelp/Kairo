@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"time"
 
@@ -86,11 +87,36 @@ func (e *Local) refreshStores(ctx context.Context) {
 		}
 		served = append(served, s)
 	}
+	refuseSharedPlaces(ctx, served)
 	e.mu.Lock()
 	e.stores = served
 	e.storesKnown = true
 	e.mu.Unlock()
 	e.storeReportAt = time.Time{} // report what is new soon
+}
+
+// refuseSharedPlaces makes unusable a volatile store whose root is, on disk,
+// where another served store's root is, or inside or around it (a bind
+// mount, which the declared paths cannot show): its scratch would be
+// another store's data.
+func refuseSharedPlaces(ctx context.Context, served []servedStore) {
+	places := make([]string, len(served))
+	for i, s := range served {
+		places[i], _ = s.fs.Place(ctx, s.decl.Root) // a root not there yet has none
+	}
+	for i := range served {
+		s := &served[i]
+		if !s.usable || s.decl.Class != machine.StoreVolatile {
+			continue
+		}
+		for j, other := range served {
+			if j != i && placesOverlap(places[i], places[j]) {
+				s.usable = false
+				s.problem = fmt.Sprintf("its root %s is, on disk, where store %s's root %s is, or inside or around it", s.decl.Root, other.decl.ID, other.decl.Root)
+				break
+			}
+		}
+	}
 }
 
 // servedStores is a copy of the stores this executor serves.
@@ -134,7 +160,7 @@ func (e *Local) reportStores() {
 
 // observeStore is what a served store holds now.
 func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObservation {
-	obs := store.StoreObservation{StoreID: s.decl.ID, ExecutorID: e.ID, Usable: s.usable, Problem: s.problem}
+	obs := store.StoreObservation{StoreID: s.decl.ID, ExecutorID: e.ID, Root: s.decl.Root, Usable: s.usable, Problem: s.problem}
 	if !s.usable {
 		return obs
 	}
@@ -144,7 +170,7 @@ func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObse
 		obs.Problem = "usage: " + err.Error()
 	}
 	started := time.Now()
-	ids, err := s.fs.List(ctx, s.decl.Root)
+	ids, unread, err := s.fs.List(ctx, s.decl.Root)
 	if err != nil {
 		if obs.Problem == "" {
 			obs.Problem = "scratch: " + err.Error()
@@ -158,6 +184,9 @@ func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObse
 		} else {
 			obs.Scratch[id] = -1 // found, not measured this time
 		}
+	}
+	for _, id := range unread {
+		obs.Scratch[id] = -1 // there, but not read: not taken as missing
 	}
 	// The whole of <root>/scratch was read (and the report is not cut by its
 	// deadline): a record not found is missing.

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"path"
 	"strconv"
 	"strings"
 	"time"
@@ -30,11 +31,17 @@ const wslStoreScript = `op=$1; shift
 # realroot: the root resolves to itself (no symlink anywhere on its path),
 # else exit 4.
 realroot() { [ "$(realpath -e -- "$1" 2>/dev/null)" = "$1" ] || { echo "root $1 is not its own real path" >&2; exit 4; }; }
-# mounted: a mount point (bind mounts included) at or under $1.
-mounted() { awk -v d="$1" '{ m=$5; gsub(/\040/, " ", m); if (m == d || index(m, d "/") == 1) f=1 } END { exit !f }' /proc/self/mountinfo; }
+# mountpoint: $1 is a mount point (bind mounts included). mounted: one is at
+# $1 or at or under $2. (mountinfo escapes a space as \040: the paths
+# compared have none, and a mount point under $2 starts with "$2/" escaped
+# or not.)
+mountpoint() { awk -v p="$1" '$5 == p { f=1 } END { exit !f }' /proc/self/mountinfo; }
+mounted() { awk -v p="$1" -v d="$2" '{ m=$5; if (m == p || m == d || index(m, d "/") == 1) f=1 } END { exit !f }' /proc/self/mountinfo; }
 case "$op" in
 ensure)
   root=$1; fs=$2
+  # no symlink on the part of the path that exists, before anything is made
+  [ "$(realpath -m -- "$root" 2>/dev/null)" = "$root" ] || { echo "root $root is not its own real path" >&2; exit 4; }
   mkdir -p -- "$root" || exit 1
   [ -d "$root" ] || { echo "root $root is not a directory" >&2; exit 1; }
   realroot "$root"
@@ -61,6 +68,9 @@ list)
     [ -d "$d" ] && [ ! -L "$d" ] || continue
     id=${d##*/}
     m="$d/.kairo-scratch"
+    # a directory or marker that cannot be read: not known to be Kairo's,
+    # nor to be gone
+    if [ ! -x "$d" ] || { [ -e "$m" ] && [ ! -r "$m" ]; }; then printf '? %s\n' "$id"; continue; fi
     [ -f "$m" ] && [ ! -L "$m" ] || continue
     [ "$(head -c 1024 -- "$m" | tr -d '[:space:]')" = "$id" ] || continue
     printf '%s\n' "$id"
@@ -70,6 +80,7 @@ create)
   p="$1/scratch"; id=$2
   mkdir -p -- "$p" || exit 1
   [ -d "$p" ] && [ ! -L "$p" ] || exit 4
+  mountpoint "$p" && { echo "$p is a mount point" >&2; exit 4; }
   d="$p/$id"; m="$d/.kairo-scratch"
   if [ -d "$d" ] && [ ! -L "$d" ] && [ -f "$m" ] && [ ! -L "$m" ] &&
     [ "$(head -c 1024 -- "$m" | tr -d '[:space:]')" = "$id" ]; then
@@ -89,7 +100,7 @@ remove)
   [ -d "$p" ] && [ ! -L "$p" ] || exit 4
   [ -e "$d" ] || [ -L "$d" ] || exit 0
   [ -d "$d" ] && [ ! -L "$d" ] || exit 4
-  mounted "$d" && { echo "a mount point is at or under $d" >&2; exit 4; }
+  mounted "$p" "$d" && { echo "a mount point is at $p or at or under $d" >&2; exit 4; }
   m="$d/.kairo-scratch"
   if [ -f "$m" ] && [ ! -L "$m" ]; then
     [ "$(head -c 1024 -- "$m" | tr -d '[:space:]')" = "$id" ] || exit 5
@@ -107,13 +118,9 @@ remove)
   exit 2 ;;
 esac`
 
-// wslRootPath is root without a trailing slash (but / itself).
-func wslRootPath(root string) string {
-	if trimmed := strings.TrimRight(root, "/"); trimmed != "" {
-		return trimmed
-	}
-	return root
-}
+// wslRootPath is root as the script compares it with its real path: cleaned
+// (no . component, repeated or trailing slash).
+func wslRootPath(root string) string { return path.Clean(root) }
 
 func (w wslStoreFS) run(ctx context.Context, timeout time.Duration, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -165,18 +172,28 @@ func (w wslStoreFS) Usage(ctx context.Context, root string) (int64, int64, error
 	return total, free, err
 }
 
-func (w wslStoreFS) List(ctx context.Context, root string) ([]string, error) {
+// Place: inside a distro a root is compared only by its path (the distro's
+// own disk holds no other store's root, and /mnt/<drive> is compared with
+// the drive when stores are declared).
+func (wslStoreFS) Place(context.Context, string) (string, error) { return "", nil }
+
+func (w wslStoreFS) List(ctx context.Context, root string) ([]string, []string, error) {
 	out, err := w.run(ctx, 5*time.Minute, "list", wslRootPath(root))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var ids []string
+	var ids, unread []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if id := strings.TrimSpace(line); validScratchID(id) {
-			ids = append(ids, id)
+		line = strings.TrimSpace(line)
+		if id, ok := strings.CutPrefix(line, "? "); ok {
+			if validScratchID(id) {
+				unread = append(unread, id)
+			}
+		} else if validScratchID(line) {
+			ids = append(ids, line)
 		}
 	}
-	return ids, nil
+	return ids, unread, nil
 }
 
 func (w wslStoreFS) Create(ctx context.Context, root, attemptID string) (string, error) {
@@ -193,6 +210,9 @@ func (w wslStoreFS) Create(ctx context.Context, root, attemptID string) (string,
 func (w wslStoreFS) Remove(ctx context.Context, root, dir, attemptID string, onlyEmpty bool) error {
 	if !validScratchID(attemptID) {
 		return fmt.Errorf("%w: attempt id %q", errOutsideRoot, attemptID)
+	}
+	if !strings.HasPrefix(root, "/") {
+		return fmt.Errorf("%w: root %s is not absolute", errOutsideRoot, root)
 	}
 	mode := "all"
 	if onlyEmpty {

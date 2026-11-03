@@ -252,8 +252,9 @@ func (s *Store) beginWrite(ctx context.Context) (*sql.Tx, error) { return beginW
 // wait for a decision nor make one wait. The scratch records it shares with
 // decisions (recording and settling scratch, under the lock) it changes only
 // with single statements whose conditions PostgreSQL checks again under the
-// row lock, so neither side loses the other's change. Nothing else may use
-// it.
+// row lock, so neither side loses the other's change; it locks the store's
+// declaration row first, so two reports of one store never lock the records
+// in different orders. Nothing else may use it.
 func (s *Store) beginUnlockedWrite(ctx context.Context) (*sql.Tx, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

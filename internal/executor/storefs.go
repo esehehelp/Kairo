@@ -19,22 +19,25 @@ import (
 // directory whose marker names it); what it deletes is only a scratch
 // directory recorded for the attempt whose marker names that attempt.
 //
-// Nothing is reached through a path opened again after it was checked: the
-// root's path has no link in it (every component checked, and on Windows the
-// path the opened root resolves to must be the declared one), and below the
-// root every operation goes through os.Root handles (openat-style on Linux,
-// handle-relative NtCreateFile on Windows). A directory checked with Lstat is
-// opened as a Root and must be the one checked (the same file), so a
-// directory swapped for a link between the two is refused; within an opened
-// directory os.Root.RemoveAll removes a link itself (a symlink, a junction,
-// any reparse point) and never what it points at, and no operation leaves the
-// directory it started from. Files are deleted without changing their
-// attributes (Windows ignores the read-only attribute on deletion; on Linux a
-// file's mode never matters), so a hard link to a file outside is unlinked
-// without touching that file; only a scratch subdirectory a task made
-// unwritable is made writable again, through its Root (directories cannot be
-// hard linked). On Linux a scratch with a mount point anywhere under it (a
-// bind mount included, which os.Root would cross) is not deleted.
+// Nothing is reached through a path: a root (or a scratch directory to
+// size) is opened one directory at a time from its volume's root, each a
+// plain directory (not a link) opened as an os.Root and checked to be the
+// one looked at (the same file, identified through a handle on both sides),
+// and a missing one is made through its parent's handle; below that every
+// operation goes through os.Root handles (openat-style on Linux,
+// handle-relative NtCreateFile on Windows), so a directory swapped for a link
+// at any moment is refused, never followed out. Within an opened directory
+// os.Root.RemoveAll removes a link itself (a symlink, a junction, any reparse
+// point) and never what it points at, and no operation leaves the directory
+// it started from. Files are deleted without changing their attributes, so a
+// hard link to a file outside is unlinked without touching that file: on
+// Linux a file's mode never matters, and on Windows the root must be on NTFS,
+// where deletion ignores the read-only attribute (elsewhere Go clears it
+// first, on the file a hard link shares). Only a directory a task made
+// unwritable is made writable again, through a handle that can only be a
+// directory (Linux). On Linux <root>/scratch must not be a mount point and a
+// scratch with a mount point anywhere under it (a bind mount included, which
+// os.Root would cross) is not deleted.
 
 const (
 	scratchDirName    = "scratch"
@@ -44,7 +47,8 @@ const (
 )
 
 var (
-	// errOutsideRoot: a scratch path that is not <root>/scratch/<attempt id>.
+	// errOutsideRoot: a scratch path that is not <root>/scratch/<attempt id>
+	// of an absolute root.
 	errOutsideRoot = errors.New("not a scratch directory of the store's root")
 	// errScratchLink: a link, a non-directory or a mount point where a
 	// plain directory must be (the root, a component of its path, the
@@ -67,9 +71,15 @@ type storeFS interface {
 	Ensure(ctx context.Context, root, filesystem string) error
 	// Usage is the total and free bytes of the filesystem holding root.
 	Usage(ctx context.Context, root string) (total, free int64, err error)
-	// List is the ids of the Kairo scratch directories under root (a
-	// directory <root>/scratch/<id> whose marker names id).
-	List(ctx context.Context, root string) ([]string, error)
+	// Place is where root really is ("" when it cannot be told): two roots
+	// whose places overlap (placesOverlap) are one place on disk, or one
+	// holds the other, whatever their paths.
+	Place(ctx context.Context, root string) (string, error)
+	// List is the Kairo scratch directories under root: ids, a directory
+	// <root>/scratch/<id> whose marker names id, and unread, one named like a
+	// scratch directory whose marker could not be read now (not known to be
+	// Kairo's, nor known to be gone).
+	List(ctx context.Context, root string) (ids, unread []string, err error)
 	// Create makes <root>/scratch/<attemptID> with its marker and returns
 	// its path (one already made for attemptID is taken as it is).
 	Create(ctx context.Context, root, attemptID string) (string, error)
@@ -85,7 +95,7 @@ type storeFS interface {
 
 // scanScratch sizes every Kairo scratch directory under root, by id.
 func scanScratch(ctx context.Context, sfs storeFS, root string) (map[string]int64, error) {
-	ids, err := sfs.List(ctx, root)
+	ids, _, err := sfs.List(ctx, root)
 	if err != nil {
 		return nil, err
 	}
@@ -128,26 +138,15 @@ type localStoreFS struct{}
 
 func (localStoreFS) Ensure(_ context.Context, root, filesystem string) error {
 	root = filepath.Clean(root)
-	if !filepath.IsAbs(root) {
-		return fmt.Errorf("root %s is not absolute", root)
-	}
-	if err := checkPathHasNoLinks(root); err != nil {
-		return err
-	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return fmt.Errorf("make root %s: %w", root, err)
-	}
-	if err := checkPathHasNoLinks(root); err != nil {
-		return err
-	}
-	fi, err := os.Lstat(root)
+	r, err := openDirPath(root, true)
 	if err != nil {
 		return err
 	}
-	if !fi.IsDir() {
-		return fmt.Errorf("root %s is not a directory", root)
-	}
+	r.Close()
 	if err = checkResolvesTo(root); err != nil {
+		return err
+	}
+	if err = checkFilesystemType(root); err != nil {
 		return err
 	}
 	on, err := onFilesystem(root, filesystem)
@@ -164,43 +163,59 @@ func (localStoreFS) Usage(_ context.Context, root string) (int64, int64, error) 
 	return diskUsage(filepath.Clean(root))
 }
 
-func (localStoreFS) List(ctx context.Context, root string) ([]string, error) {
-	r, err := openStoreRoot(root)
+func (localStoreFS) Place(_ context.Context, root string) (string, error) {
+	return placeOf(filepath.Clean(root))
+}
+
+func (localStoreFS) List(ctx context.Context, root string) ([]string, []string, error) {
+	r, err := openDirPath(root, false)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer r.Close()
 	sr, err := openPlainDir(r, scratchDirName)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer sr.Close()
 	names, err := readNames(ctx, sr)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	var ids []string
+	var ids, unread []string
 	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 		if !validScratchID(name) {
 			continue
 		}
 		ar, err := openPlainDir(sr, name)
 		if err != nil {
+			// gone meanwhile, or a link: not a scratch directory
+			if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, errScratchLink) {
+				unread = append(unread, name)
+			}
 			continue
 		}
 		id, err := readMarker(ar)
 		ar.Close()
-		if err == nil && id == name {
-			ids = append(ids, name)
+		switch {
+		case err == nil:
+			if id == name {
+				ids = append(ids, name)
+			}
+		case !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, errScratchMarker):
+			unread = append(unread, name)
 		}
 	}
-	return ids, nil
+	return ids, unread, nil
 }
 
 // Scan is scanScratch on this filesystem.
@@ -212,14 +227,9 @@ func (localStoreFS) Create(_ context.Context, root, attemptID string) (string, e
 	if !validScratchID(attemptID) {
 		return "", fmt.Errorf("%w: attempt id %q", errOutsideRoot, attemptID)
 	}
+	root = filepath.Clean(root)
 	// A root that is gone is made again (Ensure made it), through no link.
-	if err := checkPathHasNoLinks(filepath.Clean(root)); err != nil {
-		return "", err
-	}
-	if err := os.MkdirAll(filepath.Clean(root), 0o755); err != nil {
-		return "", err
-	}
-	r, err := openStoreRoot(root)
+	r, err := openDirPath(root, true)
 	if err != nil {
 		return "", err
 	}
@@ -232,7 +242,10 @@ func (localStoreFS) Create(_ context.Context, root, attemptID string) (string, e
 		return "", err
 	}
 	defer sr.Close()
-	dir := filepath.Join(filepath.Clean(root), scratchDirName, attemptID)
+	if err = checkScratchParentNotMounted(root); err != nil {
+		return "", err
+	}
+	dir := filepath.Join(root, scratchDirName, attemptID)
 	if err = sr.Mkdir(attemptID, 0o755); errors.Is(err, fs.ErrExist) {
 		ar, openErr := openPlainDir(sr, attemptID)
 		if openErr != nil {
@@ -270,24 +283,14 @@ func (localStoreFS) Remove(ctx context.Context, root, dir, attemptID string, onl
 
 func (localStoreFS) Size(ctx context.Context, dir string) (int64, error) {
 	dir = filepath.Clean(dir)
-	fi, err := os.Lstat(dir)
+	r, err := openDirPath(dir, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return 0, nil
 	}
 	if err != nil {
 		return 0, err
 	}
-	if isLink(fi) || !fi.IsDir() {
-		return 0, fmt.Errorf("%w: %s", errScratchLink, dir)
-	}
-	r, err := os.OpenRoot(dir)
-	if err != nil {
-		return 0, err
-	}
 	defer r.Close()
-	if err = checkOpened(dir, fi, r); err != nil {
-		return 0, err
-	}
 	mounts, err := mountsUnderFn(dir)
 	if err != nil {
 		return 0, err
@@ -295,77 +298,45 @@ func (localStoreFS) Size(ctx context.Context, dir string) (int64, error) {
 	return treeSize(ctx, r, dir, mounts)
 }
 
-// checkPathHasNoLinks checks that no existing component of path (an
-// absolute, cleaned path) is a link of any kind; components that do not
-// exist yet are fine.
-func checkPathHasNoLinks(path string) error {
-	volume := filepath.VolumeName(path)
-	current := volume + string(filepath.Separator)
-	rest := strings.TrimPrefix(path[len(volume):], string(filepath.Separator))
+// openDirPath opens p, an absolute path, as an os.Root one directory at a
+// time from its volume's root: each must be a plain directory, opened as the
+// one checked (openPlainDir); with create, a missing one is made through its
+// parent's handle. A link anywhere on the path, there all along or put there
+// while it is opened, is refused, and nothing is made through one.
+func openDirPath(p string, create bool) (*os.Root, error) {
+	p = filepath.Clean(p)
+	if !filepath.IsAbs(p) {
+		return nil, fmt.Errorf("%w: %s is not an absolute path", errOutsideRoot, p)
+	}
+	volume := filepath.VolumeName(p)
+	r, err := os.OpenRoot(volume + string(filepath.Separator))
+	if err != nil {
+		return nil, err
+	}
+	rest := strings.Trim(p[len(volume):], string(filepath.Separator))
 	if rest == "" {
-		return nil
+		return r, nil
 	}
-	for _, part := range strings.Split(rest, string(filepath.Separator)) {
-		current = filepath.Join(current, part)
-		fi, err := os.Lstat(current)
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil
+	for _, name := range strings.Split(rest, string(filepath.Separator)) {
+		if create {
+			if err = r.Mkdir(name, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+				r.Close()
+				return nil, fmt.Errorf("make %s: %w", p, err)
+			}
 		}
-		if err != nil {
-			return err
-		}
-		if isLink(fi) {
-			return fmt.Errorf("%w: %s, on the path of %s, is a link", errScratchLink, current, path)
-		}
-		if !fi.IsDir() {
-			return fmt.Errorf("%w: %s, on the path of %s, is not a directory", errScratchLink, current, path)
-		}
-	}
-	return nil
-}
-
-// openStoreRoot opens a store's root as an os.Root, refusing a root whose
-// path has a link in it or that changed while it was opened.
-func openStoreRoot(root string) (*os.Root, error) {
-	root = filepath.Clean(root)
-	if err := checkPathHasNoLinks(root); err != nil {
-		return nil, err
-	}
-	fi, err := os.Lstat(root)
-	if err != nil {
-		return nil, err
-	}
-	if isLink(fi) || !fi.IsDir() {
-		return nil, fmt.Errorf("%w: %s", errScratchLink, root)
-	}
-	r, err := os.OpenRoot(root)
-	if err != nil {
-		return nil, err
-	}
-	if err = checkOpened(root, fi, r); err != nil {
+		next, err := openPlainDir(r, name)
 		r.Close()
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
+		r = next
 	}
 	return r, nil
 }
 
-// checkOpened checks that r, opened at path after Lstat gave fi, is that
-// directory: the same file (where a FileInfo identifies one), and a path
-// that still has no link in it.
-func checkOpened(path string, fi os.FileInfo, r *os.Root) error {
-	opened, err := r.Stat(".")
-	if err != nil {
-		return err
-	}
-	if !sameDirectory(fi, opened) {
-		return fmt.Errorf("%w: %s changed while it was opened", errScratchLink, path)
-	}
-	return checkPathHasNoLinks(path)
-}
-
 // openPlainDir opens name, a directory directly in parent, as an os.Root: it
 // must be a plain directory (not a link), and the one opened must be the one
-// checked.
+// checked (the same file, both identified through handles).
 func openPlainDir(parent *os.Root, name string) (*os.Root, error) {
 	fi, err := parent.Lstat(name)
 	if err != nil {
@@ -383,7 +354,7 @@ func openPlainDir(parent *os.Root, name string) (*os.Root, error) {
 		sub.Close()
 		return nil, err
 	}
-	if !sameDirectory(fi, opened) {
+	if !os.SameFile(fi, opened) {
 		sub.Close()
 		return nil, fmt.Errorf("%w: %s changed while it was opened", errScratchLink, filepath.Join(parent.Name(), name))
 	}
@@ -391,20 +362,30 @@ func openPlainDir(parent *os.Root, name string) (*os.Root, error) {
 }
 
 // readMarker is the attempt id the marker in a scratch directory names. The
-// marker must be a small regular file, not a link.
+// marker must be a small regular file, not a link; it is opened without
+// waiting (a FIFO put in its place does not block) and must be the file
+// checked.
 func readMarker(dir *os.Root) (string, error) {
 	fi, err := dir.Lstat(scratchMarkerName)
 	if err != nil {
 		return "", err
 	}
+	notMarker := fmt.Errorf("%w: %s is not a small regular file", errScratchMarker, filepath.Join(dir.Name(), scratchMarkerName))
 	if isLink(fi) || !fi.Mode().IsRegular() || fi.Size() > 1024 {
-		return "", fmt.Errorf("%w: %s is not a small regular file", errScratchMarker, filepath.Join(dir.Name(), scratchMarkerName))
+		return "", notMarker
 	}
-	f, err := dir.Open(scratchMarkerName)
+	f, err := dir.OpenFile(scratchMarkerName, os.O_RDONLY|markerOpenFlags, 0)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	opened, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !opened.Mode().IsRegular() || !os.SameFile(fi, opened) {
+		return "", notMarker
+	}
 	body, err := io.ReadAll(io.LimitReader(f, 1024))
 	if err != nil {
 		return "", err
@@ -458,11 +439,27 @@ func samePath(a, b string) bool {
 	return a == b
 }
 
+// checkScratchParentNotMounted refuses a root whose <root>/scratch is a mount
+// point (a bind mount of a place elsewhere, say).
+func checkScratchParentNotMounted(root string) error {
+	parent := filepath.Join(root, scratchDirName)
+	mounts, err := mountsUnderFn(parent)
+	if err != nil {
+		return err
+	}
+	for _, m := range mounts {
+		if samePath(m, parent) {
+			return fmt.Errorf("%w: %s is a mount point", errScratchLink, parent)
+		}
+	}
+	return nil
+}
+
 // removeScratch deletes dir, the scratch directory of attemptID under root,
-// only if it is exactly <root>/scratch/<attemptID>, the root's path has no
-// link in it, neither <root>/scratch nor dir is a link, no mount point is
-// under dir, and its marker names attemptID. The marker goes last, so a
-// deletion cut short is resumed; a directory without a marker is deleted
+// only if it is exactly <root>/scratch/<attemptID> of an absolute root, no
+// directory on the way is a link, <root>/scratch is not a mount point and
+// none is under dir, and its marker names attemptID. The marker goes last, so
+// a deletion cut short is resumed; a directory without a marker is deleted
 // only if it is empty (one whose deletion stopped between the marker and the
 // directory). onlyEmpty deletes the directory only if it holds nothing but
 // its marker. A directory already gone is no error.
@@ -471,11 +468,14 @@ func removeScratch(ctx context.Context, root, dir, attemptID string, onlyEmpty b
 		return fmt.Errorf("%w: attempt id %q", errOutsideRoot, attemptID)
 	}
 	root = filepath.Clean(root)
+	if !filepath.IsAbs(root) {
+		return fmt.Errorf("%w: root %s is not absolute", errOutsideRoot, root)
+	}
 	want := filepath.Join(root, scratchDirName, attemptID)
 	if dir == "" || !samePath(filepath.Clean(dir), want) {
 		return fmt.Errorf("%w: %s is not %s", errOutsideRoot, dir, want)
 	}
-	r, err := openStoreRoot(root)
+	r, err := openDirPath(root, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
@@ -491,6 +491,20 @@ func removeScratch(ctx context.Context, root, dir, attemptID string, onlyEmpty b
 		return err
 	}
 	defer sr.Close()
+	mounts, err := mountsUnderFn(filepath.Join(root, scratchDirName))
+	if err != nil {
+		return err
+	}
+	for _, m := range mounts {
+		if samePath(m, filepath.Join(root, scratchDirName)) || samePath(m, want) || strings.HasPrefix(m, want+string(filepath.Separator)) {
+			return fmt.Errorf("%w: %s is a mount point", errScratchLink, m)
+		}
+	}
+	// A scratch directory its task made unreadable or unwritable is made
+	// the owner's again, so its marker can be read and its entries removed.
+	if fi, err := sr.Lstat(attemptID); err == nil && !isLink(fi) && fi.IsDir() && fi.Mode().Perm()&0o700 != 0o700 {
+		_ = chmodDir(sr, attemptID, fi.Mode().Perm()|0o700)
+	}
 	ar, err := openPlainDir(sr, attemptID)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
@@ -506,13 +520,6 @@ func removeScratch(ctx context.Context, root, dir, attemptID string, onlyEmpty b
 		}
 	}
 	defer closeAttempt()
-	mounts, err := mountsUnderFn(want)
-	if err != nil {
-		return err
-	}
-	if len(mounts) != 0 {
-		return fmt.Errorf("%w: %s is mounted under %s", errScratchLink, mounts[0], want)
-	}
 	id, markerErr := readMarker(ar)
 	if markerErr != nil {
 		if errors.Is(markerErr, fs.ErrNotExist) {
@@ -573,8 +580,8 @@ func removeContents(ctx context.Context, dir *os.Root, keep string) error {
 			}
 			if err := dir.RemoveAll(name); err != nil {
 				// A subdirectory a task made unwritable (Linux): writable
-				// again through the Root, then once more.
-				if !makeDirsWritable(dir, name) {
+				// again, then once more.
+				if !makeDirsWritable(ctx, dir, name) {
 					return err
 				}
 				if err = dir.RemoveAll(name); err != nil {
@@ -603,54 +610,111 @@ func readBatch(dir *os.Root) ([]string, error) {
 	return names, err
 }
 
-// treeSize is the bytes of the regular files under r (opened at path): links
-// are not followed, the mount points among mounts (paths under path) not
-// entered.
-func treeSize(ctx context.Context, r *os.Root, path string, mounts []string) (int64, error) {
-	mounted := map[string]bool{}
-	for _, m := range mounts {
-		mounted[filepath.Clean(m)] = true
+// eachEntry calls fn with each entry of name, a directory under r (as Lstat
+// sees it: links not followed), read a batch at a time, the deadline checked
+// between batches; a directory gone meanwhile has none.
+func eachEntry(ctx context.Context, r *os.Root, name string, fn func(fs.FileInfo)) error {
+	f, err := r.Open(name)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
 	}
-	var total int64
-	err := fs.WalkDir(r.FS(), ".", func(name string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil // deleted meanwhile
-			}
-			return err
-		}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		info, err := d.Info()
-		if errors.Is(err, fs.ErrNotExist) {
+		infos, err := f.Readdir(scratchListBatch)
+		for _, info := range infos {
+			fn(info)
+		}
+		if errors.Is(err, io.EOF) || err == nil && len(infos) == 0 {
 			return nil
 		}
 		if err != nil {
 			return err
 		}
-		switch {
-		case isLink(info):
-			if d.IsDir() {
-				return fs.SkipDir
-			}
-		case d.IsDir():
-			if name != "." && mounted[filepath.Join(path, filepath.FromSlash(name))] {
-				return fs.SkipDir
-			}
-		case info.Mode().IsRegular():
-			total += info.Size()
-		}
-		return nil
-	})
-	return total, err
+	}
 }
 
-// sameDirectory reports whether a (from Lstat of a path) and b (from Stat
-// of what was opened there) are the same file. On Windows a FileInfo from a
-// path loads its file id from that path now, so a directory swapped for a
-// link reads as another file.
-func sameDirectory(a, b os.FileInfo) bool { return os.SameFile(a, b) }
+// makeDirsWritable makes the directories at and under name in dir (links
+// not followed) readable, writable and searchable by their owner, so what
+// they hold can be removed, each through chmodDir (a directory only: a file's
+// mode is never changed, as it may be shared with a file outside); it reports
+// whether any was changed.
+func makeDirsWritable(ctx context.Context, dir *os.Root, name string) bool {
+	fi, err := dir.Lstat(name)
+	if err != nil || isLink(fi) || !fi.IsDir() {
+		return false
+	}
+	changed := false
+	pending := []string{filepath.ToSlash(name)}
+	if perm := fi.Mode().Perm(); perm&0o700 != 0o700 {
+		if chmodDir(dir, name, perm|0o700) != nil {
+			return false
+		}
+		changed = true
+	}
+	for len(pending) != 0 && ctx.Err() == nil {
+		p := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		_ = eachEntry(ctx, dir, filepath.FromSlash(p), func(info fs.FileInfo) {
+			if isLink(info) || !info.IsDir() {
+				return
+			}
+			child := path.Join(p, info.Name())
+			if perm := info.Mode().Perm(); perm&0o700 != 0o700 {
+				if chmodDir(dir, filepath.FromSlash(child), perm|0o700) != nil {
+					return
+				}
+				changed = true
+			}
+			pending = append(pending, child)
+		})
+	}
+	return changed
+}
+
+// treeSize is the bytes of the regular files under r (opened at root): links
+// are not followed, the mount points among mounts (paths under root) not
+// entered, each directory read a batch at a time with the deadline checked.
+func treeSize(ctx context.Context, r *os.Root, root string, mounts []string) (int64, error) {
+	mounted := map[string]bool{}
+	for _, m := range mounts {
+		mounted[filepath.Clean(m)] = true
+	}
+	var total int64
+	pending := []string{"."}
+	for len(pending) != 0 {
+		name := pending[len(pending)-1]
+		pending = pending[:len(pending)-1]
+		err := eachEntry(ctx, r, filepath.FromSlash(name), func(info fs.FileInfo) {
+			child := path.Join(name, info.Name())
+			switch {
+			case isLink(info):
+			case info.IsDir():
+				if !mounted[filepath.Join(root, filepath.FromSlash(child))] {
+					pending = append(pending, child)
+				}
+			case info.Mode().IsRegular():
+				total += info.Size()
+			}
+		})
+		if err != nil {
+			return 0, err
+		}
+	}
+	return total, nil
+}
+
+// placesOverlap reports whether two places (storeFS.Place, both known) are
+// one place or one holds the other.
+func placesOverlap(a, b string) bool {
+	under := func(p, q string) bool { return p == q || strings.HasPrefix(p, strings.TrimSuffix(q, "/")+"/") }
+	return a != "" && b != "" && (under(a, b) || under(b, a))
+}
 
 // mountsUnderFn is mountsUnder, replaced in tests.
 var mountsUnderFn = mountsUnder

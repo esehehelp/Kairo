@@ -60,9 +60,11 @@ func ScratchIDValid(id string) bool {
 }
 
 // IsScratchDir reports whether p is the scratch directory of attemptID under
-// root (<root>/scratch/<attempt id>), as StoreRootKey spells them.
+// root (<root>/scratch/<attempt id>), as StoreRootKey spells them, both
+// absolute (StoreRootKey reads a relative path as one from /).
 func IsScratchDir(p, root, attemptID string) bool {
-	return ScratchIDValid(attemptID) && StoreRootKey(p) == StoreRootKey(strings.TrimRight(root, `/\`)+"/scratch/"+attemptID)
+	return ScratchIDValid(attemptID) && StoreRootIsAbsolute(p) && StoreRootIsAbsolute(root) &&
+		StoreRootKey(p) == StoreRootKey(strings.TrimRight(root, `/\`)+"/scratch/"+attemptID)
 }
 
 // checkStoreRoot checks that root is one spelling of one place: absolute,
