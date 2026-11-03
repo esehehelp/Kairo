@@ -49,6 +49,7 @@ func (s *Server) routes() []route {
 		{"POST", "/api/resources/{id}/reconcile", roleAdmin, s.reconcileResource},
 		{"GET", "/api/machines", roleRead, s.getMachines},
 		{"POST", "/api/machines", roleAdmin, s.applyMachines},
+		{"GET", "/api/stores", roleRead, s.storeStatus},
 		{"GET", "/api/hardware", roleRead, s.listHardware},
 		{"POST", "/api/hardware/{host}/{device}/settings", roleAdmin, s.setDeviceSetting},
 		{"DELETE", "/api/hardware/{host}/{device}/settings", roleAdmin, s.clearDeviceSetting},

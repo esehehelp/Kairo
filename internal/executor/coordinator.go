@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"time"
 
+	"kairo/internal/machine"
 	"kairo/internal/store"
 )
 
@@ -33,6 +34,8 @@ type Coordinator interface {
 	ForceStopOrders(ctx context.Context, executorID string) ([]store.ForceStopOrder, error)
 	AckForceStop(ctx context.Context, attemptID, phase string, detail json.RawMessage) error
 	RecordAttemptUsage(ctx context.Context, attemptID string, ramBytes, diskWrittenBytes *int64) error
+	NodeStores(ctx context.Context, nodeID string) ([]machine.Store, error)
+	RecordStoreObservation(ctx context.Context, obs store.StoreObservation) error
 }
 
 var _ Coordinator = (*store.Store)(nil)

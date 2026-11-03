@@ -690,6 +690,41 @@ machine_conflict`. `GET /api/machines` answers `{"gpus", "undeclared",
 `kind`, `max_slowdown`, `control` and `controller`. A daemon older than stores
 refuses a declaration that has any (`stores` is an unknown field).
 
+### Data stores
+
+A store (`[[stores]]`, Machine declaration) is a place Kairo keeps data in:
+durable ones keep what is put there for good, volatile ones are scratch
+space. Kairo touches only what is its own there: what it made under the
+store's root (and, from P1b on, what it has verified copies of on a durable
+store). Anything else on the filesystem is counted, never moved, changed or
+deleted, and nothing outside the root is ever walked.
+
+Every executor serves the stores of its node in its own namespace: those
+naming it as `executor`, and, unless it is a WSL executor, those naming none.
+It asks the daemon for its node's stores when it starts and every 5 minutes
+(agent operation `stores`), makes each root that is missing, and checks that
+the root is on the declared filesystem (Windows: the root's drive; Linux: the
+same device as the filesystem's mount point; WSL: a root under `/mnt/<drive>`
+must be on that drive, a root on the distro's own disk is taken as declared).
+A store that fails is not used and is reported unusable with the reason.
+Every 5 minutes, in the background, the executor reports each store
+(`store-observation`): the filesystem's total and free bytes and the size of
+each Kairo scratch directory under the root (one whose marker names it; links
+are not followed and other filesystems not entered).
+
+`kairo store status [--json]` (`GET /api/stores`, `{"stores": [...]}`) shows
+each store: class, node (and executor), `state` (`unknown`: never reported,
+no agent serves it or one older than stores; `ready`; `unusable`, with the
+`problem`; `stale`: no report for 15 minutes; `undeclared`: no longer
+declared but still holding kept scratch), the filesystem's total and free,
+Kairo's bytes by class (`scratch_active_bytes`, `scratch_kept_bytes`,
+`pinned_bytes` and `cache_bytes`, both 0 until P1b/P1c) and
+`external_bytes`, what the filesystem uses that Kairo does not know (used
+minus Kairo's classes), then the kept scratch of each store. The latest
+report of a store is the table `store_observations`. An agent older than
+stores leaves its stores `unknown`; a daemon older than stores answers the
+agent's `stores` with 404, and the agent runs without stores (warned once).
+
 ### Hardware settings
 
 A device of a host (a GPU by UUID, or `cpu`) can be given settings: a GPU's

@@ -150,6 +150,9 @@ func applyStoresTx(ctx context.Context, tx *sql.Tx, changes []StoreChange, t str
 			if _, err := tx.ExecContext(ctx, `DELETE FROM machine_stores WHERE id=$1`, change.Store); err != nil {
 				return err
 			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM store_observations WHERE store_id=$1`, change.Store); err != nil {
+				return err
+			}
 		} else {
 			body, err := json.Marshal(change.To)
 			if err != nil {

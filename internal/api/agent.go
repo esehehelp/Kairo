@@ -43,6 +43,14 @@ type agentExecutorRequest struct {
 	ExecutorID string `json:"executor_id"`
 }
 
+type agentNodeRequest struct {
+	NodeID string `json:"node_id"`
+}
+
+type agentStoreObservationRequest struct {
+	Observation store.StoreObservation `json:"observation"`
+}
+
 type agentUnlaunchedRequest struct {
 	ExecutorID       string  `json:"executor_id"`
 	OlderThanSeconds float64 `json:"older_than_seconds"`
@@ -206,6 +214,19 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentExecutorRequest) (any, error) {
 				commands, err := s.Store.EnsurePriorityPreemption(ctx, b.ExecutorID)
 				return map[string]any{"commands": commands}, err
+			}),
+		newAgentOp(s, "stores", observeAllowed, nil,
+			func(_ context.Context, b agentNodeRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentNodeRequest) (any, error) {
+				stores, err := s.Store.NodeStores(ctx, b.NodeID)
+				return map[string]any{"stores": stores}, err
+			}),
+		newAgentOp(s, "store-observation", observeAllowed, nil,
+			func(ctx context.Context, b agentStoreObservationRequest) (string, error) {
+				return s.Store.StoreNode(ctx, b.Observation.StoreID)
+			},
+			func(ctx context.Context, b agentStoreObservationRequest) (any, error) {
+				return okBody, s.Store.RecordStoreObservation(ctx, b.Observation)
 			}),
 		newAgentOp(s, "unlaunched-leases", observeEmpty, map[string]any{"leases": []store.UnlaunchedLease{}},
 			func(ctx context.Context, b agentUnlaunchedRequest) (string, error) {

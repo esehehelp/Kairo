@@ -98,6 +98,7 @@ type topCommand struct {
 var topAliases = map[string]string{
 	"tasks": "task", "projects": "project", "executions": "execution", "exec": "execution",
 	"queues": "queue", "resources": "resource", "machines": "machine", "nodes": "node", "tokens": "token",
+	"stores": "store", "scratch": "store status", "storage": "store",
 	"log": "logs (or kairo task logs)", "status": "project status", "ls": "task list",
 	"list": "task list", "wait": "task wait", "watch": "project watch", "apply": "project apply",
 	"show": "task show", "cancel": "task cancel", "rerun": "task rerun", "-v": "version",
@@ -209,6 +210,12 @@ func init() {
 				"status": "show", "get": "show", "ls": "show", "list": "show",
 				"declare": "apply", "submit": "apply", "set": "apply",
 			},
+		}},
+		{name: "store", summary: "the places Kairo keeps data in: what they hold, and kept scratch", group: &commandGroup{
+			subs: []command{
+				{"status", "[--json]", "per store: class, node, state, filesystem total and free, Kairo's bytes by class, external; kept scratch", storeStatus},
+			},
+			aliases: map[string]string{"show": "status", "ls": "status", "list": "status", "get": "status"},
 		}},
 		{name: "hardware", summary: "device settings of hosts: show, set, reset and bench them", group: &commandGroup{
 			note: "DEVICE is a GPU UUID or cpu (a bench also takes disk:FILESYSTEM and net:NODE); a host's controller (kairo controller) carries the settings out.",

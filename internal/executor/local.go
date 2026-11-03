@@ -87,6 +87,17 @@ type Local struct {
 	// was last reported, by attempt (quiescence.go).
 	leftReported map[string]time.Time
 
+	// Stores (datastore.go): the ones this executor serves, when they were
+	// last asked for and whether that failed (warned once), when they were
+	// last reported and whether a report runs. storeFSOverride replaces how
+	// roots are reached, in tests.
+	stores          []servedStore
+	storesAt        time.Time
+	storesWarned    bool
+	storeReportAt   time.Time
+	storeReporting  bool
+	storeFSOverride storeFS
+
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
 	trees              map[string]*treeHandle
@@ -188,6 +199,10 @@ func (e *Local) tick(ctx context.Context) error {
 	e.beginStep("cleanup-retry")
 	e.retryCleanups(ctx)
 	e.sweepUnlaunched(ctx)
+	e.endStep()
+	e.beginStep("stores")
+	e.refreshStores(ctx)
+	e.reportStores()
 	e.endStep()
 	for {
 		reservation, err := e.reserveNext(ctx)

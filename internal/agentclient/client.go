@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"kairo/internal/api"
+	"kairo/internal/machine"
 	"kairo/internal/store"
 )
 
@@ -123,6 +124,21 @@ func (c *Client) EnsurePriorityPreemption(ctx context.Context, executorID string
 	}
 	err := c.call(ctx, "ensure-preemption", map[string]string{"executor_id": executorID}, &out)
 	return out.Commands, err
+}
+
+// NodeStores asks for the stores declared on this node. A daemon older than
+// stores answers 404 (an unknown route).
+func (c *Client) NodeStores(ctx context.Context, nodeID string) ([]machine.Store, error) {
+	var out struct {
+		Stores []machine.Store `json:"stores"`
+	}
+	err := c.call(ctx, "stores", map[string]string{"node_id": nodeID}, &out)
+	return out.Stores, err
+}
+
+// RecordStoreObservation reports what this node sees of one of its stores.
+func (c *Client) RecordStoreObservation(ctx context.Context, obs store.StoreObservation) error {
+	return c.call(ctx, "store-observation", map[string]any{"observation": obs}, nil)
 }
 
 // ListUnlaunchedLeases asks for this executor's leases that never reached a

@@ -45,6 +45,17 @@ func (s *Server) resourceStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"resources": entries, "external_claims": claims, "undeclared_gpus": machines.Undeclared})
 }
 
+// storeStatus is every store with its latest observation and kept scratch
+// (kairo store status).
+func (s *Server) storeStatus(w http.ResponseWriter, r *http.Request) {
+	stores, err := s.Store.ListStoreStatus(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"stores": stores})
+}
+
 func (s *Server) getMachines(w http.ResponseWriter, r *http.Request) {
 	machines, err := s.Store.ListMachines(r.Context())
 	if err != nil {
