@@ -35,6 +35,113 @@ const MaxSlowdownLimit = 0.5
 type Spec struct {
 	Nodes []Node `toml:"nodes" json:"nodes"`
 	Hosts []Host `toml:"hosts" json:"hosts,omitempty"`
+	// Stores are the places Kairo keeps data in. Absent from the JSON when
+	// none is declared, so a daemon that predates them takes the rest.
+	Stores []Store `toml:"stores" json:"stores,omitempty"`
+}
+
+// Store classes: a durable store keeps what is put there for good (Kairo
+// never deletes from it); a volatile one is fast scratch space that may be
+// lost or emptied.
+const (
+	StoreDurable  = "durable"
+	StoreVolatile = "volatile"
+)
+
+// StoreBackendLocalFS is a directory tree on a filesystem of the node (the
+// only backend so far).
+const StoreBackendLocalFS = "local-fs"
+
+// Store is a place Kairo keeps data in: a root directory, owned by Kairo, on
+// a filesystem of a node. Filesystem is the identity of the node's disk
+// resource the root is on (its admission accounting). Executor, when set,
+// names the one executor of the node whose namespace the root is in (a WSL
+// executor's Linux paths); a store without one is in the node's own namespace.
+// ReserveFreeBytes is the free space a durable store keeps (filling it stops
+// before), shown only for a volatile one.
+type Store struct {
+	ID               string `toml:"id" json:"id"`
+	Class            string `toml:"class" json:"class"`
+	Node             string `toml:"node" json:"node"`
+	Executor         string `toml:"executor" json:"executor,omitempty"`
+	Root             string `toml:"root" json:"root"`
+	Filesystem       string `toml:"filesystem" json:"filesystem"`
+	Backend          string `toml:"backend" json:"backend"`
+	ReserveFreeBytes int64  `toml:"reserve_free_bytes" json:"reserve_free_bytes,omitempty"`
+}
+
+// Normalized is s with its backend defaulted.
+func (s Store) Normalized() Store {
+	if s.Backend == "" {
+		s.Backend = StoreBackendLocalFS
+	}
+	return s
+}
+
+// StoreRootIsAbsolute reports whether root is an absolute path on either
+// family of node: a drive path (E:/kairo, E:\kairo) or a POSIX one
+// (/srv/kairo). The declaration is read where the CLI runs, not on the node.
+func StoreRootIsAbsolute(root string) bool {
+	if strings.HasPrefix(root, "/") {
+		return true
+	}
+	return len(root) >= 3 && root[1] == ':' && (root[2] == '/' || root[2] == '\\') &&
+		(root[0] >= 'a' && root[0] <= 'z' || root[0] >= 'A' && root[0] <= 'Z')
+}
+
+// storeRootKey is root for comparing roots: forward slashes, no trailing
+// slash, a drive path's case folded.
+func storeRootKey(root string) string {
+	key := strings.TrimRight(strings.ReplaceAll(root, `\`, "/"), "/")
+	if len(key) >= 2 && key[1] == ':' {
+		key = strings.ToLower(key)
+	}
+	return key
+}
+
+// validateStores: ids are unique, class and backend known, the root an
+// absolute path without "..", the node and filesystem given, the reserve not
+// negative, and no two stores of one namespace (node and executor) nested.
+func (s Spec) validateStores() error {
+	ids := map[string]bool{}
+	type namespace struct{ node, executor string }
+	roots := map[namespace][]Store{}
+	for _, raw := range s.Stores {
+		store := raw.Normalized()
+		switch {
+		case store.ID == "":
+			return errors.New("every [[stores]] needs an id")
+		case ids[store.ID]:
+			return fmt.Errorf("store %s is declared twice", store.ID)
+		}
+		ids[store.ID] = true
+		switch {
+		case store.Class != StoreDurable && store.Class != StoreVolatile:
+			return fmt.Errorf("store %s: class %q is neither %q nor %q", store.ID, store.Class, StoreDurable, StoreVolatile)
+		case store.Backend != StoreBackendLocalFS:
+			return fmt.Errorf("store %s: backend %q is not supported (only %q)", store.ID, store.Backend, StoreBackendLocalFS)
+		case store.Node == "":
+			return fmt.Errorf("store %s needs a node", store.ID)
+		case strings.TrimSpace(store.Root) != store.Root || !StoreRootIsAbsolute(store.Root):
+			return fmt.Errorf("store %s: root %q is not an absolute path", store.ID, store.Root)
+		case slices.Contains(strings.Split(strings.ReplaceAll(store.Root, `\`, "/"), "/"), ".."):
+			return fmt.Errorf("store %s: root %q contains ..", store.ID, store.Root)
+		case store.Filesystem == "":
+			return fmt.Errorf("store %s needs a filesystem (the identity of the node's disk it is on)", store.ID)
+		case store.ReserveFreeBytes < 0:
+			return fmt.Errorf("store %s: reserve_free_bytes is negative", store.ID)
+		}
+		ns := namespace{store.Node, store.Executor}
+		key := storeRootKey(store.Root)
+		for _, other := range roots[ns] {
+			otherKey := storeRootKey(other.Root)
+			if key == otherKey || strings.HasPrefix(key+"/", otherKey+"/") || strings.HasPrefix(otherKey+"/", key+"/") {
+				return fmt.Errorf("stores %s and %s have nested roots %s and %s on one node", other.ID, store.ID, other.Root, store.Root)
+			}
+		}
+		roots[ns] = append(roots[ns], store)
+	}
+	return nil
 }
 
 type Node struct {
@@ -100,7 +207,10 @@ func (s Spec) Validate() error {
 			listed[uuid] = true
 		}
 	}
-	return s.validateHosts()
+	if err := s.validateHosts(); err != nil {
+		return err
+	}
+	return s.validateStores()
 }
 
 // validateHosts: host ids are unique, a node is on at most one host, a
@@ -215,6 +325,9 @@ func (s Spec) NodeIDs() []string {
 		if host.Controller != "" {
 			out = append(out, host.Controller)
 		}
+	}
+	for _, store := range s.Stores {
+		out = append(out, store.Node)
 	}
 	sort.Strings(out)
 	return slices.Compact(out)

@@ -664,14 +664,31 @@ or its host lost its controller). `machine show` adds the hosts and the
 effective policy of each device (its own value, else its host's; event
 `host_declaration_changed`).
 
+Optional `[[stores]]` tables declare the places Kairo keeps data in (see Data
+stores): an `id`, a `class` (`durable`: kept for good, Kairo never deletes
+from it; `volatile`: scratch space), the `node`, a `root` directory (absolute:
+`E:/kairo`, `/srv/kairo`; the root belongs to Kairo), the `filesystem` it is
+on (exactly the identity of a disk resource registered on the node, the one
+its admission accounting uses), `backend` (`local-fs`, the only one so far;
+omitted: `local-fs`), `reserve_free_bytes` (for a durable store the free space
+it keeps; shown only for a volatile one) and optionally `executor`, the one
+executor of the node whose namespace the root is in (a WSL executor's Linux
+paths; without it the root is in the node's own namespace). Ids are unique and
+two roots of one namespace are never nested. A store is replaced as a whole
+on apply (`+ store`, `~ store`, `- store`; event `store_declaration_changed`);
+dropping one deletes nothing. `machine show` adds the stores.
+
 `POST /api/machines` takes `{"nodes": [{"id", "gpus"}], "hosts": [{"id",
 "nodes", "controller", "max_slowdown", "devices": [{"id", "max_slowdown",
-"control"}]}], "dry_run"}` and answers `{"changes": [{"uuid", "from", "to"}],
-"unchanged", "host_changes": [{"host", "from", "to"}], "unchanged_hosts",
-"cleared_settings", "dry_run"}`; a leased GPU is `409 machine_conflict`. `GET
-/api/machines` answers `{"gpus", "undeclared", "hosts", "devices"}`, the
-devices with `host_id`, `device_id`, `kind`, `max_slowdown`, `control` and
-`controller`.
+"control"}]}], "stores": [{"id", "class", "node", "executor", "root",
+"filesystem", "backend", "reserve_free_bytes"}], "dry_run"}` and answers
+`{"changes": [{"uuid", "from", "to"}], "unchanged", "host_changes": [{"host",
+"from", "to"}], "unchanged_hosts", "store_changes": [{"store", "from", "to"}],
+"unchanged_stores", "cleared_settings", "dry_run"}`; a leased GPU is `409
+machine_conflict`. `GET /api/machines` answers `{"gpus", "undeclared",
+"hosts", "devices", "stores"}`, the devices with `host_id`, `device_id`,
+`kind`, `max_slowdown`, `control` and `controller`. A daemon older than stores
+refuses a declaration that has any (`stores` is an unknown field).
 
 ### Hardware settings
 

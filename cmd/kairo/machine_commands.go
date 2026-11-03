@@ -64,14 +64,18 @@ func machineApply(args []string) error {
 // dropped), then hosts, then the device settings it clears.
 func formatApply(verb string, result store.MachineApplyResult) string {
 	var b strings.Builder
-	changes := len(result.Changes) + len(result.HostChanges)
-	switch {
-	case changes == 0 && result.UnchangedHosts == 0:
-		fmt.Fprintf(&b, "%s: no changes (%d GPUs declared)\n", verb, result.Unchanged)
-	case changes == 0:
-		fmt.Fprintf(&b, "%s: no changes (%d GPUs, %d hosts declared)\n", verb, result.Unchanged, result.UnchangedHosts)
-	default:
-		fmt.Fprintf(&b, "%s: %d change(s), %d unchanged\n", verb, changes, result.Unchanged+result.UnchangedHosts)
+	changes := len(result.Changes) + len(result.HostChanges) + len(result.StoreChanges)
+	if changes == 0 {
+		declared := []string{fmt.Sprintf("%d GPUs", result.Unchanged)}
+		if result.UnchangedHosts != 0 {
+			declared = append(declared, fmt.Sprintf("%d hosts", result.UnchangedHosts))
+		}
+		if result.UnchangedStores != 0 {
+			declared = append(declared, fmt.Sprintf("%d stores", result.UnchangedStores))
+		}
+		fmt.Fprintf(&b, "%s: no changes (%s declared)\n", verb, strings.Join(declared, ", "))
+	} else {
+		fmt.Fprintf(&b, "%s: %d change(s), %d unchanged\n", verb, changes, result.Unchanged+result.UnchangedHosts+result.UnchangedStores)
 	}
 	for _, c := range result.Changes {
 		switch {
@@ -102,10 +106,44 @@ func formatApply(verb string, result store.MachineApplyResult) string {
 			fmt.Fprintf(&b, "  ~ host %s  %s\n", c.Host, strings.Join(diff, "; "))
 		}
 	}
+	for _, c := range result.StoreChanges {
+		switch {
+		case c.From == nil:
+			fmt.Fprintf(&b, "  + store %s  %s\n", c.Store, strings.Join(storeFields(*c.To), "; "))
+		case c.To == nil:
+			fmt.Fprintf(&b, "  - store %s\n", c.Store)
+		default:
+			from, to := storeFields(*c.From), storeFields(*c.To)
+			var diff []string
+			for i := range from {
+				if from[i] != to[i] {
+					name, before, _ := strings.Cut(from[i], " ")
+					_, after, _ := strings.Cut(to[i], " ")
+					diff = append(diff, name+" "+before+" -> "+after)
+				}
+			}
+			fmt.Fprintf(&b, "  ~ store %s  %s\n", c.Store, strings.Join(diff, "; "))
+		}
+	}
 	for _, s := range result.ClearedSettings {
 		fmt.Fprintf(&b, "  - setting %s/%s  %s: %s (no longer controllable)\n", s.HostID, s.DeviceID, s.Owner.String(), s.Settings.String())
 	}
 	return b.String()
+}
+
+// storeFields are a store's declaration as "name value" texts, always the
+// same fields in the same order.
+func storeFields(s machine.Store) []string {
+	s = s.Normalized()
+	return []string{
+		"class " + s.Class,
+		"node " + s.Node,
+		"executor " + dash(s.Executor),
+		"root " + s.Root,
+		"filesystem " + s.Filesystem,
+		"backend " + s.Backend,
+		"reserve_free_bytes " + fmt.Sprint(s.ReserveFreeBytes),
+	}
 }
 
 // hostFields are a host's declaration as "name value" texts, always the same
@@ -203,6 +241,15 @@ func formatMachines(m store.Machines) string {
 				control = "no (no controller)"
 			}
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", device.HostID, device.DeviceID, number(device.MaxSlowdown), control)
+		}
+		w.Flush()
+	}
+	if len(m.Stores) != 0 {
+		fmt.Fprintln(&b)
+		w = tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "STORE\tCLASS\tNODE\tEXECUTOR\tROOT\tFILESYSTEM")
+		for _, s := range m.Stores {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, s.Class, s.Node, dash(s.Executor), s.Root, s.Filesystem)
 		}
 		w.Flush()
 	}

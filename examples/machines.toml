@@ -40,3 +40,31 @@ control = false                   # never changed, never benched: observe only
 id = "windows-host-1"
 nodes = ["windows-host-1"]
 controller = "windows-host-1-ctl"
+
+# Stores are optional: the places Kairo keeps data in (README, Data stores).
+# A durable store is kept for good (Kairo never deletes from it); a volatile
+# one is scratch space, where each attempt gets <root>/scratch/<attempt id>.
+# filesystem is exactly the identity of a disk resource of the node.
+# [[stores]]
+# id = "e-durable"
+# class = "durable"
+# node = "windows-host-1"
+# root = "E:/kairo"
+# filesystem = "E:"
+# backend = "local-fs"
+# reserve_free_bytes = 214748364800
+#
+# [[stores]]
+# id = "pve0-train-scratch"
+# class = "volatile"
+# node = "pve0-neo-train"
+# root = "/srv/kairo-data"
+# filesystem = "/"
+#
+# [[stores]]                       # in a WSL executor's namespace
+# id = "wsl-scratch"
+# class = "volatile"
+# node = "windows-host-1"
+# executor = "ubuntu-wsl"
+# root = "/var/tmp/kairo"
+# filesystem = "D:"

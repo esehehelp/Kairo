@@ -39,6 +39,9 @@ type MachineApplyResult struct {
 	// HostChanges and UnchangedHosts are the same for [[hosts]].
 	HostChanges    []HostChange `json:"host_changes"`
 	UnchangedHosts int          `json:"unchanged_hosts"`
+	// StoreChanges and UnchangedStores are the same for [[stores]].
+	StoreChanges    []StoreChange `json:"store_changes"`
+	UnchangedStores int           `json:"unchanged_stores"`
 	// ClearedSettings are the device settings removed because their device is
 	// no longer controllable (no longer on a host, control = false, or its
 	// host has no controller).
@@ -77,6 +80,8 @@ type Machines struct {
 	// effective policies.
 	Hosts   []machine.Host         `json:"hosts"`
 	Devices []machine.DevicePolicy `json:"devices"`
+	// Stores are the declared stores.
+	Stores []machine.Store `json:"stores"`
 }
 
 // ApplyMachines replaces the machine declaration with spec. It refuses to move
@@ -159,11 +164,17 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	if result.HostChanges, result.UnchangedHosts, err = hostChangesTx(ctx, tx, spec); err != nil {
 		return MachineApplyResult{}, err
 	}
+	if err = checkStoresTx(ctx, tx, spec.Stores); err != nil {
+		return MachineApplyResult{}, err
+	}
+	if result.StoreChanges, result.UnchangedStores, err = storeChangesTx(ctx, tx, spec); err != nil {
+		return MachineApplyResult{}, err
+	}
 	policies := spec.DevicePolicies()
 	if result.ClearedSettings, err = uncontrollableSettingsTx(ctx, tx, policies); err != nil {
 		return MachineApplyResult{}, err
 	}
-	if dryRun || len(result.Changes) == 0 && len(result.HostChanges) == 0 {
+	if dryRun || len(result.Changes) == 0 && len(result.HostChanges) == 0 && len(result.StoreChanges) == 0 {
 		return result, nil
 	}
 	t := now()
@@ -186,6 +197,9 @@ func (s *Store) ApplyMachines(ctx context.Context, spec machine.Spec, dryRun boo
 	if err = applyHostsTx(ctx, tx, result.HostChanges, t); err != nil {
 		return MachineApplyResult{}, err
 	}
+	if err = applyStoresTx(ctx, tx, result.StoreChanges, t); err != nil {
+		return MachineApplyResult{}, err
+	}
 	for _, setting := range result.ClearedSettings {
 		if err = deleteDeviceSettingTx(ctx, tx, setting, "declaration"); err != nil {
 			return MachineApplyResult{}, err
@@ -206,6 +220,9 @@ func (s *Store) ListMachines(ctx context.Context) (Machines, error) {
 	}
 	out.Hosts = append([]machine.Host{}, spec.Hosts...)
 	out.Devices = append([]machine.DevicePolicy{}, spec.DevicePolicies()...)
+	if out.Stores, err = declaredStores(ctx, s.db); err != nil {
+		return out, err
+	}
 	// each declaration's row: the one on its node, else one still on a node the GPU is no longer declared for
 	rows, err := s.db.QueryContext(ctx, `SELECT d.uuid,d.node_id,d.declared_at,r.id,r.node_id,
 		(SELECT valid_until FROM resource_observations o WHERE o.resource_id=r.id ORDER BY id DESC LIMIT 1)
