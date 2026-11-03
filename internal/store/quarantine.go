@@ -152,22 +152,24 @@ func nodeQuarantinedTx(ctx context.Context, tx *sql.Tx, nodeID string) (bool, er
 // a checkpointable attempt gets a suspend command (origin node_quarantine) and
 // continues later from its checkpoint; any other attempt gets a termination
 // that its executor carries out, after which the task runs again from the
-// start (orchestration reason quarantine_restart). New work is kept off the
-// node by ReserveNext / EnsurePriorityPreemption.
+// start (orchestration reason quarantine_restart). An attempt that exited but
+// whose lease is still held (processes it left run on) gets a termination
+// too, which ends what is left. New work is kept off the node by ReserveNext
+// / EnsurePriorityPreemption.
 func (s *Store) ReconcileNodeQuarantines(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.execution_id,a.executor_id,x.node_id,e.checkpointable
+	rows, err := s.db.QueryContext(ctx, `SELECT a.id,a.execution_id,a.executor_id,x.node_id,e.checkpointable AND a.state='running'
 		FROM attempts a
 		JOIN executors x ON x.id=a.executor_id
 		JOIN execution_requests e ON e.id=a.execution_id
 		JOIN leases l ON l.attempt_id=a.id
-		WHERE a.state='running' AND l.state='active'
+		WHERE (a.state='running' AND l.state='active' OR a.state='exited' AND l.state='releasing')
 		AND EXISTS (SELECT 1 FROM node_quarantines q WHERE q.node_id IN(x.node_id,'*'))`)
 	if err != nil {
 		return err
 	}
 	type target struct {
 		attemptID, executionID, executorID, nodeID string
-		checkpointable                             bool
+		checkpointable                             bool // and running: suspended rather than terminated
 	}
 	var targets []target
 	for rows.Next() {

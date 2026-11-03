@@ -207,8 +207,10 @@ func (s *Store) reconcilePauseTarget(ctx context.Context, operation PauseOperati
 		return s.setPauseTargetIfChanged(ctx, target, update)
 	case "exited", "quiescing":
 		// Forced: a suspend in progress is not waited for, and processes an
-		// exited launcher left behind are killed too.
-		if operation.Force != nil && facts.liveProcesses > 0 {
+		// exited launcher left behind are killed too, registered or not: the
+		// lease is not released yet, and what holds it may be a process
+		// nobody registered (its executor finds it in the attempt's tree).
+		if operation.Force != nil && (facts.liveProcesses > 0 || *facts.attemptState == "exited") {
 			return s.forceStopTarget(ctx, operation, target, facts, update)
 		}
 		update.State = "quiescing"
