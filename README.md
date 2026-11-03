@@ -674,8 +674,18 @@ its admission accounting uses), `backend` (`local-fs`, the only one so far;
 omitted: `local-fs`), `reserve_free_bytes` (for a durable store the free space
 it keeps; shown only for a volatile one) and optionally `executor`, the one
 executor of the node whose namespace the root is in (a WSL executor's Linux
-paths; without it the root is in the node's own namespace). Ids are unique and
-two roots of one namespace are never nested. A store is replaced as a whole
+paths; without it the root is in the node's own namespace). Ids are unique,
+and no two stores of one node are at one place or one inside the other,
+whatever executors they name: roots are compared as one spelling of each
+place (separators, `.` and trailing separators dropped, a drive path without
+case, a WSL `/mnt/<drive>/...` path as that drive's path), so `E:/data`,
+`e:\Data\`, `E:/./data` and `/mnt/e/data` are one place, and a root
+declared with and without an executor (or in two WSL distros) is refused.
+A root has no `..` and no control character; a POSIX root no whitespace or
+backslash; a drive path no name Windows reads as another (ending in a dot or
+a space, with `~` as in a short 8.3 name, a `:` or a character names cannot
+hold). The agent also compares where the roots really are (Data stores). A
+store is replaced as a whole
 on apply (`+ store`, `~ store`, `- store`; event `store_declaration_changed`);
 dropping one deletes nothing. `machine show` adds the stores.
 

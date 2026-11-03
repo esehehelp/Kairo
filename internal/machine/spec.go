@@ -89,23 +89,15 @@ func StoreRootIsAbsolute(root string) bool {
 		(root[0] >= 'a' && root[0] <= 'z' || root[0] >= 'A' && root[0] <= 'Z')
 }
 
-// storeRootKey is root for comparing roots: forward slashes, no trailing
-// slash, a drive path's case folded.
-func storeRootKey(root string) string {
-	key := strings.TrimRight(strings.ReplaceAll(root, `\`, "/"), "/")
-	if len(key) >= 2 && key[1] == ':' {
-		key = strings.ToLower(key)
-	}
-	return key
-}
-
-// validateStores: ids are unique, class and backend known, the root an
-// absolute path without "..", the node and filesystem given, the reserve not
-// negative, and no two stores of one namespace (node and executor) nested.
+// validateStores: ids are unique, class and backend known, the root one
+// spelling of one place (checkStoreRoot), the node and filesystem given, the
+// reserve not negative, and no two stores of one node at one place or one
+// inside the other (StoreRootKey), whatever executors they name: a root
+// declared with and without an executor, or in two WSL distros, is refused
+// rather than taken as two places.
 func (s Spec) validateStores() error {
 	ids := map[string]bool{}
-	type namespace struct{ node, executor string }
-	roots := map[namespace][]Store{}
+	roots := map[string][]Store{}
 	for _, raw := range s.Stores {
 		store := raw.Normalized()
 		switch {
@@ -122,24 +114,22 @@ func (s Spec) validateStores() error {
 			return fmt.Errorf("store %s: backend %q is not supported (only %q)", store.ID, store.Backend, StoreBackendLocalFS)
 		case store.Node == "":
 			return fmt.Errorf("store %s needs a node", store.ID)
-		case strings.TrimSpace(store.Root) != store.Root || !StoreRootIsAbsolute(store.Root):
-			return fmt.Errorf("store %s: root %q is not an absolute path", store.ID, store.Root)
-		case slices.Contains(strings.Split(strings.ReplaceAll(store.Root, `\`, "/"), "/"), ".."):
-			return fmt.Errorf("store %s: root %q contains ..", store.ID, store.Root)
+		}
+		if err := checkStoreRoot(store.Root); err != nil {
+			return fmt.Errorf("store %s: %w", store.ID, err)
+		}
+		switch {
 		case store.Filesystem == "":
 			return fmt.Errorf("store %s needs a filesystem (the identity of the node's disk it is on)", store.ID)
 		case store.ReserveFreeBytes < 0:
 			return fmt.Errorf("store %s: reserve_free_bytes is negative", store.ID)
 		}
-		ns := namespace{store.Node, store.Executor}
-		key := storeRootKey(store.Root)
-		for _, other := range roots[ns] {
-			otherKey := storeRootKey(other.Root)
-			if key == otherKey || strings.HasPrefix(key+"/", otherKey+"/") || strings.HasPrefix(otherKey+"/", key+"/") {
-				return fmt.Errorf("stores %s and %s have nested roots %s and %s on one node", other.ID, store.ID, other.Root, store.Root)
+		for _, other := range roots[store.Node] {
+			if RootsOverlap(store.Root, other.Root) {
+				return fmt.Errorf("stores %s and %s have nested roots %s and %s on node %s (one place, or one inside the other)", other.ID, store.ID, other.Root, store.Root, store.Node)
 			}
 		}
-		roots[ns] = append(roots[ns], store)
+		roots[store.Node] = append(roots[store.Node], store)
 	}
 	return nil
 }
