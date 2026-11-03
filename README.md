@@ -714,14 +714,23 @@ Every executor serves the stores of its node in its own namespace: those
 naming it as `executor`, and, unless it is a WSL executor, those naming none.
 It asks the daemon for its node's stores when it starts and every 5 minutes
 (agent operation `stores`), makes each root that is missing, and checks that
+no component of the root's path is a link (a symlink, a junction or any
+other reparse point; on Windows the path the opened root resolves to, with
+its drive, must be the declared root, so no substituted drive or short 8.3
+name either; on Linux and in WSL the root must be its own real path) and that
 the root is on the declared filesystem (Windows: the root's drive; Linux: the
 same device as the filesystem's mount point; WSL: a root under `/mnt/<drive>`
 must be on that drive, a root on the distro's own disk is taken as declared).
 A store that fails is not used and is reported unusable with the reason.
 Every 5 minutes, in the background, the executor reports each store
-(`store-observation`): the filesystem's total and free bytes and the size of
-each Kairo scratch directory under the root (one whose marker names it; links
-are not followed and other filesystems not entered).
+(`store-observation`): the filesystem's total and free bytes and each Kairo
+scratch directory under the root (one whose marker names it) with its size:
+an attempt still running there is measured at every report, any other once
+per agent process (a kept scratch when it is kept), never through a link or
+into a mount point. A report that read the whole `<root>/scratch` marks a
+recorded scratch it did not find `missing` (bytes 0, listed by
+`kairo store status`, never taken as deleted: Kairo did not delete it) until
+it is found again.
 
 `kairo store status [--json]` (`GET /api/stores`, `{"stores": [...]}`) shows
 each store: class, node (and executor), `state` (`unknown`: never reported,
@@ -774,15 +783,25 @@ P1b) and is listed by `kairo store status` with its task, size and reason;
 nothing deletes it in P1a but an operator. Deleting is done by the executor
 itself, never by `os.RemoveAll` or `rm -rf` on a path it was given: the path
 must be exactly the recorded `<root>/scratch/<attempt id>` (anything else is
-refused), neither it nor `<root>/scratch` may be a link, and its marker
-must name the attempt; it walks the tree entry by entry (`Lstat`), removes a
-symlink, junction or other reparse point itself without entering it, does
-not enter another filesystem (a mount point), and removes the marker last,
-so a deletion cut short is resumed. A deletion refused for any of these
-reasons keeps the scratch with the reason; one that failed otherwise (a file
-in use) is tried again. WSL stores are reached by one `sh` script run with
-`wsl.exe --exec` under the same rules (`rm -r --one-file-system` on what the
-scratch directory holds). A daemon older than stores never gets scratch
+refused), the root's path may hold no link, neither `<root>/scratch` nor the
+scratch directory may be a link, no mount point may be at or under the
+scratch directory (Linux, from `/proc/self/mountinfo`, bind mounts included),
+and its marker must name the attempt. Nothing is reached through a path
+opened again after it was checked: every operation below the root goes
+through `os.Root` handles (`openat`-style on Linux, handle-relative on
+Windows), a directory opened after it was checked must be the same file, and
+`os.Root.RemoveAll` removes a symlink, junction or other reparse point itself,
+never what it points at, entry by entry, the marker last, so a deletion cut
+short is resumed. Files are deleted without changing their attributes (a hard
+link to a file outside is unlinked, the file left as it was); only a
+subdirectory a task made unwritable is made writable again (Linux; a directory
+cannot be hard linked). The marker is created exclusively in the directory
+just made, never opened, so nothing put there meanwhile is written through.
+A deletion refused for any of these reasons keeps the scratch with the
+reason; one that failed otherwise (a file in use) is tried again. WSL stores
+are reached by one `sh` script run with `wsl.exe --exec` under the same rules
+(`realpath` for the root, `/proc/self/mountinfo`, the marker created with
+`noclobber`, `rm -r --one-file-system` on what the scratch directory holds). A daemon older than stores never gets scratch
 from a newer agent (it answers `stores` with 404, and the agent then neither
 makes scratch nor asks for any to settle).
 

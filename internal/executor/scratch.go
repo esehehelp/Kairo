@@ -162,6 +162,15 @@ func (e *Local) settleDueScratch(ctx context.Context) {
 			continue
 		}
 		e.scratchProblem(k.AttemptID, "", nil)
+		if settled.State == "kept" && settled.Bytes != nil {
+			// measured as it was kept: the reports need not measure it again
+			e.mu.Lock()
+			if e.scratchSized == nil {
+				e.scratchSized = map[string]int64{}
+			}
+			e.scratchSized[k.AttemptID] = *settled.Bytes
+			e.mu.Unlock()
+		}
 		e.Logger.Info("scratch "+settled.State, "attempt_id", k.AttemptID, "path", k.Path, "reason", k.Reason)
 	}
 }

@@ -27,15 +27,21 @@ type wslStoreFS struct{ distro string }
 // name the attempt; 6: the root is not on the declared drive; 7: a scratch
 // to remove only if empty holds more than its marker.
 const wslStoreScript = `op=$1; shift
+# realroot: the root resolves to itself (no symlink anywhere on its path),
+# else exit 4.
+realroot() { [ "$(realpath -e -- "$1" 2>/dev/null)" = "$1" ] || { echo "root $1 is not its own real path" >&2; exit 4; }; }
+# mounted: a mount point (bind mounts included) at or under $1.
+mounted() { awk -v d="$1" '{ m=$5; gsub(/\040/, " ", m); if (m == d || index(m, d "/") == 1) f=1 } END { exit !f }' /proc/self/mountinfo; }
 case "$op" in
 ensure)
   root=$1; fs=$2
   mkdir -p -- "$root" || exit 1
   [ -d "$root" ] || { echo "root $root is not a directory" >&2; exit 1; }
+  realroot "$root"
   case "$root/" in
   /mnt/[a-zA-Z]/*)
     drive=$(printf %s "$root" | cut -c6 | tr a-z A-Z)
-    want=$(printf %s "$fs" | tr a-z A-Z | sed 's#[\\/]*$##')
+    want=$(printf %s "$fs" | tr a-z A-Z | sed 's#[\/]*$##')
     [ "$drive:" = "$want" ] || { echo "root $root is not on filesystem $fs" >&2; exit 6; } ;;
   esac ;;
 usage)
@@ -45,7 +51,9 @@ size)
   [ -e "$d" ] || [ -L "$d" ] || { echo 0; exit 0; }
   [ -d "$d" ] && [ ! -L "$d" ] || exit 4
   du -s -b -x -P -- "$d" | cut -f1 ;;
-scan)
+list)
+  [ -e "$1" ] || exit 0
+  realroot "$1"
   p="$1/scratch"
   [ -e "$p" ] || [ -L "$p" ] || exit 0
   [ -d "$p" ] && [ ! -L "$p" ] || exit 4
@@ -55,9 +63,10 @@ scan)
     m="$d/.kairo-scratch"
     [ -f "$m" ] && [ ! -L "$m" ] || continue
     [ "$(head -c 1024 -- "$m" | tr -d '[:space:]')" = "$id" ] || continue
-    printf '%s %s\n' "$id" "$(du -s -b -x -P -- "$d" | cut -f1)"
+    printf '%s\n' "$id"
   done ;;
 create)
+  realroot "$1"
   p="$1/scratch"; id=$2
   mkdir -p -- "$p" || exit 1
   [ -d "$p" ] && [ ! -L "$p" ] || exit 4
@@ -67,15 +76,20 @@ create)
     printf '%s\n' "$d"; exit 0
   fi
   mkdir -- "$d" || exit 1
-  printf '%s\n' "$id" > "$m" || { rmdir -- "$d"; exit 1; }
+  [ -d "$d" ] && [ ! -L "$d" ] || exit 4
+  # created, never opened: noclobber (O_EXCL) refuses anything put there
+  ( set -C; printf '%s\n' "$id" > "$m" ) || { rmdir -- "$d"; exit 1; }
   printf '%s\n' "$d" ;;
 remove)
   p="$1/scratch"; dir=$2; id=$3; mode=$4; d="$p/$id"
   [ "$dir" = "$d" ] || exit 3
+  [ -e "$1" ] || exit 0
+  realroot "$1"
   [ -e "$p" ] || [ -L "$p" ] || exit 0
   [ -d "$p" ] && [ ! -L "$p" ] || exit 4
   [ -e "$d" ] || [ -L "$d" ] || exit 0
   [ -d "$d" ] && [ ! -L "$d" ] || exit 4
+  mounted "$d" && { echo "a mount point is at or under $d" >&2; exit 4; }
   m="$d/.kairo-scratch"
   if [ -f "$m" ] && [ ! -L "$m" ]; then
     [ "$(head -c 1024 -- "$m" | tr -d '[:space:]')" = "$id" ] || exit 5
@@ -151,24 +165,18 @@ func (w wslStoreFS) Usage(ctx context.Context, root string) (int64, int64, error
 	return total, free, err
 }
 
-func (w wslStoreFS) Scan(ctx context.Context, root string) (map[string]int64, error) {
-	out, err := w.run(ctx, 15*time.Minute, "scan", wslRootPath(root))
+func (w wslStoreFS) List(ctx context.Context, root string) ([]string, error) {
+	out, err := w.run(ctx, 5*time.Minute, "list", wslRootPath(root))
 	if err != nil {
 		return nil, err
 	}
-	sizes := map[string]int64{}
+	var ids []string
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 2 || !validScratchID(fields[0]) {
-			continue
+		if id := strings.TrimSpace(line); validScratchID(id) {
+			ids = append(ids, id)
 		}
-		size, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil {
-			return nil, fmt.Errorf("unexpected scan output %q", line)
-		}
-		sizes[fields[0]] = size
 	}
-	return sizes, nil
+	return ids, nil
 }
 
 func (w wslStoreFS) Create(ctx context.Context, root, attemptID string) (string, error) {

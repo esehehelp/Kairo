@@ -143,10 +143,52 @@ func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObse
 	} else {
 		obs.Problem = "usage: " + err.Error()
 	}
-	if sizes, err := s.fs.Scan(ctx, s.decl.Root); err == nil {
-		obs.Scratch = sizes
-	} else if obs.Problem == "" {
-		obs.Problem = "scratch: " + err.Error()
+	started := time.Now()
+	ids, err := s.fs.List(ctx, s.decl.Root)
+	if err != nil {
+		if obs.Problem == "" {
+			obs.Problem = "scratch: " + err.Error()
+		}
+		return obs
 	}
+	obs.Scratch = map[string]int64{}
+	for _, id := range ids {
+		if size, ok := e.scratchSize(ctx, s, id); ok {
+			obs.Scratch[id] = size
+		} else {
+			obs.Scratch[id] = -1 // found, not measured this time
+		}
+	}
+	// The whole of <root>/scratch was read (and the report is not cut by its
+	// deadline): a record not found is missing.
+	obs.ScratchScanned = ctx.Err() == nil
+	obs.ScanSeconds = time.Since(started).Seconds()
 	return obs
+}
+
+// scratchSize measures a scratch directory: an attempt running here at every
+// report, any other (kept, or not yet settled) once per executor instance,
+// nothing being written there any more. ok is false when it could not be
+// measured now.
+func (e *Local) scratchSize(ctx context.Context, s servedStore, id string) (int64, bool) {
+	e.mu.Lock()
+	_, running := e.running[id]
+	size, measured := e.scratchSized[id]
+	e.mu.Unlock()
+	if measured && !running {
+		return size, true
+	}
+	size, err := s.fs.Size(ctx, scratchPath(s.fs, s.decl.Root, id))
+	if err != nil {
+		return 0, false
+	}
+	if !running {
+		e.mu.Lock()
+		if e.scratchSized == nil {
+			e.scratchSized = map[string]int64{}
+		}
+		e.scratchSized[id] = size
+		e.mu.Unlock()
+	}
+	return size, true
 }

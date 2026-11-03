@@ -104,6 +104,9 @@ type Local struct {
 	// by attempt; when scratch was last settled and whether a round runs;
 	// the problems already warned of, by attempt.
 	scratch         map[string]string
+	// scratchSized is the size, measured once, of each scratch directory of
+	// an attempt not running here (datastore.go), by attempt.
+	scratchSized    map[string]int64
 	scratchSettleAt time.Time
 	scratchSettling bool
 	scratchProblems map[string]string
