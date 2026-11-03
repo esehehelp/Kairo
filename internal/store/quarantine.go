@@ -286,8 +286,16 @@ func (s *Store) MarkQuarantineTerminated(ctx context.Context, attemptID string) 
 	return tx.Commit()
 }
 
+// terminationBeforeExit is the condition, on a quarantine termination t of
+// attempt a, that the attempt ended because of it: the termination was
+// requested before the attempt exited (or it has not exited). Whether the
+// executor has recorded it carried out yet does not matter: the attempt's
+// exit and quiescence can be recorded first, and the restart must not be
+// lost to that order.
+const terminationBeforeExit = `(a.exited_at IS NULL OR (t.requested_at)::timestamptz<=(a.exited_at)::timestamptz)`
+
 func quarantineTerminatedTx(ctx context.Context, tx *sql.Tx, attemptID string) (bool, error) {
 	var n int
-	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations WHERE attempt_id=$1 AND state='terminated'`, attemptID).Scan(&n)
+	err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM quarantine_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.attempt_id=$1 AND `+terminationBeforeExit, attemptID).Scan(&n)
 	return n > 0, err
 }

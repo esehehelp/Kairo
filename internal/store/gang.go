@@ -669,7 +669,7 @@ func gangAggregateTx(ctx context.Context, tx *sql.Tx, current *currentTaskExecut
 	out := gangOutcome{gang: true}
 	rows, err := tx.QueryContext(ctx, `SELECT e.state,e.terminal_cause,a.id,a.state,a.exit_code,a.exit_signal,
 		(SELECT l.state FROM leases l WHERE l.execution_id=e.id ORDER BY l.created_at DESC LIMIT 1),
-		EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id AND t.state='terminated')
+		EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id AND `+terminationBeforeExit+`)
 		FROM gang_members m JOIN execution_requests e ON e.id=m.execution_id LEFT JOIN attempts a ON a.execution_id=e.id
 		WHERE m.gang_id=$1 ORDER BY m.rank`, gangID)
 	if err != nil {
