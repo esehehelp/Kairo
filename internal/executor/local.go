@@ -88,15 +88,25 @@ type Local struct {
 	leftReported map[string]time.Time
 
 	// Stores (datastore.go): the ones this executor serves, when they were
-	// last asked for and whether that failed (warned once), when they were
-	// last reported and whether a report runs. storeFSOverride replaces how
+	// last asked for, whether the daemon ever answered (storesKnown) and
+	// whether the last ask failed (warned once), when they were last
+	// reported and whether a report runs. storeFSOverride replaces how
 	// roots are reached, in tests.
 	stores          []servedStore
 	storesAt        time.Time
+	storesKnown     bool
 	storesWarned    bool
 	storeReportAt   time.Time
 	storeReporting  bool
 	storeFSOverride storeFS
+
+	// Scratch (scratch.go): the scratch made for attempts being launched,
+	// by attempt; when scratch was last settled and whether a round runs;
+	// the problems already warned of, by attempt.
+	scratch         map[string]string
+	scratchSettleAt time.Time
+	scratchSettling bool
+	scratchProblems map[string]string
 
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
@@ -203,6 +213,7 @@ func (e *Local) tick(ctx context.Context) error {
 	e.beginStep("stores")
 	e.refreshStores(ctx)
 	e.reportStores()
+	e.settleScratch()
 	e.endStep()
 	for {
 		reservation, err := e.reserveNext(ctx)
@@ -680,7 +691,7 @@ func resourceBinding(resource store.ResourceInstance) string {
 
 // launchEnv is what an attempt is told: who it is (KAIRO_ATTEMPT_TOKEN is its
 // credential for the worker API), where the daemon is and which CA to trust,
-// and which resources it holds.
+// which resources it holds, and its scratch (scratchEnv).
 func (e *Local) launchEnv(launch *store.Launch) []string {
 	bindings := make([]string, 0, len(launch.Resources))
 	resourceIDs := make([]string, 0, len(launch.Resources))
@@ -699,7 +710,7 @@ func (e *Local) launchEnv(launch *store.Launch) []string {
 	if len(bindings) > 0 {
 		env = append(env, "CUDA_VISIBLE_DEVICES="+strings.Join(bindings, ","))
 	}
-	return env
+	return append(env, e.scratchEnv(launch)...)
 }
 
 // envKey is how the OS compares variable names: case-insensitively on Windows
@@ -807,7 +818,9 @@ func (e *Local) start(launch *store.Launch) error {
 	if err := e.checkLaunchLogSpace(); err != nil {
 		return err
 	}
+	e.makeScratch(launch)
 	cmd := e.command(launch)
+	e.forgetScratch(launch.Attempt.ID)
 	prepareProcessTree(cmd)
 	outPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stdout.log")
 	errPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stderr.log")

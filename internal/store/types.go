@@ -80,6 +80,10 @@ type ExecutionSpec struct {
 	// Env is added to the attempt's environment (envspec.Validate); it never
 	// overrides what Kairo sets. Left out of the digest when empty.
 	Env map[string]string `json:"env,omitempty"`
+	// ScratchTmpdir points TMPDIR, TMP and TEMP of every rank's attempt at
+	// its scratch directory (when it has one). Left out of the digest when
+	// false.
+	ScratchTmpdir bool `json:"scratch_tmpdir,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the

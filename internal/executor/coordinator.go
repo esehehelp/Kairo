@@ -36,6 +36,9 @@ type Coordinator interface {
 	RecordAttemptUsage(ctx context.Context, attemptID string, ramBytes, diskWrittenBytes *int64) error
 	NodeStores(ctx context.Context, nodeID string) ([]machine.Store, error)
 	RecordStoreObservation(ctx context.Context, obs store.StoreObservation) error
+	RecordAttemptScratch(ctx context.Context, scratch store.AttemptScratch) error
+	ScratchToSettle(ctx context.Context, executorID string) ([]store.ScratchSettlement, error)
+	SettleScratch(ctx context.Context, settled store.ScratchSettled) error
 }
 
 var _ Coordinator = (*store.Store)(nil)

@@ -97,7 +97,8 @@ a `[[tasks.execution.gang.ranks]]` entry merges over the task's for that rank.
 The attempt inherits the executor's environment, then the declared variables
 (which may replace `PATH` and the like; on Windows names compare without
 case), then what Kairo sets (`KAIRO_*`, gang variables, `CUDA_VISIBLE_DEVICES`
-for bound GPUs), which a declaration cannot override. Names starting with
+for bound GPUs, `TMPDIR`/`TMP`/`TEMP` with `scratch_tmpdir`), which a
+declaration cannot override. Names starting with
 `KAIRO_` and `WSLENV` are rejected, and so is `CUDA_VISIBLE_DEVICES` on an
 execution with an exclusive GPU request (a CPU task may set it to `-1`). WSL
 executors pass the variables through `WSLENV` as written (`/u`, no path
@@ -725,6 +726,45 @@ report of a store is the table `store_observations`. An agent older than
 stores leaves its stores `unknown`; a daemon older than stores answers the
 agent's `stores` with 404, and the agent runs without stores (warned once).
 
+Scratch: an attempt launched by an executor that serves a usable volatile
+store (the first by id when there are several) gets a scratch directory
+there, `<root>/scratch/<attempt id>`, holding the marker file
+`.kairo-scratch` (the attempt id), made before the process starts and named
+by `KAIRO_SCRATCH`. It is recorded at the daemon (`attempt-scratch`, table
+`attempt_scratch`: attempt, store, root, path, `active`/`kept`/`deleted`,
+bytes, reason; events `scratch_created`, then `scratch_deleted` or
+`scratch_kept`) while the attempt is still authorized; if it cannot be made
+or recorded, the attempt starts without it. `TMPDIR`, `TMP` and `TEMP` are
+left alone unless the task sets `scratch_tmpdir = true` in
+`[tasks.execution]` (or the execution TOML): then they name the scratch (a
+WSL attempt gets `TMPDIR` only, since its variables also reach `wsl.exe`),
+over a declared env. Off by default, since a temporary directory emptied
+with every attempt loses caches such as torch's compile cache. It needs no
+SDK: the executor makes and settles it.
+
+Once the attempt has quiesced, or was lost, its executor settles the scratch
+(`scratch-to-settle` every 10 seconds, `settle-scratch`): after a success
+(exit 0 without a signal, or a suspend that published its checkpoint) it is
+deleted; after a failure (another exit, a signal, a launch that never ran)
+it is kept, unless it holds nothing but its marker; a lost attempt's (also
+once reconciled) is kept as it is, since its processes may still be writing.
+Kept scratch stays where it is (moving it to a durable store comes with
+P1b) and is listed by `kairo store status` with its task, size and reason;
+nothing deletes it in P1a but an operator. Deleting is done by the executor
+itself, never by `os.RemoveAll` or `rm -rf` on a path it was given: the path
+must be exactly the recorded `<root>/scratch/<attempt id>` (anything else is
+refused), neither it nor `<root>/scratch` may be a link, and its marker
+must name the attempt; it walks the tree entry by entry (`Lstat`), removes a
+symlink, junction or other reparse point itself without entering it, does
+not enter another filesystem (a mount point), and removes the marker last,
+so a deletion cut short is resumed. A deletion refused for any of these
+reasons keeps the scratch with the reason; one that failed otherwise (a file
+in use) is tried again. WSL stores are reached by one `sh` script run with
+`wsl.exe --exec` under the same rules (`rm -r --one-file-system` on what the
+scratch directory holds). A daemon older than stores never gets scratch
+from a newer agent (it answers `stores` with 404, and the agent then neither
+makes scratch nor asks for any to settle).
+
 ### Hardware settings
 
 A device of a host (a GPU by UUID, or `cpu`) can be given settings: a GPU's
@@ -1041,7 +1081,8 @@ Managed attempts receive `KAIRO_API_URL`, `KAIRO_EXECUTION_ID`,
 `KAIRO_ATTEMPT_ID`, `KAIRO_ATTEMPT_TOKEN` and, when the daemon serves TLS,
 `KAIRO_API_CA`; also `KAIRO_NODE_ID`, `KAIRO_EXECUTOR_ID`,
 `KAIRO_RESOURCE_IDS`, `KAIRO_RESOURCE_BINDINGS` and `CUDA_VISIBLE_DEVICES` (a leased GPU by its UUID, never by index),
-`KAIRO_CONTINUATION_REF` when resuming, and the gang variables for a gang
+`KAIRO_CONTINUATION_REF` when resuming, `KAIRO_SCRATCH` when the executor
+serves a volatile store (Data stores), and the gang variables for a gang
 rank. WSL attempts get them through `WSLENV`, never on the `wsl.exe` command
 line. Rank zero polls and acknowledges commands; the PyTorch adapter broadcasts the command,
 runs every rank's callback, and only publishes the continuation after the

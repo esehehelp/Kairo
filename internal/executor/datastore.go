@@ -88,6 +88,7 @@ func (e *Local) refreshStores(ctx context.Context) {
 	}
 	e.mu.Lock()
 	e.stores = served
+	e.storesKnown = true
 	e.mu.Unlock()
 	e.storeReportAt = time.Time{} // report what is new soon
 }

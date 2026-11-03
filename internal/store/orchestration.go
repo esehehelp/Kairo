@@ -451,6 +451,7 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 		Exclusive:            convertExclusive(template.Exclusive),
 		Capacity:             convertCapacity(template.Capacity),
 		Env:                  template.Env,
+		ScratchTmpdir:        template.ScratchTmpdir,
 	}
 	if template.Gang != nil {
 		gang := GangSpec{Size: template.Gang.Size, Port: template.Gang.Port}

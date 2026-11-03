@@ -51,6 +51,14 @@ type agentStoreObservationRequest struct {
 	Observation store.StoreObservation `json:"observation"`
 }
 
+type agentAttemptScratchRequest struct {
+	Scratch store.AttemptScratch `json:"scratch"`
+}
+
+type agentSettleScratchRequest struct {
+	Settled store.ScratchSettled `json:"settled"`
+}
+
 type agentUnlaunchedRequest struct {
 	ExecutorID       string  `json:"executor_id"`
 	OlderThanSeconds float64 `json:"older_than_seconds"`
@@ -227,6 +235,25 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentStoreObservationRequest) (any, error) {
 				return okBody, s.Store.RecordStoreObservation(ctx, b.Observation)
+			}),
+		newAgentOp(s, "attempt-scratch", observeRefused, nil,
+			func(ctx context.Context, b agentAttemptScratchRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.Scratch.AttemptID)
+			},
+			func(ctx context.Context, b agentAttemptScratchRequest) (any, error) {
+				return okBody, s.Store.RecordAttemptScratch(ctx, b.Scratch)
+			}),
+		newAgentOp(s, "scratch-to-settle", observeEmpty, map[string]any{"scratch": []store.ScratchSettlement{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				scratch, err := s.Store.ScratchToSettle(ctx, b.ExecutorID)
+				return map[string]any{"scratch": scratch}, err
+			}),
+		newAgentOp(s, "settle-scratch", observeRefused, nil,
+			func(ctx context.Context, b agentSettleScratchRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.Settled.AttemptID)
+			},
+			func(ctx context.Context, b agentSettleScratchRequest) (any, error) {
+				return okBody, s.Store.SettleScratch(ctx, b.Settled)
 			}),
 		newAgentOp(s, "unlaunched-leases", observeEmpty, map[string]any{"leases": []store.UnlaunchedLease{}},
 			func(ctx context.Context, b agentUnlaunchedRequest) (string, error) {

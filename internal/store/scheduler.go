@@ -49,6 +49,8 @@ type Launch struct {
 	// Env is the execution's declared environment (a gang rank's already
 	// merged with the gang's), read from the store, never from the caller.
 	Env map[string]string `json:"env,omitempty"`
+	// ScratchTmpdir: the execution points TMPDIR, TMP and TEMP at its scratch.
+	ScratchTmpdir bool `json:"scratch_tmpdir,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -624,7 +626,8 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	var executionID, projectID, leaseState, executionState, executorID string
 	var leaseEpoch int64
 	var envJSON sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch,e.env_json FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch, &envJSON)
+	var scratchTmpdir bool
+	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch,e.env_json,e.scratch_tmpdir FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch, &envJSON, &scratchTmpdir)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -645,7 +648,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		if err != nil {
 			return nil, err
 		}
-		launch.Env = env
+		launch.Env, launch.ScratchTmpdir = env, scratchTmpdir
 		return launch, tx.Commit()
 	}
 	if leaseState != "prepared" || executionState != "waiting" {
@@ -710,6 +713,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		InputContinuationRef: reservation.Execution.InputContinuationRef,
 		Gang:                 gang,
 		Env:                  env,
+		ScratchTmpdir:        scratchTmpdir,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp

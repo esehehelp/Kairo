@@ -33,6 +33,10 @@ type Manifest struct {
 	// Env is [env], added to the attempt's environment. Absent from the JSON
 	// when empty, so the digest of a manifest without it does not change.
 	Env map[string]string `toml:"env" json:"env,omitempty"`
+	// ScratchTmpdir points TMPDIR, TMP and TEMP (a WSL attempt: TMPDIR) at
+	// the attempt's scratch directory when it has one. Absent from the JSON
+	// when false.
+	ScratchTmpdir bool `toml:"scratch_tmpdir" json:"scratch_tmpdir,omitempty"`
 }
 
 type ExecutorSelector struct {

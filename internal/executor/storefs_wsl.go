@@ -24,7 +24,8 @@ type wslStoreFS struct{ distro string }
 
 // wslStoreScript: $1 is the operation, the rest its arguments. Exit 3: not
 // <root>/scratch/<id>; 4: a link or non-directory; 5: the marker does not
-// name the attempt; 6: the root is not on the declared drive.
+// name the attempt; 6: the root is not on the declared drive; 7: a scratch
+// to remove only if empty holds more than its marker.
 const wslStoreScript = `op=$1; shift
 case "$op" in
 ensure)
@@ -60,12 +61,16 @@ create)
   p="$1/scratch"; id=$2
   mkdir -p -- "$p" || exit 1
   [ -d "$p" ] && [ ! -L "$p" ] || exit 4
-  d="$p/$id"
+  d="$p/$id"; m="$d/.kairo-scratch"
+  if [ -d "$d" ] && [ ! -L "$d" ] && [ -f "$m" ] && [ ! -L "$m" ] &&
+    [ "$(head -c 1024 -- "$m" | tr -d '[:space:]')" = "$id" ]; then
+    printf '%s\n' "$d"; exit 0
+  fi
   mkdir -- "$d" || exit 1
-  printf '%s\n' "$id" > "$d/.kairo-scratch" || { rmdir -- "$d"; exit 1; }
+  printf '%s\n' "$id" > "$m" || { rmdir -- "$d"; exit 1; }
   printf '%s\n' "$d" ;;
 remove)
-  p="$1/scratch"; dir=$2; id=$3; d="$p/$id"
+  p="$1/scratch"; dir=$2; id=$3; mode=$4; d="$p/$id"
   [ "$dir" = "$d" ] || exit 3
   [ -e "$p" ] || [ -L "$p" ] || exit 0
   [ -d "$p" ] && [ ! -L "$p" ] || exit 4
@@ -78,7 +83,11 @@ remove)
     rmdir -- "$d" 2>/dev/null && exit 0
     exit 5
   fi
-  find "$d" -mindepth 1 -maxdepth 1 ! -name .kairo-scratch -exec rm -r --one-file-system -- {} + || exit 1
+  if [ "$mode" = empty ]; then
+    [ -z "$(find "$d" -mindepth 1 -maxdepth 1 ! -name .kairo-scratch -print | head -n 1)" ] || exit 7
+  else
+    find "$d" -mindepth 1 -maxdepth 1 ! -name .kairo-scratch -exec rm -r --one-file-system -- {} + || exit 1
+  fi
   rm -f -- "$m" && rmdir -- "$d" ;;
 *)
   exit 2 ;;
@@ -111,6 +120,8 @@ func (w wslStoreFS) run(ctx context.Context, timeout time.Duration, args ...stri
 				return nil, fmt.Errorf("%w: %v", errScratchLink, err)
 			case 5:
 				return nil, fmt.Errorf("%w: %v", errScratchMarker, err)
+			case 7:
+				return nil, fmt.Errorf("%w: %v", errScratchNotEmpty, err)
 			}
 		}
 		return nil, err
@@ -171,11 +182,15 @@ func (w wslStoreFS) Create(ctx context.Context, root, attemptID string) (string,
 	return strings.TrimSpace(string(out)), nil
 }
 
-func (w wslStoreFS) Remove(ctx context.Context, root, dir, attemptID string) error {
+func (w wslStoreFS) Remove(ctx context.Context, root, dir, attemptID string, onlyEmpty bool) error {
 	if !validScratchID(attemptID) {
 		return fmt.Errorf("%w: attempt id %q", errOutsideRoot, attemptID)
 	}
-	_, err := w.run(ctx, 30*time.Minute, "remove", wslRootPath(root), dir, attemptID)
+	mode := "all"
+	if onlyEmpty {
+		mode = "empty"
+	}
+	_, err := w.run(ctx, 30*time.Minute, "remove", wslRootPath(root), dir, attemptID, mode)
 	return err
 }
 

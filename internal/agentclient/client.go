@@ -141,6 +141,26 @@ func (c *Client) RecordStoreObservation(ctx context.Context, obs store.StoreObse
 	return c.call(ctx, "store-observation", map[string]any{"observation": obs}, nil)
 }
 
+// RecordAttemptScratch records the scratch made for an attempt about to
+// launch.
+func (c *Client) RecordAttemptScratch(ctx context.Context, scratch store.AttemptScratch) error {
+	return c.call(ctx, "attempt-scratch", map[string]any{"scratch": scratch}, nil)
+}
+
+// ScratchToSettle asks for this executor's scratch to delete or keep now.
+func (c *Client) ScratchToSettle(ctx context.Context, executorID string) ([]store.ScratchSettlement, error) {
+	var out struct {
+		Scratch []store.ScratchSettlement `json:"scratch"`
+	}
+	err := c.call(ctx, "scratch-to-settle", map[string]string{"executor_id": executorID}, &out)
+	return out.Scratch, err
+}
+
+// SettleScratch records what this executor did with a scratch.
+func (c *Client) SettleScratch(ctx context.Context, settled store.ScratchSettled) error {
+	return c.call(ctx, "settle-scratch", map[string]any{"settled": settled}, nil)
+}
+
 // ListUnlaunchedLeases asks for this executor's leases that never reached a
 // running attempt (store.ListUnlaunchedLeases). A daemon older than this
 // operation answers 404, as an unknown route.

@@ -29,6 +29,7 @@ const (
 
 func TestMain(m *testing.M) {
 	RunHelper(os.Args)
+	runScratchHelper(os.Args)
 	if len(os.Args) == 2 {
 		switch os.Args[1] {
 		case helperTree, helperStubborn, helperOrphan:

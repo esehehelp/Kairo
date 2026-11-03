@@ -73,8 +73,8 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 			}
 		}
 	}
-	// Gang and Env are left out of the digest when absent, so an execution
-	// without them keeps the digest it had before they existed.
+	// Gang, Env and ScratchTmpdir are left out of the digest when absent, so
+	// an execution without them keeps the digest it had before they existed.
 	digestValue := struct {
 		Scope                ScopePath
 		Argv                 []string
@@ -88,7 +88,8 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		Capacity             CapacityRequest
 		Gang                 *GangSpec         `json:",omitempty"`
 		Env                  map[string]string `json:",omitempty"`
-	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env}
+		ScratchTmpdir        bool              `json:",omitempty"`
+	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir}
 	normalized, err := json.Marshal(digestValue)
 	if err != nil {
 		return ExecutionSpec{}, nil, "", err
@@ -332,7 +333,7 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 			env = &value
 		}
 		executionID, stamp := id.New("exe"), now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir); err != nil {
 			return "", err
 		}
 		if err = insertExecutionResourcesTx(ctx, tx, executionID, spec); err != nil {

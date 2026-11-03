@@ -25,6 +25,8 @@ type submitExecutionRequest struct {
 	Exclusive []store.ExclusiveRequest `json:"exclusive"`
 	Capacity  store.CapacityRequest    `json:"capacity"`
 	Env       map[string]string        `json:"env,omitempty"`
+	// ScratchTmpdir: TMPDIR, TMP and TEMP point at the attempt's scratch.
+	ScratchTmpdir bool `json:"scratch_tmpdir,omitempty"`
 }
 
 func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +49,7 @@ func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		Argv:            body.Argv, CWD: body.CWD, ExecutorSelector: executor,
 		Priority: body.Priority, Checkpointable: body.Checkpointable, Preemptible: body.Preemptible,
 		InputContinuationRef: body.InputContinuationRef, Exclusive: body.Exclusive, Capacity: body.Capacity,
-		Env: body.Env,
+		Env: body.Env, ScratchTmpdir: body.ScratchTmpdir,
 	})
 	if err != nil {
 		writeError(w, err)

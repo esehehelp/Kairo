@@ -34,6 +34,9 @@ var (
 	// errScratchMarker: a scratch directory whose marker is missing or names
 	// another attempt.
 	errScratchMarker = errors.New("scratch marker does not name the attempt")
+	// errScratchNotEmpty: a scratch to be deleted only if empty holds more
+	// than its marker.
+	errScratchNotEmpty = errors.New("scratch directory holds more than its marker")
 )
 
 // storeFS is how an executor reaches a store's root: in its own namespace
@@ -48,11 +51,13 @@ type storeFS interface {
 	// <root>/scratch/<id> whose marker names id), by id.
 	Scan(ctx context.Context, root string) (map[string]int64, error)
 	// Create makes <root>/scratch/<attemptID> with its marker and returns
-	// its path.
+	// its path (one already made for attemptID is taken as it is).
 	Create(ctx context.Context, root, attemptID string) (string, error)
 	// Remove deletes the scratch directory dir of attemptID under root
-	// (removeScratch's rules). A directory already gone is no error.
-	Remove(ctx context.Context, root, dir, attemptID string) error
+	// (removeScratch's rules); onlyEmpty deletes it only if it holds nothing
+	// but its marker (errScratchNotEmpty otherwise). A directory already gone
+	// is no error.
+	Remove(ctx context.Context, root, dir, attemptID string, onlyEmpty bool) error
 	// Size is the bytes of the files under dir (links not followed, mount
 	// points not entered); 0 for a directory that is gone.
 	Size(ctx context.Context, dir string) (int64, error)
@@ -131,11 +136,11 @@ func (localStoreFS) Scan(_ context.Context, root string) (map[string]int64, erro
 		if id, err := readScratchMarker(dir); err != nil || id != name {
 			continue // not Kairo's
 		}
-		size, err := treeSize(dir)
-		if err != nil {
-			return nil, err
+		// One that cannot be sized now (deleted meanwhile, or unreadable)
+		// is left out of this report.
+		if size, err := treeSize(dir); err == nil {
+			out[name] = size
 		}
-		out[name] = size
 	}
 	return out, nil
 }
@@ -156,7 +161,14 @@ func (localStoreFS) Create(_ context.Context, root, attemptID string) (string, e
 		return "", fmt.Errorf("%w: %s", errScratchLink, parent)
 	}
 	dir := filepath.Join(parent, attemptID)
-	if err = os.Mkdir(dir, 0o755); err != nil {
+	if err = os.Mkdir(dir, 0o755); errors.Is(err, fs.ErrExist) {
+		if fi, statErr := os.Lstat(dir); statErr == nil && !isLink(fi) && fi.IsDir() {
+			if id, markerErr := readScratchMarker(dir); markerErr == nil && id == attemptID {
+				return dir, nil
+			}
+		}
+		return "", err
+	} else if err != nil {
 		return "", err
 	}
 	if err = os.WriteFile(filepath.Join(dir, scratchMarkerName), []byte(attemptID+"\n"), 0o644); err != nil {
@@ -166,8 +178,8 @@ func (localStoreFS) Create(_ context.Context, root, attemptID string) (string, e
 	return dir, nil
 }
 
-func (localStoreFS) Remove(_ context.Context, root, dir, attemptID string) error {
-	return removeScratch(root, dir, attemptID)
+func (localStoreFS) Remove(_ context.Context, root, dir, attemptID string, onlyEmpty bool) error {
+	return removeScratch(root, dir, attemptID, onlyEmpty)
 }
 
 func (localStoreFS) Size(_ context.Context, dir string) (int64, error) {
@@ -219,8 +231,9 @@ func samePath(a, b string) bool {
 // filesystem is not entered (the deletion stops there), and the marker goes
 // last, so a deletion cut short is resumed. A directory without a marker is
 // deleted only if it is empty (one whose deletion stopped between the marker
-// and the directory). A directory already gone is no error.
-func removeScratch(root, dir, attemptID string) error {
+// and the directory). onlyEmpty deletes the directory only if it holds
+// nothing but its marker. A directory already gone is no error.
+func removeScratch(root, dir, attemptID string, onlyEmpty bool) error {
 	if !validScratchID(attemptID) {
 		return fmt.Errorf("%w: attempt id %q", errOutsideRoot, attemptID)
 	}
@@ -260,7 +273,15 @@ func removeScratch(root, dir, attemptID string) error {
 	if id != attemptID {
 		return fmt.Errorf("%w: %s names %q, not %q", errScratchMarker, want, id, attemptID)
 	}
-	if err = removeContents(want, deviceOf(fi), scratchMarkerName); err != nil {
+	if onlyEmpty {
+		entries, err := os.ReadDir(want)
+		if err != nil {
+			return err
+		}
+		if len(entries) != 1 {
+			return fmt.Errorf("%w: %s", errScratchNotEmpty, want)
+		}
+	} else if err = removeContents(want, deviceOf(fi), scratchMarkerName); err != nil {
 		return err
 	}
 	if err = removeEntry(filepath.Join(want, scratchMarkerName), false); err != nil {
@@ -342,6 +363,9 @@ func treeSize(dir string) (int64, error) {
 
 func sizeUnder(dir string, device uint64) (int64, error) {
 	entries, err := os.ReadDir(dir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return 0, nil // deleted meanwhile
+	}
 	if err != nil {
 		return 0, err
 	}
