@@ -11,13 +11,16 @@ import (
 )
 
 // processTree is what this executor knows of an attempt's processes: the
-// launcher (pid 0 when it is gone or cannot be identified), the tree handle
-// taken at launch (nil for an attempt launched by an earlier executor
-// instance), and whether the work runs inside WSL.
+// launcher (pid 0 when it is gone or cannot be identified) and its creation
+// identity, the launcher's process group (Linux: its pid, which leads the
+// group it was started in; 0 when unknown or for WSL), the tree handle taken
+// at launch (nil for an attempt launched by an earlier executor instance),
+// and whether the work runs inside WSL.
 type processTree struct {
 	attemptID string
 	pid       int
 	identity  string
+	group     int
 	handle    *treeHandle
 	wsl       bool
 	distro    string
@@ -158,6 +161,9 @@ func (e *Local) attemptTree(o store.ForceStopOrder) processTree {
 		if liveness, _ := processidentity.HostProcessLiveness(*o.PID, *o.ProcessIdentity); liveness == processidentity.LivenessAlive {
 			t.pid = *o.PID
 		}
+	}
+	if !t.wsl && o.PID != nil {
+		t.group = *o.PID // the launcher's process group, also once it is gone
 	}
 	return t
 }
