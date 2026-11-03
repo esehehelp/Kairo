@@ -369,8 +369,9 @@ func TestLaunchGetsScratchOnAVolatileStore(t *testing.T) {
 }
 
 // Due scratch is settled on disk as the daemon says: deleted after a
-// success; after a failure kept, unless it holds nothing but its marker;
-// a lost attempt's kept as it is; a deletion refused for safety keeps it.
+// success; kept after a failure or a loss, empty or not, with its size; left
+// untouched (kept, not read) when the declaration no longer covers it; a
+// deletion refused for safety keeps it.
 func TestDueScratchIsSettled(t *testing.T) {
 	ctx := context.Background()
 	root := t.TempDir()
@@ -378,50 +379,56 @@ func TestDueScratchIsSettled(t *testing.T) {
 	failed := makeTestScratch(t, root, "att_failed", 100)
 	empty := makeTestScratch(t, root, "att_empty", -1)
 	lost := makeTestScratch(t, root, "att_lost", -1)
+	left := makeTestScratch(t, root, "att_left", 100)
 	foreign := makeTestScratch(t, root, "att_foreign", 100)
 	if err := os.WriteFile(filepath.Join(foreign, scratchMarkerName), []byte("att_other\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	outside, files := outsideTree(t)
-	settlement := func(id, path string, del, isLost bool, reason string) store.ScratchSettlement {
-		return store.ScratchSettlement{AttemptID: id, StoreID: "scratch", Root: root, Path: path, Delete: del, Lost: isLost, Reason: reason}
+	settlement := func(id, path, action, reason string) store.ScratchSettlement {
+		return store.ScratchSettlement{AttemptID: id, StoreID: "scratch", Root: root, Path: path, Action: action, Reason: reason}
 	}
 	fake := &fakeScratch{fakeStores: &fakeStores{}, due: []store.ScratchSettlement{
-		settlement("att_ok", ok, true, false, "exit 0"),
-		settlement("att_failed", failed, false, false, "exit 1"),
-		settlement("att_empty", empty, false, false, "exit 1"),
-		settlement("att_lost", lost, false, true, "attempt lost"),
-		settlement("att_foreign", foreign, true, false, "exit 0"),
-		settlement("att_outside", outside, true, false, "exit 0"),
+		settlement("att_ok", ok, store.ScratchDelete, "exit 0"),
+		settlement("att_failed", failed, store.ScratchKeep, "exit 1"),
+		settlement("att_empty", empty, store.ScratchKeep, "exit 1"),
+		settlement("att_lost", lost, store.ScratchKeep, "attempt lost"),
+		settlement("att_left", left, store.ScratchLeave, "exit 0; not touched: store scratch is no longer declared"),
+		settlement("att_foreign", foreign, store.ScratchDelete, "exit 0"),
+		settlement("att_outside", outside, store.ScratchDelete, "exit 0"),
 	}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
 	e.settleDueScratch(ctx)
 
-	if exists(ok) || exists(empty) {
-		t.Fatal("a successful or empty scratch was not deleted")
+	if exists(ok) {
+		t.Fatal("a successful scratch was not deleted")
 	}
-	if !exists(filepath.Join(failed, "data")) || !exists(lost) || !exists(filepath.Join(foreign, "data")) {
-		t.Fatal("a kept scratch was deleted")
+	for _, dir := range []string{filepath.Join(failed, "data"), filepath.Join(empty, scratchMarkerName), lost, filepath.Join(left, "data"), filepath.Join(foreign, "data")} {
+		if !exists(dir) {
+			t.Fatalf("%s, of a kept scratch, was deleted", dir)
+		}
 	}
 	checkKept(t, files)
 	got := map[string]store.ScratchSettled{}
 	for _, s := range fake.settled {
 		got[s.AttemptID] = s
 	}
-	if len(got) != 6 {
+	if len(got) != 7 {
 		t.Fatalf("settled: %+v", fake.settled)
 	}
 	failedSize := 100 + int64(len("att_failed\n"))
+	emptySize := int64(len("att_empty\n"))
 	lostSize := int64(len("att_lost\n"))
 	for id, want := range map[string]store.ScratchSettled{
 		"att_ok":     {AttemptID: "att_ok", State: "deleted"},
 		"att_failed": {AttemptID: "att_failed", State: "kept", Bytes: &failedSize},
-		"att_empty":  {AttemptID: "att_empty", State: "deleted", Empty: true},
+		"att_empty":  {AttemptID: "att_empty", State: "kept", Bytes: &emptySize},
 		"att_lost":   {AttemptID: "att_lost", State: "kept", Bytes: &lostSize},
+		"att_left":   {AttemptID: "att_left", State: "kept"},
 	} {
 		s := got[id]
-		if s.State != want.State || s.Empty != want.Empty || s.Reason != "" || (want.Bytes == nil) != (s.Bytes == nil) || want.Bytes != nil && *s.Bytes != *want.Bytes {
+		if s.State != want.State || s.Reason != "" || (want.Bytes == nil) != (s.Bytes == nil) || want.Bytes != nil && *s.Bytes != *want.Bytes {
 			t.Fatalf("%s settled %+v, want %+v", id, s, want)
 		}
 	}
@@ -434,13 +441,14 @@ func TestDueScratchIsSettled(t *testing.T) {
 
 	// a settlement the daemon does not take is tried again, warned once
 	fake.settled, fake.settleErr = nil, errors.New("daemon unreachable")
-	fake.due = []store.ScratchSettlement{settlement("att_failed", failed, false, false, "exit 1")}
+	fake.due = []store.ScratchSettlement{settlement("att_failed", failed, store.ScratchKeep, "exit 1")}
 	e.settleDueScratch(ctx)
 	e.settleDueScratch(ctx)
 	if n := strings.Count(logs.String(), "scratch not settled"); n != 1 || !exists(filepath.Join(failed, "data")) {
 		t.Fatalf("warned %d times:\n%s", n, logs.String())
 	}
 }
+
 
 // With a daemon older than stores (404) the executor makes no scratch and
 // never asks for scratch to settle; once the daemon answers for stores it

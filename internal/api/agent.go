@@ -223,7 +223,9 @@ func (s *Server) agentOps() []agentOp {
 				commands, err := s.Store.EnsurePriorityPreemption(ctx, b.ExecutorID)
 				return map[string]any{"commands": commands}, err
 			}),
-		newAgentOp(s, "stores", observeAllowed, nil,
+		// An observe-only daemon gives an agent no stores: it then neither
+		// makes a root nor a scratch, nor deletes anything.
+		newAgentOp(s, "stores", observeEmpty, map[string]any{"stores": []any{}},
 			func(_ context.Context, b agentNodeRequest) (string, error) { return b.NodeID, nil },
 			func(ctx context.Context, b agentNodeRequest) (any, error) {
 				stores, err := s.Store.NodeStores(ctx, b.NodeID)

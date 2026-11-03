@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"kairo/internal/machine"
@@ -16,11 +17,12 @@ import (
 // and TEMP). Without such a store, or when making or recording it fails,
 // the attempt starts without one. Once the attempt has quiesced or was lost
 // the executor settles its scratch as the daemon says
-// (store.ScratchToSettle): it deletes it (removeScratch's rules) or keeps
-// it; a kept one that holds nothing but its marker is deleted all the same
-// unless its attempt was lost. A deletion refused for safety (not the
-// recorded directory, a link, a marker naming another attempt) keeps the
-// scratch, saying why; one that failed otherwise is tried again.
+// (store.ScratchToSettle): it deletes it (removeScratch's rules), keeps it
+// (measured once), or leaves it untouched (kept, not even measured: the
+// declaration no longer makes its path a volatile store's scratch). A
+// deletion refused for safety (not the recorded directory, a link, a marker
+// naming another attempt) keeps the scratch, saying why; one that failed
+// otherwise is tried again.
 
 const (
 	// scratchSettleInterval: how often the scratch to settle is asked for.
@@ -175,16 +177,21 @@ func settleOnDisk(ctx context.Context, fs storeFS, k store.ScratchSettlement) (s
 		}
 		return settled, nil
 	}
-	if k.Lost {
+	switch k.Action {
+	case store.ScratchLeave:
+		settled.State = "kept"
+		return settled, nil
+	case store.ScratchKeep:
 		return keep("")
+	case store.ScratchDelete:
+	default:
+		return settled, fmt.Errorf("unknown scratch action %q", k.Action)
 	}
-	err := fs.Remove(ctx, k.Root, k.Path, k.AttemptID, !k.Delete)
+	err := fs.Remove(ctx, k.Root, k.Path, k.AttemptID, false)
 	switch {
 	case err == nil:
-		settled.State, settled.Empty = "deleted", !k.Delete
+		settled.State = "deleted"
 		return settled, nil
-	case errors.Is(err, errScratchNotEmpty):
-		return keep("")
 	case errors.Is(err, errOutsideRoot), errors.Is(err, errScratchLink), errors.Is(err, errScratchMarker):
 		return keep(k.Reason + "; not deleted: " + err.Error())
 	}

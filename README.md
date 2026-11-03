@@ -743,9 +743,12 @@ there, `<root>/scratch/<attempt id>`, holding the marker file
 by `KAIRO_SCRATCH`. It is recorded at the daemon (`attempt-scratch`, table
 `attempt_scratch`: attempt, store, root, path, `active`/`kept`/`deleted`,
 bytes, reason; events `scratch_created`, then `scratch_deleted` or
-`scratch_kept`) while the attempt is still authorized; if it cannot be made
-or recorded, the attempt starts without it. `TMPDIR`, `TMP` and `TEMP` are
-left alone unless the task sets `scratch_tmpdir = true` in
+`scratch_kept`) while the attempt is still authorized, and only on a
+volatile store of the attempt's node in its executor's namespace, at the
+store's declared root, at exactly `<root>/scratch/<attempt id>` and inside
+no other store of the node (compared as Machine declaration spells roots);
+if it cannot be made or recorded, the attempt starts without it. `TMPDIR`,
+`TMP` and `TEMP` are left alone unless the task sets `scratch_tmpdir = true` in
 `[tasks.execution]` (or the execution TOML): then they name the scratch (a
 WSL attempt gets `TMPDIR` only, since its variables also reach `wsl.exe`),
 over a declared env. Off by default, since a temporary directory emptied
@@ -753,11 +756,19 @@ with every attempt loses caches such as torch's compile cache. It needs no
 SDK: the executor makes and settles it.
 
 Once the attempt has quiesced, or was lost, its executor settles the scratch
-(`scratch-to-settle` every 10 seconds, `settle-scratch`): after a success
-(exit 0 without a signal, or a suspend that published its checkpoint) it is
+(`scratch-to-settle` every 10 seconds, with an `action` for each:
+`delete`, `keep` or `leave`; `settle-scratch`): after a success (exit 0
+without a signal, or a suspend that published its checkpoint) it is
 deleted; after a failure (another exit, a signal, a launch that never ran)
-it is kept, unless it holds nothing but its marker; a lost attempt's (also
-once reconciled) is kept as it is, since its processes may still be writing.
+it is kept, empty or not; a lost attempt's (also once reconciled) is kept as
+it is, since its processes may still be writing. Only success deletes, and
+only while the declaration still makes the recorded path the scratch
+directory of that volatile store: once the store is dropped, moved, made
+durable or another store of the node holds the path, the scratch is left
+untouched (`leave`: kept, not even measured), and the daemon refuses to
+record it deleted. An observe-only daemon gives agents no stores (`stores`
+answers an empty list) and no scratch to settle, so they make no root and
+no scratch and delete nothing.
 Kept scratch stays where it is (moving it to a durable store comes with
 P1b) and is listed by `kairo store status` with its task, size and reason;
 nothing deletes it in P1a but an operator. Deleting is done by the executor
