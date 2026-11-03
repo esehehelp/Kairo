@@ -194,6 +194,12 @@ class AttemptSession:
         self._terminal_error: KairoAPIError | None = None
         self.suspend_handled = False
         self._stop_signal_handled = False
+        # A ``checkpointed`` acknowledgement whose answer did not arrive:
+        # (command id, kind, payload), sent again before anything else (_publish).
+        self._pending_publication: tuple[str, str, dict[str, Any]] | None = None
+        # Waits between the tries of a ``checkpointed`` acknowledgement within
+        # one safe point.
+        self.publication_retry_delays: tuple[float, ...] = (1.0, 2.0)
         self.process_identity = _current_process_identity()
         self._process_registered = False
         self._registration_lock = threading.Lock()
@@ -431,6 +437,17 @@ class AttemptSession:
             except Exception as error:
                 if not self._unavailable(error):
                     raise
+        if self.managed and self._pending_publication is not None:
+            # A checkpoint was published and only the answer may have been
+            # lost: Kairo does not deliver a checkpointed command again, so
+            # the same acknowledgement is sent again first.
+            command_id, kind, payload = self._pending_publication
+            published = self._publish(command_id, kind, payload)
+            if published is None:
+                return False  # still unavailable: nothing else this time
+            if published and kind == "suspend":
+                self.suspend_handled = True
+                return True
         stop_path = next((path for path in self.stop_paths if path.exists()), None)
         if stop_path is not None:
             context = CommandContext(
@@ -506,16 +523,41 @@ class AttemptSession:
                 _log.warning("Kairo checkpoint %s published nothing; the worker carries on", context.command_id)
                 return False
             raise NoContinuationError(message)
-        try:
-            self._ack(context.command_id, "checkpointed", suspend_payload(result))
-        except Exception as error:
-            if self._withdrawn_or_unavailable(context.command_id, error):
-                return False
-            raise
+        if not self._publish(context.command_id, context.kind, suspend_payload(result)):
+            return False  # withdrawn, or kept to be sent again
         if context.kind == "checkpoint":
             return False  # published; the worker carries on
         self.suspend_handled = True
         return True
+
+    def _publish(self, command_id: str, kind: str, payload: dict[str, Any]) -> bool | None:
+        """Send the ``checkpointed`` acknowledgement: ``True`` once Kairo has
+        it, ``False`` when the command was withdrawn, ``None`` while Kairo is
+        unavailable (after the tries of :attr:`publication_retry_delays`). In
+        that last case the acknowledgement may have been recorded with only
+        its answer lost, and a checkpointed command is not delivered again,
+        so it is kept and sent again, the same (Kairo takes a repeat as the
+        same), at the start of every later safe point until answered."""
+        delays = iter(self.publication_retry_delays)
+        while True:
+            try:
+                self._ack(command_id, "checkpointed", payload)
+            except Exception as error:
+                if isinstance(error, KairoAPIError) and error.classification == errors.GONE:
+                    _log.info("Kairo command %s was withdrawn: %s", command_id, error)
+                    self._pending_publication = None
+                    return False
+                if not self._unavailable(error):
+                    self._pending_publication = None
+                    raise
+                delay = next(delays, None)
+                if delay is None:
+                    self._pending_publication = (command_id, kind, payload)
+                    return None
+                time.sleep(delay)
+                continue
+            self._pending_publication = None
+            return True
 
     def _unavailable(self, error: BaseException) -> bool:
         """Whether ``error`` says the daemon or the network is briefly

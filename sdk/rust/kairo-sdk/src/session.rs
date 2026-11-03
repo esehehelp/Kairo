@@ -208,6 +208,15 @@ struct Inner {
 struct SafePointState {
     last_poll: Option<Instant>,
     signal_handled: bool,
+    /// A `checkpointed` acknowledgement whose answer did not arrive.
+    pending_publication: Option<Publication>,
+}
+
+/// A `checkpointed` acknowledgement to send again.
+struct Publication {
+    command_id: String,
+    payload: Value,
+    checkpoint: bool,
 }
 
 /// A managed attempt: this process registered once, a background thread
@@ -277,7 +286,7 @@ impl Session {
         Session {
             inner,
             thread: Mutex::new(thread),
-            safe_point: Mutex::new(SafePointState { last_poll: None, signal_handled: false }),
+            safe_point: Mutex::new(SafePointState { last_poll: None, signal_handled: false, pending_publication: None }),
         }
     }
 
@@ -387,6 +396,20 @@ impl Session {
         if let Some(e) = lock(&self.inner.state).terminal.clone() {
             return Err(SafePointError::Kairo(e));
         }
+        // A publication whose answer did not arrive goes again first, the
+        // same (Kairo takes a repeat as the same).
+        if let Some(p) = sp.pending_publication.take() {
+            match self.inner.client.ack(&p.command_id, Phase::Checkpointed, Some(&p.payload)) {
+                Ok(()) if !p.checkpoint => return Ok(true),
+                Ok(()) => {}
+                Err(e) if e.kind == ErrorKind::Gone => {}
+                Err(e) if unavailable(&e) => {
+                    sp.pending_publication = Some(p);
+                    return Ok(false);
+                }
+                Err(e) => return Err(SafePointError::Kairo(self.observe(e))),
+            }
+        }
         // Commands first: a suspend that is already pending publishes its
         // continuation even when a stop signal arrived meanwhile.
         let now = Instant::now();
@@ -399,7 +422,7 @@ impl Session {
                 Err(e) => return Err(SafePointError::Kairo(self.observe(e))),
             };
             if let Some(command) = commands.into_iter().find(|c| c.kind == "suspend" || c.kind == "checkpoint") {
-                return self.suspend(command, callback);
+                return self.suspend(command, callback, &mut sp);
             }
         }
         if crate::signals::stop_requested() {
@@ -425,6 +448,7 @@ impl Session {
         &self,
         command: Command,
         callback: impl FnOnce(&SuspendRequest) -> Result<SuspendResult, E>,
+        sp: &mut SafePointState,
     ) -> Result<bool, SafePointError<E>> {
         let client = &self.inner.client;
         // Ok(false): the command was withdrawn (404), or the daemon is briefly
@@ -473,8 +497,20 @@ impl Session {
         };
         let mut payload = result.payload;
         payload.insert("continuation_ref".into(), continuation_ref.into());
-        // A checkpoint command is published and the worker carries on.
-        Ok(ack(Phase::Checkpointed, Some(&Value::Object(payload)))? && !checkpoint)
+        let payload = Value::Object(payload);
+        match client.ack(&command.id, Phase::Checkpointed, Some(&payload)) {
+            // A checkpoint command is published and the worker carries on.
+            Ok(()) => Ok(!checkpoint),
+            Err(e) if e.kind == ErrorKind::Gone => Ok(false),
+            Err(e) if unavailable(&e) => {
+                // It may have been recorded with only its answer lost, and a
+                // checkpointed command is not delivered again: the same
+                // acknowledgement goes again first at the next safe point.
+                sp.pending_publication = Some(Publication { command_id: command.id.clone(), payload, checkpoint });
+                Ok(false)
+            }
+            Err(e) => Err(SafePointError::Kairo(self.observe(e))),
+        }
     }
 
     /// Record a failed request: a retired or fenced attempt ends the

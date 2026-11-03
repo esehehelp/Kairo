@@ -507,3 +507,54 @@ def test_closing_a_started_session_sends_a_final_heartbeat():
     # The first heartbeat when the session starts, the final one on close.
     assert len(beats) == 2
     assert beats[-1]["progress"]["current"] == 7
+
+
+def test_unanswered_publication_is_sent_again_before_anything_else():
+    # The checkpointed acknowledgement may be recorded with only its answer
+    # lost; Kairo then does not deliver the command again, so the worker must
+    # send the same acknowledgement again rather than carry on.
+    routes = worker_routes({"GET /api/worker/commands": suspend(),
+                            "POST /api/worker/commands/cmd_1/acks": [OK, OK, UNAVAILABLE, OK]})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+        session.publication_retry_delays = ()
+        calls = []
+        assert session.safe_point(checkpoint=lambda c: calls.append(c) or "ckpt://9") is False
+        assert not session.suspend_handled
+        assert session.safe_point(checkpoint=lambda c: calls.append(c) or "ckpt://other") is True
+        assert session.suspend_handled
+    assert len(calls) == 1
+    published = [body for body in acks(daemon) if body["phase"] == "checkpointed"]
+    assert [body["payload"]["continuation_ref"] for body in published] == ["ckpt://9", "ckpt://9"]
+    assert daemon.paths("GET").count("/api/worker/commands") == 1
+
+
+def test_gang_rank_tries_its_own_acknowledgement_again_after_a_failure():
+    routes = worker_routes({"GET /api/worker/commands": [UNAVAILABLE, suspend("cmd_rank1", kind="checkpoint")],
+                            "POST /api/worker/commands/cmd_rank1/acks": OK})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+        session.gang = GangContext("gang_1", 1, 2, "10.0.0.2", 29500)
+        adapter = DistributedAdapter(session)
+        adapter._mirror_on_own_attempt(1, "checkpoint", "ckpt://rank0", None)
+        assert adapter._pending_mirror == ("checkpoint", "ckpt://rank0", None)
+        adapter._mirror_on_own_attempt(1, *adapter._pending_mirror)  # what the next safe point does
+        assert adapter._pending_mirror is None
+    assert [body["phase"] for body in acks(daemon)] == ["accepted", "checkpointing", "checkpointed"]
+
+
+def test_distributed_publication_without_an_answer_is_sent_again_before_anything_else():
+    pytest.importorskip("torch")
+    routes = worker_routes({"GET /api/worker/commands": suspend(),
+                            "POST /api/worker/commands/cmd_1/acks": [OK, OK, UNAVAILABLE, OK]})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+        adapter = DistributedAdapter(session)
+        calls = []
+        assert adapter.safe_point(lambda c: calls.append(c) or "ckpt://5") is False
+        assert adapter.safe_point(lambda c: calls.append(c) or "ckpt://other") is True
+        adapter.close()
+    assert len(calls) == 1
+    published = [body for body in acks(daemon) if body["phase"] == "checkpointed"]
+    assert [body["payload"]["continuation_ref"] for body in published] == ["ckpt://5", "ckpt://5"]
+    assert daemon.paths("GET").count("/api/worker/commands") == 1

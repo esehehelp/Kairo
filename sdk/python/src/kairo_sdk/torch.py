@@ -37,6 +37,13 @@ class DistributedAdapter:
         self.session = session
         self._stop_signal_handled = False
         self._registered = False
+        # Rank 0: a ``checkpointed`` acknowledgement whose answer did not
+        # arrive, (command id, kind, payload), sent again before anything else.
+        self._pending_publication: tuple[str, str, dict[str, Any]] | None = None
+        # A gang rank other than 0: the acknowledgement of its own command it
+        # still owes, (kind, continuation_ref, rejection), tried at every
+        # safe point until done.
+        self._pending_mirror: tuple[str, str | None, str | None] | None = None
 
     @staticmethod
     def _distribution():
@@ -219,6 +226,8 @@ class DistributedAdapter:
         self.start()
         dist, distributed = self._distribution()
         rank = dist.get_rank() if distributed else 0
+        if self._pending_mirror is not None:
+            self._mirror_on_own_attempt(rank, *self._pending_mirror)
 
         envelope: list[Any] = [None]
         if rank == 0:
@@ -227,6 +236,13 @@ class DistributedAdapter:
             dist.broadcast_object_list(envelope, src=0)
         message = envelope[0]
         _raise_terminal(self.session, message["terminal"])
+        published = message.get("published")
+        if published is not None:
+            # Rank 0 got the answer of an earlier publication only now.
+            self._mirror_on_own_attempt(rank, published["kind"], published["continuation_ref"], None)
+            if published["kind"] == "suspend":
+                self.session.suspend_handled = True
+                return True
         raw = message["command"]
         if raw is None and message["stop"]:
             return self._checkpoint_for_stop_signal(checkpoint, dist, distributed, rank)
@@ -273,11 +289,17 @@ class DistributedAdapter:
                 self._try_ack(context.command_id, "rejected", {"reason": "no continuation_ref"})
                 outcome["no_continuation"] = True
             else:
-                status = self._try_ack(context.command_id, "checkpointed", suspend_payload(result))
+                payload = suspend_payload(result)
+                status = self._try_ack(context.command_id, "checkpointed", payload)
                 outcome["ok"] = status == "ok"
                 outcome["continuation_ref"] = result.continuation_ref
                 if status == "terminal":
                     outcome["terminal"] = _terminal_message(self.session)
+                elif status == "failed" and self._unanswered():
+                    # It may have been recorded with only the answer lost, and
+                    # a checkpointed command is not delivered again: the same
+                    # acknowledgement goes again first at the next safe point.
+                    self._pending_publication = (context.command_id, context.kind, payload)
         acknowledgement = [outcome]
         if distributed:
             dist.broadcast_object_list(acknowledgement, src=0)
@@ -306,29 +328,49 @@ class DistributedAdapter:
         attempt's command of the same kind the way rank 0's was: published
         with rank 0's ``continuation_ref``, or rejected. Every rank got one
         (a checkpoint, or the suspend a gang hands every rank) and only rank
-        0 polls, so without this a rank's command stayed pending. Best
-        effort, and no collective: a failure leaves it for the next round.
+        0 polls, so without this a rank's command stayed pending. No
+        collective: a failure keeps it (``_pending_mirror``) to be tried
+        again at the next safe point.
         """
+        self._pending_mirror = None
         if rank == 0 or not self._own_attempts:
             return
         session = self.session
+        pending = (kind, continuation_ref, rejection)
         try:
             commands = session.poll_commands()
+        except (AttemptRetired, AttemptFenced):
+            return  # the attempt is over: nothing to acknowledge
         except BaseException as exc:
             session.last_control_error = exc
+            self._pending_mirror = pending
             return
         for raw in commands:
             if str(raw.get("kind") or "") != kind:
                 continue
             command_id = str(raw["id"])
-            for phase in ("accepted", "checkpointing"):
-                if self._try_ack(command_id, phase) != "ok":
-                    return
+            statuses = [self._try_ack(command_id, phase) for phase in ("accepted", "checkpointing")]
+            if "terminal" in statuses or "gone" in statuses:
+                return
+            if "failed" in statuses:
+                self._pending_mirror = pending
+                return
             if rejection is not None:
-                self._try_ack(command_id, "rejected", {"reason": f"rank 0: {rejection}"})
+                status = self._try_ack(command_id, "rejected", {"reason": f"rank 0: {rejection}"})
             elif continuation_ref:
-                self._try_ack(command_id, "checkpointed", {"continuation_ref": continuation_ref, "gang_rank": rank})
+                status = self._try_ack(command_id, "checkpointed", {"continuation_ref": continuation_ref, "gang_rank": rank})
+            else:
+                return
+            if status == "failed":
+                # Repeating an acknowledgement Kairo already took is harmless.
+                self._pending_mirror = pending
             return
+
+    def _unanswered(self) -> bool:
+        """Whether the last failed request of the session got no answer
+        (transient or retry-later), rather than a refusal."""
+        error = self.session.last_control_error
+        return error is not None and errors.classify(error) in (errors.TRANSIENT, errors.RETRY_LATER)
 
     def _checkpoint_for_stop_signal(self, checkpoint, dist, distributed: bool, rank: int) -> bool:
         """Rank 0 received a stop signal: every rank checkpoints once, then stops.
@@ -357,12 +399,24 @@ class DistributedAdapter:
     def _poll_on_rank_zero(self, progress: dict[str, Any] | None) -> dict[str, Any]:
         """Poll and accept a suspend on rank 0; the message every rank receives."""
         session = self.session
-        message: dict[str, Any] = {"command": None, "stop": False, "terminal": None}
+        message: dict[str, Any] = {"command": None, "stop": False, "terminal": None, "published": None}
         if progress is not None:
             session.set_progress(progress)
         if session._terminal_error is not None:
             message["terminal"] = _terminal_message(session)
             return message
+        if self._pending_publication is not None:
+            command_id, kind, payload = self._pending_publication
+            status = self._try_ack(command_id, "checkpointed", payload)
+            if status == "terminal":
+                message["terminal"] = _terminal_message(session)
+                return message
+            if status == "failed" and self._unanswered():
+                return message  # still unavailable: nothing else this time
+            self._pending_publication = None
+            if status == "ok":
+                message["published"] = {"kind": kind, "continuation_ref": payload.get("continuation_ref")}
+                return message
         now = time.monotonic()
         if now - session._last_poll >= session.poll_interval_seconds:
             session._last_poll = now

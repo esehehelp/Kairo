@@ -144,3 +144,37 @@ fn a_registered_process_carries_rank_pid_and_identity() {
     assert_eq!(body["pid"], std::process::id());
     assert_eq!(body["process_identity"], kairo_sdk::process_identity(std::process::id()).unwrap());
 }
+
+#[test]
+fn an_unanswered_publication_is_sent_again_before_anything_else() {
+    let command = json!({"commands": [{"id": "cmd_1", "kind": "suspend", "origin": "scope_pause", "reason": "paused", "delivery_count": 1}]});
+    let acks = "/api/worker/commands/cmd_1/acks";
+    let checkpointed = json!({"phase": "checkpointed", "payload": {"continuation_ref": "ckpt://9"}});
+    let daemon = FakeDaemon::scripted(vec![
+        Exchange::register(),
+        Exchange::heartbeat(Some(json!({}))),
+        Exchange::new("GET", "/api/worker/commands", None, 200, command),
+        Exchange::new("POST", acks, Some(json!({"phase": "accepted"})), 202, json!({"ok": true})),
+        Exchange::new("POST", acks, Some(json!({"phase": "checkpointing"})), 202, json!({"ok": true})),
+        Exchange::new("POST", acks, Some(checkpointed.clone()), 503, json!({"error": "database is locked", "code": "internal"})),
+        // The next safe point sends the same acknowledgement first, and stops.
+        Exchange::new("POST", acks, Some(checkpointed), 202, json!({"ok": true})),
+        Exchange::heartbeat(None),
+    ]);
+    let session = Attempt::from_vars(daemon.vars()).unwrap().unwrap().start(Options {
+        poll_interval: Duration::ZERO,
+        ..options()
+    });
+    daemon.wait_served(2);
+    let mut calls = 0;
+    let first = session.safe_point(|_| {
+        calls += 1;
+        Ok::<_, String>(kairo_sdk::SuspendResult::new("ckpt://9"))
+    });
+    assert!(matches!(first, Ok(false)), "{first:?}");
+    let second = session.safe_point(|_| -> Result<kairo_sdk::SuspendResult, String> { panic!("the checkpoint ran again") });
+    assert!(matches!(second, Ok(true)), "{second:?}");
+    assert_eq!(calls, 1);
+    drop(session);
+    daemon.finish();
+}
