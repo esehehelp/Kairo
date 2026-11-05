@@ -327,6 +327,8 @@ func executionProjectIDTx(ctx context.Context, tx *sql.Tx, executionID string) (
 // classify success, failure, or retryability. Process absence is finalized
 // separately by FinalizeQuiescence.
 func (s *Store) RecordTerminal(ctx context.Context, attemptID, leaseID string, epoch int64, exitCode int, exitSignal string) error {
+	// A run that ended changes the run history estimates are made from.
+	defer s.runs.invalidate()
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err

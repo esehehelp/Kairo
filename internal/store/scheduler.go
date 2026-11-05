@@ -93,6 +93,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 			return nil, err
 		}
 	}
+	history := s.runHistory(ctx)
 	started := time.Now()
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -108,6 +109,9 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	}
 	candidates, err := loadPlanCandidates(ctx, tx, m)
 	if err != nil {
+		return nil, err
+	}
+	if err = loadEstimates(ctx, tx, m, candidates, history); err != nil {
 		return nil, err
 	}
 	p := newPlanner(m, false)
