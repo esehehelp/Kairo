@@ -463,10 +463,11 @@ labels may take what is placed there.
   request keeps its `min_free_after_bytes` and the watermark free.
 - Elastic CPU: `cpu_millis_min` (at most `cpu_millis`) under `[capacity]`
   (`[tasks.execution.capacity]`) is the least an execution keeps. The rest of
-  its CPU reservation is lent to executions of the same or lower priority,
+  its CPU reservation is lent to executions of the same or higher priority,
   which then run beside it and slow it down instead of stopping it: a server
   declared with `cpu_millis = 16000` and `cpu_millis_min = 4000` lets 12 CPUs
-  of evaluations run next to it.
+  of evaluations of its priority or above run next to it. It lends nothing
+  to executions of lower priority.
 - Disk watermark: a node with a registered filesystem under
   `[scheduler] disk_min_free_bytes` of the daemon configuration (default
   5 GiB, at most 5% of the filesystem; `0` turns it off) admits nothing until

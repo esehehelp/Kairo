@@ -24,10 +24,10 @@ package store
 //     nothing.
 //   - accounting: a lease's capacity is counted once. CPU is total minus
 //     reservations, where an execution that declared cpu_millis_min lends
-//     the rest of its reservation to executions of no higher priority (it
-//     runs slower instead of being stopped); RAM is what is observed free
-//     minus the part of each reservation its attempt does not use yet
-//     (attempt_usage); disk is what is observed free minus every
+//     the rest of its reservation to executions of the same or higher
+//     priority (it runs slower instead of being stopped); RAM is what is
+//     observed free minus the part of each reservation its attempt does not
+//     use yet (attempt_usage); disk is what is observed free minus every
 //     reservation, since bytes written overstate what stays on disk.
 //   - a node with a filesystem under the free-space watermark admits nothing.
 //
