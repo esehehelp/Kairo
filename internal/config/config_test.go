@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 const daemonBase = `
@@ -217,5 +218,22 @@ func TestAgentPacksAreAllOrNothing(t *testing.T) {
 	}
 	if _, err = LoadAgent(writeConfig(t, agentBase+strings.Replace(full, "192.168.1.14:7475", "192.168.1.14", 1))); err == nil || !strings.Contains(err.Error(), "host:port") {
 		t.Fatalf("addr without a port: %v", err)
+	}
+}
+
+func TestDataScrubSettings(t *testing.T) {
+	c, err := Load(writeConfig(t, "[data]\nscrub_interval = \"72h\"\nscrub_bytes_per_day = 1073741824\n"+daemonBase))
+	if every, everyErr := c.Data.ScrubEvery(); err != nil || everyErr != nil || every != 72*time.Hour || c.Data.ScrubBytesPerDay != 1<<30 {
+		t.Fatalf("data: %+v %v %v", c.Data, err, everyErr)
+	}
+	if c, err = Load(writeConfig(t, daemonBase)); err != nil {
+		t.Fatal(err)
+	} else if every, _ := c.Data.ScrubEvery(); every != 0 {
+		t.Fatalf("unset: %v", every)
+	}
+	for _, bad := range []string{"scrub_interval = \"weekly\"\n", "scrub_interval = \"-1h\"\n", "scrub_bytes_per_day = -1\n"} {
+		if _, err := Load(writeConfig(t, "[data]\n"+bad+daemonBase)); err == nil || !strings.Contains(err.Error(), "data.") {
+			t.Fatalf("%q: %v", bad, err)
+		}
 	}
 }

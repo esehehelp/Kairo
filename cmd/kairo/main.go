@@ -100,6 +100,11 @@ func serve(args []string) error {
 	if daemonConfig.Scheduler.DiskMinFreeBytes != nil {
 		st.SetSchedulingPolicy(store.SchedulingPolicy{DiskMinFreeBytes: *daemonConfig.Scheduler.DiskMinFreeBytes})
 	}
+	scrubEvery, err := daemonConfig.Data.ScrubEvery()
+	if err != nil {
+		return err
+	}
+	st.SetDataPolicy(store.DataPolicy{ScrubInterval: scrubEvery, ScrubBytesPerDay: daemonConfig.Data.ScrubBytesPerDay})
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
 	slog.SetDefault(logger)

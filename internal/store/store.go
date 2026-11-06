@@ -75,6 +75,8 @@ type Store struct {
 	// runs is the run history the planner estimates run times from
 	// (estimate.go).
 	runs runHistoryCache
+	// data is the data policy (scrub.go).
+	data DataPolicy
 }
 
 // Open connects to the PostgreSQL database dsn (a postgres:// URL or a
@@ -108,7 +110,8 @@ func open(dsn string, create bool, tracer pgx.QueryTracer) (*Store, error) {
 		db.Close()
 		return nil, err
 	}
-	return &Store{db: db, policy: SchedulingPolicy{DiskMinFreeBytes: DefaultDiskMinFreeBytes}}, nil
+	return &Store{db: db, policy: SchedulingPolicy{DiskMinFreeBytes: DefaultDiskMinFreeBytes},
+		data: DataPolicy{ScrubInterval: DefaultScrubInterval, ScrubBytesPerDay: DefaultScrubBytesPerDay}}, nil
 }
 
 // Migrations returns the schema's numbered steps in order (the import tool

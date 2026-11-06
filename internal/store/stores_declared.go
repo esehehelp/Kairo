@@ -166,8 +166,23 @@ func checkScratchBeingDeletedTx(ctx context.Context, tx *sql.Tx, stores []machin
 	if err != nil {
 		return err
 	}
+	// So are the sources of data objects being deleted (deletions.go).
+	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.executor_id,d.root,d.source_path,x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id
+		WHERE d.source_state='deleting' ORDER BY d.id`, nil, func(rows *sql.Rows) error {
+		var objectID, kind, sourceID, storeID, executorID, root, path, nodeID string
+		if err := rows.Scan(&objectID, &kind, &sourceID, &storeID, &executorID, &root, &path, &nodeID); err != nil {
+			return err
+		}
+		if why := sourceOwnership(next, kind, nodeID, storeID, root, path, sourceID); why != "" {
+			busy = append(busy, fmt.Sprintf("%s (object %s, executor %s: %s)", path, objectID, executorID, why))
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
 	if len(busy) != 0 {
-		return fmt.Errorf("%w: scratch being deleted would no longer be a volatile store's: %s (apply again once its executor has settled it)", ErrMachineConflict, strings.Join(busy, "; "))
+		return fmt.Errorf("%w: scratch being deleted (or a copied source) would no longer be a volatile store's: %s (apply again once its executor has settled it)", ErrMachineConflict, strings.Join(busy, "; "))
 	}
 	return nil
 }

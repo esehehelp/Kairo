@@ -369,3 +369,60 @@ func TestAnUnreadableStateFileIsNeverReplaced(t *testing.T) {
 		t.Fatalf("unreadable state: %v", err)
 	}
 }
+
+// trimDaemon orders trims and records how they went.
+type trimDaemon struct {
+	*fakeDaemon
+	tmu    sync.Mutex
+	orders []store.TrimOrder
+	done   []store.TrimDone
+	asked  int
+}
+
+func (d *trimDaemon) TrimsToMake(context.Context, string) ([]store.TrimOrder, error) {
+	d.tmu.Lock()
+	defer d.tmu.Unlock()
+	d.asked++
+	return append([]store.TrimOrder(nil), d.orders...), nil
+}
+
+func (d *trimDaemon) RecordTrim(_ context.Context, _ string, done store.TrimDone) error {
+	d.tmu.Lock()
+	defer d.tmu.Unlock()
+	d.done = append(d.done, done)
+	d.orders = nil
+	return nil
+}
+
+// A controller trims the containers the daemon says, at most every
+// trimPoll, and reports how each went.
+func TestTheControllerTrimsContainersAfterDeletions(t *testing.T) {
+	daemon := &trimDaemon{fakeDaemon: &fakeDaemon{}, orders: []store.TrimOrder{{NodeID: "pve0-neo-train", VMID: 101, RequestedBytes: 1 << 30}, {NodeID: "pve0-glm", VMID: 105}}}
+	c := &clock{t: time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)}
+	ctl := newTestController(daemon.fakeDaemon, &fakeActuator{}, &fakeActuator{}, nil, c)
+	ctl.Daemon, ctl.trimSync = daemon, true
+	var trimmed []int
+	ctl.Trimmer = func(_ context.Context, vmid int) (string, error) {
+		trimmed = append(trimmed, vmid)
+		if vmid == 105 {
+			return "", errors.New("pct: not running")
+		}
+		return "/: 1 GiB (1073741824 bytes) trimmed", nil
+	}
+	ctx := context.Background()
+	ctl.Step(ctx)
+	if len(trimmed) != 2 || trimmed[0] != 101 || trimmed[1] != 105 || len(daemon.done) != 2 ||
+		daemon.done[0] != (store.TrimDone{NodeID: "pve0-neo-train", Output: "/: 1 GiB (1073741824 bytes) trimmed"}) ||
+		daemon.done[1].NodeID != "pve0-glm" || daemon.done[1].Problem != "pct: not running" {
+		t.Fatalf("trimmed %v, reported %+v", trimmed, daemon.done)
+	}
+	ctl.Step(ctx)
+	if daemon.asked != 1 {
+		t.Fatalf("asked %d times within trimPoll", daemon.asked)
+	}
+	c.advance(trimPoll)
+	ctl.Step(ctx)
+	if daemon.asked != 2 || len(trimmed) != 2 {
+		t.Fatalf("after trimPoll: asked %d, trimmed %v", daemon.asked, trimmed)
+	}
+}

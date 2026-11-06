@@ -105,6 +105,10 @@ func TestHostValidation(t *testing.T) {
 		{"device twice", "[[hosts]]\nid = \"a\"\nnodes = [\"win\"]\n[[hosts.devices]]\nid = \"cpu\"\n[[hosts.devices]]\nid = \"cpu\"\n", "lists device cpu twice"},
 		{"controller twice", "[[hosts]]\nid = \"a\"\nnodes = [\"win\"]\ncontroller = \"c\"\n[[hosts]]\nid = \"b\"\nnodes = [\"pve0-glm\", \"pve0-train\"]\ncontroller = \"c\"\n", "node c controls hosts a and b"},
 		{"unknown field", "[[hosts]]\nid = \"a\"\nnodes = [\"win\"]\nmodel = \"RTX\"\n", "unknown machine field"},
+		{"container not a node", "[[hosts]]\nid = \"a\"\nnodes = [\"pve0-glm\"]\ncontroller = \"c\"\ncontainers = { win = 101 }\n", "container win is not one of its nodes"},
+		{"container vmid", "[[hosts]]\nid = \"a\"\nnodes = [\"pve0-glm\"]\ncontroller = \"c\"\ncontainers = { pve0-glm = 0 }\n", "has vmid 0"},
+		{"one vmid twice", "[[hosts]]\nid = \"a\"\nnodes = [\"pve0-glm\", \"pve0-train\"]\ncontroller = \"c\"\ncontainers = { pve0-glm = 105, pve0-train = 105 }\n", "are both container 105"},
+		{"containers without controller", "[[hosts]]\nid = \"a\"\nnodes = [\"pve0-glm\"]\ncontainers = { pve0-glm = 105 }\n", "no controller to trim them"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := Parse(nodes + c.hosts)

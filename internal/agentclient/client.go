@@ -192,6 +192,48 @@ func (c *Client) AuthorizePackRead(ctx context.Context, nodeID, objectID, token 
 	return out.Read, err
 }
 
+// DeletionsToMake asks for the sources this executor is to delete now.
+func (c *Client) DeletionsToMake(ctx context.Context, executorID string) ([]store.DeletionOrder, error) {
+	var out struct {
+		Deletions []store.DeletionOrder `json:"deletions"`
+	}
+	err := c.call(ctx, "deletions-to-make", map[string]string{"executor_id": executorID}, &out)
+	return out.Deletions, err
+}
+
+// SettleDeletion records what this executor did with a source.
+func (c *Client) SettleDeletion(ctx context.Context, settled store.ObjectDeletion) error {
+	return c.call(ctx, "settle-deletion", map[string]any{"settled": settled}, nil)
+}
+
+// ScrubsToMake asks for the copies this executor is to read back now.
+func (c *Client) ScrubsToMake(ctx context.Context, executorID string) ([]store.ScrubOrder, error) {
+	var out struct {
+		Scrubs []store.ScrubOrder `json:"scrubs"`
+	}
+	err := c.call(ctx, "scrubs-to-make", map[string]string{"executor_id": executorID}, &out)
+	return out.Scrubs, err
+}
+
+// RecordScrub records what reading a copy back found.
+func (c *Client) RecordScrub(ctx context.Context, result store.ScrubResult) error {
+	return c.call(ctx, "record-scrub", map[string]any{"result": result}, nil)
+}
+
+// TrimsToMake asks for the containers this controller is to trim now.
+func (c *Client) TrimsToMake(ctx context.Context, nodeID string) ([]store.TrimOrder, error) {
+	var out struct {
+		Trims []store.TrimOrder `json:"trims"`
+	}
+	err := c.call(ctx, "trims-to-make", map[string]string{"node_id": nodeID}, &out)
+	return out.Trims, err
+}
+
+// RecordTrim records how a trim this controller made went.
+func (c *Client) RecordTrim(ctx context.Context, nodeID string, done store.TrimDone) error {
+	return c.call(ctx, "record-trim", map[string]any{"node_id": nodeID, "done": done}, nil)
+}
+
 // ScratchToSettle asks for this executor's scratch to delete or keep now.
 func (c *Client) ScratchToSettle(ctx context.Context, executorID string) ([]store.ScratchSettlement, error) {
 	var out struct {

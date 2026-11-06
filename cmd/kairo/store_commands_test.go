@@ -13,7 +13,8 @@ func TestStoreStatusPrintsStoresAndKeptScratch(t *testing.T) {
 	gib := func(n int64) *int64 { v := n << 30; return &v }
 	problem, kept, reason, since := "root E:/kairo is not on filesystem E:", "2026-11-03T01:02:03Z", "exit 1", "2026-11-03T04:05:06Z"
 	stores := []store.StoreStatus{
-		{Store: machine.Store{ID: "e-durable", Class: "durable", Node: "win", Root: "E:/kairo", Filesystem: "E:"}, State: "unusable", Problem: &problem, Kept: []store.KeptScratch{}},
+		{Store: machine.Store{ID: "e-durable", Class: "durable", Node: "win", Root: "E:/kairo", Filesystem: "E:"}, State: "unusable", Problem: &problem, Kept: []store.KeptScratch{},
+			CopyBytes: 6 << 30, Copies: 3, Damaged: []store.DamagedCopy{{ObjectID: "obj_9", Path: "E:/kairo/objects/202611/obj_9.tar.zst", Problem: "read back as 9 bytes", CheckedAt: since}}},
 		{Store: machine.Store{ID: "pool", Class: "volatile", Node: "pve0", Root: "/srv/kairo", Filesystem: "/"}, State: "ready",
 			TotalBytes: gib(300), FreeBytes: gib(100), ScratchActiveBytes: 2 << 30, ScratchKeptBytes: 1 << 30, OutputBytes: 3 << 30, Outputs: 2, ExternalBytes: gib(194),
 			Kept:    []store.KeptScratch{{AttemptID: "att_1", ExecutionID: "exe_1", Task: "neo/train/run", Path: "/srv/kairo/scratch/att_1", Bytes: gib(1), KeptAt: &kept, Reason: &reason}},
@@ -33,9 +34,12 @@ func TestStoreStatusPrintsStoresAndKeptScratch(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"STORE      CLASS     NODE            STATE     ROOT            FILESYSTEM  TOTAL    FREE     ACTIVE  KEPT   OUTPUTS    PACKS  PINNED  CACHE  EXTERNAL",
-		"pool       volatile  pve0            ready     /srv/kairo      /           300 GiB  100 GiB  2 GiB   1 GiB  3 GiB (2)  0 B    0 B     0 B    194 GiB",
-		"wsl        volatile  win/ubuntu-wsl  unknown   /var/tmp/kairo  D:          -        -        0 B     0 B    0 B        0 B    0 B     0 B    -",
+		"STORE      CLASS     NODE            STATE     ROOT            FILESYSTEM  TOTAL    FREE     ACTIVE  KEPT   OUTPUTS    PACKS  COPIES     PINNED  CACHE  EXTERNAL",
+		"e-durable  durable   win             unusable  E:/kairo        E:          -        -        0 B     0 B    0 B        0 B    6 GiB (3)  0 B     0 B    -",
+		"pool       volatile  pve0            ready     /srv/kairo      /           300 GiB  100 GiB  2 GiB   1 GiB  3 GiB (2)  0 B    0 B        0 B     0 B    194 GiB",
+		"wsl        volatile  win/ubuntu-wsl  unknown   /var/tmp/kairo  D:          -        -        0 B     0 B    0 B        0 B    0 B        0 B     0 B    -",
+		"damaged copies on e-durable (read back unlike their pack; nothing was deleted):",
+		"obj_9   2026-11-03T04:05:06Z  E:/kairo/objects/202611/obj_9.tar.zst  read back as 9 bytes",
 		"e-durable: root E:/kairo is not on filesystem E:",
 		"kept scratch on pool:",
 		"att_1    neo/train/run  1 GiB  2026-11-03T01:02:03Z  exit 1  /srv/kairo/scratch/att_1",

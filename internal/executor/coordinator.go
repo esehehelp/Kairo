@@ -45,6 +45,10 @@ type Coordinator interface {
 	CopiesToMake(ctx context.Context, executorID string) ([]store.CopyOrder, error)
 	RecordCopy(ctx context.Context, made store.CopyMade) error
 	AuthorizePackRead(ctx context.Context, nodeID, objectID, token string) (store.PackRead, error)
+	DeletionsToMake(ctx context.Context, executorID string) ([]store.DeletionOrder, error)
+	SettleDeletion(ctx context.Context, settled store.ObjectDeletion) error
+	ScrubsToMake(ctx context.Context, executorID string) ([]store.ScrubOrder, error)
+	RecordScrub(ctx context.Context, result store.ScrubResult) error
 }
 
 var _ Coordinator = (*store.Store)(nil)

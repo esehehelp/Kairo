@@ -71,6 +71,14 @@ type agentRecordCopyRequest struct {
 	Made store.CopyMade `json:"made"`
 }
 
+type agentSettleDeletionRequest struct {
+	Settled store.ObjectDeletion `json:"settled"`
+}
+
+type agentRecordScrubRequest struct {
+	Result store.ScrubResult `json:"result"`
+}
+
 type agentPackReadRequest struct {
 	NodeID   string `json:"node_id"`
 	ObjectID string `json:"object_id"`
@@ -307,6 +315,31 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentRecordCopyRequest) (any, error) {
 				return okBody, s.Store.RecordCopy(ctx, b.Made)
+			}),
+		// An observe-only daemon orders no deletion and no read back.
+		newAgentOp(s, "deletions-to-make", observeEmpty, map[string]any{"deletions": []store.DeletionOrder{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				deletions, err := s.Store.DeletionsToMake(ctx, b.ExecutorID)
+				return map[string]any{"deletions": deletions}, err
+			}),
+		newAgentOp(s, "settle-deletion", observeRefused, nil,
+			func(ctx context.Context, b agentSettleDeletionRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.Settled.ExecutorID)
+			},
+			func(ctx context.Context, b agentSettleDeletionRequest) (any, error) {
+				return okBody, s.Store.SettleDeletion(ctx, b.Settled)
+			}),
+		newAgentOp(s, "scrubs-to-make", observeEmpty, map[string]any{"scrubs": []store.ScrubOrder{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				scrubs, err := s.Store.ScrubsToMake(ctx, b.ExecutorID)
+				return map[string]any{"scrubs": scrubs}, err
+			}),
+		newAgentOp(s, "record-scrub", observeRefused, nil,
+			func(ctx context.Context, b agentRecordScrubRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.Result.ExecutorID)
+			},
+			func(ctx context.Context, b agentRecordScrubRequest) (any, error) {
+				return okBody, s.Store.RecordScrub(ctx, b.Result)
 			}),
 		// The agent of a pack's node asks before handing it over.
 		newAgentOp(s, "pack-read", observeRefused, nil,

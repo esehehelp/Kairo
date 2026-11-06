@@ -493,7 +493,9 @@ labels may take what is placed there.
   `[scheduler] disk_min_free_bytes` of the daemon configuration (default
   5 GiB, at most 5% of the filesystem; `0` turns it off) admits nothing until
   space is freed. Each such filesystem is kept in `node_alerts` and announced
-  by the events `disk_low_watermark` and `disk_watermark_cleared`.
+  by the events `disk_low_watermark` and `disk_watermark_cleared`. (`[data]`
+  of the same configuration sets how durable copies are read back: Data
+  stores.)
 
 Every waiting execution's latest reason is kept: `task show` prints it under
 `waiting:` (for example `gpu_leased: pve0: 1 GPU(s) of >= 11.0 GiB needed, 0
@@ -713,7 +715,10 @@ of maximum performance its devices may give up for efficiency, in [0, 0.5)
 declared for one of its nodes and `cpu` (its CPU packages); a GPU whose nodes
 are on two hosts is an error. `[[hosts.devices]]` overrides `max_slowdown` or
 sets `control = false` (never changed, never benched) for one device, a GPU
-UUID or `cpu`, listed once. Host nodes and controllers must be known nodes
+UUID or `cpu`, listed once. `containers` maps those of its nodes that are
+Proxmox containers to their vmid (`containers = { pve0-neo-train = 101 }`):
+after Kairo deletes something on one, the host's controller trims it (Data
+stores), so it needs a controller, and a vmid is one node's. Host nodes and controllers must be known nodes
 (a controller registers its node when it starts), and a controller controls
 one host. What a device is, how fast it clocks and how much power it draws is
 observed by providers and measured by benches, never declared. A host is
@@ -813,10 +818,12 @@ declared but still holding kept scratch), the filesystem's total and free,
 Kairo's bytes by class (`scratch_active_bytes`, `scratch_kept_bytes`,
 `output_bytes` with the number of `outputs`, the run output directories as
 the last report found them, shown as `OUTPUTS`, `pack_bytes` with the number
-of `packs`, shown as `PACKS`, and `pinned_bytes` and
-`cache_bytes`, both 0 until later P1b steps and P1c) and
+of `packs` made there and not deleted yet, shown as `PACKS`, `copy_bytes`
+with the number of verified `copies` on a durable store, shown as `COPIES`,
+and `pinned_bytes` and `cache_bytes`, both 0 until P1c) and
 `external_bytes`, what the filesystem uses that Kairo does not know (used
-minus Kairo's classes), then the kept scratch of each store. The latest
+minus Kairo's classes), then the kept scratch of each store and the
+`damaged` copies of each durable store. The latest
 report of a store is the table `store_observations`. An agent older than
 stores leaves its stores `unknown`; a daemon older than stores answers the
 agent's `stores` with 404, and the agent runs without stores (warned once).
@@ -863,9 +870,9 @@ recorded, the attempt starts without it (a directory made but not recorded is
 left as it is and counted). Reports measure each output directory (at every
 report while an attempt of its run runs on that executor, else once per agent
 process), and one a whole scan no longer finds is `missing` until found
-again. Nothing deletes an output directory yet: moving its pack (below) to a
-durable store and deleting it are the next P1b steps. A daemon older than
-output directories gives no run, and the attempt gets none.
+again. Once its run has ended it is packed, copied to a durable store and
+then deleted (below). A daemon older than output directories gives no run,
+and the attempt gets none.
 
 Packing: what Kairo keeps is packed where it was written, once nothing writes
 there any more. A run's output directory is due once the run has ended (its
@@ -922,8 +929,42 @@ daemon checks again. A copy that does not match has its `.partial` files
 removed (Kairo's own incomplete writes, the only thing it ever deletes on a
 durable store) and is fetched again at the next round; one renamed but not
 recorded is read back as it is. A durable store inside a WSL distro gets no
-copies yet. Deleting what was packed, once its copy is verified, is the next
-P1b step.
+copies yet.
+
+Deleting what was copied: once an object's copy is verified, the executor
+that packed it deletes its source, the run's output directory or the kept
+scratch, and the pack and file list made of it (`deletions-to-make` every
+minute, `settle-deletion`; events `source_deleted`, `source_kept`), by the
+scratch's rules below (the directory derived from the root, its kind and its
+id, its marker naming it, nothing reached through a link), and only while the
+declaration still makes the directory Kairo's. It first claims the deletion
+(`deleting`, taken only while there is a verified copy and the declaration
+says so); until it is settled `deleted`, or `kept` when the deletion is
+refused for safety (with why; it is not tried again), `kairo machine apply`
+refuses a declaration under which the directory would not be Kairo's. A
+deleted output directory or scratch is marked `deleted` and no longer counted.
+
+Reading durable copies back: a durable store keeps for good and may lose bits
+without saying so (exFAT has no journal), so an executor serving it reads
+each verified copy back in full, around the cache (`scrubs-to-make` every 10
+minutes, `record-scrub`), once `[data] scrub_interval` (daemon configuration,
+a Go duration, default `168h`) has passed since it was last read or verified,
+oldest first, at most `scrub_bytes_per_day` bytes a store a day (default 200
+GiB; one copy bigger than that is read on its own once a day). One that is
+gone, cannot be read whole, or no longer matches its pack's size and sha256
+is marked damaged (event `copy_damaged`) and listed by `kairo store status`
+under "damaged copies"; nothing is deleted or copied over it. A store whose
+objects directory is not there at all (a drive away) is left for later.
+
+Trimming containers: what is deleted inside a Proxmox container goes back to
+the host's thin pool only once it is trimmed. A deletion on a node asks for
+it (table `node_trims`, with the bytes deleted since the last trim); the
+controller of a host whose `containers` lists that node trims it
+(`trims-to-make` every 5 minutes, `pct fstrim <vmid>` with an hour's
+timeout, one container at a time, in the background so device settings are
+kept meanwhile; `record-trim`; events `node_trimmed`, `node_trim_failed`), at
+most once an hour per container. A node that is no listed container is not
+trimmed.
 
 Once the attempt has quiesced, or was lost, its executor settles the scratch
 (`scratch-to-settle` every 10 seconds, with an `action` for each:
@@ -947,9 +988,9 @@ never comes back, the conflict stays until the row is settled by hand. An
 observe-only daemon gives agents no stores (`stores` answers an empty list)
 and no scratch to settle, so they make no root and no scratch and delete
 nothing.
-Kept scratch stays where it is (moving it to a durable store comes with
-P1b) and is listed by `kairo store status` with its task, size and reason;
-nothing deletes it in P1a but an operator. Deleting is done by the executor
+Kept scratch is listed by `kairo store status` with its task, size and
+reason until it is packed, copied to a durable store and deleted (above); a
+lost attempt's waits for its reconciliation. Deleting is done by the executor
 itself, never by `os.RemoveAll` or `rm -rf` on a path it was given: the path
 must be exactly the recorded `<root>/scratch/<attempt id>` of an absolute
 root (anything else is refused), the root's path may hold no link, neither

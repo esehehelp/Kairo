@@ -227,13 +227,18 @@ type StoreStatus struct {
 	// found them; Outputs counts the recorded ones there now.
 	OutputBytes int64 `json:"output_bytes"`
 	Outputs     int   `json:"outputs"`
-	// PackBytes are the packs made on the store (data objects packed there,
-	// not moved yet); Packs counts them.
-	PackBytes     int64         `json:"pack_bytes"`
-	Packs         int           `json:"packs"`
+	// PackBytes are the packs made on the store and still there (their
+	// source not deleted yet); Packs counts them.
+	PackBytes int64 `json:"pack_bytes"`
+	Packs     int   `json:"packs"`
+	// CopyBytes are the verified copies on a durable store; Copies counts
+	// them; Damaged lists those that did not read back as their pack.
+	CopyBytes     int64         `json:"copy_bytes"`
+	Copies        int           `json:"copies"`
 	ExternalBytes *int64        `json:"external_bytes,omitempty"`
 	Kept          []KeptScratch `json:"kept"`
 	Missing       []KeptScratch `json:"missing"`
+	Damaged       []DamagedCopy `json:"damaged"`
 }
 
 // ListStoreStatus is every declared store with its latest observation and
@@ -257,7 +262,7 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 		return len(out) - 1
 	}
 	for _, d := range declared {
-		add(StoreStatus{Store: d, State: "unknown", Kept: []KeptScratch{}, Missing: []KeptScratch{}})
+		add(StoreStatus{Store: d, State: "unknown", Kept: []KeptScratch{}, Missing: []KeptScratch{}, Damaged: []DamagedCopy{}})
 	}
 	err = eachRow(ctx, tx, `SELECT store_id,COALESCE(SUM(bytes) FILTER (WHERE state IN('active','deleting')),0)::bigint,COALESCE(SUM(bytes) FILTER (WHERE state='kept'),0)::bigint
 		FROM attempt_scratch GROUP BY store_id`, nil, func(rows *sql.Rows) error {
@@ -275,7 +280,37 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 		return nil, err
 	}
 	stamp := time.Now().UTC()
-	err = eachRow(ctx, tx, `SELECT store_id,COUNT(*),COALESCE(SUM(pack_bytes),0)::bigint FROM data_objects WHERE state='packed' GROUP BY store_id`, nil, func(rows *sql.Rows) error {
+	err = eachRow(ctx, tx, `SELECT c.store_id,COUNT(*),COALESCE(SUM(o.pack_bytes),0)::bigint FROM object_copies c JOIN data_objects o ON o.id=c.object_id
+		WHERE c.state='verified' GROUP BY c.store_id`, nil, func(rows *sql.Rows) error {
+		var storeID string
+		var n int
+		var bytes int64
+		if err := rows.Scan(&storeID, &n, &bytes); err != nil {
+			return err
+		}
+		if i, ok := index[storeID]; ok {
+			out[i].Copies, out[i].CopyBytes = n, bytes
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = eachRow(ctx, tx, `SELECT store_id,object_id,COALESCE(path,''),check_problem,checked_at FROM object_copies WHERE check_problem IS NOT NULL ORDER BY store_id,checked_at,object_id`, nil, func(rows *sql.Rows) error {
+		var storeID string
+		var d DamagedCopy
+		if err := rows.Scan(&storeID, &d.ObjectID, &d.Path, &d.Problem, &d.CheckedAt); err != nil {
+			return err
+		}
+		if i, ok := index[storeID]; ok {
+			out[i].Damaged = append(out[i].Damaged, d)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = eachRow(ctx, tx, `SELECT store_id,COUNT(*),COALESCE(SUM(pack_bytes),0)::bigint FROM data_objects WHERE state='packed' AND source_state<>'deleted' GROUP BY store_id`, nil, func(rows *sql.Rows) error {
 		var storeID string
 		var n int
 		var bytes int64
@@ -331,7 +366,7 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 		st.ScratchKeptBytes += unrecorded
 		st.PinnedBytes, st.CacheBytes, st.OutputBytes = pinned, cache, outputs
 		if total.Valid && free.Valid {
-			external := max(0, total.Int64-free.Int64-st.ScratchActiveBytes-st.ScratchKeptBytes-pinned-cache-outputs-st.PackBytes)
+			external := max(0, total.Int64-free.Int64-st.ScratchActiveBytes-st.ScratchKeptBytes-pinned-cache-outputs-st.PackBytes-st.CopyBytes)
 			st.ExternalBytes = &external
 		}
 		switch at, parseErr := time.Parse(time.RFC3339Nano, observedAt); {
@@ -373,7 +408,7 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 		}
 		i, ok := index[storeID]
 		if !ok {
-			i = add(StoreStatus{Store: machine.Store{ID: storeID}, State: "undeclared", Kept: []KeptScratch{}, Missing: []KeptScratch{}})
+			i = add(StoreStatus{Store: machine.Store{ID: storeID}, State: "undeclared", Kept: []KeptScratch{}, Missing: []KeptScratch{}, Damaged: []DamagedCopy{}})
 		}
 		if state == "missing" {
 			out[i].Missing = append(out[i].Missing, k)

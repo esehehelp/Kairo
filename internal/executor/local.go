@@ -135,6 +135,10 @@ type Local struct {
 	copying      bool
 	copyProblems map[string]string
 
+	// Deleting copied sources and reading durable copies back (retire.go).
+	deletions round
+	scrubs    round
+
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
 	trees              map[string]*treeHandle
@@ -243,6 +247,8 @@ func (e *Local) tick(ctx context.Context) error {
 	e.settleScratch()
 	e.makePacks()
 	e.makeCopies()
+	e.makeDeletions()
+	e.makeScrubs()
 	e.endStep()
 	for {
 		reservation, err := e.reserveNext(ctx)

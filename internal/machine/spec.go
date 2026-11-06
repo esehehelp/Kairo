@@ -150,6 +150,10 @@ type Host struct {
 	Controller  string   `toml:"controller" json:"controller,omitempty"`
 	MaxSlowdown float64  `toml:"max_slowdown" json:"max_slowdown,omitempty"`
 	Devices     []Device `toml:"devices" json:"devices,omitempty"`
+	// Containers maps a node of the host that is a Proxmox container to its
+	// vmid: after Kairo deletes on that node, the host's controller trims it
+	// (pct fstrim), so what was deleted goes back to the host's thin pool.
+	Containers map[string]int `toml:"containers" json:"containers,omitempty"`
 }
 
 // Device overrides the host's policy for one of its devices: a GPU UUID, or
@@ -242,6 +246,21 @@ func (s Spec) validateHosts() error {
 		}
 		if err := checkSlowdown(host.MaxSlowdown); err != nil {
 			return fmt.Errorf("host %s: %w", host.ID, err)
+		}
+		vmids := map[int]string{}
+		for _, node := range slices.Sorted(maps.Keys(host.Containers)) {
+			vmid := host.Containers[node]
+			switch {
+			case !slices.Contains(host.Nodes, node):
+				return fmt.Errorf("host %s: container %s is not one of its nodes", host.ID, node)
+			case vmid <= 0:
+				return fmt.Errorf("host %s: container %s has vmid %d", host.ID, node, vmid)
+			case vmids[vmid] != "":
+				return fmt.Errorf("host %s: nodes %s and %s are both container %d", host.ID, vmids[vmid], node, vmid)
+			case host.Controller == "":
+				return fmt.Errorf("host %s lists containers but no controller to trim them", host.ID)
+			}
+			vmids[vmid] = node
 		}
 	}
 	gpuHost := map[string]string{}

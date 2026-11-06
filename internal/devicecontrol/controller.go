@@ -92,8 +92,11 @@ type Controller struct {
 	// CPUMeter reads the host's CPU package power, reported at every poll to
 	// a Daemon that is a SampleReporter (nil: not read).
 	CPUMeter cpupower.Meter
-	Now      func() time.Time
-	Logger   *slog.Logger
+	// Trimmer trims a Proxmox container of the host (trim.go; nil:
+	// PctFstrim).
+	Trimmer func(ctx context.Context, vmid int) (string, error)
+	Now     func() time.Time
+	Logger  *slog.Logger
 
 	devices     map[deviceKey]*device
 	registered  bool
@@ -103,6 +106,10 @@ type Controller struct {
 	lossReset        bool
 	// powerSkipped: the daemon skipped the latest power sample (logged once).
 	powerSkipped bool
+	// trims is the trimming round's state; trimSync runs a round within the
+	// poll (tests).
+	trims    trimState
+	trimSync bool
 }
 
 type deviceKey struct{ host, id string }
@@ -216,6 +223,7 @@ func (c *Controller) Step(ctx context.Context) {
 	}
 	c.flush(ctx)
 	c.reportPower(ctx)
+	c.trim(ctx)
 }
 
 // reportPower sends the host's CPU package power since the previous poll. A

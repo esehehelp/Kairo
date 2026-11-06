@@ -80,6 +80,11 @@ type controllerReportRequest struct {
 	Reports []store.DeviceReport `json:"reports"`
 }
 
+type controllerTrimRequest struct {
+	NodeID string         `json:"node_id"`
+	Done   store.TrimDone `json:"done"`
+}
+
 type controllerSamplesRequest struct {
 	NodeID  string                   `json:"node_id"`
 	Samples []store.ControllerSample `json:"samples"`
@@ -109,6 +114,18 @@ func (s *Server) controllerOps() []agentOp {
 			func(ctx context.Context, b controllerReportRequest) (any, error) {
 				skipped, err := s.Store.ReportDevices(ctx, b.NodeID, b.Reports)
 				return map[string]any{"skipped": skipped}, err
+			}),
+		// An observe-only daemon deletes nothing, so asks for no trim.
+		newAgentOp(s, "trims-to-make", observeEmpty, map[string]any{"trims": []store.TrimOrder{}},
+			func(_ context.Context, b controllerPollRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b controllerPollRequest) (any, error) {
+				trims, err := s.Store.TrimsToMake(ctx, b.NodeID)
+				return map[string]any{"trims": trims}, err
+			}),
+		newAgentOp(s, "record-trim", observeRefused, nil,
+			func(_ context.Context, b controllerTrimRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b controllerTrimRequest) (any, error) {
+				return okBody, s.Store.RecordTrim(ctx, b.NodeID, b.Done)
 			}),
 		// What the controller reads of its host (the CPU package's power) is
 		// observation, recorded by an observe-only daemon too.

@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/BurntSushi/toml"
 )
@@ -36,6 +37,7 @@ type Config struct {
 	// InsecureHTTP allows plain HTTP on an address other hosts can reach.
 	InsecureHTTP bool       `toml:"insecure_http"`
 	Scheduler    Scheduler  `toml:"scheduler"`
+	Data         Data       `toml:"data"`
 	Node         Node       `toml:"node"`
 	Bench        Bench      `toml:"bench"`
 	Executors    []Executor `toml:"executors"`
@@ -171,6 +173,26 @@ type Scheduler struct {
 	DiskMinFreeBytes *int64 `toml:"disk_min_free_bytes"`
 }
 
+// Data holds the data settings: how often each verified copy on a durable
+// store is read back ("168h" by default, a Go duration) and how many bytes a
+// durable store reads back a day at most (200 GiB by default).
+type Data struct {
+	ScrubInterval    string `toml:"scrub_interval"`
+	ScrubBytesPerDay int64  `toml:"scrub_bytes_per_day"`
+}
+
+// ScrubEvery is ScrubInterval parsed (0: not set).
+func (d Data) ScrubEvery() (time.Duration, error) {
+	if d.ScrubInterval == "" {
+		return 0, nil
+	}
+	every, err := time.ParseDuration(d.ScrubInterval)
+	if err != nil || every <= 0 {
+		return 0, fmt.Errorf("data.scrub_interval %q is not a positive duration such as \"168h\"", d.ScrubInterval)
+	}
+	return every, nil
+}
+
 type Node struct {
 	ID           string            `toml:"id"`
 	Name         string            `toml:"name"`
@@ -207,6 +229,12 @@ func Load(path string) (Config, error) {
 	defaults(&c)
 	if c.LogMinFreeMiB < 0 {
 		return c, errors.New("log_min_free_mib must not be negative")
+	}
+	if _, err := c.Data.ScrubEvery(); err != nil {
+		return c, err
+	}
+	if c.Data.ScrubBytesPerDay < 0 {
+		return c, errors.New("data.scrub_bytes_per_day must not be negative")
 	}
 	// [node] names the control node itself. Executors and providers are
 	// optional: a control-only daemon runs no jobs, and every job host runs

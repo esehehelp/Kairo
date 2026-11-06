@@ -57,7 +57,7 @@ func formatStores(stores []store.StoreStatus) string {
 	}
 	var b strings.Builder
 	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "STORE\tCLASS\tNODE\tSTATE\tROOT\tFILESYSTEM\tTOTAL\tFREE\tACTIVE\tKEPT\tOUTPUTS\tPACKS\tPINNED\tCACHE\tEXTERNAL")
+	fmt.Fprintln(w, "STORE\tCLASS\tNODE\tSTATE\tROOT\tFILESYSTEM\tTOTAL\tFREE\tACTIVE\tKEPT\tOUTPUTS\tPACKS\tCOPIES\tPINNED\tCACHE\tEXTERNAL")
 	counted := func(bytes int64, n int) string {
 		if n > 0 {
 			return fmt.Sprintf("%s (%d)", formatSize(bytes), n)
@@ -65,9 +65,9 @@ func formatStores(stores []store.StoreStatus) string {
 		return formatSize(bytes)
 	}
 	for _, s := range stores {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, dash(s.Class), dash(storeNodeLabel(s)), s.State, dash(s.Root), dash(s.Filesystem),
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, dash(s.Class), dash(storeNodeLabel(s)), s.State, dash(s.Root), dash(s.Filesystem),
 			optionalSize(s.TotalBytes), optionalSize(s.FreeBytes), formatSize(s.ScratchActiveBytes), formatSize(s.ScratchKeptBytes), counted(s.OutputBytes, s.Outputs),
-			counted(s.PackBytes, s.Packs), formatSize(s.PinnedBytes), formatSize(s.CacheBytes), optionalSize(s.ExternalBytes))
+			counted(s.PackBytes, s.Packs), counted(s.CopyBytes, s.Copies), formatSize(s.PinnedBytes), formatSize(s.CacheBytes), optionalSize(s.ExternalBytes))
 	}
 	w.Flush()
 	for _, s := range stores {
@@ -107,6 +107,18 @@ func formatStores(stores []store.StoreStatus) string {
 				since = *k.MissingAt
 			}
 			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", k.AttemptID, dash(k.Task), since, k.Path)
+		}
+		w.Flush()
+	}
+	for _, s := range stores {
+		if len(s.Damaged) == 0 {
+			continue
+		}
+		fmt.Fprintf(&b, "\ndamaged copies on %s (read back unlike their pack; nothing was deleted):\n", s.ID)
+		w = tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(w, "  OBJECT\tCHECKED\tPATH\tPROBLEM")
+		for _, d := range s.Damaged {
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\n", d.ObjectID, d.CheckedAt, d.Path, d.Problem)
 		}
 		w.Flush()
 	}
