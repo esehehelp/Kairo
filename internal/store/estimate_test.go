@@ -1,6 +1,8 @@
 package store
 
 import (
+	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -137,4 +139,111 @@ func TestPlannerExpectsAnOverrunningRunToTakeAsLongAgain(t *testing.T) {
 	}
 	eval := c.submit(planSpec("eval-2", "p3", 5, 1, 1000, 1))
 	c.expectReserved("exec-a", eval)
+}
+
+// ranUsing records a run like ran whose attempt was seen to use ram bytes.
+func (c *planCluster) ranUsing(spec ExecutionSpec, d time.Duration, ram int64) {
+	c.t.Helper()
+	c.submit(spec)
+	launch := c.start("exec-a")
+	if err := c.store.RecordAttemptUsage(c.ctx, launch.Attempt.ID, &ram, nil); err != nil {
+		c.t.Fatal(err)
+	}
+	epoch := launch.Lease.CoordinationEpoch
+	if err := c.store.RecordTerminal(c.ctx, launch.Attempt.ID, launch.Lease.ID, epoch, 0, ""); err != nil {
+		c.t.Fatal(err)
+	}
+	if err := c.store.FinalizeQuiescence(c.ctx, launch.Attempt.ID, launch.Lease.ID, epoch); err != nil {
+		c.t.Fatal(err)
+	}
+	end := time.Now().UTC()
+	c.setAttemptTimes(launch.Attempt.ID, end.Add(-d), end)
+}
+
+// A running lease's RAM reservation counts up to what runs like it were seen
+// to take (half again, plus 512 MiB), once three such runs were sampled and
+// its own use is known now: one that reserved 8 GiB and whose like took
+// 300 MiB leaves the rest to others. With two runs, or its use not known,
+// it counts in full.
+func TestPlannerCountsRAMUpToWhatRunsLikeItTook(t *testing.T) {
+	run := func(t *testing.T, history int, sampled bool) (*planCluster, ExecutionRequest) {
+		c := newPlanCluster(t)
+		c.node("a", 0, 16000, 64, 500)
+		for i := 1; i <= history; i++ {
+			c.ranUsing(planSpec(fmt.Sprintf("compress-%d", i), "p1", 0, 0, 1000, 8), time.Minute, 300<<20)
+		}
+		c.submit(planSpec("compress-9", "p1", 0, 0, 1000, 8))
+		running := c.start("exec-a")
+		if sampled {
+			used := int64(100 << 20)
+			if err := c.store.RecordAttemptUsage(c.ctx, running.Attempt.ID, &used, nil); err != nil {
+				t.Fatal(err)
+			}
+		}
+		c.observe("a-ram", 64*gib, 10*gib)
+		// 10 GiB free: 9 GiB fits once compress-9 counts ~1 GiB, not 8
+		return c, c.submit(planSpec("other", "p2", 0, 0, 1000, 9))
+	}
+	t.Run("three runs like it", func(t *testing.T) {
+		c, other := run(t, 3, true)
+		c.expectReserved("exec-a", other)
+	})
+	for _, tc := range []struct {
+		name    string
+		history int
+		sampled bool
+	}{{"two runs like it", 2, true}, {"its use not known", 3, false}} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, other := run(t, tc.history, tc.sampled)
+			if r := c.reserve("exec-a"); r != nil {
+				t.Fatalf("reserved %s", r.Execution.ClientRequestID)
+			}
+			if w := c.wait(other.ID); w.Reason != "insufficient_ram" {
+				t.Fatalf("other waits for %+v", w)
+			}
+		})
+	}
+}
+
+func TestExpectedRAMNeedsThreeRunsOfASpecificKey(t *testing.T) {
+	keys := estimateKeys("p", "q", "compress-4", []string{"run", "compress-4"})
+	h := &runHistory{ram: map[string][]int64{keys[2]: {1 << 30, 2 << 30}, keys[3]: {1 << 20, 1 << 20, 1 << 20}}}
+	if got, ok := h.expectedRAM(keys); ok {
+		t.Fatalf("from two runs, or a queue's: %d", got)
+	}
+	h.ram[keys[2]] = append(h.ram[keys[2]], 1<<29)
+	if got, ok := h.expectedRAM(keys); !ok || got != 3<<30+ramHeadroom {
+		t.Fatalf("expected %d %v, want %d", got, ok, 3<<30+ramHeadroom)
+	}
+}
+
+// A task's attempts carry the most RAM they were seen to use.
+func TestTaskDetailShowsTheRAMAnAttemptWasSeenToUse(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	if _, err := store.ApplyProject(ctx, projectSpec(t, orchestrationManifest())); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileProjectTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	launch := launchNext(t, store)
+	detail, err := store.GetTaskDetail(ctx, "orchestrated", "prepare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := detail.Executions[0].Attempts[0].RAMPeakBytes; got != nil {
+		t.Fatalf("ram peak before any sample: %d", *got)
+	}
+	used := int64(300 << 20)
+	if err := store.RecordAttemptUsage(ctx, launch.Attempt.ID, &used, nil); err != nil {
+		t.Fatal(err)
+	}
+	if detail, err = store.GetTaskDetail(ctx, "orchestrated", "prepare"); err != nil {
+		t.Fatal(err)
+	}
+	if got := detail.Executions[0].Attempts[0].RAMPeakBytes; got == nil || *got != used {
+		t.Fatalf("ram peak %v", got)
+	}
 }

@@ -7,11 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"kairo/internal/buildinfo"
 	"kairo/internal/store"
@@ -31,6 +33,10 @@ type Server struct {
 	ObserveOnly bool
 	// LogDirectory receives attempt logs shipped by node agents.
 	LogDirectory string
+	// SlowRequest: a request that takes this long or longer is logged at
+	// WARN (timed; 0 is 2 s). Logger receives it (nil: slog's default).
+	SlowRequest time.Duration
+	Logger      *slog.Logger
 
 	logMu sync.Mutex
 	// logDirMu guards logDir, the log directory resolved once it exists.
@@ -47,7 +53,8 @@ var (
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	for _, rt := range s.routes() {
-		mux.HandleFunc(rt.method+" "+rt.pattern, s.authorize(rt.role, rt.handler))
+		pattern := rt.method + " " + rt.pattern
+		mux.HandleFunc(pattern, s.timed(pattern, s.authorize(rt.role, rt.handler)))
 	}
 	return mux
 }

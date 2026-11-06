@@ -302,6 +302,9 @@ type AttemptDetail struct {
 	// Energy is what the GPUs of its lease used while it ran, once a sample
 	// of them has counted for it.
 	Energy *AttemptEnergy `json:"energy,omitempty"`
+	// RAMPeakBytes is the most RAM its processes were seen to use (sampled by
+	// its executor every 15 s: a short peak between samples is missed).
+	RAMPeakBytes *int64 `json:"ram_peak_bytes,omitempty"`
 }
 
 type TaskGangRank struct {
@@ -425,13 +428,15 @@ func (s *Store) taskRefs(ctx context.Context, query, taskScopeID string) ([]Task
 // taskAttemptDetails lists the attempts of a task's executions by execution.
 func (s *Store) taskAttemptDetails(ctx context.Context, taskScopeID string) (map[string][]AttemptDetail, error) {
 	out := map[string][]AttemptDetail{}
-	err := eachRow(ctx, s.db, `SELECT x.node_id,`+attemptColumns+` FROM orchestration_task_executions te JOIN attempts a ON a.execution_id=te.execution_id LEFT JOIN executors x ON x.id=a.executor_id WHERE te.task_scope_id=$1 ORDER BY COALESCE(a.authorized_at,a.started_at) NULLS FIRST,a.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
+	err := eachRow(ctx, s.db, `SELECT x.node_id,u.ram_bytes,`+attemptColumns+` FROM orchestration_task_executions te JOIN attempts a ON a.execution_id=te.execution_id LEFT JOIN executors x ON x.id=a.executor_id
+		LEFT JOIN attempt_usage u ON u.attempt_id=a.id WHERE te.task_scope_id=$1 ORDER BY COALESCE(a.authorized_at,a.started_at) NULLS FIRST,a.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var nodeID *string
-		v, err := scanAttempt(rows, &nodeID)
+		var ram *int64
+		v, err := scanAttempt(rows, &nodeID, &ram)
 		if err != nil {
 			return err
 		}
-		out[v.ExecutionID] = append(out[v.ExecutionID], AttemptDetail{AttemptView: v, NodeID: nodeID})
+		out[v.ExecutionID] = append(out[v.ExecutionID], AttemptDetail{AttemptView: v, NodeID: nodeID, RAMPeakBytes: ram})
 		return nil
 	})
 	return out, err

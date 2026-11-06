@@ -183,7 +183,7 @@ be left out of task commands for Tasks declared by a ProjectSpec.
 | Command | What it prints |
 |---|---|
 | `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress or pause) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
-| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, log paths and sizes, log issues, the energy its GPUs used (`energy: GPU 1.23 kWh (partial)`), gang ranks, and why a waiting execution waits |
+| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, log paths and sizes, log issues, the energy its GPUs used (`energy: GPU 1.23 kWh (partial)`), the most RAM its processes were seen to use beside what it reserved (`ram: peak 9.0 GiB seen (sampled every 15 s)`), gang ranks, and why a waiting execution waits |
 | `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | the last N lines (default 50, `0` all) of the latest attempt's logs, also for attempts on agent nodes; `-f` follows until the attempt has exited and its logs stopped growing |
 | `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | one line per state change (`10:01:33 hello running -> succeeded`), `DOWN`/`UP` while the daemon is unreachable, `STALL` when a running Task's logs stop growing for D; exits 0 when all succeeded (or started), 1 when one ended otherwise, 2 on timeout, 3 on a usage or lookup error |
 | `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | state changes, progress (once a minute per Task) and a summary every 10 min; with `--exit-when-idle` it exits when nothing is pending or running (1 if a watched Task did not succeed) |
@@ -328,6 +328,12 @@ trusts (`ca_file`). Every executor of the agent outside a WSL distro then
 advertises `pack_addr` among its attributes.
 
 ## API
+
+A request that takes 2 s or longer is logged by the daemon at WARN (`slow
+request`, with its route pattern, never its path or headers, so no id or
+token; its status, seconds and remote address): the SDK gives up on a
+request after 10 s, so this is where a daemon too slow for its attempts
+shows.
 
 | Method | Path | Role |
 |---|---|---|
@@ -478,7 +484,16 @@ labels may take what is placed there.
   the lesser of total minus reservations and observed free memory minus the
   part of each reservation its attempt does not use yet (what an attempt
   uses, sampled by its executor, counts for two minutes; without a sample the
-  whole reservation counts). Disk is observed free space minus every
+  whole reservation counts). A reservation counts only up to what runs like
+  it were seen to take, when three of them succeeded with their use sampled:
+  the most their attempts used, of the latest five runs sharing its most
+  specific run-time estimate key (program, subcommand and config; program and
+  subcommand; or its Task name with digits masked; never a whole queue or
+  project), half again plus 512 MiB, and never less than its attempt uses
+  now. A declaration written large (8 GiB for work that took 300 MiB) thus
+  stops holding memory it never uses, while one its like really used (16 GiB
+  for work that took 10.7 GiB) still counts in full; samples are 15 s apart,
+  which the headroom is for. Disk is observed free space minus every
   reservation on it: bytes written overstate what stays on disk (a rewritten
   checkpoint counts twice), so they never shrink a reservation. A disk
   request keeps its `min_free_after_bytes` and the watermark free.

@@ -13,7 +13,15 @@ package store
 //   - project
 //
 // A run past its estimate is expected to take as long again as it has run
-// so far. Replayed on the installation's history, half the runs land within
+// so far.
+//
+// The RAM a running lease is expected to take is likewise read from the runs
+// like it that succeeded: the most its attempts used (attempt_usage) in the
+// latest runHistoryDepth runs of its most specific key with at least
+// ramHistoryMin of them, among the first three keys only (a queue or a
+// project mixes work of very different sizes), times 1.5 plus 512 MiB
+// (samples are 15 s apart and miss short peaks), never more than it
+// reserved (planner.go counts it so). Replayed on the installation's history, half the runs land within
 // twice their estimate and long runs are mostly underestimated, which
 // backfill tolerates: it only asks whether short work ends before the
 // execution it would delay could start, and an estimate corrected as a run
@@ -44,11 +52,17 @@ const (
 	// expected to keep what it has (suspends measured take seconds to two
 	// minutes from the command to the lease's release).
 	suspendSettle = 2 * time.Minute
+	// ramHistoryMin is how many runs of a key the RAM they took is read
+	// from; ramHeadroom is added to the most of them, after half again.
+	ramHistoryMin = 3
+	ramHeadroom   = 512 << 20
 )
 
-// runHistory is the run time of the runs that succeeded, by estimate key.
+// runHistory is the run time of the runs that succeeded, by estimate key,
+// and the most RAM their attempts were seen to use.
 type runHistory struct {
 	runs map[string][]float64 // key -> seconds of the latest runs, oldest first
+	ram  map[string][]int64   // key -> bytes of the latest runs that were sampled, oldest first
 }
 
 // runHistoryCache keeps the history between passes.
@@ -87,12 +101,12 @@ func (s *Store) runHistory(ctx context.Context) *runHistory {
 // counted twice) and the keys of its last execution, in the order the runs
 // ended.
 func loadRunHistory(ctx context.Context, db *sql.DB) (*runHistory, error) {
-	h := &runHistory{runs: map[string][]float64{}}
+	h := &runHistory{runs: map[string][]float64{}, ram: map[string][]int64{}}
 	err := eachRow(ctx, db, `WITH runs AS MATERIALIZED (
 			SELECT COALESCE(e.task_scope_id,e.id) AS unit,
 				SUM(EXTRACT(EPOCH FROM (a.exited_at::timestamptz-a.started_at::timestamptz))) AS seconds,
-				MAX(a.exited_at) AS ended
-			FROM execution_requests e JOIN attempts a ON a.execution_id=e.id
+				MAX(a.exited_at) AS ended,MAX(u.ram_bytes) AS ram
+			FROM execution_requests e JOIN attempts a ON a.execution_id=e.id LEFT JOIN attempt_usage u ON u.attempt_id=a.id
 			WHERE a.started_at IS NOT NULL AND a.exited_at IS NOT NULL
 			AND NOT EXISTS(SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id AND gm.rank>0)
 			GROUP BY 1
@@ -102,14 +116,15 @@ func loadRunHistory(ctx context.Context, db *sql.DB) (*runHistory, error) {
 			FROM execution_requests e
 			ORDER BY COALESCE(e.task_scope_id,e.id),e.submitted_at DESC,e.id DESC
 		)
-		SELECT l.project_scope_id,l.queue,COALESCE(s.external_key,''),l.argv_json,r.seconds::double precision
+		SELECT l.project_scope_id,l.queue,COALESCE(s.external_key,''),l.argv_json,r.seconds::double precision,r.ram
 		FROM last l JOIN runs r ON r.unit=l.unit JOIN attempts a ON a.execution_id=l.id
 		LEFT JOIN coordination_scopes s ON s.id=l.task
 		WHERE l.state='terminal' AND l.terminal_cause='process_exit' AND a.exit_code=0 AND a.exit_signal IS NULL AND r.seconds>0
 		ORDER BY r.ended,l.unit`, nil, func(rows *sql.Rows) error {
 		var project, queue, task, argv string
 		var seconds float64
-		if err := rows.Scan(&project, &queue, &task, &argv, &seconds); err != nil {
+		var ram sql.NullInt64
+		if err := rows.Scan(&project, &queue, &task, &argv, &seconds, &ram); err != nil {
 			return err
 		}
 		for _, key := range estimateKeys(project, queue, task, decodeArgv(argv)) {
@@ -118,6 +133,13 @@ func loadRunHistory(ctx context.Context, db *sql.DB) (*runHistory, error) {
 				runs = runs[1:]
 			}
 			h.runs[key] = runs
+			if ram.Valid && ram.Int64 > 0 {
+				peaks := append(h.ram[key], ram.Int64)
+				if len(peaks) > runHistoryDepth {
+					peaks = peaks[1:]
+				}
+				h.ram[key] = peaks
+			}
 		}
 		return nil
 	})
@@ -136,6 +158,21 @@ func (h *runHistory) estimate(keys []string) (time.Duration, bool) {
 	for _, key := range keys {
 		if runs := h.runs[key]; len(runs) != 0 {
 			return time.Duration(median(runs) * float64(time.Second)), true
+		}
+	}
+	return 0, false
+}
+
+// expectedRAM is the RAM a run with keys is expected to take at most: the
+// most its like took, of the first of its three most specific keys with
+// ramHistoryMin runs sampled, times 1.5 plus ramHeadroom.
+func (h *runHistory) expectedRAM(keys []string) (int64, bool) {
+	if h == nil {
+		return 0, false
+	}
+	for _, key := range keys[:min(3, len(keys))] {
+		if peaks := h.ram[key]; len(peaks) >= ramHistoryMin {
+			return slices.Max(peaks)/2*3 + ramHeadroom, true
 		}
 	}
 	return 0, false
@@ -258,9 +295,10 @@ type planRun struct {
 	keys []string
 }
 
-// loadEstimates sets the estimated end of every live lease (m.leaseEnds) and
-// the estimated run time left of every candidate (endsIn), from history and
-// from what each run's earlier attempts ran, read in one query.
+// loadEstimates sets the estimated end of every live lease (m.leaseEnds),
+// the RAM it is expected to take (ramExpected), and the estimated run time
+// left of every candidate (endsIn), from history and from what each run's
+// earlier attempts ran, read in one query.
 func loadEstimates(ctx context.Context, tx *sql.Tx, m *planModel, candidates []*planCandidate, history *runHistory) error {
 	m.leaseEnds = map[string]time.Time{}
 	if history == nil {
@@ -283,6 +321,9 @@ func loadEstimates(ctx context.Context, tx *sql.Tx, m *planModel, candidates []*
 		r := runOf(l.projectID, l.queueID, l.taskID, l.executionID, l.argvJSON)
 		leaseRuns[id] = r
 		units = append(units, r.unit)
+		if ram, known := history.expectedRAM(r.keys); known {
+			l.ramExpected = ram
+		}
 	}
 	candidateRuns := make([]planRun, len(candidates))
 	for i, c := range candidates {
