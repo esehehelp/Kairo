@@ -417,6 +417,17 @@ registered process is absent and provider observations taken after that
 absence show resources unclaimed. An expired or executor-lost lease becomes
 stale; it is never made free based on time alone.
 
+What an exited attempt left running (its launcher exited and its exit is
+recorded, yet a process of its tree runs: one it started without
+registering, a server a wrapper left behind) is not its work any more, since
+no one reads what it does, and it holds the lease. Its executor ends it: once
+it has been seen for 10 s it is asked to stop (SIGTERM, inside WSL too; on
+Windows CTRL_BREAK no longer reaches it once its launcher is gone), and 30 s
+later it is killed (the job object, the launcher's process group, the
+processes carrying the attempt's `KAIRO_ATTEMPT_ID`, each identified as
+force stop does; never anything else). An attempt lost with an agent restart
+is not an exited one and is left alone.
+
 A compute process a provider sees on a GPU (`nvidia-smi pmon`) is an
 `external_process` claim unless it is the work of the attempt holding that GPU
 (on any node's row of it): one of the attempt's registered processes, a
