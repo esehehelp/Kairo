@@ -55,9 +55,28 @@ func sourceOwnership(declared []machine.Store, kind, nodeID, storeID, root, path
 	return outputOwnership(declared, nodeID, storeID, root, path, sourceID)
 }
 
+// goodCopyTx reports whether an object has a copy its source may be deleted
+// for: verified, not found damaged since, and on a store still declared
+// durable at the root it was made at.
+func goodCopyTx(ctx context.Context, q queryer, declared []machine.Store, objectID string) (bool, error) {
+	good := false
+	err := eachRow(ctx, q, `SELECT store_id,root FROM object_copies WHERE object_id=$1 AND state='verified' AND check_problem IS NULL`, []any{objectID}, func(rows *sql.Rows) error {
+		var storeID, root string
+		if err := rows.Scan(&storeID, &root); err != nil {
+			return err
+		}
+		for _, d := range declared {
+			good = good || d.ID == storeID && d.Class == machine.StoreDurable && d.Root == root
+		}
+		return nil
+	})
+	return good, err
+}
+
 // DeletionsToMake is what an executor is to delete now: the sources of its
-// objects with a verified copy that the declaration still makes Kairo's, and
-// those it has claimed (the declaration cannot have changed under them).
+// objects with a good copy (goodCopyTx) that the declaration still makes
+// Kairo's, and those it has claimed (the declaration cannot have changed under
+// them).
 func (s *Store) DeletionsToMake(ctx context.Context, executorID string) ([]DeletionOrder, error) {
 	tx, err := s.beginRead(ctx)
 	if err != nil {
@@ -68,21 +87,42 @@ func (s *Store) DeletionsToMake(ctx context.Context, executorID string) ([]Delet
 	if err != nil {
 		return nil, err
 	}
-	out := []DeletionOrder{}
+	type row struct {
+		order         DeletionOrder
+		state, nodeID string
+	}
+	var rows []row
 	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,d.source_state,x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id
 		WHERE d.executor_id=$1 AND d.state='packed' AND d.source_state IN('present','deleting')
-		AND EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id AND c.state='verified') ORDER BY d.packed_at,d.id`, []any{executorID}, func(rows *sql.Rows) error {
-		var o DeletionOrder
-		var state, nodeID string
-		if err := rows.Scan(&o.ObjectID, &o.Kind, &o.SourceID, &o.StoreID, &o.Root, &o.Path, &state, &nodeID); err != nil {
+		AND EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id AND c.state='verified') ORDER BY d.packed_at,d.id`, []any{executorID}, func(r *sql.Rows) error {
+		var x row
+		if err := r.Scan(&x.order.ObjectID, &x.order.Kind, &x.order.SourceID, &x.order.StoreID, &x.order.Root, &x.order.Path, &x.state, &x.nodeID); err != nil {
 			return err
 		}
-		if state == SourceDeleting || sourceOwnership(declared, o.Kind, nodeID, o.StoreID, o.Root, o.Path, o.SourceID) == "" {
-			out = append(out, o)
-		}
+		rows = append(rows, x)
 		return nil
 	})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	out := []DeletionOrder{}
+	for _, x := range rows {
+		o := x.order
+		if x.state != SourceDeleting {
+			if sourceOwnership(declared, o.Kind, x.nodeID, o.StoreID, o.Root, o.Path, o.SourceID) != "" {
+				continue
+			}
+			good, err := goodCopyTx(ctx, tx, declared, o.ObjectID)
+			if err != nil {
+				return nil, err
+			}
+			if !good {
+				continue
+			}
+		}
+		out = append(out, o)
+	}
+	return out, nil
 }
 
 // SettleDeletion records what an executor did with a source: the claim it
@@ -97,7 +137,7 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 	default:
 		return fmt.Errorf("a source is claimed deleting, deleted or kept, not %q", settled.State)
 	}
-	tx, err := s.beginUnlockedWrite(ctx)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -105,11 +145,10 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 	var executorID, kind, sourceID, storeID, root, path, state, nodeID string
 	var projectID sql.NullString
 	var bytes sql.NullInt64
-	var verified bool
 	err = tx.QueryRowContext(ctx, `SELECT d.executor_id,d.kind,d.source_id,d.store_id,d.root,d.source_path,d.source_state,x.node_id,d.project_scope_id,
-		COALESCE(d.content_bytes,0)+COALESCE(d.pack_bytes,0),EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id AND c.state='verified')
+		COALESCE(d.content_bytes,0)+COALESCE(d.pack_bytes,0)
 		FROM data_objects d JOIN executors x ON x.id=d.executor_id WHERE d.id=$1 FOR UPDATE OF d`, settled.ObjectID).
-		Scan(&executorID, &kind, &sourceID, &storeID, &root, &path, &state, &nodeID, &projectID, &bytes, &verified)
+		Scan(&executorID, &kind, &sourceID, &storeID, &root, &path, &state, &nodeID, &projectID, &bytes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -124,12 +163,16 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 	}
 	switch settled.State {
 	case SourceDeleting:
-		if state != "present" || !verified {
-			return fmt.Errorf("%w: object %s's source is %s, verified copy %v: not to be deleted", ErrStaleEpoch, settled.ObjectID, state, verified)
-		}
 		declared, err := declaredStores(ctx, tx)
 		if err != nil {
 			return err
+		}
+		good, err := goodCopyTx(ctx, tx, declared, settled.ObjectID)
+		if err != nil {
+			return err
+		}
+		if state != "present" || !good {
+			return fmt.Errorf("%w: object %s's source is %s, a good copy %v: not to be deleted", ErrStaleEpoch, settled.ObjectID, state, good)
 		}
 		if why := sourceOwnership(declared, kind, nodeID, storeID, root, path, sourceID); why != "" {
 			return fmt.Errorf("%w: object %s's source is not deleted: %s", ErrStaleEpoch, settled.ObjectID, why)

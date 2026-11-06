@@ -136,7 +136,7 @@ func (s *Store) ScrubsToMake(ctx context.Context, executorID string) ([]ScrubOrd
 // RecordScrub records reading a verified copy back: checked now, damaged
 // when it could not be read whole or no longer matches its pack.
 func (s *Store) RecordScrub(ctx context.Context, r ScrubResult) error {
-	tx, err := s.beginUnlockedWrite(ctx)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}

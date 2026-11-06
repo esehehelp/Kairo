@@ -852,9 +852,10 @@ SDK: the executor makes and settles it.
 Output directories: what a run is to keep goes in its output directory,
 `<root>/outputs/<run id>` on the store its scratch is made on, holding the
 marker `.kairo-output` (the run id) and named by `KAIRO_OUTPUT_DIR`. A run is
-an execution with the continuations that follow it: a Task's initial or rerun
-execution and its continuations (the run id is that initial or rerun
-execution's id), or a direct execution; a gang rank other than 0 has
+an execution with the continuations that follow it: a Task's execution that is
+not a continuation (its initial execution, a rerun, or a restart after a node
+quarantine or a gang's failed launch) and its continuations (the run id is
+that execution's id), or a direct execution; a gang rank other than 0 has
 `<leader's run>-rank<r>`. Every attempt of the run launched on that store gets
 the same directory: the first makes it, a continuation finds what the run
 wrote there before (its checkpoint), and a rerun or another Task writes
@@ -871,7 +872,9 @@ left as it is and counted). Reports measure each output directory (at every
 report while an attempt of its run runs on that executor, else once per agent
 process), and one a whole scan no longer finds is `missing` until found
 again. Once its run has ended it is packed, copied to a durable store and
-then deleted (below). A daemon older than output directories gives no run,
+then deleted (below); from its packing on, the daemon records no more
+attempts on it (what they wrote would be deleted without a copy), and one
+deleted is not counted again. A daemon older than output directories gives no run,
 and the attempt gets none.
 
 Packing: what Kairo keeps is packed where it was written, once nothing writes
@@ -883,8 +886,9 @@ attempt has quiesced (a lost attempt's waits until it is reconciled, since
 its processes may still write). A run suspended with a checkpoint has not
 ended: its continuation is to come. Each becomes a data object (table
 `data_objects`, `packing` then `packed`; events `pack_ordered`, `packed`),
-packed once, only while the declaration still makes the path that directory,
-by the executor that made it (`packs-to-make` every minute, `record-pack`)
+packed once, only while the declaration still makes the path that directory
+(an object ordered before its store moved is not handed out again until the
+declaration makes it so once more), by the executor that made it (`packs-to-make` every minute, `record-pack`)
 into `<root>/packs/<object id>.tar.zst` (tar, PAX format, compressed with
 zstd) with its file list `<object id>.tar.zst.files.tsv`: a header line
 `path`, `bytes`, `sha256`, `mtime_ns`, then such a line per regular file
@@ -907,9 +911,13 @@ files through handles): such an object stays `packing`, warned once.
 (`pack_bytes`, `packs`); until they are moved they are Kairo's bytes there.
 
 Copies to a durable store: each packed object is copied to the first durable
-store by id (one copy for now), taken by one executor serving that store
-(`copies-to-make` every minute, `record-copy`; table `object_copies`,
-`copying` then `verified`; events `copy_ordered`, `copy_verified`), to
+store by id that is not inside a WSL distro (one copy for now), taken by one
+executor serving that store, never a WSL executor (`copies-to-make` every
+minute, `record-copy`; table `object_copies`, `copying` then `verified`;
+events `copy_ordered`, `copy_verified`). A copy taken for a store the
+declaration no longer makes durable at that root, or that its executor no
+longer serves, is given up at its executor's next round and taken again for
+the store declared now. It is written to
 `<root>/objects/<YYYYMM>/<object id>.tar.zst` with its file list beside it
 (the month the object was made). When the pack is on a store that executor
 serves (the same node, its namespace), it is read there through handles;
@@ -928,8 +936,7 @@ are they renamed (the list first) and the copy recorded `verified`, which the
 daemon checks again. A copy that does not match has its `.partial` files
 removed (Kairo's own incomplete writes, the only thing it ever deletes on a
 durable store) and is fetched again at the next round; one renamed but not
-recorded is read back as it is. A durable store inside a WSL distro gets no
-copies yet.
+recorded is read back as it is.
 
 Deleting what was copied: once an object's copy is verified, the executor
 that packed it deletes its source, the run's output directory or the kept
@@ -938,8 +945,9 @@ minute, `settle-deletion`; events `source_deleted`, `source_kept`), by the
 scratch's rules below (the directory derived from the root, its kind and its
 id, its marker naming it, nothing reached through a link), and only while the
 declaration still makes the directory Kairo's. It first claims the deletion
-(`deleting`, taken only while there is a verified copy and the declaration
-says so); until it is settled `deleted`, or `kept` when the deletion is
+(`deleting`, taken only while there is a verified copy that no read-back has
+found damaged, on a store the declaration still makes durable at that root,
+and the declaration makes the source Kairo's); until it is settled `deleted`, or `kept` when the deletion is
 refused for safety (with why; it is not tried again), `kairo machine apply`
 refuses a declaration under which the directory would not be Kairo's. A
 deleted output directory or scratch is marked `deleted` and no longer counted.
@@ -963,8 +971,10 @@ controller of a host whose `containers` lists that node trims it
 (`trims-to-make` every 5 minutes, `pct fstrim <vmid>` with an hour's
 timeout, one container at a time, in the background so device settings are
 kept meanwhile; `record-trim`; events `node_trimmed`, `node_trim_failed`), at
-most once an hour per container. A node that is no listed container is not
-trimmed.
+most once an hour per container: a trim is ordered no sooner than an hour
+after the last order or failure, covers what was deleted before its order (a
+deletion after it asks again), and one that fails is ordered again an hour
+later. A node that is no listed container is not trimmed.
 
 Once the attempt has quiesced, or was lost, its executor settles the scratch
 (`scratch-to-settle` every 10 seconds, with an `action` for each:

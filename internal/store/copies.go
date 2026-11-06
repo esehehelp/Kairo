@@ -98,20 +98,30 @@ func (info executorInfo) serves(s machine.Store, executorID string) bool {
 	return s.Node == info.nodeID && (s.Executor == executorID || s.Executor == "" && !info.wsl)
 }
 
-// copyTarget is the durable store objects are copied to: the first declared
-// durable store by id.
-func copyTarget(declared []machine.Store) (machine.Store, bool) {
+// copyTargetTx is the durable store objects are copied to: the first
+// declared durable store by id that is not inside a WSL distro (copies are
+// not made there yet).
+func copyTargetTx(ctx context.Context, q queryer, declared []machine.Store) (machine.Store, bool, error) {
 	var durable []machine.Store
 	for _, s := range declared {
 		if s.Class == machine.StoreDurable {
 			durable = append(durable, s)
 		}
 	}
-	if len(durable) == 0 {
-		return machine.Store{}, false
-	}
 	sort.Slice(durable, func(i, j int) bool { return durable[i].ID < durable[j].ID })
-	return durable[0], true
+	for _, s := range durable {
+		if s.Executor != "" {
+			info, err := executorInfoTx(ctx, q, s.Executor)
+			if err != nil && !errors.Is(err, ErrNotFound) {
+				return machine.Store{}, false, err
+			}
+			if err != nil || info.wsl {
+				continue
+			}
+		}
+		return s, true, nil
+	}
+	return machine.Store{}, false, nil
 }
 
 // CopiesToMake is what an executor is to copy now: the copies it has taken
@@ -120,7 +130,7 @@ func copyTarget(declared []machine.Store) (machine.Store, bool) {
 // read the pack: locally, or from its agent with a token issued now (the
 // order's earlier token no longer works).
 func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrder, error) {
-	tx, err := s.beginUnlockedWrite(ctx)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -138,7 +148,11 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 		byID[d.ID] = d
 	}
 	t := now()
-	if target, ok := copyTarget(declared); ok && me.serves(target, executorID) {
+	target, ok, err := copyTargetTx(ctx, tx, declared)
+	if err != nil {
+		return nil, err
+	}
+	if ok && me.serves(target, executorID) {
 		var due []struct{ id, created, projectID string }
 		err = eachRow(ctx, tx, `SELECT d.id,d.created_at,COALESCE(d.project_scope_id,'') FROM data_objects d
 			WHERE d.state='packed' AND NOT EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id) ORDER BY d.packed_at,d.id`, nil, func(rows *sql.Rows) error {
@@ -154,9 +168,15 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 		}
 		for _, d := range due {
 			month := d.created[0:4] + d.created[5:7]
-			if _, err = tx.ExecContext(ctx, `INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'copying',$6,$7)`,
-				d.id, target.ID, executorID, target.Root, month, t, t); err != nil {
+			// Another executor serving the store may take it at the same
+			// time: it is then that one's.
+			result, err := tx.ExecContext(ctx, `INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'copying',$6,$7)
+				ON CONFLICT(object_id,store_id) DO NOTHING`, d.id, target.ID, executorID, target.Root, month, t, t)
+			if err != nil {
 				return nil, err
+			}
+			if n, _ := result.RowsAffected(); n == 0 {
+				continue
 			}
 			var project *string
 			if d.projectID != "" {
@@ -189,8 +209,13 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 	expires := time.Now().UTC().Add(copyTokenLife).Format(time.RFC3339Nano)
 	out := []CopyOrder{}
 	for _, x := range rows {
-		// Copied only to the store as it is still declared, and served here.
+		// Copied only to the store as it is still declared, and served here;
+		// a copy taken for a store no longer so is given up (nothing of it was
+		// verified), so the object is copied where the declaration says now.
 		if d, ok := byID[x.order.StoreID]; !ok || d.Class != machine.StoreDurable || d.Root != x.order.Root || !me.serves(d, executorID) {
+			if _, err = tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_id=$1 AND store_id=$2 AND executor_id=$3 AND state='copying'`, x.order.ObjectID, x.order.StoreID, executorID); err != nil {
+				return nil, err
+			}
 			continue
 		}
 		o := x.order
@@ -245,7 +270,7 @@ func (s *Store) AuthorizePackRead(ctx context.Context, nodeID, objectID, token s
 // pack's size and sha256 and the list's sha256 (ErrCopyMismatch otherwise).
 // Recording it again is no error.
 func (s *Store) RecordCopy(ctx context.Context, made CopyMade) error {
-	tx, err := s.beginUnlockedWrite(ctx)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}

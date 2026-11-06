@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
@@ -19,9 +20,14 @@ func retireFixture(t *testing.T) (*Store, *Launch, string) {
 	setupSchedulerInventory(t, store)
 	addTestDisk(t, store, "node", "D:")
 	ctx := context.Background()
+	// "executor" (a WSL one in the test inventory) packs on d-scratch;
+	// durable-exec serves both stores, which name no executor
+	if err := store.UpsertExecutor(ctx, Executor{ID: "durable-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 	declareTestStore(t, store,
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "executor", Root: "D:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "executor", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
 	)
 	launch := authorizeScratchTest(t, store, "retire")
 	if err := store.RecordRunOutput(ctx, outputOf(launch, "d-scratch")); err != nil {
@@ -51,13 +57,13 @@ func retireFixture(t *testing.T) (*Store, *Launch, string) {
 func verifyCopy(t *testing.T, store *Store, objectID string) CopyOrder {
 	t.Helper()
 	ctx := context.Background()
-	copies, err := store.CopiesToMake(ctx, "executor")
+	copies, err := store.CopiesToMake(ctx, "durable-exec")
 	if err != nil || len(copies) != 1 || copies[0].ObjectID != objectID || !copies[0].Source.Local {
 		t.Fatalf("copies %+v %v", copies, err)
 	}
 	c := copies[0]
 	path := "E:/kairo/objects/" + c.Month + "/" + objectID + ".tar.zst"
-	if err := store.RecordCopy(ctx, CopyMade{ObjectID: objectID, StoreID: "e-durable", ExecutorID: "executor", Path: path, ManifestPath: path + ".files.tsv",
+	if err := store.RecordCopy(ctx, CopyMade{ObjectID: objectID, StoreID: "e-durable", ExecutorID: "durable-exec", Path: path, ManifestPath: path + ".files.tsv",
 		Bytes: c.PackBytes, SHA256: c.PackSHA256, ManifestSHA256: c.ManifestSHA256}); err != nil {
 		t.Fatal(err)
 	}
@@ -100,8 +106,8 @@ func TestASourceIsDeletedOnlyOnceItsCopyIsVerified(t *testing.T) {
 	// while it is being deleted, a declaration under which the directory is
 	// no longer Kairo's is refused
 	moved := []machine.Store{
-		{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "executor", Root: "D:/elsewhere", Filesystem: "D:"},
-		{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "executor", Root: "E:/kairo", Filesystem: "D:"},
+		{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/elsewhere", Filesystem: "D:"},
+		{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
 	}
 	if _, err := store.ApplyMachines(ctx, storesSpec(moved...), false); !errors.Is(err, ErrMachineConflict) || !strings.Contains(err.Error(), "object "+objectID) {
 		t.Fatalf("a declaration moving it while deleted: %v", err)
@@ -167,7 +173,7 @@ func TestCopiesAreReadBackWithinTheDailyBudget(t *testing.T) {
 	ctx := context.Background()
 	order := verifyCopy(t, store, objectID)
 	store.SetDataPolicy(DataPolicy{ScrubInterval: time.Hour, ScrubBytesPerDay: 150})
-	if scrubs, err := store.ScrubsToMake(ctx, "executor"); err != nil || len(scrubs) != 0 {
+	if scrubs, err := store.ScrubsToMake(ctx, "durable-exec"); err != nil || len(scrubs) != 0 {
 		t.Fatalf("read back before its interval: %+v %v", scrubs, err)
 	}
 	if _, err := store.testExec(`UPDATE object_copies SET verified_at='2026-01-01T00:00:00Z'`); err != nil {
@@ -175,26 +181,26 @@ func TestCopiesAreReadBackWithinTheDailyBudget(t *testing.T) {
 	}
 	insertPacked(t, store, "obj_two", "executor", "d-scratch", "D:/kairo", order.PackSHA256)
 	if _, err := store.testExec(`INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,path,created_at,updated_at,verified_at)
-		VALUES('obj_two','e-durable','executor','E:/kairo','202611','verified','E:/kairo/objects/202611/obj_two.tar.zst','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')`); err != nil {
+		VALUES('obj_two','e-durable','durable-exec','E:/kairo','202611','verified','E:/kairo/objects/202611/obj_two.tar.zst','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z','2026-01-02T00:00:00Z')`); err != nil {
 		t.Fatal(err)
 	}
-	scrubs, err := store.ScrubsToMake(ctx, "executor")
+	scrubs, err := store.ScrubsToMake(ctx, "durable-exec")
 	if err != nil || len(scrubs) != 1 || scrubs[0].ObjectID != objectID || scrubs[0].Month != order.Month || scrubs[0].PackSHA256 != order.PackSHA256 {
 		t.Fatalf("within 150 bytes a day (100 each): %+v %v", scrubs, err)
 	}
-	ok := ScrubResult{ObjectID: objectID, StoreID: "e-durable", ExecutorID: "executor", Bytes: order.PackBytes, SHA256: order.PackSHA256, ManifestSHA256: order.ManifestSHA256}
+	ok := ScrubResult{ObjectID: objectID, StoreID: "e-durable", ExecutorID: "durable-exec", Bytes: order.PackBytes, SHA256: order.PackSHA256, ManifestSHA256: order.ManifestSHA256}
 	if err := store.RecordScrub(ctx, ok); err != nil {
 		t.Fatal(err)
 	}
-	if scrubs, err := store.ScrubsToMake(ctx, "executor"); err != nil || len(scrubs) != 0 {
+	if scrubs, err := store.ScrubsToMake(ctx, "durable-exec"); err != nil || len(scrubs) != 0 {
 		t.Fatalf("over the day's budget: %+v %v", scrubs, err)
 	}
 	store.SetDataPolicy(DataPolicy{ScrubInterval: time.Hour, ScrubBytesPerDay: 1000})
-	scrubs, err = store.ScrubsToMake(ctx, "executor")
+	scrubs, err = store.ScrubsToMake(ctx, "durable-exec")
 	if err != nil || len(scrubs) != 1 || scrubs[0].ObjectID != "obj_two" {
 		t.Fatalf("the next one: %+v %v", scrubs, err)
 	}
-	bad := ScrubResult{ObjectID: "obj_two", StoreID: "e-durable", ExecutorID: "executor", Bytes: 100, SHA256: strings.Repeat("00", 32), ManifestSHA256: order.ManifestSHA256}
+	bad := ScrubResult{ObjectID: "obj_two", StoreID: "e-durable", ExecutorID: "durable-exec", Bytes: 100, SHA256: strings.Repeat("00", 32), ManifestSHA256: order.ManifestSHA256}
 	if err := store.RecordScrub(ctx, bad); err != nil {
 		t.Fatal(err)
 	}
@@ -219,8 +225,8 @@ func TestDeletionsAreTrimmedByTheHostsController(t *testing.T) {
 	ctx := context.Background()
 	verifyCopy(t, store, objectID)
 	spec := storesSpec(
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "executor", Root: "D:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "executor", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
 	)
 	if err := store.UpsertNode(ctx, Node{ID: "pve0-host", Name: "pve0-host", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
 		t.Fatal(err)

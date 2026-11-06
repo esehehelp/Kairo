@@ -133,7 +133,9 @@ func TestPacksAreOrderedOnceNothingWritesThere(t *testing.T) {
 		t.Fatal(err)
 	}
 	declareTestStore(t, store, machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/elsewhere", Filesystem: "D:"})
-	if orders = packOrders(t, store); len(orders) != 1 {
-		t.Fatalf("an output directory no longer declared was ordered: %+v", orders)
+	// neither the new directory nor the scratch ordered before (its store has
+	// moved since) is handed out
+	if orders = packOrders(t, store); len(orders) != 0 {
+		t.Fatalf("a directory no longer declared was ordered: %+v", orders)
 	}
 }

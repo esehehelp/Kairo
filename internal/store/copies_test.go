@@ -38,22 +38,30 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	addTestDisk(t, store, "remote", "/")
+	// the test inventory's "executor" is a WSL one: the node's stores naming no
+	// executor are served by durable-exec
+	if err := store.UpsertExecutor(ctx, Executor{ID: "durable-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 	declareTestStore(t, store,
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "executor", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "z-durable", Class: machine.StoreDurable, Node: "remote", Root: "/srv/durable", Filesystem: "/"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "executor", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "r-pool", Class: machine.StoreVolatile, Node: "remote", Root: "/srv/kairo", Filesystem: "/"},
 	)
 	shaLocal, shaRemote := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
 	insertPacked(t, store, "obj_local", "executor", "d-scratch", "D:/kairo", shaLocal)
 	insertPacked(t, store, "obj_remote", "remote-exec", "r-pool", "/srv/kairo", shaRemote)
 
-	// only an executor serving the first durable store (e-durable) takes them
-	// (the test executor is a WSL one: it serves the stores naming it)
+	// only an executor serving the first durable store (e-durable) takes them:
+	// not the remote one, nor the WSL one of the node
+	if orders, err := store.CopiesToMake(ctx, "executor"); err != nil || len(orders) != 0 {
+		t.Fatalf("the WSL executor took %+v %v", orders, err)
+	}
 	if orders, err := store.CopiesToMake(ctx, "remote-exec"); err != nil || len(orders) != 0 {
 		t.Fatalf("the remote executor took %+v %v", orders, err)
 	}
-	orders, err := store.CopiesToMake(ctx, "executor")
+	orders, err := store.CopiesToMake(ctx, "durable-exec")
 	if err != nil || len(orders) != 2 {
 		t.Fatalf("orders %+v %v", orders, err)
 	}
@@ -84,7 +92,7 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 		}
 	}
 	// the next order's token replaces it
-	again, err := store.CopiesToMake(ctx, "executor")
+	again, err := store.CopiesToMake(ctx, "durable-exec")
 	if err != nil || len(again) != 2 {
 		t.Fatalf("orders again %+v %v", again, err)
 	}
@@ -105,7 +113,7 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 		t.Fatalf("an expired token reads: %v", err)
 	}
 
-	made := CopyMade{ObjectID: "obj_local", StoreID: "e-durable", ExecutorID: "executor", Path: "E:/kairo/objects/202611/obj_local.tar.zst",
+	made := CopyMade{ObjectID: "obj_local", StoreID: "e-durable", ExecutorID: "durable-exec", Path: "E:/kairo/objects/202611/obj_local.tar.zst",
 		ManifestPath: "E:/kairo/objects/202611/obj_local.tar.zst.files.tsv", Bytes: 100, SHA256: shaLocal, ManifestSHA256: shaLocal}
 	refused := func(what string, change func(*CopyMade), want error, text string) {
 		t.Helper()
@@ -116,7 +124,7 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 			t.Fatalf("%s: %v, want %q", what, err, text)
 		}
 	}
-	refused("by another executor", func(m *CopyMade) { m.ExecutorID = "remote-exec" }, nil, "is executor executor's")
+	refused("by another executor", func(m *CopyMade) { m.ExecutorID = "remote-exec" }, nil, "is executor durable-exec's")
 	refused("in another month", func(m *CopyMade) { m.Path = "E:/kairo/objects/202610/obj_local.tar.zst" }, nil, "is not <root>/objects/202611")
 	refused("outside the objects", func(m *CopyMade) { m.Path = "E:/kairo/obj_local.tar.zst" }, nil, "is not <root>/objects")
 	refused("its list elsewhere", func(m *CopyMade) { m.ManifestPath = "E:/kairo/objects/202611/list.tsv" }, nil, "is not beside its copy")
@@ -129,7 +137,7 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 	if err := store.RecordCopy(ctx, made); err != nil {
 		t.Fatalf("recorded again: %v", err)
 	}
-	orders, err = store.CopiesToMake(ctx, "executor")
+	orders, err = store.CopiesToMake(ctx, "durable-exec")
 	if err != nil || len(orders) != 1 || orders[0].ObjectID != "obj_remote" {
 		t.Fatalf("after the local copy was verified: %+v %v", orders, err)
 	}
@@ -138,8 +146,8 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 	// is not copied again
 	declareTestStore(t, store,
 		machine.Store{ID: "a-durable", Class: machine.StoreDurable, Node: "remote", Root: "/srv/first", Filesystem: "/"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "executor", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "executor", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "r-pool", Class: machine.StoreVolatile, Node: "remote", Root: "/srv/kairo", Filesystem: "/"},
 	)
 	insertPacked(t, store, "obj_new", "executor", "d-scratch", "D:/kairo", shaLocal)

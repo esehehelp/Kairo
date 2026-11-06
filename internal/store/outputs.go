@@ -118,11 +118,20 @@ func (s *Store) RecordRunOutput(ctx context.Context, out RunOutput) error {
 	if runID != out.RunID {
 		return fmt.Errorf("attempt %s runs in run %s, not %s", out.AttemptID, runID, out.RunID)
 	}
-	var existing, lastAttempt string
-	err = tx.QueryRowContext(ctx, `SELECT path,last_attempt_id FROM run_outputs WHERE run_id=$1 AND store_id=$2`, out.RunID, out.StoreID).Scan(&existing, &lastAttempt)
+	var existing, lastAttempt, state string
+	err = tx.QueryRowContext(ctx, `SELECT path,last_attempt_id,state FROM run_outputs WHERE run_id=$1 AND store_id=$2`, out.RunID, out.StoreID).Scan(&existing, &lastAttempt, &state)
 	found := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
+	}
+	// Once packed (or deleted after its copy), a run's directory takes no
+	// more writes: what came after would be deleted without a copy.
+	var packed bool
+	if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM data_objects WHERE kind='output' AND source_id=$1 AND store_id=$2)`, out.RunID, out.StoreID).Scan(&packed); err != nil {
+		return err
+	}
+	if packed || state == SourceDeleted {
+		return fmt.Errorf("%w: run %s's output directory on %s is packed already", ErrStaleEpoch, out.RunID, out.StoreID)
 	}
 	if found && existing != out.Path {
 		return fmt.Errorf("run %s already has output directory %s on store %s", out.RunID, existing, out.StoreID)

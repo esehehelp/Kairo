@@ -165,7 +165,7 @@ func recordOutputsObservedTx(ctx context.Context, tx *sql.Tx, obs StoreObservati
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE run_outputs o SET bytes=CASE WHEN r.bytes>=0 THEN r.bytes ELSE o.bytes END,state='active',missing_at=NULL,updated_at=$1
 		FROM jsonb_to_recordset(($2)::jsonb) AS r(run_id text,bytes bigint)
-		WHERE o.run_id=r.run_id AND o.store_id=$3 AND o.root=$4`, t, string(seen), obs.StoreID, obs.Root); err != nil {
+		WHERE o.run_id=r.run_id AND o.store_id=$3 AND o.root=$4 AND o.state IN('active','missing')`, t, string(seen), obs.StoreID, obs.Root); err != nil {
 		return 0, err
 	}
 	if obs.OutputsScanned {

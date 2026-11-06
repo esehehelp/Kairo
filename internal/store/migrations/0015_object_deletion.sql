@@ -14,13 +14,16 @@ ALTER TABLE object_copies ADD COLUMN checked_at TEXT;
 ALTER TABLE object_copies ADD COLUMN check_problem TEXT;
 -- A node whose filesystems had something deleted, to be trimmed by its
 -- host's controller (pct fstrim, for a Proxmox container): requested since
--- the latest trim, with the bytes deleted since; when it was last trimmed and
--- how that went.
+-- the latest trim, with the bytes deleted since; when a trim was last ordered
+-- (a trim covers what was deleted before its order), when it last succeeded
+-- (as of its order) and when one last failed, with what it said.
 CREATE TABLE node_trims(
  node_id TEXT PRIMARY KEY,
  requested_at TEXT,
  requested_bytes BIGINT NOT NULL DEFAULT 0,
+ ordered_at TEXT,
  trimmed_at TEXT,
+ failed_at TEXT,
  problem TEXT,
  output TEXT,
  updated_at TEXT NOT NULL

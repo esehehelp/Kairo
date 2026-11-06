@@ -48,9 +48,11 @@ func controlledContainers(spec machine.Spec, controllerNodeID string) map[string
 
 // TrimsToMake is what the controller on node controllerNodeID is to trim
 // now: its host's containers with a deletion since their last trim, each at
-// most once per trimInterval.
+// most once per trimInterval, none while one ordered within trimInterval is
+// still to report, and one whose last trim failed again only after
+// trimInterval. Each is ordered now: the trim covers what was deleted before.
 func (s *Store) TrimsToMake(ctx context.Context, controllerNodeID string) ([]TrimOrder, error) {
-	tx, err := s.beginRead(ctx)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +73,9 @@ func (s *Store) TrimsToMake(ctx context.Context, controllerNodeID string) ([]Tri
 	slices.Sort(nodes)
 	since := time.Now().UTC().Add(-trimInterval).Format(time.RFC3339Nano)
 	err = eachRow(ctx, tx, `SELECT node_id,requested_bytes FROM node_trims WHERE node_id=ANY($1::text[]) AND requested_at IS NOT NULL
-		AND (trimmed_at IS NULL OR ((requested_at)::timestamptz>(trimmed_at)::timestamptz AND (trimmed_at)::timestamptz<($2)::timestamptz)) ORDER BY node_id`,
+		AND (trimmed_at IS NULL OR ((requested_at)::timestamptz>(trimmed_at)::timestamptz AND (trimmed_at)::timestamptz<($2)::timestamptz))
+		AND (ordered_at IS NULL OR (ordered_at)::timestamptz<($2)::timestamptz)
+		AND (failed_at IS NULL OR (failed_at)::timestamptz<($2)::timestamptz) ORDER BY node_id`,
 		[]any{nodes, since}, func(rows *sql.Rows) error {
 			var o TrimOrder
 			if err := rows.Scan(&o.NodeID, &o.RequestedBytes); err != nil {
@@ -81,13 +85,22 @@ func (s *Store) TrimsToMake(ctx context.Context, controllerNodeID string) ([]Tri
 			out = append(out, o)
 			return nil
 		})
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	t := now()
+	for _, o := range out {
+		if _, err = tx.ExecContext(ctx, `UPDATE node_trims SET ordered_at=$1,updated_at=$2 WHERE node_id=$3`, t, t, o.NodeID); err != nil {
+			return nil, err
+		}
+	}
+	return out, tx.Commit()
 }
 
 // RecordTrim records a trim the controller on node controllerNodeID made of
 // one of its host's containers.
 func (s *Store) RecordTrim(ctx context.Context, controllerNodeID string, done TrimDone) error {
-	tx, err := s.beginUnlockedWrite(ctx)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
@@ -103,10 +116,18 @@ func (s *Store) RecordTrim(ctx context.Context, controllerNodeID string, done Tr
 		done.Output = done.Output[:4096]
 	}
 	t := now()
-	// A request made since the trim began is kept for the next one.
-	if _, err = tx.ExecContext(ctx, `UPDATE node_trims SET trimmed_at=$1,problem=$2,output=$3,
-		requested_bytes=CASE WHEN $2::text IS NULL THEN 0 ELSE requested_bytes END,updated_at=$4 WHERE node_id=$5`,
-		t, nullable(done.Problem), nullable(done.Output), t, done.NodeID); err != nil {
+	if done.Problem == "" {
+		// Trimmed as of its order (now, when it was never ordered): what was
+		// deleted since is still to be trimmed, and its bytes stay counted.
+		_, err = tx.ExecContext(ctx, `UPDATE node_trims SET trimmed_at=COALESCE(ordered_at,$1),
+			requested_bytes=CASE WHEN ordered_at IS NOT NULL AND (requested_at)::timestamptz>(ordered_at)::timestamptz THEN requested_bytes ELSE 0 END,
+			ordered_at=NULL,failed_at=NULL,problem=NULL,output=$2,updated_at=$3 WHERE node_id=$4`, t, nullable(done.Output), t, done.NodeID)
+	} else {
+		// Failed: still to be trimmed, again after trimInterval.
+		_, err = tx.ExecContext(ctx, `UPDATE node_trims SET ordered_at=NULL,failed_at=$1,problem=$2,output=$3,updated_at=$4 WHERE node_id=$5`,
+			t, done.Problem, nullable(done.Output), t, done.NodeID)
+	}
+	if err != nil {
 		return err
 	}
 	event := "node_trimmed"

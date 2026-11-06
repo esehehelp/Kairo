@@ -97,7 +97,7 @@ func runEndedTx(ctx context.Context, q queryer, runID string) (bool, error) {
 // pack and has not reported packed, and, made objects now, the directories
 // of its that have become due since (the rules above).
 func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder, error) {
-	tx, err := s.beginUnlockedWrite(ctx)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -168,15 +168,21 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 			return nil, err
 		}
 	}
+	// Every order still to be packed, while the declaration still makes its
+	// directory Kairo's on a volatile store (one changed since waits).
 	out := []PackOrder{}
-	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,
+	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,x.node_id,
 		CASE WHEN d.kind='output' THEN (SELECT o.bytes FROM run_outputs o WHERE o.run_id=d.source_id AND o.store_id=d.store_id)
 		ELSE (SELECT k.bytes FROM attempt_scratch k WHERE k.attempt_id=d.source_id) END
-		FROM data_objects d WHERE d.executor_id=$1 AND d.state='packing' ORDER BY d.created_at,d.id`, []any{executorID}, func(rows *sql.Rows) error {
+		FROM data_objects d JOIN executors x ON x.id=d.executor_id WHERE d.executor_id=$1 AND d.state='packing' ORDER BY d.created_at,d.id`, []any{executorID}, func(rows *sql.Rows) error {
 		var o PackOrder
+		var nodeID string
 		var bytes sql.NullInt64
-		if err := rows.Scan(&o.ObjectID, &o.Kind, &o.SourceID, &o.StoreID, &o.Root, &o.Path, &bytes); err != nil {
+		if err := rows.Scan(&o.ObjectID, &o.Kind, &o.SourceID, &o.StoreID, &o.Root, &o.Path, &nodeID, &bytes); err != nil {
 			return err
+		}
+		if sourceOwnership(declared, o.Kind, nodeID, o.StoreID, o.Root, o.Path, o.SourceID) != "" {
+			return nil
 		}
 		if bytes.Valid {
 			o.Bytes = &bytes.Int64
@@ -194,7 +200,7 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 // pack: at <root>/packs/<object id>.tar.zst with its file list beside it.
 // Recording the same pack again is no error.
 func (s *Store) RecordPack(ctx context.Context, made PackMade) error {
-	tx, err := s.beginUnlockedWrite(ctx)
+	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
