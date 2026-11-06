@@ -30,6 +30,11 @@ func dataImport(args []string) error {
 	if *project == "" || *node == "" || len(paths) == 0 {
 		return usageError("data import needs --project, --node and at least one PATH (an absolute path on the node)")
 	}
+	for _, p := range paths {
+		if msysRewritten(p) {
+			return usageError("%s looks like a POSIX path Git Bash rewrote into its own directory: run with MSYS_NO_PATHCONV=1 (or write //srv/...)", p)
+		}
+	}
 	client, err := newAPIClient(*api)
 	if err != nil {
 		return err
@@ -189,4 +194,25 @@ func dataFetch(args []string) error {
 		fmt.Println(o.ObjectID + ": " + state)
 	}
 	return nil
+}
+
+// msysRewritten reports whether p is a POSIX path (/srv/x) that Git Bash
+// (MSYS) turned into a path under its own install directory
+// (C:/Program Files/Git/srv/x) before the CLI saw it.
+func msysRewritten(p string) bool {
+	if os.Getenv("MSYSTEM") == "" {
+		return false
+	}
+	q := strings.ToLower(strings.ReplaceAll(p, `\`, "/"))
+	i := strings.Index(q, "/git/")
+	if len(q) < 3 || q[1] != ':' || i < 0 {
+		return false
+	}
+	rest := q[i+len("/git/"):]
+	for _, top := range []string{"srv/", "root/", "home/", "var/", "mnt/", "opt/", "tmp/", "data/", "media/"} {
+		if strings.HasPrefix(rest, top) {
+			return true
+		}
+	}
+	return false
 }

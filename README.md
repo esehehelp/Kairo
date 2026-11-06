@@ -1190,6 +1190,9 @@ never followed), then the pack, and the node is trimmed as after every
 deletion. A directory that changed since it was packed is kept, with why,
 and its pack goes all the same. A file written between that check and the
 removal is lost with it: import directories nothing writes in any more.
+From Git Bash a POSIX path is rewritten into Git's own directory before
+the CLI sees it (`/srv/x` becomes `C:/Program Files/Git/srv/x`): the CLI
+refuses one that looks so; run it with `MSYS_NO_PATHCONV=1`.
 `kairo data list [--project P] [--kind output|scratch|import] [--limit N]
 [--json]` (`GET /api/data/objects`, `{"objects": [...]}`, newest first, 200
 by default) shows each object: kind, project, name, node, `packing` or
