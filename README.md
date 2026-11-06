@@ -468,7 +468,16 @@ labels may take what is placed there.
   the lesser of total minus reservations and observed free memory minus the
   part of each reservation its attempt does not use yet (what an attempt
   uses, sampled by its executor, counts for two minutes; without a sample the
-  whole reservation counts). Disk is observed free space minus every
+  whole reservation counts). A reservation counts only up to what runs like
+  it were seen to take, when three of them succeeded with their use sampled:
+  the most their attempts used, of the latest five runs sharing its most
+  specific run-time estimate key (program, subcommand and config; program and
+  subcommand; or its Task name with digits masked; never a whole queue or
+  project), half again plus 512 MiB, and never less than its attempt uses
+  now. A declaration written large (8 GiB for work that took 300 MiB) thus
+  stops holding memory it never uses, while one its like really used (16 GiB
+  for work that took 10.7 GiB) still counts in full; samples are 15 s apart,
+  which the headroom is for. Disk is observed free space minus every
   reservation on it: bytes written overstate what stays on disk (a rewritten
   checkpoint counts twice), so they never shrink a reservation. A disk
   request keeps its `min_free_after_bytes` and the watermark free.

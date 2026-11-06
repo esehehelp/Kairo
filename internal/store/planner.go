@@ -29,8 +29,10 @@ package store
 //     the rest of its reservation to executions of the same or higher
 //     priority (it runs slower instead of being stopped); RAM is what is
 //     observed free minus the part of each reservation its attempt does not
-//     use yet (attempt_usage); disk is what is observed free minus every
-//     reservation, since bytes written overstate what stays on disk.
+//     use yet (attempt_usage), a reservation counted only up to what runs
+//     like it were seen to take (estimate.go), when enough of them were;
+//     disk is what is observed free minus every reservation, since bytes
+//     written overstate what stays on disk.
 //   - a node with a filesystem under the free-space watermark admits nothing.
 //
 // Every waiting execution's reason is kept in admission_waits.
@@ -113,6 +115,7 @@ type planLease struct {
 	capacity                               map[capKey]int64
 	used                                   map[capKey]int64 // taken up, of capacity
 	cpuLendable                            int64            // reserved CPU above cpu_millis_min
+	ramExpected                            int64            // RAM runs like it took at most, with headroom (0: not known)
 	// For its run-time estimate (estimate.go): the execution's queue, Task
 	// and argv, and when its attempt started and whether it has exited.
 	queueID, taskID *string
@@ -639,8 +642,15 @@ func (m *planModel) available(key capKey, c planCapacity, freed func(string) boo
 			}
 			continue
 		}
-		reserved += quantity
-		outstanding += quantity - used
+		// A RAM reservation counts up to what runs like it were seen to
+		// take (with headroom), never less than its attempt uses now; one
+		// whose use is not known now counts in full.
+		counted := quantity
+		if key.kind == "ram" && l.ramExpected > 0 && measured {
+			counted = min(quantity, max(used, l.ramExpected))
+		}
+		reserved += counted
+		outstanding += counted - used
 		if key.kind == "cpu" && l.priority <= priority {
 			lent += l.cpuLendable
 		}
