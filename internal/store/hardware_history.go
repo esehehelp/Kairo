@@ -146,7 +146,6 @@ func (s *Store) HardwareSamples(ctx context.Context, since, until time.Time, ste
 		b.buckets[ms][metric] = value.Float64
 	}
 	// Every resource's series key, kind, node and row.
-	kindOf := map[string]string{}
 	err := eachRow(ctx, s.db, `SELECT `+deviceKey+`,r.kind,r.node_id,r.id FROM resource_instances r WHERE r.kind IN('gpu','cpu','ram','disk') ORDER BY r.node_id,r.id`, nil, func(rows *sql.Rows) error {
 		var key, kind, node, resourceID string
 		if err := rows.Scan(&key, &kind, &node, &resourceID); err != nil {
@@ -155,7 +154,6 @@ func (s *Store) HardwareSamples(ctx context.Context, since, until time.Time, ste
 		if !want(key) {
 			return nil
 		}
-		kindOf[key] = kind
 		series := get(key, kind).series
 		if !slices.Contains(series.Nodes, node) {
 			series.Nodes = append(series.Nodes, node)
