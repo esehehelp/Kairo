@@ -1308,6 +1308,11 @@ it captures instead of suspending it, checkpointable or not:
   a reserved lease revoked as for any pause.
 - leases are released only through the ordinary quiescence proof, and the
   operation is `quiesced` once the executors also confirm the trees are gone.
+  An exiting process gives up its memory, and with it the environment
+  `/proc/PID/environ` reads, before it closes its files (a GPU's among them)
+  and becomes a zombie: one found by its `KAIRO_ATTEMPT_ID` is remembered
+  with its starttime and counted while it is still there with that starttime,
+  not a zombie, with an empty environment.
 - the task ends in state `stopped`: no continuation or restart is planned, and
   its dependants are blocked as for a failed task. The task result records the
   operation, actor and reason.

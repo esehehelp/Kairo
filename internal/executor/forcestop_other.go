@@ -135,17 +135,20 @@ func groupPIDs(t processTree) ([]int, error) {
 }
 
 // attemptPIDs lists the live processes whose environment carries
-// KAIRO_ATTEMPT_ID=attemptID (zombies have an empty environment). A process
-// that exited meanwhile, or one of another user (the attempt's processes run
-// as this executor's user), is skipped; any other failure to read an
+// KAIRO_ATTEMPT_ID=attemptID (zombies have an empty environment), and those
+// the last scan found that are exiting (attemptMembers). A process that
+// exited meanwhile, or one of another user (the attempt's processes run as
+// this executor's user), is skipped; any other failure to read an
 // environment is an error, not a process found absent.
 func attemptPIDs(attemptID string) ([]int, error) {
 	want := []byte("KAIRO_ATTEMPT_ID=" + attemptID)
+	known := attemptMembers.known(attemptID)
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, fmt.Errorf("list processes: %w", err)
 	}
 	self := os.Getpid()
+	found := map[int]string{}
 	var pids []int
 	for _, entry := range entries {
 		pid, err := strconv.Atoi(entry.Name())
@@ -159,14 +162,47 @@ func attemptPIDs(attemptID string) ([]int, error) {
 			}
 			return nil, fmt.Errorf("read the environment of process %d: %w", pid, err)
 		}
+		carries := false
 		for _, kv := range bytes.Split(environ, []byte{0}) {
 			if bytes.Equal(kv, want) {
-				pids = append(pids, pid)
+				carries = true
 				break
 			}
 		}
+		remembered, wasFound := known[pid]
+		if !carries && (!wasFound || len(environ) > 0) {
+			continue
+		}
+		body, err := os.ReadFile("/proc/" + entry.Name() + "/stat")
+		if err != nil {
+			continue // exited meanwhile
+		}
+		identity, err := processidentity.LinuxIdentityFromStat(pid, string(body))
+		if err != nil {
+			if carries {
+				pids = append(pids, pid) // found, not remembered
+			}
+			continue
+		}
+		if !carries && (identity != remembered || statExited(string(body))) {
+			continue
+		}
+		found[pid] = identity
+		pids = append(pids, pid)
 	}
+	attemptMembers.set(attemptID, found)
 	return pids, nil
+}
+
+// statExited reports whether the text of a /proc/PID/stat is a zombie's (or
+// a dead process's).
+func statExited(stat string) bool {
+	end := strings.LastIndexByte(stat, ')')
+	if end < 0 {
+		return false
+	}
+	fields := strings.Fields(stat[end+1:])
+	return len(fields) > 0 && (fields[0] == "Z" || fields[0] == "X")
 }
 
 // launcherRunning reports whether pid (with that creation identity, when
