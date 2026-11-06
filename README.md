@@ -1155,9 +1155,11 @@ Kairo did not make under it, data written before the stores were declared or
 outside them. Each PATH becomes a data object of kind `import` of the
 project (`source_id` the object itself; event `import_ordered`), named NAME
 (with several paths `NAME/<the directory's name>`; without NAME the
-directory's name). It is packed by the executor of the node that serves the
-node's first volatile store by id (never a WSL executor) onto that store,
-like an output directory, the directory opened one directory at a time from
+directory's name). It is packed by an executor of the node (never a WSL
+one) onto a volatile store it serves: the one on the directory's filesystem
+(the store whose declared `filesystem` holds the path, the longest such:
+`F:` for `F:/models`, `/srv/models` for `/srv/models/qwen`), else the first
+by id; like an output directory, the directory opened one directory at a time from
 its volume's root through handles (no link on its path; links, special files
 and mount points inside are skipped, counted), once the store has the room
 for what it holds; then it is copied to a durable store and read back like

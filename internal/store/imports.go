@@ -17,8 +17,10 @@ import (
 // Existing data comes under Kairo by being imported (kairo data import): a
 // directory on a node, outside every store of the node, becomes a data
 // object of kind import (source_id the object itself, source_path the
-// directory). The executor of the node that serves the node's first volatile
-// store (by id; never a WSL executor) packs it there, into
+// directory). It is packed by an executor of the node (never a WSL one) on
+// a volatile store it serves: the one on the directory's filesystem (the
+// store whose declared filesystem holds the path, the longest such), else
+// the first by id; into
 // <root>/packs/<object id>.tar.zst as an output directory is packed, the
 // directory reached through handles; it is then copied to a durable store
 // and read back like every object. The directory is not Kairo's: it is only
@@ -167,8 +169,12 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 		}
 	}
 	sort.Slice(volatile, func(i, j int) bool { return volatile[i].ID < volatile[j].ID })
-	var packStore machine.Store
-	packExecutor := ""
+	// the stores an executor of the node packs on, by id, with that executor
+	type packer struct {
+		store    machine.Store
+		executor string
+	}
+	var packers []packer
 	for _, d := range volatile {
 		for _, executorID := range executorIDs {
 			info, err := executorInfoTx(ctx, tx, executorID)
@@ -176,16 +182,24 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 				return nil, err
 			}
 			if !info.wsl && info.serves(d, executorID) {
-				packStore, packExecutor = d, executorID
+				packers = append(packers, packer{d, executorID})
 				break
 			}
 		}
-		if packExecutor != "" {
-			break
-		}
 	}
-	if packExecutor == "" {
+	if len(packers) == 0 {
 		return nil, fmt.Errorf("%w: node %q has no volatile store an executor packs on (none declared, or only WSL ones)", ErrImportRefused, req.Node)
+	}
+	// packerOf is the store a directory is packed on: the one on its
+	// filesystem, else the first
+	packerOf := func(dir string) packer {
+		best, bestLen := packers[0], -1
+		for _, p := range packers {
+			if fs := machine.StoreRootKey(p.store.Filesystem); machine.PathUnder(dir, p.store.Filesystem) && len(fs) > bestLen {
+				best, bestLen = p, len(fs)
+			}
+		}
+		return best
 	}
 	// directories being imported on the node now
 	var busy []struct{ objectID, dir string }
@@ -201,13 +215,15 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 	if err != nil {
 		return nil, err
 	}
-	posix := strings.HasPrefix(packStore.Root, "/")
 	out := make([]ImportedObject, 0, len(req.Paths))
 	t := now()
 	for _, dir := range req.Paths {
 		if err := machine.CheckDataPath(dir); err != nil {
 			return nil, fmt.Errorf("%w: %v", ErrImportRefused, err)
 		}
+		p := packerOf(dir)
+		packStore, packExecutor := p.store, p.executor
+		posix := strings.HasPrefix(packStore.Root, "/")
 		if strings.HasPrefix(dir, "/") != posix {
 			return nil, fmt.Errorf("%w: %s is not a path of node %s's store %s (%s)", ErrImportRefused, dir, req.Node, packStore.ID, packStore.Root)
 		}

@@ -61,7 +61,7 @@ func TestAnImportNamesDirectoriesOutsideEveryStore(t *testing.T) {
 		"relative":          {Project: "imp", Node: "node", Paths: []string{"data/a"}},
 		"POSIX on Windows":  {Project: "imp", Node: "node", Paths: []string{"/srv/data"}},
 		"dot dot":           {Project: "imp", Node: "node", Paths: []string{"D:/data/../kairo"}},
-		"other drive":       {Project: "imp", Node: "node", Paths: []string{"F:/data"}, DeleteSource: true},
+		"other drive":       {Project: "imp", Node: "node", Paths: []string{"G:/data"}, DeleteSource: true},
 		"no paths":          {Project: "imp", Node: "node"},
 		"name with newline": {Project: "imp", Node: "node", Paths: []string{"D:/data/a"}, Name: "a\nb"},
 	}
@@ -207,5 +207,30 @@ func TestAnImportedDirectoryIsDeletedOnlyWhenAskedFor(t *testing.T) {
 	// once settled, the directory may be imported again
 	if _, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"D:/data/a"}}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A directory is packed on the volatile store of its own filesystem when
+// the node has one, else on the first by id.
+func TestAnImportIsPackedOnTheStoreOfItsFilesystem(t *testing.T) {
+	store := importFixture(t)
+	ctx := context.Background()
+	addTestDisk(t, store, "node", "F:")
+	declareTestStore(t, store,
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "f-models", Class: machine.StoreVolatile, Node: "node", Root: "F:/kairo-store", Filesystem: "F:"},
+	)
+	objects, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"F:/Strata-data", "D:/data/x", "G:/elsewhere"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, want := range []string{"f-models", "d-scratch", "d-scratch"} {
+		if objects[i].StoreID != want {
+			t.Fatalf("%s packed on %s, want %s", objects[i].Path, objects[i].StoreID, want)
+		}
+	}
+	if _, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"F:/models"}, DeleteSource: true}); err != nil {
+		t.Fatalf("an F: directory may be deleted once copied, packed on F:: %v", err)
 	}
 }
