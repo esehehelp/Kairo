@@ -57,10 +57,14 @@ func formatStores(stores []store.StoreStatus) string {
 	}
 	var b strings.Builder
 	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "STORE\tCLASS\tNODE\tSTATE\tROOT\tFILESYSTEM\tTOTAL\tFREE\tACTIVE\tKEPT\tPINNED\tCACHE\tEXTERNAL")
+	fmt.Fprintln(w, "STORE\tCLASS\tNODE\tSTATE\tROOT\tFILESYSTEM\tTOTAL\tFREE\tACTIVE\tKEPT\tOUTPUTS\tPINNED\tCACHE\tEXTERNAL")
 	for _, s := range stores {
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, dash(s.Class), dash(storeNodeLabel(s)), s.State, dash(s.Root), dash(s.Filesystem),
-			optionalSize(s.TotalBytes), optionalSize(s.FreeBytes), formatSize(s.ScratchActiveBytes), formatSize(s.ScratchKeptBytes),
+		outputs := formatSize(s.OutputBytes)
+		if s.Outputs > 0 {
+			outputs = fmt.Sprintf("%s (%d)", outputs, s.Outputs)
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ID, dash(s.Class), dash(storeNodeLabel(s)), s.State, dash(s.Root), dash(s.Filesystem),
+			optionalSize(s.TotalBytes), optionalSize(s.FreeBytes), formatSize(s.ScratchActiveBytes), formatSize(s.ScratchKeptBytes), outputs,
 			formatSize(s.PinnedBytes), formatSize(s.CacheBytes), optionalSize(s.ExternalBytes))
 	}
 	w.Flush()

@@ -59,6 +59,10 @@ type agentSettleScratchRequest struct {
 	Settled store.ScratchSettled `json:"settled"`
 }
 
+type agentRunOutputRequest struct {
+	Output store.RunOutput `json:"output"`
+}
+
 type agentUnlaunchedRequest struct {
 	ExecutorID       string  `json:"executor_id"`
 	OlderThanSeconds float64 `json:"older_than_seconds"`
@@ -256,6 +260,13 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentSettleScratchRequest) (any, error) {
 				return okBody, s.Store.SettleScratch(ctx, b.Settled)
+			}),
+		newAgentOp(s, "run-output", observeRefused, nil,
+			func(ctx context.Context, b agentRunOutputRequest) (string, error) {
+				return s.Store.AttemptNode(ctx, b.Output.AttemptID)
+			},
+			func(ctx context.Context, b agentRunOutputRequest) (any, error) {
+				return okBody, s.Store.RecordRunOutput(ctx, b.Output)
 			}),
 		newAgentOp(s, "unlaunched-leases", observeEmpty, map[string]any{"leases": []store.UnlaunchedLease{}},
 			func(ctx context.Context, b agentUnlaunchedRequest) (string, error) {

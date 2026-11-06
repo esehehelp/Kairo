@@ -23,10 +23,12 @@ import (
 // taken as declared.
 type wslStoreFS struct{ distro string }
 
-// wslStoreScript: $1 is the operation, the rest its arguments. Exit 3: not
-// <root>/scratch/<id>; 4: a link or non-directory; 5: the marker does not
-// name the attempt; 6: the root is not on the declared drive; 7: a scratch
-// to remove only if empty holds more than its marker.
+// wslStoreScript: $1 is the operation, the rest its arguments (list, create
+// and remove take the root, then the kind's directory and marker names: a
+// scratch's or an output's). Exit 3: not <root>/<dir>/<id>; 4: a link or
+// non-directory; 5: the marker does not name the id; 6: the root is not on
+// the declared drive; 7: a directory to remove only if empty holds more than
+// its marker.
 const wslStoreScript = `op=$1; shift
 # realroot: the root resolves to itself (no symlink anywhere on its path),
 # else exit 4.
@@ -61,13 +63,13 @@ size)
 list)
   [ -e "$1" ] || exit 0
   realroot "$1"
-  p="$1/scratch"
+  p="$1/$2"; mk=$3
   [ -e "$p" ] || [ -L "$p" ] || exit 0
   [ -d "$p" ] && [ ! -L "$p" ] || exit 4
   for d in "$p"/*; do
     [ -d "$d" ] && [ ! -L "$d" ] || continue
     id=${d##*/}
-    m="$d/.kairo-scratch"
+    m="$d/$mk"
     # a directory or marker that cannot be read: not known to be Kairo's,
     # nor to be gone
     if [ ! -x "$d" ] || { [ -e "$m" ] && [ ! -r "$m" ]; }; then printf '? %s\n' "$id"; continue; fi
@@ -77,11 +79,11 @@ list)
   done ;;
 create)
   realroot "$1"
-  p="$1/scratch"; id=$2
+  p="$1/$2"; mk=$3; id=$4
   mkdir -p -- "$p" || exit 1
   [ -d "$p" ] && [ ! -L "$p" ] || exit 4
   mountpoint "$p" && { echo "$p is a mount point" >&2; exit 4; }
-  d="$p/$id"; m="$d/.kairo-scratch"
+  d="$p/$id"; m="$d/$mk"
   if [ -d "$d" ] && [ ! -L "$d" ] && [ -f "$m" ] && [ ! -L "$m" ] &&
     [ "$(head -c 1024 -- "$m" | tr -d '[:space:]')" = "$id" ]; then
     printf '%s\n' "$d"; exit 0
@@ -92,7 +94,7 @@ create)
   ( set -C; printf '%s\n' "$id" > "$m" ) || { rmdir -- "$d"; exit 1; }
   printf '%s\n' "$d" ;;
 remove)
-  p="$1/scratch"; dir=$2; id=$3; mode=$4; d="$p/$id"
+  p="$1/$2"; mk=$3; dir=$4; id=$5; mode=$6; d="$p/$id"
   [ "$dir" = "$d" ] || exit 3
   [ -e "$1" ] || exit 0
   realroot "$1"
@@ -101,7 +103,7 @@ remove)
   [ -e "$d" ] || [ -L "$d" ] || exit 0
   [ -d "$d" ] && [ ! -L "$d" ] || exit 4
   mounted "$p" "$d" && { echo "a mount point is at $p or at or under $d" >&2; exit 4; }
-  m="$d/.kairo-scratch"
+  m="$d/$mk"
   if [ -f "$m" ] && [ ! -L "$m" ]; then
     [ "$(head -c 1024 -- "$m" | tr -d '[:space:]')" = "$id" ] || exit 5
   else
@@ -109,9 +111,9 @@ remove)
     exit 5
   fi
   if [ "$mode" = empty ]; then
-    [ -z "$(find "$d" -mindepth 1 -maxdepth 1 ! -name .kairo-scratch -print | head -n 1)" ] || exit 7
+    [ -z "$(find "$d" -mindepth 1 -maxdepth 1 ! -name "$mk" -print | head -n 1)" ] || exit 7
   else
-    find "$d" -mindepth 1 -maxdepth 1 ! -name .kairo-scratch -exec rm -r --one-file-system -- {} + || exit 1
+    find "$d" -mindepth 1 -maxdepth 1 ! -name "$mk" -exec rm -r --one-file-system -- {} + || exit 1
   fi
   rm -f -- "$m" && rmdir -- "$d" ;;
 *)
@@ -178,7 +180,11 @@ func (w wslStoreFS) Usage(ctx context.Context, root string) (int64, int64, error
 func (wslStoreFS) Place(context.Context, string) (string, error) { return "", nil }
 
 func (w wslStoreFS) List(ctx context.Context, root string) ([]string, []string, error) {
-	out, err := w.run(ctx, 5*time.Minute, "list", wslRootPath(root))
+	return w.ListKind(ctx, root, kindScratch)
+}
+
+func (w wslStoreFS) ListKind(ctx context.Context, root string, kind dirKind) ([]string, []string, error) {
+	out, err := w.run(ctx, 5*time.Minute, "list", wslRootPath(root), kind.dir, kind.marker)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -197,10 +203,14 @@ func (w wslStoreFS) List(ctx context.Context, root string) ([]string, []string, 
 }
 
 func (w wslStoreFS) Create(ctx context.Context, root, attemptID string) (string, error) {
+	return w.CreateKind(ctx, root, kindScratch, attemptID)
+}
+
+func (w wslStoreFS) CreateKind(ctx context.Context, root string, kind dirKind, attemptID string) (string, error) {
 	if !validScratchID(attemptID) {
-		return "", fmt.Errorf("%w: attempt id %q", errOutsideRoot, attemptID)
+		return "", fmt.Errorf("%w: id %q", errOutsideRoot, attemptID)
 	}
-	out, err := w.run(ctx, time.Minute, "create", wslRootPath(root), attemptID)
+	out, err := w.run(ctx, time.Minute, "create", wslRootPath(root), kind.dir, kind.marker, attemptID)
 	if err != nil {
 		return "", err
 	}
@@ -208,8 +218,12 @@ func (w wslStoreFS) Create(ctx context.Context, root, attemptID string) (string,
 }
 
 func (w wslStoreFS) Remove(ctx context.Context, root, dir, attemptID string, onlyEmpty bool) error {
+	return w.RemoveKind(ctx, root, kindScratch, dir, attemptID, onlyEmpty)
+}
+
+func (w wslStoreFS) RemoveKind(ctx context.Context, root string, kind dirKind, dir, attemptID string, onlyEmpty bool) error {
 	if !validScratchID(attemptID) {
-		return fmt.Errorf("%w: attempt id %q", errOutsideRoot, attemptID)
+		return fmt.Errorf("%w: id %q", errOutsideRoot, attemptID)
 	}
 	if !strings.HasPrefix(root, "/") {
 		return fmt.Errorf("%w: root %s is not absolute", errOutsideRoot, root)
@@ -218,7 +232,7 @@ func (w wslStoreFS) Remove(ctx context.Context, root, dir, attemptID string, onl
 	if onlyEmpty {
 		mode = "empty"
 	}
-	_, err := w.run(ctx, 30*time.Minute, "remove", wslRootPath(root), dir, attemptID, mode)
+	_, err := w.run(ctx, 30*time.Minute, "remove", wslRootPath(root), kind.dir, kind.marker, dir, attemptID, mode)
 	return err
 }
 

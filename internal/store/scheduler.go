@@ -51,6 +51,10 @@ type Launch struct {
 	Env map[string]string `json:"env,omitempty"`
 	// ScratchTmpdir: the execution points TMPDIR, TMP and TEMP at its scratch.
 	ScratchTmpdir bool `json:"scratch_tmpdir,omitempty"`
+	// RunID is the run the execution belongs to (outputs.go): its output
+	// directory is <root>/outputs/<run id>. Empty from a daemon older than
+	// output directories.
+	RunID string `json:"run_id,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -652,6 +656,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		if err != nil {
 			return nil, err
 		}
+		if launch.RunID, err = runIDTx(ctx, tx, executionID); err != nil {
+			return nil, err
+		}
 		launch.Env, launch.ScratchTmpdir = env, scratchTmpdir
 		return launch, tx.Commit()
 	}
@@ -698,6 +705,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err = appendCoordinationEventTx(ctx, tx, "launch_authorized", &projectID, "attempt", attemptID, &leaseEpoch, map[string]string{"execution_id": executionID, "lease_id": reservation.Lease.ID, "authorization_id": authorizationID}); err != nil {
 		return nil, err
 	}
+	runID, err := runIDTx(ctx, tx, executionID)
+	if err != nil {
+		return nil, err
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -718,6 +729,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		Gang:                 gang,
 		Env:                  env,
 		ScratchTmpdir:        scratchTmpdir,
+		RunID:                runID,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp

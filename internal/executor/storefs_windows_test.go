@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"testing"
+
+	"golang.org/x/sys/windows"
 )
 
 // mklinkJunction makes link a junction to target (no privilege needed, as
@@ -83,4 +85,32 @@ func TestRemoveScratchNeverFollowsAJunction(t *testing.T) {
 	if _, err := fs.Scan(ctx, linked); !errors.Is(err, errScratchLink) {
 		t.Fatalf("scanned through a junction: %v", err)
 	}
+}
+
+// A root on NTFS or exFAT is taken; on exFAT a deletion's clearing of the
+// read-only attribute can only reach the file deleted (no hard links). The
+// exFAT case runs where a drive is exFAT.
+func TestFilesystemTypeTakesNTFSAndExFAT(t *testing.T) {
+	if err := checkFilesystemType(os.Getenv("SystemDrive") + `\`); err != nil {
+		t.Fatalf("the system drive: %v", err)
+	}
+	for drive := 'D'; drive <= 'Z'; drive++ {
+		root := string(drive) + `:\`
+		if _, err := os.Stat(root); err != nil {
+			continue
+		}
+		path, err := windows.UTF16PtrFromString(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		fsName := make([]uint16, windows.MAX_PATH+1)
+		if windows.GetVolumeInformation(path, nil, 0, nil, nil, nil, &fsName[0], uint32(len(fsName))) != nil || windows.UTF16ToString(fsName) != "exFAT" {
+			continue
+		}
+		if err := checkFilesystemType(root); err != nil {
+			t.Fatalf("exFAT drive %s: %v", root, err)
+		}
+		return
+	}
+	t.Log("no exFAT drive here: only NTFS checked")
 }

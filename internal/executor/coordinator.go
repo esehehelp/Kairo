@@ -39,6 +39,7 @@ type Coordinator interface {
 	RecordAttemptScratch(ctx context.Context, scratch store.AttemptScratch) error
 	ScratchToSettle(ctx context.Context, executorID string) ([]store.ScratchSettlement, error)
 	SettleScratch(ctx context.Context, settled store.ScratchSettled) error
+	RecordRunOutput(ctx context.Context, out store.RunOutput) error
 }
 
 var _ Coordinator = (*store.Store)(nil)

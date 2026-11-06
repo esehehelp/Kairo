@@ -191,6 +191,23 @@ func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObse
 	// The whole of <root>/scratch was read (and the report is not cut by its
 	// deadline): a record not found is missing.
 	obs.ScratchScanned = ctx.Err() == nil
+	// The run output directories, the same way.
+	if runs, unread, err := s.fs.ListKind(ctx, s.decl.Root, kindOutput); err == nil {
+		obs.Outputs = map[string]int64{}
+		for _, id := range runs {
+			if size, ok := e.outputSize(ctx, s, id); ok {
+				obs.Outputs[id] = size
+			} else {
+				obs.Outputs[id] = -1
+			}
+		}
+		for _, id := range unread {
+			obs.Outputs[id] = -1
+		}
+		obs.OutputsScanned = ctx.Err() == nil
+	} else if obs.Problem == "" {
+		obs.Problem = "outputs: " + err.Error()
+	}
 	obs.ScanSeconds = time.Since(started).Seconds()
 	return obs
 }

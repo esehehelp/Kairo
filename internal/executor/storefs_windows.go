@@ -87,9 +87,10 @@ func diskUsage(dir string) (int64, int64, error) {
 const markerOpenFlags = 0
 
 // checkFilesystemType checks that root is on NTFS, where Go deletes a file
-// ignoring its read-only attribute (FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE).
-// Elsewhere it clears the attribute first, which a hard link shares with
-// the file outside it points at.
+// ignoring its read-only attribute (FILE_DISPOSITION_IGNORE_READONLY_ATTRIBUTE),
+// or on exFAT, which has no hard links (nor reparse points): elsewhere Go
+// clears the attribute first, which a hard link shares with the file
+// outside it points at, and on exFAT that file can only be the one deleted.
 func checkFilesystemType(root string) error {
 	path, err := windows.UTF16PtrFromString(root)
 	if err != nil {
@@ -103,8 +104,8 @@ func checkFilesystemType(root string) error {
 	if err = windows.GetVolumeInformation(&volume[0], nil, 0, nil, nil, nil, &name[0], uint32(len(name))); err != nil {
 		return fmt.Errorf("filesystem of %s: %w", root, err)
 	}
-	if fsName := windows.UTF16ToString(name); fsName != "NTFS" {
-		return fmt.Errorf("root %s is on %s, not NTFS (where files are deleted without clearing their read-only attribute)", root, fsName)
+	if fsName := windows.UTF16ToString(name); fsName != "NTFS" && fsName != "exFAT" {
+		return fmt.Errorf("root %s is on %s, not NTFS or exFAT (where a deletion never clears the read-only attribute of a file a hard link shares)", root, fsName)
 	}
 	return nil
 }

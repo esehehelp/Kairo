@@ -66,6 +66,34 @@ func TestWSLStoreScript(t *testing.T) {
 			t.Fatalf("%v: %s", err, out)
 		}
 	}
+	// a run's output directory: made (found again), listed apart from
+	// scratch, never removed as a scratch or as another run's
+	out, err := w.CreateKind(ctx, root, kindOutput, "exe_1")
+	if err != nil || out != base+"/r/outputs/exe_1" {
+		t.Fatalf("create output: %q %v", out, err)
+	}
+	if o, err := sh("printf ckpt > " + out + "/step.pt"); err != nil {
+		t.Fatalf("%v: %s", err, o)
+	}
+	if again, err := w.CreateKind(ctx, root, kindOutput, "exe_1"); err != nil || again != out {
+		t.Fatalf("create output again: %q %v", again, err)
+	}
+	if runs, _, err := w.ListKind(ctx, root, kindOutput); err != nil || !reflect.DeepEqual(runs, []string{"exe_1"}) {
+		t.Fatalf("list outputs: %v %v", runs, err)
+	}
+	if err := w.Remove(ctx, root, out, "exe_1", false); !errors.Is(err, errOutsideRoot) {
+		t.Fatalf("an output removed as a scratch: %v", err)
+	}
+	if err := w.RemoveKind(ctx, root, kindOutput, out, "exe_2", false); !errors.Is(err, errOutsideRoot) {
+		t.Fatalf("an output removed as another run's: %v", err)
+	}
+	if _, err := sh("test -e " + out + "/step.pt"); err != nil {
+		t.Fatal("the output directory was touched")
+	}
+	if err := w.RemoveKind(ctx, root, kindOutput, out, "exe_1", false); err != nil {
+		t.Fatalf("remove output: %v", err)
+	}
+
 	if err := w.Remove(ctx, root, dir, "att_1", false); err != nil {
 		t.Fatalf("remove: %v", err)
 	}

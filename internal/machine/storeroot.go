@@ -67,6 +67,13 @@ func IsScratchDir(p, root, attemptID string) bool {
 		StoreRootKey(p) == StoreRootKey(strings.TrimRight(root, `/\`)+"/scratch/"+attemptID)
 }
 
+// IsOutputDir reports whether p is the output directory of runID under root
+// (<root>/outputs/<run id>), as StoreRootKey spells them, both absolute.
+func IsOutputDir(p, root, runID string) bool {
+	return ScratchIDValid(runID) && StoreRootIsAbsolute(p) && StoreRootIsAbsolute(root) &&
+		StoreRootKey(p) == StoreRootKey(strings.TrimRight(root, `/\`)+"/outputs/"+runID)
+}
+
 // checkStoreRoot checks that root is one spelling of one place: absolute,
 // without .. and without control characters. A POSIX root has no whitespace
 // or backslash (the mount table, which a deletion is checked against,

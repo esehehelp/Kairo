@@ -103,13 +103,22 @@ type Local struct {
 	// Scratch (scratch.go): the scratch made for attempts being launched,
 	// by attempt; when scratch was last settled and whether a round runs;
 	// the problems already warned of, by attempt.
-	scratch         map[string]string
+	scratch map[string]string
 	// scratchSized is the size, measured once, of each scratch directory of
 	// an attempt not running here (datastore.go), by attempt.
 	scratchSized    map[string]int64
 	scratchSettleAt time.Time
 	scratchSettling bool
 	scratchProblems map[string]string
+
+	// Output directories (outputs.go): the one made for each attempt being
+	// launched, by attempt, until its environment is built; the run of each
+	// attempt launched with one, by attempt, while it runs here; and the
+	// size, measured once, of each run's directory none of whose attempts
+	// runs here, by run.
+	outputs     map[string]string
+	outputRuns  map[string]string
+	outputSized map[string]int64
 
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
@@ -694,7 +703,8 @@ func resourceBinding(resource store.ResourceInstance) string {
 
 // launchEnv is what an attempt is told: who it is (KAIRO_ATTEMPT_TOKEN is its
 // credential for the worker API), where the daemon is and which CA to trust,
-// which resources it holds, and its scratch (scratchEnv).
+// which resources it holds, its scratch (scratchEnv) and its run's output
+// directory (outputEnv).
 func (e *Local) launchEnv(launch *store.Launch) []string {
 	bindings := make([]string, 0, len(launch.Resources))
 	resourceIDs := make([]string, 0, len(launch.Resources))
@@ -713,7 +723,8 @@ func (e *Local) launchEnv(launch *store.Launch) []string {
 	if len(bindings) > 0 {
 		env = append(env, "CUDA_VISIBLE_DEVICES="+strings.Join(bindings, ","))
 	}
-	return append(env, e.scratchEnv(launch)...)
+	env = append(env, e.scratchEnv(launch)...)
+	return append(env, e.outputEnv(launch)...)
 }
 
 // envKey is how the OS compares variable names: case-insensitively on Windows
@@ -822,6 +833,7 @@ func (e *Local) start(launch *store.Launch) error {
 		return err
 	}
 	e.makeScratch(launch)
+	e.makeOutput(launch)
 	cmd := e.command(launch)
 	e.forgetScratch(launch.Attempt.ID)
 	prepareProcessTree(cmd)
@@ -908,6 +920,7 @@ func (e *Local) start(launch *store.Launch) error {
 		}
 		e.mu.Lock()
 		delete(e.running, launch.Attempt.ID)
+		delete(e.outputRuns, launch.Attempt.ID)
 		e.mu.Unlock()
 		e.forgetLogProblems(launch.Attempt.ID)
 	}()

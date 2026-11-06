@@ -35,6 +35,11 @@ type StoreObservation struct {
 	Scratch        map[string]int64 `json:"scratch,omitempty"`
 	ScratchScanned bool             `json:"scratch_scanned,omitempty"`
 	ScanSeconds    float64          `json:"scan_seconds,omitempty"`
+	// Outputs are the run output directories found under the root (run id ->
+	// bytes, -1 when found but not measured this time); OutputsScanned says
+	// the whole of <root>/outputs was read.
+	Outputs        map[string]int64 `json:"outputs,omitempty"`
+	OutputsScanned bool             `json:"outputs_scanned,omitempty"`
 }
 
 // StoreStaleAfter is how old a store's latest observation may be before its
@@ -124,15 +129,63 @@ func (s *Store) RecordStoreObservation(ctx context.Context, obs StoreObservation
 		FROM attempt_scratch WHERE store_id=$1`, obs.StoreID).Scan(&active, &kept); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO store_observations(store_id,executor_id,observed_at,usable,problem,total_bytes,free_bytes,scratch_active_bytes,scratch_kept_bytes,scratch_unrecorded_bytes,pinned_bytes,cache_bytes)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,0)
+	outputs, err := recordOutputsObservedTx(ctx, tx, obs, t)
+	if err != nil {
+		return err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO store_observations(store_id,executor_id,observed_at,usable,problem,total_bytes,free_bytes,scratch_active_bytes,scratch_kept_bytes,scratch_unrecorded_bytes,pinned_bytes,cache_bytes,output_bytes)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,0,$11)
 		ON CONFLICT(store_id) DO UPDATE SET executor_id=excluded.executor_id,observed_at=excluded.observed_at,usable=excluded.usable,problem=excluded.problem,
 		total_bytes=excluded.total_bytes,free_bytes=excluded.free_bytes,scratch_active_bytes=excluded.scratch_active_bytes,scratch_kept_bytes=excluded.scratch_kept_bytes,
-		scratch_unrecorded_bytes=excluded.scratch_unrecorded_bytes,pinned_bytes=excluded.pinned_bytes,cache_bytes=excluded.cache_bytes`,
-		obs.StoreID, obs.ExecutorID, t, obs.Usable, nullable(obs.Problem), obs.TotalBytes, obs.FreeBytes, active, kept, unrecorded); err != nil {
+		scratch_unrecorded_bytes=excluded.scratch_unrecorded_bytes,pinned_bytes=excluded.pinned_bytes,cache_bytes=excluded.cache_bytes,output_bytes=excluded.output_bytes`,
+		obs.StoreID, obs.ExecutorID, t, obs.Usable, nullable(obs.Problem), obs.TotalBytes, obs.FreeBytes, active, kept, unrecorded, outputs); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// recordOutputsObservedTx applies what a report found of the store's run
+// output directories at the observed root, as RecordStoreObservation does
+// for scratch: a found directory's measured bytes, a missing one found again
+// active again, and, after a whole scan, one not found missing (bytes 0).
+// It returns the bytes of the store's output directories: the recorded
+// ones' and those found without a record.
+func recordOutputsObservedTx(ctx context.Context, tx *sql.Tx, obs StoreObservation, t string) (int64, error) {
+	type found struct {
+		RunID string `json:"run_id"`
+		Bytes int64  `json:"bytes"`
+	}
+	list := make([]found, 0, len(obs.Outputs))
+	for runID, bytes := range obs.Outputs {
+		list = append(list, found{runID, bytes})
+	}
+	seen, err := json.Marshal(list)
+	if err != nil {
+		return 0, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE run_outputs o SET bytes=CASE WHEN r.bytes>=0 THEN r.bytes ELSE o.bytes END,state='active',missing_at=NULL,updated_at=$1
+		FROM jsonb_to_recordset(($2)::jsonb) AS r(run_id text,bytes bigint)
+		WHERE o.run_id=r.run_id AND o.store_id=$3 AND o.root=$4`, t, string(seen), obs.StoreID, obs.Root); err != nil {
+		return 0, err
+	}
+	if obs.OutputsScanned {
+		since := time.Now().UTC().Add(-time.Duration(obs.ScanSeconds*float64(time.Second)) - scratchScanMargin).Format(time.RFC3339Nano)
+		if _, err = tx.ExecContext(ctx, `UPDATE run_outputs o SET state='missing',bytes=0,missing_at=$1,updated_at=$2
+			WHERE o.store_id=$3 AND o.root=$4 AND o.state='active' AND (o.updated_at)::timestamptz<($5)::timestamptz
+			AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(($6)::jsonb) AS r(run_id text,bytes bigint) WHERE r.run_id=o.run_id)`,
+			t, t, obs.StoreID, obs.Root, since, string(seen)); err != nil {
+			return 0, err
+		}
+	}
+	var recorded, unrecorded int64
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(bytes) FILTER (WHERE state='active'),0)::bigint FROM run_outputs WHERE store_id=$1`, obs.StoreID).Scan(&recorded); err != nil {
+		return 0, err
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(r.bytes),0)::bigint FROM jsonb_to_recordset(($1)::jsonb) AS r(run_id text,bytes bigint)
+		WHERE r.bytes>0 AND NOT EXISTS(SELECT 1 FROM run_outputs o WHERE o.run_id=r.run_id AND o.store_id=$2)`, string(seen), obs.StoreID).Scan(&unrecorded); err != nil {
+		return 0, err
+	}
+	return recorded + unrecorded, nil
 }
 
 // KeptScratch is an attempt's scratch kept on a store (its attempt failed or
@@ -160,19 +213,23 @@ type KeptScratch struct {
 // directory was no longer found.
 type StoreStatus struct {
 	machine.Store
-	State              string        `json:"state"`
-	Problem            *string       `json:"problem,omitempty"`
-	ObservedAt         *string       `json:"observed_at,omitempty"`
-	ObservedBy         *string       `json:"observed_by,omitempty"`
-	TotalBytes         *int64        `json:"total_bytes,omitempty"`
-	FreeBytes          *int64        `json:"free_bytes,omitempty"`
-	ScratchActiveBytes int64         `json:"scratch_active_bytes"`
-	ScratchKeptBytes   int64         `json:"scratch_kept_bytes"`
-	PinnedBytes        int64         `json:"pinned_bytes"`
-	CacheBytes         int64         `json:"cache_bytes"`
-	ExternalBytes      *int64        `json:"external_bytes,omitempty"`
-	Kept               []KeptScratch `json:"kept"`
-	Missing            []KeptScratch `json:"missing"`
+	State              string  `json:"state"`
+	Problem            *string `json:"problem,omitempty"`
+	ObservedAt         *string `json:"observed_at,omitempty"`
+	ObservedBy         *string `json:"observed_by,omitempty"`
+	TotalBytes         *int64  `json:"total_bytes,omitempty"`
+	FreeBytes          *int64  `json:"free_bytes,omitempty"`
+	ScratchActiveBytes int64   `json:"scratch_active_bytes"`
+	ScratchKeptBytes   int64   `json:"scratch_kept_bytes"`
+	PinnedBytes        int64   `json:"pinned_bytes"`
+	CacheBytes         int64   `json:"cache_bytes"`
+	// OutputBytes are the store's run output directories as its last report
+	// found them; Outputs counts the recorded ones there now.
+	OutputBytes   int64         `json:"output_bytes"`
+	Outputs       int           `json:"outputs"`
+	ExternalBytes *int64        `json:"external_bytes,omitempty"`
+	Kept          []KeptScratch `json:"kept"`
+	Missing       []KeptScratch `json:"missing"`
 }
 
 // ListStoreStatus is every declared store with its latest observation and
@@ -214,13 +271,27 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 		return nil, err
 	}
 	stamp := time.Now().UTC()
-	err = eachRow(ctx, tx, `SELECT store_id,executor_id,observed_at,usable,problem,total_bytes,free_bytes,scratch_unrecorded_bytes,pinned_bytes,cache_bytes FROM store_observations`, nil, func(rows *sql.Rows) error {
+	err = eachRow(ctx, tx, `SELECT store_id,COUNT(*) FROM run_outputs WHERE state='active' GROUP BY store_id`, nil, func(rows *sql.Rows) error {
+		var storeID string
+		var n int
+		if err := rows.Scan(&storeID, &n); err != nil {
+			return err
+		}
+		if i, ok := index[storeID]; ok {
+			out[i].Outputs = n
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	err = eachRow(ctx, tx, `SELECT store_id,executor_id,observed_at,usable,problem,total_bytes,free_bytes,scratch_unrecorded_bytes,pinned_bytes,cache_bytes,output_bytes FROM store_observations`, nil, func(rows *sql.Rows) error {
 		var storeID, executorID, observedAt string
 		var usable bool
 		var problem sql.NullString
 		var total, free sql.NullInt64
-		var unrecorded, pinned, cache int64
-		if err := rows.Scan(&storeID, &executorID, &observedAt, &usable, &problem, &total, &free, &unrecorded, &pinned, &cache); err != nil {
+		var unrecorded, pinned, cache, outputs int64
+		if err := rows.Scan(&storeID, &executorID, &observedAt, &usable, &problem, &total, &free, &unrecorded, &pinned, &cache, &outputs); err != nil {
 			return err
 		}
 		i, ok := index[storeID]
@@ -239,9 +310,9 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 			st.FreeBytes = &free.Int64
 		}
 		st.ScratchKeptBytes += unrecorded
-		st.PinnedBytes, st.CacheBytes = pinned, cache
+		st.PinnedBytes, st.CacheBytes, st.OutputBytes = pinned, cache, outputs
 		if total.Valid && free.Valid {
-			external := max(0, total.Int64-free.Int64-st.ScratchActiveBytes-st.ScratchKeptBytes-pinned-cache)
+			external := max(0, total.Int64-free.Int64-st.ScratchActiveBytes-st.ScratchKeptBytes-pinned-cache-outputs)
 			st.ExternalBytes = &external
 		}
 		switch at, parseErr := time.Parse(time.RFC3339Nano, observedAt); {

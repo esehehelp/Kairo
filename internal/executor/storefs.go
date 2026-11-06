@@ -15,9 +15,11 @@ import (
 
 // A store's root belongs to Kairo. Under it an attempt's scratch is
 // <root>/scratch/<attempt id>, holding the marker file .kairo-scratch that
-// names the attempt. What Kairo counts there is only what it made (a
-// directory whose marker names it); what it deletes is only a scratch
-// directory recorded for the attempt whose marker names that attempt.
+// names the attempt, and a run's output directory is <root>/outputs/<run id>,
+// holding the marker .kairo-output that names the run (a dirKind each). What
+// Kairo counts there is only what it made (a directory whose marker names
+// it); what it deletes is only a directory recorded for the id its marker
+// names.
 //
 // Nothing is reached through a path: a root (or a scratch directory to
 // size) is opened one directory at a time from its volume's root, each a
@@ -33,7 +35,8 @@ import (
 // hard link to a file outside is unlinked without touching that file: on
 // Linux a file's mode never matters, and on Windows the root must be on NTFS,
 // where deletion ignores the read-only attribute (elsewhere Go clears it
-// first, on the file a hard link shares). Only a directory a task made
+// first, on the file a hard link shares), or on exFAT, which has no hard
+// links. Only a directory a task made
 // unwritable is made writable again, through a handle that can only be a
 // directory (Linux). On Linux <root>/scratch must not be a mount point and a
 // scratch with a mount point anywhere under it (a bind mount included, which
@@ -42,6 +45,8 @@ import (
 const (
 	scratchDirName    = "scratch"
 	scratchMarkerName = ".kairo-scratch"
+	outputDirName     = "outputs"
+	outputMarkerName  = ".kairo-output"
 	// scratchListBatch is how many directory entries are read at a time.
 	scratchListBatch = 1024
 )
@@ -61,6 +66,17 @@ var (
 	// errScratchNotEmpty: a scratch to be deleted only if empty holds more
 	// than its marker.
 	errScratchNotEmpty = errors.New("scratch directory holds more than its marker")
+)
+
+// dirKind is a kind of directory Kairo makes under a store's root: the
+// directory it is made in (<root>/<dir>/<id>) and the marker naming its id.
+type dirKind struct{ dir, marker string }
+
+var (
+	// kindScratch: an attempt's scratch, <root>/scratch/<attempt id>.
+	kindScratch = dirKind{dir: scratchDirName, marker: scratchMarkerName}
+	// kindOutput: a run's output directory, <root>/outputs/<run id>.
+	kindOutput = dirKind{dir: outputDirName, marker: outputMarkerName}
 )
 
 // storeFS is how an executor reaches a store's root: in its own namespace
@@ -91,6 +107,11 @@ type storeFS interface {
 	// Size is the bytes of the regular files under dir (links not followed,
 	// mount points not entered); 0 for a directory that is gone.
 	Size(ctx context.Context, dir string) (int64, error)
+	// ListKind, CreateKind and RemoveKind are List, Create and Remove for the
+	// directories of kind (List, Create and Remove are kindScratch's).
+	ListKind(ctx context.Context, root string, kind dirKind) (ids, unread []string, err error)
+	CreateKind(ctx context.Context, root string, kind dirKind, id string) (string, error)
+	RemoveKind(ctx context.Context, root string, kind dirKind, dir, id string, onlyEmpty bool) error
 }
 
 // scanScratch sizes every Kairo scratch directory under root, by id.
@@ -112,11 +133,14 @@ func scanScratch(ctx context.Context, sfs storeFS, root string) (map[string]int6
 
 // scratchPath is <root>/scratch/<id> as sfs spells paths (a Linux path for a
 // WSL distro's root).
-func scratchPath(sfs storeFS, root, id string) string {
+func scratchPath(sfs storeFS, root, id string) string { return kindPath(sfs, root, kindScratch, id) }
+
+// kindPath is <root>/<kind's dir>/<id> as sfs spells paths.
+func kindPath(sfs storeFS, root string, kind dirKind, id string) string {
 	if _, ok := sfs.(wslStoreFS); ok {
-		return path.Join(wslRootPath(root), scratchDirName, id)
+		return path.Join(wslRootPath(root), kind.dir, id)
 	}
-	return filepath.Join(root, scratchDirName, id)
+	return filepath.Join(root, kind.dir, id)
 }
 
 // validScratchID reports whether id can name a scratch directory: a plain
@@ -167,7 +191,11 @@ func (localStoreFS) Place(_ context.Context, root string) (string, error) {
 	return placeOf(filepath.Clean(root))
 }
 
-func (localStoreFS) List(ctx context.Context, root string) ([]string, []string, error) {
+func (l localStoreFS) List(ctx context.Context, root string) ([]string, []string, error) {
+	return l.ListKind(ctx, root, kindScratch)
+}
+
+func (localStoreFS) ListKind(ctx context.Context, root string, kind dirKind) ([]string, []string, error) {
 	r, err := openDirPath(root, false)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil, nil
@@ -176,7 +204,7 @@ func (localStoreFS) List(ctx context.Context, root string) ([]string, []string, 
 		return nil, nil, err
 	}
 	defer r.Close()
-	sr, err := openPlainDir(r, scratchDirName)
+	sr, err := openPlainDir(r, kind.dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, nil, nil
 	}
@@ -204,7 +232,7 @@ func (localStoreFS) List(ctx context.Context, root string) ([]string, []string, 
 			}
 			continue
 		}
-		id, err := readMarker(ar)
+		id, err := readMarkerOf(ar, kind.marker)
 		ar.Close()
 		switch {
 		case err == nil:
@@ -223,9 +251,13 @@ func (l localStoreFS) Scan(ctx context.Context, root string) (map[string]int64, 
 	return scanScratch(ctx, l, root)
 }
 
-func (localStoreFS) Create(_ context.Context, root, attemptID string) (string, error) {
+func (l localStoreFS) Create(ctx context.Context, root, attemptID string) (string, error) {
+	return l.CreateKind(ctx, root, kindScratch, attemptID)
+}
+
+func (localStoreFS) CreateKind(_ context.Context, root string, kind dirKind, attemptID string) (string, error) {
 	if !validScratchID(attemptID) {
-		return "", fmt.Errorf("%w: attempt id %q", errOutsideRoot, attemptID)
+		return "", fmt.Errorf("%w: id %q", errOutsideRoot, attemptID)
 	}
 	root = filepath.Clean(root)
 	// A root that is gone is made again (Ensure made it), through no link.
@@ -234,24 +266,24 @@ func (localStoreFS) Create(_ context.Context, root, attemptID string) (string, e
 		return "", err
 	}
 	defer r.Close()
-	if err = r.Mkdir(scratchDirName, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+	if err = r.Mkdir(kind.dir, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
 		return "", err
 	}
-	sr, err := openPlainDir(r, scratchDirName)
+	sr, err := openPlainDir(r, kind.dir)
 	if err != nil {
 		return "", err
 	}
 	defer sr.Close()
-	if err = checkScratchParentNotMounted(root); err != nil {
+	if err = checkParentNotMounted(root, kind); err != nil {
 		return "", err
 	}
-	dir := filepath.Join(root, scratchDirName, attemptID)
+	dir := filepath.Join(root, kind.dir, attemptID)
 	if err = sr.Mkdir(attemptID, 0o755); errors.Is(err, fs.ErrExist) {
 		ar, openErr := openPlainDir(sr, attemptID)
 		if openErr != nil {
 			return "", openErr
 		}
-		id, markerErr := readMarker(ar)
+		id, markerErr := readMarkerOf(ar, kind.marker)
 		ar.Close()
 		if markerErr == nil && id == attemptID {
 			return dir, nil
@@ -267,8 +299,8 @@ func (localStoreFS) Create(_ context.Context, root, attemptID string) (string, e
 	}
 	// The marker is created, never opened: a file (or a link) put there
 	// meanwhile is not written through.
-	if err = writeMarker(ar, attemptID); err != nil {
-		_ = ar.Remove(scratchMarkerName)
+	if err = writeMarkerOf(ar, kind.marker, attemptID); err != nil {
+		_ = ar.Remove(kind.marker)
 		ar.Close()
 		_ = sr.Remove(attemptID)
 		return "", err
@@ -279,6 +311,10 @@ func (localStoreFS) Create(_ context.Context, root, attemptID string) (string, e
 
 func (localStoreFS) Remove(ctx context.Context, root, dir, attemptID string, onlyEmpty bool) error {
 	return removeScratch(ctx, root, dir, attemptID, onlyEmpty)
+}
+
+func (localStoreFS) RemoveKind(ctx context.Context, root string, kind dirKind, dir, id string, onlyEmpty bool) error {
+	return removeKindDir(ctx, root, kind, dir, id, onlyEmpty)
 }
 
 func (localStoreFS) Size(ctx context.Context, dir string) (int64, error) {
@@ -361,20 +397,22 @@ func openPlainDir(parent *os.Root, name string) (*os.Root, error) {
 	return sub, nil
 }
 
-// readMarker is the attempt id the marker in a scratch directory names. The
-// marker must be a small regular file, not a link; it is opened without
-// waiting (a FIFO put in its place does not block) and must be the file
-// checked.
-func readMarker(dir *os.Root) (string, error) {
-	fi, err := dir.Lstat(scratchMarkerName)
+// readMarker is the attempt id the marker in a scratch directory names.
+func readMarker(dir *os.Root) (string, error) { return readMarkerOf(dir, scratchMarkerName) }
+
+// readMarkerOf is the id the marker named marker in dir names. The marker
+// must be a small regular file, not a link; it is opened without waiting (a
+// FIFO put in its place does not block) and must be the file checked.
+func readMarkerOf(dir *os.Root, marker string) (string, error) {
+	fi, err := dir.Lstat(marker)
 	if err != nil {
 		return "", err
 	}
-	notMarker := fmt.Errorf("%w: %s is not a small regular file", errScratchMarker, filepath.Join(dir.Name(), scratchMarkerName))
+	notMarker := fmt.Errorf("%w: %s is not a small regular file", errScratchMarker, filepath.Join(dir.Name(), marker))
 	if isLink(fi) || !fi.Mode().IsRegular() || fi.Size() > 1024 {
 		return "", notMarker
 	}
-	f, err := dir.OpenFile(scratchMarkerName, os.O_RDONLY|markerOpenFlags, 0)
+	f, err := dir.OpenFile(marker, os.O_RDONLY|markerOpenFlags, 0)
 	if err != nil {
 		return "", err
 	}
@@ -393,10 +431,15 @@ func readMarker(dir *os.Root) (string, error) {
 	return strings.TrimSpace(string(body)), nil
 }
 
-// writeMarker creates the marker naming attemptID; it fails when anything
-// is already there.
+// writeMarker creates the scratch marker naming attemptID.
 func writeMarker(dir *os.Root, attemptID string) error {
-	f, err := dir.OpenFile(scratchMarkerName, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	return writeMarkerOf(dir, scratchMarkerName, attemptID)
+}
+
+// writeMarkerOf creates the marker named marker naming id; it fails when
+// anything is already there.
+func writeMarkerOf(dir *os.Root, marker, attemptID string) error {
+	f, err := dir.OpenFile(marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 	if err != nil {
 		return err
 	}
@@ -441,8 +484,12 @@ func samePath(a, b string) bool {
 
 // checkScratchParentNotMounted refuses a root whose <root>/scratch is a mount
 // point (a bind mount of a place elsewhere, say).
-func checkScratchParentNotMounted(root string) error {
-	parent := filepath.Join(root, scratchDirName)
+func checkScratchParentNotMounted(root string) error { return checkParentNotMounted(root, kindScratch) }
+
+// checkParentNotMounted refuses a root whose <root>/<kind's dir> is a mount
+// point.
+func checkParentNotMounted(root string, kind dirKind) error {
+	parent := filepath.Join(root, kind.dir)
 	mounts, err := mountsUnderFn(parent)
 	if err != nil {
 		return err
@@ -464,14 +511,20 @@ func checkScratchParentNotMounted(root string) error {
 // directory). onlyEmpty deletes the directory only if it holds nothing but
 // its marker. A directory already gone is no error.
 func removeScratch(ctx context.Context, root, dir, attemptID string, onlyEmpty bool) error {
+	return removeKindDir(ctx, root, kindScratch, dir, attemptID, onlyEmpty)
+}
+
+// removeKindDir is removeScratch for the directory of id of kind,
+// <root>/<kind's dir>/<id>, with its marker.
+func removeKindDir(ctx context.Context, root string, kind dirKind, dir, attemptID string, onlyEmpty bool) error {
 	if !validScratchID(attemptID) {
-		return fmt.Errorf("%w: attempt id %q", errOutsideRoot, attemptID)
+		return fmt.Errorf("%w: id %q", errOutsideRoot, attemptID)
 	}
 	root = filepath.Clean(root)
 	if !filepath.IsAbs(root) {
 		return fmt.Errorf("%w: root %s is not absolute", errOutsideRoot, root)
 	}
-	want := filepath.Join(root, scratchDirName, attemptID)
+	want := filepath.Join(root, kind.dir, attemptID)
 	if dir == "" || !samePath(filepath.Clean(dir), want) {
 		return fmt.Errorf("%w: %s is not %s", errOutsideRoot, dir, want)
 	}
@@ -483,7 +536,7 @@ func removeScratch(ctx context.Context, root, dir, attemptID string, onlyEmpty b
 		return err
 	}
 	defer r.Close()
-	sr, err := openPlainDir(r, scratchDirName)
+	sr, err := openPlainDir(r, kind.dir)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}
@@ -491,12 +544,12 @@ func removeScratch(ctx context.Context, root, dir, attemptID string, onlyEmpty b
 		return err
 	}
 	defer sr.Close()
-	mounts, err := mountsUnderFn(filepath.Join(root, scratchDirName))
+	mounts, err := mountsUnderFn(filepath.Join(root, kind.dir))
 	if err != nil {
 		return err
 	}
 	for _, m := range mounts {
-		if samePath(m, filepath.Join(root, scratchDirName)) || samePath(m, want) || strings.HasPrefix(m, want+string(filepath.Separator)) {
+		if samePath(m, filepath.Join(root, kind.dir)) || samePath(m, want) || strings.HasPrefix(m, want+string(filepath.Separator)) {
 			return fmt.Errorf("%w: %s is a mount point", errScratchLink, m)
 		}
 	}
@@ -520,7 +573,7 @@ func removeScratch(ctx context.Context, root, dir, attemptID string, onlyEmpty b
 		}
 	}
 	defer closeAttempt()
-	id, markerErr := readMarker(ar)
+	id, markerErr := readMarkerOf(ar, kind.marker)
 	if markerErr != nil {
 		if errors.Is(markerErr, fs.ErrNotExist) {
 			names, err := readNames(ctx, ar)
@@ -542,14 +595,14 @@ func removeScratch(ctx context.Context, root, dir, attemptID string, onlyEmpty b
 			return err
 		}
 		for _, name := range names {
-			if name != scratchMarkerName {
+			if name != kind.marker {
 				return fmt.Errorf("%w: %s", errScratchNotEmpty, want)
 			}
 		}
-	} else if err = removeContents(ctx, ar, scratchMarkerName); err != nil {
+	} else if err = removeContents(ctx, ar, kind.marker); err != nil {
 		return err
 	}
-	if err = ar.Remove(scratchMarkerName); err != nil && !errors.Is(err, fs.ErrNotExist) {
+	if err = ar.Remove(kind.marker); err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return err
 	}
 	closeAttempt()

@@ -763,7 +763,7 @@ other reparse point; on Windows the path the opened root resolves to, with
 its drive, must be the declared root, so no substituted drive or short 8.3
 name either; on Linux and in WSL the root must be its own real path) and that
 the root is on the declared filesystem (Windows: the root's drive, which must
-be NTFS; Linux: the same device as the filesystem's mount point; WSL: a root
+be NTFS or exFAT; Linux: the same device as the filesystem's mount point; WSL: a root
 under `/mnt/<drive>` must be on that drive, a root on the distro's own disk is
 taken as declared). The root is opened, and a missing one made, one
 directory at a time from its volume's root, each through its parent's handle
@@ -795,7 +795,9 @@ no agent serves it or one older than stores; `ready`; `unusable`, with the
 `problem`; `stale`: no report for 15 minutes; `undeclared`: no longer
 declared but still holding kept scratch), the filesystem's total and free,
 Kairo's bytes by class (`scratch_active_bytes`, `scratch_kept_bytes`,
-`pinned_bytes` and `cache_bytes`, both 0 until P1b/P1c) and
+`output_bytes` with the number of `outputs`, the run output directories as
+the last report found them, shown as `OUTPUTS`, and `pinned_bytes` and
+`cache_bytes`, both 0 until later P1b steps and P1c) and
 `external_bytes`, what the filesystem uses that Kairo does not know (used
 minus Kairo's classes), then the kept scratch of each store. The latest
 report of a store is the table `store_observations`. An agent older than
@@ -822,6 +824,32 @@ WSL attempt gets `TMPDIR` only, since its variables also reach `wsl.exe`),
 over a declared env. Off by default, since a temporary directory emptied
 with every attempt loses caches such as torch's compile cache. It needs no
 SDK: the executor makes and settles it.
+
+Output directories: what a run is to keep goes in its output directory,
+`<root>/outputs/<run id>` on the store its scratch is made on, holding the
+marker `.kairo-output` (the run id) and named by `KAIRO_OUTPUT_DIR`. A run is
+an execution with the continuations that follow it: a Task's initial or rerun
+execution and its continuations (the run id is that initial or rerun
+execution's id), or a direct execution; a gang rank other than 0 has
+`<leader's run>-rank<r>`. Every attempt of the run launched on that store gets
+the same directory: the first makes it, a continuation finds what the run
+wrote there before (its checkpoint), and a rerun or another Task writes
+somewhere else, so one run never trips over another's files. A continuation
+placed on another node gets a directory of its own there (bringing the
+earlier one comes with P1c). It is recorded at the daemon (`run-output`,
+table `run_outputs`: run, store, root, path, `active`/`missing`, the last
+attempt that got it, bytes; events `output_created`, then `output_reused` for
+each later attempt) under the scratch's rules: only for an attempt about to
+launch in that run, on a volatile store of its node in its executor's
+namespace, at exactly `<root>/outputs/<run id>`; if it cannot be made or
+recorded, the attempt starts without it (a directory made but not recorded is
+left as it is and counted). Reports measure each output directory (at every
+report while an attempt of its run runs on that executor, else once per agent
+process), and one a whole scan no longer finds is `missing` until found
+again. Nothing deletes an output directory yet: packing it, moving it to a
+durable store once its run has ended and deleting it there are the next P1b
+steps. A daemon older than output directories gives no run, and the attempt
+gets none.
 
 Once the attempt has quiesced, or was lost, its executor settles the scratch
 (`scratch-to-settle` every 10 seconds, with an `action` for each:
@@ -864,7 +892,9 @@ entry by entry, the marker last, so a deletion cut short is resumed. Files
 are deleted without changing their attributes (a hard link to a file outside
 is unlinked, the file left as it was): on Windows this needs NTFS, where Go
 deletes ignoring the read-only attribute (elsewhere it clears it first, on
-the file a hard link shares), hence the NTFS check. Only a directory a task
+the file a hard link shares), or exFAT, which has no hard links (nor
+reparse points), so the attribute cleared can only be the deleted file's;
+hence the filesystem check. Only a directory a task
 made unwritable (the scratch directory itself or one under it) is made
 writable again, on Linux, through an `O_PATH|O_NOFOLLOW|O_DIRECTORY` handle
 that can only be that directory, so a file put in its place keeps its mode.
@@ -1196,8 +1226,9 @@ Managed attempts receive `KAIRO_API_URL`, `KAIRO_EXECUTION_ID`,
 `KAIRO_ATTEMPT_ID`, `KAIRO_ATTEMPT_TOKEN` and, when the daemon serves TLS,
 `KAIRO_API_CA`; also `KAIRO_NODE_ID`, `KAIRO_EXECUTOR_ID`,
 `KAIRO_RESOURCE_IDS`, `KAIRO_RESOURCE_BINDINGS` and `CUDA_VISIBLE_DEVICES` (a leased GPU by its UUID, never by index),
-`KAIRO_CONTINUATION_REF` when resuming, `KAIRO_SCRATCH` when the executor
-serves a volatile store (Data stores), and the gang variables for a gang
+`KAIRO_CONTINUATION_REF` when resuming, `KAIRO_SCRATCH` and
+`KAIRO_OUTPUT_DIR` when the executor serves a volatile store (Data stores),
+and the gang variables for a gang
 rank. WSL attempts get them through `WSLENV`, never on the `wsl.exe` command
 line. Rank zero polls and acknowledges commands; the PyTorch adapter broadcasts the command,
 runs every rank's callback, and only publishes the continuation after the

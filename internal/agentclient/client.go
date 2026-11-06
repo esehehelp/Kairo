@@ -147,6 +147,12 @@ func (c *Client) RecordAttemptScratch(ctx context.Context, scratch store.Attempt
 	return c.call(ctx, "attempt-scratch", map[string]any{"scratch": scratch}, nil)
 }
 
+// RecordRunOutput records the output directory made (or found) for an
+// attempt about to launch.
+func (c *Client) RecordRunOutput(ctx context.Context, out store.RunOutput) error {
+	return c.call(ctx, "run-output", map[string]any{"output": out}, nil)
+}
+
 // ScratchToSettle asks for this executor's scratch to delete or keep now.
 func (c *Client) ScratchToSettle(ctx context.Context, executorID string) ([]store.ScratchSettlement, error) {
 	var out struct {
