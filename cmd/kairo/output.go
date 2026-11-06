@@ -84,6 +84,7 @@ type attemptInfo struct {
 	StderrBytes     *int64               `json:"stderr_bytes"`
 	LogProblems     []store.LogProblem   `json:"log_problems"`
 	Energy          *store.AttemptEnergy `json:"energy"`
+	RAMPeakBytes    *int64               `json:"ram_peak_bytes"`
 }
 
 // ended reports whether the attempt's process is gone for good.

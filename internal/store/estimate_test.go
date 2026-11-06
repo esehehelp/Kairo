@@ -1,6 +1,7 @@
 package store
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -213,5 +214,36 @@ func TestExpectedRAMNeedsThreeRunsOfASpecificKey(t *testing.T) {
 	h.ram[keys[2]] = append(h.ram[keys[2]], 1<<29)
 	if got, ok := h.expectedRAM(keys); !ok || got != 3<<30+ramHeadroom {
 		t.Fatalf("expected %d %v, want %d", got, ok, 3<<30+ramHeadroom)
+	}
+}
+
+// A task's attempts carry the most RAM they were seen to use.
+func TestTaskDetailShowsTheRAMAnAttemptWasSeenToUse(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	if _, err := store.ApplyProject(ctx, projectSpec(t, orchestrationManifest())); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileProjectTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	launch := launchNext(t, store)
+	detail, err := store.GetTaskDetail(ctx, "orchestrated", "prepare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := detail.Executions[0].Attempts[0].RAMPeakBytes; got != nil {
+		t.Fatalf("ram peak before any sample: %d", *got)
+	}
+	used := int64(300 << 20)
+	if err := store.RecordAttemptUsage(ctx, launch.Attempt.ID, &used, nil); err != nil {
+		t.Fatal(err)
+	}
+	if detail, err = store.GetTaskDetail(ctx, "orchestrated", "prepare"); err != nil {
+		t.Fatal(err)
+	}
+	if got := detail.Executions[0].Attempts[0].RAMPeakBytes; got == nil || *got != used {
+		t.Fatalf("ram peak %v", got)
 	}
 }

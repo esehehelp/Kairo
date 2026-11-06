@@ -197,6 +197,10 @@ func renderAttempt(w io.Writer, a attemptInfo) {
 	if a.Energy != nil {
 		line("energy", "%s", energyText(*a.Energy))
 	}
+	if a.RAMPeakBytes != nil {
+		// beside the RAM reserved (resources above): what to declare
+		line("ram", "peak %s seen (sampled every 15 s)", byteSize(*a.RAMPeakBytes))
+	}
 }
 
 // energyText is what an attempt's GPUs used: "GPU 1.23 kWh", "GPU 37.5 Wh
