@@ -255,8 +255,13 @@ nothing to do and its actuating operations are refused (423).
 Each attempt gets its own worker token at launch authorization, in
 `KAIRO_ATTEMPT_TOKEN`. It identifies the attempt (and the lease and epoch it
 was issued under) to the worker API, and stops working once the attempt has
-quiesced or was fenced (for instance marked lost by a daemon restart). The
-executor never passes its own process's `KAIRO_*` variables to an attempt.
+quiesced or was fenced (for instance marked lost by a daemon restart). A
+worker that calls in the few hundred milliseconds between its start and its
+executor recording it running (the attempt authorized, its lease prepared) is
+answered as running, with no command, its heartbeat and processes recorded,
+not fenced: a server that polls at once, or a rank that registers at once,
+would otherwise be stopped by its own launch. The executor never passes its
+own process's `KAIRO_*` variables to an attempt.
 
 ### TLS
 
