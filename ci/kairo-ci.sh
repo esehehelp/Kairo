@@ -16,15 +16,19 @@ for arg in "$@"; do
   *) rev=$arg ;;
   esac
 done
-site=local/ci-site.env
+# The site's settings and the script's files are in the main checkout's local/ (also when run from a worktree).
+main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
+site=${KAIRO_CI_SITE:-$main/local/ci-site.env}
 [ -f "$site" ] || { echo "$site is missing (see README, CI on Kairo)" >&2; exit 2; }
 # CI_WINDOWS_ROOT: where windows-local's checks unpack (/d/kairo-ci); CI_PVE1_HOST: the Proxmox host of pve1-work
 # (root@...); CI_PVE1_VMID: pve1-work's container.
 . "$site"
 sha=$(git rev-parse --short=12 "$rev^{commit}")
-mkdir -p local/ci/src
-tar=local/ci/src/$sha.tar
-git archive --format=tar -o "$tar" "$sha"
+work=$main/local/ci
+mkdir -p "$work/src"
+tar=$work/src/$sha.tar
+# The tree as committed: no CRLF conversion (core.autocrlf), which would break the scripts and gofmt on Linux.
+git -c core.autocrlf=false -c core.eol=lf archive --format=tar -o "$tar" "$sha"
 echo "kairo-ci $sha: $(git log -1 --format=%s "$sha")"
 
 # windows-local reads it here
@@ -34,7 +38,7 @@ cp "$tar" "$CI_WINDOWS_ROOT/src/$sha.tar"
 scp -q -o BatchMode=yes "$tar" "$CI_PVE1_HOST:/tmp/kairo-ci-$sha.tar"
 ssh -o BatchMode=yes "$CI_PVE1_HOST" "pct push $CI_PVE1_VMID /tmp/kairo-ci-$sha.tar /srv/kairo-ci/src/$sha.tar --perms 644 && rm /tmp/kairo-ci-$sha.tar"
 
-manifest=local/ci/kairo-ci-$sha.toml
+manifest=$work/kairo-ci-$sha.toml
 sed "s/@SHA@/$sha/g" ci/tasks.toml.in > "$manifest"
 kairo project apply "$manifest"
 if [ -z "$wait" ]; then
