@@ -112,7 +112,7 @@ func TestLineageFollowsLivingParents(t *testing.T) {
 	}
 	for name, change := range map[string]func(map[int]process){
 		"a parent that started after its child (a reused pid)": func(m map[int]process) { m[10] = process{identity: "later", parent: 1, start: 250} },
-		"an exited parent": func(m map[int]process) { m[10] = process{identity: "launcher", parent: 1, start: 100, exited: true} },
+		"an exited parent":     func(m map[int]process) { m[10] = process{identity: "launcher", parent: 1, start: 100, exited: true} },
 		"an unreadable parent": func(m map[int]process) { delete(m, 10) },
 	} {
 		t.Run(name, func(t *testing.T) {
