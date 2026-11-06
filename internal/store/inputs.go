@@ -202,9 +202,10 @@ func sameNamespace(ctx context.Context, q queryer, declared []machine.Store, p i
 
 // pinInputNodeTx plans an orchestrated execution with inputs onto the node
 // they are on, unless its executor selector names a node itself or they are
-// on more than one (or none: the launch then says why).
+// on more than one (or none: the launch then says why). A gang is not
+// pinned: its ranks go on distinct nodes (rank 0 reads the inputs).
 func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *ExecutionSpec) error {
-	if len(spec.Inputs) == 0 {
+	if len(spec.Inputs) == 0 || spec.Gang != nil {
 		return nil
 	}
 	var selector map[string]any

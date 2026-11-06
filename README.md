@@ -549,8 +549,9 @@ labels may take what is placed there.
   run's output directory still on its volatile store, or an imported
   directory still where it was imported from (not deleted, or kept without
   `--delete-source`). A task with inputs is planned onto the node they are
-  on (unless its `[tasks.execution.executor]` names a `node` itself, or they
-  are on more than one), and each is checked when its attempt launches: on
+  on (unless its `[tasks.execution.executor]` names a `node` itself, they
+  are on more than one, or it is a gang, whose rank 0 alone is handed its
+  inputs), and each is checked when its attempt launches: on
   that node, in its executor's namespace (a store it serves; an imported
   directory of a non-WSL executor for a non-WSL one), there as a directory.
   One that is not (on another node, or deleted once copied) aborts the

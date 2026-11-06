@@ -666,8 +666,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		if launch.RunID, err = runIDTx(ctx, tx, executionID); err != nil {
 			return nil, err
 		}
-		if launch.Inputs, err = resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON); err != nil {
-			return nil, err
+		if launch.Gang == nil || launch.Gang.Rank == 0 {
+			if launch.Inputs, err = resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON); err != nil {
+				return nil, err
+			}
 		}
 		launch.Env, launch.ScratchTmpdir, launch.Confine = env, scratchTmpdir, confine || s.confinesAll(time.Now())
 		return launch, tx.Commit()
@@ -719,9 +721,12 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err != nil {
 		return nil, err
 	}
-	inputs, err := resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON)
-	if err != nil {
-		return nil, err
+	// a gang's inputs are rank 0's to read
+	var inputs []LaunchInput
+	if gang == nil || gang.Rank == 0 {
+		if inputs, err = resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON); err != nil {
+			return nil, err
+		}
 	}
 	if err = tx.Commit(); err != nil {
 		return nil, err

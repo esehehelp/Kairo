@@ -44,7 +44,8 @@ func confineCommand(cmd *exec.Cmd, writable []string, scratch string) (func(), e
 		args = append(args, "--write", w)
 	}
 	args = append(append(args, "--"), cmd.Args...)
-	cmd.Path, cmd.Args = self, args
+	// the attempt's argv[0] is looked up by the launcher, on its own PATH
+	cmd.Path, cmd.Args, cmd.Err = self, args, nil
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
