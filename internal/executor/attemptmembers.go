@@ -11,11 +11,12 @@ import (
 // of a WSL attempt, are found by the KAIRO_ATTEMPT_ID in their environment.
 // A process that exits gives up its memory, and with it its environment,
 // before it closes its files (a GPU's among them) and becomes a zombie, which
-// takes a while for a big one: no longer found by its environment, it is
-// still there. So each scan remembers the processes it found, with their
-// creation identity (the stat starttime), and the next counts one of them
-// that is still there with the same identity, not a zombie, while its
-// environment reads empty.
+// takes a while for a big one: its environment then reads empty, or its
+// reading is refused (permission denied), so it is no longer found by it,
+// yet it is still there. So each scan remembers the processes it found, with
+// their creation identity (the stat starttime), and the next counts one of
+// them that is still there with the same identity, not a zombie, while its
+// environment reads empty or cannot be read.
 
 // memberMemo holds, per scan key (an attempt; for WSL, its distro and
 // attempt), the processes the last scan found, by pid.
@@ -48,7 +49,8 @@ func (m *memberMemo) set(key string, found map[int]string) {
 // wslAttemptScript finds the Linux processes of an attempt ($1): those whose
 // environment carries its KAIRO_ATTEMPT_ID, and those of the processes the
 // last scan found (the remaining arguments, pid:starttime) that are still
-// there with that starttime, not zombies, with an empty environment (exiting).
+// there with that starttime, not zombies, with an environment that is empty
+// or cannot be read (exiting).
 // It signals them unless the signal ($2) is 0, and prints them as
 // pid:starttime, as read before the signal.
 const wslAttemptScript = `a=$1 sig=$2
@@ -58,8 +60,9 @@ set -f
 for m in "$@"; do
   p=${m%%:*}
   case " $pids " in *" $p "*) continue ;; esac
-  grep -qz . "/proc/$p/environ" 2>/dev/null
-  [ $? -eq 1 ] || continue
+  # 0: an environment without the id (another process now); 1: empty;
+  # 2: refused (exiting) or gone (then the stat below is not there)
+  grep -qz . "/proc/$p/environ" 2>/dev/null && continue
   st=$(cat "/proc/$p/stat" 2>/dev/null) || continue
   set -- ${st##*) }
   case $1 in Z|X) continue ;; esac

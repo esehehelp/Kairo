@@ -136,7 +136,8 @@ func groupPIDs(t processTree) ([]int, error) {
 
 // attemptPIDs lists the live processes whose environment carries
 // KAIRO_ATTEMPT_ID=attemptID (zombies have an empty environment), and those
-// the last scan found that are exiting (attemptMembers). A process that
+// the last scan found that are exiting (attemptMembers: their environment
+// reads empty, or is refused). A process that
 // exited meanwhile, or one of another user (the attempt's processes run as
 // this executor's user), is skipped; any other failure to read an
 // environment is an error, not a process found absent.
@@ -155,12 +156,19 @@ func attemptPIDs(attemptID string) ([]int, error) {
 		if err != nil || pid == self {
 			continue
 		}
+		remembered, wasFound := known[pid]
 		environ, err := os.ReadFile("/proc/" + entry.Name() + "/environ")
 		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) || errors.Is(err, fs.ErrPermission) {
+			switch {
+			case errors.Is(err, fs.ErrPermission) && wasFound:
+				// an exiting process (its memory gone) is refused: one
+				// found before is checked by its stat below
+				environ = nil
+			case errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) || errors.Is(err, fs.ErrPermission):
 				continue
+			default:
+				return nil, fmt.Errorf("read the environment of process %d: %w", pid, err)
 			}
-			return nil, fmt.Errorf("read the environment of process %d: %w", pid, err)
 		}
 		carries := false
 		for _, kv := range bytes.Split(environ, []byte{0}) {
@@ -169,7 +177,6 @@ func attemptPIDs(attemptID string) ([]int, error) {
 				break
 			}
 		}
-		remembered, wasFound := known[pid]
 		if !carries && (!wasFound || len(environ) > 0) {
 			continue
 		}
