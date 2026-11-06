@@ -81,12 +81,17 @@ func TestStoresUnavailableAreWarnedOnce(t *testing.T) {
 }
 
 // An executor serves its node's stores in its namespace: one naming it, and
-// (unless it is WSL) one naming no executor. It makes a missing root and
-// checks the root's filesystem; a store on another one is unusable.
+// (unless it is WSL) one naming no executor. It makes a missing volatile
+// root, never a durable one (a disk not mounted), and checks the root's
+// filesystem; a store on another one is unusable.
 func TestStoresServedMadeAndChecked(t *testing.T) {
 	dir := t.TempDir()
+	if err := os.Mkdir(filepath.Join(dir, "wrong-root"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	fake := &fakeStores{stores: []machine.Store{
 		{ID: "local", Class: machine.StoreVolatile, Node: "node", Root: filepath.Join(dir, "local-root"), Filesystem: testFilesystem(dir)},
+		{ID: "missing", Class: machine.StoreDurable, Node: "node", Root: filepath.Join(dir, "durable-root"), Filesystem: testFilesystem(dir)},
 		{ID: "wrong", Class: machine.StoreDurable, Node: "node", Root: filepath.Join(dir, "wrong-root"), Filesystem: otherFilesystem()},
 		{ID: "wsl-only", Class: machine.StoreVolatile, Node: "node", Executor: "ubuntu-wsl", Root: "/var/tmp/kairo", Filesystem: "D:"},
 	}}
@@ -94,8 +99,13 @@ func TestStoresServedMadeAndChecked(t *testing.T) {
 	e := storesExecutor(t, fake, &logs)
 	e.refreshStores(context.Background())
 	served := e.servedStores()
-	if len(served) != 2 || served[0].decl.ID != "local" || !served[0].usable || served[1].decl.ID != "wrong" || served[1].usable || !strings.Contains(served[1].problem, "is not on filesystem") {
+	if len(served) != 3 || served[0].decl.ID != "local" || !served[0].usable ||
+		served[1].decl.ID != "missing" || served[1].usable || !strings.Contains(served[1].problem, "is not there") ||
+		served[2].decl.ID != "wrong" || served[2].usable || !strings.Contains(served[2].problem, "is not on filesystem") {
 		t.Fatalf("served: %+v", served)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "durable-root")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("a durable root was made: %v", err)
 	}
 	if fi, err := os.Stat(filepath.Join(dir, "local-root")); err != nil || !fi.IsDir() {
 		t.Fatalf("root not made: %v", err)
@@ -112,7 +122,7 @@ func TestStoresServedMadeAndChecked(t *testing.T) {
 	wsl := storesExecutor(t, fake, &logs)
 	wsl.ID, wsl.Kind = "ubuntu-wsl", "wsl2"
 	wsl.storeFSOverride = localStoreFS{}
-	if got := []bool{wsl.serves(fake.stores[0]), wsl.serves(fake.stores[2])}; got[0] || !got[1] {
+	if got := []bool{wsl.serves(fake.stores[0]), wsl.serves(fake.stores[3])}; got[0] || !got[1] {
 		t.Fatalf("WSL executor serves %v", got)
 	}
 }

@@ -162,10 +162,10 @@ func TestARootWithALinkOnItsPathIsRefused(t *testing.T) {
 	base := t.TempDir()
 	symlinkOrSkip(t, outside, filepath.Join(base, "linked"))
 	root := filepath.Join(base, "linked")
-	if err := fs.Ensure(ctx, root, testFilesystem(base)); !errors.Is(err, errScratchLink) {
+	if err := fs.Ensure(ctx, root, testFilesystem(base), true); !errors.Is(err, errScratchLink) {
 		t.Fatalf("ensure: %v", err)
 	}
-	if err := fs.Ensure(ctx, filepath.Join(root, "store"), testFilesystem(base)); !errors.Is(err, errScratchLink) {
+	if err := fs.Ensure(ctx, filepath.Join(root, "store"), testFilesystem(base), true); !errors.Is(err, errScratchLink) {
 		t.Fatalf("ensure below the link: %v", err)
 	}
 	if _, _, err := fs.List(ctx, root); !errors.Is(err, errScratchLink) {

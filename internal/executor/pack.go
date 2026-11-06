@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -39,8 +40,12 @@ import (
 // Inside, regular files and directories are packed; links, special files
 // and (on Linux) mount points are not followed or entered, only counted as
 // skipped; the marker itself is left out. A file must be the one listed and
-// keep its size while it is read (nothing writes there any more), else the
-// round fails and is tried again. Packing is not done for a store inside a
+// keep its size and mtime while it is read, and hold no more than its size
+// (nothing writes there any more), else the round fails and is tried again;
+// a name that is not UTF-8 is refused (the file list could not name it).
+// Once renamed, the directory is synced and both are read back from disk
+// around the cache: only a pack that reads back as written is recorded.
+// Packing is not done for a store inside a
 // WSL distro yet (its files are Linux files the executor cannot read through
 // handles): such an object stays to be packed.
 
@@ -63,6 +68,10 @@ var (
 	errPackNotHere = errors.New("directories of a store inside a WSL distro are not packed yet")
 	// errPackChanged: a file changed while it was packed.
 	errPackChanged = errors.New("a file changed while it was packed")
+	// errPackName: a name the file list cannot hold.
+	errPackName = errors.New("a name that is not UTF-8")
+	// errPackReadBack: a pack that does not read back as it was written.
+	errPackReadBack = errors.New("the pack does not read back as it was written")
 )
 
 // packResult is a pack made: its paths, sizes, contents and sha256s.
@@ -130,6 +139,22 @@ func (localStoreFS) Pack(ctx context.Context, root string, kind dirKind, id, obj
 	}
 	res.packPath = filepath.Join(root, packsDirName, objectID+packSuffix)
 	res.manifestPath = res.packPath + manifestSuffix
+	listSHA, _, err := hashUncached(pr, objectID+packSuffix+manifestSuffix, res.manifestPath)
+	if err == nil {
+		var packSHA string
+		var packBytes int64
+		packSHA, packBytes, err = hashUncached(pr, objectID+packSuffix, res.packPath)
+		if err == nil && (packSHA != res.packSHA256 || packBytes != res.packBytes || listSHA != res.manifestHash) {
+			err = fmt.Errorf("%w: %d bytes, sha256 %s (list %s); written %d bytes, sha256 %s (list %s)",
+				errPackReadBack, packBytes, packSHA, listSHA, res.packBytes, res.packSHA256, res.manifestHash)
+		}
+	}
+	if err != nil {
+		// not recorded: made again at the next round
+		_ = pr.Remove(objectID + packSuffix)
+		_ = pr.Remove(objectID + packSuffix + manifestSuffix)
+		return res, err
+	}
 	return res, nil
 }
 
@@ -176,7 +201,8 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 	for _, m := range mounts {
 		mounted[filepath.Clean(m)] = true
 	}
-	var lines []string
+	type listLine struct{ path, line string }
+	var lines []listLine
 	pending := []string{"."}
 	for len(pending) != 0 {
 		dir := pending[len(pending)-1]
@@ -192,6 +218,9 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 				return res, err
 			}
 			rel := path.Join(dir, info.Name())
+			if !utf8.ValidString(rel) {
+				return res, fmt.Errorf("%w: %q", errPackName, rel)
+			}
 			switch {
 			case dir == "." && info.Name() == marker:
 			case isLink(info):
@@ -210,7 +239,7 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 				if err != nil {
 					return res, err
 				}
-				lines = append(lines, line)
+				lines = append(lines, listLine{rel, line})
 				res.files++
 				res.contentBytes += size
 			default:
@@ -235,11 +264,14 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 	}
 	written = true
 	res.packBytes, res.packSHA256 = counted.n, hex.EncodeToString(packHash.Sum(nil))
-	sort.Strings(lines)
-	body := manifestHeader + "\n"
-	if len(lines) != 0 {
-		body += strings.Join(lines, "\n") + "\n"
+	// sorted by path, not by the escaped line
+	sort.Slice(lines, func(i, j int) bool { return lines[i].path < lines[j].path })
+	var list strings.Builder
+	list.WriteString(manifestHeader + "\n")
+	for _, l := range lines {
+		list.WriteString(l.line + "\n")
 	}
+	body := list.String()
 	listHash := sha256.Sum256([]byte(body))
 	res.manifestHash = hex.EncodeToString(listHash[:])
 	if err = writeNew(packs, listName+partialSuffix, []byte(body)); err != nil {
@@ -253,12 +285,20 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 	if err = packs.Rename(packName+partialSuffix, packName); err != nil {
 		return res, err
 	}
+	if err = syncRenamed(packs, listName, packName); err != nil {
+		return res, err
+	}
+	for name, size := range map[string]int64{packName: res.packBytes, listName: int64(len(body))} {
+		if fi, err := packs.Lstat(name); err != nil || !fi.Mode().IsRegular() || fi.Size() != size {
+			return res, fmt.Errorf("%w: %s not there as written (%v)", errPackReadBack, name, err)
+		}
+	}
 	return res, nil
 }
 
 // packFile writes the regular file rel (as info listed it) to tw and returns
-// its file list line and size. The file opened must be the one listed and
-// must keep its size while it is read.
+// its file list line and size. The file opened must be the one listed, must
+// hold no more than its size and keep its size and mtime while it is read.
 func packFile(src *os.Root, tw *tar.Writer, rel string, info fs.FileInfo) (string, int64, error) {
 	fh, err := src.OpenFile(filepath.FromSlash(rel), os.O_RDONLY|markerOpenFlags, 0)
 	if err != nil {
@@ -283,6 +323,17 @@ func packFile(src *os.Root, tw *tar.Writer, rel string, info fs.FileInfo) (strin
 	}
 	if n != size {
 		return "", 0, fmt.Errorf("%w: %s shrank from %d to %d bytes", errPackChanged, rel, size, n)
+	}
+	var more [1]byte
+	if m, _ := fh.Read(more[:]); m > 0 {
+		return "", 0, fmt.Errorf("%w: %s grew past %d bytes", errPackChanged, rel, size)
+	}
+	after, err := fh.Stat()
+	if err != nil {
+		return "", 0, err
+	}
+	if after.Size() != size || !after.ModTime().Equal(opened.ModTime()) {
+		return "", 0, fmt.Errorf("%w: %s was written while it was read", errPackChanged, rel)
 	}
 	return fmt.Sprintf("%s\t%d\t%s\t%d", escapeListPath(rel), size, hex.EncodeToString(h.Sum(nil)), opened.ModTime().UnixNano()), size, nil
 }
@@ -318,31 +369,14 @@ func writeNew(dir *os.Root, name string, body []byte) error {
 // makePacks packs, in the background, what the daemon says is to be packed
 // now (at most every packInterval), once the daemon has answered for stores.
 func (e *Local) makePacks() {
-	e.mu.Lock()
-	due := e.storesKnown && !e.packing && time.Since(e.packAt) >= packInterval
-	if due {
-		e.packing = true
-		e.packAt = time.Now()
-	}
-	e.mu.Unlock()
-	if !due {
-		return
-	}
-	go func() {
-		defer func() {
-			e.mu.Lock()
-			e.packing = false
-			e.mu.Unlock()
-		}()
-		ctx, cancel := context.WithTimeout(context.Background(), packRoundTimeout)
-		defer cancel()
-		e.packDue(ctx)
-	}()
+	e.startRound(&e.packs, packInterval, packRoundTimeout, e.packDue)
 }
 
 // packDue packs every object the daemon says is due on a usable store this
 // executor serves, one at a time, and records each. A failure is warned once
-// per object (again when it changes) and tried again at the next round.
+// per object (again when it changes) and tried again later (roundProblem).
+// A source an attempt this executor launched still runs in is left for
+// later.
 func (e *Local) packDue(ctx context.Context) {
 	orders, err := e.Store.PacksToMake(ctx, e.ID)
 	if err != nil {
@@ -363,6 +397,8 @@ func (e *Local) packDue(ctx context.Context) {
 			continue
 		case !ok || !s.usable || s.decl.Root != o.Root:
 			// not served here as ordered now: asked again next round
+			continue
+		case e.inUse(kind, o.SourceID) || !e.due(&e.packs, o.ObjectID):
 			continue
 		}
 		if o.Bytes != nil {
@@ -389,22 +425,7 @@ func (e *Local) packDue(ctx context.Context) {
 	}
 }
 
-// packProblem warns of a packing problem once (again when it changes); an
-// empty message clears it. objectID "" is the round itself.
+// packProblem is roundProblem for packing.
 func (e *Local) packProblem(objectID, message string, err error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if message == "" {
-		delete(e.packProblems, objectID)
-		return
-	}
-	text := message + ": " + err.Error()
-	if e.packProblems[objectID] == text {
-		return
-	}
-	if e.packProblems == nil {
-		e.packProblems = map[string]string{}
-	}
-	e.packProblems[objectID] = text
-	e.Logger.Warn(message, "executor_id", e.ID, "object_id", objectID, "error", err)
+	e.roundProblem(&e.packs, objectID, message, err)
 }

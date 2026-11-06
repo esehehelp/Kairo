@@ -117,3 +117,21 @@ func placeOf(string) (string, error) { return "", nil }
 // mountsUnder: a volume mounted in a folder is a reparse point there, which
 // nothing enters or deletes through; there is no mount to look for.
 func mountsUnder(string) ([]string, error) { return nil, nil }
+
+// syncRenamed makes the renames of names in dir durable as far as Windows
+// lets it: a directory cannot be flushed, so each file renamed is (with its
+// directory entry on exFAT, its metadata and the journal on NTFS).
+func syncRenamed(dir *os.Root, names ...string) error {
+	for _, name := range names {
+		f, err := dir.OpenFile(name, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		err = f.Sync()
+		f.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}

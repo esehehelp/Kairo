@@ -81,7 +81,9 @@ func (e *Local) refreshStores(ctx context.Context) {
 			continue
 		}
 		s := servedStore{decl: decl.Normalized(), fs: fs, usable: true}
-		if err := fs.Ensure(ctx, decl.Root, decl.Filesystem); err != nil {
+		// A durable store's root is never made: one missing may be a disk
+		// not mounted, and what went there would be on another.
+		if err := fs.Ensure(ctx, decl.Root, decl.Filesystem, decl.Class != machine.StoreDurable); err != nil {
 			s.usable, s.problem = false, err.Error()
 			e.Logger.Warn("store not usable", "executor_id", e.ID, "store_id", decl.ID, "root", decl.Root, "error", err)
 		}

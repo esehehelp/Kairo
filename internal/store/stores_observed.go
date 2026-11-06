@@ -228,7 +228,8 @@ type StoreStatus struct {
 	OutputBytes int64 `json:"output_bytes"`
 	Outputs     int   `json:"outputs"`
 	// PackBytes are the packs made on the store and still there (their
-	// source not deleted yet); Packs counts them.
+	// source neither deleted nor kept: a kept source's pack is removed);
+	// Packs counts them.
 	PackBytes int64 `json:"pack_bytes"`
 	Packs     int   `json:"packs"`
 	// CopyBytes are the verified copies on a durable store; Copies counts
@@ -310,7 +311,7 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = eachRow(ctx, tx, `SELECT store_id,COUNT(*),COALESCE(SUM(pack_bytes),0)::bigint FROM data_objects WHERE state='packed' AND source_state<>'deleted' GROUP BY store_id`, nil, func(rows *sql.Rows) error {
+	err = eachRow(ctx, tx, `SELECT store_id,COUNT(*),COALESCE(SUM(pack_bytes),0)::bigint FROM data_objects WHERE state='packed' AND source_state NOT IN('deleted','kept') GROUP BY store_id`, nil, func(rows *sql.Rows) error {
 		var storeID string
 		var n int
 		var bytes int64

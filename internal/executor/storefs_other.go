@@ -34,7 +34,9 @@ func deviceOf(fi os.FileInfo) uint64 {
 }
 
 // onFilesystem reports whether root is on the filesystem mounted at
-// filesystem (/, /srv): the same device.
+// filesystem (/, /srv): filesystem is a mount point (where /proc tells: a
+// disk not mounted leaves a plain directory there, on its parent's device)
+// and root is on the same device.
 func onFilesystem(root, filesystem string) (bool, error) {
 	a, err := os.Stat(root)
 	if err != nil {
@@ -44,7 +46,31 @@ func onFilesystem(root, filesystem string) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	if mounted, known, err := isMountPoint(filesystem); err != nil {
+		return false, err
+	} else if known && !mounted {
+		return false, fmt.Errorf("%s is not a mount point", filesystem)
+	}
 	return deviceOf(a) == deviceOf(b), nil
+}
+
+// isMountPoint reports whether p is a mount point, from
+// /proc/self/mountinfo; known is false where there is none.
+func isMountPoint(p string) (mounted, known bool, err error) {
+	if _, err := os.Stat("/proc/self/mountinfo"); errors.Is(err, fs.ErrNotExist) {
+		return false, false, nil
+	}
+	p = filepath.Clean(p)
+	points, err := mountsUnder(p)
+	if err != nil {
+		return false, true, err
+	}
+	for _, m := range points {
+		if m == p {
+			return true, true, nil
+		}
+	}
+	return false, true, nil
 }
 
 // checkResolvesTo checks that root resolves to itself (no link anywhere on
@@ -172,4 +198,15 @@ func unescapeMountField(s string) string {
 		b.WriteByte(s[i])
 	}
 	return b.String()
+}
+
+// syncRenamed makes the renames of names in dir durable: the directory
+// synced.
+func syncRenamed(dir *os.Root, _ ...string) error {
+	f, err := dir.Open(".")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }

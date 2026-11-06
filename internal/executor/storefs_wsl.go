@@ -45,8 +45,9 @@ ensure)
   root=$1; fs=$2
   # no symlink on the part of the path that exists, before anything is made
   [ "$(realpath -m -- "$root" 2>/dev/null)" = "$root" ] || { echo "root $root is not its own real path" >&2; exit 4; }
-  mkdir -p -- "$root" || exit 1
-  [ -d "$root" ] || { echo "root $root is not a directory" >&2; exit 1; }
+  # made only when $3 is 1 (never a durable store's)
+  if [ "$3" = 1 ]; then mkdir -p -- "$root" || exit 1; fi
+  [ -d "$root" ] || { echo "root $root is not there, or not a directory" >&2; exit 1; }
   realroot "$root"
   case "$root/" in
   /mnt/[a-zA-Z]/*)
@@ -153,8 +154,12 @@ func (w wslStoreFS) run(ctx context.Context, timeout time.Duration, args ...stri
 	return out, nil
 }
 
-func (w wslStoreFS) Ensure(ctx context.Context, root, filesystem string) error {
-	_, err := w.run(ctx, time.Minute, "ensure", wslRootPath(root), filesystem)
+func (w wslStoreFS) Ensure(ctx context.Context, root, filesystem string, create bool) error {
+	made := "0"
+	if create {
+		made = "1"
+	}
+	_, err := w.run(ctx, time.Minute, "ensure", wslRootPath(root), filesystem, made)
 	return err
 }
 

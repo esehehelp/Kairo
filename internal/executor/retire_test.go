@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"kairo/internal/machine"
 	"kairo/internal/store"
@@ -145,4 +146,101 @@ func TestDurableCopiesAreReadBack(t *testing.T) {
 	if len(fake.scrubbed) != 3 || !strings.Contains(fake.scrubbed[2].Problem, "its pack") {
 		t.Fatalf("a copy gone: %+v", fake.scrubbed)
 	}
+}
+
+// A source is deleted only if that loses nothing its pack does not hold:
+// written to, added to, or holding a link since it was packed, it is kept
+// (with why) and its pack goes all the same; files listed but gone (a
+// deletion cut short) are no matter; one an attempt still runs in is left.
+func TestASourceThatChangedSinceItWasPackedIsKept(t *testing.T) {
+	ctx := context.Background()
+	run := func(t *testing.T, change func(t *testing.T, dir string), inUse bool) (*fakeRetire, string, packResult) {
+		t.Helper()
+		volatile := filepath.Join(t.TempDir(), "volatile")
+		res := packed(t, volatile)
+		dir := filepath.Join(volatile, outputDirName, "exe_1")
+		change(t, dir)
+		fake := &fakeRetire{fakeCopies: newFakeCopies()}
+		var logs bytes.Buffer
+		e := storesExecutor(t, fake, &logs)
+		e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
+		if inUse {
+			e.outputRuns = map[string]string{"att_9": "exe_1"}
+		}
+		fake.deletions = []store.DeletionOrder{{ObjectID: "obj_1", Kind: store.ObjectOutput, SourceID: "exe_1", StoreID: "c-scratch", Root: volatile}}
+		e.deleteDue(ctx)
+		return fake, dir, res
+	}
+	kept := func(t *testing.T, change func(t *testing.T, dir string), why string) {
+		t.Helper()
+		fake, dir, res := run(t, change, false)
+		if len(fake.settled) != 2 || fake.settled[1].State != store.SourceKept || !strings.Contains(fake.settled[1].Reason, why) {
+			t.Fatalf("settled %+v, want kept for %q", fake.settled, why)
+		}
+		if !exists(filepath.Join(dir, "weights.bin")) || exists(res.packPath) || exists(res.manifestPath) {
+			t.Fatalf("source deleted, or its pack left (pack there: %v)", exists(res.packPath))
+		}
+	}
+	t.Run("appended to", func(t *testing.T) {
+		kept(t, func(t *testing.T, dir string) {
+			f, err := os.OpenFile(filepath.Join(dir, "log.txt"), os.O_WRONLY|os.O_APPEND, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = f.WriteString("step 5001 ok\n")
+			f.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+		}, "has changed since it was packed")
+	})
+	t.Run("rewritten, same size", func(t *testing.T) {
+		kept(t, func(t *testing.T, dir string) {
+			p := filepath.Join(dir, "log.txt")
+			body, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = os.WriteFile(p, bytes.ToUpper(body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			later := time.Now().Add(time.Hour)
+			if err = os.Chtimes(p, later, later); err != nil {
+				t.Fatal(err)
+			}
+		}, "has changed since it was packed")
+	})
+	t.Run("added to", func(t *testing.T) {
+		kept(t, func(t *testing.T, dir string) {
+			if err := os.MkdirAll(filepath.Join(dir, "ckpt-2"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "ckpt-2", "model.pt"), []byte("late"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, "ckpt-2/model.pt is not in its pack")
+	})
+	t.Run("a link", func(t *testing.T) {
+		kept(t, func(t *testing.T, dir string) {
+			if err := os.Symlink("weights.bin", filepath.Join(dir, "latest")); err != nil {
+				t.Skipf("no symlink here: %v", err)
+			}
+		}, "latest is a link")
+	})
+	t.Run("a deletion cut short", func(t *testing.T) {
+		fake, dir, res := run(t, func(t *testing.T, dir string) {
+			if err := os.Remove(filepath.Join(dir, "weights.bin")); err != nil {
+				t.Fatal(err)
+			}
+		}, false)
+		if len(fake.settled) != 2 || fake.settled[1].State != store.SourceDeleted || exists(dir) || exists(res.packPath) {
+			t.Fatalf("settled %+v (source there: %v)", fake.settled, exists(dir))
+		}
+	})
+	t.Run("in use", func(t *testing.T) {
+		fake, dir, res := run(t, func(*testing.T, string) {}, true)
+		if len(fake.settled) != 0 || !exists(dir) || !exists(res.packPath) {
+			t.Fatalf("touched while an attempt runs in it: %+v", fake.settled)
+		}
+	})
 }

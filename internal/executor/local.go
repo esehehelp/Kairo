@@ -121,23 +121,14 @@ type Local struct {
 	outputRuns  map[string]string
 	outputSized map[string]int64
 
-	// Packing (pack.go): when what is to be packed was last asked for,
-	// whether a round runs, and the problems already warned of, by object.
-	packAt       time.Time
-	packing      bool
-	packProblems map[string]string
-
-	// Copies to a durable store (transfer.go): the client packs are fetched
-	// from other agents with (their CA trusted), when copies were last asked
-	// for, whether a round runs, and the problems already warned of.
-	PackClient   *http.Client
-	copyAt       time.Time
-	copying      bool
-	copyProblems map[string]string
-
-	// Deleting copied sources and reading durable copies back (retire.go).
-	deletions round
-	scrubs    round
+	// Packing (pack.go), copies to a durable store (transfer.go; PackClient
+	// fetches packs from other agents, their CA trusted), deleting copied
+	// sources and reading durable copies back (retire.go): each a round.
+	PackClient *http.Client
+	packs      round
+	copies     round
+	deletions  round
+	scrubs     round
 
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
@@ -857,6 +848,15 @@ func (e *Local) start(launch *store.Launch) error {
 	}
 	e.makeScratch(launch)
 	e.makeOutput(launch)
+	launched := false
+	defer func() {
+		if !launched {
+			// not started after all: its run no longer runs here
+			e.mu.Lock()
+			delete(e.outputRuns, launch.Attempt.ID)
+			e.mu.Unlock()
+		}
+	}()
 	cmd := e.command(launch)
 	e.forgetScratch(launch.Attempt.ID)
 	prepareProcessTree(cmd)
@@ -947,6 +947,7 @@ func (e *Local) start(launch *store.Launch) error {
 		e.mu.Unlock()
 		e.forgetLogProblems(launch.Attempt.ID)
 	}()
+	launched = true
 	return nil
 }
 

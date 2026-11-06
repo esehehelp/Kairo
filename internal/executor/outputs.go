@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 
 	"kairo/internal/store"
 )
@@ -16,8 +17,10 @@ import (
 // store, without a run (a daemon older than output directories), or when
 // making or recording it fails (logged), the attempt starts without one; a
 // directory made but not recorded is left as it is (it is counted as
-// unrecorded, and a later attempt of the run records it). Nothing here
-// deletes an output directory.
+// unrecorded, and a later attempt of the run records it), unless the daemon
+// refused it for good (the run's directory is packed already, or the attempt
+// is no longer to launch): then one holding only its marker, just made, is
+// removed again. Nothing else here deletes an output directory.
 
 // makeOutput makes (or finds) and records the output directory of an attempt
 // about to start and keeps its path for the attempt's environment.
@@ -41,6 +44,9 @@ func (e *Local) makeOutput(launch *store.Launch) {
 		RunID: launch.RunID, StoreID: s.decl.ID, ExecutorID: e.ID, Root: s.decl.Root, Path: dir}
 	if err = e.retryUnanswered(ctx, func() error { return e.Store.RecordRunOutput(ctx, record) }); err != nil {
 		e.Logger.Warn("attempt starts without an output directory: not recorded", "attempt_id", attemptID, "run_id", launch.RunID, "path", dir, "error", err)
+		if errors.Is(err, store.ErrStaleEpoch) {
+			_ = s.fs.RemoveKind(ctx, s.decl.Root, kindOutput, dir, launch.RunID, true)
+		}
 		return
 	}
 	e.mu.Lock()

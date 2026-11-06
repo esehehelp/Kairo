@@ -778,13 +778,18 @@ deleted, and nothing outside the root is ever walked.
 Every executor serves the stores of its node in its own namespace: those
 naming it as `executor`, and, unless it is a WSL executor, those naming none.
 It asks the daemon for its node's stores when it starts and every 5 minutes
-(agent operation `stores`), makes each root that is missing, and checks that
+(agent operation `stores`), makes each volatile store's root that is missing
+(never a durable store's: one missing may be a disk not mounted, and what
+Kairo wrote there would be on another; it is unusable until it is there), and
+checks that
 no component of the root's path is a link (a symlink, a junction or any
 other reparse point; on Windows the path the opened root resolves to, with
 its drive, must be the declared root, so no substituted drive or short 8.3
 name either; on Linux and in WSL the root must be its own real path) and that
 the root is on the declared filesystem (Windows: the root's drive, which must
-be NTFS or exFAT; Linux: the same device as the filesystem's mount point; WSL: a root
+be NTFS or exFAT; Linux: the same device as the filesystem, which must be a
+mount point in `/proc/self/mountinfo` (a disk not mounted leaves a plain
+directory there); WSL: a root
 under `/mnt/<drive>` must be on that drive, a root on the distro's own disk is
 taken as declared). The root is opened, and a missing one made, one
 directory at a time from its volume's root, each through its parent's handle
@@ -818,7 +823,8 @@ declared but still holding kept scratch), the filesystem's total and free,
 Kairo's bytes by class (`scratch_active_bytes`, `scratch_kept_bytes`,
 `output_bytes` with the number of `outputs`, the run output directories as
 the last report found them, shown as `OUTPUTS`, `pack_bytes` with the number
-of `packs` made there and not deleted yet, shown as `PACKS`, `copy_bytes`
+of `packs` made there and not removed yet (with their source, or with a source
+kept), shown as `PACKS`, `copy_bytes`
 with the number of verified `copies` on a durable store, shown as `COPIES`,
 and `pinned_bytes` and `cache_bytes`, both 0 until P1c) and
 `external_bytes`, what the filesystem uses that Kairo does not know (used
@@ -868,7 +874,8 @@ each later attempt) under the scratch's rules: only for an attempt about to
 launch in that run, on a volatile store of its node in its executor's
 namespace, at exactly `<root>/outputs/<run id>`; if it cannot be made or
 recorded, the attempt starts without it (a directory made but not recorded is
-left as it is and counted). Reports measure each output directory (at every
+left as it is and counted; one refused for good, its run's directory packed
+already, is removed again if it holds only its marker). Reports measure each output directory (at every
 report while an attempt of its run runs on that executor, else once per agent
 process), and one a whole scan no longer finds is `missing` until found
 again. Once its run has ended it is packed, copied to a durable store and
@@ -900,10 +907,18 @@ files and mount points are skipped (counted, never followed or entered), and
 the marker is left out. The directory is reached as the store's rules say: the
 executor derives it from the root, the object's kind and its id (never a path
 it is sent), opens it one directory at a time through handles and checks its
-marker names it; a file must be the one listed and keep its size while it is
-read, else the round fails and is tried again. Both files are written under a
-`.partial` name, synced and renamed (the list first), so a pack that is there
-is whole, and a round cut short starts the object again. An object whose
+marker names it; a file must be the one listed, keep its size and mtime
+while it is read and hold no more than its size, else the round fails and is
+tried again; a name that is not UTF-8 is refused (the list could not name
+it). The list is sorted by the raw path. Both files are written under a
+`.partial` name, synced and renamed (the list first), the renames synced (the
+directory on Linux, each file on Windows), and then both are read back from
+disk around the cache: only a pack that reads back as written is recorded,
+so a pack that is there is whole, and a round cut short starts the object
+again. A source an attempt this executor launched still runs in waits. An
+object that fails is tried again at the next round, then after twice as long
+each time (from a minute) up to an hour; this holds for copies, deletions
+and read-backs too. An object whose
 directory is bigger than the store's free space waits. Directories of a store
 inside a WSL distro are not packed yet (the executor cannot read the distro's
 files through handles): such an object stays `packing`, warned once.
@@ -928,15 +943,24 @@ the daemon's CA, with a token the daemon issued for that copy (`GET
 agent asks the daemon about each request (`pack-read`): only the copy's
 latest token, unexpired (12 hours, a round's longest), from the node whose
 executor made the pack, gets it; anything else is 403 or 404 and learns
-nothing. A fetch cut short is resumed with a range request. Both files are
-written as `.partial` and synced, then read back from disk around the cache
-(Windows: `FILE_FLAG_NO_BUFFERING`; Linux: the file's cached pages dropped
-first), and only if the pack's size and sha256 and the list's sha256 match
-are they renamed (the list first) and the copy recorded `verified`, which the
-daemon checks again. A copy that does not match has its `.partial` files
-removed (Kairo's own incomplete writes, the only thing it ever deletes on a
-durable store) and is fetched again at the next round; one renamed but not
-recorded is read back as it is.
+nothing. A fetch cut short is resumed with a range request, a `.partial`
+pack already as long as the pack is not fetched again, a body longer than the
+pack fails, and a fetch that receives nothing for 5 minutes is given up (the
+client bounds the connection, handshake and answer's head too; the server
+closes idle connections and warns of a refused request once a minute per
+object). Both files are written as `.partial` and synced, then read back from
+disk around the cache (Windows: `FILE_FLAG_NO_BUFFERING`, the file opened by
+its path checked to be the one in the directory opened; Linux: the file's
+cached pages dropped first, best effort: a filesystem with a cache of its own,
+ZFS's ARC, may still answer from memory), and only if the pack's size and
+sha256 and the list's sha256 match are they renamed (the list first), the
+renames synced, and the copy recorded `verified`, which the daemon checks
+again, once the files under their final names are the ones read back. A copy
+that does not match has its files removed and is fetched again later: its
+`.partial` files, or, renamed but not recorded (an order is only for a copy
+not recorded), its final ones. These, Kairo's own writes never recorded, are
+the only thing it ever deletes on a durable store. One renamed but not
+recorded that matches is recorded as it is.
 
 Deleting what was copied: once an object's copy is verified, the executor
 that packed it deletes its source, the run's output directory or the kept
@@ -944,7 +968,17 @@ scratch, and the pack and file list made of it (`deletions-to-make` every
 minute, `settle-deletion`; events `source_deleted`, `source_kept`), by the
 scratch's rules below (the directory derived from the root, its kind and its
 id, its marker naming it, nothing reached through a link), and only while the
-declaration still makes the directory Kairo's. It first claims the deletion
+declaration still makes the directory Kairo's. Before anything goes, the
+source is checked against the pack's file list: each regular file there must
+be listed with the size and mtime it was packed with (stat'ed through its
+handle), and nothing else may be there but directories: a file written or
+added since, a link, a special file or a mount point (none of which the pack
+holds) keeps the source, with why, and its pack is removed all the same (the
+copy holds it). Files listed but gone are no matter (a deletion cut short
+removed them). A source an attempt this executor launched still runs in
+waits. A marker that cannot be read now (denied, in use, an I/O error) or a
+directory replaced while it was opened is a failure tried again, not a
+reason to keep. It first claims the deletion
 (`deleting`, taken only while there is a verified copy that no read-back has
 found damaged, on a store the declaration still makes durable at that root,
 and the declaration makes the source Kairo's); until it is settled `deleted`, or `kept` when the deletion is

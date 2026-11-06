@@ -58,9 +58,11 @@ var (
 	errOutsideRoot = errors.New("not a scratch directory of the store's root")
 	// errScratchLink: a link, a non-directory or a mount point where a
 	// plain directory must be (the root, a component of its path, the
-	// scratch parent or a scratch directory), or a directory changed while it
-	// was being opened.
+	// scratch parent or a scratch directory).
 	errScratchLink = errors.New("a link, mount point or non-directory where a plain directory must be")
+	// errRaced: a directory or file replaced while it was being opened (a
+	// race, so tried again, unlike a link found there).
+	errRaced = errors.New("changed while it was opened")
 	// errScratchMarker: a scratch directory whose marker is missing or names
 	// another attempt.
 	errScratchMarker = errors.New("scratch marker does not name the attempt")
@@ -83,9 +85,10 @@ var (
 // storeFS is how an executor reaches a store's root: in its own namespace
 // (localStoreFS) or inside a WSL distro (wslStoreFS).
 type storeFS interface {
-	// Ensure makes the root if it is missing and checks that it is a
-	// directory on the declared filesystem whose path has no link in it.
-	Ensure(ctx context.Context, root, filesystem string) error
+	// Ensure makes the root if it is missing (only with create: never a
+	// durable store's) and checks that it is a directory on the declared
+	// filesystem whose path has no link in it.
+	Ensure(ctx context.Context, root, filesystem string, create bool) error
 	// Usage is the total and free bytes of the filesystem holding root.
 	Usage(ctx context.Context, root string) (total, free int64, err error)
 	// Place is where root really is ("" when it cannot be told): two roots
@@ -164,9 +167,12 @@ func validScratchID(id string) bool {
 // localStoreFS reaches a root in the executor's own namespace.
 type localStoreFS struct{}
 
-func (localStoreFS) Ensure(_ context.Context, root, filesystem string) error {
+func (localStoreFS) Ensure(_ context.Context, root, filesystem string, create bool) error {
 	root = filepath.Clean(root)
-	r, err := openDirPath(root, true)
+	r, err := openDirPath(root, create)
+	if !create && errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("root %s is not there (Kairo makes no durable store's root: one missing may be a disk not mounted): %w", root, err)
+	}
 	if err != nil {
 		return err
 	}
@@ -396,7 +402,7 @@ func openPlainDir(parent *os.Root, name string) (*os.Root, error) {
 	}
 	if !os.SameFile(fi, opened) {
 		sub.Close()
-		return nil, fmt.Errorf("%w: %s changed while it was opened", errScratchLink, filepath.Join(parent.Name(), name))
+		return nil, fmt.Errorf("%w: %s", errRaced, filepath.Join(parent.Name(), name))
 	}
 	return sub, nil
 }
@@ -591,7 +597,12 @@ func removeKindDir(ctx context.Context, root string, kind dirKind, dir, attemptI
 				}
 			}
 		}
-		return fmt.Errorf("%w: %s: %v", errScratchMarker, want, markerErr)
+		if errors.Is(markerErr, fs.ErrNotExist) || errors.Is(markerErr, errScratchMarker) {
+			// no marker in what holds more, or not a marker: not Kairo's
+			return fmt.Errorf("%w: %s: %v", errScratchMarker, want, markerErr)
+		}
+		// unreadable now (denied, in use, an I/O error): tried again
+		return fmt.Errorf("read the marker of %s: %w", want, markerErr)
 	}
 	if id != attemptID {
 		return fmt.Errorf("%w: %s names %q, not %q", errScratchMarker, want, id, attemptID)

@@ -35,7 +35,7 @@ func TestWSLStoreScript(t *testing.T) {
 	}
 
 	root := base + "/./r//"
-	if err := w.Ensure(ctx, root, "D:"); err != nil {
+	if err := w.Ensure(ctx, root, "D:", true); err != nil {
 		t.Fatalf("ensure %s: %v", root, err)
 	}
 	dir, err := w.Create(ctx, root, "att_1")
@@ -101,7 +101,7 @@ func TestWSLStoreScript(t *testing.T) {
 		t.Fatal("scratch not removed")
 	}
 
-	if err := w.Ensure(ctx, base+"/link/sub", "D:"); !errors.Is(err, errScratchLink) {
+	if err := w.Ensure(ctx, base+"/link/sub", "D:", true); !errors.Is(err, errScratchLink) {
 		t.Fatalf("a root through a symlink: %v", err)
 	}
 	if _, err := sh("test -e " + base + "/real/sub"); err == nil {
