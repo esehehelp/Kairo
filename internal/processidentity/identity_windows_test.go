@@ -15,6 +15,19 @@ import (
 	"time"
 )
 
+// requireWSL skips a test that runs against the Ubuntu distro unless
+// KAIRO_TEST_WSL=1 says this host has it (a Windows runner has wsl.exe and no
+// distro).
+func requireWSL(t *testing.T) {
+	t.Helper()
+	if os.Getenv("KAIRO_TEST_WSL") != "1" {
+		t.Skip("set KAIRO_TEST_WSL=1 to run against WSL")
+	}
+	if _, err := exec.LookPath("wsl.exe"); err != nil {
+		t.Skip("WSL is unavailable")
+	}
+}
+
 func TestHostProcessAliveUsesCreationIdentity(t *testing.T) {
 	pid := os.Getpid()
 	identity, err := ForPID(pid)
@@ -58,9 +71,7 @@ func TestLineageOfAChildNamesThisProcess(t *testing.T) {
 }
 
 func TestWSLProcessLivenessRecognizesAbsentPID(t *testing.T) {
-	if _, err := exec.LookPath("wsl.exe"); err != nil {
-		t.Skip("WSL is unavailable")
-	}
+	requireWSL(t)
 	state, err := WSLProcessLiveness(context.Background(), "Ubuntu", 2147483647, "proc:2147483647:starttime:1")
 	if err != nil {
 		t.Fatal(err)
@@ -71,9 +82,7 @@ func TestWSLProcessLivenessRecognizesAbsentPID(t *testing.T) {
 }
 
 func TestWSLProcessLivenessRecognizesLivePID(t *testing.T) {
-	if _, err := exec.LookPath("wsl.exe"); err != nil {
-		t.Skip("WSL is unavailable")
-	}
+	requireWSL(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "wsl.exe", "-d", "Ubuntu", "--exec", "sh", "-c", "printf '%s\\n' $$; exec sleep 10")

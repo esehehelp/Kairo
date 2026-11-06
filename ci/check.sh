@@ -70,7 +70,7 @@ windows)
   ;;
 wsl)
   step "go test against WSL"
-  KAIRO_TEST_WSL=1 go test -count=1 -run 'WSL' ./internal/executor/
+  KAIRO_TEST_WSL=1 go test -count=1 -run 'WSL' ./internal/executor/ ./internal/processidentity/
   ;;
 sdk-python)
   step "pytest (Python SDK)"

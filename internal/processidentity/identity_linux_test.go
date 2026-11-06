@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestLineageOfAChildNamesThisProcessAndItsAttempt(t *testing.T) {
@@ -27,7 +28,15 @@ func TestLineageOfAChildNamesThisProcessAndItsAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got := LineageOf(cmd.Process.Pid, child)
+	// Just after exec the environment may read empty for a moment (the new
+	// image has not set it up yet): read again until it is there.
+	var got Lineage
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		got = LineageOf(cmd.Process.Pid, child)
+		if got.AttemptID != "" || time.Now().After(deadline) {
+			break
+		}
+	}
 	if len(got.Ancestors) == 0 || got.Ancestors[0] != self || got.AttemptID != "att-lineage" {
 		t.Fatalf("lineage = %+v, want attempt att-lineage and ancestors starting with %s", got, self)
 	}
