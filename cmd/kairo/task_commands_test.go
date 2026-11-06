@@ -224,7 +224,7 @@ func showFixture() *contractAPI {
 						{"problem": "log_forward_failed", "stream": "stderr", "detail": "agent API 500: no space left on device", "first_seen_at": stamp(base.Add(-3*time.Hour - 20*time.Minute)),
 							"last_seen_at": stamp(base.Add(-3*time.Hour - 15*time.Minute)), "resolved_at": stamp(base.Add(-3*time.Hour - 15*time.Minute))},
 					},
-					"energy": map[string]any{"gpu_joules": 4428000, "gpu_seconds_covered": 3590, "partial": true, "updated_at": stamp(base.Add(-3 * time.Hour))},
+					"energy":         map[string]any{"gpu_joules": 4428000, "gpu_seconds_covered": 3590, "partial": true, "updated_at": stamp(base.Add(-3 * time.Hour))},
 					"ram_peak_bytes": 9 << 30}}},
 			{"ordinal": 2, "execution_id": "exe_2", "reason": "retry", "state": "waiting",
 				"gang": []map[string]any{{"rank": 0, "execution_id": "exe_2", "state": "waiting"}, {"rank": 1, "execution_id": "exe_2r1", "state": "authorized", "node_id": "pve0"}},
