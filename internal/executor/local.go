@@ -123,6 +123,9 @@ type Local struct {
 	outputs     map[string]string
 	outputRuns  map[string]string
 	outputSized map[string]int64
+	// caches: each attempt being launched's cache directory (confine.go),
+	// until its environment is built.
+	caches map[string]string
 
 	// Packing (pack.go), copies to a durable store (transfer.go; PackClient
 	// fetches packs from other agents, their CA trusted), deleting copied
@@ -745,6 +748,7 @@ func (e *Local) launchEnv(launch *store.Launch) []string {
 	}
 	env = append(env, e.scratchEnv(launch)...)
 	env = append(env, e.outputEnv(launch)...)
+	env = append(env, e.cacheEnv(launch)...)
 	for _, in := range launch.Inputs {
 		if in.Path != "" {
 			env = append(env, datainput.EnvName(in.Name)+"="+in.Path)
@@ -885,6 +889,7 @@ func (e *Local) start(launch *store.Launch) error {
 	}
 	e.makeScratch(launch)
 	e.makeOutput(launch)
+	e.makeCache(launch)
 	launched := false
 	defer func() {
 		if !launched {
@@ -897,6 +902,15 @@ func (e *Local) start(launch *store.Launch) error {
 	cmd := e.command(launch)
 	e.forgetScratch(launch.Attempt.ID)
 	prepareProcessTree(cmd)
+	if launch.Confine {
+		release, err := e.confine(cmd)
+		if err != nil {
+			return err
+		}
+		if release != nil {
+			defer release()
+		}
+	}
 	outPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stdout.log")
 	errPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stderr.log")
 	stdout, err := openAttemptLog(outPath)

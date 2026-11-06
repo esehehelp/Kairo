@@ -98,6 +98,9 @@ type ExecutionSpec struct {
 	// Inputs are what the execution reads, handed to its attempts by path
 	// (inputs.go). Left out of the digest when empty.
 	Inputs []datainput.Input `json:"inputs,omitempty"`
+	// Confine: its attempts may write only where Kairo hands them (the data
+	// policy may confine every execution). Left out of the digest when false.
+	Confine bool `json:"confine,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the

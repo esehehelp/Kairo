@@ -34,6 +34,8 @@ type submitExecutionRequest struct {
 	FinishBy  string `json:"finish_by,omitempty"`
 	// Inputs: data the execution reads (datainput).
 	Inputs []datainput.Input `json:"inputs,omitempty"`
+	// Confine: its attempts write only where Kairo hands them.
+	Confine bool `json:"confine,omitempty"`
 }
 
 func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +60,7 @@ func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		InputContinuationRef: body.InputContinuationRef, Exclusive: body.Exclusive, Capacity: body.Capacity,
 		Env: body.Env, ScratchTmpdir: body.ScratchTmpdir,
 		NotBefore: body.NotBefore, StartBy: body.StartBy, FinishBy: body.FinishBy,
-		Inputs: body.Inputs,
+		Inputs: body.Inputs, Confine: body.Confine,
 	})
 	if err != nil {
 		writeError(w, err)

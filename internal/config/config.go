@@ -179,6 +179,21 @@ type Scheduler struct {
 type Data struct {
 	ScrubInterval    string `toml:"scrub_interval"`
 	ScrubBytesPerDay int64  `toml:"scrub_bytes_per_day"`
+	// ConfineFrom (RFC 3339 with an offset): every attempt launched from
+	// then on is confined, whether its execution asks or not.
+	ConfineFrom string `toml:"confine_from"`
+}
+
+// ConfineTime is ConfineFrom parsed (zero: not set).
+func (d Data) ConfineTime() (time.Time, error) {
+	if d.ConfineFrom == "" {
+		return time.Time{}, nil
+	}
+	t, err := time.Parse(time.RFC3339, d.ConfineFrom)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("data.confine_from %q is not a time with an offset such as \"2026-11-14T00:00:00+09:00\"", d.ConfineFrom)
+	}
+	return t, nil
 }
 
 // ScrubEvery is ScrubInterval parsed (0: not set).

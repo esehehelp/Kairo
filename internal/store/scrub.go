@@ -25,6 +25,16 @@ type DataPolicy struct {
 	// ScrubBytesPerDay bounds what one durable store reads back in a day
 	// (one copy bigger than it is read on its own once a day).
 	ScrubBytesPerDay int64
+	// ConfineFrom: every attempt launched from this time on is confined
+	// (Launch.Confine), whether its execution asked or not. Zero: only those
+	// that ask.
+	ConfineFrom time.Time
+}
+
+// confinesAll reports whether every launch at t is confined.
+func (s *Store) confinesAll(t time.Time) bool {
+	from := s.data.ConfineFrom
+	return !from.IsZero() && !t.Before(from)
 }
 
 // Defaults of the data policy.

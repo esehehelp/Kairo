@@ -13,3 +13,6 @@ CREATE INDEX data_objects_name_idx ON data_objects(project_scope_id,name);
 -- An execution's inputs (inputs.go): JSON [{name, task|data|object}], NULL
 -- when it has none.
 ALTER TABLE execution_requests ADD COLUMN inputs_json TEXT;
+-- confine: its attempts may write only where Kairo hands them (scratch,
+-- output directory, cache directory).
+ALTER TABLE execution_requests ADD COLUMN confine BOOLEAN NOT NULL DEFAULT FALSE;

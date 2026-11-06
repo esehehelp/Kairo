@@ -25,8 +25,9 @@ func attachTree(*exec.Cmd) (*treeHandle, error) { return nil, nil }
 
 func (h *treeHandle) close() {}
 
-// RunHelper has no helper subcommands outside Windows.
-func RunHelper([]string) {}
+// RunHelper runs a helper subcommand of this binary when args name one (the
+// confining launcher, confine_linux.go) and does not return then.
+func RunHelper(args []string) { runConfineHelper(args) }
 
 // stopTreeGracefully sends SIGTERM to the launcher's process group and to every
 // process carrying the attempt's KAIRO_ATTEMPT_ID (which also reaches children

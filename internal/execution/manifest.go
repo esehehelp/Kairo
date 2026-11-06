@@ -48,6 +48,11 @@ type Manifest struct {
 	// a task input is for tasks of a project). Absent from the JSON when
 	// empty.
 	Inputs []datainput.Input `toml:"inputs" json:"inputs,omitempty"`
+	// Confine: the attempt may write only to its scratch, its run's output
+	// directory and its project's cache directory (executor/confine*.go);
+	// the daemon's data policy can confine every execution from a time on.
+	// Absent from the JSON when false.
+	Confine bool `toml:"confine" json:"confine,omitempty"`
 }
 
 type ExecutorSelector struct {

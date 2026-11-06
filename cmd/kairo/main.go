@@ -104,7 +104,11 @@ func serve(args []string) error {
 	if err != nil {
 		return err
 	}
-	st.SetDataPolicy(store.DataPolicy{ScrubInterval: scrubEvery, ScrubBytesPerDay: daemonConfig.Data.ScrubBytesPerDay})
+	confineFrom, err := daemonConfig.Data.ConfineTime()
+	if err != nil {
+		return err
+	}
+	st.SetDataPolicy(store.DataPolicy{ScrubInterval: scrubEvery, ScrubBytesPerDay: daemonConfig.Data.ScrubBytesPerDay, ConfineFrom: confineFrom})
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
 	slog.SetDefault(logger)

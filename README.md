@@ -555,6 +555,34 @@ labels may take what is placed there.
   output directory, by its task while it is that task's latest run, by its
   object's name or id; an imported directory with `--delete-source`, by its
   name or id. Inputs are in the execution's digest only when there are some.
+- Confinement: `confine = true` in `[tasks.execution]` (or an execution
+  manifest) makes its attempts write only where Kairo hands them: their
+  scratch (`KAIRO_SCRATCH`), their run's output directory
+  (`KAIRO_OUTPUT_DIR`) and their project's cache directory
+  (`KAIRO_CACHE_DIR`; Data stores). Everything else they read as before but
+  cannot change; `TMPDIR`, `TMP` and `TEMP` name the scratch. The daemon's
+  `[data] confine_from` (a time with an offset, `"2026-11-14T00:00:00+09:00"`)
+  confines every attempt launched from then on, whether its execution asks
+  or not. A confined launch on an executor without a usable volatile store
+  (so without a scratch and an output directory) is refused, as is one
+  inside WSL for now (`launch_aborted: cannot confine the attempt here:
+  ...`). On Linux the launcher is the agent's binary run in a mount
+  namespace of its own (Go makes its mounts private, so nothing reaches the
+  node): it binds each of those directories, `/dev/shm` and `/proc` onto
+  itself, then a `tmp` directory of the scratch over `/tmp`, makes every
+  mount read-only (`mount_setattr`, recursively from `/`), makes those
+  writable again and execs the attempt's argv (looked up on its `PATH`) in
+  its place, so the pid, process group and creation time are the
+  attempt's; the agent must be able to make mounts (root, as in the
+  containers it runs in), devices stay usable, and it exits 126 (127 for an
+  argv not found) saying why on stderr if it cannot. On Windows the launcher
+  runs with a copy of the agent's token at Low integrity, and those three
+  directories are labelled Low (inherited by what is made in them): a Low
+  integrity process reads what it could before but writes only what is
+  labelled Low, and its children inherit the token. CUDA, Python and native
+  programs run so; programs that make named objects at the session's level
+  do not start (MSYS and Git Bash tools among them). Confinement is in the
+  execution's digest only when asked for.
 - Placement: among the nodes an execution fits on, the one left with the
   fewest free GPUs (CPU work stays off GPU nodes, GPU work packs onto as few
   as it can), then the most free CPU. A gang's ranks go on distinct nodes, all
@@ -968,6 +996,16 @@ WSL attempt gets `TMPDIR` only, since its variables also reach `wsl.exe`),
 over a declared env. Off by default, since a temporary directory emptied
 with every attempt loses caches such as torch's compile cache. It needs no
 SDK: the executor makes and settles it.
+
+Cache directories: every attempt launched by an executor that serves a
+usable volatile store also gets its project's cache directory on the store
+its scratch is made on, `<root>/cache/<project scope id>` (marker
+`.kairo-cache` naming the project), named by `KAIRO_CACHE_DIR`: what
+attempts of a project keep for one another on that node (compiled kernels,
+package caches; point `XDG_CACHE_HOME`, `TORCHINDUCTOR_CACHE_DIR`,
+`TRITON_CACHE_DIR`, `UV_CACHE_DIR`, `HF_HOME` or `CUDA_CACHE_PATH` there).
+Kairo does not delete it, nor count it yet (it shows as external bytes).
+A confined attempt (Admission, Confinement) may write it.
 
 Output directories: what a run is to keep goes in its output directory,
 `<root>/outputs/<run id>` on the store its scratch is made on, holding the

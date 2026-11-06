@@ -76,6 +76,11 @@ type Execution struct {
 	// task input names a task this one depends on. Absent from the JSON when
 	// empty.
 	Inputs []datainput.Input `toml:"inputs" json:"inputs,omitempty"`
+	// Confine: the attempt may write only to its scratch, its run's output
+	// directory and its project's cache directory (executor/confine*.go);
+	// the daemon's data policy can confine every execution from a time on.
+	// Absent from the JSON when false.
+	Confine bool `toml:"confine" json:"confine,omitempty"`
 }
 
 // Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
