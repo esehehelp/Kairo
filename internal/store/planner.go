@@ -929,7 +929,7 @@ func (p *planner) order(candidates []*planCandidate, visit func(*planCandidate) 
 	remaining := append([]*planCandidate(nil), candidates...)
 	latest := make(map[*planCandidate]time.Time, len(candidates))
 	for _, c := range candidates {
-		if at, ok := c.mustStartBy(); ok {
+		if at, ok := c.mustStartBy(p.m.stamp); ok {
 			latest[c] = at
 		}
 	}
@@ -1060,7 +1060,10 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 		}
 		return planPlacement{wait: planWait{reason: f.reason, node: f.node, message: rankPrefix(c, ranks[0]) + message}}, time.Time{}
 	}
-	if p.preempt {
+	// Nothing is suspended for room that only an execution waiting for its
+	// not_before holds: it is free until then, and suspending work now would
+	// leave it idle (the execution waits, holding as below, instead).
+	if p.preempt && !p.onlyNotBeforeInTheWay(c, ranks, options) {
 		if victims, slots, ok := p.makeRoom(c, ranks, target, ov); ok {
 			for _, v := range victims {
 				p.victims[v.id] = true
@@ -1112,34 +1115,62 @@ func (p *planner) notYet(c *planCandidate, ranks []planRank, options [][]planExe
 		wait.message += "; nothing is held for it before " + formatInstant(notBefore.Add(-notBeforeHold), zone)
 		return planPlacement{wait: wait}, notBefore
 	}
-	target, ok := p.assign(ranks, options, newOverlay(), allFreed)
-	if !ok {
-		wait.message += "; no node can hold it, so nothing is held for it"
-		return planPlacement{wait: wait}, time.Time{}
-	}
+	// Where it fits by its not_before: beside what the pass has handed out,
+	// once the leases expected to end by then have; else where it would go
+	// once every lease in its way ends.
 	all := p.overlayFor(nil)
+	endsBy := func(id string) bool {
+		end, known := p.m.leaseEnds[id]
+		return known && !end.After(notBefore)
+	}
+	target, ok := p.assign(ranks, options, all, endsBy)
+	if !ok {
+		if target, ok = p.assign(ranks, options, newOverlay(), allFreed); !ok {
+			wait.message += "; no node can hold it, so nothing is held for it"
+			return planPlacement{wait: wait}, time.Time{}
+		}
+	}
 	start, known := p.startAt(ranks, target, all)
 	if !known || start.Before(notBefore) {
 		start = notBefore
 	}
+	whole := true
 	for i, slot := range target {
 		f := p.m.fit(slot.fit.node, ranks[i].demand, all, noneFreed)
-		p.holds = append(p.holds, planHold{from: start, fit: f, by: c.execution.ID})
+		whole = whole && f.ok
+		p.holds = append(p.holds, planHold{from: start, fit: f, by: c.execution.ID, notBefore: true})
 	}
 	wait.node = target[0].fit.node
-	wait.message += "; what it needs on " + wait.node + " is held for it: only work expected to end by " + formatInstant(start, zone) + " may use it"
+	held := "what it needs on " + wait.node + " is held for it"
+	if !whole {
+		held = "it is to run on " + wait.node + ", where what of it is free now is held for it"
+	}
+	wait.message += "; " + held + ": only work expected to end by " + formatInstant(start, zone) + " may use it"
 	if !known {
 		return planPlacement{wait: wait}, time.Time{}
 	}
 	return planPlacement{wait: wait}, start
 }
 
+// staleDeadline: a start_by or finish_by further past than this (a rerun
+// days later of a task that declared one) neither orders nor is reported.
+const staleDeadline = 12 * time.Hour
+
+// deadline is a start_by or finish_by of c, unless it is stale.
+func (c *planCandidate) deadline(stamp time.Time, value *string) (time.Time, bool) {
+	t, ok := instant.Parse(deref(value))
+	if !ok || stamp.Sub(t) > staleDeadline {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
 // mustStartBy is the latest c may start to keep its start_by and its
 // finish_by (less its estimated run time, when there is one); ok is false
-// when it has neither.
-func (c *planCandidate) mustStartBy() (time.Time, bool) {
-	at, ok := instant.Parse(deref(c.execution.StartBy))
-	if finishBy, has := instant.Parse(deref(c.execution.FinishBy)); has {
+// when it has neither (or only stale ones).
+func (c *planCandidate) mustStartBy(stamp time.Time) (time.Time, bool) {
+	at, ok := c.deadline(stamp, c.execution.StartBy)
+	if finishBy, has := c.deadline(stamp, c.execution.FinishBy); has {
 		finishBy = finishBy.Add(-c.endsIn)
 		if !ok || finishBy.Before(at) {
 			at, ok = finishBy, true
@@ -1153,7 +1184,7 @@ func (c *planCandidate) mustStartBy() (time.Time, bool) {
 // expected to start, zero when not known).
 func (p *planner) deadlineNote(c *planCandidate, start time.Time) string {
 	var notes []string
-	if startBy, ok := instant.Parse(deref(c.execution.StartBy)); ok {
+	if startBy, ok := c.deadline(p.m.stamp, c.execution.StartBy); ok {
 		switch {
 		case p.m.stamp.After(startBy):
 			notes = append(notes, "its start_by "+formatInstant(startBy, startBy.Location())+" has passed")
@@ -1161,7 +1192,7 @@ func (p *planner) deadlineNote(c *planCandidate, start time.Time) string {
 			notes = append(notes, "expected to start after its start_by "+formatInstant(startBy, startBy.Location()))
 		}
 	}
-	if finishBy, ok := instant.Parse(deref(c.execution.FinishBy)); ok {
+	if finishBy, ok := c.deadline(p.m.stamp, c.execution.FinishBy); ok {
 		begin := start
 		if begin.IsZero() {
 			begin = p.m.stamp
@@ -1200,12 +1231,19 @@ type planHold struct {
 	from time.Time
 	fit  planFit
 	by   string
+	// notBefore: held for an execution waiting for its not_before (notYet).
+	notBefore bool
 }
 
 // overlayFor is what the pass has handed out as c sees it: every placement,
 // and every hold unless c is expected to end by the time the hold starts
 // (c nil, or without an estimate: every hold).
 func (p *planner) overlayFor(c *planCandidate) planOverlay {
+	return p.overlayHolding(c, func(planHold) bool { return true })
+}
+
+// overlayHolding is overlayFor(c) with only the holds keep accepts.
+func (p *planner) overlayHolding(c *planCandidate, keep func(planHold) bool) planOverlay {
 	if len(p.holds) == 0 {
 		return p.ov
 	}
@@ -1215,11 +1253,26 @@ func (p *planner) overlayFor(c *planCandidate) planOverlay {
 	}
 	ov := p.ov.clone()
 	for _, h := range p.holds {
-		if end.IsZero() || end.After(h.from) {
+		if keep(h) && (end.IsZero() || end.After(h.from)) {
 			ov.take(h.fit, h.by)
 		}
 	}
 	return ov
+}
+
+// onlyNotBeforeInTheWay reports whether c would fit now but for what is held
+// for executions waiting for their not_before.
+func (p *planner) onlyNotBeforeInTheWay(c *planCandidate, ranks []planRank, options [][]planExecutor) bool {
+	held := false
+	for _, h := range p.holds {
+		held = held || h.notBefore
+	}
+	if !held {
+		return false
+	}
+	ov := p.overlayHolding(c, func(h planHold) bool { return !h.notBefore })
+	_, ok := p.assign(ranks, options, ov, noneFreed)
+	return ok
 }
 
 // startAt is when ranks could start on target if what runs there ends as

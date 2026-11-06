@@ -112,3 +112,72 @@ func TestPlannerWaitSaysWhenADeadlineIsMissed(t *testing.T) {
 		t.Fatalf("job-2 waits for %+v", w)
 	}
 }
+
+// The hold goes where the execution fits by its not_before: a free node, not
+// one whose GPUs are leased with no end in sight.
+func TestPlannerHoldsForANotBeforeWhereItWillFit(t *testing.T) {
+	c := newPlanCluster(t)
+	c.node("a", 2, 16000, 64, 500)
+	c.node("b", 2, 16000, 64, 500)
+	for _, name := range []string{"busy-1", "busy-2"} {
+		c.submit(planSpec(name, "p1", 0, 1, 1000, 1))
+		c.start("exec-a")
+	}
+	spec := planSpec("predict", "rhllem", 10, 1, 1000, 1)
+	spec.NotBefore = at(time.Hour)
+	predict := c.submit(spec)
+	fresh := c.submit(planSpec("fresh", "p4", 0, 2, 1000, 1))
+	if r := c.reserve("exec-b"); r != nil {
+		t.Fatalf("exec-b reserved %s into the hold of predict", r.Execution.ClientRequestID)
+	}
+	if w := c.wait(predict.ID); w.NodeID == nil || *w.NodeID != "b" || !strings.Contains(w.Message, "what it needs on b is held for it") {
+		t.Fatalf("predict waits for %+v", w)
+	}
+	if w := c.wait(fresh.ID); w.Reason == "" {
+		t.Fatalf("fresh does not wait")
+	}
+}
+
+// Nothing is suspended for room only a not_before hold takes.
+func TestPlannerSuspendsNothingForANotBeforeHold(t *testing.T) {
+	c := newPlanCluster(t)
+	c.node("a", 2, 16000, 64, 500)
+	c.submit(planSpec("victim", "p1", 0, 1, 1000, 1))
+	c.start("exec-a")
+	spec := planSpec("predict", "rhllem", 10, 1, 1000, 1)
+	spec.NotBefore = at(time.Hour)
+	c.submit(spec)
+	c.submit(planSpec("mid", "p2", 5, 1, 1000, 1))
+	commands, err := c.store.EnsurePriorityPreemption(c.ctx, "exec-a")
+	if err != nil || len(commands) != 0 {
+		t.Fatalf("preemption for a not_before hold: %v %v", commands, err)
+	}
+}
+
+// A start_by long past (a rerun days later) neither orders nor is reported.
+func TestPlannerForgetsAStaleDeadline(t *testing.T) {
+	c := newPlanCluster(t)
+	c.node("a", 1, 16000, 64, 500)
+	c.submit(planSpec("running", "p0", 0, 1, 1000, 1))
+	c.start("exec-a")
+	first := c.submit(planSpec("first", "p1", 5, 1, 1000, 1))
+	stale := planSpec("stale", "p2", 5, 1, 1000, 1)
+	stale.StartBy = at(-48 * time.Hour)
+	staleExecution := c.submit(stale)
+	if r := c.reserve("exec-a"); r != nil {
+		t.Fatalf("reserved %s on a leased GPU", r.Execution.ClientRequestID)
+	}
+	if w := c.wait(staleExecution.ID); strings.Contains(w.Message, "start_by") {
+		t.Fatalf("stale waits for %+v", w)
+	}
+	if w := c.wait(first.ID); w.Reason != "gpu_leased" {
+		t.Fatalf("first waits for %+v", w)
+	}
+
+	// It does not go first either: the earlier submission does.
+	c2 := newPlanCluster(t)
+	c2.node("a", 1, 16000, 64, 500)
+	earlier := c2.submit(planSpec("earlier", "p1", 5, 1, 1000, 1))
+	c2.submit(stale)
+	c2.expectReserved("exec-a", earlier)
+}

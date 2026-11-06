@@ -484,14 +484,17 @@ labels may take what is placed there.
   string; a time without an offset is refused, since the daemon and the CLI
   may be in different zones. Before its `not_before` an execution is not
   admitted and reserves nothing (wait reason `not_before`). From two hours
-  before it, it holds what it needs on the node it would run on, as backfill
-  does, from its `not_before` (or later, when what runs there is expected to
-  end later): until then only work expected to end by that time may use it,
-  so it starts on time unless work of higher priority comes first or
-  something without an estimate was already running there. `start_by` and `finish_by` are when it should have started
+  before it, it holds what it needs, as backfill does, on a node it will fit
+  on by then (once the leases expected to end by then have), from its
+  `not_before` (or later, when what runs there is expected to end later):
+  until then only work expected to end by that time may use it, so it starts
+  on time unless work of higher priority comes first or something without
+  an estimate was already running there. Nothing is suspended to make room
+  that only such a hold takes. `start_by` and `finish_by` are when it should have started
   and ended. Besides the order, they only show: a wait that is past one, or
-  expected to miss one (by estimated run times), says so. Nothing is
-  suspended or stopped for either; that stays with `priority`. A
+  expected to miss one (by estimated run times), says so; one more than 12
+  hours past (a rerun days later) is ignored. Nothing is suspended or
+  stopped for either; that stays with `priority`. A
   continuation keeps the `not_before` and `finish_by` of its task, not its
   `start_by` (it started already). `task show` prints the three under
   `times:`.
