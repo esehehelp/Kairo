@@ -1,0 +1,103 @@
+# Kairo's CI as Kairo tasks: the checks of one commit (@SHA@, filled in by ci/kairo-ci.sh), each a Task of project
+# kairo-ci that unpacks the commit's tree (copied to each node by ci/kairo-ci.sh) into a fresh directory, runs
+# ci/check.sh CHECK from that tree, and removes the directory. Priority -500: CI waits for everyone's work and preempts
+# nothing (the lowest serving is -100). The checks on pve1-work reserve 3 GiB of its 4 GiB each, so the planner runs
+# them one at a time; those on windows-local run beside each other.
+schema_version = 1
+
+[project]
+name = "kairo-ci"
+
+[defaults]
+queue = "ci"
+policy = "RunToCompletion@v1"
+
+[defaults.execution]
+schema_version = 2
+priority = -500
+checkpointable = false
+preemptible = false
+
+[[tasks]]
+name = "@SHA@-linux"
+[tasks.execution]
+argv = ["runuser", "-u", "ci", "--", "bash", "-c", "set -e; d=$(mktemp -d /srv/kairo-ci/run/@SHA@-linux.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; HOME=/home/ci GOCACHE=/srv/kairo-ci/cache/ci-build GOMODCACHE=/srv/kairo-ci/cache/ci-mod bash ci/check.sh linux"]
+cwd = "/srv/kairo-ci"
+[tasks.execution.executor]
+labels = { site = "pve1" }
+[tasks.execution.capacity]
+cpu_millis = 6000
+ram_bytes = 3221225472
+strength = "admitted"
+
+[[tasks]]
+name = "@SHA@-linux-race"
+[tasks.execution]
+argv = ["runuser", "-u", "ci", "--", "bash", "-c", "set -e; d=$(mktemp -d /srv/kairo-ci/run/@SHA@-linux-race.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; HOME=/home/ci GOCACHE=/srv/kairo-ci/cache/ci-build GOMODCACHE=/srv/kairo-ci/cache/ci-mod bash ci/check.sh linux-race"]
+cwd = "/srv/kairo-ci"
+[tasks.execution.executor]
+labels = { site = "pve1" }
+[tasks.execution.capacity]
+cpu_millis = 6000
+ram_bytes = 3221225472
+strength = "admitted"
+
+[[tasks]]
+name = "@SHA@-linux-root"
+[tasks.execution]
+argv = ["bash", "-c", "set -e; d=$(mktemp -d /srv/kairo-ci/run/@SHA@-linux-root.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; GOCACHE=/srv/kairo-ci/cache/root-build GOMODCACHE=/srv/kairo-ci/cache/root-mod bash ci/check.sh linux-root"]
+cwd = "/srv/kairo-ci"
+[tasks.execution.executor]
+labels = { site = "pve1" }
+[tasks.execution.capacity]
+cpu_millis = 4000
+ram_bytes = 3221225472
+strength = "admitted"
+
+[[tasks]]
+name = "@SHA@-windows"
+[tasks.execution]
+argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d /d/kairo-ci/run/@SHA@-windows.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /d/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh windows"]
+cwd = "D:/kairo-ci"
+[tasks.execution.executor]
+labels = { environment = "windows" }
+[tasks.execution.capacity]
+cpu_millis = 8000
+ram_bytes = 6442450944
+strength = "admitted"
+
+[[tasks]]
+name = "@SHA@-wsl"
+[tasks.execution]
+argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d /d/kairo-ci/run/@SHA@-wsl.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /d/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh wsl"]
+cwd = "D:/kairo-ci"
+[tasks.execution.executor]
+labels = { environment = "windows" }
+[tasks.execution.capacity]
+cpu_millis = 2000
+ram_bytes = 1073741824
+strength = "admitted"
+
+[[tasks]]
+name = "@SHA@-sdk-python"
+[tasks.execution]
+argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d /d/kairo-ci/run/@SHA@-sdk-python.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /d/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh sdk-python"]
+cwd = "D:/kairo-ci"
+[tasks.execution.executor]
+labels = { environment = "windows" }
+[tasks.execution.capacity]
+cpu_millis = 2000
+ram_bytes = 1073741824
+strength = "admitted"
+
+[[tasks]]
+name = "@SHA@-sdk-rust"
+[tasks.execution]
+argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d /d/kairo-ci/run/@SHA@-sdk-rust.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /d/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; CARGO_TARGET_DIR=/d/kairo-ci/cache/cargo-target bash ci/check.sh sdk-rust"]
+cwd = "D:/kairo-ci"
+[tasks.execution.executor]
+labels = { environment = "windows" }
+[tasks.execution.capacity]
+cpu_millis = 4000
+ram_bytes = 2147483648
+strength = "admitted"

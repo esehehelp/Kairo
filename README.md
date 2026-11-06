@@ -1858,6 +1858,40 @@ uv run --project sdk/python pytest -q
 git diff --check
 ```
 
+### CI on Kairo
+
+Kairo's CI runs on Kairo: `bash ci/kairo-ci.sh [REV] [--wait]` declares the
+checks of one commit as Tasks of project `kairo-ci` (queue `ci`,
+`ci/tasks.toml.in` with the commit's short sha), so they run on this
+installation's own nodes, where the code runs, under the same admission as
+any work. The script copies the commit's tree (`git archive`) to each node the
+checks run on, as `local/ci-site.env` says:
+
+```sh
+CI_WINDOWS_ROOT=/d/kairo-ci          # where windows-local's checks unpack
+CI_PVE1_HOST=root@192.168.1.252      # the Proxmox host of pve1-work
+CI_PVE1_VMID=116                     # pve1-work's container
+```
+
+Each Task unpacks that tree into a fresh directory, runs `ci/check.sh CHECK`
+from it (the checks are those of the commit, and nothing a running check reads
+changes under it), and removes the directory: `<sha>-linux` (gofmt, `go vet`
+for Linux and Windows, `go test`), `<sha>-linux-race` and `<sha>-linux-root`
+(the executor, process and provider tests as root) on pve1-work, the first two
+as an unprivileged user (`ci`) so the tests of unreadable and undeletable
+files mean something; `<sha>-windows`, `<sha>-wsl` (`KAIRO_TEST_WSL=1`),
+`<sha>-sdk-python` and `<sha>-sdk-rust` on windows-local. pve1-work has Go,
+gcc (for `-race`) and a test PostgreSQL 17 at `127.0.0.1:55432` (role
+`kairo`, a superuser as in the test container, since dropping a test database
+ends its other connections; listening on localhost only, `fsync` off),
+windows-local the test container above. The checks
+run at priority -500: they wait for everyone's work and preempt nothing. Each
+of pve1-work's reserves 3 GiB of its 4, so the planner runs them one at a
+time. `--wait` waits for all of them (`kairo task wait --match`) and exits 0
+only if every check succeeded; `kairo task logs kairo-ci ci <sha>-<check>`
+shows what failed, and `kairo task rerun` runs a check again (a declared Task
+is immutable, so a commit is declared once).
+
 Real NVIDIA, WSL, process-kill, and DDP runs are host-specific integration
 tests rather than ordinary unit tests, and so are the controller's changes of
 real clocks, power limits and processor settings (its tests use fake
