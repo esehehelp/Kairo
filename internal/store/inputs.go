@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
+	"strings"
 
 	"kairo/internal/datainput"
 	"kairo/internal/machine"
@@ -13,23 +15,26 @@ import (
 
 // Inputs (datainput) are what an execution reads, handed to its attempts by
 // path as KAIRO_INPUT_<NAME>, never named by a path the task chose:
-//   - a task input is the output directory of the latest run of a task of
-//     the same project (the declaring task depends on it, so that run has
-//     succeeded before this one is planned);
+//   - a task input is the output of the latest run of a task of the same
+//     project (the declaring task depends on it, so that run has succeeded
+//     before this one is planned);
 //   - a data input is the newest data object of the project with that name
 //     (an imported directory, say); an object input is a data object by id.
 //
-// For now an input is read in place: a run's output directory that is still
-// on its volatile store, or an imported directory still where it was
-// imported from. An orchestrated execution with inputs is planned onto the
-// node they are on (its executor selector naming no node of its own), and
-// once launched each input is checked to be on the attempt's node, in its
-// executor's namespace; one that is not (elsewhere, or deleted once copied)
-// aborts the launch saying why (launch_aborted: ...): bringing an object
-// from a durable store comes next. While a task that is pending or running,
-// or an execution not yet ended, names an input, the directory it is read
-// from is not deleted once copied (pinnedSourceTx): it is packed and copied
-// as usual and deleted once no one waits to read it.
+// An input is read where it is on the node an attempt runs on: a run's
+// output directory still on its volatile store, an imported directory still
+// where it was imported from, or the object brought to that node
+// (placements.go: fetched from its durable copy and unpacked under
+// <root>/inputs/<object id>). An execution with inputs is planned onto a
+// node (its executor selector naming none of its own): the one every input
+// is on, else the one the first is on or was made on; it waits
+// (inputs_not_ready) until each is there, those missing being brought there
+// meanwhile, and once launched each is checked to be there, in its
+// executor's namespace (a launch that finds one not there aborts saying
+// why). While a task that is pending or running, or an execution not yet
+// ended, names an input, the directory it was made in is not deleted once
+// copied (pinnedSourceTx): it is packed and copied as usual and deleted once
+// no one waits to read it.
 
 // LaunchInput is an input as an attempt is handed it: the directory it is
 // read from (Path), or why it cannot be had here now (Problem).
@@ -39,16 +44,56 @@ type LaunchInput struct {
 	Problem string `json:"problem,omitempty"`
 }
 
-// inputPlace is where an input can be read in place: on node, by executor
-// (a run's output directory: served from store) or, for an imported
-// directory, by executors of that namespace (executor its packing one).
+// inputPlace is where an input can be read: on node, at path; a run's
+// output directory or an object brought to a node is on storeID (served by
+// whoever serves the store), an imported directory is in the namespace of
+// executor (the one that packs it).
 type inputPlace struct {
 	node, executor, storeID, path string
 }
 
+// inputSource is what an input names now: its data object (objectID, ""
+// while its run's output is not packed yet; packed once it is) and where it
+// can be read (places), or, with none of either, why not (problem).
+type inputSource struct {
+	objectID string
+	packed   bool
+	places   []inputPlace
+	problem  string
+}
+
+// on reports whether the input can be read on node.
+func (src inputSource) on(node string) bool {
+	for _, p := range src.places {
+		if p.node == node {
+			return true
+		}
+	}
+	return false
+}
+
+// selectorNode is the node an executor selector names ("" for none).
+func selectorNode(selector string) string {
+	var sel struct {
+		Node string `json:"node"`
+	}
+	_ = json.Unmarshal([]byte(selector), &sel)
+	return sel.Node
+}
+
+// decodeInputs reads an execution's inputs_json.
+func decodeInputs(body string) ([]datainput.Input, error) {
+	var inputs []datainput.Input
+	if body == "" {
+		return nil, nil
+	}
+	err := json.Unmarshal([]byte(body), &inputs)
+	return inputs, err
+}
+
 // latestRunTx is the latest run of a task of a project (its newest
-// execution that is not a continuation) and the task's state; ErrNotFound
-// for a task the project does not declare or one never run.
+// execution that is not a continuation); ErrNotFound for a task the project
+// does not declare or one never run.
 func latestRunTx(ctx context.Context, q queryer, projectScopeID, task string) (string, error) {
 	var runID string
 	err := q.QueryRowContext(ctx, `SELECT o.execution_id FROM orchestration_task_executions o JOIN orchestration_tasks t ON t.task_scope_id=o.task_scope_id
@@ -59,95 +104,129 @@ func latestRunTx(ctx context.Context, q queryer, projectScopeID, task string) (s
 	return runID, err
 }
 
-// inputPlaceTx is where an input of an execution of a project can be read in
-// place now, or why it cannot.
-func inputPlaceTx(ctx context.Context, q queryer, declared []machine.Store, projectScopeID string, in datainput.Input) (inputPlace, string, error) {
-	if in.Task != "" {
-		runID, err := latestRunTx(ctx, q, projectScopeID, in.Task)
+// inputSourceTx is what an input of an execution of a project names now
+// (see inputSource).
+func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, projectScopeID string, in datainput.Input) (inputSource, error) {
+	var src inputSource
+	what := ""
+	runID := ""
+	switch {
+	case in.Task != "":
+		what = "task " + in.Task
+		var err error
+		runID, err = latestRunTx(ctx, q, projectScopeID, in.Task)
 		if errors.Is(err, ErrNotFound) {
-			return inputPlace{}, "task " + in.Task + " has no run", nil
+			return inputSource{problem: what + " has no run"}, nil
 		}
 		if err != nil {
-			return inputPlace{}, "", err
+			return src, err
 		}
-		return runOutputPlaceTx(ctx, q, declared, runID, "task "+in.Task+"'s latest run "+runID)
-	}
-	var objectID, kind, sourceID, executorID, root, path, sourceState string
-	var storeID string
-	query := `SELECT d.id,d.kind,d.source_id,d.executor_id,d.store_id,d.root,d.source_path,d.source_state FROM data_objects d
-		WHERE d.project_scope_id=$1 AND d.name=$2 ORDER BY d.created_at DESC,d.id DESC LIMIT 1`
-	arg, what := in.Data, "data "+in.Data
-	if in.Object != "" {
-		query = `SELECT d.id,d.kind,d.source_id,d.executor_id,d.store_id,d.root,d.source_path,d.source_state FROM data_objects d
-			WHERE d.project_scope_id=$1 AND d.id=$2`
-		arg, what = in.Object, "object "+in.Object
-	}
-	err := q.QueryRowContext(ctx, query, projectScopeID, arg).Scan(&objectID, &kind, &sourceID, &executorID, &storeID, &root, &path, &sourceState)
-	if errors.Is(err, sql.ErrNoRows) {
-		return inputPlace{}, "the project has no " + what, nil
-	}
-	if err != nil {
-		return inputPlace{}, "", err
-	}
-	switch kind {
-	case ObjectOutput:
-		return runOutputPlaceTx(ctx, q, declared, sourceID, what+" (run "+sourceID+")")
-	case ObjectImport:
-		if sourceState != "present" && sourceState != SourceKept || sourceState == SourceKept && !importKeptInPlace(ctx, q, objectID) {
-			return inputPlace{}, what + " (" + objectID + ") is no longer where it was imported from (" + sourceState + "); bringing it from its durable copy is not done yet", nil
+		what += "'s latest run " + runID
+		var state string
+		err = q.QueryRowContext(ctx, `SELECT id,state FROM data_objects WHERE kind='output' AND source_id=$1 ORDER BY created_at DESC LIMIT 1`, runID).Scan(&src.objectID, &state)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return src, err
 		}
-		info, err := executorInfoTx(ctx, q, executorID)
+		src.packed = state == "packed"
+	default:
+		query := `SELECT id,state FROM data_objects WHERE project_scope_id=$1 AND name=$2 ORDER BY created_at DESC,id DESC LIMIT 1`
+		arg := in.Data
+		what = "data " + in.Data
+		if in.Object != "" {
+			query = `SELECT id,state FROM data_objects WHERE project_scope_id=$1 AND id=$2`
+			arg, what = in.Object, "object "+in.Object
+		}
+		var state string
+		err := q.QueryRowContext(ctx, query, projectScopeID, arg).Scan(&src.objectID, &state)
+		if errors.Is(err, sql.ErrNoRows) {
+			return inputSource{problem: "the project has no " + what}, nil
+		}
 		if err != nil {
-			return inputPlace{}, "", err
+			return src, err
 		}
-		if why := importOwnership(declared, info.nodeID, storeID, root, path); why != "" {
-			return inputPlace{}, what + " (" + objectID + "): " + why, nil
+		src.packed = state == "packed"
+		var kind, sourceID, executorID, storeID, root, path, sourceState string
+		var deleteSource bool
+		if err = q.QueryRowContext(ctx, `SELECT kind,source_id,executor_id,store_id,root,source_path,source_state,delete_source FROM data_objects WHERE id=$1`, src.objectID).
+			Scan(&kind, &sourceID, &executorID, &storeID, &root, &path, &sourceState, &deleteSource); err != nil {
+			return src, err
 		}
-		return inputPlace{node: info.nodeID, executor: executorID, path: path}, "", nil
+		switch kind {
+		case ObjectOutput:
+			runID = sourceID
+		case ObjectImport:
+			// in place while it is where it was imported from (not deleted,
+			// nor kept for having changed since it was packed)
+			if sourceState == "present" || sourceState == SourceKept && !deleteSource {
+				info, err := executorInfoTx(ctx, q, executorID)
+				if err != nil {
+					return src, err
+				}
+				if importOwnership(declared, info.nodeID, storeID, root, path) == "" {
+					src.places = append(src.places, inputPlace{node: info.nodeID, executor: executorID, path: path})
+				}
+			}
+		default:
+			return inputSource{problem: what + " (" + src.objectID + ") is kept scratch, not data to read"}, nil
+		}
 	}
-	return inputPlace{}, what + " (" + objectID + ") is kept scratch, not data to read", nil
-}
-
-// importKeptInPlace reports whether an imported directory settled kept was
-// kept where it is by its import (without delete_source), not for having
-// changed since it was packed.
-func importKeptInPlace(ctx context.Context, q queryer, objectID string) bool {
-	var deleteSource bool
-	err := q.QueryRowContext(ctx, `SELECT delete_source FROM data_objects WHERE id=$1`, objectID).Scan(&deleteSource)
-	return err == nil && !deleteSource
+	if runID != "" {
+		if p, ok, err := runOutputPlaceTx(ctx, q, declared, runID); err != nil {
+			return src, err
+		} else if ok {
+			src.places = append(src.places, p)
+		}
+	}
+	if src.objectID != "" {
+		err := eachRow(ctx, q, `SELECT p.store_id,p.root,p.path,x.node_id FROM object_placements p JOIN executors x ON x.id=p.executor_id
+			WHERE p.object_id=$1 AND p.state='ready' ORDER BY p.store_id`, []any{src.objectID}, func(rows *sql.Rows) error {
+			var p inputPlace
+			var root string
+			if err := rows.Scan(&p.storeID, &root, &p.path, &p.node); err != nil {
+				return err
+			}
+			for _, d := range declared {
+				if d.ID == p.storeID && d.Class == machine.StoreVolatile && d.Root == root && d.Node == p.node {
+					src.places = append(src.places, p)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return src, err
+		}
+	}
+	if len(src.places) == 0 && src.objectID == "" {
+		src.problem = what + " left no output here (its executor served no volatile store), nor is it packed yet"
+	}
+	return src, nil
 }
 
 // runOutputPlaceTx is where a run's output directory is (rank 0's), while it
 // is on a volatile store as the declaration makes it.
-func runOutputPlaceTx(ctx context.Context, q queryer, declared []machine.Store, runID, what string) (inputPlace, string, error) {
+func runOutputPlaceTx(ctx context.Context, q queryer, declared []machine.Store, runID string) (inputPlace, bool, error) {
 	var p inputPlace
 	var root, state string
 	err := q.QueryRowContext(ctx, `SELECT o.store_id,o.root,o.path,o.state,o.executor_id,x.node_id FROM run_outputs o JOIN executors x ON x.id=o.executor_id
 		WHERE o.run_id=$1 ORDER BY o.updated_at DESC LIMIT 1`, runID).Scan(&p.storeID, &root, &p.path, &state, &p.executor, &p.node)
 	if errors.Is(err, sql.ErrNoRows) {
-		return inputPlace{}, what + " has no output directory (its executor served no volatile store)", nil
+		return p, false, nil
 	}
 	if err != nil {
-		return inputPlace{}, "", err
+		return p, false, err
 	}
-	if state != "active" {
-		return inputPlace{}, what + "'s output directory is " + state + "; bringing it from its durable copy is not done yet", nil
-	}
-	if why := outputOwnership(declared, p.node, p.storeID, root, p.path, runID); why != "" {
-		return inputPlace{}, what + ": " + why, nil
-	}
-	return p, "", nil
+	return p, state == "active" && outputOwnership(declared, p.node, p.storeID, root, p.path, runID) == "", nil
 }
 
 // resolveInputsTx is the inputs of an execution as its attempt on executor
-// is handed them: each read in place on the executor's node in its
+// is handed them: each read where it is on the executor's node, in its
 // namespace, or the problem.
 func resolveInputsTx(ctx context.Context, q queryer, executionID, projectScopeID, executorID string, inputsJSON sql.NullString) ([]LaunchInput, error) {
 	if !inputsJSON.Valid || inputsJSON.String == "" {
 		return nil, nil
 	}
-	var inputs []datainput.Input
-	if err := json.Unmarshal([]byte(inputsJSON.String), &inputs); err != nil {
+	inputs, err := decodeInputs(inputsJSON.String)
+	if err != nil {
 		return nil, fmt.Errorf("execution %s inputs: %w", executionID, err)
 	}
 	declared, err := declaredStores(ctx, q)
@@ -161,19 +240,25 @@ func resolveInputsTx(ctx context.Context, q queryer, executionID, projectScopeID
 	out := make([]LaunchInput, 0, len(inputs))
 	for _, in := range inputs {
 		li := LaunchInput{Name: in.Name}
-		p, problem, err := inputPlaceTx(ctx, q, declared, projectScopeID, in)
+		src, err := inputSourceTx(ctx, q, declared, projectScopeID, in)
 		if err != nil {
 			return nil, err
 		}
-		switch {
-		case problem != "":
-			li.Problem = problem
-		case p.node != me.nodeID:
-			li.Problem = fmt.Sprintf("it is on node %s, not on %s; bringing it here is not done yet", p.node, me.nodeID)
-		case !sameNamespace(ctx, q, declared, p, me, executorID):
-			li.Problem = fmt.Sprintf("it is in executor %s's namespace, not %s's", p.executor, executorID)
-		default:
-			li.Path = p.path
+		for _, p := range src.places {
+			if p.node == me.nodeID && sameNamespace(ctx, q, declared, p, me, executorID) {
+				li.Path = p.path
+				break
+			}
+		}
+		if li.Path == "" {
+			switch {
+			case src.problem != "":
+				li.Problem = src.problem
+			case src.on(me.nodeID):
+				li.Problem = "it is on node " + me.nodeID + " in another executor's namespace"
+			default:
+				li.Problem = "it is not on node " + me.nodeID + " (yet)"
+			}
 		}
 		out = append(out, li)
 	}
@@ -181,9 +266,8 @@ func resolveInputsTx(ctx context.Context, q queryer, executionID, projectScopeID
 }
 
 // sameNamespace reports whether executor (me) reaches the path of an input
-// as written: a run's output directory on a store it serves, or an imported
-// directory of its own or, for an executor not of WSL, of another such of
-// its node.
+// as written: on a store it serves, or an imported directory of its own or,
+// for an executor not of WSL, of another such of its node.
 func sameNamespace(ctx context.Context, q queryer, declared []machine.Store, p inputPlace, me executorInfo, executorID string) bool {
 	if p.storeID != "" {
 		for _, s := range declared {
@@ -200,10 +284,53 @@ func sameNamespace(ctx context.Context, q queryer, declared []machine.Store, p i
 	return err == nil && !other.wsl && !me.wsl
 }
 
-// pinInputNodeTx plans an orchestrated execution with inputs onto the node
-// they are on, unless its executor selector names a node itself or they are
-// on more than one (or none: the launch then says why). A gang is not
-// pinned: its ranks go on distinct nodes (rank 0 reads the inputs).
+// inputsNodeTx is the node an execution with inputs is planned onto: the
+// first (by id) every input is on, else the first the first input is on,
+// else the node its data object was made on ("" when none is known).
+func inputsNodeTx(ctx context.Context, q queryer, declared []machine.Store, projectScopeID string, inputs []datainput.Input) (string, error) {
+	var sources []inputSource
+	for _, in := range inputs {
+		src, err := inputSourceTx(ctx, q, declared, projectScopeID, in)
+		if err != nil {
+			return "", err
+		}
+		sources = append(sources, src)
+	}
+	nodes := map[string]bool{}
+	for _, p := range sources[0].places {
+		nodes[p.node] = true
+	}
+	var common []string
+	for n := range nodes {
+		all := true
+		for _, src := range sources[1:] {
+			all = all && src.on(n)
+		}
+		if all {
+			common = append(common, n)
+		}
+	}
+	sort.Strings(common)
+	if len(common) > 0 {
+		return common[0], nil
+	}
+	if len(sources[0].places) > 0 {
+		return sources[0].places[0].node, nil
+	}
+	if sources[0].objectID != "" {
+		var node string
+		err := q.QueryRowContext(ctx, `SELECT x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id WHERE d.id=$1`, sources[0].objectID).Scan(&node)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return "", err
+		}
+		return node, nil
+	}
+	return "", nil
+}
+
+// pinInputNodeTx plans an execution with inputs onto the node they are on
+// (inputsNodeTx), unless its executor selector names a node itself. A gang
+// is not pinned: its ranks go on distinct nodes (rank 0 reads the inputs).
 func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *ExecutionSpec) error {
 	if len(spec.Inputs) == 0 || spec.Gang != nil {
 		return nil
@@ -217,34 +344,59 @@ func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *Execut
 	}
 	var projectScopeID string
 	if err := q.QueryRowContext(ctx, `SELECT id FROM coordination_scopes WHERE kind='project' AND external_key=$1`, project).Scan(&projectScopeID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil // a project made by this very submission has no data yet
+		}
 		return err
 	}
 	declared, err := declaredStores(ctx, q)
 	if err != nil {
 		return err
 	}
-	nodes := map[string]bool{}
-	for _, in := range spec.Inputs {
-		p, problem, err := inputPlaceTx(ctx, q, declared, projectScopeID, in)
-		if err != nil {
-			return err
-		}
-		if problem == "" {
-			nodes[p.node] = true
-		}
+	node, err := inputsNodeTx(ctx, q, declared, projectScopeID, spec.Inputs)
+	if err != nil || node == "" {
+		return err
 	}
-	if len(nodes) != 1 {
-		return nil
-	}
-	for node := range nodes {
-		selector["node"] = node
-	}
+	selector["node"] = node
 	body, err := json.Marshal(selector)
 	if err != nil {
 		return err
 	}
 	spec.ExecutorSelector = body
 	return nil
+}
+
+// inputsWaitTx says why an execution with inputs is not admitted yet (""
+// when it may be): an input that cannot be had at all, or one not on the
+// node it is planned onto (yet: those that are packed objects are brought
+// there, orderInputFetches).
+func inputsWaitTx(ctx context.Context, q queryer, declared []machine.Store, projectScopeID, selector, inputsJSON string) (string, error) {
+	inputs, err := decodeInputs(inputsJSON)
+	if err != nil {
+		return "its inputs cannot be read: " + err.Error(), nil
+	}
+	node := selectorNode(selector)
+	var missing []string
+	for _, in := range inputs {
+		src, err := inputSourceTx(ctx, q, declared, projectScopeID, in)
+		if err != nil {
+			return "", err
+		}
+		switch {
+		case src.problem != "":
+			return "input " + in.Name + ": " + src.problem, nil
+		case node == "" && len(src.places) == 0:
+			missing = append(missing, in.Name+" (on no node: name one in its executor selector)")
+		case node != "" && !src.on(node) && !src.packed:
+			missing = append(missing, in.Name+" (brought to "+node+" once packed)")
+		case node != "" && !src.on(node):
+			missing = append(missing, in.Name+" (being brought to "+node+")")
+		}
+	}
+	if len(missing) == 0 {
+		return "", nil
+	}
+	return "waiting for its inputs: " + strings.Join(missing, ", "), nil
 }
 
 // pinnedSourceTx says why an object's source is not to be deleted yet (""
@@ -302,4 +454,36 @@ func pinnedSourceTx(ctx context.Context, q queryer, objectID string) (string, er
 		}
 	}
 	return "", nil
+}
+
+// loadInputsWaits notes, on each candidate with inputs (of ids), why it is
+// not admitted yet for them (inputsWaitTx). A gang's inputs are its rank
+// 0's, which is not planned onto them: they are not waited for.
+func loadInputsWaits(ctx context.Context, tx *sql.Tx, candidates []*planCandidate, ids []string) error {
+	inputs := map[string]string{}
+	err := eachRow(ctx, tx, `SELECT id,inputs_json FROM execution_requests WHERE id=ANY($1::text[]) AND inputs_json IS NOT NULL`, []any{ids}, func(rows *sql.Rows) error {
+		var id, body string
+		if err := rows.Scan(&id, &body); err != nil {
+			return err
+		}
+		inputs[id] = body
+		return nil
+	})
+	if err != nil || len(inputs) == 0 {
+		return err
+	}
+	declared, err := declaredStores(ctx, tx)
+	if err != nil {
+		return err
+	}
+	for _, c := range candidates {
+		body, ok := inputs[c.execution.ID]
+		if !ok || c.gangID != "" {
+			continue
+		}
+		if c.inputsWait, err = inputsWaitTx(ctx, tx, declared, c.execution.ProjectScopeID, c.selectorJSON, body); err != nil {
+			return err
+		}
+	}
+	return nil
 }

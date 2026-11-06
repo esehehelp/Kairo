@@ -222,6 +222,7 @@ func init() {
 			subs: []command{
 				{"import", "--project P --node N [--name NAME] [--delete-source] [--json] PATH...", "import directories of a node: packed, copied to a durable store, read back", dataImport},
 				{"list", "[--project P] [--kind K] [--limit N] [--json]", "data objects, newest first: source, pack, verified copies, what became of the source", dataList},
+				{"fetch", "--project P --node N [--data NAME]... [OBJECT...]", "bring data objects to a node (unpacked under <root>/inputs/<object id>) for its executions to read", dataFetch},
 			},
 			aliases: map[string]string{"ls": "list", "show": "list", "add": "import"},
 		}},

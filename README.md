@@ -398,7 +398,7 @@ shows.
 | POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
 | GET, POST | `/api/machines` (the machine declaration) | read, admin |
 | GET | `/api/stores`, `/api/data/objects` (`?project=&kind=&limit=`) | read |
-| POST | `/api/data/imports` | admin |
+| POST | `/api/data/imports`, `/api/data/fetches` | admin |
 | GET | `/api/hardware` (`?host=`) | read |
 | GET | `/api/hardware/samples`, `/api/hardware/leases` (`?since=&until=&step=&key=`) | read |
 | POST, DELETE | `/api/hardware/{host}/{device}/settings` | admin |
@@ -545,18 +545,23 @@ labels may take what is placed there.
   of the same project (tasks only, and T must be in `depends_on`, so that run
   has succeeded first); `data = "NAME"`, the newest data object of the
   project with that name (an import's, say: Data stores); `object = "obj_..."`,
-  a data object of the project by id. For now an input is read in place: a
-  run's output directory still on its volatile store, or an imported
-  directory still where it was imported from (not deleted, or kept without
-  `--delete-source`). A task with inputs is planned onto the node they are
-  on (unless its `[tasks.execution.executor]` names a `node` itself, they
-  are on more than one, or it is a gang, whose rank 0 alone is handed its
-  inputs), and each is checked when its attempt launches: on
-  that node, in its executor's namespace (a store it serves; an imported
-  directory of a non-WSL executor for a non-WSL one), there as a directory.
-  One that is not (on another node, or deleted once copied) aborts the
-  launch, the execution ending `launch_aborted: input NAME: why`; bringing
-  an object from its durable copy comes next. While a task that is pending
+  a data object of the project by id. An input is read where it is on the
+  node an attempt runs on: a run's output directory still on its volatile
+  store, an imported directory still where it was imported from (not
+  deleted, or kept without `--delete-source`), or its data object brought to
+  that node (Data stores: brought inputs). An execution with inputs (a task
+  or a direct one) is planned onto a node, unless its executor selector
+  names a `node` itself or it is a gang (whose rank 0 alone is handed its
+  inputs): the first every input is on, else the one the first input is on,
+  else the one its object was made on. It waits (`inputs_not_ready`, saying
+  which and why) until every input is on that node, those missing being
+  brought there meanwhile once they are packed; one that cannot be had at
+  all (a task with no run, a name the project has no object of) says so.
+  Each is checked again when its attempt launches: on that node, in its
+  executor's namespace (a store it serves; an imported directory of a
+  non-WSL executor for a non-WSL one), there as a directory; one that is not
+  aborts the launch, the execution ending `launch_aborted: input NAME: why`.
+  While a task that is pending
   or running, or an execution not yet ended, names it as an input, a source
   is not deleted once copied (it is packed and copied as usual): a run's
   output directory, by its task while it is that task's latest run, by its
@@ -650,7 +655,7 @@ Every waiting execution's latest reason is kept: `task show` prints it under
 `waiting:` (for example `gpu_leased: pve0: 1 GPU(s) of >= 11.0 GiB needed, 0
 usable; leased by glm/maya-r3 (priority -100)`), and `task list` adds its
 code to the NOTE (`execution waiting: insufficient_ram`). The codes are
-`no_executor`, `not_before`, `awaiting_executor`, `gpu_leased`, `held_for_higher_priority`,
+`no_executor`, `not_before`, `inputs_not_ready`, `awaiting_executor`, `gpu_leased`, `held_for_higher_priority`,
 `gpu_memory_low`, `insufficient_gpu`, `insufficient_cpu`, `insufficient_ram`,
 `insufficient_disk`, `external_claim`, `unattributed_activity`,
 `stale_observation`, `disk_low_watermark` and `preempting`.
@@ -975,7 +980,7 @@ the last report found them, shown as `OUTPUTS`, `pack_bytes` with the number
 of `packs` made there and not removed yet (with their source, or with a source
 kept), shown as `PACKS`, `copy_bytes`
 with the number of verified `copies` on a durable store, shown as `COPIES`,
-and `pinned_bytes` and `cache_bytes`, both 0 until P1c) and
+`pinned_bytes`, 0 for now, and `cache_bytes`, the inputs brought there) and
 `external_bytes`, what the filesystem uses that Kairo does not know (used
 minus Kairo's classes), then the kept scratch of each store and the
 `damaged` copies of each durable store. The latest
@@ -1191,6 +1196,34 @@ by default) shows each object: kind, project, name, node, `packing` or
 `packed`, files, content and pack bytes, verified copies (and the path of
 one), and what became of its source (`present`, `deleting`, `deleted`,
 `kept`, with why).
+
+Brought inputs: an input not on the node an execution waits on is brought
+there once it is a packed object (a fetch, ordered as the daemon reconciles
+tasks, for each input an execution waiting on a node lacks there; or by
+`kairo data fetch --project P --node N [--data NAME]... [OBJECT...]`,
+`POST /api/data/fetches`, `{"project", "node", "data", "objects"}`). It is
+brought to the node's first volatile store by id that an executor of the
+node that is not a WSL one serves, by that executor (table
+`object_placements`: `fetching`, then `ready` with its bytes; events
+`fetch_ordered`, `fetched`; agent operations `fetches-to-make` every minute,
+`record-fetch`): the object's pack is read from a verified durable copy (a
+copy found damaged is not), or, while its source is not yet settled, from
+the pack where it was made, on a store this executor serves (through
+handles) before another node's agent (its `[packs]` server, with a token the
+daemon issued for that fetch, valid 12 hours, that only the agent of the
+node holding that copy or pack may honour; a durable copy is served from
+`<root>/objects/<month>`), into `<root>/inputs/<object id>.tar.zst.partial`
+with its file list (resumed with a range request when cut short), checked
+against the pack's size and sha256 and the list's sha256, and unpacked into
+`<root>/inputs/<object id>.partial`: only directories and regular files at
+relative paths inside it (written through a handle on it, so nothing
+escapes), each file's size and sha256 checked against the list and its
+mtime set as packed, every listed file there; then it is renamed
+`<root>/inputs/<object id>`, the pack and list are removed and it is
+recorded ready. A fetch that fails is warned once and tried again later.
+What is brought stays, read in place by every later execution on that node
+that names it, and is counted as the store's `CACHE` bytes; nothing evicts
+it yet.
 
 Reading durable copies back: a durable store keeps for good and may lose bits
 without saying so (exFAT has no journal), so an executor serving it reads

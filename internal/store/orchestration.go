@@ -199,7 +199,7 @@ func (s *Store) ReconcileProjectTasks(ctx context.Context) error {
 			return err
 		}
 	}
-	return nil
+	return s.orderInputFetches(ctx)
 }
 
 func (s *Store) planProjectTasks(ctx context.Context) error {

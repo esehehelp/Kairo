@@ -71,6 +71,10 @@ type agentRecordCopyRequest struct {
 	Made store.CopyMade `json:"made"`
 }
 
+type agentRecordFetchRequest struct {
+	Made store.FetchMade `json:"made"`
+}
+
 type agentSettleDeletionRequest struct {
 	Settled store.ObjectDeletion `json:"settled"`
 }
@@ -315,6 +319,19 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentRecordCopyRequest) (any, error) {
 				return okBody, s.Store.RecordCopy(ctx, b.Made)
+			}),
+		// An observe-only daemon orders nothing brought.
+		newAgentOp(s, "fetches-to-make", observeEmpty, map[string]any{"fetches": []store.FetchOrder{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				fetches, err := s.Store.FetchesToMake(ctx, b.ExecutorID)
+				return map[string]any{"fetches": fetches}, err
+			}),
+		newAgentOp(s, "record-fetch", observeRefused, nil,
+			func(ctx context.Context, b agentRecordFetchRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.Made.ExecutorID)
+			},
+			func(ctx context.Context, b agentRecordFetchRequest) (any, error) {
+				return okBody, s.Store.RecordFetch(ctx, b.Made)
 			}),
 		// An observe-only daemon orders no deletion and no read back.
 		newAgentOp(s, "deletions-to-make", observeEmpty, map[string]any{"deletions": []store.DeletionOrder{}}, byExecutor,

@@ -43,3 +43,18 @@ func (s *Server) listDataObjects(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"objects": objects})
 }
+
+// fetchData orders data objects brought to a node (kairo data fetch).
+func (s *Server) fetchData(w http.ResponseWriter, r *http.Request) {
+	var body store.FetchRequest
+	if err := decode(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	objects, err := s.Store.FetchData(r.Context(), body)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"objects": objects})
+}

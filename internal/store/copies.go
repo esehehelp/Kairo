@@ -35,6 +35,9 @@ type CopySource struct {
 	Root    string `json:"root"`
 	Addr    string `json:"addr,omitempty"`
 	Token   string `json:"token,omitempty"`
+	// Month: the pack is a durable store's copy, under
+	// <root>/objects/<month>; empty: <root>/packs (placements.go).
+	Month string `json:"month,omitempty"`
 }
 
 // CopyOrder is a pack its executor is to copy to the durable store StoreID
@@ -67,6 +70,8 @@ type CopyMade struct {
 type PackRead struct {
 	StoreID string `json:"store_id"`
 	Root    string `json:"root"`
+	// Month: a durable copy, under <root>/objects/<month> (a fetch's).
+	Month string `json:"month,omitempty"`
 }
 
 // ErrCopyMismatch: a copy read back does not match its pack.
@@ -253,6 +258,14 @@ func (s *Store) AuthorizePackRead(ctx context.Context, nodeID, objectID, token s
 	err := s.db.QueryRowContext(ctx, `SELECT d.store_id,d.root,c.token_expires_at FROM data_objects d JOIN executors x ON x.id=d.executor_id
 		JOIN object_copies c ON c.object_id=d.id AND c.state='copying' AND c.token_hash=$1
 		WHERE d.id=$2 AND d.state='packed' AND x.node_id=$3`, hashToken(token), objectID, nodeID).Scan(&read.StoreID, &read.Root, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		// a fetch's (placements.go): read from the store it was issued for,
+		// on that node
+		var month sql.NullString
+		err = s.db.QueryRowContext(ctx, `SELECT p.source_store_id,p.source_root,p.source_month,p.token_expires_at FROM object_placements p
+			WHERE p.object_id=$1 AND p.token_hash=$2 AND p.state='fetching' AND p.source_node_id=$3`, objectID, hashToken(token), nodeID).Scan(&read.StoreID, &read.Root, &month, &expires)
+		read.Month = month.String
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return read, ErrNotFound
 	}

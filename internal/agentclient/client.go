@@ -182,6 +182,20 @@ func (c *Client) RecordCopy(ctx context.Context, made store.CopyMade) error {
 	return c.call(ctx, "record-copy", map[string]any{"made": made}, nil)
 }
 
+// FetchesToMake asks for what this executor is to bring to its node now.
+func (c *Client) FetchesToMake(ctx context.Context, executorID string) ([]store.FetchOrder, error) {
+	var out struct {
+		Fetches []store.FetchOrder `json:"fetches"`
+	}
+	err := c.call(ctx, "fetches-to-make", map[string]string{"executor_id": executorID}, &out)
+	return out.Fetches, err
+}
+
+// RecordFetch records an object this executor brought and unpacked.
+func (c *Client) RecordFetch(ctx context.Context, made store.FetchMade) error {
+	return c.call(ctx, "record-fetch", map[string]any{"made": made}, nil)
+}
+
 // AuthorizePackRead asks whether token lets this node hand over an
 // object's pack, and where it is.
 func (c *Client) AuthorizePackRead(ctx context.Context, nodeID, objectID, token string) (store.PackRead, error) {

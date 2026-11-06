@@ -133,6 +133,7 @@ type Local struct {
 	PackClient *http.Client
 	packs      round
 	copies     round
+	fetches    round
 	deletions  round
 	scrubs     round
 
@@ -244,6 +245,7 @@ func (e *Local) tick(ctx context.Context) error {
 	e.settleScratch()
 	e.makePacks()
 	e.makeCopies()
+	e.makeFetches()
 	e.makeDeletions()
 	e.makeScrubs()
 	e.endStep()

@@ -376,6 +376,8 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 	leaderSpec := spec
 	if spec.Gang != nil {
 		leaderSpec = rankSpec(spec, 0)
+	} else if err = pinInputNodeTx(ctx, tx, spec.Scope.Project, &leaderSpec); err != nil {
+		return "", false, err
 	}
 	executionID, err := insert(leaderSpec, spec.ClientRequestID, digest)
 	if err != nil {

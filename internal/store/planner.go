@@ -167,6 +167,9 @@ type planCandidate struct {
 	demand planDemand
 	gangID string
 	ranks  []planRank
+	// inputsWait: why it is not admitted yet for its inputs (inputs.go);
+	// empty when it has none, or each is where it is planned.
+	inputsWait string
 	// endsIn is how long it is expected to run once admitted (0: no
 	// estimate, it may use nothing held for others).
 	endsIn time.Duration
@@ -1024,6 +1027,9 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + "no live executor matches the executor labels"}}, time.Time{}
 		}
 	}
+	if c.inputsWait != "" {
+		return planPlacement{wait: planWait{reason: "inputs_not_ready", message: c.inputsWait}}, time.Time{}
+	}
 	if notBefore, ok := instant.Parse(deref(c.execution.NotBefore)); ok && notBefore.After(p.m.stamp) {
 		return p.notYet(c, ranks, options, notBefore)
 	}
@@ -1546,6 +1552,9 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 	ids := make([]string, 0, len(candidates))
 	for _, c := range candidates {
 		ids = append(ids, c.execution.ID)
+	}
+	if err = loadInputsWaits(ctx, tx, candidates, ids); err != nil {
+		return nil, err
 	}
 	for _, gang := range members {
 		for _, member := range gang {

@@ -133,12 +133,17 @@ func (s *Store) RecordStoreObservation(ctx context.Context, obs StoreObservation
 	if err != nil {
 		return err
 	}
+	// cache: the objects brought here for executions to read (placements.go)
+	var cache int64
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(bytes),0)::bigint FROM object_placements WHERE store_id=$1 AND state='ready'`, obs.StoreID).Scan(&cache); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO store_observations(store_id,executor_id,observed_at,usable,problem,total_bytes,free_bytes,scratch_active_bytes,scratch_kept_bytes,scratch_unrecorded_bytes,pinned_bytes,cache_bytes,output_bytes)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,0,$11)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,0,$12,$11)
 		ON CONFLICT(store_id) DO UPDATE SET executor_id=excluded.executor_id,observed_at=excluded.observed_at,usable=excluded.usable,problem=excluded.problem,
 		total_bytes=excluded.total_bytes,free_bytes=excluded.free_bytes,scratch_active_bytes=excluded.scratch_active_bytes,scratch_kept_bytes=excluded.scratch_kept_bytes,
 		scratch_unrecorded_bytes=excluded.scratch_unrecorded_bytes,pinned_bytes=excluded.pinned_bytes,cache_bytes=excluded.cache_bytes,output_bytes=excluded.output_bytes`,
-		obs.StoreID, obs.ExecutorID, t, obs.Usable, nullable(obs.Problem), obs.TotalBytes, obs.FreeBytes, active, kept, unrecorded, outputs); err != nil {
+		obs.StoreID, obs.ExecutorID, t, obs.Usable, nullable(obs.Problem), obs.TotalBytes, obs.FreeBytes, active, kept, unrecorded, outputs, cache); err != nil {
 		return err
 	}
 	return tx.Commit()

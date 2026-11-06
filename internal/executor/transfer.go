@@ -238,6 +238,9 @@ func (e *Local) fetch(ctx context.Context, o store.CopyOrder, served map[string]
 			return errPackNotHere
 		}
 		open = func(name string, offset int64) (io.ReadCloser, int64, error) {
+			if o.Source.Month != "" {
+				return openLocalObject(o.Source.Root, o.Source.Month, name, offset)
+			}
 			return openLocalPack(o.Source.Root, name, offset)
 		}
 	} else {
@@ -335,6 +338,22 @@ func (c ctxReader) Read(p []byte) (int, error) {
 // regular file reached through handles, at offset.
 func openLocalPack(root, name string, offset int64) (io.ReadCloser, int64, error) {
 	f, err := openPackFile(root, name)
+	if err != nil {
+		return nil, 0, err
+	}
+	if offset > 0 {
+		if _, err = f.Seek(offset, io.SeekStart); err != nil {
+			f.Close()
+			return nil, 0, err
+		}
+	}
+	return f, offset, nil
+}
+
+// openLocalObject opens a durable copy, <root>/objects/<month>/name of a
+// store this executor serves, at offset.
+func openLocalObject(root, month, name string, offset int64) (io.ReadCloser, int64, error) {
+	f, err := openObjectFile(root, month, name)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -527,7 +546,12 @@ func (p *PackServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "the pack's store is not served here", http.StatusNotFound)
 		return
 	}
-	f, err := openPackFile(root, name)
+	open := func() (*os.File, error) { return openPackFile(root, name) }
+	if read.Month != "" {
+		// a durable copy, for a fetch (store/placements.go)
+		open = func() (*os.File, error) { return openObjectFile(root, read.Month, name) }
+	}
+	f, err := open()
 	if err != nil {
 		p.warn(objectID, "pack not opened", "error", err)
 		http.NotFound(w, r)

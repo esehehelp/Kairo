@@ -151,3 +151,42 @@ func valueOr(p *string) string {
 	}
 	return *p
 }
+
+// dataFetch: kairo data fetch --project P --node N [--data NAME]... [OBJECT...].
+func dataFetch(args []string) error {
+	fs := newFlags("data fetch")
+	api := apiFlag(fs)
+	project := fs.String("project", "", "the project the data belongs to (required)")
+	node := fs.String("node", "", "the node to bring it to (required)")
+	var names stringList
+	fs.Var(&names, "data", "a data object by name (the newest packed); repeatable")
+	objects, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if *project == "" || *node == "" || len(names)+len(objects) == 0 {
+		return usageError("data fetch needs --project, --node and --data NAME or an OBJECT id")
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	var body struct {
+		Objects []store.FetchedObject `json:"objects"`
+	}
+	err = client.callJSON(http.MethodPost, "/api/data/fetches", store.FetchRequest{Project: *project, Node: *node, Data: names, Objects: objects}, &body)
+	if routeMissing(err) {
+		return fmt.Errorf("the daemon does not bring data to nodes: %s", olderDaemonHint())
+	}
+	if err != nil {
+		return err
+	}
+	for _, o := range body.Objects {
+		state := "ordered"
+		if !o.Ordered {
+			state = "there or on its way already"
+		}
+		fmt.Println(o.ObjectID + ": " + state)
+	}
+	return nil
+}

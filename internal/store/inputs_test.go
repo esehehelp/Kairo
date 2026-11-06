@@ -125,9 +125,9 @@ task = "train"
 	}
 }
 
-// An input that cannot be read in place on the attempt's node is handed as
-// a problem (the launch is aborted saying why), and a data input names the
-// newest object of the project with that name.
+// A data input names the newest object of the project with that name: an
+// execution reading an imported directory is planned onto its node and
+// handed it in place; one naming data the project lacks waits saying so.
 func TestAnInputNotHereIsAProblem(t *testing.T) {
 	store := importFixture(t)
 	ctx := context.Background()
@@ -139,8 +139,17 @@ func TestAnInputNotHereIsAProblem(t *testing.T) {
 	spec.Scope.Project = "imp"
 	spec.ExecutorSelector = json.RawMessage(`{"labels":{"environment":"windows"}}`)
 	spec.Exclusive, spec.Checkpointable, spec.Preemptible = []ExclusiveRequest{}, false, false
-	spec.Inputs = []datainput.Input{{Name: "data", Data: "sumire"}, {Name: "gone", Data: "nothing"}}
+	spec.Inputs = []datainput.Input{{Name: "data", Data: "sumire"}}
 	if _, _, err := store.SubmitExecution(ctx, spec); err != nil {
+		t.Fatal(err)
+	}
+	lacking := spec
+	lacking.ClientRequestID = "lacking"
+	lacking.Scope.Task = "other"
+	lacking.Priority = -1
+	lacking.Inputs = []datainput.Input{{Name: "gone", Data: "nothing"}}
+	waiting, _, err := store.SubmitExecution(ctx, lacking)
+	if err != nil {
 		t.Fatal(err)
 	}
 	reservation, err := store.ReserveNext(ctx, "win-exec")
@@ -154,10 +163,18 @@ func TestAnInputNotHereIsAProblem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(launch.Inputs) != 2 || launch.Inputs[0].Path != "D:/data/sumire" || launch.Inputs[1].Problem == "" || launch.Inputs[1].Path != "" {
+	if len(launch.Inputs) != 1 || launch.Inputs[0].Path != "D:/data/sumire" || launch.Inputs[0].Problem != "" {
 		t.Fatalf("inputs: %+v (imported %+v)", launch.Inputs, imported)
 	}
-	if !strings.Contains(launch.Inputs[1].Problem, "no data nothing") {
-		t.Fatalf("problem: %q", launch.Inputs[1].Problem)
+	if r, err := store.ReserveNext(ctx, "win-exec"); err != nil || r != nil {
+		t.Fatalf("an execution naming data the project lacks is admitted: %+v %v", r, err)
+	}
+	declared, err := declaredStores(ctx, store.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	why, err := inputsWaitTx(ctx, store.db, declared, waiting.ProjectScopeID, `{"labels":{"environment":"windows"}}`, `[{"name":"gone","data":"nothing"}]`)
+	if err != nil || !strings.Contains(why, "input gone: the project has no data nothing") {
+		t.Fatalf("wait: %q %v", why, err)
 	}
 }
