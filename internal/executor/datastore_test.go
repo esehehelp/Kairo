@@ -17,11 +17,14 @@ import (
 )
 
 // testFilesystem is the filesystem identity dir is on, as a filesystem
-// provider names it: its drive on Windows, a path of its filesystem
-// elsewhere.
+// provider names it: its drive on Windows, the mount point covering it on
+// Linux.
 func testFilesystem(dir string) string {
 	if runtime.GOOS == "windows" {
 		return filepath.VolumeName(dir)
+	}
+	if m := mountOf(dir); m != "" {
+		return m // a declared filesystem must be a mount point
 	}
 	return dir
 }
