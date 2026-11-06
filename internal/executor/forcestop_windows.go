@@ -145,33 +145,30 @@ func (e *Local) treeAlive(ctx context.Context, t processTree) (bool, error) {
 	return false, nil
 }
 
-// wslAttemptScript finds the Linux processes of an attempt by the
-// KAIRO_ATTEMPT_ID every process launched for it inherits, signals them
-// unless the signal is 0, and prints their pids.
-const wslAttemptScript = `pids=$(grep -lzxF -e "KAIRO_ATTEMPT_ID=$1" /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n' | cut -d/ -f3)
-if [ -n "$pids" ] && [ "$2" != 0 ]; then kill -s "$2" $pids 2>/dev/null; fi
-echo $pids`
-
+// wslAttemptProcesses finds (and signals, unless signal is "0") the Linux
+// processes of an attempt in WSL by wslAttemptScript, with those the last
+// scan of the attempt in that distro found (attemptMembers).
 func wslAttemptProcesses(ctx context.Context, distro, attemptID, signal string) ([]int, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
+	key := distro + "/" + attemptID // neither holds a /
 	args := []string{}
 	if distro != "" {
 		args = append(args, "-d", distro)
 	}
 	args = append(args, "--exec", "sh", "-c", wslAttemptScript, "kairo-force-stop", attemptID, signal)
+	for pid, start := range attemptMembers.known(key) {
+		args = append(args, strconv.Itoa(pid)+":"+start)
+	}
 	out, err := extcmd.Output(ctx, "wsl.exe", args...)
 	if err != nil {
 		return nil, fmt.Errorf("find attempt processes in WSL: %w", err)
 	}
-	var pids []int
-	for _, f := range strings.Fields(string(out)) {
-		pid, err := strconv.Atoi(f)
-		if err != nil {
-			return nil, fmt.Errorf("unexpected WSL output %q", strings.TrimSpace(string(out)))
-		}
-		pids = append(pids, pid)
+	pids, found, err := parseAttemptMembers(string(out))
+	if err != nil {
+		return nil, err
 	}
+	attemptMembers.set(key, found)
 	return pids, nil
 }
 
