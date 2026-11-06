@@ -313,6 +313,12 @@ controller (`kairo controller`, see Hardware settings) connects the same way.
 
 ## API
 
+A request that takes 2 s or longer is logged by the daemon at WARN (`slow
+request`, with its route pattern, never its path or headers, so no id or
+token; its status, seconds and remote address): the SDK gives up on a
+request after 10 s, so this is where a daemon too slow for its attempts
+shows.
+
 | Method | Path | Role |
 |---|---|---|
 | GET | `/health` | none |
