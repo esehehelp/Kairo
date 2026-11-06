@@ -19,7 +19,7 @@ import (
 // since and until are RFC 3339 times (default: the last 24 hours, since at
 // most store.HistoryRetention ago); step is a duration ("60s", "5m") or
 // seconds (default and least: what keeps a series within maxPoints buckets,
-// and never under 10 s); key, repeatable, limits the answer to those series
+// and never under the history's 30 s); key, repeatable, limits the answer to those series
 // (a GPU's UUID, a resource id, host/<host>/cpu).
 
 // maxPoints is the most buckets a series of /api/hardware/samples holds.
@@ -56,7 +56,7 @@ func historyWindow(r *http.Request, now time.Time) (since, until time.Time, keys
 
 // historyStep is the bucket width of a samples request over [since, until).
 func historyStep(r *http.Request, since, until time.Time) (time.Duration, error) {
-	least := max(10*time.Second, until.Sub(since)/maxPoints)
+	least := max(store.HistoryInterval, until.Sub(since)/maxPoints)
 	step := least
 	if v := r.URL.Query().Get("step"); v != "" {
 		d, err := time.ParseDuration(v)

@@ -120,6 +120,9 @@ func recordDeviceSampleTx(ctx context.Context, tx *sql.Tx, resourceID, observedA
 		device, resourceID, stamp, sampleStamp(until), sample.PowerW, sample.PowerLimitW, sample.SMClockMHz, sample.MemClockMHz, sample.PState, sample.EventReasons, sample.MemUtilization, sample.FanPercent, sample.PCIeGen, sample.PCIeWidth); err != nil {
 		return err
 	}
+	if err = recordDeviceHistoryTx(ctx, tx, device, at, sample); err != nil {
+		return err
+	}
 	if p := sample.DeviceProperties; !p.empty() {
 		_, err = tx.ExecContext(ctx, `INSERT INTO device_properties(device,default_power_limit_w,min_power_limit_w,max_power_limit_w,max_sm_clock_mhz,max_mem_clock_mhz,pcie_gen_max,pcie_width_max,observed_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)
 			ON CONFLICT(device) DO UPDATE SET default_power_limit_w=excluded.default_power_limit_w,min_power_limit_w=excluded.min_power_limit_w,max_power_limit_w=excluded.max_power_limit_w,
@@ -329,6 +332,9 @@ func (s *Store) RecordControllerSamples(ctx context.Context, nodeID string, samp
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO device_samples(device,resource_id,observed_at,valid_until,power_w) VALUES($1,NULL,$2,$3,$4)`,
 			HostCPUDevice(hostID), sampleStamp(at), sampleStamp(until), sample.PowerW); err != nil {
+			return nil, err
+		}
+		if err = recordDeviceHistoryTx(ctx, tx, HostCPUDevice(hostID), at, DeviceSample{PowerW: sample.PowerW}); err != nil {
 			return nil, err
 		}
 	}

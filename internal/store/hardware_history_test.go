@@ -23,21 +23,21 @@ func observeAt(t *testing.T, s *Store, resourceID string, at time.Time, total, f
 	}
 }
 
-// An observation is kept in the history at most every historyInterval per
+// An observation is kept in the history at most every HistoryInterval per
 // resource, with what the resource's live leases reserved of it then.
-func TestHistoryKeepsAnObservationEveryTenSecondsWithWhatWasReserved(t *testing.T) {
+func TestHistoryKeepsAnObservationEveryThirtySecondsWithWhatWasReserved(t *testing.T) {
 	c := newPlanCluster(t)
 	c.node("a", 0, 16000, 64, 500)
 	before, _ := historyRows(t, c.store, "a-ram")
 	base := time.Now().Add(-time.Hour)
 	observeAt(t, c.store, "a-ram", base, 64*gib, 60*gib)
-	observeAt(t, c.store, "a-ram", base.Add(4*time.Second), 64*gib, 59*gib)
+	observeAt(t, c.store, "a-ram", base.Add(20*time.Second), 64*gib, 59*gib)
 	if n, _ := historyRows(t, c.store, "a-ram"); n != before+1 {
-		t.Fatalf("%d rows after two observations 4 s apart, want %d", n, before+1)
+		t.Fatalf("%d rows after two observations 20 s apart, want %d", n, before+1)
 	}
-	observeAt(t, c.store, "a-ram", base.Add(11*time.Second), 64*gib, 58*gib)
+	observeAt(t, c.store, "a-ram", base.Add(31*time.Second), 64*gib, 58*gib)
 	if n, _ := historyRows(t, c.store, "a-ram"); n != before+2 {
-		t.Fatalf("%d rows after a third 11 s later, want %d", n, before+2)
+		t.Fatalf("%d rows after a third 31 s after the first, want %d", n, before+2)
 	}
 	c.observe("a-ram", 64*gib, 64*gib) // fresh again: the ones above expired an hour ago
 	c.submit(planSpec("job", "p", 0, 0, 2000, 8))
@@ -64,15 +64,22 @@ func TestHardwareSamplesBucketsAndJoinsDeviceSamples(t *testing.T) {
 	ctx := context.Background()
 	since := time.Now().Add(-10 * time.Minute).Truncate(time.Minute)
 	observeAt(t, c.store, "a-ram", since.Add(5*time.Second), 64*gib, 60*gib)
-	observeAt(t, c.store, "a-ram", since.Add(20*time.Second), 64*gib, 56*gib)
+	observeAt(t, c.store, "a-ram", since.Add(40*time.Second), 64*gib, 56*gib)
 	observeAt(t, c.store, "a-ram", since.Add(3*time.Minute), 64*gib, 48*gib)
-	// a CPU package power sample of a-cpu, and the series of host h over a
+	// a CPU package power sample of a-cpu, and two of host h (over a) as its
+	// controller (a) reads them, 20 s apart: the history keeps the first
 	if _, err := c.store.ApplyMachines(ctx, machine.Spec{Hosts: []machine.Host{{ID: "h", Nodes: []string{"a"}, Controller: "a", MaxSlowdown: 0.05}}}, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := c.store.testExec(`INSERT INTO device_samples(device,resource_id,observed_at,valid_until,power_w) VALUES('a-cpu','a-cpu',$1,$2,80),('host/h/cpu',NULL,$1,$2,120)`,
-		sampleStamp(since.Add(10*time.Second)), sampleStamp(since.Add(70*time.Second))); err != nil {
+	if _, err := c.store.testExec(`INSERT INTO device_history(device,sampled_at,power_w) VALUES('a-cpu',$1::timestamptz,80)`, since.Add(10*time.Second).Format(time.RFC3339)); err != nil {
 		t.Fatal(err)
+	}
+	power := func(w float64) *float64 { return &w }
+	for i, w := range []float64{120, 999} {
+		at := since.Add(time.Duration(10+20*i) * time.Second)
+		if skipped, err := c.store.RecordControllerSamples(ctx, "a", []ControllerSample{{DeviceID: "cpu", ObservedAt: at.Format(time.RFC3339Nano), ValidUntil: at.Add(time.Minute).Format(time.RFC3339Nano), PowerW: power(w)}}); err != nil || len(skipped) != 0 {
+			t.Fatalf("controller sample: %v %v", skipped, err)
+		}
 	}
 	out, err := c.store.HardwareSamples(ctx, since, since.Add(5*time.Minute), time.Minute, nil)
 	if err != nil {

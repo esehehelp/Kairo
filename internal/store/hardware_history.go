@@ -15,39 +15,67 @@ import (
 //
 // Resource observations are kept only an hour (only each resource's latest
 // is read for admission), so recordHistoryTx keeps at most one row per
-// resource every historyInterval in resource_history, with the sum of what
-// its live leases reserved then, for HistoryRetention. HardwareSamples
-// averages those rows, and the device samples of the same devices (power,
-// clocks), into buckets; LeaseIntervals lists the leases that held a
-// resource within a window.
+// resource every HistoryInterval in resource_history, with the sum of what
+// its live leases reserved then, for HistoryRetention; recordDeviceHistoryTx
+// does the same with device samples (power, clocks) in device_history.
+// HardwareSamples averages both into buckets; LeaseIntervals lists the
+// leases that held a resource within a window.
+//
+// The interval keeps a day's history small enough to average on each
+// request: on pve1's PostgreSQL (2 cores) a day of device_samples (a row per
+// provider poll, about 150,000) took 2.3 s; a day of both histories is about
+// 80,000 narrow rows.
 
-// historyInterval is the least time between two history rows of a resource.
-const historyInterval = 10 * time.Second
+// HistoryInterval is the least time between two history rows of a resource
+// or device.
+const HistoryInterval = 30 * time.Second
 
 // HistoryRetention is how long resource history is kept (as device samples).
 var HistoryRetention = 72 * time.Hour
 
 // recordHistoryTx keeps observation o of a resource in resource_history,
-// unless the resource has a row less than historyInterval from it.
+// unless the resource has a row less than HistoryInterval from it.
 func recordHistoryTx(ctx context.Context, tx *sql.Tx, o Observation) error {
 	_, err := tx.ExecContext(ctx, `INSERT INTO resource_history(resource_id,sampled_at,total_bytes,free_bytes,utilization,reserved)
 		SELECT $1,$2::timestamptz,$3,$4,$5,
 			(SELECT COALESCE(SUM(li.quantity),0) FROM lease_items li JOIN leases l ON l.id=li.lease_id WHERE li.resource_id=$1 AND l.state IN `+liveLeaseStates+`)
 		WHERE NOT EXISTS(SELECT 1 FROM resource_history WHERE resource_id=$1 AND sampled_at>$2::timestamptz-$6*interval '1 second' AND sampled_at<$2::timestamptz+$6*interval '1 second')
 		ON CONFLICT DO NOTHING`,
-		o.ResourceID, o.ObservedAt, o.TotalBytes, o.FreeBytes, o.Utilization, historyInterval.Seconds())
+		o.ResourceID, o.ObservedAt, o.TotalBytes, o.FreeBytes, o.Utilization, HistoryInterval.Seconds())
 	return err
 }
 
-// PruneHistory deletes resource history older than olderThan and returns how
-// many rows it removed.
-func (s *Store) PruneHistory(ctx context.Context, olderThan time.Duration) (int, error) {
-	result, err := s.exec(ctx, `DELETE FROM resource_history WHERE sampled_at<$1::timestamptz`, time.Now().Add(-olderThan).UTC().Format(time.RFC3339Nano))
-	if err != nil {
-		return 0, err
+// recordDeviceHistoryTx keeps device sample s of device, read at at, in
+// device_history, unless the device has a row less than HistoryInterval from
+// it.
+func recordDeviceHistoryTx(ctx context.Context, tx *sql.Tx, device string, at time.Time, s DeviceSample) error {
+	var clock *float64
+	if s.SMClockMHz != nil {
+		v := float64(*s.SMClockMHz)
+		clock = &v
 	}
-	n, _ := result.RowsAffected()
-	return int(n), nil
+	_, err := tx.ExecContext(ctx, `INSERT INTO device_history(device,sampled_at,power_w,power_limit_w,sm_clock_mhz,mem_util)
+		SELECT $1,$2::timestamptz,$3,$4,$5,$6
+		WHERE NOT EXISTS(SELECT 1 FROM device_history WHERE device=$1 AND sampled_at>$2::timestamptz-$7*interval '1 second' AND sampled_at<$2::timestamptz+$7*interval '1 second')
+		ON CONFLICT DO NOTHING`,
+		device, at.UTC().Format(time.RFC3339Nano), s.PowerW, s.PowerLimitW, clock, s.MemUtilization, HistoryInterval.Seconds())
+	return err
+}
+
+// PruneHistory deletes resource and device history older than olderThan and
+// returns how many rows it removed.
+func (s *Store) PruneHistory(ctx context.Context, olderThan time.Duration) (int, error) {
+	cutoff := time.Now().Add(-olderThan).UTC().Format(time.RFC3339Nano)
+	removed := 0
+	for _, table := range []string{"resource_history", "device_history"} {
+		result, err := s.exec(ctx, `DELETE FROM `+table+` WHERE sampled_at<$1::timestamptz`, cutoff)
+		if err != nil {
+			return removed, err
+		}
+		n, _ := result.RowsAffected()
+		removed += int(n)
+	}
+	return removed, nil
 }
 
 // HardwareSeries is one device's or resource's history, bucketed: T holds
@@ -170,8 +198,7 @@ func (s *Store) HardwareSamples(ctx context.Context, since, until time.Time, ste
 		return out, err
 	}
 	// The devices' power and clocks: a GPU's by its UUID, a node's CPU
-	// package by its cpu resource, a host's by its controller's series
-	// (named, so the samples are read through their (device, time) index).
+	// package by its cpu resource, a host's by its controller's series.
 	hostNodes := map[string][]string{}
 	if spec, err := declaredSpec(ctx, s.db); err == nil {
 		for _, host := range spec.Hosts {
@@ -189,10 +216,10 @@ func (s *Store) HardwareSamples(ctx context.Context, since, until time.Time, ste
 	for device := range hostNodes {
 		devices = append(devices, device)
 	}
-	err = eachRow(ctx, s.db, `SELECT device,date_bin($2::interval,observed_at::timestamptz,$1::timestamptz),
+	err = eachRow(ctx, s.db, `SELECT device,date_bin($3::interval,sampled_at,$1::timestamptz),
 			AVG(power_w),AVG(power_limit_w),AVG(sm_clock_mhz),AVG(mem_util)
-		FROM device_samples WHERE device=ANY($5::text[]) AND observed_at>=$3 AND observed_at<$4
-		GROUP BY 1,2`, []any{out.Since, interval, sampleStamp(since), sampleStamp(until), devices}, func(rows *sql.Rows) error {
+		FROM device_history WHERE device=ANY($4::text[]) AND sampled_at>=$1::timestamptz AND sampled_at<$2::timestamptz
+		GROUP BY 1,2`, []any{out.Since, out.Until, interval, devices}, func(rows *sql.Rows) error {
 		var device string
 		var bucket time.Time
 		var power, limit, clock, memUtil sql.NullFloat64

@@ -160,17 +160,18 @@ sample). `kairo doctor` ends with the same table.
 Resource observations describe the present: only each resource's latest one
 is used, and the daemon prunes the others once they are an hour old. Device
 samples are kept for 72 hours (each device's latest always), and so is the
-resource history: at most one observation per resource every 10 seconds,
-with what its live leases reserved of it then. `kairo db compact --config
-kairo.toml` prunes all three at once and vacuums their tables; it may run
-alongside the daemon (PostgreSQL's autovacuum does the same in time).
+hardware history: at most one observation per resource every 30 seconds,
+with what its live leases reserved of it then, and one device sample per
+device as often. `kairo db compact --config kairo.toml` prunes them all at
+once and vacuums their tables; it may run alongside the daemon (PostgreSQL's
+autovacuum does the same in time).
 
 The history is for dashboards, through two read routes. Both take `since`
 and `until` (RFC 3339; by default the last 24 hours, and `since` no earlier
 than 72 hours ago) and `key` (repeatable) to keep only some series:
 
 - `GET /api/hardware/samples` (also `step`, a duration such as `60s` or a
-  number of seconds; never less than 10 s or than a 2000th of the window)
+  number of seconds; never less than 30 s or than a 2000th of the window)
   averages the history into buckets of `step` aligned on `since` and answers
   `{"since", "until", "step_seconds", "series"}`. Each series is `{"key",
   "kind", "nodes", "resources", "t", "metrics"}`: `t` holds the start of each

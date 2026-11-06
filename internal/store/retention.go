@@ -127,6 +127,6 @@ func (s *Store) Compact(ctx context.Context) (int, error) {
 		return removed, err
 	}
 	// VACUUM runs outside a transaction, and changes no row.
-	_, err = s.db.ExecContext(ctx, `VACUUM (ANALYZE) resource_observations, device_samples, resource_history`)
+	_, err = s.db.ExecContext(ctx, `VACUUM (ANALYZE) resource_observations, device_samples, resource_history, device_history`)
 	return removed, err
 }
