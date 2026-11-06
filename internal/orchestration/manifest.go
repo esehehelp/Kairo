@@ -12,6 +12,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"kairo/internal/envspec"
+	"kairo/internal/instant"
 )
 
 const (
@@ -58,6 +59,16 @@ type Execution struct {
 	// by default: a temporary directory emptied with every attempt loses
 	// caches such as torch's compile cache. Absent from the JSON when false.
 	ScratchTmpdir bool `toml:"scratch_tmpdir" json:"scratch_tmpdir,omitempty"`
+	// NotBefore: the execution is not admitted, and reserves nothing, before
+	// this time; from notBeforeHold before it, what it needs is held for it
+	// where it is going (store/planner.go). StartBy and FinishBy are when it
+	// should have started and ended: within a priority, executions with one go
+	// first, the one that must start soonest first; a wait that misses one
+	// says so. None makes Kairo stop anything. Offset date-times; absent from
+	// the JSON when unset, so existing task digests do not change.
+	NotBefore instant.Instant `toml:"not_before" json:"not_before,omitempty"`
+	StartBy   instant.Instant `toml:"start_by" json:"start_by,omitempty"`
+	FinishBy  instant.Instant `toml:"finish_by" json:"finish_by,omitempty"`
 }
 
 // Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
@@ -298,6 +309,9 @@ func normalizeExecution(value *Execution) error {
 	}
 	if value.Preemptible && !value.Checkpointable {
 		return errors.New("preemptible execution must be checkpointable")
+	}
+	if err := instant.CheckOrder(string(value.NotBefore), string(value.StartBy), string(value.FinishBy)); err != nil {
+		return err
 	}
 	if value.Executor.Labels == nil {
 		value.Executor.Labels = map[string]string{}

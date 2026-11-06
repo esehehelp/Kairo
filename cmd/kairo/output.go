@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"kairo/internal/instant"
 	"kairo/internal/orchestration"
 	"kairo/internal/store"
 )
@@ -403,6 +404,21 @@ func shortStamp(s *string) string {
 // longTime is a full local time for task show; longStamp is that of a
 // timestamp, "-" when unknown.
 func longTime(t time.Time) string { return t.In(displayZone).Format("2006-01-02 15:04:05") }
+
+// declaredTimes is a task's not_before, start_by and finish_by, in the local
+// zone ("" when it has none).
+func declaredTimes(e orchestration.Execution) string {
+	var parts []string
+	for _, field := range []struct {
+		name  string
+		value instant.Instant
+	}{{"not before", e.NotBefore}, {"start by", e.StartBy}, {"finish by", e.FinishBy}} {
+		if t, ok := field.value.Time(); ok {
+			parts = append(parts, field.name+" "+t.In(displayZone).Format("2006-01-02 15:04"))
+		}
+	}
+	return strings.Join(parts, "  ")
+}
 
 func longStamp(s *string) string {
 	if t, ok := parseStamp(s); ok {

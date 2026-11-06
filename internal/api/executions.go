@@ -27,6 +27,10 @@ type submitExecutionRequest struct {
 	Env       map[string]string        `json:"env,omitempty"`
 	// ScratchTmpdir: TMPDIR, TMP and TEMP point at the attempt's scratch.
 	ScratchTmpdir bool `json:"scratch_tmpdir,omitempty"`
+	// NotBefore, StartBy, FinishBy: RFC 3339 times with an offset.
+	NotBefore string `json:"not_before,omitempty"`
+	StartBy   string `json:"start_by,omitempty"`
+	FinishBy  string `json:"finish_by,omitempty"`
 }
 
 func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
@@ -50,6 +54,7 @@ func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		Priority: body.Priority, Checkpointable: body.Checkpointable, Preemptible: body.Preemptible,
 		InputContinuationRef: body.InputContinuationRef, Exclusive: body.Exclusive, Capacity: body.Capacity,
 		Env: body.Env, ScratchTmpdir: body.ScratchTmpdir,
+		NotBefore: body.NotBefore, StartBy: body.StartBy, FinishBy: body.FinishBy,
 	})
 	if err != nil {
 		writeError(w, err)

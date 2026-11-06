@@ -5,9 +5,16 @@ package store
 // all nodes with a live executor, every lease and claim. The pass, not the
 // executor that happens to poll first, decides where each execution goes:
 //
-//   - order: priority first (higher first); within a priority, the project
-//     with the smallest dominant share of GPUs, CPU and RAM held goes next,
-//     then the earlier submission.
+//   - order: priority first (higher first); within a priority, an execution
+//     with a start_by or finish_by goes first, the one that must start
+//     soonest first (a finish_by less its estimated run time); then the
+//     project with the smallest dominant share of GPUs, CPU and RAM held,
+//     then the earlier submission. A wait that misses a start_by or
+//     finish_by says so; neither makes anything stop.
+//   - not_before: an execution is not admitted, and holds nothing, before
+//     its not_before; from notBeforeHold before it, it holds what it needs
+//     where it is going from its not_before, as backfill holds are (work
+//     expected to end by then may use it meanwhile).
 //   - placement: an execution goes to the node it fits on best, the one left
 //     with the fewest free GPUs (CPU work stays off GPU nodes, GPU work packs),
 //     then the most free CPU. It is reserved when that node's executor polls.
@@ -47,7 +54,13 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"kairo/internal/instant"
 )
+
+// notBeforeHold is how long before its not_before an execution starts to hold
+// what it needs (planner.notYet).
+const notBeforeHold = 2 * time.Hour
 
 // SchedulingPolicy holds the installation-wide admission settings.
 type SchedulingPolicy struct {
@@ -909,15 +922,37 @@ func (p *planner) share(project string) float64 {
 	return share
 }
 
-// order yields candidates by priority, then fair share, then submission.
+// order yields candidates by priority, then the latest they may start to
+// keep their start_by and finish_by (those with one first), then fair share,
+// then submission.
 func (p *planner) order(candidates []*planCandidate, visit func(*planCandidate) (bool, error)) error {
 	remaining := append([]*planCandidate(nil), candidates...)
+	latest := make(map[*planCandidate]time.Time, len(candidates))
+	for _, c := range candidates {
+		if at, ok := c.mustStartBy(); ok {
+			latest[c] = at
+		}
+	}
 	for len(remaining) != 0 {
 		best := 0
 		for i := 1; i < len(remaining); i++ {
 			a, b := remaining[i].execution, remaining[best].execution
 			if a.Priority != b.Priority {
 				if a.Priority > b.Priority {
+					best = i
+				}
+				continue
+			}
+			la, hasA := latest[remaining[i]]
+			lb, hasB := latest[remaining[best]]
+			if hasA != hasB {
+				if hasA {
+					best = i
+				}
+				continue
+			}
+			if hasA && !la.Equal(lb) {
+				if la.Before(lb) {
 					best = i
 				}
 				continue
@@ -965,8 +1000,19 @@ func (p *planner) slotsFor(selector string, leader bool) []planExecutor {
 	return slots
 }
 
-// place decides one candidate and records the decision in the overlay.
+// place decides one candidate and records the decision in the overlay; a
+// wait says when it misses the candidate's start_by or finish_by.
 func (p *planner) place(c *planCandidate) planPlacement {
+	placement, start := p.decide(c)
+	if len(placement.slots) == 0 && placement.terminal == "" {
+		placement.wait.message += p.deadlineNote(c, start)
+	}
+	return placement
+}
+
+// decide is place without the deadline note; start is when the candidate is
+// expected to start when it waits (zero: not known).
+func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 	ranks := c.ranks
 	if c.gangID == "" {
 		ranks = []planRank{{rank: 0, candidate: c.executionCandidate, demand: c.demand}}
@@ -975,15 +1021,18 @@ func (p *planner) place(c *planCandidate) planPlacement {
 	for i, r := range ranks {
 		options[i] = p.slotsFor(r.candidate.selectorJSON, c.gangID != "" && r.rank == 0)
 		if len(options[i]) == 0 {
-			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + "no live executor matches the executor labels"}}
+			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + "no live executor matches the executor labels"}}, time.Time{}
 		}
+	}
+	if notBefore, ok := instant.Parse(deref(c.execution.NotBefore)); ok && notBefore.After(p.m.stamp) {
+		return p.notYet(c, ranks, options, notBefore)
 	}
 	// What the pass has handed out, as c sees it: what is held for an
 	// execution expected to start only after c would end does not stop it.
 	ov := p.overlayFor(c)
 	if slots, ok := p.assign(ranks, options, ov, noneFreed); ok {
 		p.commit(c, slots)
-		return planPlacement{slots: slots}
+		return planPlacement{slots: slots}, time.Time{}
 	}
 	// Nowhere to go now. A single execution whose every node refuses it by
 	// its own policy ends here.
@@ -995,7 +1044,7 @@ func (p *planner) place(c *planCandidate) planPlacement {
 			reason = f.reason
 		}
 		if terminal {
-			return planPlacement{terminal: reason}
+			return planPlacement{terminal: reason}, time.Time{}
 		}
 	}
 	// Where it would go once the leases in its way end, if anywhere.
@@ -1009,7 +1058,7 @@ func (p *planner) place(c *planCandidate) planPlacement {
 		if f.ok || f.reason == "" {
 			message = "no node can hold every rank at once"
 		}
-		return planPlacement{wait: planWait{reason: f.reason, node: f.node, message: rankPrefix(c, ranks[0]) + message}}
+		return planPlacement{wait: planWait{reason: f.reason, node: f.node, message: rankPrefix(c, ranks[0]) + message}}, time.Time{}
 	}
 	if p.preempt {
 		if victims, slots, ok := p.makeRoom(c, ranks, target, ov); ok {
@@ -1023,7 +1072,7 @@ func (p *planner) place(c *planCandidate) planPlacement {
 			for i, v := range victims {
 				labels[i] = p.m.leaseLabel(v.id)
 			}
-			return planPlacement{victims: victims, wait: planWait{reason: "preempting", node: slots[0].fit.node, message: "suspending " + strings.Join(labels, ", ") + " to make room"}}
+			return planPlacement{victims: victims, wait: planWait{reason: "preempting", node: slots[0].fit.node, message: "suspending " + strings.Join(labels, ", ") + " to make room"}}, time.Time{}
 		}
 	}
 	// Hold what it can use where it is going, from when it is expected to
@@ -1045,7 +1094,103 @@ func (p *planner) place(c *planCandidate) planPlacement {
 		wait.message += "; expected to start in about " + formatAbout(start.Sub(p.m.stamp)) +
 			" by estimated run times, and work expected to end before then may use what it holds"
 	}
-	return planPlacement{wait: wait}
+	if !known {
+		start = time.Time{}
+	}
+	return planPlacement{wait: wait}, start
+}
+
+// notYet decides a candidate before its not_before: nothing is placed and
+// nothing suspended for it. Within notBeforeHold of it, what it needs is held
+// where it is going (as for a blocked execution, place) from its not_before,
+// or from when what runs there is expected to end if that is later: only
+// work expected to end by then may use it meanwhile.
+func (p *planner) notYet(c *planCandidate, ranks []planRank, options [][]planExecutor, notBefore time.Time) (planPlacement, time.Time) {
+	zone := notBefore.Location()
+	wait := planWait{reason: "not_before", message: "not admitted before its not_before " + formatInstant(notBefore, zone)}
+	if notBefore.Sub(p.m.stamp) > notBeforeHold {
+		wait.message += "; nothing is held for it before " + formatInstant(notBefore.Add(-notBeforeHold), zone)
+		return planPlacement{wait: wait}, notBefore
+	}
+	target, ok := p.assign(ranks, options, newOverlay(), allFreed)
+	if !ok {
+		wait.message += "; no node can hold it, so nothing is held for it"
+		return planPlacement{wait: wait}, time.Time{}
+	}
+	all := p.overlayFor(nil)
+	start, known := p.startAt(ranks, target, all)
+	if !known || start.Before(notBefore) {
+		start = notBefore
+	}
+	for i, slot := range target {
+		f := p.m.fit(slot.fit.node, ranks[i].demand, all, noneFreed)
+		p.holds = append(p.holds, planHold{from: start, fit: f, by: c.execution.ID})
+	}
+	wait.node = target[0].fit.node
+	wait.message += "; what it needs on " + wait.node + " is held for it: only work expected to end by " + formatInstant(start, zone) + " may use it"
+	if !known {
+		return planPlacement{wait: wait}, time.Time{}
+	}
+	return planPlacement{wait: wait}, start
+}
+
+// mustStartBy is the latest c may start to keep its start_by and its
+// finish_by (less its estimated run time, when there is one); ok is false
+// when it has neither.
+func (c *planCandidate) mustStartBy() (time.Time, bool) {
+	at, ok := instant.Parse(deref(c.execution.StartBy))
+	if finishBy, has := instant.Parse(deref(c.execution.FinishBy)); has {
+		finishBy = finishBy.Add(-c.endsIn)
+		if !ok || finishBy.Before(at) {
+			at, ok = finishBy, true
+		}
+	}
+	return at, ok
+}
+
+// deadlineNote is what a wait of c says of its start_by and finish_by: that
+// one has passed, or that it is expected to be missed (start: when c is
+// expected to start, zero when not known).
+func (p *planner) deadlineNote(c *planCandidate, start time.Time) string {
+	var notes []string
+	if startBy, ok := instant.Parse(deref(c.execution.StartBy)); ok {
+		switch {
+		case p.m.stamp.After(startBy):
+			notes = append(notes, "its start_by "+formatInstant(startBy, startBy.Location())+" has passed")
+		case !start.IsZero() && start.After(startBy):
+			notes = append(notes, "expected to start after its start_by "+formatInstant(startBy, startBy.Location()))
+		}
+	}
+	if finishBy, ok := instant.Parse(deref(c.execution.FinishBy)); ok {
+		begin := start
+		if begin.IsZero() {
+			begin = p.m.stamp
+		}
+		switch {
+		case p.m.stamp.After(finishBy):
+			notes = append(notes, "its finish_by "+formatInstant(finishBy, finishBy.Location())+" has passed")
+		case c.endsIn > 0 && begin.Add(c.endsIn).After(finishBy):
+			notes = append(notes, "expected to end after its finish_by "+formatInstant(finishBy, finishBy.Location())+" by estimated run times")
+		}
+	}
+	if len(notes) == 0 {
+		return ""
+	}
+	return "; " + strings.Join(notes, "; ")
+}
+
+// formatInstant is a time as a wait shows it, in zone (the one it was
+// declared with).
+func formatInstant(t time.Time, zone *time.Location) string {
+	return t.In(zone).Format("2006-01-02 15:04 -07:00")
+}
+
+// deref is *s, or "" for nil.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // planHold is what a waiting execution holds where it is going.

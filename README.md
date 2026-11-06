@@ -472,9 +472,29 @@ disk watermark alerts current.
 Executors of one node share its resources, so any of them that matches the
 labels may take what is placed there.
 
-- Order: higher `priority` first. Within a priority, the project holding the
-  smallest share of the installation's GPUs, CPU or RAM (whichever share is
-  largest) goes next, then the earlier submission.
+- Order: higher `priority` first. Within a priority, an execution with a
+  `start_by` or `finish_by` goes first, the one that must start soonest first
+  (its `start_by`, or its `finish_by` less its estimated run time, whichever
+  is earlier); then the project holding the smallest share of the
+  installation's GPUs, CPU or RAM (whichever share is largest), then the
+  earlier submission.
+- Start times: `not_before`, `start_by` and `finish_by` in
+  `[tasks.execution]` (or an execution manifest) are times with an offset, a
+  TOML date-time (`not_before = 2026-11-08T06:50:00+09:00`) or the same as a
+  string; a time without an offset is refused, since the daemon and the CLI
+  may be in different zones. Before its `not_before` an execution is not
+  admitted and reserves nothing (wait reason `not_before`). From two hours
+  before it, it holds what it needs on the node it would run on, as backfill
+  does, from its `not_before` (or later, when what runs there is expected to
+  end later): until then only work expected to end by that time may use it,
+  so it starts on time unless work of higher priority comes first or
+  something without an estimate was already running there. `start_by` and `finish_by` are when it should have started
+  and ended. Besides the order, they only show: a wait that is past one, or
+  expected to miss one (by estimated run times), says so. Nothing is
+  suspended or stopped for either; that stays with `priority`. A
+  continuation keeps the `not_before` and `finish_by` of its task, not its
+  `start_by` (it started already). `task show` prints the three under
+  `times:`.
 - Placement: among the nodes an execution fits on, the one left with the
   fewest free GPUs (CPU work stays off GPU nodes, GPU work packs onto as few
   as it can), then the most free CPU. A gang's ranks go on distinct nodes, all
@@ -535,7 +555,7 @@ Every waiting execution's latest reason is kept: `task show` prints it under
 `waiting:` (for example `gpu_leased: pve0: 1 GPU(s) of >= 11.0 GiB needed, 0
 usable; leased by glm/maya-r3 (priority -100)`), and `task list` adds its
 code to the NOTE (`execution waiting: insufficient_ram`). The codes are
-`no_executor`, `awaiting_executor`, `gpu_leased`, `held_for_higher_priority`,
+`no_executor`, `not_before`, `awaiting_executor`, `gpu_leased`, `held_for_higher_priority`,
 `gpu_memory_low`, `insufficient_gpu`, `insufficient_cpu`, `insufficient_ram`,
 `insufficient_disk`, `external_claim`, `unattributed_activity`,
 `stale_observation`, `disk_low_watermark` and `preempting`.

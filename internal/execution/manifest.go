@@ -13,6 +13,7 @@ import (
 	"github.com/BurntSushi/toml"
 
 	"kairo/internal/envspec"
+	"kairo/internal/instant"
 )
 
 type Manifest struct {
@@ -37,6 +38,11 @@ type Manifest struct {
 	// the attempt's scratch directory when it has one. Absent from the JSON
 	// when false.
 	ScratchTmpdir bool `toml:"scratch_tmpdir" json:"scratch_tmpdir,omitempty"`
+	// NotBefore, StartBy and FinishBy are as in a task's [tasks.execution]
+	// (orchestration.Execution). Absent from the JSON when unset.
+	NotBefore instant.Instant `toml:"not_before" json:"not_before,omitempty"`
+	StartBy   instant.Instant `toml:"start_by" json:"start_by,omitempty"`
+	FinishBy  instant.Instant `toml:"finish_by" json:"finish_by,omitempty"`
 }
 
 type ExecutorSelector struct {
@@ -117,6 +123,9 @@ func normalizeAndValidate(m *Manifest) error {
 	}
 	if m.Preemptible && !m.Checkpointable {
 		return errors.New("preemptible execution must be checkpointable")
+	}
+	if err := instant.CheckOrder(string(m.NotBefore), string(m.StartBy), string(m.FinishBy)); err != nil {
+		return err
 	}
 	if m.Executor.Labels == nil {
 		m.Executor.Labels = map[string]string{}

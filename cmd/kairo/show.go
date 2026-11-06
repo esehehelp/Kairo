@@ -38,6 +38,9 @@ func renderTask(w io.Writer, project string, t *taskDetail, now time.Time) {
 			line("cwd", "%s", e.CWD)
 		}
 		line("priority", "%d  checkpointable: %s  preemptible: %s", e.Priority, yesNo(e.Checkpointable), yesNo(e.Preemptible))
+		if times := declaredTimes(e); times != "" {
+			line("times", "%s", times)
+		}
 		if len(e.Executor.Labels) > 0 {
 			line("executor", "%s", keyValues(e.Executor.Labels))
 		}

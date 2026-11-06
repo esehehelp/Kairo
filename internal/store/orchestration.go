@@ -452,6 +452,13 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 		Capacity:             convertCapacity(template.Capacity),
 		Env:                  template.Env,
 		ScratchTmpdir:        template.ScratchTmpdir,
+		NotBefore:            string(template.NotBefore),
+		FinishBy:             string(template.FinishBy),
+	}
+	// A continuation goes on from where its run was suspended: it started
+	// long ago, so a start_by says nothing of it.
+	if continuation == nil {
+		spec.StartBy = string(template.StartBy)
 	}
 	if template.Gang != nil {
 		gang := GangSpec{Size: template.Gang.Size, Port: template.Gang.Port}

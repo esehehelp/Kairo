@@ -84,6 +84,13 @@ type ExecutionSpec struct {
 	// its scratch directory (when it has one). Left out of the digest when
 	// false.
 	ScratchTmpdir bool `json:"scratch_tmpdir,omitempty"`
+	// NotBefore: not admitted, and holding nothing, before this time (RFC
+	// 3339 with an offset); StartBy and FinishBy: when it should have started
+	// and ended, which order it within its priority (planner.go). Left out of
+	// the digest when empty.
+	NotBefore string `json:"not_before,omitempty"`
+	StartBy   string `json:"start_by,omitempty"`
+	FinishBy  string `json:"finish_by,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the
@@ -146,6 +153,9 @@ type ExecutionRequest struct {
 	TerminalAt           *string           `json:"terminal_at,omitempty"`
 	Resources            []ResourceRequest `json:"resource_requests,omitempty"`
 	Env                  map[string]string `json:"env,omitempty"`
+	NotBefore            *string           `json:"not_before,omitempty"`
+	StartBy              *string           `json:"start_by,omitempty"`
+	FinishBy             *string           `json:"finish_by,omitempty"`
 }
 
 type ExecutionFilter struct {

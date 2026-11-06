@@ -13,6 +13,7 @@ import (
 
 	"kairo/internal/envspec"
 	"kairo/internal/id"
+	"kairo/internal/instant"
 )
 
 func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, error) {
@@ -73,8 +74,21 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 			}
 		}
 	}
-	// Gang, Env and ScratchTmpdir are left out of the digest when absent, so
-	// an execution without them keeps the digest it had before they existed.
+	if spec.NotBefore, err = instant.Normalize(spec.NotBefore); err != nil {
+		return ExecutionSpec{}, nil, "", fmt.Errorf("not_before: %w", err)
+	}
+	if spec.StartBy, err = instant.Normalize(spec.StartBy); err != nil {
+		return ExecutionSpec{}, nil, "", fmt.Errorf("start_by: %w", err)
+	}
+	if spec.FinishBy, err = instant.Normalize(spec.FinishBy); err != nil {
+		return ExecutionSpec{}, nil, "", fmt.Errorf("finish_by: %w", err)
+	}
+	if err = instant.CheckOrder(spec.NotBefore, spec.StartBy, spec.FinishBy); err != nil {
+		return ExecutionSpec{}, nil, "", err
+	}
+	// Gang, Env, ScratchTmpdir and the times are left out of the digest when
+	// absent, so an execution without them keeps the digest it had before
+	// they existed.
 	digestValue := struct {
 		Scope                ScopePath
 		Argv                 []string
@@ -89,7 +103,10 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		Gang                 *GangSpec         `json:",omitempty"`
 		Env                  map[string]string `json:",omitempty"`
 		ScratchTmpdir        bool              `json:",omitempty"`
-	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir}
+		NotBefore            string            `json:",omitempty"`
+		StartBy              string            `json:",omitempty"`
+		FinishBy             string            `json:",omitempty"`
+	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy}
 	normalized, err := json.Marshal(digestValue)
 	if err != nil {
 		return ExecutionSpec{}, nil, "", err
@@ -333,7 +350,7 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 			env = &value
 		}
 		executionID, stamp := id.New("exe"), now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir,not_before,start_by,finish_by) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir, nullable(spec.NotBefore), nullable(spec.StartBy), nullable(spec.FinishBy)); err != nil {
 			return "", err
 		}
 		if err = insertExecutionResourcesTx(ctx, tx, executionID, spec); err != nil {
@@ -421,7 +438,7 @@ func scanExecution(row interface{ Scan(...any) error }) (ExecutionRequest, error
 	var execution ExecutionRequest
 	var argv, selector string
 	var env sql.NullString
-	err := row.Scan(&execution.ID, &execution.ProjectScopeID, &execution.QueueScopeID, &execution.TaskScopeID, &execution.ClientRequestID, &execution.SpecDigest, &execution.State, &argv, &execution.CWD, &selector, &execution.Priority, &execution.Checkpointable, &execution.Preemptible, &execution.InputContinuationRef, &execution.TerminalCause, &execution.SubmittedAt, &execution.AuthorizedAt, &execution.StartedAt, &execution.TerminalAt, &env)
+	err := row.Scan(&execution.ID, &execution.ProjectScopeID, &execution.QueueScopeID, &execution.TaskScopeID, &execution.ClientRequestID, &execution.SpecDigest, &execution.State, &argv, &execution.CWD, &selector, &execution.Priority, &execution.Checkpointable, &execution.Preemptible, &execution.InputContinuationRef, &execution.TerminalCause, &execution.SubmittedAt, &execution.AuthorizedAt, &execution.StartedAt, &execution.TerminalAt, &env, &execution.NotBefore, &execution.StartBy, &execution.FinishBy)
 	if err != nil {
 		return ExecutionRequest{}, err
 	}
@@ -447,7 +464,7 @@ func decodeEnv(column sql.NullString) (map[string]string, error) {
 	return env, nil
 }
 
-const executionSelect = `SELECT id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,terminal_cause,submitted_at,authorized_at,started_at,terminal_at,env_json FROM execution_requests`
+const executionSelect = `SELECT id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,terminal_cause,submitted_at,authorized_at,started_at,terminal_at,env_json,not_before,start_by,finish_by FROM execution_requests`
 
 func (s *Store) GetExecution(ctx context.Context, executionID string) (ExecutionRequest, error) {
 	execution, err := scanExecution(s.db.QueryRowContext(ctx, executionSelect+` WHERE id=$1`, executionID))
