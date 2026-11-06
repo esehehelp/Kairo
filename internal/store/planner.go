@@ -644,9 +644,11 @@ func (m *planModel) available(key capKey, c planCapacity, freed func(string) boo
 		}
 		// A RAM reservation counts up to what runs like it were seen to
 		// take (with headroom), never less than its attempt uses now; one
-		// whose use is not known now counts in full.
+		// whose use is not known now counts in full, and so does one holding
+		// a GPU: the host memory CUDA pins is not in the samples (RSS, PSS,
+		// working set), and a host without swap hangs when it runs out.
 		counted := quantity
-		if key.kind == "ram" && l.ramExpected > 0 && measured {
+		if key.kind == "ram" && l.ramExpected > 0 && measured && len(l.devices) == 0 {
 			counted = min(quantity, max(used, l.ramExpected))
 		}
 		reserved += counted

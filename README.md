@@ -474,7 +474,10 @@ labels may take what is placed there.
   specific run-time estimate key (program, subcommand and config; program and
   subcommand; or its Task name with digits masked; never a whole queue or
   project), half again plus 512 MiB, and never less than its attempt uses
-  now. A declaration written large (8 GiB for work that took 300 MiB) thus
+  now. A lease holding a GPU counts in full: the host memory CUDA pins is not
+  in the samples (PSS on Linux, the private working set on Windows; neither
+  counts pinned memory, and the Windows one leaves out mapped files such as
+  a model's weights), and a host without swap hangs when it runs out. A declaration written large (8 GiB for work that took 300 MiB) thus
   stops holding memory it never uses, while one its like really used (16 GiB
   for work that took 10.7 GiB) still counts in full; samples are 15 s apart,
   which the headroom is for. Disk is observed free space minus every
