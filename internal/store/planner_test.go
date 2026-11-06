@@ -336,8 +336,8 @@ func TestPlannerRecordsThatNoExecutorMatches(t *testing.T) {
 }
 
 // An execution that declared cpu_millis_min lends the rest of its CPU to
-// executions of no higher priority: they run beside it, slowing it down,
-// instead of stopping it.
+// executions of the same or higher priority: they run beside it, slowing it
+// down, instead of stopping it.
 func TestPlannerRunsSmallWorkBesideAnElasticExecution(t *testing.T) {
 	c := newPlanCluster(t)
 	c.node("a", 0, 16000, 64, 500)

@@ -72,6 +72,9 @@ type Store struct {
 	// lastPass is when ReserveNext last completed a whole planning pass
 	// (UnixNano; 0: never), which lets a poll with nothing to plan skip one.
 	lastPass atomic.Int64
+	// runs is the run history the planner estimates run times from
+	// (estimate.go).
+	runs runHistoryCache
 }
 
 // Open connects to the PostgreSQL database dsn (a postgres:// URL or a

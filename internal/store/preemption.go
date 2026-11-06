@@ -25,6 +25,7 @@ func (s *Store) EnsurePriorityPreemption(ctx context.Context, executorID string)
 	if work, err := s.planWork(ctx); err != nil || !work {
 		return nil, err
 	}
+	history := s.runHistory(ctx)
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
@@ -39,6 +40,9 @@ func (s *Store) EnsurePriorityPreemption(ctx context.Context, executorID string)
 	}
 	candidates, err := loadPlanCandidates(ctx, tx, m)
 	if err != nil {
+		return nil, err
+	}
+	if err = loadEstimates(ctx, tx, m, candidates, history); err != nil {
 		return nil, err
 	}
 	p := newPlanner(m, true)

@@ -12,11 +12,13 @@ package store
 //     with the fewest free GPUs (CPU work stays off GPU nodes, GPU work packs),
 //     then the most free CPU. It is reserved when that node's executor polls.
 //   - backfill: an execution that fits nowhere holds what it can use on its
-//     closest node, so later executions cannot take it, and only when what
-//     stops it is other leases (they end). Later executions run on whatever
-//     nobody holds. An execution blocked by something that does not end by
-//     itself (a foreign GPU process, a stale observation, a node too small)
-//     holds nothing.
+//     closest node, and only when what stops it is other leases (they end),
+//     from when it is expected to start there (estimate.go: when enough of
+//     those leases are expected to have ended; now when no estimate tells).
+//     Later executions run on whatever nobody holds, and on what it holds
+//     if they are expected to end by then. An execution blocked by
+//     something that does not end by itself (a foreign GPU process, a stale
+//     observation, a node too small) holds nothing.
 //   - preemption: an execution that fits nowhere may suspend cooperative
 //     executions of lower priority (checkpointable and preemptible) whose
 //     GPUs or RAM are what stops it, the fewest needed. CPU is never a reason
@@ -24,10 +26,10 @@ package store
 //     nothing.
 //   - accounting: a lease's capacity is counted once. CPU is total minus
 //     reservations, where an execution that declared cpu_millis_min lends
-//     the rest of its reservation to executions of no higher priority (it
-//     runs slower instead of being stopped); RAM is what is observed free
-//     minus the part of each reservation its attempt does not use yet
-//     (attempt_usage); disk is what is observed free minus every
+//     the rest of its reservation to executions of the same or higher
+//     priority (it runs slower instead of being stopped); RAM is what is
+//     observed free minus the part of each reservation its attempt does not
+//     use yet (attempt_usage); disk is what is observed free minus every
 //     reservation, since bytes written overstate what stays on disk.
 //   - a node with a filesystem under the free-space watermark admits nothing.
 //
@@ -111,6 +113,12 @@ type planLease struct {
 	capacity                               map[capKey]int64
 	used                                   map[capKey]int64 // taken up, of capacity
 	cpuLendable                            int64            // reserved CPU above cpu_millis_min
+	// For its run-time estimate (estimate.go): the execution's queue, Task
+	// and argv, and when its attempt started and whether it has exited.
+	queueID, taskID *string
+	argvJSON        string
+	attemptStarted  string
+	attemptExited   bool
 }
 
 type gpuDemand struct {
@@ -143,6 +151,9 @@ type planCandidate struct {
 	demand planDemand
 	gangID string
 	ranks  []planRank
+	// endsIn is how long it is expected to run once admitted (0: no
+	// estimate, it may use nothing held for others).
+	endsIn time.Duration
 }
 
 type planModel struct {
@@ -157,10 +168,15 @@ type planModel struct {
 	lowDisk   map[string][]string // node -> messages
 	labels    map[string]string   // scope id -> name
 	totals    map[string]float64  // kind -> installation total, for shares
+	// leaseEnds is when each live lease is expected to give back what it
+	// holds (estimate.go); a lease without one is not expected to.
+	leaseEnds map[string]time.Time
 }
 
 // planOverlay is what the pass has handed out so far: devices placed on or
-// held for an execution, and capacity placed or held per node.
+// held for an execution, and capacity placed or held per node. The pass
+// keeps placements (and room made by preemption) in one, and the holds of
+// waiting executions apart (planner.holds, overlayFor).
 type planOverlay struct {
 	devices  map[string]string
 	capacity map[capKey]int64
@@ -382,7 +398,8 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 		COALESCE((SELECT MIN(CASE WHEN COALESCE(rr.policy_json::jsonb->>'on_unattributed_activity','wait')='allow' THEN 1 ELSE 0 END)
 			FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='exclusive' AND rr.kind='gpu'),0),
 		u.ram_bytes,u.disk_written_bytes,u.observed_at,
-		COALESCE((SELECT rr.quantity-(rr.constraints_json::jsonb->>'min_quantity')::bigint FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='capacity' AND rr.kind='cpu' AND rr.constraints_json::jsonb->>'min_quantity' IS NOT NULL),0)
+		COALESCE((SELECT rr.quantity-(rr.constraints_json::jsonb->>'min_quantity')::bigint FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='capacity' AND rr.kind='cpu' AND rr.constraints_json::jsonb->>'min_quantity' IS NOT NULL),0),
+		e.queue_scope_id,e.task_scope_id,e.argv_json,COALESCE(a.started_at,''),a.exited_at IS NOT NULL
 		FROM leases l JOIN executors x ON x.id=l.executor_id JOIN execution_requests e ON e.id=l.execution_id
 		LEFT JOIN attempts a ON a.id=l.attempt_id LEFT JOIN attempt_usage u ON u.attempt_id=l.attempt_id
 		WHERE l.state IN `+liveLeaseStates+` ORDER BY l.id`)
@@ -402,7 +419,7 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 		var u usage
 		if err = rows.Scan(&l.id, &l.executionID, &l.attemptID, &l.executorID, &l.nodeID, &executorEnabled, &leaseState, &l.epoch, &attemptState,
 			&l.priority, &checkpointable, &preemptible, &executionState, &l.projectID, &l.label, &l.startedAt, &l.gang, &l.allowsUnattributed,
-			&u.ram, &u.disk, &u.at, &l.cpuLendable); err != nil {
+			&u.ram, &u.disk, &u.at, &l.cpuLendable, &l.queueID, &l.taskID, &l.argvJSON, &l.attemptStarted, &l.attemptExited); err != nil {
 			rows.Close()
 			return err
 		}
@@ -847,6 +864,8 @@ type planner struct {
 	// victims are leases already chosen to make room in this pass.
 	victims map[string]bool
 	usage   map[string]map[string]float64 // project -> kind -> held
+	// holds are what waiting executions hold (place), apart from ov.
+	holds []planHold
 }
 
 func newPlanner(m *planModel, preempt bool) *planner {
@@ -947,7 +966,10 @@ func (p *planner) place(c *planCandidate) planPlacement {
 			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + "no live executor matches the executor labels"}}
 		}
 	}
-	if slots, ok := p.assign(ranks, options, p.ov, noneFreed); ok {
+	// What the pass has handed out, as c sees it: what is held for an
+	// execution expected to start only after c would end does not stop it.
+	ov := p.overlayFor(c)
+	if slots, ok := p.assign(ranks, options, ov, noneFreed); ok {
 		p.commit(c, slots)
 		return planPlacement{slots: slots}
 	}
@@ -956,7 +978,7 @@ func (p *planner) place(c *planCandidate) planPlacement {
 	if c.gangID == "" {
 		terminal, reason := true, ""
 		for _, e := range options[0] {
-			f := p.m.fit(e.nodeID, ranks[0].demand, p.ov, noneFreed)
+			f := p.m.fit(e.nodeID, ranks[0].demand, ov, noneFreed)
 			terminal = terminal && f.terminal
 			reason = f.reason
 		}
@@ -967,7 +989,7 @@ func (p *planner) place(c *planCandidate) planPlacement {
 	// Where it would go once the leases in its way end, if anywhere.
 	target, transient := p.assign(ranks, options, newOverlay(), allFreed)
 	if !transient {
-		f := p.m.fit(options[0][0].nodeID, ranks[0].demand, p.ov, noneFreed)
+		f := p.m.fit(options[0][0].nodeID, ranks[0].demand, ov, noneFreed)
 		if f.ok || f.reason == "held_for_higher_priority" || f.reason == "gpu_leased" {
 			f = p.m.fit(options[0][0].nodeID, ranks[0].demand, newOverlay(), allFreed)
 		}
@@ -978,7 +1000,7 @@ func (p *planner) place(c *planCandidate) planPlacement {
 		return planPlacement{wait: planWait{reason: f.reason, node: f.node, message: rankPrefix(c, ranks[0]) + message}}
 	}
 	if p.preempt {
-		if victims, slots, ok := p.makeRoom(c, ranks, target); ok {
+		if victims, slots, ok := p.makeRoom(c, ranks, target, ov); ok {
 			for _, v := range victims {
 				p.victims[v.id] = true
 			}
@@ -992,16 +1014,113 @@ func (p *planner) place(c *planCandidate) planPlacement {
 			return planPlacement{victims: victims, wait: planWait{reason: "preempting", node: slots[0].fit.node, message: "suspending " + strings.Join(labels, ", ") + " to make room"}}
 		}
 	}
-	// Hold what it can use where it is going.
+	// Hold what it can use where it is going, from when it is expected to
+	// start there: work expected to end by then may use it meanwhile.
+	all := p.overlayFor(nil)
+	start, known := p.startAt(ranks, target, all)
+	if !known {
+		start = p.m.stamp
+	}
 	var wait planWait
 	for i, slot := range target {
-		f := p.m.fit(slot.fit.node, ranks[i].demand, p.ov, noneFreed)
-		p.ov.take(f, c.execution.ID)
+		f := p.m.fit(slot.fit.node, ranks[i].demand, all, noneFreed)
+		p.holds = append(p.holds, planHold{from: start, fit: f, by: c.execution.ID})
 		if wait.reason == "" && !f.ok {
 			wait = planWait{reason: f.reason, node: f.node, message: rankPrefix(c, ranks[i]) + f.message}
 		}
 	}
+	if start.After(p.m.stamp) {
+		wait.message += "; expected to start in about " + formatAbout(start.Sub(p.m.stamp)) +
+			" by estimated run times, and work expected to end before then may use what it holds"
+	}
 	return planPlacement{wait: wait}
+}
+
+// planHold is what a waiting execution holds where it is going.
+type planHold struct {
+	// from is when it is expected to start there (the pass's stamp when no
+	// estimate says): an execution expected to end by then may use the hold.
+	from time.Time
+	fit  planFit
+	by   string
+}
+
+// overlayFor is what the pass has handed out as c sees it: every placement,
+// and every hold unless c is expected to end by the time the hold starts
+// (c nil, or without an estimate: every hold).
+func (p *planner) overlayFor(c *planCandidate) planOverlay {
+	if len(p.holds) == 0 {
+		return p.ov
+	}
+	var end time.Time
+	if c != nil && c.endsIn > 0 {
+		end = p.m.stamp.Add(c.endsIn)
+	}
+	ov := p.ov.clone()
+	for _, h := range p.holds {
+		if end.IsZero() || end.After(h.from) {
+			ov.take(h.fit, h.by)
+		}
+	}
+	return ov
+}
+
+// startAt is when ranks could start on target if what runs there ends as
+// estimated: per rank, when enough of the leases in its way will have ended
+// for it to fit beside what ov hands out, and the latest of those. known is
+// false when the estimates cannot tell (a lease in the way has none, or all
+// the leases with one ending is not enough).
+func (p *planner) startAt(ranks []planRank, target []planSlot, ov planOverlay) (time.Time, bool) {
+	start := p.m.stamp
+	for i, slot := range target {
+		node := map[string]bool{slot.fit.node: true}
+		var inTheWay []string
+		for _, id := range p.m.leaseIDs {
+			if p.reaches(p.m.leases[id], node) {
+				inTheWay = append(inTheWay, id)
+			}
+		}
+		sort.SliceStable(inTheWay, func(a, b int) bool {
+			ea, ka := p.m.leaseEnds[inTheWay[a]]
+			eb, kb := p.m.leaseEnds[inTheWay[b]]
+			if ka != kb {
+				return ka
+			}
+			return ea.Before(eb)
+		})
+		gone := map[string]bool{}
+		freed := func(id string) bool { return gone[id] }
+		at, fits := p.m.stamp, p.m.fit(slot.fit.node, ranks[i].demand, ov, freed).ok
+		for _, id := range inTheWay {
+			if fits {
+				break
+			}
+			end, known := p.m.leaseEnds[id]
+			if !known {
+				break
+			}
+			gone[id] = true
+			at = end
+			fits = p.m.fit(slot.fit.node, ranks[i].demand, ov, freed).ok
+		}
+		if !fits {
+			return time.Time{}, false
+		}
+		if at.After(start) {
+			start = at
+		}
+	}
+	return start, true
+}
+
+// formatAbout is a rough duration: minutes under an hour, else hours and
+// minutes.
+func formatAbout(d time.Duration) string {
+	minutes := int(d.Round(time.Minute) / time.Minute)
+	if minutes < 60 {
+		return fmt.Sprintf("%d min", max(1, minutes))
+	}
+	return fmt.Sprintf("%dh%02dm", minutes/60, minutes%60)
 }
 
 func rankPrefix(c *planCandidate, r planRank) string {
@@ -1070,7 +1189,7 @@ func (p *planner) commit(c *planCandidate, slots []planSlot) {
 
 // makeRoom finds the fewest lower-priority cooperative leases whose suspension
 // lets every rank of c fit on its target node.
-func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot) ([]*planLease, []planSlot, bool) {
+func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot, ov planOverlay) ([]*planLease, []planSlot, bool) {
 	var pool []*planLease
 	nodes := map[string]bool{}
 	for _, s := range target {
@@ -1114,7 +1233,7 @@ func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot
 		freed := func(leaseID string) bool { return chosen[leaseID] }
 		slots := make([]planSlot, len(target))
 		for i, s := range target {
-			f := p.m.fit(s.fit.node, needs[i], p.ov, freed)
+			f := p.m.fit(s.fit.node, needs[i], ov, freed)
 			if !f.ok {
 				return nil, false
 			}

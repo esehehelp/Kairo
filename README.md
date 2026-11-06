@@ -443,8 +443,13 @@ labels may take what is placed there.
   as it can), then the most free CPU. A gang's ranks go on distinct nodes, all
   or none.
 - Backfill: an execution that fits nowhere holds, on the node it would run on
-  once the leases in its way end, what it can already use there; executions
-  after it run on everything nobody holds. It holds nothing when what stops it
+  once the leases in its way end, what it can already use there, from when
+  it is expected to start: when enough of those leases are expected to have
+  ended (Run-time estimates). Executions after it run on everything nobody
+  holds, and on what it holds if they are expected to end before it starts;
+  an execution without an estimate, or held for by one whose start no
+  estimate tells (a lease in its way has none), does not. Its wait reason
+  says when it is expected to start. It holds nothing when what stops it
   does not end by itself: a process Kairo did not start on a GPU, activity no
   process explains, a stale observation, a node too small for it, the disk
   watermark.
@@ -464,10 +469,11 @@ labels may take what is placed there.
   request keeps its `min_free_after_bytes` and the watermark free.
 - Elastic CPU: `cpu_millis_min` (at most `cpu_millis`) under `[capacity]`
   (`[tasks.execution.capacity]`) is the least an execution keeps. The rest of
-  its CPU reservation is lent to executions of the same or lower priority,
+  its CPU reservation is lent to executions of the same or higher priority,
   which then run beside it and slow it down instead of stopping it: a server
   declared with `cpu_millis = 16000` and `cpu_millis_min = 4000` lets 12 CPUs
-  of evaluations run next to it.
+  of evaluations of its priority or above run next to it. It lends nothing
+  to executions of lower priority.
 - Disk watermark: a node with a registered filesystem under
   `[scheduler] disk_min_free_bytes` of the daemon configuration (default
   5 GiB, at most 5% of the filesystem; `0` turns it off) admits nothing until
@@ -482,6 +488,44 @@ code to the NOTE (`execution waiting: insufficient_ram`). The codes are
 `gpu_memory_low`, `insufficient_gpu`, `insufficient_cpu`, `insufficient_ram`,
 `insufficient_disk`, `external_claim`, `unattributed_activity`,
 `stale_observation`, `disk_low_watermark` and `preempting`.
+
+### Run-time estimates
+
+Backfill needs to know roughly when running work ends and how long waiting
+work will take. Nothing is declared for it: a run (a Task's executions
+together, or a direct execution) is expected to take what the runs like it
+took that succeeded before, the median of the latest five that share its
+most specific key:
+
+1. project, queue, program, subcommand or script, and config file, with
+   digits masked (`neo_ime.cli train --config shunran-v0.9-30m.toml` is like
+   `... shunran-v0.10-4m.toml`)
+2. project, queue, program, and subcommand or script
+3. project, queue, and Task name, with digits and hashes masked
+4. project and queue
+5. project
+
+The program is the first word of the command line that is not a runner (`uv
+run`, `python -m`, `pwsh -Command`, `wsl.exe --exec`...), without its
+directory, extension and hashes. A run that succeeded is one whose last
+execution exited 0 without a signal; what it took is the time its attempts
+ran, summed. What a run is still expected to take is its estimate minus what
+its attempts have run so far; a run already past its estimate is expected to
+take as long again as it has run (at least a minute). A lease with a live
+suspend command is expected to end within two minutes; one whose attempt has
+exited (and still holds what it left running), or whose run has no
+estimate, is not expected to end, so what waits behind it holds as without
+estimates. The history is read again after any attempt exits, and at least
+every 10 minutes.
+
+Replayed on this installation's history (4,200 runs), half the estimates
+fall within twice the actual run time, and long runs are mostly
+underestimated, since the runs like them were often short trials. Backfill
+tolerates that: it only asks whether short work ends before the execution it
+would delay could start, and an estimate corrected as a run overruns costs
+that execution little. In a simulation of the same history, backfill on
+these estimates gave the same completion times as backfill on the actual run
+times, and much shorter ones than holding with no estimates.
 
 ### Executor ticks
 
