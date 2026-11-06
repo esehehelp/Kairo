@@ -222,7 +222,7 @@ type fakeClock struct {
 func useFakeClock(t *testing.T, start time.Time) *fakeClock {
 	t.Helper()
 	clock := &fakeClock{now: start}
-	savedNow, savedSleep, savedLocal := nowFunc, sleepFunc, time.Local
+	savedNow, savedSleep, savedZone := nowFunc, sleepFunc, displayZone
 	nowFunc = func() time.Time { return clock.now }
 	sleepFunc = func(ctx context.Context, d time.Duration) bool {
 		clock.sleeps++
@@ -238,8 +238,8 @@ func useFakeClock(t *testing.T, start time.Time) *fakeClock {
 		}
 		return ctx.Err() == nil
 	}
-	time.Local = time.UTC
-	t.Cleanup(func() { nowFunc, sleepFunc, time.Local = savedNow, savedSleep, savedLocal })
+	displayZone = time.UTC
+	t.Cleanup(func() { nowFunc, sleepFunc, displayZone = savedNow, savedSleep, savedZone })
 	return clock
 }
 

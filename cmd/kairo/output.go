@@ -381,12 +381,16 @@ func parseStamp(s *string) (time.Time, bool) {
 	return t, true
 }
 
+// displayZone is where times are shown: the local zone (tests set another
+// instead of changing time.Local, which other goroutines read).
+var displayZone = time.Local
+
 // clock is the HH:MM:SS of event lines.
-func clock(t time.Time) string { return t.Local().Format("15:04:05") }
+func clock(t time.Time) string { return t.In(displayZone).Format("15:04:05") }
 
 // shortTime is the MM-DD HH:MM of tables; shortStamp is that of a
 // timestamp, "-" when unknown.
-func shortTime(t time.Time) string { return t.Local().Format("01-02 15:04") }
+func shortTime(t time.Time) string { return t.In(displayZone).Format("01-02 15:04") }
 
 func shortStamp(s *string) string {
 	if t, ok := parseStamp(s); ok {
@@ -397,7 +401,7 @@ func shortStamp(s *string) string {
 
 // longTime is a full local time for task show; longStamp is that of a
 // timestamp, "-" when unknown.
-func longTime(t time.Time) string { return t.Local().Format("2006-01-02 15:04:05") }
+func longTime(t time.Time) string { return t.In(displayZone).Format("2006-01-02 15:04:05") }
 
 func longStamp(s *string) string {
 	if t, ok := parseStamp(s); ok {
