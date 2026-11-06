@@ -33,9 +33,9 @@ func TestStoreStatusPrintsStoresAndKeptScratch(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"STORE      CLASS     NODE            STATE     ROOT            FILESYSTEM  TOTAL    FREE     ACTIVE  KEPT   OUTPUTS    PINNED  CACHE  EXTERNAL",
-		"pool       volatile  pve0            ready     /srv/kairo      /           300 GiB  100 GiB  2 GiB   1 GiB  3 GiB (2)  0 B     0 B    194 GiB",
-		"wsl        volatile  win/ubuntu-wsl  unknown   /var/tmp/kairo  D:          -        -        0 B     0 B    0 B        0 B     0 B    -",
+		"STORE      CLASS     NODE            STATE     ROOT            FILESYSTEM  TOTAL    FREE     ACTIVE  KEPT   OUTPUTS    PACKS  PINNED  CACHE  EXTERNAL",
+		"pool       volatile  pve0            ready     /srv/kairo      /           300 GiB  100 GiB  2 GiB   1 GiB  3 GiB (2)  0 B    0 B     0 B    194 GiB",
+		"wsl        volatile  win/ubuntu-wsl  unknown   /var/tmp/kairo  D:          -        -        0 B     0 B    0 B        0 B    0 B     0 B    -",
 		"e-durable: root E:/kairo is not on filesystem E:",
 		"kept scratch on pool:",
 		"att_1    neo/train/run  1 GiB  2026-11-03T01:02:03Z  exit 1  /srv/kairo/scratch/att_1",

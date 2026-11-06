@@ -120,6 +120,12 @@ type Local struct {
 	outputRuns  map[string]string
 	outputSized map[string]int64
 
+	// Packing (pack.go): when what is to be packed was last asked for,
+	// whether a round runs, and the problems already warned of, by object.
+	packAt       time.Time
+	packing      bool
+	packProblems map[string]string
+
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
 	trees              map[string]*treeHandle
@@ -226,6 +232,7 @@ func (e *Local) tick(ctx context.Context) error {
 	e.refreshStores(ctx)
 	e.reportStores()
 	e.settleScratch()
+	e.makePacks()
 	e.endStep()
 	for {
 		reservation, err := e.reserveNext(ctx)

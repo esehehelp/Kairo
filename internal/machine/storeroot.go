@@ -74,6 +74,15 @@ func IsOutputDir(p, root, runID string) bool {
 		StoreRootKey(p) == StoreRootKey(strings.TrimRight(root, `/\`)+"/outputs/"+runID)
 }
 
+// IsPackPath reports whether p is the pack of objectID under root
+// (<root>/packs/<object id>.tar.zst), as StoreRootKey spells them, both
+// absolute; with suffix, the file beside it named so (the file list,
+// ".files.tsv").
+func IsPackPath(p, root, objectID, suffix string) bool {
+	return ScratchIDValid(objectID) && StoreRootIsAbsolute(p) && StoreRootIsAbsolute(root) &&
+		StoreRootKey(p) == StoreRootKey(strings.TrimRight(root, `/\`)+"/packs/"+objectID+".tar.zst"+suffix)
+}
+
 // checkStoreRoot checks that root is one spelling of one place: absolute,
 // without .. and without control characters. A POSIX root has no whitespace
 // or backslash (the mount table, which a deletion is checked against,

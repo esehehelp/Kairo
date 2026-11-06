@@ -63,6 +63,10 @@ type agentRunOutputRequest struct {
 	Output store.RunOutput `json:"output"`
 }
 
+type agentRecordPackRequest struct {
+	Made store.PackMade `json:"made"`
+}
+
 type agentUnlaunchedRequest struct {
 	ExecutorID       string  `json:"executor_id"`
 	OlderThanSeconds float64 `json:"older_than_seconds"`
@@ -267,6 +271,19 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentRunOutputRequest) (any, error) {
 				return okBody, s.Store.RecordRunOutput(ctx, b.Output)
+			}),
+		// An observe-only daemon orders no packs.
+		newAgentOp(s, "packs-to-make", observeEmpty, map[string]any{"packs": []store.PackOrder{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				packs, err := s.Store.PacksToMake(ctx, b.ExecutorID)
+				return map[string]any{"packs": packs}, err
+			}),
+		newAgentOp(s, "record-pack", observeRefused, nil,
+			func(ctx context.Context, b agentRecordPackRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.Made.ExecutorID)
+			},
+			func(ctx context.Context, b agentRecordPackRequest) (any, error) {
+				return okBody, s.Store.RecordPack(ctx, b.Made)
 			}),
 		newAgentOp(s, "unlaunched-leases", observeEmpty, map[string]any{"leases": []store.UnlaunchedLease{}},
 			func(ctx context.Context, b agentUnlaunchedRequest) (string, error) {

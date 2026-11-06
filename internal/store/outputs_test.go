@@ -95,31 +95,45 @@ count = 1
 		}
 	}
 
+	ended := func(runID string, want bool) {
+		t.Helper()
+		if got, err := runEndedTx(ctx, store.db, runID); err != nil || got != want {
+			t.Fatalf("run %s ended: %v %v, want %v", runID, got, err, want)
+		}
+	}
 	first := authorizeNext(t, store)
 	if first.RunID != first.Execution.ID {
 		t.Fatalf("the initial execution's run is %q, want its own id %s", first.RunID, first.Execution.ID)
 	}
+	ended(first.RunID, false)
 	finish(first, 75, "checkpoint://step-5")
+	ended(first.RunID, false) // its continuation waits
 	continued := authorizeNext(t, store)
 	if continued.Execution.ID == first.Execution.ID || continued.RunID != first.Execution.ID {
 		t.Fatalf("the continuation %s is in run %q, want %s", continued.Execution.ID, continued.RunID, first.Execution.ID)
 	}
 	finish(continued, 1, "")
+	ended(first.RunID, true) // the Task failed
 	if _, err := store.RerunTask(ctx, "runs", "train", "tester", "rerun-1"); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.ReconcileProjectTasks(ctx); err != nil {
 		t.Fatal(err)
 	}
+	ended(first.RunID, true) // pending again, but a later run was made
 	rerun := authorizeNext(t, store)
 	if rerun.RunID != rerun.Execution.ID || rerun.RunID == first.Execution.ID {
 		t.Fatalf("the rerun %s is in run %q, want a run of its own", rerun.Execution.ID, rerun.RunID)
 	}
+	ended(rerun.RunID, false)
 	finish(rerun, 75, "checkpoint://step-9")
 	again := authorizeNext(t, store)
 	if again.RunID != rerun.Execution.ID {
 		t.Fatalf("the rerun's continuation is in run %q, want %s", again.RunID, rerun.Execution.ID)
 	}
+	ended(rerun.RunID, false)
+	ended(rerun.RunID+"-rank1", false)
+	ended("exe_unknown", false)
 
 	// a direct execution, and the ranks of a gang
 	spec := schedulerExecutionSpec("direct")

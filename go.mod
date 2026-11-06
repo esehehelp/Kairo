@@ -7,6 +7,7 @@ require modernc.org/sqlite v1.46.1
 require (
 	github.com/BurntSushi/toml v1.4.0
 	github.com/jackc/pgx/v5 v5.7.1
+	github.com/klauspost/compress v1.18.0
 	golang.org/x/sys v0.37.0
 )
 

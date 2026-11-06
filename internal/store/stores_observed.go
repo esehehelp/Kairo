@@ -225,8 +225,12 @@ type StoreStatus struct {
 	CacheBytes         int64   `json:"cache_bytes"`
 	// OutputBytes are the store's run output directories as its last report
 	// found them; Outputs counts the recorded ones there now.
-	OutputBytes   int64         `json:"output_bytes"`
-	Outputs       int           `json:"outputs"`
+	OutputBytes int64 `json:"output_bytes"`
+	Outputs     int   `json:"outputs"`
+	// PackBytes are the packs made on the store (data objects packed there,
+	// not moved yet); Packs counts them.
+	PackBytes     int64         `json:"pack_bytes"`
+	Packs         int           `json:"packs"`
 	ExternalBytes *int64        `json:"external_bytes,omitempty"`
 	Kept          []KeptScratch `json:"kept"`
 	Missing       []KeptScratch `json:"missing"`
@@ -271,6 +275,21 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 		return nil, err
 	}
 	stamp := time.Now().UTC()
+	err = eachRow(ctx, tx, `SELECT store_id,COUNT(*),COALESCE(SUM(pack_bytes),0)::bigint FROM data_objects WHERE state='packed' GROUP BY store_id`, nil, func(rows *sql.Rows) error {
+		var storeID string
+		var n int
+		var bytes int64
+		if err := rows.Scan(&storeID, &n, &bytes); err != nil {
+			return err
+		}
+		if i, ok := index[storeID]; ok {
+			out[i].Packs, out[i].PackBytes = n, bytes
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	err = eachRow(ctx, tx, `SELECT store_id,COUNT(*) FROM run_outputs WHERE state='active' GROUP BY store_id`, nil, func(rows *sql.Rows) error {
 		var storeID string
 		var n int
@@ -312,7 +331,7 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 		st.ScratchKeptBytes += unrecorded
 		st.PinnedBytes, st.CacheBytes, st.OutputBytes = pinned, cache, outputs
 		if total.Valid && free.Valid {
-			external := max(0, total.Int64-free.Int64-st.ScratchActiveBytes-st.ScratchKeptBytes-pinned-cache-outputs)
+			external := max(0, total.Int64-free.Int64-st.ScratchActiveBytes-st.ScratchKeptBytes-pinned-cache-outputs-st.PackBytes)
 			st.ExternalBytes = &external
 		}
 		switch at, parseErr := time.Parse(time.RFC3339Nano, observedAt); {

@@ -112,6 +112,9 @@ type storeFS interface {
 	ListKind(ctx context.Context, root string, kind dirKind) (ids, unread []string, err error)
 	CreateKind(ctx context.Context, root string, kind dirKind, id string) (string, error)
 	RemoveKind(ctx context.Context, root string, kind dirKind, dir, id string, onlyEmpty bool) error
+	// Pack packs the directory of id of kind into <root>/packs/<object
+	// id>.tar.zst with its file list (pack.go).
+	Pack(ctx context.Context, root string, kind dirKind, id, objectID string) (packResult, error)
 }
 
 // scanScratch sizes every Kairo scratch directory under root, by id.

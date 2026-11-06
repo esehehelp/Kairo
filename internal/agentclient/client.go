@@ -153,6 +153,20 @@ func (c *Client) RecordRunOutput(ctx context.Context, out store.RunOutput) error
 	return c.call(ctx, "run-output", map[string]any{"output": out}, nil)
 }
 
+// PacksToMake asks for what this executor is to pack now.
+func (c *Client) PacksToMake(ctx context.Context, executorID string) ([]store.PackOrder, error) {
+	var out struct {
+		Packs []store.PackOrder `json:"packs"`
+	}
+	err := c.call(ctx, "packs-to-make", map[string]string{"executor_id": executorID}, &out)
+	return out.Packs, err
+}
+
+// RecordPack records a pack this executor made.
+func (c *Client) RecordPack(ctx context.Context, made store.PackMade) error {
+	return c.call(ctx, "record-pack", map[string]any{"made": made}, nil)
+}
+
 // ScratchToSettle asks for this executor's scratch to delete or keep now.
 func (c *Client) ScratchToSettle(ctx context.Context, executorID string) ([]store.ScratchSettlement, error) {
 	var out struct {

@@ -40,6 +40,8 @@ type Coordinator interface {
 	ScratchToSettle(ctx context.Context, executorID string) ([]store.ScratchSettlement, error)
 	SettleScratch(ctx context.Context, settled store.ScratchSettled) error
 	RecordRunOutput(ctx context.Context, out store.RunOutput) error
+	PacksToMake(ctx context.Context, executorID string) ([]store.PackOrder, error)
+	RecordPack(ctx context.Context, made store.PackMade) error
 }
 
 var _ Coordinator = (*store.Store)(nil)

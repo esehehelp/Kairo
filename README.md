@@ -796,7 +796,8 @@ no agent serves it or one older than stores; `ready`; `unusable`, with the
 declared but still holding kept scratch), the filesystem's total and free,
 Kairo's bytes by class (`scratch_active_bytes`, `scratch_kept_bytes`,
 `output_bytes` with the number of `outputs`, the run output directories as
-the last report found them, shown as `OUTPUTS`, and `pinned_bytes` and
+the last report found them, shown as `OUTPUTS`, `pack_bytes` with the number
+of `packs`, shown as `PACKS`, and `pinned_bytes` and
 `cache_bytes`, both 0 until later P1b steps and P1c) and
 `external_bytes`, what the filesystem uses that Kairo does not know (used
 minus Kairo's classes), then the kept scratch of each store. The latest
@@ -846,10 +847,41 @@ recorded, the attempt starts without it (a directory made but not recorded is
 left as it is and counted). Reports measure each output directory (at every
 report while an attempt of its run runs on that executor, else once per agent
 process), and one a whole scan no longer finds is `missing` until found
-again. Nothing deletes an output directory yet: packing it, moving it to a
-durable store once its run has ended and deleting it there are the next P1b
-steps. A daemon older than output directories gives no run, and the attempt
-gets none.
+again. Nothing deletes an output directory yet: moving its pack (below) to a
+durable store and deleting it are the next P1b steps. A daemon older than
+output directories gives no run, and the attempt gets none.
+
+Packing: what Kairo keeps is packed where it was written, once nothing writes
+there any more. A run's output directory is due once the run has ended (its
+Task is no longer pending or running, or a rerun of it has started; a direct
+execution once terminal; a gang rank's with its leader's) and the last
+attempt that got it has quiesced; a failed attempt's kept scratch once the
+attempt has quiesced (a lost attempt's waits until it is reconciled, since
+its processes may still write). A run suspended with a checkpoint has not
+ended: its continuation is to come. Each becomes a data object (table
+`data_objects`, `packing` then `packed`; events `pack_ordered`, `packed`),
+packed once, only while the declaration still makes the path that directory,
+by the executor that made it (`packs-to-make` every minute, `record-pack`)
+into `<root>/packs/<object id>.tar.zst` (tar, PAX format, compressed with
+zstd) with its file list `<object id>.tar.zst.files.tsv`: a header line
+`path`, `bytes`, `sha256`, `mtime_ns`, then such a line per regular file
+(the fields separated by tabs),
+sorted by its path (relative, `/`-separated; a backslash, tab, CR or LF in it
+written `\\`, `\t`, `\r`, `\n`), the format neo-ime's own packs on the durable
+store use. Directories are packed with their mode and mtime; links, special
+files and mount points are skipped (counted, never followed or entered), and
+the marker is left out. The directory is reached as the store's rules say: the
+executor derives it from the root, the object's kind and its id (never a path
+it is sent), opens it one directory at a time through handles and checks its
+marker names it; a file must be the one listed and keep its size while it is
+read, else the round fails and is tried again. Both files are written under a
+`.partial` name, synced and renamed (the list first), so a pack that is there
+is whole, and a round cut short starts the object again. An object whose
+directory is bigger than the store's free space waits. Directories of a store
+inside a WSL distro are not packed yet (the executor cannot read the distro's
+files through handles): such an object stays `packing`, warned once.
+`kairo store status` shows the packs made on each store as `PACKS`
+(`pack_bytes`, `packs`); until they are moved they are Kairo's bytes there.
 
 Once the attempt has quiesced, or was lost, its executor settles the scratch
 (`scratch-to-settle` every 10 seconds, with an `action` for each:
