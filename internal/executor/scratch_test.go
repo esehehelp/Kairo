@@ -457,7 +457,6 @@ func TestDueScratchIsSettled(t *testing.T) {
 	}
 }
 
-
 // With a daemon older than stores (404) the executor makes no scratch and
 // never asks for scratch to settle; once the daemon answers for stores it
 // does.

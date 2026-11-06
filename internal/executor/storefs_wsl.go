@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -199,6 +200,8 @@ func (w wslStoreFS) ListKind(ctx context.Context, root string, kind dirKind) ([]
 			ids = append(ids, line)
 		}
 	}
+	slices.Sort(ids)
+	slices.Sort(unread)
 	return ids, unread, nil
 }
 

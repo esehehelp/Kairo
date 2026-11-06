@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 )
 
@@ -468,6 +469,9 @@ func readNames(ctx context.Context, dir *os.Root) ([]string, error) {
 		batch, err := f.Readdirnames(scratchListBatch)
 		names = append(names, batch...)
 		if errors.Is(err, io.EOF) || err == nil && len(batch) == 0 {
+			// in the directory's own order on Linux: sorted, as os.ReadDir
+			// gives them
+			slices.Sort(names)
 			return names, nil
 		}
 		if err != nil {

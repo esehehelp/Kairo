@@ -110,7 +110,9 @@ func TestRecordAttemptScratchChecksTheLaunch(t *testing.T) {
 			t.Fatalf("%s: %v, want %q", what, err, want)
 		}
 	}
-	refused("on a durable store", func(s *AttemptScratch) { s.StoreID, s.Root, s.Path = "d-durable", "D:/durable", "D:/durable/scratch/"+s.AttemptID }, "no longer volatile")
+	refused("on a durable store", func(s *AttemptScratch) {
+		s.StoreID, s.Root, s.Path = "d-durable", "D:/durable", "D:/durable/scratch/"+s.AttemptID
+	}, "no longer volatile")
 	refused("on another executor's store", func(s *AttemptScratch) {
 		s.StoreID, s.Root, s.Path = "w-scratch", "/var/tmp/kairo", "/var/tmp/kairo/scratch/"+s.AttemptID
 	}, "in executor wsl's namespace")
