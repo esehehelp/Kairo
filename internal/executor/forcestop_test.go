@@ -24,6 +24,7 @@ const (
 	helperSleep      = "__test-sleep"       // sleep
 	helperSleepStubb = "__test-sleep-stubb" // sleep ignoring interrupts
 	helperOrphan     = "__test-orphan"      // start a sleeping child and exit at once
+	helperOrphanStub = "__test-orphan-stub" // start a child ignoring interrupts and exit at once
 	helperPrint      = "__test-print"       // print a line to stdout and stderr, exit 1
 )
 
@@ -32,9 +33,9 @@ func TestMain(m *testing.M) {
 	runScratchHelper(os.Args)
 	if len(os.Args) == 2 {
 		switch os.Args[1] {
-		case helperTree, helperStubborn, helperOrphan:
+		case helperTree, helperStubborn, helperOrphan, helperOrphanStub:
 			child := helperSleep
-			if os.Args[1] == helperStubborn {
+			if os.Args[1] == helperStubborn || os.Args[1] == helperOrphanStub {
 				signal.Notify(make(chan os.Signal, 1), os.Interrupt, syscall.SIGTERM)
 				child = helperSleepStubb
 			}
@@ -43,7 +44,7 @@ func TestMain(m *testing.M) {
 				os.Exit(3)
 			}
 			os.Stdout.WriteString(strconv.Itoa(cmd.Process.Pid) + "\n")
-			if os.Args[1] == helperOrphan {
+			if os.Args[1] == helperOrphan || os.Args[1] == helperOrphanStub {
 				os.Exit(0)
 			}
 			time.Sleep(2 * time.Minute)

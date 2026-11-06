@@ -10,6 +10,19 @@ import (
 	"kairo/internal/id"
 )
 
+// workerState says what a worker of an attempt may do: live, its attempt
+// running (or quiescing) on an active (or releasing) lease; or pending, its
+// executor having started the process but not yet recorded it as running
+// (the attempt authorized, its lease prepared). A worker that calls at once
+// (a server polling for commands, a rank registering) lands in that gap of
+// a few hundred milliseconds: it is answered as live, with no command (none
+// is issued to an attempt not yet running), not as fenced.
+func workerState(attemptState, leaseState string) (live, pending bool) {
+	live = (attemptState == "running" || attemptState == "quiescing") && (leaseState == "active" || leaseState == "releasing")
+	pending = attemptState == "authorized" && leaseState == "prepared"
+	return live, pending
+}
+
 func (s *Store) Heartbeat(ctx context.Context, attemptID, leaseID string, epoch int64, progress json.RawMessage) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -25,8 +38,15 @@ func (s *Store) Heartbeat(ctx context.Context, attemptID, leaseID string, epoch 
 	if !json.Valid(progress) {
 		return errors.New("progress must be valid JSON")
 	}
+	var attemptState, leaseState string
+	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=$1 AND l.attempt_id=a.id WHERE a.id=$2`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
+		return err
+	}
+	if live, pending := workerState(attemptState, leaseState); !live && !pending {
+		return ErrStaleEpoch
+	}
 	t := now()
-	res, err := tx.ExecContext(ctx, `UPDATE attempts SET last_heartbeat_at=$1,progress_json=$2 WHERE id=$3 AND state IN('running','quiescing')`, t, string(progress), attemptID)
+	res, err := tx.ExecContext(ctx, `UPDATE attempts SET last_heartbeat_at=$1,progress_json=$2 WHERE id=$3 AND state IN('authorized','running','quiescing')`, t, string(progress), attemptID)
 	if err != nil {
 		return err
 	}
@@ -52,7 +72,7 @@ func (s *Store) RegisterProcess(ctx context.Context, attemptID, leaseID string, 
 	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=$1 AND l.attempt_id=a.id WHERE a.id=$2`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
 		return err
 	}
-	if (attemptState != "running" && attemptState != "quiescing") || (leaseState != "active" && leaseState != "releasing") {
+	if live, pending := workerState(attemptState, leaseState); !live && !pending {
 		return ErrStaleEpoch
 	}
 	var registeredPID int
@@ -104,7 +124,11 @@ func (s *Store) PollCommands(ctx context.Context, attemptID, leaseID string, epo
 	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=$1 AND l.attempt_id=a.id WHERE a.id=$2`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
 		return nil, err
 	}
-	if (attemptState != "running" && attemptState != "quiescing") || (leaseState != "active" && leaseState != "releasing") {
+	live, pending := workerState(attemptState, leaseState)
+	if pending {
+		return nil, nil
+	}
+	if !live {
 		return nil, ErrStaleEpoch
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,execution_id,attempt_id,kind,origin,reason,state,delivery_count,created_at,payload_json
@@ -156,7 +180,11 @@ func (s *Store) hasPollableCommands(ctx context.Context, attemptID, leaseID stri
 	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state FROM attempts a JOIN leases l ON l.id=$1 AND l.attempt_id=a.id WHERE a.id=$2`, leaseID, attemptID).Scan(&attemptState, &leaseState); err != nil {
 		return false, err
 	}
-	if (attemptState != "running" && attemptState != "quiescing") || (leaseState != "active" && leaseState != "releasing") {
+	live, starting := workerState(attemptState, leaseState)
+	if starting {
+		return false, nil
+	}
+	if !live {
 		return false, ErrStaleEpoch
 	}
 	var pending bool

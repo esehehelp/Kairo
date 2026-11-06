@@ -1,8 +1,10 @@
 package executor
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -82,5 +84,61 @@ func TestQuiescenceWaitsForWhatTheAttemptLeftRunning(t *testing.T) {
 			t.Fatal("not released once nothing was left")
 		}
 		time.Sleep(100 * time.Millisecond)
+	}
+}
+
+// What an exited attempt left running is asked to stop once it has been seen
+// for leftoverGrace, killed leftoverKillAfter later, and the lease released
+// once nothing is left.
+func TestQuiescenceEndsWhatTheAttemptLeftRunning(t *testing.T) {
+	savedGrace, savedKill := leftoverGrace, leftoverKillAfter
+	leftoverGrace, leftoverKillAfter = 0, 2*time.Second
+	t.Cleanup(func() { leftoverGrace, leftoverKillAfter = savedGrace, savedKill })
+	cmd, handle, child := startTestTree(t, helperOrphanStub)
+	attemptID := "att-" + helperOrphanStub
+	tree := processTree{attemptID: attemptID, pid: cmd.Process.Pid, handle: handle}
+	deadline := time.Now().Add(10 * time.Second)
+	for alive, _ := tree.launcherAlive(); alive; alive, _ = tree.launcherAlive() {
+		if time.Now().After(deadline) {
+			t.Fatal("launcher did not exit")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	fake := &fakeQuiescence{candidate: store.QuiescenceCandidate{
+		Attempt: store.Attempt{ID: attemptID, State: "exited", CoordinationEpoch: 1},
+		Lease:   store.Lease{ID: "lea", CoordinationEpoch: 1, State: "releasing"},
+	}}
+	var logs bytes.Buffer
+	e := NewLocal("e", fake, t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
+	e.trees = map[string]*treeHandle{attemptID: handle}
+	ctx := context.Background()
+	pass := func() {
+		t.Helper()
+		if err := e.reconcileQuiescence(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pass() // seen
+	pass() // asked to stop: it ignores that
+	time.Sleep(300 * time.Millisecond)
+	if !processAlive(child) || fake.finalized != 0 || !strings.Contains(logs.String(), "asking what the exited attempt left running to stop") {
+		t.Fatalf("after the ask: child alive %v, finalized %d\n%s", processAlive(child), fake.finalized, logs.String())
+	}
+	deadline = time.Now().Add(20 * time.Second)
+	for {
+		pass()
+		fake.mu.Lock()
+		done := fake.finalized > 0
+		fake.mu.Unlock()
+		if done {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("not released; child alive %v\n%s", processAlive(child), logs.String())
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if processAlive(child) || !strings.Contains(logs.String(), "killed what the exited attempt left running") {
+		t.Fatalf("child alive %v\n%s", processAlive(child), logs.String())
 	}
 }

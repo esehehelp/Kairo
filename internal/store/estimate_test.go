@@ -163,16 +163,17 @@ func (c *planCluster) ranUsing(spec ExecutionSpec, d time.Duration, ram int64) {
 // A running lease's RAM reservation counts up to what runs like it were seen
 // to take (half again, plus 512 MiB), once three such runs were sampled and
 // its own use is known now: one that reserved 8 GiB and whose like took
-// 300 MiB leaves the rest to others. With two runs, or its use not known,
-// it counts in full.
+// 300 MiB leaves the rest to others. With two runs, its use not known, or a
+// GPU held (CUDA's pinned host memory is not in the samples), it counts in
+// full.
 func TestPlannerCountsRAMUpToWhatRunsLikeItTook(t *testing.T) {
-	run := func(t *testing.T, history int, sampled bool) (*planCluster, ExecutionRequest) {
+	run := func(t *testing.T, history int, sampled bool, gpus int) (*planCluster, ExecutionRequest) {
 		c := newPlanCluster(t)
-		c.node("a", 0, 16000, 64, 500)
+		c.node("a", 1, 16000, 64, 500)
 		for i := 1; i <= history; i++ {
 			c.ranUsing(planSpec(fmt.Sprintf("compress-%d", i), "p1", 0, 0, 1000, 8), time.Minute, 300<<20)
 		}
-		c.submit(planSpec("compress-9", "p1", 0, 0, 1000, 8))
+		c.submit(planSpec("compress-9", "p1", 0, gpus, 1000, 8))
 		running := c.start("exec-a")
 		if sampled {
 			used := int64(100 << 20)
@@ -185,16 +186,17 @@ func TestPlannerCountsRAMUpToWhatRunsLikeItTook(t *testing.T) {
 		return c, c.submit(planSpec("other", "p2", 0, 0, 1000, 9))
 	}
 	t.Run("three runs like it", func(t *testing.T) {
-		c, other := run(t, 3, true)
+		c, other := run(t, 3, true, 0)
 		c.expectReserved("exec-a", other)
 	})
 	for _, tc := range []struct {
 		name    string
 		history int
 		sampled bool
-	}{{"two runs like it", 2, true}, {"its use not known", 3, false}} {
+		gpus    int
+	}{{"two runs like it", 2, true, 0}, {"its use not known", 3, false, 0}, {"holding a GPU", 3, true, 1}} {
 		t.Run(tc.name, func(t *testing.T) {
-			c, other := run(t, tc.history, tc.sampled)
+			c, other := run(t, tc.history, tc.sampled, tc.gpus)
 			if r := c.reserve("exec-a"); r != nil {
 				t.Fatalf("reserved %s", r.Execution.ClientRequestID)
 			}

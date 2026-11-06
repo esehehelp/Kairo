@@ -256,8 +256,13 @@ nothing to do and its actuating operations are refused (423).
 Each attempt gets its own worker token at launch authorization, in
 `KAIRO_ATTEMPT_TOKEN`. It identifies the attempt (and the lease and epoch it
 was issued under) to the worker API, and stops working once the attempt has
-quiesced or was fenced (for instance marked lost by a daemon restart). The
-executor never passes its own process's `KAIRO_*` variables to an attempt.
+quiesced or was fenced (for instance marked lost by a daemon restart). A
+worker that calls in the few hundred milliseconds between its start and its
+executor recording it running (the attempt authorized, its lease prepared) is
+answered as running, with no command, its heartbeat and processes recorded,
+not fenced: a server that polls at once, or a rank that registers at once,
+would otherwise be stopped by its own launch. The executor never passes its
+own process's `KAIRO_*` variables to an attempt.
 
 ### TLS
 
@@ -428,6 +433,17 @@ registered process is absent and provider observations taken after that
 absence show resources unclaimed. An expired or executor-lost lease becomes
 stale; it is never made free based on time alone.
 
+What an exited attempt left running (its launcher exited and its exit is
+recorded, yet a process of its tree runs: one it started without
+registering, a server a wrapper left behind) is not its work any more, since
+no one reads what it does, and it holds the lease. Its executor ends it: once
+it has been seen for 10 s it is asked to stop (SIGTERM, inside WSL too; on
+Windows CTRL_BREAK no longer reaches it once its launcher is gone), and 30 s
+later it is killed (the job object, the launcher's process group, the
+processes carrying the attempt's `KAIRO_ATTEMPT_ID`, each identified as
+force stop does; never anything else). An attempt lost with an agent restart
+is not an exited one and is left alone.
+
 A compute process a provider sees on a GPU (`nvidia-smi pmon`) is an
 `external_process` claim unless it is the work of the attempt holding that GPU
 (on any node's row of it): one of the attempt's registered processes, a
@@ -490,7 +506,10 @@ labels may take what is placed there.
   specific run-time estimate key (program, subcommand and config; program and
   subcommand; or its Task name with digits masked; never a whole queue or
   project), half again plus 512 MiB, and never less than its attempt uses
-  now. A declaration written large (8 GiB for work that took 300 MiB) thus
+  now. A lease holding a GPU counts in full: the host memory CUDA pins is not
+  in the samples (PSS on Linux, the private working set on Windows; neither
+  counts pinned memory, and the Windows one leaves out mapped files such as
+  a model's weights), and a host without swap hangs when it runs out. A declaration written large (8 GiB for work that took 300 MiB) thus
   stops holding memory it never uses, while one its like really used (16 GiB
   for work that took 10.7 GiB) still counts in full; samples are 15 s apart,
   which the headroom is for. Disk is observed free space minus every
