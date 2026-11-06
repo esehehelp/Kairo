@@ -159,9 +159,38 @@ sample). `kairo doctor` ends with the same table.
 
 Resource observations describe the present: only each resource's latest one
 is used, and the daemon prunes the others once they are an hour old. Device
-samples are kept for 72 hours (each device's latest always). `kairo db
-compact --config kairo.toml` prunes both at once and vacuums their tables; it
-may run alongside the daemon (PostgreSQL's autovacuum does the same in time).
+samples are kept for 72 hours (each device's latest always), and so is the
+resource history: at most one observation per resource every 10 seconds,
+with what its live leases reserved of it then. `kairo db compact --config
+kairo.toml` prunes all three at once and vacuums their tables; it may run
+alongside the daemon (PostgreSQL's autovacuum does the same in time).
+
+The history is for dashboards, through two read routes. Both take `since`
+and `until` (RFC 3339; by default the last 24 hours, and `since` no earlier
+than 72 hours ago) and `key` (repeatable) to keep only some series:
+
+- `GET /api/hardware/samples` (also `step`, a duration such as `60s` or a
+  number of seconds; never less than 10 s or than a 2000th of the window)
+  averages the history into buckets of `step` aligned on `since` and answers
+  `{"since", "until", "step_seconds", "series"}`. Each series is `{"key",
+  "kind", "nodes", "resources", "t", "metrics"}`: `t` holds the start of each
+  bucket that has a sample, in Unix milliseconds, and each metric one value
+  per bucket (`null` where none of its samples had it). A GPU is one series
+  by its UUID, listing every node it is declared on (`kind` `gpu`: `util`
+  and `mem_util` in percent, `mem_used`, `mem_total` in bytes, `power_w`,
+  `power_limit_w`, `sm_clock_mhz` from its device samples). A node's `cpu`
+  has `total`, `reserved` (millicores) and `power_w` (its CPU package, as
+  the node reads it); `ram` and `disk` have `used`, `total` and `reserved`
+  (bytes); a host's CPU package as its controller reads it is the series
+  `host/<host>/cpu` (`kind` `host_cpu`, `power_w`; its nodes are the
+  host's), which is the only package power of a container node.
+- `GET /api/hardware/leases` answers `{"since", "until", "leases"}`: every
+  lease that held a resource within the window, by resource and start, each
+  `{"key", "resource_id", "kind", "node", "lease_id", "state",
+  "execution_id", "project", "queue", "task", "quantity", "start", "end"}`.
+  `start` is when the lease was made (admission counts it from its
+  reservation) and `end` when it was released, `null` while it holds the
+  resource (a stale lease too); both RFC 3339.
 
 CPU, RAM, and disk reservations are admission accounting rather than hard OS
 limits (see Admission for how they are counted). GPU exclusion is a coordination guarantee among Kairo participants;
@@ -362,6 +391,7 @@ shows.
 | POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
 | GET, POST | `/api/machines` (the machine declaration) | read, admin |
 | GET | `/api/hardware` (`?host=`) | read |
+| GET | `/api/hardware/samples`, `/api/hardware/leases` (`?since=&until=&step=&key=`) | read |
 | POST, DELETE | `/api/hardware/{host}/{device}/settings` | admin |
 | POST | `/api/hardware/{host}/{device}/bench` | admin |
 | GET | `/api/hardware/{host}/profile` (`?device=`) | read |

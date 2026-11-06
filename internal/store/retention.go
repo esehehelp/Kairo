@@ -121,7 +121,12 @@ func (s *Store) Compact(ctx context.Context) (int, error) {
 	if err != nil {
 		return removed, err
 	}
+	history, err := s.PruneHistory(ctx, HistoryRetention)
+	removed += history
+	if err != nil {
+		return removed, err
+	}
 	// VACUUM runs outside a transaction, and changes no row.
-	_, err = s.db.ExecContext(ctx, `VACUUM (ANALYZE) resource_observations, device_samples`)
+	_, err = s.db.ExecContext(ctx, `VACUUM (ANALYZE) resource_observations, device_samples, resource_history`)
 	return removed, err
 }

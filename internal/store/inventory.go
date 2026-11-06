@@ -81,8 +81,18 @@ func (s *Store) RecordObservation(ctx context.Context, o Observation) error {
 	if o.ResourceID == "" || o.ObservedAt == "" || o.ValidUntil == "" {
 		return errors.New("resource_id, observed_at, and valid_until are required")
 	}
-	_, err := s.exec(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, o.ResourceID, o.ObservedAt, o.ValidUntil, o.TotalBytes, o.FreeBytes, o.Utilization, o.TemperatureC, validJSON(o.Evidence))
-	return err
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, o.ResourceID, o.ObservedAt, o.ValidUntil, o.TotalBytes, o.FreeBytes, o.Utilization, o.TemperatureC, validJSON(o.Evidence)); err != nil {
+		return err
+	}
+	if err = recordHistoryTx(ctx, tx, o); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // ApplyObservationBatch persists one provider poll and only clears a known
@@ -182,6 +192,9 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO resource_observations(resource_id,observed_at,valid_until,total_bytes,free_bytes,utilization,temperature_c,evidence_json) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`, observation.ResourceID, observation.ObservedAt, observation.ValidUntil, observation.TotalBytes, observation.FreeBytes, observation.Utilization, observation.TemperatureC, validJSON(observation.Evidence))
 		if err != nil {
+			return err
+		}
+		if err = recordHistoryTx(ctx, tx, observation); err != nil {
 			return err
 		}
 		if observation.Device != nil {

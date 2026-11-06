@@ -228,6 +228,12 @@ func serve(args []string) error {
 			} else if removed > 0 {
 				logger.Info("pruned device samples", "rows", removed)
 			}
+			removed, err = st.PruneHistory(ctx, store.HistoryRetention)
+			if err != nil && ctx.Err() == nil {
+				logger.Error("resource history pruning failed", "error", err)
+			} else if removed > 0 {
+				logger.Info("pruned resource history", "rows", removed)
+			}
 			select {
 			case <-ctx.Done():
 				return
