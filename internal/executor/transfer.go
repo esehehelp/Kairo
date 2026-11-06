@@ -173,6 +173,7 @@ func verifyCopy(dir *os.Root, dirPath, packName, listName string, o store.CopyOr
 	if err = syncRenamed(dir, finalList, finalPack); err != nil {
 		return made, err
 	}
+	want := map[string]string{finalList: o.ManifestSHA256, finalPack: o.PackSHA256}
 	for name, read := range map[string]os.FileInfo{finalList: listRead, finalPack: packRead} {
 		f, err := dir.OpenFile(name, os.O_RDONLY|markerOpenFlags, 0)
 		if err != nil {
@@ -183,8 +184,18 @@ func verifyCopy(dir *os.Root, dirPath, packName, listName string, o store.CopyOr
 		if err != nil {
 			return made, err
 		}
-		if !os.SameFile(there, read) || there.Size() != read.Size() || !there.ModTime().Equal(read.ModTime()) {
-			// written over meanwhile: read back again at the next round
+		if os.SameFile(there, read) && there.Size() == read.Size() && there.ModTime().Equal(read.ModTime()) {
+			continue
+		}
+		// Not the file read back: written over meanwhile, or on a filesystem
+		// whose file ids do not survive a rename (exFAT, where an id is where
+		// the file's directory entry is). Read it back again under its final
+		// name: what is there must be what the order says.
+		sum, n, _, err := hashUncachedFile(dir, name, filepath.Join(dirPath, name))
+		if err != nil {
+			return made, err
+		}
+		if sum != want[name] || name == finalPack && n != o.PackBytes {
 			return made, fmt.Errorf("%w: %s is not the file read back", errRaced, filepath.Join(dirPath, name))
 		}
 	}

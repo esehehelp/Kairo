@@ -1045,7 +1045,9 @@ cached pages dropped first, best effort: a filesystem with a cache of its own,
 ZFS's ARC, may still answer from memory), and only if the pack's size and
 sha256 and the list's sha256 match are they renamed (the list first), the
 renames synced, and the copy recorded `verified`, which the daemon checks
-again, once the files under their final names are the ones read back. A copy
+again, once the files under their final names are the ones read back (where
+a rename gives a file another id, as exFAT does, they are read back again
+under their final names and must match). A copy
 that does not match has its files removed and is fetched again later: its
 `.partial` files, or, renamed but not recorded (an order is only for a copy
 not recorded), its final ones. These, Kairo's own writes never recorded, are
