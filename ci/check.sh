@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # One CI check of the tree this script is in (an extracted commit), as a Kairo task of project kairo-ci runs it
-# (ci/kairo-ci.sh). The check is the first argument:
+# (ci/kairo-ci.sh), or as a job of GitHub's CI (.github/workflows/ci.yml, the checks that need nothing of this
+# installation). The check is the first argument:
 #   linux       gofmt, go vet (Linux and Windows), go test   (pve1-work, as an unprivileged user)
 #   linux-race  go test -race                               (pve1-work, as an unprivileged user)
 #   linux-root  the executor and process tests as root      (pve1-work)
@@ -12,10 +13,14 @@
 set -euo pipefail
 check=${1:?usage: ci/check.sh CHECK}
 cd "$(dirname "$0")/.."
-case "$(uname -s)" in
-MINGW* | MSYS* | CYGWIN*) export PATH="/c/Program Files/Go/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH" ;;
-*) export PATH="/usr/local/go/bin:$PATH" ;;
-esac
+# On the installation's nodes Go, uv and cargo are where they install themselves, not always on a task's PATH; a
+# GitHub runner has set up the ones it uses, first on its PATH.
+if [ -z "${GITHUB_ACTIONS:-}" ]; then
+  case "$(uname -s)" in
+  MINGW* | MSYS* | CYGWIN*) export PATH="/c/Program Files/Go/bin:$HOME/.local/bin:$HOME/.cargo/bin:$PATH" ;;
+  *) export PATH="/usr/local/go/bin:$PATH" ;;
+  esac
+fi
 step() { printf '\n== %s\n' "$*"; }
 pg_reachable() {
   local hostport
@@ -65,7 +70,7 @@ windows)
   ;;
 wsl)
   step "go test against WSL"
-  KAIRO_TEST_WSL=1 go test -count=1 -run 'WSL' ./internal/executor/
+  KAIRO_TEST_WSL=1 go test -count=1 -run 'WSL' ./internal/executor/ ./internal/processidentity/
   ;;
 sdk-python)
   step "pytest (Python SDK)"

@@ -1,0 +1,91 @@
+# The checks of ci/check.sh that need nothing of this installation, on GitHub's hosted runners, for every push to
+# main and every pull request. The checks that need the real environment (WSL, the LXC on pve1, the hardware) run
+# on Kairo itself (ci/kairo-ci.sh). No self-hosted runner and no secrets: a pull request from a fork runs here with
+# a read-only token, never on the installation's machines.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [linux, linux-race, linux-root]
+    services:
+      # The store tests' PostgreSQL, as on pve1-work: role kairo (a superuser, as the image makes it).
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: kairo
+          POSTGRES_PASSWORD: kairo-test
+          POSTGRES_DB: kairo
+        ports: ["55432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U kairo" --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      KAIRO_TEST_PG: postgres://kairo:kairo-test@127.0.0.1:55432/kairo
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: ci/check.sh ${{ matrix.check }}
+        run: |
+          if [ "${{ matrix.check }}" = linux-root ]; then
+            sudo env "PATH=$PATH" "GITHUB_ACTIONS=$GITHUB_ACTIONS" "GOMODCACHE=$(go env GOMODCACHE)" bash ci/check.sh linux-root
+          else
+            bash ci/check.sh "${{ matrix.check }}"
+          fi
+
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      KAIRO_TEST_PG: postgres://kairo:kairo-test@127.0.0.1:5432/kairo
+    steps:
+      # The tree as committed: CRLF would break the scripts.
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: start the image's PostgreSQL
+        shell: pwsh
+        run: |
+          $svc = Get-Service -Name 'postgresql*' | Select-Object -First 1
+          Set-Service -Name $svc.Name -StartupType Manual
+          Start-Service -Name $svc.Name
+          $env:PGPASSWORD = 'root'
+          & "$env:PGBIN\psql.exe" -U postgres -h 127.0.0.1 -v ON_ERROR_STOP=1 `
+            -c "CREATE ROLE kairo LOGIN SUPERUSER PASSWORD 'kairo-test'" -c "CREATE DATABASE kairo OWNER kairo"
+      - name: ci/check.sh windows
+        shell: bash
+        run: bash ci/check.sh windows
+
+  sdk:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        check: [sdk-python, sdk-rust]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        if: matrix.check == 'sdk-python'
+      - name: ci/check.sh ${{ matrix.check }}
+        run: bash ci/check.sh "${{ matrix.check }}"
