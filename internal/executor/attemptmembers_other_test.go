@@ -66,8 +66,8 @@ func TestAttemptScriptFindsRemembersAndSignals(t *testing.T) {
 	}
 	self := os.Getpid()
 	pids, found := run("0",
-		"999999999:1", // gone
-		strconv.Itoa(self)+":1", // another starttime
+		"999999999:1",                             // gone
+		strconv.Itoa(self)+":1",                   // another starttime
 		strconv.Itoa(self)+":"+statStart(t, self), // there, but with an environment
 	)
 	if !slices.Equal(pids, []int{pid}) || found[pid] != statStart(t, pid) {
