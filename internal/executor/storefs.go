@@ -108,6 +108,8 @@ type storeFS interface {
 	// its marker (errScratchNotEmpty otherwise). A directory already gone is
 	// no error.
 	Remove(ctx context.Context, root, dir, attemptID string, onlyEmpty bool) error
+	// PackDir packs an imported directory dir into <root>/packs (pack.go).
+	PackDir(ctx context.Context, root, dir, objectID string) (packResult, error)
 	// Size is the bytes of the regular files under dir (links not followed,
 	// mount points not entered); 0 for a directory that is gone.
 	Size(ctx context.Context, dir string) (int64, error)

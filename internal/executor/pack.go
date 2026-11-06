@@ -122,7 +122,43 @@ func (localStoreFS) Pack(ctx context.Context, root string, kind dirKind, id, obj
 	if err != nil {
 		return res, err
 	}
-	if err = r.Mkdir(packsDirName, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+	return packInto(ctx, r, root, sr, src, mounts, kind.marker, objectID)
+}
+
+// PackDir packs an imported directory dir (store.ImportData: outside every
+// store; not Kairo's, only read) into <root>/packs as Pack packs a
+// directory of Kairo's: dir is opened one directory at a time from its
+// volume's root through handles (no link on its path), and there is no
+// marker to leave out.
+func (localStoreFS) PackDir(ctx context.Context, root, dir, objectID string) (packResult, error) {
+	var res packResult
+	if !validScratchID(objectID) || !filepath.IsAbs(dir) {
+		return res, fmt.Errorf("%w: directory %q, object %q", errOutsideRoot, dir, objectID)
+	}
+	root, dir = filepath.Clean(root), filepath.Clean(dir)
+	r, err := openDirPath(root, false)
+	if err != nil {
+		return res, err
+	}
+	defer r.Close()
+	sr, err := openDirPath(dir, false)
+	if err != nil {
+		return res, err
+	}
+	defer sr.Close()
+	mounts, err := mountsUnderFn(dir)
+	if err != nil {
+		return res, err
+	}
+	return packInto(ctx, r, root, sr, dir, mounts, "", objectID)
+}
+
+// packInto packs src (opened as sr; marker, if any, left out) into the packs
+// directory of the store opened as r at root, and reads the pack back.
+func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src string, mounts []string, marker, objectID string) (packResult, error) {
+	var res packResult
+	err := r.Mkdir(packsDirName, 0o755)
+	if err != nil && !errors.Is(err, fs.ErrExist) {
 		return res, err
 	}
 	pr, err := openPlainDir(r, packsDirName)
@@ -133,7 +169,7 @@ func (localStoreFS) Pack(ctx context.Context, root string, kind dirKind, id, obj
 	if err = checkParentNotMounted(root, dirKind{dir: packsDirName}); err != nil {
 		return res, err
 	}
-	res, err = writePack(ctx, sr, src, mounts, kind.marker, pr, objectID+packSuffix)
+	res, err = writePack(ctx, sr, src, mounts, marker, pr, objectID+packSuffix)
 	if err != nil {
 		return res, err
 	}
@@ -159,6 +195,10 @@ func (localStoreFS) Pack(ctx context.Context, root string, kind dirKind, id, obj
 }
 
 func (wslStoreFS) Pack(context.Context, string, dirKind, string, string) (packResult, error) {
+	return packResult{}, errPackNotHere
+}
+
+func (wslStoreFS) PackDir(context.Context, string, string, string) (packResult, error) {
 	return packResult{}, errPackNotHere
 }
 
@@ -390,6 +430,10 @@ func (e *Local) packDue(ctx context.Context) {
 	}
 	for _, o := range orders {
 		s, ok := served[o.StoreID]
+		if o.Kind == store.ObjectImport {
+			e.packImport(ctx, o, s, ok)
+			continue
+		}
 		kind, known := kindOf(o.Kind)
 		switch {
 		case !known:
@@ -423,6 +467,38 @@ func (e *Local) packDue(ctx context.Context) {
 		e.Logger.Info("packed", "object_id", o.ObjectID, "kind", o.Kind, "source_id", o.SourceID, "files", res.files,
 			"content_bytes", res.contentBytes, "pack_bytes", res.packBytes, "skipped", res.skipped, "seconds", time.Since(started).Seconds())
 	}
+}
+
+// packImport packs an imported directory (store.ImportData) onto the store
+// it was ordered packed on, once there is room there for all it holds.
+func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
+	if !served || !s.usable || s.decl.Root != o.Root || !e.due(&e.packs, o.ObjectID) {
+		return
+	}
+	size, err := s.fs.Size(ctx, o.Path)
+	if err == nil {
+		var free int64
+		if _, free, err = s.fs.Usage(ctx, s.decl.Root); err == nil && free < size {
+			err = fmt.Errorf("%d bytes free on %s, %d to pack", free, s.decl.ID, size)
+		}
+	}
+	started := time.Now()
+	var res packResult
+	if err == nil {
+		res, err = s.fs.PackDir(ctx, s.decl.Root, o.Path, o.ObjectID)
+	}
+	if err == nil {
+		err = e.Store.RecordPack(ctx, store.PackMade{ObjectID: o.ObjectID, ExecutorID: e.ID, PackPath: res.packPath, ManifestPath: res.manifestPath,
+			PackBytes: res.packBytes, ContentBytes: res.contentBytes, Files: res.files, Skipped: res.skipped,
+			PackSHA256: res.packSHA256, ManifestSHA256: res.manifestHash})
+	}
+	if err != nil {
+		e.packProblem(o.ObjectID, "imported directory not packed", err)
+		return
+	}
+	e.packProblem(o.ObjectID, "", nil)
+	e.Logger.Info("packed", "object_id", o.ObjectID, "kind", o.Kind, "path", o.Path, "files", res.files,
+		"content_bytes", res.contentBytes, "pack_bytes", res.packBytes, "skipped", res.skipped, "seconds", time.Since(started).Seconds())
 }
 
 // packProblem is roundProblem for packing.

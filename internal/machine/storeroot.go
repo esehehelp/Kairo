@@ -136,3 +136,16 @@ func checkStoreRoot(root string) error {
 	}
 	return nil
 }
+
+// CheckDataPath checks a path data is named by outside a store (an imported
+// directory) as a root is checked: absolute, one spelling of one place
+// (checkStoreRoot), and not a filesystem's root (/ or a drive's).
+func CheckDataPath(p string) error {
+	if err := checkStoreRoot(p); err != nil {
+		return err
+	}
+	if k := StoreRootKey(p); k == "/" || len(k) == 3 && k[1] == ':' && k[2] == '/' {
+		return fmt.Errorf("path %q is a filesystem's root", p)
+	}
+	return nil
+}

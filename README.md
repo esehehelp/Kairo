@@ -391,6 +391,8 @@ shows.
 | GET | `/api/resources` | read |
 | POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
 | GET, POST | `/api/machines` (the machine declaration) | read, admin |
+| GET | `/api/stores`, `/api/data/objects` (`?project=&kind=&limit=`) | read |
+| POST | `/api/data/imports` | admin |
 | GET | `/api/hardware` (`?host=`) | read |
 | GET | `/api/hardware/samples`, `/api/hardware/leases` (`?since=&until=&step=&key=`) | read |
 | POST, DELETE | `/api/hardware/{host}/{device}/settings` | admin |
@@ -1073,6 +1075,49 @@ and the declaration makes the source Kairo's); until it is settled `deleted`, or
 refused for safety (with why; it is not tried again), `kairo machine apply`
 refuses a declaration under which the directory would not be Kairo's. A
 deleted output directory or scratch is marked `deleted` and no longer counted.
+
+Importing existing data: `kairo data import --project P --node N [--name
+NAME] [--delete-source] PATH...` (`POST /api/data/imports`, `{"project",
+"node", "paths", "name", "delete_source"}`, answered `201 {"objects": [...]}`
+with each object's id, name, path, store and executor) brings directories
+Kairo did not make under it, data written before the stores were declared or
+outside them. Each PATH becomes a data object of kind `import` of the
+project (`source_id` the object itself; event `import_ordered`), named NAME
+(with several paths `NAME/<the directory's name>`; without NAME the
+directory's name). It is packed by the executor of the node that serves the
+node's first volatile store by id (never a WSL executor) onto that store,
+like an output directory, the directory opened one directory at a time from
+its volume's root through handles (no link on its path; links, special files
+and mount points inside are skipped, counted), once the store has the room
+for what it holds; then it is copied to a durable store and read back like
+every object. A path must be absolute, in the namespace of that store (a
+drive path on a Windows store, a POSIX one on a Linux store), one spelling of
+one place (as a root), not a filesystem's root, inside no store of the node
+and holding none, and not inside, at or around a directory being imported on
+the node (still to be packed, or copied and not yet deleted or kept); a store
+later declared over it stops its packing and deletion, and a declaration
+under which a directory being deleted would no longer be outside every store
+is refused like one under a scratch being deleted. The directory is not
+Kairo's: it is only read. Without `--delete-source` it stays where it is:
+once copied only the pack goes, and the source is settled `kept` ("imported
+without delete_source"). With it, once its copy is verified, the executor
+claims the deletion and checks the directory as a source is checked (each
+regular file listed in the pack with its size and mtime, nothing else there
+but directories) and to be on the filesystem of the store it was packed on
+(the same drive on Windows, where a drive path given to be deleted must be
+the store's drive; the same device elsewhere, so never a mount or another
+disk, and never a durable store), then removes it through its parent's
+handle (the directory itself a plain one; a link under it removed itself,
+never followed), then the pack, and the node is trimmed as after every
+deletion. A directory that changed since it was packed is kept, with why,
+and its pack goes all the same. A file written between that check and the
+removal is lost with it: import directories nothing writes in any more.
+`kairo data list [--project P] [--kind output|scratch|import] [--limit N]
+[--json]` (`GET /api/data/objects`, `{"objects": [...]}`, newest first, 200
+by default) shows each object: kind, project, name, node, `packing` or
+`packed`, files, content and pack bytes, verified copies (and the path of
+one), and what became of its source (`present`, `deleting`, `deleted`,
+`kept`, with why).
 
 Reading durable copies back: a durable store keeps for good and may lose bits
 without saying so (exFAT has no journal), so an executor serving it reads

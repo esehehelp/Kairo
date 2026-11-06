@@ -28,13 +28,16 @@ const (
 
 // DeletionOrder is a source its executor is to delete now: the directory of
 // Kind and SourceID under Root of StoreID, and the object's pack and list.
+// An imported directory (kind import) is Path itself, deleted only with
+// DeleteSource (without it only the pack goes and the source is kept).
 type DeletionOrder struct {
-	ObjectID string `json:"object_id"`
-	Kind     string `json:"kind"`
-	SourceID string `json:"source_id"`
-	StoreID  string `json:"store_id"`
-	Root     string `json:"root"`
-	Path     string `json:"path"`
+	ObjectID     string `json:"object_id"`
+	Kind         string `json:"kind"`
+	SourceID     string `json:"source_id"`
+	StoreID      string `json:"store_id"`
+	Root         string `json:"root"`
+	Path         string `json:"path"`
+	DeleteSource bool   `json:"delete_source,omitempty"`
 }
 
 // ObjectDeletion is what an executor did with a source: claimed it
@@ -47,10 +50,14 @@ type ObjectDeletion struct {
 	Reason     string `json:"reason,omitempty"`
 }
 
-// sourceOwnership is scratchOwnership or outputOwnership by the object's kind.
+// sourceOwnership is scratchOwnership, outputOwnership or importOwnership
+// by the object's kind.
 func sourceOwnership(declared []machine.Store, kind, nodeID, storeID, root, path, sourceID string) string {
-	if kind == ObjectScratch {
+	switch kind {
+	case ObjectScratch:
 		return scratchOwnership(declared, nodeID, storeID, root, path, sourceID)
+	case ObjectImport:
+		return importOwnership(declared, nodeID, storeID, root, path)
 	}
 	return outputOwnership(declared, nodeID, storeID, root, path, sourceID)
 }
@@ -92,11 +99,11 @@ func (s *Store) DeletionsToMake(ctx context.Context, executorID string) ([]Delet
 		state, nodeID string
 	}
 	var rows []row
-	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,d.source_state,x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id
+	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,d.delete_source,d.source_state,x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id
 		WHERE d.executor_id=$1 AND d.state='packed' AND d.source_state IN('present','deleting')
 		AND EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id AND c.state='verified') ORDER BY d.packed_at,d.id`, []any{executorID}, func(r *sql.Rows) error {
 		var x row
-		if err := r.Scan(&x.order.ObjectID, &x.order.Kind, &x.order.SourceID, &x.order.StoreID, &x.order.Root, &x.order.Path, &x.state, &x.nodeID); err != nil {
+		if err := r.Scan(&x.order.ObjectID, &x.order.Kind, &x.order.SourceID, &x.order.StoreID, &x.order.Root, &x.order.Path, &x.order.DeleteSource, &x.state, &x.nodeID); err != nil {
 			return err
 		}
 		rows = append(rows, x)
@@ -143,12 +150,13 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 	}
 	defer tx.Rollback()
 	var executorID, kind, sourceID, storeID, root, path, state, nodeID string
+	var deleteSource bool
 	var projectID sql.NullString
 	var bytes sql.NullInt64
-	err = tx.QueryRowContext(ctx, `SELECT d.executor_id,d.kind,d.source_id,d.store_id,d.root,d.source_path,d.source_state,x.node_id,d.project_scope_id,
+	err = tx.QueryRowContext(ctx, `SELECT d.executor_id,d.kind,d.source_id,d.store_id,d.root,d.source_path,d.delete_source,d.source_state,x.node_id,d.project_scope_id,
 		COALESCE(d.content_bytes,0)+COALESCE(d.pack_bytes,0)
 		FROM data_objects d JOIN executors x ON x.id=d.executor_id WHERE d.id=$1 FOR UPDATE OF d`, settled.ObjectID).
-		Scan(&executorID, &kind, &sourceID, &storeID, &root, &path, &state, &nodeID, &projectID, &bytes)
+		Scan(&executorID, &kind, &sourceID, &storeID, &root, &path, &deleteSource, &state, &nodeID, &projectID, &bytes)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -174,6 +182,9 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 		if state != "present" || !good {
 			return fmt.Errorf("%w: object %s's source is %s, a good copy %v: not to be deleted", ErrStaleEpoch, settled.ObjectID, state, good)
 		}
+		if kind == ObjectImport && !deleteSource {
+			return fmt.Errorf("%w: object %s was imported without delete_source: its directory is not to be deleted", ErrStaleEpoch, settled.ObjectID)
+		}
 		if why := sourceOwnership(declared, kind, nodeID, storeID, root, path, sourceID); why != "" {
 			return fmt.Errorf("%w: object %s's source is not deleted: %s", ErrStaleEpoch, settled.ObjectID, why)
 		}
@@ -196,9 +207,10 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 		return err
 	}
 	if settled.State == SourceDeleted {
-		if kind == ObjectOutput {
+		switch kind {
+		case ObjectOutput:
 			_, err = tx.ExecContext(ctx, `UPDATE run_outputs SET state='deleted',bytes=0,updated_at=$1 WHERE run_id=$2 AND store_id=$3`, t, sourceID, storeID)
-		} else {
+		case ObjectScratch:
 			_, err = tx.ExecContext(ctx, `UPDATE attempt_scratch SET state='deleted',bytes=0,reason=COALESCE(reason,'')||'; deleted once copied to a durable store',updated_at=$1 WHERE attempt_id=$2`, t, sourceID)
 		}
 		if err != nil {

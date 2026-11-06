@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -154,6 +155,12 @@ func (e *Local) deleteDue(ctx context.Context) {
 	}
 	for _, o := range orders {
 		s, ok := served[o.StoreID]
+		if o.Kind == store.ObjectImport {
+			if ok && s.usable && s.decl.Root == o.Root && e.due(&e.deletions, o.ObjectID) {
+				e.retireImport(ctx, o, s)
+			}
+			continue
+		}
 		kind, known := kindOf(o.Kind)
 		if !known || !ok || !s.usable || s.decl.Root != o.Root {
 			continue
@@ -198,6 +205,148 @@ func (e *Local) deleteDue(ctx context.Context) {
 		}
 		e.Logger.Info("source deleted once copied", "object_id", o.ObjectID, "kind", o.Kind, "source_id", o.SourceID, "store_id", o.StoreID)
 	}
+}
+
+// retireImport settles an imported directory once its copy is verified.
+// Imported without delete_source, only its pack goes and the directory is
+// kept. With it, the deletion is claimed, the directory checked against the
+// pack's file list (checkPackedDir) and to be on the filesystem of the store
+// the pack was made on, then removed through its parent's handle, then its
+// pack; a directory refused for safety is kept, with why, and its pack
+// removed all the same.
+func (e *Local) retireImport(ctx context.Context, o store.DeletionOrder, s servedStore) {
+	if _, isLocal := s.fs.(localStoreFS); !isLocal {
+		return
+	}
+	settle := func(state, reason string) error {
+		return e.Store.SettleDeletion(ctx, store.ObjectDeletion{ObjectID: o.ObjectID, ExecutorID: e.ID, State: state, Reason: reason})
+	}
+	var err error
+	state, reason := store.SourceDeleted, ""
+	if !o.DeleteSource {
+		state, reason = store.SourceKept, "imported without delete_source: left where it is"
+		if err = removePack(s.fs, s.decl.Root, o.ObjectID); err == nil {
+			err = settle(state, reason)
+		}
+	} else if err = settle(store.SourceDeleting, ""); err == nil {
+		err = checkPackedDir(ctx, s.decl.Root, o.Path, o.ObjectID)
+		if err == nil {
+			err = onSameFilesystem(o.Path, s.decl.Root)
+		}
+		if err == nil {
+			err = removeImportedDir(o.Path)
+		}
+		if err == nil {
+			err = removePack(s.fs, s.decl.Root, o.ObjectID)
+		}
+		switch {
+		case err == nil:
+			err = settle(state, "")
+		case errors.Is(err, errOutsideRoot), errors.Is(err, errScratchLink), errors.Is(err, errSourceChanged):
+			state, reason = store.SourceKept, "not deleted: "+err.Error()
+			if err = removePack(s.fs, s.decl.Root, o.ObjectID); err == nil {
+				err = settle(state, reason)
+			}
+		}
+	}
+	if err != nil {
+		e.roundProblem(&e.deletions, o.ObjectID, "imported directory not settled", err)
+		return
+	}
+	e.roundProblem(&e.deletions, o.ObjectID, "", nil)
+	if state == store.SourceKept {
+		e.Logger.Info("imported directory kept once copied", "object_id", o.ObjectID, "path", o.Path, "reason", reason)
+		return
+	}
+	e.Logger.Info("imported directory deleted once copied", "object_id", o.ObjectID, "path", o.Path)
+}
+
+// checkPackedDir is checkPacked for an imported directory dir: deleting it
+// loses nothing objectID's pack does not hold. A directory gone is no
+// matter.
+func checkPackedDir(ctx context.Context, root, dir, objectID string) error {
+	if !validScratchID(objectID) || !filepath.IsAbs(dir) {
+		return fmt.Errorf("%w: directory %q, object %q", errOutsideRoot, dir, objectID)
+	}
+	root, dir = filepath.Clean(root), filepath.Clean(dir)
+	sr, err := openDirPath(dir, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer sr.Close()
+	listed, err := readPackList(root, objectID+packSuffix+manifestSuffix)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("%w: its pack's file list is gone", errSourceChanged)
+	}
+	if err != nil {
+		return err
+	}
+	return checkAgainstList(ctx, sr, dir, "", listed)
+}
+
+// errOtherFilesystem: an imported directory not on the filesystem of the
+// store its pack was made on (another disk, a mount, a durable store's).
+var errOtherFilesystem = errors.New("not on the filesystem of the store it was packed on")
+
+// onSameFilesystem checks that dir is on the filesystem root is on: the
+// same drive (Windows; checkResolvesTo makes the drive in dir's path the
+// volume it is on) or device (elsewhere).
+func onSameFilesystem(dir, root string) error {
+	if err := checkResolvesTo(dir); err != nil {
+		return err
+	}
+	if runtime.GOOS == "windows" {
+		if !strings.EqualFold(filepath.VolumeName(dir), filepath.VolumeName(root)) {
+			return fmt.Errorf("%w: %s, %s", errSourceChanged, dir, errOtherFilesystem)
+		}
+		return nil
+	}
+	a, err := os.Stat(dir)
+	if err != nil {
+		return err
+	}
+	b, err := os.Stat(root)
+	if err != nil {
+		return err
+	}
+	if deviceOf(a) != deviceOf(b) {
+		return fmt.Errorf("%w: %s, %s", errSourceChanged, dir, errOtherFilesystem)
+	}
+	return nil
+}
+
+// removeImportedDir removes dir through its parent's handle, opened one
+// directory at a time from the volume's root (no link on the path): dir
+// itself must be a plain directory, and os.Root.RemoveAll removes a link
+// under it itself, never what it points at. A directory gone is no error.
+func removeImportedDir(dir string) error {
+	dir = filepath.Clean(dir)
+	parent, base := filepath.Dir(dir), filepath.Base(dir)
+	if parent == dir || base == "" || base == "." {
+		return fmt.Errorf("%w: %s", errOutsideRoot, dir)
+	}
+	pr, err := openDirPath(parent, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer pr.Close()
+	fi, err := pr.Lstat(base)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if isLink(fi) || !fi.IsDir() {
+		return fmt.Errorf("%w: %s", errScratchLink, dir)
+	}
+	return pr.RemoveAll(base)
 }
 
 // inUse reports whether an attempt this executor launched still runs in the
@@ -265,7 +414,13 @@ func checkPacked(ctx context.Context, root string, kind dirKind, id, objectID st
 	if err != nil {
 		return err
 	}
-	src := filepath.Join(root, kind.dir, id)
+	return checkAgainstList(ctx, sr, filepath.Join(root, kind.dir, id), kind.marker, listed)
+}
+
+// checkAgainstList walks the source src (opened as sr) and checks that each
+// regular file there is in listed as packed and nothing else is there but
+// directories (the marker, if any, aside).
+func checkAgainstList(ctx context.Context, sr *os.Root, src, marker string, listed map[string]packedFile) error {
 	mounts, err := mountsUnderFn(src)
 	if err != nil {
 		return err
@@ -288,7 +443,7 @@ func checkPacked(ctx context.Context, root string, kind dirKind, id, objectID st
 			}
 			rel := path.Join(dir, info.Name())
 			switch {
-			case dir == "." && info.Name() == kind.marker:
+			case marker != "" && dir == "." && info.Name() == marker:
 			case isLink(info):
 				return fmt.Errorf("%w: %s is a link (not packed)", errSourceChanged, rel)
 			case info.IsDir():

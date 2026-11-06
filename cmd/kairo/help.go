@@ -217,6 +217,14 @@ func init() {
 			},
 			aliases: map[string]string{"show": "status", "ls": "status", "list": "status", "get": "status"},
 		}},
+		{name: "data", summary: "what Kairo keeps: packed outputs, kept scratch and imported directories, and their durable copies", group: &commandGroup{
+			note: "An import packs directories of a node (outside every store) onto its volatile store and copies them to a durable store; with --delete-source each is deleted once its copy is verified.",
+			subs: []command{
+				{"import", "--project P --node N [--name NAME] [--delete-source] [--json] PATH...", "import directories of a node: packed, copied to a durable store, read back", dataImport},
+				{"list", "[--project P] [--kind K] [--limit N] [--json]", "data objects, newest first: source, pack, verified copies, what became of the source", dataList},
+			},
+			aliases: map[string]string{"ls": "list", "show": "list", "add": "import"},
+		}},
 		{name: "hardware", summary: "device settings of hosts: show, set, reset and bench them", group: &commandGroup{
 			note: "DEVICE is a GPU UUID or cpu (a bench also takes disk:FILESYSTEM and net:NODE); a host's controller (kairo controller) carries the settings out.",
 			subs: []command{
