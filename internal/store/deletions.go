@@ -119,6 +119,16 @@ func (s *Store) DeletionsToMake(ctx context.Context, executorID string) ([]Delet
 			if sourceOwnership(declared, o.Kind, x.nodeID, o.StoreID, o.Root, o.Path, o.SourceID) != "" {
 				continue
 			}
+			// read in place by an input someone still waits to read
+			if o.Kind != ObjectScratch && (o.Kind != ObjectImport || o.DeleteSource) {
+				pinned, err := pinnedSourceTx(ctx, tx, o.ObjectID)
+				if err != nil {
+					return nil, err
+				}
+				if pinned != "" {
+					continue
+				}
+			}
 			good, err := goodCopyTx(ctx, tx, declared, o.ObjectID)
 			if err != nil {
 				return nil, err

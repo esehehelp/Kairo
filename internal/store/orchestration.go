@@ -424,6 +424,9 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	if err != nil {
 		return plannedOrchestrationDecision{}, err
 	}
+	if err = pinInputNodeTx(ctx, tx, task.project, &spec); err != nil {
+		return plannedOrchestrationDecision{}, err
+	}
 	specBody, err := json.Marshal(spec)
 	if err != nil {
 		return plannedOrchestrationDecision{}, err
@@ -452,6 +455,7 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 		Capacity:             convertCapacity(template.Capacity),
 		Env:                  template.Env,
 		ScratchTmpdir:        template.ScratchTmpdir,
+		Inputs:               template.Inputs,
 		NotBefore:            string(template.NotBefore),
 		FinishBy:             string(template.FinishBy),
 	}

@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"kairo/internal/datainput"
 	"kairo/internal/envspec"
 	"kairo/internal/processidentity"
 	"kairo/internal/provider"
@@ -743,7 +744,35 @@ func (e *Local) launchEnv(launch *store.Launch) []string {
 		env = append(env, "CUDA_VISIBLE_DEVICES="+strings.Join(bindings, ","))
 	}
 	env = append(env, e.scratchEnv(launch)...)
-	return append(env, e.outputEnv(launch)...)
+	env = append(env, e.outputEnv(launch)...)
+	for _, in := range launch.Inputs {
+		if in.Path != "" {
+			env = append(env, datainput.EnvName(in.Name)+"="+in.Path)
+		}
+	}
+	return env
+}
+
+// checkInputs refuses a launch one of whose inputs cannot be had here (the
+// daemon says why) or is not a directory there now (store/inputs.go): the
+// attempt does not start, and its execution ends launch_aborted saying so.
+// A WSL executor's paths are the distro's: they are not looked at from here.
+func (e *Local) checkInputs(launch *store.Launch) error {
+	wsl := e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2"
+	for _, in := range launch.Inputs {
+		if in.Problem != "" {
+			return fmt.Errorf("input %s: %s", in.Name, in.Problem)
+		}
+		if wsl {
+			continue
+		}
+		r, err := openDirPath(in.Path, false)
+		if err != nil {
+			return fmt.Errorf("input %s (%s): %w", in.Name, in.Path, err)
+		}
+		r.Close()
+	}
+	return nil
 }
 
 // envKey is how the OS compares variable names: case-insensitively on Windows
@@ -849,6 +878,9 @@ func (e *Local) start(launch *store.Launch) error {
 	// Output written to a full filesystem goes nowhere: refuse the launch
 	// rather than start a process nobody can follow.
 	if err := e.checkLaunchLogSpace(); err != nil {
+		return err
+	}
+	if err := e.checkInputs(launch); err != nil {
 		return err
 	}
 	e.makeScratch(launch)

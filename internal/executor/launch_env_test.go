@@ -172,3 +172,33 @@ func TestWSLLaunchSharesDeclaredEnvThroughWSLENV(t *testing.T) {
 		t.Fatalf("RANK shared %d times: %q", count, wslenv)
 	}
 }
+
+// An input is handed as KAIRO_INPUT_<NAME> (the name in upper case); a
+// launch one of whose inputs cannot be had here, or is not a directory here
+// now, is refused saying which and why.
+func TestInputsAreHandedByPathOrRefuseTheLaunch(t *testing.T) {
+	dir := t.TempDir()
+	e := &Local{ID: "exec", NodeID: "node"}
+	launch := testLaunch()
+	launch.Inputs = []store.LaunchInput{{Name: "init", Path: dir}, {Name: "Shards_2", Path: dir}}
+	env := e.launchEnv(launch)
+	for _, name := range []string{"KAIRO_INPUT_INIT", "KAIRO_INPUT_SHARDS_2"} {
+		if v, ok := envValue(env, name); !ok || v != dir {
+			t.Fatalf("%s = %q, %v", name, v, ok)
+		}
+	}
+	if err := e.checkInputs(launch); err != nil {
+		t.Fatal(err)
+	}
+	launch.Inputs = append(launch.Inputs, store.LaunchInput{Name: "gone", Path: dir + "/gone"})
+	if err := e.checkInputs(launch); err == nil || !strings.Contains(err.Error(), "input gone") {
+		t.Fatalf("a missing input: %v", err)
+	}
+	launch.Inputs = []store.LaunchInput{{Name: "far", Problem: "it is on node pve0-neo-train, not on node"}}
+	if err := e.checkInputs(launch); err == nil || !strings.Contains(err.Error(), "input far: it is on node pve0-neo-train") {
+		t.Fatalf("an input elsewhere: %v", err)
+	}
+	if _, ok := envValue(e.launchEnv(launch), "KAIRO_INPUT_FAR"); ok {
+		t.Fatal("an input without a path is handed")
+	}
+}

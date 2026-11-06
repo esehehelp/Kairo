@@ -531,6 +531,30 @@ labels may take what is placed there.
   continuation keeps the `not_before` and `finish_by` of its task, not its
   `start_by` (it started already). `task show` prints the three under
   `times:`.
+- Inputs: `[[tasks.execution.inputs]]` (`[[inputs]]` in an execution
+  manifest) name what an execution reads, each handed to its attempts by
+  path as `KAIRO_INPUT_<NAME>` (the name in upper case: a letter, then
+  letters, digits and `_`, 64 at most, each once; at most 32), with exactly
+  one source: `task = "T"`, the output directory of the latest run of task T
+  of the same project (tasks only, and T must be in `depends_on`, so that run
+  has succeeded first); `data = "NAME"`, the newest data object of the
+  project with that name (an import's, say: Data stores); `object = "obj_..."`,
+  a data object of the project by id. For now an input is read in place: a
+  run's output directory still on its volatile store, or an imported
+  directory still where it was imported from (not deleted, or kept without
+  `--delete-source`). A task with inputs is planned onto the node they are
+  on (unless its `[tasks.execution.executor]` names a `node` itself, or they
+  are on more than one), and each is checked when its attempt launches: on
+  that node, in its executor's namespace (a store it serves; an imported
+  directory of a non-WSL executor for a non-WSL one), there as a directory.
+  One that is not (on another node, or deleted once copied) aborts the
+  launch, the execution ending `launch_aborted: input NAME: why`; bringing
+  an object from its durable copy comes next. While a task that is pending
+  or running, or an execution not yet ended, names it as an input, a source
+  is not deleted once copied (it is packed and copied as usual): a run's
+  output directory, by its task while it is that task's latest run, by its
+  object's name or id; an imported directory with `--delete-source`, by its
+  name or id. Inputs are in the execution's digest only when there are some.
 - Placement: among the nodes an execution fits on, the one left with the
   fewest free GPUs (CPU work stays off GPU nodes, GPU work packs onto as few
   as it can), then the most free CPU. A gang's ranks go on distinct nodes, all

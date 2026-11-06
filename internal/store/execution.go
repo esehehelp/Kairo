@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 
+	"kairo/internal/datainput"
 	"kairo/internal/envspec"
 	"kairo/internal/id"
 	"kairo/internal/instant"
@@ -32,6 +33,9 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 	}
 	if spec.Preemptible && !spec.Checkpointable {
 		return ExecutionSpec{}, nil, "", errors.New("preemptible execution must be checkpointable")
+	}
+	if err := datainput.Validate(spec.Inputs, true); err != nil {
+		return ExecutionSpec{}, nil, "", err
 	}
 	if len(spec.ExecutorSelector) == 0 {
 		spec.ExecutorSelector = json.RawMessage(`{}`)
@@ -106,7 +110,8 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		NotBefore            string            `json:",omitempty"`
 		StartBy              string            `json:",omitempty"`
 		FinishBy             string            `json:",omitempty"`
-	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy}
+		Inputs               []datainput.Input `json:",omitempty"`
+	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy, spec.Inputs}
 	normalized, err := json.Marshal(digestValue)
 	if err != nil {
 		return ExecutionSpec{}, nil, "", err
@@ -349,8 +354,17 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 			value := string(body)
 			env = &value
 		}
+		var inputs *string
+		if len(spec.Inputs) != 0 {
+			body, err := json.Marshal(spec.Inputs)
+			if err != nil {
+				return "", err
+			}
+			value := string(body)
+			inputs = &value
+		}
 		executionID, stamp := id.New("exe"), now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir,not_before,start_by,finish_by) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir, nullable(spec.NotBefore), nullable(spec.StartBy), nullable(spec.FinishBy)); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir,not_before,start_by,finish_by,inputs_json) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir, nullable(spec.NotBefore), nullable(spec.StartBy), nullable(spec.FinishBy), inputs); err != nil {
 			return "", err
 		}
 		if err = insertExecutionResourcesTx(ctx, tx, executionID, spec); err != nil {

@@ -10,3 +10,6 @@ ALTER TABLE data_objects ADD CONSTRAINT data_objects_kind_check CHECK(kind IN('o
 ALTER TABLE data_objects ADD COLUMN name TEXT;
 ALTER TABLE data_objects ADD COLUMN delete_source BOOLEAN NOT NULL DEFAULT FALSE;
 CREATE INDEX data_objects_name_idx ON data_objects(project_scope_id,name);
+-- An execution's inputs (inputs.go): JSON [{name, task|data|object}], NULL
+-- when it has none.
+ALTER TABLE execution_requests ADD COLUMN inputs_json TEXT;

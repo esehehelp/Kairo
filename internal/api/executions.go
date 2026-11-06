@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 
+	"kairo/internal/datainput"
 	"kairo/internal/store"
 )
 
@@ -31,6 +32,8 @@ type submitExecutionRequest struct {
 	NotBefore string `json:"not_before,omitempty"`
 	StartBy   string `json:"start_by,omitempty"`
 	FinishBy  string `json:"finish_by,omitempty"`
+	// Inputs: data the execution reads (datainput).
+	Inputs []datainput.Input `json:"inputs,omitempty"`
 }
 
 func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
@@ -55,6 +58,7 @@ func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		InputContinuationRef: body.InputContinuationRef, Exclusive: body.Exclusive, Capacity: body.Capacity,
 		Env: body.Env, ScratchTmpdir: body.ScratchTmpdir,
 		NotBefore: body.NotBefore, StartBy: body.StartBy, FinishBy: body.FinishBy,
+		Inputs: body.Inputs,
 	})
 	if err != nil {
 		writeError(w, err)

@@ -12,6 +12,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 
+	"kairo/internal/datainput"
 	"kairo/internal/envspec"
 	"kairo/internal/instant"
 )
@@ -43,6 +44,10 @@ type Manifest struct {
 	NotBefore instant.Instant `toml:"not_before" json:"not_before,omitempty"`
 	StartBy   instant.Instant `toml:"start_by" json:"start_by,omitempty"`
 	FinishBy  instant.Instant `toml:"finish_by" json:"finish_by,omitempty"`
+	// Inputs are [[inputs]] as in a task's execution (data or object only:
+	// a task input is for tasks of a project). Absent from the JSON when
+	// empty.
+	Inputs []datainput.Input `toml:"inputs" json:"inputs,omitempty"`
 }
 
 type ExecutorSelector struct {
@@ -125,6 +130,9 @@ func normalizeAndValidate(m *Manifest) error {
 		return errors.New("preemptible execution must be checkpointable")
 	}
 	if err := instant.CheckOrder(string(m.NotBefore), string(m.StartBy), string(m.FinishBy)); err != nil {
+		return err
+	}
+	if err := datainput.Validate(m.Inputs, false); err != nil {
 		return err
 	}
 	if m.Executor.Labels == nil {

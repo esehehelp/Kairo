@@ -1,6 +1,10 @@
 package store
 
-import "encoding/json"
+import (
+	"encoding/json"
+
+	"kairo/internal/datainput"
+)
 
 type ScopePath struct {
 	Project string `json:"project"`
@@ -91,6 +95,9 @@ type ExecutionSpec struct {
 	NotBefore string `json:"not_before,omitempty"`
 	StartBy   string `json:"start_by,omitempty"`
 	FinishBy  string `json:"finish_by,omitempty"`
+	// Inputs are what the execution reads, handed to its attempts by path
+	// (inputs.go). Left out of the digest when empty.
+	Inputs []datainput.Input `json:"inputs,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the

@@ -6,11 +6,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
 	"github.com/BurntSushi/toml"
 
+	"kairo/internal/datainput"
 	"kairo/internal/envspec"
 	"kairo/internal/instant"
 )
@@ -69,6 +71,11 @@ type Execution struct {
 	NotBefore instant.Instant `toml:"not_before" json:"not_before,omitempty"`
 	StartBy   instant.Instant `toml:"start_by" json:"start_by,omitempty"`
 	FinishBy  instant.Instant `toml:"finish_by" json:"finish_by,omitempty"`
+	// Inputs are [[tasks.execution.inputs]]: data the attempt reads, handed
+	// to it by path as KAIRO_INPUT_<NAME> (datainput, store/inputs.go). A
+	// task input names a task this one depends on. Absent from the JSON when
+	// empty.
+	Inputs []datainput.Input `toml:"inputs" json:"inputs,omitempty"`
 }
 
 // Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
@@ -204,6 +211,11 @@ func Normalize(manifest Manifest) (Validated, error) {
 			task.DependsOn[dependencyIndex] = dependency
 		}
 		sort.Strings(task.DependsOn)
+		for _, in := range task.Execution.Inputs {
+			if in.Task != "" && !slices.Contains(task.DependsOn, in.Task) {
+				return Validated{}, fmt.Errorf("task %q input %q names task %q, which it does not depend on (add it to depends_on)", task.Name, in.Name, in.Task)
+			}
+		}
 	}
 	for _, task := range manifest.Tasks {
 		for _, dependency := range task.DependsOn {
@@ -311,6 +323,9 @@ func normalizeExecution(value *Execution) error {
 		return errors.New("preemptible execution must be checkpointable")
 	}
 	if err := instant.CheckOrder(string(value.NotBefore), string(value.StartBy), string(value.FinishBy)); err != nil {
+		return err
+	}
+	if err := datainput.Validate(value.Inputs, true); err != nil {
 		return err
 	}
 	if value.Executor.Labels == nil {

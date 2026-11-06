@@ -55,6 +55,9 @@ type Launch struct {
 	// directory is <root>/outputs/<run id>. Empty from a daemon older than
 	// output directories.
 	RunID string `json:"run_id,omitempty"`
+	// Inputs are the execution's inputs as this attempt reads them
+	// (inputs.go): a path each, or why it cannot be had here.
+	Inputs []LaunchInput `json:"inputs,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -633,9 +636,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	defer tx.Rollback()
 	var executionID, projectID, leaseState, executionState, executorID string
 	var leaseEpoch int64
-	var envJSON sql.NullString
+	var envJSON, inputsJSON sql.NullString
 	var scratchTmpdir bool
-	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch,e.env_json,e.scratch_tmpdir FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch, &envJSON, &scratchTmpdir)
+	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch,e.env_json,e.scratch_tmpdir,e.inputs_json FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch, &envJSON, &scratchTmpdir, &inputsJSON)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -657,6 +660,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 			return nil, err
 		}
 		if launch.RunID, err = runIDTx(ctx, tx, executionID); err != nil {
+			return nil, err
+		}
+		if launch.Inputs, err = resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON); err != nil {
 			return nil, err
 		}
 		launch.Env, launch.ScratchTmpdir = env, scratchTmpdir
@@ -709,6 +715,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err != nil {
 		return nil, err
 	}
+	inputs, err := resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON)
+	if err != nil {
+		return nil, err
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -730,6 +740,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		Env:                  env,
 		ScratchTmpdir:        scratchTmpdir,
 		RunID:                runID,
+		Inputs:               inputs,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp

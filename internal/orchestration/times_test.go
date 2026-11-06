@@ -1,6 +1,7 @@
 package orchestration
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -77,6 +78,46 @@ func TestParseTimesValidation(t *testing.T) {
 		_, err := Parse([]byte(timesSpec(c.fields)))
 		if err == nil || !strings.Contains(err.Error(), c.want) {
 			t.Errorf("%q: got %v, want %q", c.fields, err, c.want)
+		}
+	}
+}
+
+// A task input names a task the declaring task depends on; inputs are named
+// once each, a letter then letters, digits and _, with exactly one source.
+func TestInputsOfATask(t *testing.T) {
+	base := `schema_version = 1
+[project]
+name = "p"
+[[tasks]]
+name = "train"
+queue = "q"
+depends_on = []
+policy = "RunToCompletion@v1"
+[tasks.execution]
+schema_version = 2
+argv = ["true"]
+cwd = "/work"
+[[tasks]]
+name = "decay"
+queue = "q"
+depends_on = %s
+policy = "RunToCompletion@v1"
+[tasks.execution]
+schema_version = 2
+argv = ["true"]
+cwd = "/work"
+%s`
+	for _, c := range []struct{ deps, inputs, wantErr string }{
+		{`["train"]`, "[[tasks.execution.inputs]]\nname = \"init\"\ntask = \"train\"\n", ""},
+		{`["train"]`, "[[tasks.execution.inputs]]\nname = \"data\"\ndata = \"sumire/p600m\"\n", ""},
+		{`[]`, "[[tasks.execution.inputs]]\nname = \"init\"\ntask = \"train\"\n", "does not depend on"},
+		{`["train"]`, "[[tasks.execution.inputs]]\nname = \"init\"\ntask = \"train\"\ndata = \"x\"\n", "exactly one of"},
+		{`["train"]`, "[[tasks.execution.inputs]]\nname = \"1st\"\ntask = \"train\"\n", "is not a letter"},
+		{`["train"]`, "[[tasks.execution.inputs]]\nname = \"a\"\ndata = \"x\"\n[[tasks.execution.inputs]]\nname = \"A\"\ndata = \"y\"\n", "named twice"},
+	} {
+		_, err := Parse([]byte(fmt.Sprintf(base, c.deps, c.inputs)))
+		if c.wantErr == "" && err != nil || c.wantErr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErr)) {
+			t.Fatalf("deps %s inputs %q: %v, want %q", c.deps, c.inputs, err, c.wantErr)
 		}
 	}
 }
