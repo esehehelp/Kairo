@@ -167,6 +167,31 @@ func (c *Client) RecordPack(ctx context.Context, made store.PackMade) error {
 	return c.call(ctx, "record-pack", map[string]any{"made": made}, nil)
 }
 
+// CopiesToMake asks for what this executor is to copy to a durable store
+// now.
+func (c *Client) CopiesToMake(ctx context.Context, executorID string) ([]store.CopyOrder, error) {
+	var out struct {
+		Copies []store.CopyOrder `json:"copies"`
+	}
+	err := c.call(ctx, "copies-to-make", map[string]string{"executor_id": executorID}, &out)
+	return out.Copies, err
+}
+
+// RecordCopy records a copy this executor wrote and read back.
+func (c *Client) RecordCopy(ctx context.Context, made store.CopyMade) error {
+	return c.call(ctx, "record-copy", map[string]any{"made": made}, nil)
+}
+
+// AuthorizePackRead asks whether token lets this node hand over an
+// object's pack, and where it is.
+func (c *Client) AuthorizePackRead(ctx context.Context, nodeID, objectID, token string) (store.PackRead, error) {
+	var out struct {
+		Read store.PackRead `json:"read"`
+	}
+	err := c.call(ctx, "pack-read", map[string]string{"node_id": nodeID, "object_id": objectID, "token": token}, &out)
+	return out.Read, err
+}
+
 // ScratchToSettle asks for this executor's scratch to delete or keep now.
 func (c *Client) ScratchToSettle(ctx context.Context, executorID string) ([]store.ScratchSettlement, error) {
 	var out struct {

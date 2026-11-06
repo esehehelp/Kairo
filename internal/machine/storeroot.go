@@ -83,6 +83,27 @@ func IsPackPath(p, root, objectID, suffix string) bool {
 		StoreRootKey(p) == StoreRootKey(strings.TrimRight(root, `/\`)+"/packs/"+objectID+".tar.zst"+suffix)
 }
 
+// IsObjectPath reports whether p is the copy of objectID made in month
+// (YYYYMM) on the durable store at root (<root>/objects/<month>/<object
+// id>.tar.zst, with suffix the file beside it), as StoreRootKey spells them.
+func IsObjectPath(p, root, month, objectID, suffix string) bool {
+	return ValidMonth(month) && ScratchIDValid(objectID) && StoreRootIsAbsolute(p) && StoreRootIsAbsolute(root) &&
+		StoreRootKey(p) == StoreRootKey(strings.TrimRight(root, `/\`)+"/objects/"+month+"/"+objectID+".tar.zst"+suffix)
+}
+
+// ValidMonth reports whether month is YYYYMM.
+func ValidMonth(month string) bool {
+	if len(month) != 6 {
+		return false
+	}
+	for _, r := range month {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return month[4:] >= "01" && month[4:] <= "12"
+}
+
 // checkStoreRoot checks that root is one spelling of one place: absolute,
 // without .. and without control characters. A POSIX root has no whitespace
 // or backslash (the mount table, which a deletion is checked against,

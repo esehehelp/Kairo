@@ -312,6 +312,21 @@ The rest (`log_directory`, `log_min_free_mib`, `observe_only`,
 agent refuses an `http://` URL unless `insecure_http = true`. A host's device
 controller (`kairo controller`, see Hardware settings) connects the same way.
 
+An agent whose node makes packs that another node's agent copies to a
+durable store (Data stores) serves them with `[packs]`, all four or none:
+
+```toml
+[packs]
+listen = ":7475"                 # where it listens
+addr = "192.168.1.14:7475"       # where other agents reach it (pack_addr)
+cert_file = "/etc/kairo/pack.pem" # kairo tls issue-server --host 192.168.1.14
+key_file = "/etc/kairo/pack-key.pem"
+```
+
+The certificate comes from the daemon's CA, which the fetching agent already
+trusts (`ca_file`). Every executor of the agent outside a WSL distro then
+advertises `pack_addr` among its attributes.
+
 ## API
 
 | Method | Path | Role |
@@ -711,7 +726,8 @@ effective policy of each device (its own value, else its host's; event
 
 Optional `[[stores]]` tables declare the places Kairo keeps data in (see Data
 stores): an `id`, a `class` (`durable`: kept for good, Kairo never deletes
-from it; `volatile`: scratch space), the `node`, a `root` directory (absolute:
+what it keeps there, only its own copies that did not complete; `volatile`:
+scratch space), the `node`, a `root` directory (absolute:
 `E:/kairo`, `/srv/kairo`; the root belongs to Kairo), the `filesystem` it is
 on (exactly the identity of a disk resource registered on the node, the one
 its admission accounting uses), `backend` (`local-fs`, the only one so far;
@@ -882,6 +898,32 @@ inside a WSL distro are not packed yet (the executor cannot read the distro's
 files through handles): such an object stays `packing`, warned once.
 `kairo store status` shows the packs made on each store as `PACKS`
 (`pack_bytes`, `packs`); until they are moved they are Kairo's bytes there.
+
+Copies to a durable store: each packed object is copied to the first durable
+store by id (one copy for now), taken by one executor serving that store
+(`copies-to-make` every minute, `record-copy`; table `object_copies`,
+`copying` then `verified`; events `copy_ordered`, `copy_verified`), to
+`<root>/objects/<YYYYMM>/<object id>.tar.zst` with its file list beside it
+(the month the object was made). When the pack is on a store that executor
+serves (the same node, its namespace), it is read there through handles;
+otherwise it is fetched from the agent of the pack's node, at the address its
+executor advertises (`pack_addr`, Agent configuration), over HTTPS trusting
+the daemon's CA, with a token the daemon issued for that copy (`GET
+/packs/<object id>.tar.zst` and `.files.tsv`, `Authorization: Bearer`). That
+agent asks the daemon about each request (`pack-read`): only the copy's
+latest token, unexpired (12 hours, a round's longest), from the node whose
+executor made the pack, gets it; anything else is 403 or 404 and learns
+nothing. A fetch cut short is resumed with a range request. Both files are
+written as `.partial` and synced, then read back from disk around the cache
+(Windows: `FILE_FLAG_NO_BUFFERING`; Linux: the file's cached pages dropped
+first), and only if the pack's size and sha256 and the list's sha256 match
+are they renamed (the list first) and the copy recorded `verified`, which the
+daemon checks again. A copy that does not match has its `.partial` files
+removed (Kairo's own incomplete writes, the only thing it ever deletes on a
+durable store) and is fetched again at the next round; one renamed but not
+recorded is read back as it is. A durable store inside a WSL distro gets no
+copies yet. Deleting what was packed, once its copy is verified, is the next
+P1b step.
 
 Once the attempt has quiesced, or was lost, its executor settles the scratch
 (`scratch-to-settle` every 10 seconds, with an `action` for each:

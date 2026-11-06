@@ -320,6 +320,20 @@ type Agent struct {
 	Bench                      Bench      `toml:"bench"`
 	Executors                  []Executor `toml:"executors"`
 	Providers                  []Provider `toml:"providers"`
+	Packs                      Packs      `toml:"packs"`
+}
+
+// Packs is this agent's pack server, from which other agents fetch the packs
+// made here to copy them to a durable store: Listen is where it listens
+// (":7475"), Addr the host:port other agents reach it at (advertised as each
+// executor's pack_addr), CertFile and KeyFile its TLS certificate for that
+// host (kairo tls issue-server, from the daemon's CA). Without Listen there is
+// none, and packs made here are copied only by an executor of this node.
+type Packs struct {
+	Listen   string `toml:"listen"`
+	Addr     string `toml:"addr"`
+	CertFile string `toml:"cert_file"`
+	KeyFile  string `toml:"key_file"`
 }
 
 func LoadAgent(path string) (Agent, error) {
@@ -357,6 +371,14 @@ func LoadAgent(path string) (Agent, error) {
 	}
 	if a.ObservationIntervalSeconds == 0 {
 		a.ObservationIntervalSeconds = 5
+	}
+	if p := a.Packs; p.Listen != "" || p.Addr != "" || p.CertFile != "" || p.KeyFile != "" {
+		if p.Listen == "" || p.Addr == "" || p.CertFile == "" || p.KeyFile == "" {
+			return a, errors.New("packs needs listen, addr, cert_file and key_file together")
+		}
+		if _, port, err := net.SplitHostPort(p.Addr); err != nil || port == "" {
+			return a, fmt.Errorf("packs.addr %q is not host:port", p.Addr)
+		}
 	}
 	if a.Node.OS == "" {
 		a.Node.OS = runtime.GOOS

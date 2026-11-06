@@ -201,3 +201,21 @@ func TestDatabaseFromTheFileTheEnvironmentAndAPasswordFile(t *testing.T) {
 		})
 	}
 }
+
+func TestAgentPacksAreAllOrNothing(t *testing.T) {
+	agentBase := "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0\"\nname = \"pve0\"\n[[executors]]\nid = \"pve0-linux\"\nkind = \"linux\"\n"
+	full := "[packs]\nlisten = \":7475\"\naddr = \"192.168.1.14:7475\"\ncert_file = \"pack.pem\"\nkey_file = \"pack-key.pem\"\n"
+	a, err := LoadAgent(writeConfig(t, agentBase+full))
+	if err != nil || a.Packs.Listen != ":7475" || a.Packs.Addr != "192.168.1.14:7475" {
+		t.Fatalf("packs: %+v %v", a.Packs, err)
+	}
+	if a, err = LoadAgent(writeConfig(t, agentBase)); err != nil || a.Packs != (Packs{}) {
+		t.Fatalf("no packs: %+v %v", a.Packs, err)
+	}
+	if _, err = LoadAgent(writeConfig(t, agentBase+"[packs]\nlisten = \":7475\"\n")); err == nil || !strings.Contains(err.Error(), "together") {
+		t.Fatalf("packs half set: %v", err)
+	}
+	if _, err = LoadAgent(writeConfig(t, agentBase+strings.Replace(full, "192.168.1.14:7475", "192.168.1.14", 1))); err == nil || !strings.Contains(err.Error(), "host:port") {
+		t.Fatalf("addr without a port: %v", err)
+	}
+}

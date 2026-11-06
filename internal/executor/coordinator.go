@@ -42,6 +42,9 @@ type Coordinator interface {
 	RecordRunOutput(ctx context.Context, out store.RunOutput) error
 	PacksToMake(ctx context.Context, executorID string) ([]store.PackOrder, error)
 	RecordPack(ctx context.Context, made store.PackMade) error
+	CopiesToMake(ctx context.Context, executorID string) ([]store.CopyOrder, error)
+	RecordCopy(ctx context.Context, made store.CopyMade) error
+	AuthorizePackRead(ctx context.Context, nodeID, objectID, token string) (store.PackRead, error)
 }
 
 var _ Coordinator = (*store.Store)(nil)

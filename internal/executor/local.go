@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -126,6 +127,14 @@ type Local struct {
 	packing      bool
 	packProblems map[string]string
 
+	// Copies to a durable store (transfer.go): the client packs are fetched
+	// from other agents with (their CA trusted), when copies were last asked
+	// for, whether a round runs, and the problems already warned of.
+	PackClient   *http.Client
+	copyAt       time.Time
+	copying      bool
+	copyProblems map[string]string
+
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
 	trees              map[string]*treeHandle
@@ -233,6 +242,7 @@ func (e *Local) tick(ctx context.Context) error {
 	e.reportStores()
 	e.settleScratch()
 	e.makePacks()
+	e.makeCopies()
 	e.endStep()
 	for {
 		reservation, err := e.reserveNext(ctx)

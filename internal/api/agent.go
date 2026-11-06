@@ -67,6 +67,16 @@ type agentRecordPackRequest struct {
 	Made store.PackMade `json:"made"`
 }
 
+type agentRecordCopyRequest struct {
+	Made store.CopyMade `json:"made"`
+}
+
+type agentPackReadRequest struct {
+	NodeID   string `json:"node_id"`
+	ObjectID string `json:"object_id"`
+	Token    string `json:"token"`
+}
+
 type agentUnlaunchedRequest struct {
 	ExecutorID       string  `json:"executor_id"`
 	OlderThanSeconds float64 `json:"older_than_seconds"`
@@ -284,6 +294,26 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentRecordPackRequest) (any, error) {
 				return okBody, s.Store.RecordPack(ctx, b.Made)
+			}),
+		// An observe-only daemon orders no copies.
+		newAgentOp(s, "copies-to-make", observeEmpty, map[string]any{"copies": []store.CopyOrder{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				copies, err := s.Store.CopiesToMake(ctx, b.ExecutorID)
+				return map[string]any{"copies": copies}, err
+			}),
+		newAgentOp(s, "record-copy", observeRefused, nil,
+			func(ctx context.Context, b agentRecordCopyRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.Made.ExecutorID)
+			},
+			func(ctx context.Context, b agentRecordCopyRequest) (any, error) {
+				return okBody, s.Store.RecordCopy(ctx, b.Made)
+			}),
+		// The agent of a pack's node asks before handing it over.
+		newAgentOp(s, "pack-read", observeRefused, nil,
+			func(_ context.Context, b agentPackReadRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentPackReadRequest) (any, error) {
+				read, err := s.Store.AuthorizePackRead(ctx, b.NodeID, b.ObjectID, b.Token)
+				return map[string]any{"read": read}, err
 			}),
 		newAgentOp(s, "unlaunched-leases", observeEmpty, map[string]any{"leases": []store.UnlaunchedLease{}},
 			func(ctx context.Context, b agentUnlaunchedRequest) (string, error) {

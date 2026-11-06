@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -80,7 +82,16 @@ func agentCommand(args []string) error {
 	}
 	executors := make([]store.Executor, 0, len(cfg.Executors))
 	for _, e := range cfg.Executors {
-		attrs, _ := json.Marshal(e.Labels)
+		labels := e.Labels
+		// Executors outside a WSL distro advertise this agent's pack server:
+		// other agents fetch from it the packs they make.
+		if cfg.Packs.Addr != "" && e.Kind != "wsl2" && e.Labels["environment"] != "wsl2" {
+			labels = map[string]string{"pack_addr": cfg.Packs.Addr}
+			for k, v := range e.Labels {
+				labels[k] = v
+			}
+		}
+		attrs, _ := json.Marshal(labels)
 		executors = append(executors, store.Executor{ID: e.ID, NodeID: cfg.Node.ID, Kind: e.Kind, Attributes: attrs, Enabled: e.Enabled == nil || *e.Enabled})
 	}
 	nodeAttrs, _ := json.Marshal(cfg.Bench.Attributes(cfg.Node.Labels))
@@ -107,18 +118,23 @@ func agentCommand(args []string) error {
 	}
 	logger.Info("agent registered", "node_id", cfg.Node.ID, "server", cfg.ServerURL, "executors", len(executors))
 
-	errCh := make(chan error, 1+len(cfg.Executors))
+	errCh := make(chan error, 2+len(cfg.Executors))
 	shipper := &agentclient.LogShipper{Client: client, Dir: cfg.LogDirectory}
 	go func() {
 		if err := shipper.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 			errCh <- err
 		}
 	}()
+	// Packs are fetched from other agents over HTTPS, trusting the daemon's CA.
+	packClient := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig.Clone(), ResponseHeaderTimeout: time.Minute}}
+	var running []*executor.Local
 	for _, configured := range cfg.Executors {
 		if configured.Enabled != nil && !*configured.Enabled {
 			continue
 		}
 		exec := executor.NewLocal(configured.ID, client, cfg.LogDirectory, logger)
+		exec.PackClient = packClient
+		running = append(running, exec)
 		exec.APIURL = cfg.AttemptAPIURL
 		exec.APICA = apiCA
 		exec.NodeID = cfg.Node.ID
@@ -134,6 +150,28 @@ func agentCommand(args []string) error {
 				errCh <- err
 			}
 		}()
+	}
+	if cfg.Packs.Listen != "" {
+		cert, err := tls.LoadX509KeyPair(cfg.Packs.CertFile, cfg.Packs.KeyFile)
+		if err != nil {
+			return fmt.Errorf("packs certificate: %w", err)
+		}
+		serverTLS := tlsutil.ServerConfig()
+		serverTLS.Certificates = []tls.Certificate{cert}
+		server := &http.Server{Addr: cfg.Packs.Listen, TLSConfig: serverTLS, ReadHeaderTimeout: 30 * time.Second,
+			Handler: &executor.PackServer{Store: client, NodeID: cfg.Node.ID, Executors: running, Logger: logger}}
+		go func() {
+			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("pack server: %w", err)
+			}
+		}()
+		go func() {
+			<-ctx.Done()
+			shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = server.Shutdown(shutdown)
+		}()
+		logger.Info("pack server listening", "listen", cfg.Packs.Listen, "addr", cfg.Packs.Addr)
 	}
 	select {
 	case <-ctx.Done():
