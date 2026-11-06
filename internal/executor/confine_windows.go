@@ -77,4 +77,3 @@ func labelLow(dir string) error {
 	}
 	return windows.SetNamedSecurityInfo(dir, windows.SE_FILE_OBJECT, windows.LABEL_SECURITY_INFORMATION, nil, nil, nil, sacl)
 }
-
