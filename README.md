@@ -1572,7 +1572,9 @@ as an unprivileged user (`ci`) so the tests of unreadable and undeletable
 files mean something; `<sha>-windows`, `<sha>-wsl` (`KAIRO_TEST_WSL=1`),
 `<sha>-sdk-python` and `<sha>-sdk-rust` on windows-local. pve1-work has Go,
 gcc (for `-race`) and a test PostgreSQL 17 at `127.0.0.1:55432` (role
-`kairo`, `fsync` off), windows-local the test container above. The checks
+`kairo`, a superuser as in the test container, since dropping a test database
+ends its other connections; listening on localhost only, `fsync` off),
+windows-local the test container above. The checks
 run at priority -500: they wait for everyone's work and preempt nothing. Each
 of pve1-work's reserves 3 GiB of its 4, so the planner runs them one at a
 time. `--wait` waits for all of them (`kairo task wait --match`) and exits 0
