@@ -1554,6 +1554,20 @@ uv run --project sdk/python pytest -q
 git diff --check
 ```
 
+### CI on GitHub
+
+Every push to `main` and every pull request runs the checks that need
+nothing of this installation on GitHub's hosted runners
+(`.github/workflows/ci.yml`, each a `ci/check.sh` check): `linux`,
+`linux-race` and `linux-root` on Ubuntu with PostgreSQL 17 as a service
+(role `kairo`, a superuser), `windows` on Windows with the image's
+PostgreSQL, and `sdk-python` and `sdk-rust` on Ubuntu. There is no
+self-hosted runner and no secret: a pull request from a fork runs there with
+a read-only token, never on the installation's machines. The checks that need
+the real environment (WSL, the LXC on pve1, the hardware) run on Kairo itself
+(below), before a deploy and before a large branch is merged. Deploying is
+not done from GitHub.
+
 ### CI on Kairo
 
 Kairo's CI runs on Kairo: `bash ci/kairo-ci.sh [REV] [--wait]` declares the
