@@ -354,9 +354,15 @@ durable store (Data stores) serves them with `[packs]`, all four or none:
 [packs]
 listen = ":7475"                 # where it listens
 addr = "192.168.1.14:7475"       # where other agents reach it (pack_addr)
-cert_file = "/etc/kairo/pack.pem" # kairo tls issue-server --host 192.168.1.14
+cert_file = "/etc/kairo/pack.pem" # server.pem of kairo tls issue --host 192.168.1.14
 key_file = "/etc/kairo/pack-key.pem"
 ```
+
+The certificate is one the daemon's CA issued for that address: `kairo tls
+issue --dir DIR --host 192.168.1.14` in a directory holding copies of the
+CA's `ca.pem` and `ca-key.pem` (not the daemon's own directory, whose
+`server.pem` it would replace) writes `server.pem` and `server-key.pem`
+there.
 
 The certificate comes from the daemon's CA, which the fetching agent already
 trusts (`ca_file`). Every executor of the agent outside a WSL distro then
