@@ -7,3 +7,7 @@ __pycache__/
 .venv/
 .claude/
 sdk/rust/target/
+
+# go build ./cmd/kairo in the tree
+/kairo
+/kairo.exe
