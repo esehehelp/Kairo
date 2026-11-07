@@ -326,12 +326,12 @@ type DataObject struct {
 	RegeneratedAs       *string `json:"regenerated_as,omitempty"`
 	RegenerationProblem *string `json:"regeneration_problem,omitempty"`
 	Files               *int64  `json:"files,omitempty"`
-	ContentBytes *int64  `json:"content_bytes,omitempty"`
-	PackBytes    *int64  `json:"pack_bytes,omitempty"`
-	Copies       int     `json:"copies"`
-	CopyPath     *string `json:"copy_path,omitempty"`
-	CreatedAt    string  `json:"created_at"`
-	PackedAt     *string `json:"packed_at,omitempty"`
+	ContentBytes        *int64  `json:"content_bytes,omitempty"`
+	PackBytes           *int64  `json:"pack_bytes,omitempty"`
+	Copies              int     `json:"copies"`
+	CopyPath            *string `json:"copy_path,omitempty"`
+	CreatedAt           string  `json:"created_at"`
+	PackedAt            *string `json:"packed_at,omitempty"`
 }
 
 // DataObjectFilter narrows kairo data list: a project, a kind, and at most

@@ -196,8 +196,8 @@ func TestFileListsCompareWithoutMtimes(t *testing.T) {
 	head := "path\tbytes\tsha256\tmtime_ns\n"
 	a := head + "a\t1\tx\t1\nb\t2\ty\t1\n"
 	for list, want := range map[string]string{
-		head + "b\t2\ty\t9\na\t1\tx\t9\n": "",
-		head + "a\t1\tx\t1\n":             "1 files missing, 0 added, 0 changed (b)",
+		head + "b\t2\ty\t9\na\t1\tx\t9\n":             "",
+		head + "a\t1\tx\t1\n":                         "1 files missing, 0 added, 0 changed (b)",
 		head + "a\t1\tz\t1\nb\t2\ty\t1\nc\t0\tw\t1\n": "0 files missing, 1 added, 1 changed (a)",
 	} {
 		if got := compareFileLists(a, list); got != want {
