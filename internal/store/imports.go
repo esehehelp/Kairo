@@ -202,11 +202,16 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 		return best
 	}
 	// directories being imported on the node now
-	var busy []struct{ objectID, dir string }
-	err = eachRow(ctx, tx, `SELECT d.id,d.source_path FROM data_objects d JOIN executors x ON x.id=d.executor_id
+	type importing struct {
+		objectID, dir, project, name, storeID, executorID, sourceState string
+		deleteSource                                                   bool
+	}
+	var busy []importing
+	err = eachRow(ctx, tx, `SELECT d.id,d.source_path,COALESCE(d.project_scope_id,''),COALESCE(d.name,''),d.store_id,d.executor_id,d.source_state,d.delete_source
+		FROM data_objects d JOIN executors x ON x.id=d.executor_id
 		WHERE d.kind='import' AND x.node_id=$1 AND (d.state='packing' OR d.source_state IN('present','deleting'))`, []any{req.Node}, func(rows *sql.Rows) error {
-		var b struct{ objectID, dir string }
-		if err := rows.Scan(&b.objectID, &b.dir); err != nil {
+		var b importing
+		if err := rows.Scan(&b.objectID, &b.dir, &b.project, &b.name, &b.storeID, &b.executorID, &b.sourceState, &b.deleteSource); err != nil {
 			return err
 		}
 		busy = append(busy, b)
@@ -233,10 +238,30 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 		if why := importOwnership(declared, req.Node, packStore.ID, packStore.Root, dir); why != "" {
 			return nil, fmt.Errorf("%w: %s", ErrImportRefused, why)
 		}
+		upgraded := false
 		for _, b := range busy {
-			if machine.RootsOverlap(dir, b.dir) {
-				return nil, fmt.Errorf("%w: %s overlaps %s, being imported as %s", ErrImportRefused, dir, b.dir, b.objectID)
+			if !machine.RootsOverlap(dir, b.dir) {
+				continue
 			}
+			// The same directory, imported by the project without
+			// delete_source and not settled yet: asked again with it, that
+			// import now deletes it once copied (nothing is packed again).
+			if req.DeleteSource && !b.deleteSource && b.sourceState == "present" && b.project == projectID &&
+				machine.StoreRootKey(dir) == machine.StoreRootKey(b.dir) {
+				if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET delete_source=TRUE,updated_at=$1 WHERE id=$2 AND source_state='present'`, t, b.objectID); err != nil {
+					return nil, err
+				}
+				if err = appendCoordinationEventTx(ctx, tx, "import_delete_source", &projectID, "object", b.objectID, nil, map[string]any{"path": b.dir}); err != nil {
+					return nil, err
+				}
+				out = append(out, ImportedObject{ObjectID: b.objectID, Name: b.name, Path: b.dir, StoreID: b.storeID, ExecutorID: b.executorID})
+				upgraded = true
+				break
+			}
+			return nil, fmt.Errorf("%w: %s overlaps %s, being imported as %s", ErrImportRefused, dir, b.dir, b.objectID)
+		}
+		if upgraded {
+			continue
 		}
 		base := path.Base(machine.StoreRootKey(dir))
 		name := base
@@ -258,7 +283,7 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 			"store_id": packStore.ID, "executor_id": packExecutor, "delete_source": req.DeleteSource}); err != nil {
 			return nil, err
 		}
-		busy = append(busy, struct{ objectID, dir string }{objectID, dir})
+		busy = append(busy, importing{objectID: objectID, dir: dir, project: projectID, name: name, storeID: packStore.ID, executorID: packExecutor, sourceState: "present", deleteSource: req.DeleteSource})
 		out = append(out, ImportedObject{ObjectID: objectID, Name: name, Path: dir, StoreID: packStore.ID, ExecutorID: packExecutor})
 	}
 	return out, tx.Commit()

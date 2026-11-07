@@ -205,8 +205,22 @@ func TestAnImportedDirectoryIsDeletedOnlyWhenAskedFor(t *testing.T) {
 		}
 	}
 	// once settled, the directory may be imported again
-	if _, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"D:/data/a"}}); err != nil {
+	again, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"D:/data/a"}})
+	if err != nil {
 		t.Fatal(err)
+	}
+	// imported again with delete_source while not settled: the same import
+	// now deletes it once copied
+	upgraded, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"D:/data/a"}, DeleteSource: true})
+	if err != nil || len(upgraded) != 1 || upgraded[0].ObjectID != again[0].ObjectID {
+		t.Fatalf("upgrade: %+v %v (was %+v)", upgraded, err, again)
+	}
+	var deleteSource bool
+	if err := store.db.QueryRowContext(ctx, `SELECT delete_source FROM data_objects WHERE id=$1`, again[0].ObjectID).Scan(&deleteSource); err != nil || !deleteSource {
+		t.Fatalf("delete_source %v %v", deleteSource, err)
+	}
+	if _, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"D:/data/a/sub"}, DeleteSource: true}); err == nil {
+		t.Fatal("a directory inside one being imported is imported")
 	}
 }
 

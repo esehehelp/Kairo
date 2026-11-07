@@ -1178,7 +1178,10 @@ under which a directory being deleted would no longer be outside every store
 is refused like one under a scratch being deleted. The directory is not
 Kairo's: it is only read. Without `--delete-source` it stays where it is:
 once copied only the pack goes, and the source is settled `kept` ("imported
-without delete_source"). With it, once its copy is verified, the executor
+without delete_source"); the same directory imported again by the project
+with `--delete-source` before that (its import still `present`) turns that
+import into one that deletes it, nothing packed again (event
+`import_delete_source`), while one settled since is packed again. With it, once its copy is verified, the executor
 claims the deletion and checks the directory as a source is checked (each
 regular file listed in the pack with its size and mtime, nothing else there
 but directories) and to be on the filesystem of the store it was packed on
