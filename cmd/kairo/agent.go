@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -126,12 +125,9 @@ func agentCommand(args []string) error {
 			errCh <- err
 		}
 	}()
-	// Packs are fetched from other agents over HTTPS, trusting the daemon's CA.
-	// A connection, its handshake and the answer's head each have a bound; a
-	// body that stops coming is given up by the executor (stallTimeout).
-	packClient := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig.Clone(),
-		DialContext:         (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		TLSHandshakeTimeout: 30 * time.Second, ResponseHeaderTimeout: time.Minute, IdleConnTimeout: 90 * time.Second}}
+	// Packs are fetched from other agents over HTTPS (HTTP/1.1), trusting the
+	// daemon's CA (executor.PackHTTPClient).
+	packClient := executor.PackHTTPClient(tlsConfig)
 	var running []*executor.Local
 	for _, configured := range cfg.Executors {
 		if configured.Enabled != nil && !*configured.Enabled {
@@ -161,12 +157,7 @@ func agentCommand(args []string) error {
 		if err != nil {
 			return fmt.Errorf("packs certificate: %w", err)
 		}
-		serverTLS := tlsutil.ServerConfig()
-		serverTLS.Certificates = []tls.Certificate{cert}
-		// No write timeout: a pack takes as long as it takes; an idle
-		// connection is closed.
-		server := &http.Server{Addr: cfg.Packs.Listen, TLSConfig: serverTLS, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute,
-			Handler: &executor.PackServer{Store: client, NodeID: cfg.Node.ID, Executors: running, Logger: logger}}
+		server := executor.PackHTTPServer(cfg.Packs.Listen, cert, &executor.PackServer{Store: client, NodeID: cfg.Node.ID, Executors: running, Logger: logger})
 		go func() {
 			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("pack server: %w", err)
