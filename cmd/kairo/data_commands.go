@@ -141,6 +141,9 @@ func formatDataObjects(objects []store.DataObject) string {
 		if o.Kind == store.ObjectImport && o.DeleteSource && source == "present" {
 			source = "present (delete once copied)"
 		}
+		if o.RegeneratedAs != nil {
+			source += " (made again as " + *o.RegeneratedAs + ")"
+		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", o.ID, o.Kind, dash(o.Lifecycle), dash(valueOr(o.Project)), dash(valueOr(o.Name)), o.Node, o.State, files,
 			optionalSize(o.ContentBytes), optionalSize(o.PackBytes), o.Copies, source, o.SourcePath)
 	}
@@ -148,6 +151,9 @@ func formatDataObjects(objects []store.DataObject) string {
 	for _, o := range objects {
 		if o.SourceReason != nil && *o.SourceReason != "" {
 			fmt.Fprintf(&b, "%s: %s\n", o.ID, *o.SourceReason)
+		}
+		if o.RegenerationProblem != nil {
+			fmt.Fprintf(&b, "%s: %s\n", o.ID, *o.RegenerationProblem)
 		}
 	}
 	return b.String()

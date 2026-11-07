@@ -17,5 +17,13 @@ ALTER TABLE data_objects ADD CONSTRAINT data_objects_source_state_check CHECK(so
 -- (an object brought there, temporal data) is deleted when the store runs
 -- short of room, least recently read first; the executor serving it claims
 -- each (evicting) and settles it.
+-- Made again (regenerate.go): the rerun of its task ordered to make an
+-- object again (regeneration_ordinal; the rerun's node_id, the node it is
+-- planned onto), the object that holds the same files since
+-- (regenerated_as), or how what was made differs (regeneration_problem).
+ALTER TABLE data_objects ADD COLUMN regeneration_ordinal BIGINT;
+ALTER TABLE data_objects ADD COLUMN regenerated_as TEXT;
+ALTER TABLE data_objects ADD COLUMN regeneration_problem TEXT;
+ALTER TABLE orchestration_task_reruns ADD COLUMN node_id TEXT;
 ALTER TABLE object_placements DROP CONSTRAINT object_placements_state_check;
 ALTER TABLE object_placements ADD CONSTRAINT object_placements_state_check CHECK(state IN('fetching','ready','evicting'));

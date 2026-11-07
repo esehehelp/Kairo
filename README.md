@@ -555,8 +555,10 @@ labels may take what is placed there.
   inputs): the first every input is on, else the one the first input is on,
   else the one its object was made on. It waits (`inputs_not_ready`, saying
   which and why) until every input is on that node, those missing being
-  brought there meanwhile once they are packed; one that cannot be had at
-  all (a task with no run, a name the project has no object of) says so.
+  brought there meanwhile once they are packed, or made again there when
+  they are temporal data (Data stores: temporal data); one that cannot be
+  had at all (a task with no run, a name the project has no object of,
+  temporal data made again differing from what it was) says so.
   Each is checked again when its attempt launches: on that node, in its
   executor's namespace (a store it serves; an imported directory of a
   non-WSL executor for a non-WSL one), there as a directory; one that is not
@@ -571,7 +573,8 @@ labels may take what is placed there.
   that what a run of it writes to its output directory can be made again by
   running the task again (a dataset built from sources kept elsewhere, say):
   that output is temporal data (Data stores: temporal data), not copied to a
-  durable store. Not for a gang. In the execution's digest only when set.
+  durable store, and the task may be rerun by Kairo to make it again where
+  it is read. Not for a gang. In the execution's digest only when set.
 - Store: `store = "ID"` in `[tasks.execution]` (or an execution manifest)
   names the volatile store (Machine declaration) its attempts' scratch, run
   output and cache directories go on, instead of the first their executor
@@ -1183,6 +1186,28 @@ is read in place by the executions that name it as an input; it is never
 brought to another node (a pack would be needed), nor deleted once copied
 (it is not copied), but it is evicted when its store runs short of room
 (Evicting, below). `kairo data list` shows each object's `LIFECYCLE`.
+
+Made again: an execution waiting on a node for an input that is temporal
+data not on that node (evicted, or made on another) has it made again there
+by the task that makes it, once that task has succeeded: the task is rerun
+(rerun request `regenerate:<object id>`, actor `kairo`; event
+`regeneration_ordered`), its execution planned onto that node, and the
+object keeps the rerun's ordinal (`regeneration_ordinal`); it is ordered
+once per object. A task pending or running is waited for; one failed,
+stopped, cancelled or blocked is the project's to rerun (the wait says so):
+nothing is retried. Each output a run of the task leaves is compared, once
+identified, with the objects of the task that are evicted or ordered made
+again: its file list against theirs (each file's path, size and sha256, not
+its mtime). One that holds the same files is the object made again
+(`regenerated_as`; it takes the object's name; event `regenerated`): every
+input naming the object, or its name, reads it in the object's place (and
+keeps it from eviction while it waits). The output of a run ordered to make
+an object again that differs leaves the object a problem
+(`regeneration_problem`; event `regeneration_differs`): its readers wait,
+saying how it differs, until a later run (rerun by hand) makes the same
+files, or they are changed to read the task's output instead (an input
+`task = "T"` reads the task's latest run whatever it holds). `kairo data list`
+shows an object made again (`made again as obj_...`) and the problem.
 
 Importing existing data: `kairo data import --project P --node N [--name
 NAME] [--delete-source | --regenerable-by TASK] PATH...` (`POST /api/data/imports`, `{"project",

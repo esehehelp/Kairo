@@ -199,7 +199,10 @@ func (s *Store) ReconcileProjectTasks(ctx context.Context) error {
 			return err
 		}
 	}
-	return s.orderInputFetches(ctx)
+	if err := s.orderInputFetches(ctx); err != nil {
+		return err
+	}
+	return s.orderRegenerations(ctx)
 }
 
 func (s *Store) planProjectTasks(ctx context.Context) error {
@@ -423,6 +426,18 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	spec, err := taskExecutionSpec(ScopePath{Project: task.project, Queue: task.queue, Task: task.name}, template, orchestrationClientRequestID(decisionKey), continuation)
 	if err != nil {
 		return plannedOrchestrationDecision{}, err
+	}
+	// a rerun ordered to make temporal data again goes on the node that lacks it
+	if reason == "rerun" {
+		node, err := rerunNodeTx(ctx, tx, task.taskScopeID, ordinal)
+		if err != nil {
+			return plannedOrchestrationDecision{}, err
+		}
+		if node != "" && spec.Gang == nil {
+			if err = pinNodeSpec(&spec, node); err != nil {
+				return plannedOrchestrationDecision{}, err
+			}
+		}
 	}
 	if err = pinInputNodeTx(ctx, tx, task.project, &spec); err != nil {
 		return plannedOrchestrationDecision{}, err

@@ -50,6 +50,9 @@ type LaunchInput struct {
 // executor (the one that packs it).
 type inputPlace struct {
 	node, executor, storeID, path string
+	// object: the data object read there ("" for a run's output not yet
+	// identified)
+	object string
 }
 
 // inputSource is what an input names now: its data object (objectID, ""
@@ -172,7 +175,7 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 					return src, err
 				}
 				if importOwnership(declared, info.nodeID, storeID, root, path) == "" {
-					src.places = append(src.places, inputPlace{node: info.nodeID, executor: executorID, path: path})
+					src.places = append(src.places, inputPlace{node: info.nodeID, executor: executorID, path: path, object: src.objectID})
 				}
 			}
 		default:
@@ -183,6 +186,7 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 		if p, ok, err := runOutputPlaceTx(ctx, q, declared, runID); err != nil {
 			return src, err
 		} else if ok {
+			p.object = src.objectID
 			src.places = append(src.places, p)
 		}
 	}
@@ -196,6 +200,7 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 			}
 			for _, d := range declared {
 				if d.ID == p.storeID && d.Class == machine.StoreVolatile && d.Root == root && d.Node == p.node {
+					p.object = src.objectID
 					src.places = append(src.places, p)
 				}
 			}
@@ -203,6 +208,22 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 		})
 		if err != nil {
 			return src, err
+		}
+		// made again (regenerate.go): read where what holds the same files is
+		// too, or only (the object it was made again as stands for it then)
+		var again sql.NullString
+		if err := q.QueryRowContext(ctx, `SELECT regenerated_as FROM data_objects WHERE id=$1`, src.objectID).Scan(&again); err != nil {
+			return src, err
+		}
+		if again.Valid {
+			next, err := inputSourceTx(ctx, q, declared, projectScopeID, datainput.Input{Name: in.Name, Object: again.String})
+			if err != nil {
+				return src, err
+			}
+			if len(src.places) == 0 {
+				return next, nil
+			}
+			src.places = append(src.places, next.places...)
 		}
 	}
 	if len(src.places) == 0 && src.objectID == "" {
@@ -263,7 +284,9 @@ func resolveInputsTx(ctx context.Context, q *sql.Tx, executionID, projectScopeID
 		for _, p := range src.places {
 			if p.node == me.nodeID && sameNamespace(ctx, q, declared, p, me, executorID) {
 				li.Path = p.path
-				read = append(read, src.objectID)
+				if p.object != "" {
+					read = append(read, p.object)
+				}
 				break
 			}
 		}
@@ -426,8 +449,17 @@ func inputsWaitTx(ctx context.Context, q queryer, declared []machine.Store, proj
 			return "input " + in.Name + ": " + src.problem, nil
 		case node == "" && len(src.places) == 0:
 			missing = append(missing, in.Name+" (on no node: name one in its executor selector)")
+		case node != "" && !src.on(node) && src.temporal && src.objectID != "":
+			why, hard, err := regenerationWaitTx(ctx, q, src.objectID, node)
+			if err != nil {
+				return "", err
+			}
+			if hard {
+				return "input " + in.Name + ": " + why, nil
+			}
+			missing = append(missing, in.Name+" ("+why+")")
 		case node != "" && !src.on(node) && src.temporal:
-			missing = append(missing, in.Name+" (temporal data, not on "+node+": made again there by its task)")
+			missing = append(missing, in.Name+" (temporal data, not identified yet)")
 		case node != "" && !src.on(node) && !src.packed:
 			missing = append(missing, in.Name+" (brought to "+node+" once packed)")
 		case node != "" && !src.on(node):
@@ -454,7 +486,20 @@ func pinnedSourceTx(ctx context.Context, q queryer, objectID string) (string, er
 		return "", nil
 	}
 	// each a key and value an input names it by, as the inputs' JSON has them
+	// (or names an object it was made again as, regenerate.go)
 	refs := []map[string]string{{"object": objectID}}
+	err := eachRow(ctx, q, `WITH RECURSIVE before(id) AS (SELECT id FROM data_objects WHERE regenerated_as=$1
+		UNION SELECT d.id FROM data_objects d JOIN before b ON d.regenerated_as=b.id) SELECT id FROM before`, []any{objectID}, func(rows *sql.Rows) error {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		refs = append(refs, map[string]string{"object": id})
+		return nil
+	})
+	if err != nil {
+		return "", err
+	}
 	if name.Valid && name.String != "" {
 		refs = append(refs, map[string]string{"data": name.String})
 	}

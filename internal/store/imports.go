@@ -321,7 +321,11 @@ type DataObject struct {
 	SourceReason *string `json:"source_reason,omitempty"`
 	DeleteSource bool    `json:"delete_source"`
 	Lifecycle    string  `json:"lifecycle"`
-	Files        *int64  `json:"files,omitempty"`
+	// RegeneratedAs: the object made again that stands for this one;
+	// RegenerationProblem: how what was made again differs (regenerate.go).
+	RegeneratedAs       *string `json:"regenerated_as,omitempty"`
+	RegenerationProblem *string `json:"regeneration_problem,omitempty"`
+	Files               *int64  `json:"files,omitempty"`
 	ContentBytes *int64  `json:"content_bytes,omitempty"`
 	PackBytes    *int64  `json:"pack_bytes,omitempty"`
 	Copies       int     `json:"copies"`
@@ -346,20 +350,21 @@ func (s *Store) DataObjects(ctx context.Context, filter DataObjectFilter) ([]Dat
 	}
 	out := []DataObject{}
 	err := eachRow(ctx, s.db, `SELECT d.id,d.kind,d.name,p.external_key,x.node_id,d.store_id,d.source_id,d.source_path,d.state,d.source_state,d.source_reason,d.delete_source,d.lifecycle,
-			d.files,d.content_bytes,d.pack_bytes,d.created_at,d.packed_at,
+			d.regenerated_as,d.regeneration_problem,d.files,d.content_bytes,d.pack_bytes,d.created_at,d.packed_at,
 			(SELECT COUNT(*) FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL),
 			(SELECT c.path FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL ORDER BY c.store_id LIMIT 1)
 		FROM data_objects d JOIN executors x ON x.id=d.executor_id LEFT JOIN coordination_scopes p ON p.id=d.project_scope_id
 		WHERE ($1='' OR p.external_key=$1) AND ($2='' OR d.kind=$2) ORDER BY d.created_at DESC,d.id DESC LIMIT $3`, []any{filter.Project, filter.Kind, limit}, func(rows *sql.Rows) error {
 		var o DataObject
-		var name, project, reason, packedAt, copyPath sql.NullString
+		var name, project, reason, packedAt, copyPath, again, problem sql.NullString
 		var files, content, pack sql.NullInt64
 		if err := rows.Scan(&o.ID, &o.Kind, &name, &project, &o.Node, &o.StoreID, &o.SourceID, &o.SourcePath, &o.State, &o.SourceState, &reason, &o.DeleteSource, &o.Lifecycle,
-			&files, &content, &pack, &o.CreatedAt, &packedAt, &o.Copies, &copyPath); err != nil {
+			&again, &problem, &files, &content, &pack, &o.CreatedAt, &packedAt, &o.Copies, &copyPath); err != nil {
 			return err
 		}
 		o.Name, o.Project, o.SourceReason, o.PackedAt, o.CopyPath = stringPtr(name), stringPtr(project), stringPtr(reason), stringPtr(packedAt), stringPtr(copyPath)
 		o.Files, o.ContentBytes, o.PackBytes = int64Ptr(files), int64Ptr(content), int64Ptr(pack)
+		o.RegeneratedAs, o.RegenerationProblem = stringPtr(again), stringPtr(problem)
 		out = append(out, o)
 		return nil
 	})

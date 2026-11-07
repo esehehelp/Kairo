@@ -22,8 +22,9 @@ import (
 // would be and kept here (manifest). The directory stays on its volatile
 // store, read in place by every execution that names it as an input (and
 // pinned while one waits to), until room runs short there and it is evicted
-// (unused ones first), and it is made again by rerunning the task when an
-// execution needs it, the new identity compared with the old.
+// (least recently used first, evictions.go), and it is made again by
+// rerunning the task when an execution needs it, the new identity compared
+// with the old (regenerate.go).
 
 // recordIdentityTx records the identity an executor made for a temporal
 // object (made.Identity): the file list at <root>/packs/<object id>.tar.zst
@@ -61,6 +62,11 @@ func recordIdentityTx(ctx context.Context, tx *sql.Tx, made PackMade, root, stat
 	if err := appendCoordinationEventTx(ctx, tx, "identified", project, "object", made.ObjectID, nil, map[string]any{"kind": kind, "source_id": sourceID,
 		"content_bytes": made.ContentBytes, "files": made.Files, "skipped": made.Skipped, "manifest_sha256": made.ManifestSHA256}); err != nil {
 		return err
+	}
+	if kind == ObjectOutput {
+		if err := linkRegenerationsTx(ctx, tx, made.ObjectID, sourceID, made.Manifest); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
