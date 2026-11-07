@@ -236,7 +236,7 @@ func (s *Store) FetchesToMake(ctx context.Context, executorID string) ([]FetchOr
 	}
 	var rows []row
 	err = eachRow(ctx, tx, `SELECT p.object_id,p.store_id,p.root,d.pack_bytes,COALESCE(d.content_bytes,0),d.pack_sha256,d.manifest_sha256,d.executor_id,d.store_id,d.root,d.source_state
-		FROM object_placements p JOIN data_objects d ON d.id=p.object_id WHERE p.executor_id=$1 AND p.state='fetching' AND d.state='packed' ORDER BY p.created_at,p.object_id`, []any{executorID}, func(r *sql.Rows) error {
+		FROM object_placements p JOIN data_objects d ON d.id=p.object_id WHERE p.executor_id=$1 AND p.state='fetching' AND d.state='packed' AND d.lifecycle='durable' ORDER BY p.created_at,p.object_id`, []any{executorID}, func(r *sql.Rows) error {
 		var x row
 		if err := r.Scan(&x.order.ObjectID, &x.order.StoreID, &x.order.Root, &x.order.PackBytes, &x.order.ContentBytes, &x.order.PackSHA256, &x.order.ManifestSHA256,
 			&x.packExecutor, &x.packStore, &x.packRoot, &x.sourceState); err != nil {

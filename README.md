@@ -567,6 +567,11 @@ labels may take what is placed there.
   output directory, by its task while it is that task's latest run, by its
   object's name or id; an imported directory with `--delete-source`, by its
   name or id. Inputs are in the execution's digest only when there are some.
+- Regenerable: `regenerable = true` in a task's `[tasks.execution]` says
+  that what a run of it writes to its output directory can be made again by
+  running the task again (a dataset built from sources kept elsewhere, say):
+  that output is temporal data (Data stores: temporal data), not copied to a
+  durable store. Not for a gang. In the execution's digest only when set.
 - Store: `store = "ID"` in `[tasks.execution]` (or an execution manifest)
   names the volatile store (Machine declaration) its attempts' scratch, run
   output and cache directories go on, instead of the first their executor
@@ -1161,9 +1166,25 @@ refused for safety (with why; it is not tried again), `kairo machine apply`
 refuses a declaration under which the directory would not be Kairo's. A
 deleted output directory or scratch is marked `deleted` and no longer counted.
 
+Temporal data: what can be made again need not take room on a durable
+store, which keeps what cannot. A data object is `durable` (the default:
+packed, copied to a durable store, as below) or `temporal` (column
+`lifecycle`): the output of a run of a task declared `regenerable`
+(Admission), or a directory imported with `--regenerable-by TASK` (a task
+of the project declared regenerable; not with `--delete-source`), whose
+task is kept as the one that makes it (`producer_task_scope_id`). A temporal
+object is not packed and not copied: its executor makes only its identity,
+the file list a pack of it would have (`identity` in `packs-to-make`; every
+file read, nothing written but `<root>/packs/<object id>.tar.zst.files.tsv`),
+recorded with the list itself, which the store keeps (`manifest`; event
+`identified`). The directory stays where it is, on its volatile store, and
+is read in place by the executions that name it as an input; it is never
+brought to another node (a pack would be needed), nor deleted once copied
+(it is not copied). `kairo data list` shows each object's `LIFECYCLE`.
+
 Importing existing data: `kairo data import --project P --node N [--name
-NAME] [--delete-source] PATH...` (`POST /api/data/imports`, `{"project",
-"node", "paths", "name", "delete_source"}`, answered `201 {"objects": [...]}`
+NAME] [--delete-source | --regenerable-by TASK] PATH...` (`POST /api/data/imports`, `{"project",
+"node", "paths", "name", "delete_source", "regenerable_by"}`, answered `201 {"objects": [...]}`
 with each object's id, name, path, store and executor) brings directories
 Kairo did not make under it, data written before the stores were declared or
 outside them. Each PATH becomes a data object of kind `import` of the

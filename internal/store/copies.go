@@ -160,7 +160,7 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 	if ok && me.serves(target, executorID) {
 		var due []struct{ id, created, projectID string }
 		err = eachRow(ctx, tx, `SELECT d.id,d.created_at,COALESCE(d.project_scope_id,'') FROM data_objects d
-			WHERE d.state='packed' AND NOT EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id) ORDER BY d.packed_at,d.id`, nil, func(rows *sql.Rows) error {
+			WHERE d.state='packed' AND d.lifecycle='durable' AND NOT EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id) ORDER BY d.packed_at,d.id`, nil, func(rows *sql.Rows) error {
 			var d struct{ id, created, projectID string }
 			if err := rows.Scan(&d.id, &d.created, &d.projectID); err != nil {
 				return err

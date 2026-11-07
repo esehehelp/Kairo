@@ -141,3 +141,32 @@ func TestRemoveImportedDirRefusesALink(t *testing.T) {
 		t.Fatalf("same filesystem: %v", err)
 	}
 }
+
+// A temporal object's identity is the file list a pack of it would have,
+// made without writing the pack.
+func TestAnIdentityIsThePacksFileListWithoutThePack(t *testing.T) {
+	ctx := context.Background()
+	base := t.TempDir()
+	root, data := filepath.Join(base, "volatile"), filepath.Join(base, "data")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	importedTree(t, data)
+	id, err := (localStoreFS{}).IdentifyDir(ctx, root, data, "obj_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id.packPath != "" || id.packBytes != 0 || exists(filepath.Join(root, packsDirName, "obj_t"+packSuffix)) {
+		t.Fatalf("an identity wrote a pack: %+v", id)
+	}
+	if !exists(id.manifestPath) || id.files != 2 || id.contentBytes != 4096+11 || !strings.HasPrefix(id.listBody, manifestHeader+"\n") {
+		t.Fatalf("identity %+v", id)
+	}
+	pack, err := (localStoreFS{}).PackDir(ctx, root, data, "obj_p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pack.manifestHash != id.manifestHash {
+		t.Fatalf("the identity's list differs from the pack's: %s, %s", id.manifestHash, pack.manifestHash)
+	}
+}

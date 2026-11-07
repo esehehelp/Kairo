@@ -86,6 +86,12 @@ type Execution struct {
 	// its executor serves; the execution is planned onto that store's node.
 	// Absent from the JSON when empty.
 	Store string `toml:"store" json:"store,omitempty"`
+	// Regenerable: what a run of this task writes to its output directory
+	// can be made again by running the task again (store/temporal.go): it is
+	// not copied to a durable store, only its identity (its file list) is
+	// kept; it is evicted when its store runs short of room and made again
+	// when an execution needs it. Absent from the JSON when false.
+	Regenerable bool `toml:"regenerable" json:"regenerable,omitempty"`
 }
 
 // Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
@@ -341,6 +347,9 @@ func normalizeExecution(value *Execution) error {
 	value.Store = strings.TrimSpace(value.Store)
 	if value.Store != "" && value.Gang != nil {
 		return errors.New("store is for a single execution, not a gang (its ranks are on distinct nodes)")
+	}
+	if value.Regenerable && value.Gang != nil {
+		return errors.New("regenerable is for a single execution, not a gang")
 	}
 	if value.Executor.Labels == nil {
 		value.Executor.Labels = map[string]string{}

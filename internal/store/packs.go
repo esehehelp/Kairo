@@ -22,6 +22,12 @@ import (
 // makes the path that directory. Moving the pack to a durable store, and
 // deleting what was packed, come next.
 
+// Lifecycles of data objects (temporal.go).
+const (
+	LifecycleDurable  = "durable"
+	LifecycleTemporal = "temporal"
+)
+
 // Kinds of data objects (PackOrder.Kind).
 const (
 	ObjectOutput  = "output"
@@ -40,6 +46,9 @@ type PackOrder struct {
 	Root     string `json:"root"`
 	Path     string `json:"path"`
 	Bytes    *int64 `json:"bytes,omitempty"`
+	// Identity: a temporal object (temporal.go): only its file list is
+	// made, beside where its pack would be; nothing is packed.
+	Identity bool `json:"identity,omitempty"`
 }
 
 // PackMade is a pack an executor made for an object: where (the pack and its
@@ -56,7 +65,15 @@ type PackMade struct {
 	Skipped        int64  `json:"skipped"`
 	PackSHA256     string `json:"pack_sha256"`
 	ManifestSHA256 string `json:"manifest_sha256"`
+	// Identity: only the file list was made (a temporal object): PackPath
+	// is empty, PackBytes and PackSHA256 zero; Manifest is the list itself,
+	// kept as the object's identity.
+	Identity bool   `json:"identity,omitempty"`
+	Manifest string `json:"manifest,omitempty"`
 }
+
+// maxManifestBytes bounds a temporal object's file list kept in the store.
+const maxManifestBytes = 256 << 20
 
 var rankRun = regexp.MustCompile(`^(.+)-rank[0-9]+$`)
 
@@ -159,9 +176,25 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 				continue
 			}
 		}
+		lifecycle, producer := LifecycleDurable, any(nil)
+		if d.kind == ObjectOutput {
+			base := d.sourceID
+			if m := rankRun.FindStringSubmatch(base); m != nil {
+				base = m[1]
+			}
+			var regenerable bool
+			var taskScope sql.NullString
+			if err = tx.QueryRowContext(ctx, `SELECT e.regenerable,o.task_scope_id FROM execution_requests e LEFT JOIN orchestration_task_executions o ON o.execution_id=e.id WHERE e.id=$1`, base).
+				Scan(&regenerable, &taskScope); err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return nil, err
+			}
+			if regenerable && taskScope.Valid {
+				lifecycle, producer = LifecycleTemporal, taskScope.String
+			}
+		}
 		objectID := id.New("obj")
-		if _, err = tx.ExecContext(ctx, `INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,created_at,updated_at)
-			VALUES($1,$2,$3,$4,$5,$6,$7,$8,'packing',$9,$10)`, objectID, d.kind, d.sourceID, d.storeID, executorID, d.root, d.path, d.projectID, t, t); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,lifecycle,producer_task_scope_id,created_at,updated_at)
+			VALUES($1,$2,$3,$4,$5,$6,$7,$8,'packing',$9,$10,$11,$12)`, objectID, d.kind, d.sourceID, d.storeID, executorID, d.root, d.path, d.projectID, lifecycle, producer, t, t); err != nil {
 			return nil, err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "pack_ordered", &d.projectID, "object", objectID, nil, map[string]any{"kind": d.kind, "source_id": d.sourceID, "store_id": d.storeID, "path": d.path}); err != nil {
@@ -173,14 +206,15 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 	out := []PackOrder{}
 	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,x.node_id,
 		CASE WHEN d.kind='output' THEN (SELECT o.bytes FROM run_outputs o WHERE o.run_id=d.source_id AND o.store_id=d.store_id)
-		ELSE (SELECT k.bytes FROM attempt_scratch k WHERE k.attempt_id=d.source_id) END
+		ELSE (SELECT k.bytes FROM attempt_scratch k WHERE k.attempt_id=d.source_id) END,d.lifecycle
 		FROM data_objects d JOIN executors x ON x.id=d.executor_id WHERE d.executor_id=$1 AND d.state='packing' ORDER BY d.created_at,d.id`, []any{executorID}, func(rows *sql.Rows) error {
 		var o PackOrder
-		var nodeID string
+		var nodeID, lifecycle string
 		var bytes sql.NullInt64
-		if err := rows.Scan(&o.ObjectID, &o.Kind, &o.SourceID, &o.StoreID, &o.Root, &o.Path, &nodeID, &bytes); err != nil {
+		if err := rows.Scan(&o.ObjectID, &o.Kind, &o.SourceID, &o.StoreID, &o.Root, &o.Path, &nodeID, &bytes, &lifecycle); err != nil {
 			return err
 		}
+		o.Identity = lifecycle == LifecycleTemporal
 		if sourceOwnership(declared, o.Kind, nodeID, o.StoreID, o.Root, o.Path, o.SourceID) != "" {
 			return nil
 		}
@@ -205,11 +239,11 @@ func (s *Store) RecordPack(ctx context.Context, made PackMade) error {
 		return err
 	}
 	defer tx.Rollback()
-	var executorID, root, state, kind, sourceID string
+	var executorID, root, state, kind, sourceID, lifecycle string
 	var projectID sql.NullString
-	var packSHA sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT executor_id,root,state,kind,source_id,project_scope_id,pack_sha256 FROM data_objects WHERE id=$1 FOR UPDATE`, made.ObjectID).
-		Scan(&executorID, &root, &state, &kind, &sourceID, &projectID, &packSHA)
+	var packSHA, listSHA sql.NullString
+	err = tx.QueryRowContext(ctx, `SELECT executor_id,root,state,kind,source_id,project_scope_id,pack_sha256,lifecycle,manifest_sha256 FROM data_objects WHERE id=$1 FOR UPDATE`, made.ObjectID).
+		Scan(&executorID, &root, &state, &kind, &sourceID, &projectID, &packSHA, &lifecycle, &listSHA)
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	}
@@ -218,6 +252,12 @@ func (s *Store) RecordPack(ctx context.Context, made PackMade) error {
 	}
 	if executorID != made.ExecutorID {
 		return fmt.Errorf("object %s is executor %s's to pack, not %s's", made.ObjectID, executorID, made.ExecutorID)
+	}
+	if made.Identity != (lifecycle == LifecycleTemporal) {
+		return fmt.Errorf("object %s is %s: an identity is recorded for a temporal object, a pack for a durable one", made.ObjectID, lifecycle)
+	}
+	if made.Identity {
+		return recordIdentityTx(ctx, tx, made, root, state, kind, sourceID, projectID, listSHA)
 	}
 	if state == "packed" {
 		if packSHA.String == made.PackSHA256 {

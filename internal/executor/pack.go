@@ -80,6 +80,8 @@ type packResult struct {
 	packBytes, contentBytes  int64
 	files, skipped           int64
 	packSHA256, manifestHash string
+	// listBody: the file list as written (an identity's, recorded with it)
+	listBody string
 }
 
 // kindOf is the directory kind of an object kind.
@@ -94,6 +96,17 @@ func kindOf(objectKind string) (dirKind, bool) {
 }
 
 func (localStoreFS) Pack(ctx context.Context, root string, kind dirKind, id, objectID string) (packResult, error) {
+	return packKind(ctx, root, kind, id, objectID, false)
+}
+
+// Identify makes the identity of a temporal object (store/temporal.go): the
+// file list Pack would write, from reading every file as Pack does, with no
+// pack beside it.
+func (localStoreFS) Identify(ctx context.Context, root string, kind dirKind, id, objectID string) (packResult, error) {
+	return packKind(ctx, root, kind, id, objectID, true)
+}
+
+func packKind(ctx context.Context, root string, kind dirKind, id, objectID string, identity bool) (packResult, error) {
 	var res packResult
 	if !validScratchID(id) || !validScratchID(objectID) {
 		return res, fmt.Errorf("%w: id %q, object %q", errOutsideRoot, id, objectID)
@@ -122,7 +135,7 @@ func (localStoreFS) Pack(ctx context.Context, root string, kind dirKind, id, obj
 	if err != nil {
 		return res, err
 	}
-	return packInto(ctx, r, root, sr, src, mounts, kind.marker, objectID)
+	return packInto(ctx, r, root, sr, src, mounts, kind.marker, objectID, identity)
 }
 
 // PackDir packs an imported directory dir (store.ImportData: outside every
@@ -131,6 +144,15 @@ func (localStoreFS) Pack(ctx context.Context, root string, kind dirKind, id, obj
 // volume's root through handles (no link on its path), and there is no
 // marker to leave out.
 func (localStoreFS) PackDir(ctx context.Context, root, dir, objectID string) (packResult, error) {
+	return packDir(ctx, root, dir, objectID, false)
+}
+
+// IdentifyDir is Identify for an imported directory.
+func (localStoreFS) IdentifyDir(ctx context.Context, root, dir, objectID string) (packResult, error) {
+	return packDir(ctx, root, dir, objectID, true)
+}
+
+func packDir(ctx context.Context, root, dir, objectID string, identity bool) (packResult, error) {
 	var res packResult
 	if !validScratchID(objectID) || !filepath.IsAbs(dir) {
 		return res, fmt.Errorf("%w: directory %q, object %q", errOutsideRoot, dir, objectID)
@@ -150,12 +172,13 @@ func (localStoreFS) PackDir(ctx context.Context, root, dir, objectID string) (pa
 	if err != nil {
 		return res, err
 	}
-	return packInto(ctx, r, root, sr, dir, mounts, "", objectID)
+	return packInto(ctx, r, root, sr, dir, mounts, "", objectID, identity)
 }
 
 // packInto packs src (opened as sr; marker, if any, left out) into the packs
-// directory of the store opened as r at root, and reads the pack back.
-func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src string, mounts []string, marker, objectID string) (packResult, error) {
+// directory of the store opened as r at root, and reads the pack back; with
+// identity, only the file list is written and read back.
+func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src string, mounts []string, marker, objectID string, identity bool) (packResult, error) {
 	var res packResult
 	err := r.Mkdir(packsDirName, 0o755)
 	if err != nil && !errors.Is(err, fs.ErrExist) {
@@ -169,13 +192,23 @@ func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src str
 	if err = checkParentNotMounted(root, dirKind{dir: packsDirName}); err != nil {
 		return res, err
 	}
-	res, err = writePack(ctx, sr, src, mounts, marker, pr, objectID+packSuffix)
+	res, err = writePack(ctx, sr, src, mounts, marker, pr, objectID+packSuffix, identity)
 	if err != nil {
 		return res, err
 	}
 	res.packPath = filepath.Join(root, packsDirName, objectID+packSuffix)
 	res.manifestPath = res.packPath + manifestSuffix
 	listSHA, _, err := hashUncached(pr, objectID+packSuffix+manifestSuffix, res.manifestPath)
+	if identity {
+		res.packPath = ""
+		if err == nil && listSHA != res.manifestHash {
+			err = fmt.Errorf("%w: list sha256 %s; written %s", errPackReadBack, listSHA, res.manifestHash)
+		}
+		if err != nil {
+			_ = pr.Remove(objectID + packSuffix + manifestSuffix)
+		}
+		return res, err
+	}
 	if err == nil {
 		var packSHA string
 		var packBytes int64
@@ -202,6 +235,14 @@ func (wslStoreFS) PackDir(context.Context, string, string, string) (packResult, 
 	return packResult{}, errPackNotHere
 }
 
+func (wslStoreFS) Identify(context.Context, string, dirKind, string, string) (packResult, error) {
+	return packResult{}, errPackNotHere
+}
+
+func (wslStoreFS) IdentifyDir(context.Context, string, string, string) (packResult, error) {
+	return packResult{}, errPackNotHere
+}
+
 // countWriter counts the bytes written through it.
 type countWriter struct{ n int64 }
 
@@ -212,7 +253,7 @@ func (c *countWriter) Write(p []byte) (int, error) {
 
 // writePack packs src (opened at srcPath) into packName and its file list in
 // packs, leaving out the marker at its top. See above for what goes in.
-func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []string, marker string, packs *os.Root, packName string) (packResult, error) {
+func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []string, marker string, packs *os.Root, packName string, identity bool) (packResult, error) {
 	var res packResult
 	listName := packName + manifestSuffix
 	for _, name := range []string{packName + partialSuffix, listName + partialSuffix} {
@@ -220,21 +261,26 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 			return res, err
 		}
 	}
-	f, err := packs.OpenFile(packName+partialSuffix, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-	if err != nil {
-		return res, err
-	}
-	written := false
-	defer func() {
-		if !written {
-			f.Close()
-			_ = packs.Remove(packName + partialSuffix)
-		}
-	}()
+	// An identity reads and lists every file as a pack does, writing no pack.
+	var f *os.File
+	var zw io.WriteCloser = nopWriteCloser{io.Discard}
 	packHash, counted := sha256.New(), &countWriter{}
-	zw, err := zstd.NewWriter(io.MultiWriter(f, packHash, counted), zstd.WithEncoderLevel(zstd.SpeedBetterCompression))
-	if err != nil {
-		return res, err
+	written := false
+	if !identity {
+		var err error
+		f, err = packs.OpenFile(packName+partialSuffix, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		if err != nil {
+			return res, err
+		}
+		defer func() {
+			if !written {
+				f.Close()
+				_ = packs.Remove(packName + partialSuffix)
+			}
+		}()
+		if zw, err = zstd.NewWriter(io.MultiWriter(f, packHash, counted), zstd.WithEncoderLevel(zstd.SpeedBetterCompression)); err != nil {
+			return res, err
+		}
 	}
 	tw := tar.NewWriter(zw)
 	mounted := map[string]bool{}
@@ -290,20 +336,22 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 			pending = append(pending, subdirs[i])
 		}
 	}
-	if err = tw.Close(); err != nil {
+	if err := tw.Close(); err != nil {
 		return res, err
 	}
-	if err = zw.Close(); err != nil {
+	if err := zw.Close(); err != nil {
 		return res, err
 	}
-	if err = f.Sync(); err != nil {
-		return res, err
-	}
-	if err = f.Close(); err != nil {
-		return res, err
+	if !identity {
+		if err := f.Sync(); err != nil {
+			return res, err
+		}
+		if err := f.Close(); err != nil {
+			return res, err
+		}
+		res.packBytes, res.packSHA256 = counted.n, hex.EncodeToString(packHash.Sum(nil))
 	}
 	written = true
-	res.packBytes, res.packSHA256 = counted.n, hex.EncodeToString(packHash.Sum(nil))
 	// sorted by path, not by the escaped line
 	sort.Slice(lines, func(i, j int) bool { return lines[i].path < lines[j].path })
 	var list strings.Builder
@@ -312,20 +360,30 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 		list.WriteString(l.line + "\n")
 	}
 	body := list.String()
+	res.listBody = body
 	listHash := sha256.Sum256([]byte(body))
 	res.manifestHash = hex.EncodeToString(listHash[:])
-	if err = writeNew(packs, listName+partialSuffix, []byte(body)); err != nil {
+	if err := writeNew(packs, listName+partialSuffix, []byte(body)); err != nil {
 		_ = packs.Remove(packName + partialSuffix)
 		return res, err
 	}
 	// The file list first: a pack that is there has its list beside it.
-	if err = packs.Rename(listName+partialSuffix, listName); err != nil {
+	if err := packs.Rename(listName+partialSuffix, listName); err != nil {
 		return res, err
 	}
-	if err = packs.Rename(packName+partialSuffix, packName); err != nil {
+	if identity {
+		if err := syncRenamed(packs, listName); err != nil {
+			return res, err
+		}
+		if fi, err := packs.Lstat(listName); err != nil || !fi.Mode().IsRegular() || fi.Size() != int64(len(body)) {
+			return res, fmt.Errorf("%w: %s not there as written (%v)", errPackReadBack, listName, err)
+		}
+		return res, nil
+	}
+	if err := packs.Rename(packName+partialSuffix, packName); err != nil {
 		return res, err
 	}
-	if err = syncRenamed(packs, listName, packName); err != nil {
+	if err := syncRenamed(packs, listName, packName); err != nil {
 		return res, err
 	}
 	for name, size := range map[string]int64{packName: res.packBytes, listName: int64(len(body))} {
@@ -452,12 +510,13 @@ func (e *Local) packDue(ctx context.Context) {
 			}
 		}
 		started := time.Now()
-		res, err := s.fs.Pack(ctx, s.decl.Root, kind, o.SourceID, o.ObjectID)
+		pack := s.fs.Pack
+		if o.Identity {
+			pack = s.fs.Identify
+		}
+		res, err := pack(ctx, s.decl.Root, kind, o.SourceID, o.ObjectID)
 		if err == nil {
-			made := store.PackMade{ObjectID: o.ObjectID, ExecutorID: e.ID, PackPath: res.packPath, ManifestPath: res.manifestPath,
-				PackBytes: res.packBytes, ContentBytes: res.contentBytes, Files: res.files, Skipped: res.skipped,
-				PackSHA256: res.packSHA256, ManifestSHA256: res.manifestHash}
-			err = e.Store.RecordPack(ctx, made)
+			err = e.Store.RecordPack(ctx, packMade(e.ID, o, res))
 		}
 		if err != nil {
 			e.packProblem(o.ObjectID, "not packed", err)
@@ -485,12 +544,14 @@ func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore
 	started := time.Now()
 	var res packResult
 	if err == nil {
-		res, err = s.fs.PackDir(ctx, s.decl.Root, o.Path, o.ObjectID)
+		pack := s.fs.PackDir
+		if o.Identity {
+			pack = s.fs.IdentifyDir
+		}
+		res, err = pack(ctx, s.decl.Root, o.Path, o.ObjectID)
 	}
 	if err == nil {
-		err = e.Store.RecordPack(ctx, store.PackMade{ObjectID: o.ObjectID, ExecutorID: e.ID, PackPath: res.packPath, ManifestPath: res.manifestPath,
-			PackBytes: res.packBytes, ContentBytes: res.contentBytes, Files: res.files, Skipped: res.skipped,
-			PackSHA256: res.packSHA256, ManifestSHA256: res.manifestHash})
+		err = e.Store.RecordPack(ctx, packMade(e.ID, o, res))
 	}
 	if err != nil {
 		e.packProblem(o.ObjectID, "imported directory not packed", err)
@@ -500,6 +561,23 @@ func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore
 	e.Logger.Info("packed", "object_id", o.ObjectID, "kind", o.Kind, "path", o.Path, "files", res.files,
 		"content_bytes", res.contentBytes, "pack_bytes", res.packBytes, "skipped", res.skipped, "seconds", time.Since(started).Seconds())
 }
+
+// packMade is what is recorded of a pack (or an identity, o.Identity) made
+// for an order.
+func packMade(executorID string, o store.PackOrder, res packResult) store.PackMade {
+	made := store.PackMade{ObjectID: o.ObjectID, ExecutorID: executorID, PackPath: res.packPath, ManifestPath: res.manifestPath,
+		PackBytes: res.packBytes, ContentBytes: res.contentBytes, Files: res.files, Skipped: res.skipped,
+		PackSHA256: res.packSHA256, ManifestSHA256: res.manifestHash}
+	if o.Identity {
+		made.Identity, made.Manifest = true, res.listBody
+	}
+	return made
+}
+
+// nopWriteCloser is a Writer with a Close that does nothing.
+type nopWriteCloser struct{ io.Writer }
+
+func (nopWriteCloser) Close() error { return nil }
 
 // packProblem is roundProblem for packing.
 func (e *Local) packProblem(objectID, message string, err error) {

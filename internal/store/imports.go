@@ -45,6 +45,10 @@ type ImportRequest struct {
 	Paths        []string `json:"paths"`
 	Name         string   `json:"name,omitempty"`
 	DeleteSource bool     `json:"delete_source,omitempty"`
+	// RegenerableBy: the directories are made by this task of the project
+	// (declared regenerable): they are temporal data (temporal.go), not
+	// copied to a durable store, made again by that task when needed.
+	RegenerableBy string `json:"regenerable_by,omitempty"`
 }
 
 // ImportedObject is an object an import made: the directory, its name, the
@@ -144,6 +148,17 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 	}
 	if err != nil {
 		return nil, err
+	}
+	lifecycle, producer := LifecycleDurable, any(nil)
+	if req.RegenerableBy != "" {
+		if req.DeleteSource {
+			return nil, fmt.Errorf("%w: temporal data stays where it is: --regenerable-by and --delete-source together", ErrImportRefused)
+		}
+		scope, err := regenerableTaskTx(ctx, tx, projectID, req.RegenerableBy)
+		if err != nil {
+			return nil, err
+		}
+		lifecycle, producer = LifecycleTemporal, scope
 	}
 	declared, err := declaredStores(ctx, tx)
 	if err != nil {
@@ -275,8 +290,8 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 			return nil, err
 		}
 		objectID := id.New("obj")
-		if _, err = tx.ExecContext(ctx, `INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,name,delete_source,created_at,updated_at)
-			VALUES($1,'import',$1,$2,$3,$4,$5,$6,'packing',$7,$8,$9,$10)`, objectID, packStore.ID, packExecutor, packStore.Root, dir, projectID, name, req.DeleteSource, t, t); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,name,delete_source,lifecycle,producer_task_scope_id,created_at,updated_at)
+			VALUES($1,'import',$1,$2,$3,$4,$5,$6,'packing',$7,$8,$9,$10,$11,$12)`, objectID, packStore.ID, packExecutor, packStore.Root, dir, projectID, name, req.DeleteSource, lifecycle, producer, t, t); err != nil {
 			return nil, err
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "import_ordered", &projectID, "object", objectID, nil, map[string]any{"node": req.Node, "path": dir, "name": name,
@@ -305,6 +320,7 @@ type DataObject struct {
 	SourceState  string  `json:"source_state"`
 	SourceReason *string `json:"source_reason,omitempty"`
 	DeleteSource bool    `json:"delete_source"`
+	Lifecycle    string  `json:"lifecycle"`
 	Files        *int64  `json:"files,omitempty"`
 	ContentBytes *int64  `json:"content_bytes,omitempty"`
 	PackBytes    *int64  `json:"pack_bytes,omitempty"`
@@ -329,7 +345,7 @@ func (s *Store) DataObjects(ctx context.Context, filter DataObjectFilter) ([]Dat
 		limit = 200
 	}
 	out := []DataObject{}
-	err := eachRow(ctx, s.db, `SELECT d.id,d.kind,d.name,p.external_key,x.node_id,d.store_id,d.source_id,d.source_path,d.state,d.source_state,d.source_reason,d.delete_source,
+	err := eachRow(ctx, s.db, `SELECT d.id,d.kind,d.name,p.external_key,x.node_id,d.store_id,d.source_id,d.source_path,d.state,d.source_state,d.source_reason,d.delete_source,d.lifecycle,
 			d.files,d.content_bytes,d.pack_bytes,d.created_at,d.packed_at,
 			(SELECT COUNT(*) FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL),
 			(SELECT c.path FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL ORDER BY c.store_id LIMIT 1)
@@ -338,7 +354,7 @@ func (s *Store) DataObjects(ctx context.Context, filter DataObjectFilter) ([]Dat
 		var o DataObject
 		var name, project, reason, packedAt, copyPath sql.NullString
 		var files, content, pack sql.NullInt64
-		if err := rows.Scan(&o.ID, &o.Kind, &name, &project, &o.Node, &o.StoreID, &o.SourceID, &o.SourcePath, &o.State, &o.SourceState, &reason, &o.DeleteSource,
+		if err := rows.Scan(&o.ID, &o.Kind, &name, &project, &o.Node, &o.StoreID, &o.SourceID, &o.SourcePath, &o.State, &o.SourceState, &reason, &o.DeleteSource, &o.Lifecycle,
 			&files, &content, &pack, &o.CreatedAt, &packedAt, &o.Copies, &copyPath); err != nil {
 			return err
 		}

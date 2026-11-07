@@ -22,6 +22,7 @@ func dataImport(args []string) error {
 	node := fs.String("node", "", "the node the directories are on (required)")
 	name := fs.String("name", "", "the object's name (with several directories, NAME/<directory>; default the directory's name)")
 	deleteSource := fs.Bool("delete-source", false, "delete each directory once its copy on a durable store is verified (only on the volatile store's filesystem)")
+	regenerableBy := fs.String("regenerable-by", "", "the directories are made by this task of the project (declared regenerable): temporal data, not copied to a durable store")
 	asJSON := fs.Bool("json", false, "print the daemon's response")
 	paths, err := parseFlags(fs, args)
 	if err != nil {
@@ -39,7 +40,7 @@ func dataImport(args []string) error {
 	if err != nil {
 		return err
 	}
-	payload, err := client.call(http.MethodPost, "/api/data/imports", store.ImportRequest{Project: *project, Node: *node, Paths: paths, Name: *name, DeleteSource: *deleteSource})
+	payload, err := client.call(http.MethodPost, "/api/data/imports", store.ImportRequest{Project: *project, Node: *node, Paths: paths, Name: *name, DeleteSource: *deleteSource, RegenerableBy: *regenerableBy})
 	if routeMissing(err) {
 		return fmt.Errorf("the daemon does not import data: %s", olderDaemonHint())
 	}
@@ -64,9 +65,12 @@ func dataImport(args []string) error {
 	}
 	w.Flush()
 	fmt.Print(b.String())
-	if *deleteSource {
+	switch {
+	case *regenerableBy != "":
+		fmt.Println("temporal data: only each directory's identity (its file list) is kept; it stays where it is, made again by task " + *regenerableBy + " when needed (kairo data list)")
+	case *deleteSource:
 		fmt.Println("each directory is deleted once its copy on a durable store is verified, if it still holds only what was packed (kairo data list)")
-	} else {
+	default:
 		fmt.Println("the directories stay where they are; only the packs go once copied (kairo data list)")
 	}
 	return nil
@@ -127,7 +131,7 @@ func formatDataObjects(objects []store.DataObject) string {
 	}
 	var b strings.Builder
 	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "OBJECT\tKIND\tPROJECT\tNAME\tNODE\tSTATE\tFILES\tCONTENT\tPACK\tCOPIES\tSOURCE\tPATH")
+	fmt.Fprintln(w, "OBJECT\tKIND\tLIFECYCLE\tPROJECT\tNAME\tNODE\tSTATE\tFILES\tCONTENT\tPACK\tCOPIES\tSOURCE\tPATH")
 	for _, o := range objects {
 		files := "-"
 		if o.Files != nil {
@@ -137,7 +141,7 @@ func formatDataObjects(objects []store.DataObject) string {
 		if o.Kind == store.ObjectImport && o.DeleteSource && source == "present" {
 			source = "present (delete once copied)"
 		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", o.ID, o.Kind, dash(valueOr(o.Project)), dash(valueOr(o.Name)), o.Node, o.State, files,
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%d\t%s\t%s\n", o.ID, o.Kind, dash(o.Lifecycle), dash(valueOr(o.Project)), dash(valueOr(o.Name)), o.Node, o.State, files,
 			optionalSize(o.ContentBytes), optionalSize(o.PackBytes), o.Copies, source, o.SourcePath)
 	}
 	w.Flush()

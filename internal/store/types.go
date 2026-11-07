@@ -105,6 +105,9 @@ type ExecutionSpec struct {
 	// directories go on (the execution is planned onto its node). Left out
 	// of the digest when empty.
 	Store string `json:"store,omitempty"`
+	// Regenerable: its run's output can be made again by rerunning its task
+	// (temporal.go). Left out of the digest when false.
+	Regenerable bool `json:"regenerable,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the

@@ -458,6 +458,7 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 		Inputs:               template.Inputs,
 		Confine:              template.Confine,
 		Store:                template.Store,
+		Regenerable:          template.Regenerable,
 		NotBefore:            string(template.NotBefore),
 		FinishBy:             string(template.FinishBy),
 	}

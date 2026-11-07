@@ -57,9 +57,11 @@ type inputPlace struct {
 // can be read (places), or, with none of either, why not (problem).
 type inputSource struct {
 	objectID string
-	packed   bool
-	places   []inputPlace
-	problem  string
+	// packed: a durable object with its pack made (it can be brought);
+	// temporal: an object that is not packed, made again instead (temporal.go)
+	packed, temporal bool
+	places           []inputPlace
+	problem          string
 }
 
 // on reports whether the input can be read on node.
@@ -122,29 +124,31 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 			return src, err
 		}
 		what += "'s latest run " + runID
-		var state string
-		err = q.QueryRowContext(ctx, `SELECT id,state FROM data_objects WHERE kind='output' AND source_id=$1 ORDER BY created_at DESC LIMIT 1`, runID).Scan(&src.objectID, &state)
+		var state, lifecycle string
+		err = q.QueryRowContext(ctx, `SELECT id,state,lifecycle FROM data_objects WHERE kind='output' AND source_id=$1 ORDER BY created_at DESC LIMIT 1`, runID).Scan(&src.objectID, &state, &lifecycle)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return src, err
 		}
-		src.packed = state == "packed"
+		src.temporal = lifecycle == LifecycleTemporal
+		src.packed = state == "packed" && !src.temporal
 	default:
-		query := `SELECT id,state FROM data_objects WHERE project_scope_id=$1 AND name=$2 ORDER BY created_at DESC,id DESC LIMIT 1`
+		query := `SELECT id,state,lifecycle FROM data_objects WHERE project_scope_id=$1 AND name=$2 ORDER BY created_at DESC,id DESC LIMIT 1`
 		arg := in.Data
 		what = "data " + in.Data
 		if in.Object != "" {
-			query = `SELECT id,state FROM data_objects WHERE project_scope_id=$1 AND id=$2`
+			query = `SELECT id,state,lifecycle FROM data_objects WHERE project_scope_id=$1 AND id=$2`
 			arg, what = in.Object, "object "+in.Object
 		}
-		var state string
-		err := q.QueryRowContext(ctx, query, projectScopeID, arg).Scan(&src.objectID, &state)
+		var state, lifecycle string
+		err := q.QueryRowContext(ctx, query, projectScopeID, arg).Scan(&src.objectID, &state, &lifecycle)
 		if errors.Is(err, sql.ErrNoRows) {
 			return inputSource{problem: "the project has no " + what}, nil
 		}
 		if err != nil {
 			return src, err
 		}
-		src.packed = state == "packed"
+		src.temporal = lifecycle == LifecycleTemporal
+		src.packed = state == "packed" && !src.temporal
 		var kind, sourceID, executorID, storeID, root, path, sourceState string
 		var deleteSource bool
 		if err = q.QueryRowContext(ctx, `SELECT kind,source_id,executor_id,store_id,root,source_path,source_state,delete_source FROM data_objects WHERE id=$1`, src.objectID).
@@ -409,6 +413,8 @@ func inputsWaitTx(ctx context.Context, q queryer, declared []machine.Store, proj
 			return "input " + in.Name + ": " + src.problem, nil
 		case node == "" && len(src.places) == 0:
 			missing = append(missing, in.Name+" (on no node: name one in its executor selector)")
+		case node != "" && !src.on(node) && src.temporal:
+			missing = append(missing, in.Name+" (temporal data, not on "+node+": made again there by its task)")
 		case node != "" && !src.on(node) && !src.packed:
 			missing = append(missing, in.Name+" (brought to "+node+" once packed)")
 		case node != "" && !src.on(node):
