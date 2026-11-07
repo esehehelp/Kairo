@@ -353,8 +353,8 @@ func (s *Store) RecordFetch(ctx context.Context, made FetchMade) error {
 	case made.Bytes < 0:
 		return fmt.Errorf("object %s: impossible size", made.ObjectID)
 	}
-	if state == "ready" {
-		return tx.Commit()
+	if state != "fetching" {
+		return tx.Commit() // ready, or being evicted
 	}
 	t := now()
 	if _, err = tx.ExecContext(ctx, `UPDATE object_placements SET state='ready',bytes=$1,token_hash=NULL,token_expires_at=NULL,ready_at=$2,updated_at=$3 WHERE object_id=$4 AND store_id=$5`,

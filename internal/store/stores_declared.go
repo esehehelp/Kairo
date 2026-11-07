@@ -166,9 +166,10 @@ func checkScratchBeingDeletedTx(ctx context.Context, tx *sql.Tx, stores []machin
 	if err != nil {
 		return err
 	}
-	// So are the sources of data objects being deleted (deletions.go).
+	// So are the sources of data objects being deleted (deletions.go) or
+	// evicted (evictions.go),
 	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.executor_id,d.root,d.source_path,x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id
-		WHERE d.source_state='deleting' ORDER BY d.id`, nil, func(rows *sql.Rows) error {
+		WHERE d.source_state IN('deleting','evicting') ORDER BY d.id`, nil, func(rows *sql.Rows) error {
 		var objectID, kind, sourceID, storeID, executorID, root, path, nodeID string
 		if err := rows.Scan(&objectID, &kind, &sourceID, &storeID, &executorID, &root, &path, &nodeID); err != nil {
 			return err
@@ -176,6 +177,24 @@ func checkScratchBeingDeletedTx(ctx context.Context, tx *sql.Tx, stores []machin
 		if why := sourceOwnership(next, kind, nodeID, storeID, root, path, sourceID); why != "" {
 			busy = append(busy, fmt.Sprintf("%s (object %s, executor %s: %s)", path, objectID, executorID, why))
 		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	// and objects brought to a store being evicted from it.
+	err = eachRow(ctx, tx, `SELECT p.object_id,p.store_id,p.executor_id,p.root,p.path,x.node_id FROM object_placements p JOIN executors x ON x.id=p.executor_id
+		WHERE p.state='evicting' ORDER BY p.object_id,p.store_id`, nil, func(rows *sql.Rows) error {
+		var objectID, storeID, executorID, root, path, nodeID string
+		if err := rows.Scan(&objectID, &storeID, &executorID, &root, &path, &nodeID); err != nil {
+			return err
+		}
+		for _, d := range next {
+			if d.ID == storeID && d.Class == machine.StoreVolatile && d.Node == nodeID && d.Root == root {
+				return nil
+			}
+		}
+		busy = append(busy, fmt.Sprintf("%s (object %s brought there, executor %s: store %s would no longer be volatile at %s on %s)", path, objectID, executorID, storeID, root, nodeID))
 		return nil
 	})
 	if err != nil {

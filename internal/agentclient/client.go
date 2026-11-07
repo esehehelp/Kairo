@@ -220,6 +220,20 @@ func (c *Client) SettleDeletion(ctx context.Context, settled store.ObjectDeletio
 	return c.call(ctx, "settle-deletion", map[string]any{"settled": settled}, nil)
 }
 
+// EvictionsToMake asks for what this executor is to evict now.
+func (c *Client) EvictionsToMake(ctx context.Context, executorID string) ([]store.EvictionOrder, error) {
+	var out struct {
+		Evictions []store.EvictionOrder `json:"evictions"`
+	}
+	err := c.call(ctx, "evictions-to-make", map[string]string{"executor_id": executorID}, &out)
+	return out.Evictions, err
+}
+
+// SettleEviction records what this executor did with an eviction.
+func (c *Client) SettleEviction(ctx context.Context, settled store.EvictionSettled) error {
+	return c.call(ctx, "settle-eviction", map[string]any{"settled": settled}, nil)
+}
+
 // ScrubsToMake asks for the copies this executor is to read back now.
 func (c *Client) ScrubsToMake(ctx context.Context, executorID string) ([]store.ScrubOrder, error) {
 	var out struct {

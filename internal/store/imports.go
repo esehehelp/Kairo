@@ -224,7 +224,7 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 	var busy []importing
 	err = eachRow(ctx, tx, `SELECT d.id,d.source_path,COALESCE(d.project_scope_id,''),COALESCE(d.name,''),d.store_id,d.executor_id,d.source_state,d.delete_source
 		FROM data_objects d JOIN executors x ON x.id=d.executor_id
-		WHERE d.kind='import' AND x.node_id=$1 AND (d.state='packing' OR d.source_state IN('present','deleting'))`, []any{req.Node}, func(rows *sql.Rows) error {
+		WHERE d.kind='import' AND x.node_id=$1 AND (d.state='packing' OR d.source_state IN('present','deleting','evicting'))`, []any{req.Node}, func(rows *sql.Rows) error {
 		var b importing
 		if err := rows.Scan(&b.objectID, &b.dir, &b.project, &b.name, &b.storeID, &b.executorID, &b.sourceState, &b.deleteSource); err != nil {
 			return err

@@ -316,7 +316,7 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 	if err != nil {
 		return nil, err
 	}
-	err = eachRow(ctx, tx, `SELECT store_id,COUNT(*),COALESCE(SUM(pack_bytes),0)::bigint FROM data_objects WHERE state='packed' AND source_state NOT IN('deleted','kept') GROUP BY store_id`, nil, func(rows *sql.Rows) error {
+	err = eachRow(ctx, tx, `SELECT store_id,COUNT(*),COALESCE(SUM(pack_bytes),0)::bigint FROM data_objects WHERE state='packed' AND lifecycle='durable' AND source_state NOT IN('deleted','kept') GROUP BY store_id`, nil, func(rows *sql.Rows) error {
 		var storeID string
 		var n int
 		var bytes int64

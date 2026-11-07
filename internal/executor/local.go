@@ -135,6 +135,7 @@ type Local struct {
 	copies     round
 	fetches    round
 	deletions  round
+	evictions  round
 	scrubs     round
 
 	// Force stop (forcestop.go): process tree handles of the attempts this
@@ -247,6 +248,7 @@ func (e *Local) tick(ctx context.Context) error {
 	e.makeCopies()
 	e.makeFetches()
 	e.makeDeletions()
+	e.makeEvictions()
 	e.makeScrubs()
 	e.endStep()
 	for {

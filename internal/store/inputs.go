@@ -124,13 +124,16 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 			return src, err
 		}
 		what += "'s latest run " + runID
-		var state, lifecycle string
-		err = q.QueryRowContext(ctx, `SELECT id,state,lifecycle FROM data_objects WHERE kind='output' AND source_id=$1 ORDER BY created_at DESC LIMIT 1`, runID).Scan(&src.objectID, &state, &lifecycle)
+		var state, lifecycle, sourceState string
+		err = q.QueryRowContext(ctx, `SELECT id,state,lifecycle,source_state FROM data_objects WHERE kind='output' AND source_id=$1 ORDER BY created_at DESC LIMIT 1`, runID).Scan(&src.objectID, &state, &lifecycle, &sourceState)
 		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return src, err
 		}
 		src.temporal = lifecycle == LifecycleTemporal
 		src.packed = state == "packed" && !src.temporal
+		if src.temporal && evictedOrEvicting(sourceState) {
+			runID = "" // its output directory is (being) evicted
+		}
 	default:
 		query := `SELECT id,state,lifecycle FROM data_objects WHERE project_scope_id=$1 AND name=$2 ORDER BY created_at DESC,id DESC LIMIT 1`
 		arg := in.Data
@@ -157,7 +160,9 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 		}
 		switch kind {
 		case ObjectOutput:
-			runID = sourceID
+			if !(src.temporal && evictedOrEvicting(sourceState)) {
+				runID = sourceID
+			}
 		case ObjectImport:
 			// in place while it is where it was imported from (not deleted,
 			// nor kept for having changed since it was packed)
@@ -206,6 +211,12 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 	return src, nil
 }
 
+// evictedOrEvicting reports whether a temporal object's directory is evicted
+// or being evicted (evictions.go): not to be read where it was.
+func evictedOrEvicting(sourceState string) bool {
+	return sourceState == "evicting" || sourceState == "evicted"
+}
+
 // runOutputPlaceTx is where a run's output directory is (rank 0's), while it
 // is on a volatile store as the declaration makes it.
 func runOutputPlaceTx(ctx context.Context, q queryer, declared []machine.Store, runID string) (inputPlace, bool, error) {
@@ -225,7 +236,7 @@ func runOutputPlaceTx(ctx context.Context, q queryer, declared []machine.Store, 
 // resolveInputsTx is the inputs of an execution as its attempt on executor
 // is handed them: each read where it is on the executor's node, in its
 // namespace, or the problem.
-func resolveInputsTx(ctx context.Context, q queryer, executionID, projectScopeID, executorID string, inputsJSON sql.NullString) ([]LaunchInput, error) {
+func resolveInputsTx(ctx context.Context, q *sql.Tx, executionID, projectScopeID, executorID string, inputsJSON sql.NullString) ([]LaunchInput, error) {
 	if !inputsJSON.Valid || inputsJSON.String == "" {
 		return nil, nil
 	}
@@ -242,6 +253,7 @@ func resolveInputsTx(ctx context.Context, q queryer, executionID, projectScopeID
 		return nil, err
 	}
 	out := make([]LaunchInput, 0, len(inputs))
+	var read []string
 	for _, in := range inputs {
 		li := LaunchInput{Name: in.Name}
 		src, err := inputSourceTx(ctx, q, declared, projectScopeID, in)
@@ -251,6 +263,7 @@ func resolveInputsTx(ctx context.Context, q queryer, executionID, projectScopeID
 		for _, p := range src.places {
 			if p.node == me.nodeID && sameNamespace(ctx, q, declared, p, me, executorID) {
 				li.Path = p.path
+				read = append(read, src.objectID)
 				break
 			}
 		}
@@ -266,7 +279,7 @@ func resolveInputsTx(ctx context.Context, q queryer, executionID, projectScopeID
 		}
 		out = append(out, li)
 	}
-	return out, nil
+	return out, noteInputsReadTx(ctx, q, read)
 }
 
 // sameNamespace reports whether executor (me) reaches the path of an input

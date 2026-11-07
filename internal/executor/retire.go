@@ -293,8 +293,12 @@ var errOtherFilesystem = errors.New("not on the filesystem of the store it was p
 
 // onSameFilesystem checks that dir is on the filesystem root is on: the
 // same drive (Windows; checkResolvesTo makes the drive in dir's path the
-// volume it is on) or device (elsewhere).
+// volume it is on) or device (elsewhere). A directory gone is no matter (a
+// removal cut short removed it).
 func onSameFilesystem(dir, root string) error {
+	if _, err := os.Lstat(dir); errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
 	if err := checkResolvesTo(dir); err != nil {
 		return err
 	}

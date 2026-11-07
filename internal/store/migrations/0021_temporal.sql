@@ -13,3 +13,9 @@ ALTER TABLE data_objects ADD COLUMN manifest TEXT;
 ALTER TABLE data_objects ADD COLUMN last_used_at TEXT;
 ALTER TABLE data_objects DROP CONSTRAINT data_objects_source_state_check;
 ALTER TABLE data_objects ADD CONSTRAINT data_objects_source_state_check CHECK(source_state IN('present','deleting','deleted','kept','evicting','evicted'));
+-- Evicting (evictions.go): what a volatile store holds that can be had again
+-- (an object brought there, temporal data) is deleted when the store runs
+-- short of room, least recently read first; the executor serving it claims
+-- each (evicting) and settles it.
+ALTER TABLE object_placements DROP CONSTRAINT object_placements_state_check;
+ALTER TABLE object_placements ADD CONSTRAINT object_placements_state_check CHECK(state IN('fetching','ready','evicting'));

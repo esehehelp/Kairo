@@ -905,7 +905,8 @@ scratch space), the `node`, a `root` directory (absolute:
 on (exactly the identity of a disk resource registered on the node, the one
 its admission accounting uses), `backend` (`local-fs`, the only one so far;
 omitted: `local-fs`), `reserve_free_bytes` (for a durable store the free space
-it keeps; shown only for a volatile one) and optionally `executor`, the one
+it keeps; for a volatile one the free space below which it evicts, see
+Evicting, a tenth of its total when unset) and optionally `executor`, the one
 executor of the node whose namespace the root is in (a WSL executor's Linux
 paths; without it the root is in the node's own namespace). Ids are unique,
 and no two stores of one node are at one place or one inside the other,
@@ -1180,7 +1181,8 @@ recorded with the list itself, which the store keeps (`manifest`; event
 `identified`). The directory stays where it is, on its volatile store, and
 is read in place by the executions that name it as an input; it is never
 brought to another node (a pack would be needed), nor deleted once copied
-(it is not copied). `kairo data list` shows each object's `LIFECYCLE`.
+(it is not copied), but it is evicted when its store runs short of room
+(Evicting, below). `kairo data list` shows each object's `LIFECYCLE`.
 
 Importing existing data: `kairo data import --project P --node N [--name
 NAME] [--delete-source | --regenerable-by TASK] PATH...` (`POST /api/data/imports`, `{"project",
@@ -1231,7 +1233,7 @@ refuses one that looks so; run it with `MSYS_NO_PATHCONV=1`.
 by default) shows each object: kind, project, name, node, `packing` or
 `packed`, files, content and pack bytes, verified copies (and the path of
 one), and what became of its source (`present`, `deleting`, `deleted`,
-`kept`, with why).
+`kept`, `evicting`, `evicted`, with why).
 
 Brought inputs: an input not on the node an execution waits on is brought
 there once it is a packed object (a fetch, ordered as the daemon reconciles
@@ -1258,8 +1260,39 @@ mtime set as packed, every listed file there; then it is renamed
 `<root>/inputs/<object id>`, the pack and list are removed and it is
 recorded ready. A fetch that fails is warned once and tried again later.
 What is brought stays, read in place by every later execution on that node
-that names it, and is counted as the store's `CACHE` bytes; nothing evicts
-it yet.
+that names it, and is counted as the store's `CACHE` bytes, until it is
+evicted.
+
+Evicting: a volatile store whose free space, as its executor last reported
+it, is below its floor (its declared `reserve_free_bytes`, else a tenth of
+its total) has things evicted until it would be back above it (agent
+operations `evictions-to-make` every minute, `settle-eviction`; events
+`eviction_ordered`, `evicted`, `eviction_kept`), each only what can be had
+again: what was brought there first (it can be brought again from its
+durable copy), then temporal data on it of that executor (it can be made
+again by its task), each least recently used first (the later of when it
+was made, or brought there, and when an attempt was last handed it as an
+input, `data_objects.last_used_at`), and never one a task pending or running,
+or an execution not yet ended, names as an input. Each is claimed first
+(placement `evicting`, or source `evicting`: not read in place nor handed to
+an attempt from then on, and a declaration under which it would no longer be
+Kairo's is refused), then deleted by the executor: a brought object's
+`<root>/inputs/<object id>` through the inputs directory's handle; a
+temporal run output directory by the store's rules, as a copied source is
+deleted, unless an attempt this executor launched still runs in it; a
+temporal imported directory through its parent's handle, on the store's
+filesystem; a temporal directory only while it holds just what its identity
+lists (each regular file listed, with the size and mtime it was identified
+with, nothing else but directories), then its identity's file list. It is
+settled `evicted` (a placement forgotten, so the object may be brought
+again; a temporal run output directory marked `deleted`), and the node is
+trimmed as after a deletion; one refused for safety (changed since it was
+identified, in use, not Kairo's) is settled kept, present again with why,
+and not ordered evicted again for an hour; one that failed otherwise stays
+claimed and is tried again. A temporal object evicted is gone until its task
+is run again (Temporal data). An imported temporal directory is evicted like
+Kairo's own: import with `--regenerable-by` only what its task really makes
+again.
 
 Reading durable copies back: a durable store keeps for good and may lose bits
 without saying so (exFAT has no journal), so an executor serving it reads

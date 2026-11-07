@@ -79,6 +79,10 @@ type agentSettleDeletionRequest struct {
 	Settled store.ObjectDeletion `json:"settled"`
 }
 
+type agentSettleEvictionRequest struct {
+	Settled store.EvictionSettled `json:"settled"`
+}
+
 type agentRecordScrubRequest struct {
 	Result store.ScrubResult `json:"result"`
 }
@@ -345,6 +349,19 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentSettleDeletionRequest) (any, error) {
 				return okBody, s.Store.SettleDeletion(ctx, b.Settled)
+			}),
+		// An observe-only daemon orders no eviction.
+		newAgentOp(s, "evictions-to-make", observeEmpty, map[string]any{"evictions": []store.EvictionOrder{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				evictions, err := s.Store.EvictionsToMake(ctx, b.ExecutorID)
+				return map[string]any{"evictions": evictions}, err
+			}),
+		newAgentOp(s, "settle-eviction", observeRefused, nil,
+			func(ctx context.Context, b agentSettleEvictionRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.Settled.ExecutorID)
+			},
+			func(ctx context.Context, b agentSettleEvictionRequest) (any, error) {
+				return okBody, s.Store.SettleEviction(ctx, b.Settled)
 			}),
 		newAgentOp(s, "scrubs-to-make", observeEmpty, map[string]any{"scrubs": []store.ScrubOrder{}}, byExecutor,
 			func(ctx context.Context, b agentExecutorRequest) (any, error) {

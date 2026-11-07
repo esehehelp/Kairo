@@ -49,6 +49,8 @@ type Coordinator interface {
 	AuthorizePackRead(ctx context.Context, nodeID, objectID, token string) (store.PackRead, error)
 	DeletionsToMake(ctx context.Context, executorID string) ([]store.DeletionOrder, error)
 	SettleDeletion(ctx context.Context, settled store.ObjectDeletion) error
+	EvictionsToMake(ctx context.Context, executorID string) ([]store.EvictionOrder, error)
+	SettleEviction(ctx context.Context, settled store.EvictionSettled) error
 	ScrubsToMake(ctx context.Context, executorID string) ([]store.ScrubOrder, error)
 	RecordScrub(ctx context.Context, result store.ScrubResult) error
 }
