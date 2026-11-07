@@ -28,7 +28,7 @@ func (e *Local) makeOutput(launch *store.Launch) {
 	if launch.RunID == "" {
 		return
 	}
-	s, ok := e.scratchStore()
+	s, ok := e.storeFor(launch)
 	if !ok {
 		return
 	}

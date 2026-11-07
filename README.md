@@ -567,6 +567,15 @@ labels may take what is placed there.
   output directory, by its task while it is that task's latest run, by its
   object's name or id; an imported directory with `--delete-source`, by its
   name or id. Inputs are in the execution's digest only when there are some.
+- Store: `store = "ID"` in `[tasks.execution]` (or an execution manifest)
+  names the volatile store (Machine declaration) its attempts' scratch, run
+  output and cache directories go on, instead of the first their executor
+  serves (Data stores): one with room for a large output, say. The
+  execution is planned onto that store's node (unless its executor selector
+  names a node itself); a launch on an executor that does not serve it,
+  usable, as a volatile store is refused (`launch_aborted: store ID is not a
+  usable volatile store executor E serves`). Not for a gang. In the
+  execution's digest only when set.
 - Confinement: `confine = true` in `[tasks.execution]` (or an execution
   manifest) makes its attempts write only where Kairo hands them: their
   scratch (`KAIRO_SCRATCH`), their run's output directory

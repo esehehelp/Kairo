@@ -328,11 +328,12 @@ func inputsNodeTx(ctx context.Context, q queryer, declared []machine.Store, proj
 	return "", nil
 }
 
-// pinInputNodeTx plans an execution with inputs onto the node they are on
+// pinInputNodeTx plans an execution onto the node of the store it names
+// (spec.Store), else, with inputs, onto the node they are on
 // (inputsNodeTx), unless its executor selector names a node itself. A gang
 // is not pinned: its ranks go on distinct nodes (rank 0 reads the inputs).
 func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *ExecutionSpec) error {
-	if len(spec.Inputs) == 0 || spec.Gang != nil {
+	if len(spec.Inputs) == 0 && spec.Store == "" || spec.Gang != nil {
 		return nil
 	}
 	var selector map[string]any
@@ -341,6 +342,27 @@ func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *Execut
 	}
 	if node, _ := selector["node"].(string); node != "" {
 		return nil
+	}
+	if spec.Store != "" {
+		declared, err := declaredStores(ctx, q)
+		if err != nil {
+			return err
+		}
+		for _, d := range declared {
+			if d.ID == spec.Store {
+				if d.Class != machine.StoreVolatile {
+					return nil // its launch is refused, saying why
+				}
+				selector["node"] = d.Node
+				body, err := json.Marshal(selector)
+				if err != nil {
+					return err
+				}
+				spec.ExecutorSelector = body
+				return nil
+			}
+		}
+		return nil // not declared: its launch is refused, saying why
 	}
 	var projectScopeID string
 	if err := q.QueryRowContext(ctx, `SELECT id FROM coordination_scopes WHERE kind='project' AND external_key=$1`, project).Scan(&projectScopeID); err != nil {

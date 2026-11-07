@@ -36,6 +36,34 @@ const (
 
 // scratchStore is the store an attempt's scratch is made on: the first
 // usable volatile store this executor serves (by id).
+// storeFor is the volatile store an attempt's scratch, output and cache
+// directories go on: the one its execution names, if this executor serves
+// it usable now, else the first (scratchStore).
+func (e *Local) storeFor(launch *store.Launch) (servedStore, bool) {
+	if launch.Store == "" {
+		return e.scratchStore()
+	}
+	for _, s := range e.servedStores() {
+		if s.decl.ID == launch.Store && s.usable && s.decl.Class == machine.StoreVolatile {
+			return s, true
+		}
+	}
+	return servedStore{}, false
+}
+
+// checkStore refuses a launch whose execution names a store this executor
+// does not serve, usable, as a volatile one (it would have none of its
+// directories where it asked for them).
+func (e *Local) checkStore(launch *store.Launch) error {
+	if launch.Store == "" {
+		return nil
+	}
+	if _, ok := e.storeFor(launch); !ok {
+		return fmt.Errorf("store %s is not a usable volatile store executor %s serves", launch.Store, e.ID)
+	}
+	return nil
+}
+
 func (e *Local) scratchStore() (servedStore, bool) {
 	for _, s := range e.servedStores() {
 		if s.usable && s.decl.Class == machine.StoreVolatile {
@@ -50,7 +78,7 @@ func (e *Local) scratchStore() (servedStore, bool) {
 // one (no volatile store, or making or recording it failed, which is
 // logged) the attempt starts all the same.
 func (e *Local) makeScratch(launch *store.Launch) {
-	s, ok := e.scratchStore()
+	s, ok := e.storeFor(launch)
 	if !ok {
 		return
 	}

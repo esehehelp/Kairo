@@ -62,6 +62,9 @@ type Launch struct {
 	// directory and its project's cache directory: the execution asked for
 	// it, or the data policy confines every launch now (DataPolicy).
 	Confine bool `json:"confine,omitempty"`
+	// Store: the volatile store this attempt's scratch, output and cache
+	// directories are to go on ("" for the executor's first).
+	Store string `json:"store,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -640,9 +643,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	defer tx.Rollback()
 	var executionID, projectID, leaseState, executionState, executorID string
 	var leaseEpoch int64
-	var envJSON, inputsJSON sql.NullString
+	var envJSON, inputsJSON, storeID sql.NullString
 	var scratchTmpdir, confine bool
-	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch,e.env_json,e.scratch_tmpdir,e.inputs_json,e.confine FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch, &envJSON, &scratchTmpdir, &inputsJSON, &confine)
+	err = tx.QueryRowContext(ctx, `SELECT l.execution_id,e.project_scope_id,l.state,e.state,l.executor_id,l.coordination_epoch,e.env_json,e.scratch_tmpdir,e.inputs_json,e.confine,e.store_id FROM leases l JOIN execution_requests e ON e.id=l.execution_id WHERE l.id=$1`, reservation.Lease.ID).Scan(&executionID, &projectID, &leaseState, &executionState, &executorID, &leaseEpoch, &envJSON, &scratchTmpdir, &inputsJSON, &confine, &storeID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -671,7 +674,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 				return nil, err
 			}
 		}
-		launch.Env, launch.ScratchTmpdir, launch.Confine = env, scratchTmpdir, confine || s.confinesAll(time.Now())
+		launch.Env, launch.ScratchTmpdir, launch.Confine, launch.Store = env, scratchTmpdir, confine || s.confinesAll(time.Now()), storeID.String
 		return launch, tx.Commit()
 	}
 	if leaseState != "prepared" || executionState != "waiting" {
@@ -751,6 +754,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		RunID:                runID,
 		Inputs:               inputs,
 		Confine:              confine || s.confinesAll(time.Now()),
+		Store:                storeID.String,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp

@@ -37,6 +37,10 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 	if err := datainput.Validate(spec.Inputs, true); err != nil {
 		return ExecutionSpec{}, nil, "", err
 	}
+	spec.Store = strings.TrimSpace(spec.Store)
+	if spec.Store != "" && spec.Gang != nil {
+		return ExecutionSpec{}, nil, "", errors.New("store is for a single execution, not a gang")
+	}
 	if len(spec.ExecutorSelector) == 0 {
 		spec.ExecutorSelector = json.RawMessage(`{}`)
 	}
@@ -112,7 +116,8 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		FinishBy             string            `json:",omitempty"`
 		Inputs               []datainput.Input `json:",omitempty"`
 		Confine              bool              `json:",omitempty"`
-	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy, spec.Inputs, spec.Confine}
+		Store                string            `json:",omitempty"`
+	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy, spec.Inputs, spec.Confine, spec.Store}
 	normalized, err := json.Marshal(digestValue)
 	if err != nil {
 		return ExecutionSpec{}, nil, "", err
@@ -365,7 +370,7 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 			inputs = &value
 		}
 		executionID, stamp := id.New("exe"), now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir,not_before,start_by,finish_by,inputs_json,confine) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir, nullable(spec.NotBefore), nullable(spec.StartBy), nullable(spec.FinishBy), inputs, spec.Confine); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir,not_before,start_by,finish_by,inputs_json,confine,store_id) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir, nullable(spec.NotBefore), nullable(spec.StartBy), nullable(spec.FinishBy), inputs, spec.Confine, nullable(spec.Store)); err != nil {
 			return "", err
 		}
 		if err = insertExecutionResourcesTx(ctx, tx, executionID, spec); err != nil {

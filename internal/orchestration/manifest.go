@@ -81,6 +81,11 @@ type Execution struct {
 	// the daemon's data policy can confine every execution from a time on.
 	// Absent from the JSON when false.
 	Confine bool `toml:"confine" json:"confine,omitempty"`
+	// Store names the volatile store (Machine declaration) its attempts'
+	// scratch, run output and cache directories go on, instead of the first
+	// its executor serves; the execution is planned onto that store's node.
+	// Absent from the JSON when empty.
+	Store string `toml:"store" json:"store,omitempty"`
 }
 
 // Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
@@ -332,6 +337,10 @@ func normalizeExecution(value *Execution) error {
 	}
 	if err := datainput.Validate(value.Inputs, true); err != nil {
 		return err
+	}
+	value.Store = strings.TrimSpace(value.Store)
+	if value.Store != "" && value.Gang != nil {
+		return errors.New("store is for a single execution, not a gang (its ranks are on distinct nodes)")
 	}
 	if value.Executor.Labels == nil {
 		value.Executor.Labels = map[string]string{}

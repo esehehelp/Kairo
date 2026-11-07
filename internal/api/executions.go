@@ -36,6 +36,8 @@ type submitExecutionRequest struct {
 	Inputs []datainput.Input `json:"inputs,omitempty"`
 	// Confine: its attempts write only where Kairo hands them.
 	Confine bool `json:"confine,omitempty"`
+	// Store: the volatile store its scratch, output and cache go on.
+	Store string `json:"store,omitempty"`
 }
 
 func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
@@ -60,7 +62,7 @@ func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		InputContinuationRef: body.InputContinuationRef, Exclusive: body.Exclusive, Capacity: body.Capacity,
 		Env: body.Env, ScratchTmpdir: body.ScratchTmpdir,
 		NotBefore: body.NotBefore, StartBy: body.StartBy, FinishBy: body.FinishBy,
-		Inputs: body.Inputs, Confine: body.Confine,
+		Inputs: body.Inputs, Confine: body.Confine, Store: body.Store,
 	})
 	if err != nil {
 		writeError(w, err)

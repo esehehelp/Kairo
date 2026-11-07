@@ -889,6 +889,9 @@ func (e *Local) start(launch *store.Launch) error {
 	if err := e.checkInputs(launch); err != nil {
 		return err
 	}
+	if err := e.checkStore(launch); err != nil {
+		return err
+	}
 	e.makeScratch(launch)
 	e.makeOutput(launch)
 	e.makeCache(launch)

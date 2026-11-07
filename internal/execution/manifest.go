@@ -53,6 +53,11 @@ type Manifest struct {
 	// the daemon's data policy can confine every execution from a time on.
 	// Absent from the JSON when false.
 	Confine bool `toml:"confine" json:"confine,omitempty"`
+	// Store names the volatile store (Machine declaration) its attempts'
+	// scratch, run output and cache directories go on, instead of the first
+	// its executor serves; the execution is planned onto that store's node.
+	// Absent from the JSON when empty.
+	Store string `toml:"store" json:"store,omitempty"`
 }
 
 type ExecutorSelector struct {

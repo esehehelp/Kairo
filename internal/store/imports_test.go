@@ -248,3 +248,45 @@ func TestAnImportIsPackedOnTheStoreOfItsFilesystem(t *testing.T) {
 		t.Fatalf("an F: directory may be deleted once copied, packed on F:: %v", err)
 	}
 }
+
+// An execution naming a volatile store is planned onto its node and its
+// launch names the store; one naming a store that is not volatile is not
+// pinned (its launch is refused by the executor).
+func TestAnExecutionNamesTheStoreItsDirectoriesGoOn(t *testing.T) {
+	store := importFixture(t)
+	ctx := context.Background()
+	spec := schedulerExecutionSpec("on-d")
+	spec.Scope.Project = "imp"
+	spec.ExecutorSelector = json.RawMessage(`{"labels":{"environment":"windows"}}`)
+	spec.Exclusive, spec.Checkpointable, spec.Preemptible = []ExclusiveRequest{}, false, false
+	spec.Store = "d-scratch"
+	execution, _, err := store.SubmitExecution(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var selector map[string]any
+	if err := json.Unmarshal(execution.ExecutorSelector, &selector); err != nil || selector["node"] != "node" {
+		t.Fatalf("selector %s %v", execution.ExecutorSelector, err)
+	}
+	reservation, err := store.ReserveNext(ctx, "win-exec")
+	if err != nil || reservation == nil {
+		t.Fatalf("reserve: %+v %v", reservation, err)
+	}
+	if err = store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := store.AuthorizeLaunch(ctx, reservation)
+	if err != nil || launch.Store != "d-scratch" {
+		t.Fatalf("launch store %q %v", launch.Store, err)
+	}
+	durable := spec
+	durable.ClientRequestID, durable.Scope.Task, durable.Store = "on-e", "other", "e-durable"
+	got, _, err := store.SubmitExecution(ctx, durable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector = nil
+	if err := json.Unmarshal(got.ExecutorSelector, &selector); err != nil || selector["node"] != nil {
+		t.Fatalf("pinned to a durable store's node: %s %v", got.ExecutorSelector, err)
+	}
+}

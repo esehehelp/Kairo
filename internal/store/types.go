@@ -101,6 +101,10 @@ type ExecutionSpec struct {
 	// Confine: its attempts may write only where Kairo hands them (the data
 	// policy may confine every execution). Left out of the digest when false.
 	Confine bool `json:"confine,omitempty"`
+	// Store: the volatile store its attempts' scratch, output and cache
+	// directories go on (the execution is planned onto its node). Left out
+	// of the digest when empty.
+	Store string `json:"store,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the
