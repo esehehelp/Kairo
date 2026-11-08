@@ -281,6 +281,35 @@ func TestPlannerPreemptsBelowTheTopPriority(t *testing.T) {
 	}
 }
 
+// A waiting execution that suspending what it may would not make room for
+// (the GPU's lease would go, but RAM others hold would still be short)
+// suspends nothing and says it waits for that RAM, not for the GPU.
+func TestPlannerSaysWhatSuspendingWouldLeaveShort(t *testing.T) {
+	c := newPlanCluster(t)
+	c.node("a", 1, 16000, 64, 500)
+	c.submit(planSpec("serve", "p1", -100, 1, 1000, 4))
+	c.start("exec-a")
+	collect := planSpec("collect", "p3", 0, 0, 1000, 40)
+	collect.Preemptible = false
+	c.submit(collect)
+	c.start("exec-a")
+	bench := planSpec("bench", "p2", -50, 1, 1000, 28)
+	bench.Checkpointable, bench.Preemptible = false, false
+	waiter := c.submit(bench)
+	commands, err := c.store.EnsurePriorityPreemption(c.ctx, "exec-a")
+	if err != nil || len(commands) != 0 {
+		t.Fatalf("commands=%v err=%v", commands, err)
+	}
+	if r := c.reserve("exec-a"); r != nil {
+		t.Fatalf("reserved %s", r.Execution.ClientRequestID)
+	}
+	w := c.wait(waiter.ID)
+	if w.Reason != "insufficient_ram" ||
+		!strings.HasPrefix(w.Message, "a: 28.0 GiB ram needed, 24.0 GiB free even were p1/serve (priority -100) suspended, so none is suspended for it; and a: 1 GPU(s) needed, 0 usable; leased by p1/serve") {
+		t.Fatalf("waits for %+v", w)
+	}
+}
+
 // A node with a filesystem under the watermark admits nothing, and says so.
 func TestPlannerStopsAdmissionUnderTheDiskWatermark(t *testing.T) {
 	c := newPlanCluster(t)

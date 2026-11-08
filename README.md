@@ -632,7 +632,13 @@ labels may take what is placed there.
   `preemptible` and whose GPUs or RAM are what stops it, the fewest needed
   (already suspending ones first, then the lowest priority, single executions
   before gangs, the most recently started). Too little CPU or disk is waited
-  for, never a reason to suspend anything.
+  for, never a reason to suspend anything. One that suspending all of them
+  would still not make room for (their GPU would come free, but not the RAM
+  others hold) suspends none, and waits with what would still be short
+  rather than with what they hold (`insufficient_ram: pve0: 28.0 GiB ram
+  needed, 24.0 GiB free even were glm/maya-r3 (priority -100) suspended, so
+  none is suspended for it; and pve0: 1 GPU(s) needed, 0 usable; leased by
+  glm/maya-r3 (priority -100)`).
 - Accounting: CPU is the node's total minus the reservations on it. RAM is
   the lesser of total minus reservations and observed free memory minus the
   part of each reservation its attempt does not use yet (what an attempt

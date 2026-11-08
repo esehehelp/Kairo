@@ -1069,7 +1069,13 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 	// Nothing is suspended for room that only an execution waiting for its
 	// not_before holds: it is free until then, and suspending work now would
 	// leave it idle (the execution waits, holding as below, instead).
-	if p.preempt && !p.onlyNotBeforeInTheWay(c, ranks, options) {
+	// Nor for room it would not make: what would still be short is then the
+	// reason it waits.
+	var stuck planWait
+	if !p.onlyNotBeforeInTheWay(c, ranks, options) {
+		stuck = p.stillShort(c, ranks, target, ov)
+	}
+	if p.preempt && stuck.reason == "" && !p.onlyNotBeforeInTheWay(c, ranks, options) {
 		if victims, slots, ok := p.makeRoom(c, ranks, target, ov); ok {
 			for _, v := range victims {
 				p.victims[v.id] = true
@@ -1098,6 +1104,15 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 		if wait.reason == "" && !f.ok {
 			wait = planWait{reason: f.reason, node: f.node, message: rankPrefix(c, ranks[i]) + f.message}
 		}
+	}
+	// What it may suspend would not make room: the reason is what would
+	// still be short (RAM, say, where a GPU it could have is leased).
+	if stuck.reason != "" {
+		message := stuck.message + ", so none is suspended for it"
+		if wait.reason != stuck.reason && wait.message != "" {
+			message += "; and " + wait.message
+		}
+		wait = planWait{reason: stuck.reason, node: stuck.node, message: message}
 	}
 	if start.After(p.m.stamp) {
 		wait.message += "; expected to start in about " + formatAbout(start.Sub(p.m.stamp)) +
@@ -1406,18 +1421,7 @@ func (p *planner) commit(c *planCandidate, slots []planSlot) {
 // makeRoom finds the fewest lower-priority cooperative leases whose suspension
 // lets every rank of c fit on its target node.
 func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot, ov planOverlay) ([]*planLease, []planSlot, bool) {
-	var pool []*planLease
-	nodes := map[string]bool{}
-	for _, s := range target {
-		nodes[s.fit.node] = true
-	}
-	for _, id := range p.m.leaseIDs {
-		l := p.m.leases[id]
-		if p.victims[id] || l.priority >= c.execution.Priority || !(l.victim || l.suspending) || !p.reaches(l, nodes) {
-			continue
-		}
-		pool = append(pool, l)
-	}
+	pool := p.victimPool(c, target)
 	sort.SliceStable(pool, func(a, b int) bool {
 		x, y := pool[a], pool[b]
 		if x.suspending != y.suspending {
@@ -1434,17 +1438,7 @@ func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot
 		}
 		return x.id < y.id
 	})
-	// Victims are chosen for GPUs and RAM only; CPU and disk the waiting
-	// execution waits for, or borrows, as without preemption.
-	needs := make([]planDemand, len(ranks))
-	for i, r := range ranks {
-		needs[i] = planDemand{priority: r.demand.priority, gpus: r.demand.gpus}
-		for _, c := range r.demand.capacity {
-			if c.kind == "ram" {
-				needs[i].capacity = append(needs[i].capacity, c)
-			}
-		}
-	}
+	needs := roomNeeds(ranks)
 	fits := func(chosen map[string]bool) ([]planSlot, bool) {
 		freed := func(leaseID string) bool { return chosen[leaseID] }
 		slots := make([]planSlot, len(target))
@@ -1483,6 +1477,70 @@ func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot
 		chosen[picked[i].id] = true
 	}
 	return picked, slots, true
+}
+
+// victimPool lists the leases c may suspend to go to target: of lower
+// priority, cooperative (or already suspending), holding something there,
+// and not chosen for another execution of this pass.
+func (p *planner) victimPool(c *planCandidate, target []planSlot) []*planLease {
+	var pool []*planLease
+	nodes := map[string]bool{}
+	for _, s := range target {
+		nodes[s.fit.node] = true
+	}
+	for _, id := range p.m.leaseIDs {
+		l := p.m.leases[id]
+		if p.victims[id] || l.priority >= c.execution.Priority || !(l.victim || l.suspending) || !p.reaches(l, nodes) {
+			continue
+		}
+		pool = append(pool, l)
+	}
+	return pool
+}
+
+// roomNeeds is what victims are chosen for: GPUs and RAM only; CPU and disk
+// the waiting execution waits for, or borrows, as without preemption.
+func roomNeeds(ranks []planRank) []planDemand {
+	needs := make([]planDemand, len(ranks))
+	for i, r := range ranks {
+		needs[i] = planDemand{priority: r.demand.priority, gpus: r.demand.gpus}
+		for _, c := range r.demand.capacity {
+			if c.kind == "ram" {
+				needs[i].capacity = append(needs[i].capacity, c)
+			}
+		}
+	}
+	return needs
+}
+
+// stillShort says, for c that may suspend leases to go to target, what would
+// still be short there were all of them suspended (a GPU it could have
+// coming free, but not the RAM others hold, say): suspending them would not
+// make room, and so none is. It is empty when that would make room, or c may
+// suspend nothing (what is in its way is then the reason).
+func (p *planner) stillShort(c *planCandidate, ranks []planRank, target []planSlot, ov planOverlay) planWait {
+	pool := p.victimPool(c, target)
+	if len(pool) == 0 {
+		return planWait{}
+	}
+	all := map[string]bool{}
+	labels := make([]string, 0, 4)
+	for i, l := range pool {
+		all[l.id] = true
+		switch {
+		case i < 3:
+			labels = append(labels, p.m.leaseLabel(l.id))
+		case i == 3:
+			labels = append(labels, fmt.Sprintf("%d more", len(pool)-3))
+		}
+	}
+	needs := roomNeeds(ranks)
+	for i, s := range target {
+		if f := p.m.fit(s.fit.node, needs[i], ov, func(leaseID string) bool { return all[leaseID] }); !f.ok {
+			return planWait{reason: f.reason, node: f.node, message: rankPrefix(c, ranks[i]) + f.message + " even were " + strings.Join(labels, ", ") + " suspended"}
+		}
+	}
+	return planWait{}
 }
 
 // reaches reports whether lease l holds anything on one of nodes.
