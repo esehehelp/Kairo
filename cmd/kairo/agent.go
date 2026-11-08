@@ -97,10 +97,19 @@ func agentCommand(args []string) error {
 	nodeAttrs, _ := json.Marshal(cfg.Bench.Attributes(cfg.Node.Labels))
 	node := store.Node{ID: cfg.Node.ID, Name: cfg.Node.Name, OS: cfg.Node.OS, Architecture: cfg.Node.Architecture, Attributes: nodeAttrs, Enabled: true}
 
+	// The attempts an earlier run of this agent launched that still run (or
+	// exited since, their exit written) are adopted, not lost.
+	ours := map[string]bool{}
+	for _, e := range executors {
+		ours[e.ID] = e.Enabled
+	}
+	records := executor.AdoptableAttempts(cfg.LogDirectory, ours, logger)
+	var adopted []string
 	// Registration is retried: the daemon (or the tunnel to it) may come up
 	// after the agent.
 	for delay := time.Second; ; delay = min(2*delay, 30*time.Second) {
-		stale, regErr := client.Register(ctx, node, executors, registered)
+		stale, kept, regErr := client.RegisterAdopting(ctx, node, executors, registered, executor.Adopted(records))
+		adopted = kept
 		if regErr == nil {
 			for id, n := range stale {
 				if n > 0 {
@@ -146,6 +155,7 @@ func agentCommand(args []string) error {
 		exec.MinLogFreeBytes = int64(cfg.LogMinFreeMiB) << 20
 		exec.FlushLogs = shipper.ShipAttempt
 		exec.Providers = providerSet
+		exec.Adopt(records, adopted)
 		go func() {
 			if err := exec.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- err

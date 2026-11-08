@@ -29,13 +29,22 @@ type treeHandle struct {
 	group bool
 }
 
-// attachTree puts a just-started launcher into a new job object. The job does
-// not kill on close (the daemon may restart while attempts run) and allows
-// explicit breakaway, so nothing changes for the attempt except that the
-// executor can later terminate everything in it at once.
-func attachTree(cmd *exec.Cmd) (*treeHandle, error) {
+// attachTree puts a just-started launcher into a new job object, named name
+// when not "" (an agent restarted meanwhile opens it again, openTree). The
+// job does not kill on close (the agent may restart while attempts run) and
+// allows explicit breakaway, so nothing changes for the attempt except that
+// the executor can later terminate everything in it at once.
+func attachTree(cmd *exec.Cmd, name string) (*treeHandle, error) {
 	h := &treeHandle{group: cmd.SysProcAttr != nil && cmd.SysProcAttr.CreationFlags&windows.CREATE_NEW_PROCESS_GROUP != 0}
-	job, err := windows.CreateJobObject(nil, nil)
+	var named *uint16
+	if name != "" {
+		p, err := windows.UTF16PtrFromString(name)
+		if err != nil {
+			return h, err
+		}
+		named = p
+	}
+	job, err := windows.CreateJobObject(nil, named)
 	if err != nil {
 		return h, fmt.Errorf("create job object: %w", err)
 	}
@@ -45,7 +54,7 @@ func attachTree(cmd *exec.Cmd) (*treeHandle, error) {
 		windows.CloseHandle(job)
 		return h, fmt.Errorf("configure job object: %w", err)
 	}
-	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+	process, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE|windows.PROCESS_DUP_HANDLE, false, uint32(cmd.Process.Pid))
 	if err != nil {
 		windows.CloseHandle(job)
 		return h, fmt.Errorf("open launcher: %w", err)
@@ -56,6 +65,15 @@ func attachTree(cmd *exec.Cmd) (*treeHandle, error) {
 		return h, fmt.Errorf("assign launcher to job object: %w", err)
 	}
 	h.job = job
+	if named != nil {
+		// A name lasts while a handle to the job is open: the launcher holds
+		// one (never used), so an agent restarted while it runs finds the
+		// job by name.
+		var held windows.Handle
+		if err = windows.DuplicateHandle(windows.CurrentProcess(), job, process, &held, jobObjectQuery, false, 0); err != nil {
+			return h, fmt.Errorf("hand the job object to the launcher: %w", err)
+		}
+	}
 	return h, nil
 }
 
@@ -195,6 +213,7 @@ func ctrlBreak(ctx context.Context, pid int) error {
 // RunHelper runs a helper subcommand of this binary when args name one and
 // then exits; otherwise it returns. main calls it before anything else.
 func RunHelper(args []string) {
+	runShim(args)
 	if len(args) != 3 || args[1] != ctrlBreakHelperArg {
 		return
 	}

@@ -505,6 +505,41 @@ of another attempt, one whose parent has exited or whose environment cannot be
 read) stays a claim, and a GPU with a claim is not given to a preempting
 execution.
 
+### Agent restarts
+
+An attempt's launcher is a shim: the kairo binary of its executor run as
+`__kairo-shim`, whose pid, process group (Linux) or console process group
+and job object (Windows) and creation time are the attempt's. The executor
+starts the shim, puts it in the attempt's job object (Windows; named
+`kairo-attempt-<attempt id>`, and the shim is handed a handle to it, so the
+name lasts while the shim runs), activates the attempt and records it in
+`running/<attempt id>.json` under its log directory; only then does the shim
+start the attempt's command, with its environment, directory and logs, and
+confined when the execution is (Data stores). A launch whose activation is
+refused thus runs nothing. The shim lets SIGTERM and CTRL_BREAK go by (the
+command, in its group, is sent the same), waits for the command and writes
+its exit code to `running/<attempt id>.exit` before it exits with it; the
+attempt's exit is recorded from that file (the shim's own end, when it wrote
+none: killed).
+
+The agent is thus not the parent of the work, and an agent stopped and
+started again (only its own process: a Linux unit's `KillMode=process`; on
+Windows the agent alone, not the shims, which run the same image) keeps its
+attempts. At start it adopts each recorded attempt of its executors whose
+shim still runs, or is gone having written the exit: it names them (attempt,
+executor, the shim's pid and creation identity) when it registers, and the
+daemon keeps each one running or quiescing on that executor with that pid
+and identity as it was (event `attempt_adopted`); every other attempt the
+executor held is lost as before (`attempt_lost`), and its record removed. An
+adopted attempt is watched (every second) until its shim exits, and its exit
+is then recorded; meanwhile its logs are shipped on from where the daemon's
+copy ends, its usage is sampled, a force stop reaches it through its job
+object (found again by name) or its process group, and its scratch and
+output directory count as in use. A shim gone without its exit (killed, or
+the node restarted) is not adopted: that attempt is lost. An attempt
+launched before shims (by an agent from before them) is lost by a restart as
+before. A daemon with executors of its own adopts the same way.
+
 ### Admission
 
 Which waiting execution runs where is decided by one planning pass over the
@@ -761,8 +796,8 @@ than an earlier sample showed:
 
 A process that cannot be read (another user's, a kernel without
 `smaps_rollup`) makes that figure unknown, and admission then counts the
-whole reservation. Attempts launched by an earlier instance of the executor
-(before an agent restart) are not sampled.
+whole reservation. An attempt adopted after an agent restart is sampled as
+one launched by the agent; one lost is not.
 
 ### Attempt logs
 
@@ -2210,19 +2245,26 @@ SQLite Kairo, so its schema is complete.
 
 ## Upgrading a running installation
 
-A daemon (or node agent) that starts marks the attempts its executors had
-running as lost: it cannot vouch for processes a previous incarnation
-launched. Drain before replacing either binary: pause the projects, wait
-until no attempt is authorized, running or quiescing, then stop the agents
-and the daemon, back up the database (`pg_dump`), replace the binaries and configurations, start the daemon, then the agents,
-check `kairo doctor` and `kairo resource status`, and resume. Code that queued
-executions will load (scripts, the editable SDK) must not change while they
-wait.
+Replacing the daemon alone touches no attempt: back up the database
+(`pg_dump`), replace the binary and restart it. An agent that starts adopts
+the attempts its executors launched that still run, and marks the others lost
+(Agent restarts): replacing an agent whose attempts run under shims loses
+nothing. On Linux rename the new binary over the old one (the shims keep
+running the old file) and restart the unit; on Windows, where a running image
+cannot be overwritten but can be renamed, rename the agent's binary aside,
+copy the new one in its place and stop the agent process alone (not the
+shims, which run the renamed image). Replacing an agent that launched
+attempts without shims (from before them) loses those: drain first, pausing
+the projects until no attempt is authorized, running or quiescing on that
+node, then resume. Code that queued executions will load (scripts, the
+editable SDK) must not change while they wait.
 
-Replace the agents together with the daemon: an agent older than the daemon
+Replace the daemon first, then the agents: an agent older than the daemon
 starts attempts without their declared `env`, and a daemon older than the
-agent refuses its log problem reports (the agent logs them) and its
-observations, which carry power samples (its resources then go stale). A
+agent refuses its log problem reports (the agent logs them), its
+observations, which carry power samples (its resources then go stale), and
+the registration of an agent that has attempts to adopt (which retries until
+the daemon is replaced). A
 daemon opening an older database applies the schema migrations it lacks
 (see Database); keep the backup, since an older binary refuses the newer
 schema.

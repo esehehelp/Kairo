@@ -29,7 +29,12 @@ func TestAConfinedAttemptWritesOnlyWhereItIsHanded(t *testing.T) {
 	cmd.Env = append(os.Environ(), "KAIRO_SCRATCH="+scratch, "KAIRO_OUTPUT_DIR="+output, "KAIRO_CACHE_DIR="+cache)
 	prepareProcessTree(cmd)
 	cmd.SysProcAttr.CmdLine = `cmd /s /c "` + script + `"` // as written: cmd reads quotes its own way
-	release, err := e.confine(cmd)
+	conf, err := e.confine(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// as the attempt's shim confines its command
+	release, err := confineCommand(cmd, conf.writable, conf.scratch)
 	if err != nil {
 		t.Fatal(err)
 	}

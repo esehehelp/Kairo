@@ -102,9 +102,18 @@ func setEnv(env []string, name, value string) []string {
 	return append(out, name+"="+value)
 }
 
-// confine makes cmd, an attempt's launcher, confined (see above); release,
-// if not nil, is called once the launcher has started (or failed to).
-func (e *Local) confine(cmd *exec.Cmd) (release func(), err error) {
+// confinement is what a confined attempt may write; its shim confines the
+// command with it (confineCommand).
+type confinement struct {
+	writable []string
+	scratch  string
+}
+
+// confine readies cmd, an attempt's command, to be confined (see above): its
+// temporary directory is its scratch, and the directories it may write are
+// made ready as confineCommand makes them (which also tells, before
+// anything starts, that it can be confined here).
+func (e *Local) confine(cmd *exec.Cmd) (*confinement, error) {
 	if e.isWSL() {
 		return nil, fmt.Errorf("%w: confinement inside WSL is not done yet", errConfineHere)
 	}
@@ -119,5 +128,12 @@ func (e *Local) confine(cmd *exec.Cmd) (release func(), err error) {
 	if cache != "" {
 		writable = append(writable, cache)
 	}
-	return confineCommand(cmd, writable, scratch)
+	release, err := confineCommand(&exec.Cmd{Path: cmd.Path, Args: cmd.Args}, writable, scratch)
+	if err != nil {
+		return nil, err
+	}
+	if release != nil {
+		release()
+	}
+	return &confinement{writable: writable, scratch: scratch}, nil
 }

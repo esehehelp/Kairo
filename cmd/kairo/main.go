@@ -133,6 +133,14 @@ func serve(args []string) error {
 			return fmt.Errorf("unsupported provider kind %q", p.Kind)
 		}
 	}
+	// Attempts a previous run of this daemon's executors launched that still
+	// run are adopted, as an agent adopts them (agent.go).
+	ours := map[string]bool{}
+	for _, e := range daemonConfig.Executors {
+		ours[e.ID] = e.Enabled == nil || *e.Enabled
+	}
+	records := executor.AdoptableAttempts(daemonConfig.LogDirectory, ours, logger)
+	var adopted []string
 	for _, e := range daemonConfig.Executors {
 		enabled := e.Enabled == nil || *e.Enabled
 		attrs, _ := json.Marshal(e.Labels)
@@ -140,10 +148,11 @@ func serve(args []string) error {
 			return err
 		}
 		if enabled {
-			stale, err := st.MarkExecutorUnknown(context.Background(), e.ID)
+			stale, kept, err := st.ReregisterExecutor(context.Background(), e.ID, executor.Adopted(records))
 			if err != nil {
 				return fmt.Errorf("startup reconciliation: %w", err)
 			}
+			adopted = append(adopted, kept...)
 			if stale > 0 {
 				logger.Warn("executor has stale leases pending reconciliation", "executor_id", e.ID, "count", stale)
 			}
@@ -310,6 +319,7 @@ func serve(args []string) error {
 		exec.ObservationInterval = time.Duration(daemonConfig.ObservationIntervalSeconds) * time.Second
 		exec.MinLogFreeBytes = int64(daemonConfig.LogMinFreeMiB) << 20
 		exec.Providers = providerSet
+		exec.Adopt(records, adopted)
 		go func() {
 			if err := exec.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 				errCh <- err

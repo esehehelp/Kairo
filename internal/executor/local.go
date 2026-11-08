@@ -62,8 +62,10 @@ type Local struct {
 	// logProblems are the problems already recorded, by attempt.
 	logProblems map[string]map[string]bool
 
-	mu      sync.Mutex
-	running map[string]*exec.Cmd
+	mu sync.Mutex
+	// running holds the attempts running here, launched or adopted: the pid
+	// of each one's shim.
+	running map[string]int
 
 	// Prepared gang ranks waiting at the launch barrier, by lease ID.
 	pendingGang map[string]pendingGangRank
@@ -168,7 +170,7 @@ type pendingGangRank struct {
 func NewLocal(id string, st Coordinator, logDir string, logger *slog.Logger) *Local {
 	return &Local{
 		ID: id, Store: st, LogDir: logDir, Interval: 250 * time.Millisecond,
-		Logger: logger, running: make(map[string]*exec.Cmd),
+		Logger: logger, running: make(map[string]int),
 	}
 }
 
@@ -907,106 +909,157 @@ func (e *Local) start(launch *store.Launch) error {
 		}
 	}()
 	cmd := e.command(launch)
+	if cmd.Err != nil {
+		return cmd.Err
+	}
 	e.forgetScratch(launch.Attempt.ID)
 	prepareProcessTree(cmd)
+	var conf *confinement
 	if launch.Confine {
-		release, err := e.confine(cmd)
+		c, err := e.confine(cmd)
 		if err != nil {
 			return err
 		}
-		if release != nil {
-			defer release()
-		}
+		conf = c
 	}
-	outPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stdout.log")
-	errPath := filepath.Join(e.LogDir, launch.Attempt.ID+".stderr.log")
+	id := launch.Attempt.ID
+	job := ""
+	if runtime.GOOS == "windows" {
+		job = "kairo-attempt-" + id
+	}
+	// The attempt's launcher is its shim (shim.go): the command starts only
+	// once the shim is in its job object and the attempt is recorded, and
+	// an agent restarted meanwhile adopts it.
+	forgetRecord(e.LogDir, id)
+	if err := os.MkdirAll(recordsDir(e.LogDir), 0o755); err != nil {
+		return err
+	}
+	shim, goAhead, err := shimCommand(cmd, exitPath(e.LogDir, id), conf)
+	if err != nil {
+		return err
+	}
+	readEnd := shim.Stdin.(*os.File)
+	outPath := filepath.Join(e.LogDir, id+".stdout.log")
+	errPath := filepath.Join(e.LogDir, id+".stderr.log")
 	stdout, err := openAttemptLog(outPath)
 	if err != nil {
+		readEnd.Close()
+		goAhead.Close()
 		return err
 	}
 	stderr, err := openAttemptLog(errPath)
 	if err != nil {
 		stdout.Close()
+		readEnd.Close()
+		goAhead.Close()
 		return err
 	}
-	cmd.Stdout, cmd.Stderr = stdout, stderr
-	if err = cmd.Start(); err != nil {
+	closeLogs := func() {
 		stdout.Close()
 		stderr.Close()
+	}
+	shim.Stdout, shim.Stderr = stdout, stderr
+	err = shim.Start()
+	readEnd.Close()
+	if err != nil {
+		goAhead.Close()
+		closeLogs()
 		return err
 	}
 	// The tree handle (Windows: a job object) lets a force stop reach every
 	// descendant; without it the stop falls back to walking the tree.
-	tree, treeErr := attachTree(cmd)
+	tree, treeErr := attachTree(shim, job)
 	if treeErr != nil {
-		e.Logger.Warn("attempt process tree not tracked", "attempt_id", launch.Attempt.ID, "error", treeErr)
+		e.Logger.Warn("attempt process tree not tracked", "attempt_id", id, "error", treeErr)
 	}
-	identity, identityErr := processidentity.ForPID(cmd.Process.Pid)
+	identity, identityErr := processidentity.ForPID(shim.Process.Pid)
 	if identityErr != nil {
-		e.killUnactivated(launch, cmd, tree, "")
-		stdout.Close()
-		stderr.Close()
+		goAhead.Close()
+		e.killUnactivated(launch, shim, tree, "")
+		closeLogs()
 		return fmt.Errorf("read process creation identity: %w", identityErr)
 	}
 	// Asked again while no answer arrives: a repeat of an activation that
 	// went through is answered the same (store.ActivateLaunch).
 	err = e.retryUnanswered(context.Background(), func() error {
-		return e.Store.ActivateLaunch(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, cmd.Process.Pid, identity)
+		return e.Store.ActivateLaunch(context.Background(), id, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, shim.Process.Pid, identity)
 	})
+	record := AttemptRecord{AttemptID: id, ExecutorID: e.ID, LeaseID: launch.Lease.ID, Epoch: launch.Lease.CoordinationEpoch,
+		RunID: launch.RunID, PID: shim.Process.Pid, Identity: identity, Job: job}
+	if err == nil {
+		err = writeRecord(e.LogDir, record)
+	}
+	if err == nil {
+		err = sendGoAhead(goAhead)
+	}
 	if err != nil {
-		e.killUnactivated(launch, cmd, tree, identity)
-		stdout.Close()
-		stderr.Close()
+		goAhead.Close()
+		e.killUnactivated(launch, shim, tree, identity)
+		forgetRecord(e.LogDir, id)
+		closeLogs()
 		return err
 	}
 	go e.recordLogPaths(launch, outPath, errPath)
 	e.mu.Lock()
-	e.running[launch.Attempt.ID] = cmd
+	e.running[id] = shim.Process.Pid
 	if tree != nil {
 		if e.trees == nil {
 			e.trees = map[string]*treeHandle{}
 		}
-		e.trees[launch.Attempt.ID] = tree
+		e.trees[id] = tree
 	}
 	e.mu.Unlock()
-	e.trackUsage(launch.Attempt.ID, cmd.Process.Pid, identity)
+	e.trackUsage(id, shim.Process.Pid, identity)
 	go func() {
-		waitErr := cmd.Wait()
-		e.untrackUsage(launch.Attempt.ID)
-		stdout.Close()
-		stderr.Close()
-		exit := cmd.ProcessState.ExitCode()
-		e.checkLogSpaceAtExit(launch.Attempt.ID)
-		if e.FlushLogs != nil {
-			// Bounded: the shipper goes on retrying in the background.
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := e.FlushLogs(ctx, launch.Attempt.ID); err != nil {
-				e.Logger.Warn("attempt logs not shipped at exit; retrying in the background", "attempt_id", launch.Attempt.ID, "error", err)
-			}
-			cancel()
+		waitErr := shim.Wait()
+		exit, written := readExit(e.LogDir, id)
+		if !written {
+			// killed (a force stop, the OOM killer): the shim's own end
+			exit = shim.ProcessState.ExitCode()
+			e.Logger.Info("attempt's shim exited without writing its exit", "attempt_id", id, "exit", exit, "wait_error", waitErr)
 		}
-		// RecordTerminal is idempotent, so a transient failure (a remote
-		// agent losing its connection to the daemon) is retried rather than
-		// leaving the lease stuck in active.
-		for delay := time.Second; ; delay = min(2*delay, time.Minute) {
-			err := e.Store.RecordTerminal(context.Background(), launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, exit, "")
-			if err == nil {
-				break
-			}
-			e.Logger.Error("could not record attempt exit", "attempt_id", launch.Attempt.ID, "wait_error", waitErr, "error", err)
-			if errors.Is(err, store.ErrStaleEpoch) || errors.Is(err, store.ErrNotFound) {
-				break
-			}
-			time.Sleep(delay)
-		}
-		e.mu.Lock()
-		delete(e.running, launch.Attempt.ID)
-		delete(e.outputRuns, launch.Attempt.ID)
-		e.mu.Unlock()
-		e.forgetLogProblems(launch.Attempt.ID)
+		e.finishAttempt(record, exit, closeLogs)
 	}()
 	launched = true
 	return nil
+}
+
+// finishAttempt records the exit of an attempt launched or adopted here
+// whose shim has exited, and forgets it.
+func (e *Local) finishAttempt(r AttemptRecord, exit int, closeLogs func()) {
+	e.untrackUsage(r.AttemptID)
+	if closeLogs != nil {
+		closeLogs()
+	}
+	e.checkLogSpaceAtExit(r.AttemptID)
+	if e.FlushLogs != nil {
+		// Bounded: the shipper goes on retrying in the background.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := e.FlushLogs(ctx, r.AttemptID); err != nil {
+			e.Logger.Warn("attempt logs not shipped at exit; retrying in the background", "attempt_id", r.AttemptID, "error", err)
+		}
+		cancel()
+	}
+	// RecordTerminal is idempotent, so a transient failure (a remote agent
+	// losing its connection to the daemon) is retried rather than leaving
+	// the lease stuck in active.
+	for delay := time.Second; ; delay = min(2*delay, time.Minute) {
+		err := e.Store.RecordTerminal(context.Background(), r.AttemptID, r.LeaseID, r.Epoch, exit, "")
+		if err == nil {
+			break
+		}
+		e.Logger.Error("could not record attempt exit", "attempt_id", r.AttemptID, "error", err)
+		if errors.Is(err, store.ErrStaleEpoch) || errors.Is(err, store.ErrNotFound) {
+			break
+		}
+		time.Sleep(delay)
+	}
+	forgetRecord(e.LogDir, r.AttemptID)
+	e.mu.Lock()
+	delete(e.running, r.AttemptID)
+	delete(e.outputRuns, r.AttemptID)
+	e.mu.Unlock()
+	e.forgetLogProblems(r.AttemptID)
 }
 
 // recordLogPaths records where an attempt's logs are, retrying while the

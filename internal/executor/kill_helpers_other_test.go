@@ -48,3 +48,6 @@ func processAlive(pid int) bool {
 }
 
 func hideTestConsole(*exec.Cmd) {}
+
+// adoptedTreeOpened: there is no handle to open outside Windows.
+func adoptedTreeOpened(*treeHandle) bool { return true }

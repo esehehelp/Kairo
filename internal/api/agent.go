@@ -25,6 +25,8 @@ type agentRegisterRequest struct {
 	Node      store.Node       `json:"node"`
 	Executors []store.Executor `json:"executors"`
 	Providers []agentProvider  `json:"providers"`
+	// Adopt lists the attempts the agent still runs (store.ReregisterExecutor).
+	Adopt []store.AdoptedAttempt `json:"adopt,omitempty"`
 }
 
 type agentProvider struct {
@@ -506,6 +508,7 @@ func (s *Server) agentRegister(ctx context.Context, b agentRegisterRequest) (any
 		}
 	}
 	stale := map[string]int{}
+	adopted := []string{}
 	for _, e := range b.Executors {
 		if e.ID == "" {
 			return nil, errors.New("executor id is required")
@@ -515,16 +518,18 @@ func (s *Server) agentRegister(ctx context.Context, b agentRegisterRequest) (any
 			return nil, err
 		}
 		if e.Enabled {
-			// A (re)starting agent cannot vouch for leases its previous
-			// incarnation held; they go stale until quiescence is proven.
-			n, err := s.Store.MarkExecutorUnknown(ctx, e.ID)
+			// A (re)starting agent vouches only for the attempts it adopts;
+			// every other lease its previous incarnation held goes stale
+			// until quiescence is proven.
+			n, kept, err := s.Store.ReregisterExecutor(ctx, e.ID, b.Adopt)
 			if err != nil {
 				return nil, err
 			}
 			stale[e.ID] = n
+			adopted = append(adopted, kept...)
 		}
 	}
-	return map[string]any{"stale_leases": stale}, nil
+	return map[string]any{"stale_leases": stale, "adopted": adopted}, nil
 }
 
 // agentSetLogPaths records the daemon-side copies of an attempt's logs:

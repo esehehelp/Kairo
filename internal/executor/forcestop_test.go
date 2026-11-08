@@ -26,11 +26,20 @@ const (
 	helperOrphan     = "__test-orphan"      // start a sleeping child and exit at once
 	helperOrphanStub = "__test-orphan-stub" // start a child ignoring interrupts and exit at once
 	helperPrint      = "__test-print"       // print a line to stdout and stderr, exit 1
+	helperExitWhen   = "__test-exit-when"   // exit 7 once the file named next exists
 )
 
 func TestMain(m *testing.M) {
 	RunHelper(os.Args)
 	runScratchHelper(os.Args)
+	if len(os.Args) == 3 && os.Args[1] == helperExitWhen {
+		for deadline := time.Now().Add(time.Minute); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+			if _, err := os.Stat(os.Args[2]); err == nil {
+				os.Exit(7)
+			}
+		}
+		os.Exit(3)
+	}
 	if len(os.Args) == 2 {
 		switch os.Args[1] {
 		case helperTree, helperStubborn, helperOrphan, helperOrphanStub:
@@ -80,7 +89,7 @@ func startTestTree(t *testing.T, mode string) (*exec.Cmd, *treeHandle, int) {
 	if err = cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	tree, err := attachTree(cmd)
+	tree, err := attachTree(cmd, "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -175,7 +184,7 @@ func TestForceStopKillsWhatIgnoresTheGracefulStop(t *testing.T) {
 	cmd, handle, child := startTestTree(t, helperStubborn)
 	fake := &fakeForceStops{order: store.ForceStopOrder{AttemptID: "att", ExecutionID: "exe", State: "pending", GraceSeconds: 1, KillAfterSeconds: 1}}
 	e := NewLocal("e", fake, t.TempDir(), slog.Default())
-	e.running["att"] = cmd
+	e.running["att"] = cmd.Process.Pid
 	e.trees = map[string]*treeHandle{"att": handle}
 	ctx := context.Background()
 	e.carryOutForceStops(ctx)

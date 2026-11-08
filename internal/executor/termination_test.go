@@ -60,7 +60,7 @@ func TestTerminationEndsWhatTheLauncherLeftBehindBeforeItIsRecorded(t *testing.T
 	}
 	fake := &fakeTerminations{term: store.QuarantineTermination{AttemptID: attemptID, ExecutionID: "exe"}}
 	e := NewLocal("e", fake, t.TempDir(), slog.Default())
-	e.running[attemptID] = cmd
+	e.running[attemptID] = cmd.Process.Pid
 	e.trees = map[string]*treeHandle{attemptID: handle}
 	ctx := context.Background()
 	if err := e.carryOutQuarantineTerminations(ctx); err != nil {

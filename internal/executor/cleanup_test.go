@@ -7,7 +7,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -159,7 +158,7 @@ func TestRetryUnansweredAsksAgainOnlyWithoutAnAnswer(t *testing.T) {
 }
 
 // refusedActivation refuses every activation (a fenced launch) after the
-// launcher has had time to start its child.
+// launcher has had time to start what it would.
 type refusedActivation struct {
 	Coordinator
 }
@@ -169,9 +168,9 @@ func (refusedActivation) ActivateLaunch(context.Context, string, string, int64, 
 	return store.ErrStaleEpoch
 }
 
-// A launch whose activation is refused kills what the launcher started, not
-// only the launcher.
-func TestRefusedActivationKillsTheWholeProcessTree(t *testing.T) {
+// A launch whose activation is refused runs nothing: its shim never gets
+// the go-ahead, and is gone with no record of the attempt left.
+func TestARefusedActivationRunsNothing(t *testing.T) {
 	logDir := t.TempDir()
 	e := NewLocal("e", refusedActivation{}, logDir, slog.New(slog.DiscardHandler))
 	e.FreeSpace = func(string) (int64, error) { return 1 << 40, nil }
@@ -184,20 +183,11 @@ func TestRefusedActivationKillsTheWholeProcessTree(t *testing.T) {
 	if err := e.start(launch); !errors.Is(err, store.ErrStaleEpoch) {
 		t.Fatalf("start: %v", err)
 	}
-	out, err := os.ReadFile(filepath.Join(logDir, "att-refused.stdout.log"))
-	if err != nil {
-		t.Fatal(err)
+	if out, err := os.ReadFile(filepath.Join(logDir, "att-refused.stdout.log")); err != nil || len(out) != 0 {
+		t.Fatalf("the command ran: %q %v", out, err)
 	}
-	child, err := strconv.Atoi(strings.TrimSpace(string(out)))
-	if err != nil {
-		t.Fatalf("child pid in the launcher's output: %q", out)
-	}
-	deadline := time.Now().Add(15 * time.Second)
-	for processAlive(child) {
-		if time.Now().After(deadline) {
-			t.Fatalf("child %d of an unactivated launcher survived", child)
-		}
-		time.Sleep(100 * time.Millisecond)
+	if _, err := os.Stat(recordPath(logDir, "att-refused")); !os.IsNotExist(err) {
+		t.Fatalf("a record of the refused attempt is left: %v", err)
 	}
 }
 

@@ -37,7 +37,12 @@ func TestAConfinedAttemptWritesOnlyWhereItIsHanded(t *testing.T) {
 	cmd := exec.Command("sh", "-c", script)
 	cmd.Env = append(os.Environ(), "KAIRO_SCRATCH="+scratch, "KAIRO_OUTPUT_DIR="+output, "KAIRO_CACHE_DIR="+cache)
 	prepareProcessTree(cmd)
-	if _, err := e.confine(cmd); err != nil {
+	conf, err := e.confine(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// as the attempt's shim confines its command
+	if _, err := confineCommand(cmd, conf.writable, conf.scratch); err != nil {
 		t.Fatal(err)
 	}
 	out, err := cmd.CombinedOutput()

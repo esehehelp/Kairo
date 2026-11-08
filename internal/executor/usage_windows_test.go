@@ -100,7 +100,7 @@ func TestWindowsTreeUsageOfARealChild(t *testing.T) {
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 	}()
-	tree, err := attachTree(cmd)
+	tree, err := attachTree(cmd, "")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -21,13 +21,17 @@ import (
 // (prepareProcessTree), which is all that is kept.
 type treeHandle struct{}
 
-func attachTree(*exec.Cmd) (*treeHandle, error) { return nil, nil }
+func attachTree(*exec.Cmd, string) (*treeHandle, error) { return nil, nil }
 
 func (h *treeHandle) close() {}
 
-// RunHelper runs a helper subcommand of this binary when args name one (the
-// confining launcher, confine_linux.go) and does not return then.
-func RunHelper(args []string) { runConfineHelper(args) }
+// RunHelper runs a helper subcommand of this binary when args name one (an
+// attempt's shim, shim.go; the confining launcher, confine_linux.go) and
+// does not return then.
+func RunHelper(args []string) {
+	runShim(args)
+	runConfineHelper(args)
+}
 
 // stopTreeGracefully sends SIGTERM to the launcher's process group and to every
 // process carrying the attempt's KAIRO_ATTEMPT_ID (which also reaches children

@@ -35,3 +35,7 @@ func hideTestConsole(cmd *exec.Cmd) {
 	cmd.SysProcAttr.CreationFlags |= 0x00000010 // CREATE_NEW_CONSOLE
 	cmd.SysProcAttr.HideWindow = true
 }
+
+// adoptedTreeOpened reports whether an adopted attempt's tree handle has its
+// job object and console group.
+func adoptedTreeOpened(h *treeHandle) bool { return h != nil && h.job != 0 && h.group }

@@ -99,11 +99,25 @@ type Provider struct {
 // Register upserts this node, its providers and executors, and marks the
 // executors' previous leases stale until quiescence is proven again.
 func (c *Client) Register(ctx context.Context, node store.Node, executors []store.Executor, providers []Provider) (map[string]int, error) {
+	stale, _, err := c.RegisterAdopting(ctx, node, executors, providers, nil)
+	return stale, err
+}
+
+// RegisterAdopting is Register keeping the attempts in adopt the daemon
+// finds as they were launched (store.ReregisterExecutor); adopted are those
+// it kept. An empty adopt is not sent (a daemon before adoption refuses the
+// field).
+func (c *Client) RegisterAdopting(ctx context.Context, node store.Node, executors []store.Executor, providers []Provider, adopt []store.AdoptedAttempt) (stale map[string]int, adopted []string, err error) {
 	var out struct {
 		StaleLeases map[string]int `json:"stale_leases"`
+		Adopted     []string       `json:"adopted"`
 	}
-	err := c.call(ctx, "register", map[string]any{"node": node, "executors": executors, "providers": providers}, &out)
-	return out.StaleLeases, err
+	body := map[string]any{"node": node, "executors": executors, "providers": providers}
+	if len(adopt) > 0 {
+		body["adopt"] = adopt
+	}
+	err = c.call(ctx, "register", body, &out)
+	return out.StaleLeases, out.Adopted, err
 }
 
 func (c *Client) ApplyObservationBatch(ctx context.Context, providerID string, resources []store.ResourceInstance, observations []store.Observation, claims []store.ExternalClaim) error {

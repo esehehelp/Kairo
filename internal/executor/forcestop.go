@@ -152,8 +152,8 @@ func (e *Local) ackForceStop(ctx context.Context, attemptID, phase string, detai
 func (e *Local) attemptTree(o store.ForceStopOrder) processTree {
 	t := processTree{attemptID: o.AttemptID, identity: deref(o.ProcessIdentity), wsl: e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2", distro: e.Attributes["distro"]}
 	e.mu.Lock()
-	if cmd := e.running[o.AttemptID]; cmd != nil && cmd.Process != nil {
-		t.pid = cmd.Process.Pid
+	if pid := e.running[o.AttemptID]; pid != 0 {
+		t.pid = pid
 	}
 	t.handle = e.trees[o.AttemptID]
 	e.mu.Unlock()

@@ -595,31 +595,66 @@ func (s *Store) FinalizeQuiescence(ctx context.Context, attemptID, leaseID strin
 	return tx.Commit()
 }
 
+// MarkExecutorUnknown is ReregisterExecutor of an executor that adopts
+// nothing: every lease it held goes stale.
 func (s *Store) MarkExecutorUnknown(ctx context.Context, executorID string) (int, error) {
+	n, _, err := s.ReregisterExecutor(ctx, executorID, nil)
+	return n, err
+}
+
+// AdoptedAttempt is an attempt a restarted agent still runs: its launcher
+// (the attempt's shim) alive with the pid and creation identity the attempt
+// was activated with, or gone having written the attempt's exit.
+type AdoptedAttempt struct {
+	AttemptID       string `json:"attempt_id"`
+	ExecutorID      string `json:"executor_id"`
+	PID             int    `json:"pid"`
+	ProcessIdentity string `json:"process_identity"`
+}
+
+// ReregisterExecutor settles what a (re)starting agent's executor held: an
+// attempt in adopt, running or quiescing there with that pid and identity,
+// stays as it is (event attempt_adopted) and is returned; every other
+// attempt is lost and its lease stale, as are leases with no attempt yet
+// (the agent cannot vouch for them).
+func (s *Store) ReregisterExecutor(ctx context.Context, executorID string, adopt []AdoptedAttempt) (int, []string, error) {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.execution_id,a.coordination_epoch,l.id FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=$1 AND a.state IN('authorized','running','quiescing') AND l.state IN('prepared','active','releasing','revocation_requested')`, executorID)
+	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.execution_id,a.coordination_epoch,l.id,a.state,a.pid,a.process_identity FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=$1 AND a.state IN('authorized','running','quiescing') AND l.state IN('prepared','active','releasing','revocation_requested')`, executorID)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	type lost struct {
 		attempt, execution, lease string
 		epoch                     int64
 	}
-	var values []lost
+	claimed := map[string]AdoptedAttempt{}
+	for _, a := range adopt {
+		if a.ExecutorID == executorID {
+			claimed[a.AttemptID] = a
+		}
+	}
+	var values, kept []lost
 	for rows.Next() {
 		var value lost
-		if err = rows.Scan(&value.attempt, &value.execution, &value.epoch, &value.lease); err != nil {
+		var state string
+		var pid sql.NullInt64
+		var identity sql.NullString
+		if err = rows.Scan(&value.attempt, &value.execution, &value.epoch, &value.lease, &state, &pid, &identity); err != nil {
 			rows.Close()
-			return 0, err
+			return 0, nil, err
+		}
+		if a, ok := claimed[value.attempt]; ok && state != "authorized" && pid.Valid && int(pid.Int64) == a.PID && identity.Valid && identity.String == a.ProcessIdentity {
+			kept = append(kept, value)
+			continue
 		}
 		values = append(values, value)
 	}
 	if err = rows.Close(); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	// A daemon can die after reserving or physically preparing resources but
 	// before it creates an attempt. Those leases are equally in-doubt and must
@@ -628,7 +663,7 @@ func (s *Store) MarkExecutorUnknown(ctx context.Context, executorID string) (int
 		FROM leases l WHERE l.executor_id=$1 AND l.attempt_id IS NULL
 		AND l.state IN('reserved','prepared','revocation_requested')`, executorID)
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	type orphan struct {
 		lease, execution string
@@ -639,49 +674,60 @@ func (s *Store) MarkExecutorUnknown(ctx context.Context, executorID string) (int
 		var value orphan
 		if err = orphanRows.Scan(&value.lease, &value.execution, &value.epoch); err != nil {
 			orphanRows.Close()
-			return 0, err
+			return 0, nil, err
 		}
 		orphans = append(orphans, value)
 	}
 	if err = orphanRows.Close(); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	t := now()
 	for _, value := range values {
 		if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='lost',coordination_epoch=coordination_epoch+1 WHERE id=$1`, value.attempt); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='stale',stale_at=$1,coordination_epoch=coordination_epoch+1 WHERE id=$2`, t, value.lease); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE launch_authorizations SET state='revoked',revoked_at=$1 WHERE attempt_id=$2 AND state='issued'`, t, value.attempt); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		if _, err = tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause='executor_identity_lost',terminal_at=$1 WHERE id=$2 AND state!='terminal'`, t, value.execution); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		projectID, projectErr := executionProjectIDTx(ctx, tx, value.execution)
 		if projectErr != nil {
-			return 0, projectErr
+			return 0, nil, projectErr
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "attempt_lost", &projectID, "attempt", value.attempt, &value.epoch, map[string]any{"execution_id": value.execution, "lease_id": value.lease}); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
+	}
+	adopted := make([]string, 0, len(kept))
+	for _, value := range kept {
+		projectID, projectErr := executionProjectIDTx(ctx, tx, value.execution)
+		if projectErr != nil {
+			return 0, nil, projectErr
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "attempt_adopted", &projectID, "attempt", value.attempt, &value.epoch, map[string]any{"execution_id": value.execution, "lease_id": value.lease, "executor_id": executorID}); err != nil {
+			return 0, nil, err
+		}
+		adopted = append(adopted, value.attempt)
 	}
 	for _, value := range orphans {
 		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='stale',stale_at=$1,coordination_epoch=coordination_epoch+1 WHERE id=$2`, t, value.lease); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 		projectID, projectErr := executionProjectIDTx(ctx, tx, value.execution)
 		if projectErr != nil {
-			return 0, projectErr
+			return 0, nil, projectErr
 		}
 		if err = appendCoordinationEventTx(ctx, tx, "lease_stale", &projectID, "lease", value.lease, &value.epoch, map[string]any{"execution_id": value.execution, "cause": "executor_identity_lost_before_authorization"}); err != nil {
-			return 0, err
+			return 0, nil, err
 		}
 	}
 	if err = tx.Commit(); err != nil {
-		return 0, err
+		return 0, nil, err
 	}
-	return len(values) + len(orphans), nil
+	return len(values) + len(orphans), adopted, nil
 }

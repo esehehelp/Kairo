@@ -7,7 +7,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -185,7 +184,7 @@ func TestRunningAttemptsGetLogSpaceShortagesRecordedOnce(t *testing.T) {
 	free.Store(100 << 20)
 	e := logSpaceExecutor(fake, "/srv/kairo/attempts", func(string) (int64, error) { return free.Load(), nil })
 	e.LogCheckInterval = 1
-	e.running["att_1"] = &exec.Cmd{}
+	e.running["att_1"] = 1
 	check := func() {
 		e.lastLogCheck = e.lastLogCheck.Add(-1)
 		e.watchLogSpace(ctx)
