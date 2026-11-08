@@ -38,12 +38,25 @@ type AttemptFilter struct {
 	ExecutionID    string
 	State          string
 	Limit          int
+	// After is the cursor a page ended at (ListAttemptsPage): the page is
+	// the attempts after it.
+	After string
 }
 
 // ListAttempts returns attempts newest first (by authorization time), with
 // their last reported progress.
 func (s *Store) ListAttempts(ctx context.Context, filter AttemptFilter) ([]AttemptView, error) {
-	query := `SELECT ` + attemptColumns + ` FROM attempts a JOIN execution_requests e ON e.id=a.execution_id`
+	out, _, err := s.ListAttemptsPage(ctx, filter)
+	return out, err
+}
+
+// ListAttemptsPage lists attempts newest first (by authorization time, else
+// start; those with neither last), up to the filter's limit (100 by default,
+// at most 1000) after its cursor; next is the cursor to read the rest from,
+// "" when there is no more.
+func (s *Store) ListAttemptsPage(ctx context.Context, filter AttemptFilter) (out []AttemptView, next string, err error) {
+	const key = `COALESCE(a.authorized_at,a.started_at)`
+	query := `SELECT ` + key + `,` + attemptColumns + ` FROM attempts a JOIN execution_requests e ON e.id=a.execution_id`
 	conditions := make([]string, 0, 3)
 	args := make([]any, 0, 4)
 	if filter.ProjectScopeID != "" {
@@ -55,32 +68,53 @@ func (s *Store) ListAttempts(ctx context.Context, filter AttemptFilter) ([]Attem
 	if filter.State != "" {
 		conditions = append(conditions, `a.state=`+bind(&args, filter.State))
 	}
+	if filter.After != "" {
+		after, err := parseListCursor(filter.After)
+		if err != nil {
+			return nil, "", err
+		}
+		id := bind(&args, after.id)
+		if after.key == nil {
+			conditions = append(conditions, `(`+key+` IS NULL AND a.id>`+id+`)`)
+		} else {
+			at := bind(&args, *after.key)
+			conditions = append(conditions, `(`+key+`<`+at+` OR `+key+`=`+at+` AND a.id>`+id+` OR `+key+` IS NULL)`)
+		}
+	}
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
-	query += ` ORDER BY COALESCE(a.authorized_at,a.started_at) DESC NULLS LAST,a.id LIMIT `
-	limit := filter.Limit
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-	query += bind(&args, limit)
+	query += ` ORDER BY ` + key + ` DESC NULLS LAST,a.id LIMIT `
+	limit := listLimit(filter.Limit)
+	query += bind(&args, limit+1)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	defer rows.Close()
-	out := make([]AttemptView, 0)
+	out = make([]AttemptView, 0)
+	var keys []*string
 	for rows.Next() {
-		v, err := scanAttempt(rows)
+		var at sql.NullString
+		v, err := scanAttempt(rows, &at)
 		if err != nil {
-			return nil, err
+			return nil, "", err
 		}
 		out = append(out, v)
+		if at.Valid {
+			keys = append(keys, &at.String)
+		} else {
+			keys = append(keys, nil)
+		}
 	}
-	return out, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, "", err
+	}
+	if len(out) > limit {
+		out = out[:limit]
+		next = listCursor{key: keys[limit-1], id: out[limit-1].ID}.String()
+	}
+	return out, next, nil
 }
 
 // AttemptLogPaths returns where an attempt's logs live on the daemon host, as

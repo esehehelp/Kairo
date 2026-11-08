@@ -76,7 +76,7 @@ func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) listExecutions(w http.ResponseWriter, r *http.Request) {
-	filter := store.ExecutionFilter{State: r.URL.Query().Get("state"), Limit: queryInt(r, "limit", 100)}
+	filter := store.ExecutionFilter{State: r.URL.Query().Get("state"), Limit: queryInt(r, "limit", 100), After: r.URL.Query().Get("after")}
 	project, queue, task := r.URL.Query().Get("project"), r.URL.Query().Get("queue"), r.URL.Query().Get("task")
 	if project == "" && (queue != "" || task != "") {
 		writeError(w, errors.New("queue and task filters require a project"))
@@ -99,7 +99,7 @@ func (s *Server) listExecutions(w http.ResponseWriter, r *http.Request) {
 		filter.ProjectScopeID = scopes.Project.ID
 		filter.ScopeID = mostSpecificScope(scopes).ID
 	}
-	values, err := s.Store.ListExecutions(r.Context(), filter)
+	values, next, err := s.Store.ListExecutionsPage(r.Context(), filter)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -107,7 +107,11 @@ func (s *Server) listExecutions(w http.ResponseWriter, r *http.Request) {
 	if values == nil {
 		values = []store.ExecutionRequest{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"executions": values})
+	body := map[string]any{"executions": values}
+	if next != "" {
+		body["next"] = next
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) getExecution(w http.ResponseWriter, r *http.Request) {
@@ -137,9 +141,9 @@ func (s *Server) withdrawExecution(w http.ResponseWriter, r *http.Request) {
 }
 
 // listAttempts is the read side of attempt progress: ?project=, ?execution_id=,
-// ?state=, ?limit=. Newest attempts first.
+// ?state=, ?limit=, ?after= (the next of a page). Newest attempts first.
 func (s *Server) listAttempts(w http.ResponseWriter, r *http.Request) {
-	filter := store.AttemptFilter{ExecutionID: r.URL.Query().Get("execution_id"), State: r.URL.Query().Get("state"), Limit: queryInt(r, "limit", 100)}
+	filter := store.AttemptFilter{ExecutionID: r.URL.Query().Get("execution_id"), State: r.URL.Query().Get("state"), Limit: queryInt(r, "limit", 100), After: r.URL.Query().Get("after")}
 	if project := r.URL.Query().Get("project"); project != "" {
 		scopes, err := s.Store.GetScopeByPath(r.Context(), store.ScopePath{Project: project})
 		if err != nil {
@@ -148,12 +152,16 @@ func (s *Server) listAttempts(w http.ResponseWriter, r *http.Request) {
 		}
 		filter.ProjectScopeID = scopes.Project.ID
 	}
-	values, err := s.Store.ListAttempts(r.Context(), filter)
+	values, next, err := s.Store.ListAttemptsPage(r.Context(), filter)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"attempts": values})
+	body := map[string]any{"attempts": values}
+	if next != "" {
+		body["next"] = next
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) listEvents(w http.ResponseWriter, r *http.Request) {

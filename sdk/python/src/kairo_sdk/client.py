@@ -212,6 +212,51 @@ class KairoClient:
         )
         return _array(self._request("GET", f"/api/attempts?{query}"), "attempts")
 
+    def all_executions(
+        self,
+        project: str | None = None,
+        state: str | None = None,
+        *,
+        page_size: int = 1000,
+    ) -> Iterator[dict[str, Any]]:
+        """Every execution, oldest first, read a page at a time."""
+        return self._pages("/api/executions", "executions", page_size, project=project, state=state)
+
+    def all_attempts(
+        self,
+        project: str | None = None,
+        execution_id: str | None = None,
+        state: str | None = None,
+        *,
+        page_size: int = 1000,
+    ) -> Iterator[dict[str, Any]]:
+        """Every attempt, newest first, read a page at a time."""
+        return self._pages(
+            "/api/attempts",
+            "attempts",
+            page_size,
+            project=project,
+            execution_id=execution_id,
+            state=state,
+        )
+
+    def _pages(
+        self, path: str, key: str, page_size: int, **filters: str | None
+    ) -> Iterator[dict[str, Any]]:
+        """Follow a list's ``next`` cursor until a page has none."""
+        page_size = _limit(page_size)
+        after: str | None = None
+        while True:
+            query = _query(**filters, limit=page_size, after=after)
+            response = self._request("GET", f"{path}?{query}")
+            yield from _array(response, key)
+            cursor = response.get("next")
+            if not cursor:
+                return
+            if cursor == after:
+                raise RuntimeError(f"Kairo {key} response did not advance the cursor")
+            after = str(cursor)
+
     def events(
         self,
         project: str | None = None,

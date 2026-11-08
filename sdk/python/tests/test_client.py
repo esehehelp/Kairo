@@ -236,3 +236,32 @@ def test_operator_settings_hide_the_token():
     client = KairoClient("https://kairo.example:7474", token="kairo_admin_secret")
     assert "kairo_admin_secret" not in repr(client.settings)
     assert client.settings.url == "https://kairo.example:7474"
+
+
+def test_all_executions_and_attempts_follow_the_next_cursor():
+    routes = {
+        ("GET", "/api/executions?project=p&limit=2"): (
+            200,
+            {"executions": [{"id": "exe_1"}, {"id": "exe_2"}], "next": "c2"},
+        ),
+        ("GET", "/api/executions?project=p&limit=2&after=c2"): (
+            200,
+            {"executions": [{"id": "exe_3"}]},
+        ),
+        ("GET", "/api/attempts?execution_id=exe_1&limit=1000"): (200, {"attempts": [{"id": "att_1"}]}),
+    }
+    with serve(FakeDaemon(routes)) as daemon:
+        client = KairoClient(daemon.url, token="tok")
+        assert [e["id"] for e in client.all_executions("p", page_size=2)] == ["exe_1", "exe_2", "exe_3"]
+        assert [a["id"] for a in client.all_attempts(execution_id="exe_1")] == ["att_1"]
+
+
+def test_all_executions_refuse_a_cursor_that_does_not_move():
+    routes = {
+        ("GET", "/api/executions?limit=1"): (200, {"executions": [{"id": "exe_1"}], "next": "c1"}),
+        ("GET", "/api/executions?limit=1&after=c1"): (200, {"executions": [{"id": "exe_1"}], "next": "c1"}),
+    }
+    with serve(FakeDaemon(routes)) as daemon:
+        client = KairoClient(daemon.url, token="tok")
+        with pytest.raises(RuntimeError, match="did not advance"):
+            list(client.all_executions(page_size=1))

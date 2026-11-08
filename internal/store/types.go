@@ -180,6 +180,9 @@ type ExecutionFilter struct {
 	ScopeID        string
 	State          string
 	Limit          int
+	// After is the cursor a page ended at (ListExecutionsPage): the page
+	// is the executions after it.
+	After string
 }
 
 type ResourceRequest struct {

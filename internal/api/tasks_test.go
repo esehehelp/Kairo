@@ -239,6 +239,35 @@ func TestTaskCancelAndRerunOverTheAPI(t *testing.T) {
 	if status, raw = d.call(t, http.MethodGet, "/api/executions?state=waiting", d.admin, nil); status != http.StatusOK || !bytes.Contains(raw, []byte(`"executions":[]`)) {
 		t.Fatalf("waiting executions: %d %s", status, raw)
 	}
+	// The two executions, a page each: the first page says where the next
+	// starts; the last says nothing.
+	var pages []struct {
+		Executions []struct {
+			ID string `json:"id"`
+		} `json:"executions"`
+		Next string `json:"next"`
+	}
+	for after := ""; len(pages) < 3; {
+		status, raw = d.call(t, http.MethodGet, "/api/executions?limit=1&after="+after, d.admin, nil)
+		var page struct {
+			Executions []struct {
+				ID string `json:"id"`
+			} `json:"executions"`
+			Next string `json:"next"`
+		}
+		if status != http.StatusOK || json.Unmarshal(raw, &page) != nil {
+			t.Fatalf("page: %d %s", status, raw)
+		}
+		pages = append(pages, page)
+		if after = page.Next; after == "" {
+			break
+		}
+	}
+	if len(pages) != 2 || len(pages[0].Executions) != 1 || len(pages[1].Executions) != 1 || pages[0].Executions[0].ID == pages[1].Executions[0].ID {
+		t.Fatalf("pages: %+v", pages)
+	}
+	status, raw = d.call(t, http.MethodGet, "/api/attempts?after=nonsense", d.admin, nil)
+	expectError(t, "a cursor no page returned", status, raw, http.StatusBadRequest, "bad_request")
 }
 
 func TestTaskCancelStartedExecutionConflicts(t *testing.T) {

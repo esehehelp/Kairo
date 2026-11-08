@@ -445,6 +445,14 @@ daemon's `log_directory` are served. `kairo logs
 the last N bytes, `--follow` polls every 2 s until Ctrl-C), and the Python
 SDK's `KairoClient.attempt_log` reads one slice.
 
+`GET /api/executions` (`?project=&queue=&task=&scope_id=&state=`, oldest
+first by submission) and `GET /api/attempts` (`?project=&execution_id=&state=`,
+newest first by authorization) return `limit` rows (default 100, at most
+1000). A page with more after it says where they start, `next` (an opaque
+cursor); the same request with `after=` that cursor reads them, and the last
+page has no `next`. The Python SDK's `KairoClient.all_executions` and
+`all_attempts` follow it.
+
 Clients follow the contract in `sdk/conformance` (how to find the daemon, when
 a token may be sent, how to classify each error); every SDK's tests replay it.
 Codes: `unauthorized` 401, `forbidden` 403, `not_found` 404, `stale_epoch` and

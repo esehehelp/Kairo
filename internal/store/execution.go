@@ -502,6 +502,14 @@ func (s *Store) GetExecution(ctx context.Context, executionID string) (Execution
 }
 
 func (s *Store) ListExecutions(ctx context.Context, filter ExecutionFilter) ([]ExecutionRequest, error) {
+	out, _, err := s.ListExecutionsPage(ctx, filter)
+	return out, err
+}
+
+// ListExecutionsPage lists executions oldest first (by submission), up to
+// the filter's limit (100 by default, at most 1000) after its cursor; next is
+// the cursor to read the rest from, "" when there is no more.
+func (s *Store) ListExecutionsPage(ctx context.Context, filter ExecutionFilter) (out []ExecutionRequest, next string, err error) {
 	query := executionSelect
 	conditions := make([]string, 0, 3)
 	args := make([]any, 0, 4)
@@ -515,48 +523,62 @@ func (s *Store) ListExecutions(ctx context.Context, filter ExecutionFilter) ([]E
 	if filter.State != "" {
 		conditions = append(conditions, `state=`+bind(&args, filter.State))
 	}
+	if filter.After != "" {
+		after, err := parseListCursor(filter.After)
+		if err != nil || after.key == nil {
+			return nil, "", ErrBadCursor
+		}
+		conditions = append(conditions, `(submitted_at,id)>(`+bind(&args, *after.key)+`,`+bind(&args, after.id)+`)`)
+	}
 	if len(conditions) > 0 {
 		query += ` WHERE ` + strings.Join(conditions, ` AND `)
 	}
 	query += ` ORDER BY submitted_at,id LIMIT `
-	limit := filter.Limit
-	if limit <= 0 {
-		limit = 100
-	}
-	if limit > 1000 {
-		limit = 1000
-	}
-	query += bind(&args, limit)
+	limit := listLimit(filter.Limit)
+	query += bind(&args, limit+1)
 	rows, err := s.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	out := make([]ExecutionRequest, 0)
+	out = make([]ExecutionRequest, 0)
 	for rows.Next() {
 		execution, scanErr := scanExecution(rows)
 		if scanErr != nil {
 			rows.Close()
-			return nil, scanErr
+			return nil, "", scanErr
 		}
 		out = append(out, execution)
 	}
 	if err = rows.Err(); err != nil {
 		rows.Close()
-		return nil, err
+		return nil, "", err
 	}
 	rows.Close()
+	if len(out) > limit {
+		out = out[:limit]
+		last := out[limit-1]
+		next = listCursor{key: &last.SubmittedAt, id: last.ID}.String()
+	}
 	ids := make([]string, len(out))
 	for i := range out {
 		ids[i] = out[i].ID
 	}
 	resources, err := s.executionResources(ctx, ids)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	for i := range out {
 		out[i].Resources = resources[out[i].ID]
 	}
-	return out, nil
+	return out, next, nil
+}
+
+// listLimit is a list's page size: 100 by default, at most 1000.
+func listLimit(limit int) int {
+	if limit <= 0 {
+		return 100
+	}
+	return min(limit, 1000)
 }
 
 func (s *Store) listExecutionResources(ctx context.Context, executionID string) ([]ResourceRequest, error) {
