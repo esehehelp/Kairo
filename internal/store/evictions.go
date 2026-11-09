@@ -181,7 +181,8 @@ func evictionsOnStoreTx(ctx context.Context, tx *sql.Tx, d machine.Store, execut
 		return nil, err
 	}
 	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.source_path,COALESCE(d.content_bytes,0),d.last_used_at,d.created_at,d.source_reason IS NOT NULL,d.updated_at FROM data_objects d
-		WHERE d.store_id=$1 AND d.root=$2 AND d.executor_id=$3 AND d.lifecycle='temporal' AND d.state='packed' AND d.source_state=$4`, []any{d.ID, d.Root, executorID, sourceState}, func(rows *sql.Rows) error {
+		WHERE d.store_id=$1 AND d.root=$2 AND d.executor_id=$3 AND d.lifecycle='temporal' AND d.state='packed' AND d.source_state=$4
+		AND (d.transfer_state IS NULL OR $5)`, []any{d.ID, d.Root, executorID, sourceState, claimed}, func(rows *sql.Rows) error {
 		c := candidate{order: EvictionOrder{Kind: EvictTemporal, StoreID: d.ID, Root: d.Root}}
 		var kept bool
 		var updated string

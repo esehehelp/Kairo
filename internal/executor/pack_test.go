@@ -265,3 +265,51 @@ func TestPackRoundPacksWhatIsOrdered(t *testing.T) {
 		t.Fatalf("warned %d times", n)
 	}
 }
+
+// Temporal data to bring to another node is packed whole when its files are
+// still those its identity lists (a pack listing others is removed, not
+// recorded), and its pack is removed once nothing waits for it, its file
+// list (the identity) staying.
+func TestTemporalDataIsPackedForAMoveAndThePackRemovedAfter(t *testing.T) {
+	ctx := context.Background()
+	root := filepath.Join(t.TempDir(), "volatile")
+	fake := &fakePacks{fakeOutputs: &fakeOutputs{fakeScratch: &fakeScratch{fakeStores: &fakeStores{}}}}
+	var logs bytes.Buffer
+	e := storesExecutor(t, fake, &logs)
+	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
+	dir, err := (localStoreFS{}).CreateKind(ctx, root, kindOutput, "exe_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(dir, "shard-0.bin"), []byte("data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	identity, err := (localStoreFS{}).Identify(ctx, root, kindOutput, "exe_1", "obj_t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	order := store.PackOrder{ObjectID: "obj_t", Kind: store.ObjectOutput, SourceID: "exe_1", StoreID: "c-scratch", Root: root, Transfer: true, ManifestSHA256: identity.manifestHash}
+	// changed since it was identified: not kept
+	stale := order
+	stale.ManifestSHA256 = strings.Repeat("ef", 32)
+	fake.orders = []store.PackOrder{stale}
+	e.packDue(ctx)
+	pack := filepath.Join(root, packsDirName, "obj_t"+packSuffix)
+	if len(fake.made) != 0 || exists(pack) || !strings.Contains(logs.String(), "changed since it was identified") {
+		t.Fatalf("a pack listing other files: made %+v, pack there %v\n%s", fake.made, exists(pack), logs.String())
+	}
+	e.packs.retryAt = nil // tried again now
+	fake.orders = []store.PackOrder{order}
+	e.packDue(ctx)
+	if len(fake.made) != 1 || !fake.made[0].Transfer || fake.made[0].PackSHA256 != sha256File(t, pack) || fake.made[0].ManifestSHA256 != identity.manifestHash {
+		t.Fatalf("made: %+v", fake.made)
+	}
+	if entries := unpack(t, pack); entries["shard-0.bin"] != "data" {
+		t.Fatalf("packed: %v", entries)
+	}
+	fake.orders = []store.PackOrder{{ObjectID: "obj_t", Kind: store.ObjectOutput, SourceID: "exe_1", StoreID: "c-scratch", Root: root, Drop: true}}
+	e.packDue(ctx)
+	if len(fake.made) != 2 || !fake.made[1].Dropped || exists(pack) || !exists(pack+manifestSuffix) {
+		t.Fatalf("dropped: %+v, pack there %v, list there %v", fake.made, exists(pack), exists(pack+manifestSuffix))
+	}
+}

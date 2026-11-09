@@ -488,6 +488,10 @@ func (e *Local) packDue(ctx context.Context) {
 	}
 	for _, o := range orders {
 		s, ok := served[o.StoreID]
+		if o.Drop {
+			e.dropTransferPack(ctx, o, s, ok)
+			continue
+		}
 		if o.Kind == store.ObjectImport {
 			e.packImport(ctx, o, s, ok)
 			continue
@@ -511,10 +515,13 @@ func (e *Local) packDue(ctx context.Context) {
 		}
 		started := time.Now()
 		pack := s.fs.Pack
-		if o.Identity {
+		if o.Identity && !o.Transfer {
 			pack = s.fs.Identify
 		}
 		res, err := pack(ctx, s.decl.Root, kind, o.SourceID, o.ObjectID)
+		if err == nil {
+			err = checkTransferPack(s, o, res)
+		}
 		if err == nil {
 			err = e.Store.RecordPack(ctx, packMade(e.ID, o, res))
 		}
@@ -545,10 +552,13 @@ func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore
 	var res packResult
 	if err == nil {
 		pack := s.fs.PackDir
-		if o.Identity {
+		if o.Identity && !o.Transfer {
 			pack = s.fs.IdentifyDir
 		}
 		res, err = pack(ctx, s.decl.Root, o.Path, o.ObjectID)
+		if err == nil {
+			err = checkTransferPack(s, o, res)
+		}
 	}
 	if err == nil {
 		err = e.Store.RecordPack(ctx, packMade(e.ID, o, res))
@@ -571,7 +581,39 @@ func packMade(executorID string, o store.PackOrder, res packResult) store.PackMa
 	if o.Identity {
 		made.Identity, made.Manifest = true, res.listBody
 	}
+	made.Transfer = o.Transfer
 	return made
+}
+
+// checkTransferPack checks that a pack made to bring temporal data to
+// another node (o.Transfer) holds what its identity lists; one that does
+// not is removed (the directory changed since it was identified: it is not
+// brought).
+func checkTransferPack(s servedStore, o store.PackOrder, res packResult) error {
+	if !o.Transfer || res.manifestHash == o.ManifestSHA256 {
+		return nil
+	}
+	_ = removePackOnly(s.fs, s.decl.Root, o.ObjectID)
+	return fmt.Errorf("its files changed since it was identified (list sha256 %s, identity %s): not brought", res.manifestHash, o.ManifestSHA256)
+}
+
+// dropTransferPack removes the pack made to bring temporal data to another
+// node once nothing waits for it there (o.Drop); its file list, the
+// object's identity, stays.
+func (e *Local) dropTransferPack(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
+	if !served || s.decl.Root != o.Root {
+		return
+	}
+	err := removePackOnly(s.fs, s.decl.Root, o.ObjectID)
+	if err == nil {
+		err = e.Store.RecordPack(ctx, store.PackMade{ObjectID: o.ObjectID, ExecutorID: e.ID, Dropped: true})
+	}
+	if err != nil {
+		e.packProblem(o.ObjectID, "pack made for a move not removed", err)
+		return
+	}
+	e.packProblem(o.ObjectID, "", nil)
+	e.Logger.Info("removed the pack made to bring temporal data to another node", "object_id", o.ObjectID)
 }
 
 // nopWriteCloser is a Writer with a Close that does nothing.

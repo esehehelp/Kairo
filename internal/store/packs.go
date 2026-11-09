@@ -49,6 +49,13 @@ type PackOrder struct {
 	// Identity: a temporal object (temporal.go): only its file list is
 	// made, beside where its pack would be; nothing is packed.
 	Identity bool `json:"identity,omitempty"`
+	// Transfer: a temporal object is packed to be brought to another node
+	// (transfer.go); the pack's file list must have ManifestSHA256, its
+	// identity's, or the pack is not kept. Drop: that pack is removed (its
+	// file list, the identity, stays).
+	Transfer       bool   `json:"transfer,omitempty"`
+	Drop           bool   `json:"drop,omitempty"`
+	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
 }
 
 // PackMade is a pack an executor made for an object: where (the pack and its
@@ -70,6 +77,10 @@ type PackMade struct {
 	// kept as the object's identity.
 	Identity bool   `json:"identity,omitempty"`
 	Manifest string `json:"manifest,omitempty"`
+	// Transfer: a pack made for a move (PackOrder.Transfer); Dropped: that
+	// pack removed (PackOrder.Drop).
+	Transfer bool `json:"transfer,omitempty"`
+	Dropped  bool `json:"dropped,omitempty"`
 }
 
 // maxManifestBytes bounds a temporal object's file list kept in the store.
@@ -227,6 +238,31 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 	if err != nil {
 		return nil, err
 	}
+	// Temporal data to pack for a move, or whose pack for one to remove
+	// (transfer.go), while its directory is still Kairo's there.
+	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,x.node_id,d.content_bytes,d.transfer_state,d.manifest_sha256
+		FROM data_objects d JOIN executors x ON x.id=d.executor_id
+		WHERE d.executor_id=$1 AND d.lifecycle='temporal' AND d.state='packed' AND d.transfer_state IN('packing','dropping') ORDER BY d.updated_at,d.id`, []any{executorID}, func(rows *sql.Rows) error {
+		var o PackOrder
+		var nodeID, transfer string
+		var bytes sql.NullInt64
+		var listSHA sql.NullString
+		if err := rows.Scan(&o.ObjectID, &o.Kind, &o.SourceID, &o.StoreID, &o.Root, &o.Path, &nodeID, &bytes, &transfer, &listSHA); err != nil {
+			return err
+		}
+		o.Transfer, o.Drop, o.ManifestSHA256 = transfer == transferPacking, transfer == transferDropping, listSHA.String
+		if o.Transfer && sourceOwnership(declared, o.Kind, nodeID, o.StoreID, o.Root, o.Path, o.SourceID) != "" {
+			return nil
+		}
+		if bytes.Valid {
+			o.Bytes = &bytes.Int64
+		}
+		out = append(out, o)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
 	return out, tx.Commit()
 }
 
@@ -252,6 +288,9 @@ func (s *Store) RecordPack(ctx context.Context, made PackMade) error {
 	}
 	if executorID != made.ExecutorID {
 		return fmt.Errorf("object %s is executor %s's to pack, not %s's", made.ObjectID, executorID, made.ExecutorID)
+	}
+	if made.Transfer || made.Dropped {
+		return recordTransferTx(ctx, tx, made, root, projectID)
 	}
 	if made.Identity != (lifecycle == LifecycleTemporal) {
 		return fmt.Errorf("object %s is %s: an identity is recorded for a temporal object, a pack for a durable one", made.ObjectID, lifecycle)

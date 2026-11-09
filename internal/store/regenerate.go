@@ -34,8 +34,9 @@ import (
 // regenerationRequest is the rerun request id ordering object made again.
 func regenerationRequest(objectID string) string { return "regenerate:" + objectID }
 
-// orderRegenerations orders made again, on its node, each temporal input an
-// execution waits for there and lacks.
+// orderRegenerations brings to its node (transfer.go), or orders made again
+// there, each temporal input an execution waits for there and lacks: brought
+// when its directory is present on another node, made again otherwise.
 func (s *Store) orderRegenerations(ctx context.Context) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -59,6 +60,7 @@ func (s *Store) orderRegenerations(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	wanted := map[string]bool{}
 	for _, w := range found {
 		node := selectorNode(w.selector)
 		inputs, err := decodeInputs(w.inputs)
@@ -73,10 +75,22 @@ func (s *Store) orderRegenerations(ctx context.Context) error {
 			if src.problem != "" || !src.temporal || src.objectID == "" || src.on(node) {
 				continue
 			}
+			// brought from where it is, when it is anywhere (transfer.go)
+			brought, err := bringTemporalTx(ctx, tx, declared, src.objectID, node)
+			if err != nil {
+				return err
+			}
+			if brought {
+				wanted[src.objectID] = true
+				continue
+			}
 			if err = regenerateTx(ctx, tx, src.objectID, node); err != nil {
 				return err
 			}
 		}
+	}
+	if err = dropTransfersTx(ctx, tx, wanted); err != nil {
+		return err
 	}
 	return tx.Commit()
 }

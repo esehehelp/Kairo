@@ -450,6 +450,12 @@ func inputsWaitTx(ctx context.Context, q queryer, declared []machine.Store, proj
 		case node == "" && len(src.places) == 0:
 			missing = append(missing, in.Name+" (on no node: name one in its executor selector)")
 		case node != "" && !src.on(node) && src.temporal && src.objectID != "":
+			if why, brought, err := transferWaitTx(ctx, q, src.objectID, node); err != nil {
+				return "", err
+			} else if brought {
+				missing = append(missing, in.Name+" ("+why+")")
+				continue
+			}
 			why, hard, err := regenerationWaitTx(ctx, q, src.objectID, node)
 			if err != nil {
 				return "", err

@@ -598,8 +598,9 @@ labels may take what is placed there.
   inputs): the first every input is on, else the one the first input is on,
   else the one its object was made on. It waits (`inputs_not_ready`, saying
   which and why) until every input is on that node, those missing being
-  brought there meanwhile once they are packed, or made again there when
-  they are temporal data (Data stores: temporal data); one that cannot be
+  brought there meanwhile once they are packed (temporal data from the node
+  it is on, or made again there when it is on none: Data stores: temporal
+  data); one that cannot be
   had at all (a task with no run, a name the project has no object of,
   temporal data made again differing from what it was) says so.
   Each is checked again when its attempt launches: on that node, in its
@@ -1231,13 +1232,28 @@ the file list a pack of it would have (`identity` in `packs-to-make`; every
 file read, nothing written but `<root>/packs/<object id>.tar.zst.files.tsv`),
 recorded with the list itself, which the store keeps (`manifest`; event
 `identified`). The directory stays where it is, on its volatile store, and
-is read in place by the executions that name it as an input; it is never
-brought to another node (a pack would be needed), nor deleted once copied
-(it is not copied), but it is evicted when its store runs short of room
-(Evicting, below). `kairo data list` shows each object's `LIFECYCLE`.
+is read in place by the executions that name it as an input; it is not
+deleted once copied (it is not copied), but it is evicted when its store
+runs short of room (Evicting, below). `kairo data list` shows each object's
+`LIFECYCLE`.
+
+Brought between nodes: an execution waiting on a node for temporal data that
+is on another node (its directory still there) has it brought, not made
+again. The executor holding it packs it for the move (`transfer_state`
+`packing`, the pack order's `transfer`; event `transfer_ordered`): the pack's
+file list must be its identity's, or it is removed and not recorded (the
+directory changed since it was identified: it is not brought). Packed
+(`packed`, with the pack's path, size and sha256; event `transfer_packed`),
+it is brought as a durable object is (Brought inputs, below), from the agent
+of the node that packed it: it is not copied to a durable store. Once no
+execution waits for it on a node lacking it and none is being brought, the
+pack is removed (`dropping`, the order's `drop`; its identity's file list
+stays; event `transfer_dropped`). Meanwhile its directory is not evicted. The
+waiting execution says where it is in that (`being packed on N to be brought
+to M`, `being brought to M from N`).
 
 Made again: an execution waiting on a node for an input that is temporal
-data not on that node (evicted, or made on another) has it made again there
+data on no node (evicted wherever it was) has it made again there
 by the task that makes it, once that task has succeeded: the task is rerun
 (rerun request `regenerate:<object id>`, actor `kairo`; event
 `regeneration_ordered`), its execution planned onto that node, and the

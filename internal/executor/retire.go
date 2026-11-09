@@ -545,6 +545,16 @@ func unescapeListPath(p string) string {
 // through handles (a link there is removed itself); ones already gone are no
 // error.
 func removePack(sfs storeFS, root, objectID string) error {
+	return removePackFiles(sfs, root, objectID, objectID+packSuffix+manifestSuffix, objectID+packSuffix)
+}
+
+// removePackOnly removes the pack of objectID under root but not its file
+// list (a temporal object's identity).
+func removePackOnly(sfs storeFS, root, objectID string) error {
+	return removePackFiles(sfs, root, objectID, objectID+packSuffix)
+}
+
+func removePackFiles(sfs storeFS, root, objectID string, names ...string) error {
 	if _, ok := sfs.(localStoreFS); !ok {
 		return errPackNotHere
 	}
@@ -564,7 +574,7 @@ func removePack(sfs storeFS, root, objectID string) error {
 		return err
 	}
 	defer pr.Close()
-	for _, name := range []string{objectID + packSuffix + manifestSuffix, objectID + packSuffix} {
+	for _, name := range names {
 		if err := pr.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
