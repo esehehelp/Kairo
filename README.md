@@ -1242,7 +1242,11 @@ by the task that makes it, once that task has succeeded: the task is rerun
 (rerun request `regenerate:<object id>`, actor `kairo`; event
 `regeneration_ordered`), its execution planned onto that node, and the
 object keeps the rerun's ordinal (`regeneration_ordinal`); it is ordered
-once per object. A task pending or running is waited for; one failed,
+once per object. Only where the task can run: when no enabled executor of
+that node has the executor labels of the task's latest execution (a dataset
+built from files one machine alone holds, read on another), nothing is
+ordered and its readers wait saying so (temporal data is not brought between
+nodes: make such data a durable output, which is). A task pending or running is waited for; one failed,
 stopped, cancelled or blocked is the project's to rerun (the wait says so):
 nothing is retried. Each output a run of the task leaves is compared, once
 identified, with the objects of the task that are evicted or ordered made

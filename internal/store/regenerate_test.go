@@ -205,3 +205,104 @@ func TestFileListsCompareWithoutMtimes(t *testing.T) {
 		}
 	}
 }
+
+// Temporal data whose task cannot run where it is read (no executor there
+// has the task's labels) is not ordered made again there: its reader waits,
+// saying so.
+func TestTemporalDataIsNotOrderedMadeAgainWhereItsTaskCannotRun(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	addTestDisk(t, store, "node", "/")
+	ctx := context.Background()
+	declareTestStore(t, store,
+		machine.Store{ID: "w-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "executor", Root: "/var/kairo", Filesystem: "/"},
+	)
+	if _, err := store.ApplyProject(ctx, projectSpec(t, `schema_version = 1
+[project]
+name = "sumire"
+[[tasks]]
+name = "build"
+queue = "q"
+depends_on = []
+policy = "RunToCompletion@v1"
+[tasks.execution]
+schema_version = 2
+argv = ["build-dataset"]
+cwd = "/work"
+regenerable = true
+[tasks.execution.executor]
+labels = { environment = "wsl2" }
+`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileProjectTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	build := authorizeNext(t, store)
+	if err := store.RecordRunOutput(ctx, RunOutput{AttemptID: build.Attempt.ID, LeaseID: build.Lease.ID, Epoch: build.Lease.CoordinationEpoch, RunID: build.RunID,
+		StoreID: "w-scratch", ExecutorID: "executor", Root: "/var/kairo", Path: "/var/kairo/outputs/" + build.RunID}); err != nil {
+		t.Fatal(err)
+	}
+	epoch := build.Lease.CoordinationEpoch
+	if err := store.ActivateLaunch(ctx, build.Attempt.ID, build.Lease.ID, epoch, build.AuthorizationToken, 100, "launcher:100"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordTerminal(ctx, build.Attempt.ID, build.Lease.ID, epoch, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	refreshSchedulerGPU(t, store)
+	if err := store.FinalizeQuiescence(ctx, build.Attempt.ID, build.Lease.ID, epoch); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileProjectTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	orders, err := store.PacksToMake(ctx, "executor")
+	if err != nil || len(orders) != 1 || !orders[0].Identity {
+		t.Fatalf("orders %+v %v", orders, err)
+	}
+	list := "path\tbytes\tsha256\tmtime_ns\nshard-0.bin\t4\t" + strings.Repeat("ab", 32) + "\t1\n"
+	sum := sha256.Sum256([]byte(list))
+	object := orders[0].ObjectID
+	if err = store.RecordPack(ctx, PackMade{ObjectID: object, ExecutorID: "executor", ManifestPath: "/var/kairo/packs/" + object + ".tar.zst.files.tsv",
+		ContentBytes: 4, Files: 1, ManifestSHA256: hex.EncodeToString(sum[:]), Identity: true, Manifest: list}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.testExec(`UPDATE data_objects SET source_state='evicted' WHERE id=$1`, object); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.testExec(`UPDATE run_outputs SET state='deleted' WHERE run_id=$1`, build.RunID); err != nil {
+		t.Fatal(err)
+	}
+	// the node's executor no longer has the task's labels
+	if _, err = store.testExec(`UPDATE executors SET attributes_json='{}' WHERE id='executor'`); err != nil {
+		t.Fatal(err)
+	}
+	declared, err := declaredStores(ctx, store.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := schedulerExecutionSpec("reader")
+	reader.Scope.Project = "sumire"
+	reader.Exclusive, reader.Checkpointable, reader.Preemptible = []ExclusiveRequest{}, false, false
+	in := datainput.Input{Name: "data", Object: object}
+	reader.Inputs = []datainput.Input{in}
+	execution, _, err := store.SubmitExecution(ctx, reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal([]datainput.Input{in})
+	why, err := inputsWaitTx(ctx, store.db, declared, execution.ProjectScopeID, string(execution.ExecutorSelector), string(body))
+	if err != nil || !strings.Contains(why, "cannot make again on node") {
+		t.Fatalf("wait: %q %v", why, err)
+	}
+	for i := 0; i < 2; i++ {
+		if err = store.ReconcileProjectTasks(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var ordered *int64
+	if err = store.db.QueryRowContext(ctx, `SELECT regeneration_ordinal FROM data_objects WHERE id=$1`, object).Scan(&ordered); err != nil || ordered != nil {
+		t.Fatalf("ordered made again where its task cannot run: %v %v", ordered, err)
+	}
+}

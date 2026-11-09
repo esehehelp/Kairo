@@ -108,6 +108,9 @@ func regenerateTx(ctx context.Context, tx *sql.Tx, objectID, node string) error 
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM execution_requests e JOIN leases l ON l.execution_id=e.id WHERE e.task_scope_id=$1 AND (e.state<>'terminal' OR l.state<>'released'))`, producer.String).Scan(&held); err != nil || held {
 		return err
 	}
+	if runs, err := producerRunsOnTx(ctx, tx, producer.String, node); err != nil || !runs {
+		return err
+	}
 	ordinal, err := markTaskRerunTx(ctx, tx, producer.String, regenerationRequest(objectID), "kairo")
 	if err != nil {
 		return err
@@ -123,6 +126,42 @@ func regenerateTx(ctx context.Context, tx *sql.Tx, objectID, node string) error 
 		project = &projectID.String
 	}
 	return appendCoordinationEventTx(ctx, tx, "regeneration_ordered", project, "object", objectID, nil, map[string]any{"task": name, "ordinal": ordinal, "node": node})
+}
+
+// producerRunsOnTx reports whether the task that makes a temporal object can
+// run on node: an enabled executor there has the executor labels of its
+// latest execution (a task never run is given the benefit of the doubt).
+// Temporal data is not brought between nodes, so one made where its reader
+// cannot make it again (a dataset built from files on one machine only)
+// waits, saying so, rather than ordering a rerun that never starts.
+func producerRunsOnTx(ctx context.Context, q queryer, producer, node string) (bool, error) {
+	var selector string
+	err := q.QueryRowContext(ctx, `SELECT executor_selector_json FROM execution_requests WHERE task_scope_id=$1 ORDER BY submitted_at DESC,id DESC LIMIT 1`, producer).Scan(&selector)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	spec := ExecutionSpec{ExecutorSelector: json.RawMessage(selector)}
+	if pinNodeSpec(&spec, node) != nil {
+		return true, nil
+	}
+	rows, err := q.QueryContext(ctx, `SELECT attributes_json FROM executors WHERE node_id=$1 AND enabled`, node)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var attributes string
+		if err = rows.Scan(&attributes); err != nil {
+			return false, err
+		}
+		if selectorMatches(string(spec.ExecutorSelector), node, attributes) {
+			return true, nil
+		}
+	}
+	return false, rows.Err()
 }
 
 // rerunNodeTx is the node a task's rerun at ordinal is to be planned onto
@@ -296,6 +335,15 @@ func regenerationWaitTx(ctx context.Context, q queryer, objectID, node string) (
 			return "the task that makes it again is no longer declared", true, nil
 		}
 		return "", false, err
+	}
+	if !ordered.Valid {
+		runs, err := producerRunsOnTx(ctx, q, producer.String, node)
+		if err != nil {
+			return "", false, err
+		}
+		if !runs {
+			return "temporal data, which task " + name + " cannot make again on " + node + " (no executor there has its labels) and is not brought between nodes: make it a durable output, or read it where it is made", true, nil
+		}
 	}
 	switch {
 	case ordered.Valid && (state == "pending" || state == "running"):
