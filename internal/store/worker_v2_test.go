@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
+	"time"
 )
 
 func startCooperativeExecution(t *testing.T, requestID string) (*Store, ExecutionRequest, *Launch) {
@@ -240,5 +242,47 @@ func TestDelayedRejectedAckCannotReactivateExitedLease(t *testing.T) {
 	refreshSchedulerGPU(t, store)
 	if err = store.FinalizeQuiescence(ctx, launch.Attempt.ID, launch.Lease.ID, epoch); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A node whose agent is gone is fenced: its attempt lost, its execution
+// terminal, its lease stale (so that reconcile can free the GPU); not while
+// an executor of it still polls, and not a node without executors.
+func TestFencingANodeMakesTheLeasesOfItsSilentExecutorsStale(t *testing.T) {
+	store, execution, launch := startCooperativeExecution(t, "fence")
+	ctx := context.Background()
+	if _, err := store.testExec(`UPDATE executors SET last_seen_at=$1 WHERE id='executor'`, now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.FenceNode(ctx, "node", "me", "gone"); !errors.Is(err, ErrExecutorLive) {
+		t.Fatalf("a polling executor's node fenced: %v", err)
+	}
+	if _, err := store.FenceNode(ctx, "no-such-node", "me", "gone"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a node without executors: %v", err)
+	}
+	if _, err := store.testExec(`UPDATE executors SET last_seen_at=$1 WHERE id='executor'`, time.Now().UTC().Add(-10*time.Minute).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := store.FenceNode(ctx, "node", "me", "gone")
+	if err != nil || stale["executor"] != 1 {
+		t.Fatalf("fenced: %v %v", stale, err)
+	}
+	var attemptState, leaseState, executionState string
+	if err := store.db.QueryRowContext(ctx, `SELECT a.state,l.state,e.state FROM attempts a JOIN leases l ON l.attempt_id=a.id JOIN execution_requests e ON e.id=a.execution_id WHERE a.id=$1`, launch.Attempt.ID).Scan(&attemptState, &leaseState, &executionState); err != nil {
+		t.Fatal(err)
+	}
+	if attemptState != "lost" || leaseState != "stale" || executionState != "terminal" {
+		t.Fatalf("attempt %s, lease %s, execution %s (%s)", attemptState, leaseState, executionState, execution.ID)
+	}
+	events, err := store.ListEvents(ctx, EventFilter{Limit: 1000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range events {
+		found = found || e.EventType == "node_fenced" && e.AggregateID == "node"
+	}
+	if !found {
+		t.Fatal("no node_fenced event")
 	}
 }

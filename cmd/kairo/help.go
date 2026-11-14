@@ -251,11 +251,12 @@ func init() {
 				"benchmark": "bench", "measure": "bench", "curve": "profile", "profiles": "profile",
 			},
 		}},
-		{name: "node", summary: "quarantine or release nodes", group: &commandGroup{
+		{name: "node", summary: "quarantine, release or fence nodes", group: &commandGroup{
 			subs: []command{
 				{"quarantine", "NODE_ID|--all [--reason R]", "suspend or end the work on a node", bind(nodeAction, "quarantine")},
 				{"release", "NODE_ID|--all", "end a node quarantine", bind(nodeAction, "release")},
 				{"quarantine-status", "", "current node quarantines (JSON)", bind(nodeAction, "quarantine-status")},
+				{"fence", "NODE_ID --confirm-agent-gone [--reason R]", "make the leases of a node whose agent is gone stale", bind(nodeAction, "fence")},
 			},
 			aliases: map[string]string{"status": "quarantine-status", "ls": "quarantine-status", "list": "quarantine-status", "enable": "release"},
 		}},

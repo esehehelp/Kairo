@@ -321,6 +321,7 @@ func TestResourceAndNodeCommandsUseTheAPIRoutes(t *testing.T) {
 		{"node", "quarantine", api, "--actor", "me", "--reason", "maintenance", "pve0"},
 		{"node", "release", api, "--actor", "me", "--all"},
 		{"node", "quarantine-status", api},
+		{"node", "fence", api, "--actor", "me", "--confirm-agent-gone", "pve0"},
 	} {
 		if _, err := captureStdout(t, func() error { return run(args) }); err != nil {
 			t.Fatalf("%v: %v", args, err)
@@ -334,6 +335,7 @@ func TestResourceAndNodeCommandsUseTheAPIRoutes(t *testing.T) {
 		`POST /api/nodes/pve0/quarantine {"actor":"me","reason":"maintenance"}`,
 		`DELETE /api/nodes/all/quarantine {"actor":"me"}`,
 		"GET /api/nodes/quarantines",
+		`POST /api/nodes/pve0/fence {"actor":"me","confirm_agent_gone":true,"reason":"agent gone"}`,
 	}
 	if strings.Join(requests, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("requests:\n%s\nwant:\n%s", strings.Join(requests, "\n"), strings.Join(want, "\n"))

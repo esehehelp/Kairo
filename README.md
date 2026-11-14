@@ -396,6 +396,7 @@ shows.
 | POST | `/api/scopes/{id}/pause`, `/api/scopes/{id}/resume` | admin |
 | GET | `/api/nodes/quarantines` | read |
 | POST, DELETE | `/api/nodes/{id}/quarantine` | admin |
+| POST | `/api/nodes/{id}/fence` | admin |
 | GET | `/api/resources` | read |
 | POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
 | GET, POST | `/api/machines` (the machine declaration) | read, admin |
@@ -481,8 +482,12 @@ database is unreachable, overloaded or gave up on a lock: transient, retry). `GE
 Checkpoint publication does not prove process exit, and process exit does not
 prove distributed quiescence. Kairo releases a lease only after every
 registered process is absent and provider observations taken after that
-absence show resources unclaimed. An expired or executor-lost lease becomes
-stale; it is never made free based on time alone.
+absence show resources unclaimed. A lease its executor cannot vouch for
+becomes stale: when the executor's agent registers again without adopting
+its attempt, or when an operator fences the node of an agent that is gone
+(`kairo node fence`, Node fence below). Time alone never makes a lease stale
+or free: a stale lease holds its resources until `kairo resource reconcile
+RESOURCE_ID --confirm-process-absent` releases it.
 
 What an exited attempt left running (its launcher exited and its exit is
 recorded, yet a process of its tree runs: one it started without
@@ -1781,6 +1786,24 @@ node (or every node) until `kairo node release <NODE_ID>` (or `--all`):
 `kairo node quarantine-status` shows each quarantine with the attempts still
 alive on it; the quarantine has taken full effect once that count is zero.
 Every step is recorded as a coordination event.
+
+### Node fence
+
+An agent that stops for good (its machine lost, its container destroyed)
+never registers again, so the leases of its attempts stay active and hold
+their GPUs and the rest. `kairo node fence NODE_ID --confirm-agent-gone
+[--reason R]` (`POST /api/nodes/{id}/fence`, admin) settles them as the
+agent's registration would have, adopting nothing: each attempt of the
+node's executors is lost, its execution terminal (`executor_identity_lost`),
+and every lease of theirs stale (event `node_fenced`, with the stale leases
+per executor). It is refused (409 `executor_live`) while an executor of the
+node has polled within the last minute: a live agent settles its own leases
+when it restarts. A stale lease still holds its resources; once nothing of
+those attempts runs, `kairo resource reconcile RESOURCE_ID
+--confirm-process-absent` releases it. Should the agent come back after
+all, it does not adopt the attempts it finds (they are lost): their
+processes go on unwatched until they end or are stopped by hand, which is
+what `--confirm-process-absent` is there to check.
 
 ### Force stop
 

@@ -7,6 +7,9 @@ import (
 )
 
 func nodeAction(action string, args []string) error {
+	if action == "fence" {
+		return nodeFence(args)
+	}
 	fs := newFlags("node " + action)
 	api := apiFlag(fs)
 	var all *bool
@@ -59,4 +62,31 @@ func defaultActor() string {
 		return u
 	}
 	return "operator"
+}
+
+// nodeFence settles the leases of a node whose agent is gone for good
+// (POST /api/nodes/ID/fence): its attempts lost, their leases stale, to be
+// freed by resource reconcile once nothing of them runs.
+func nodeFence(args []string) error {
+	fs := newFlags("node fence")
+	api := apiFlag(fs)
+	actor := fs.String("actor", defaultActor(), "who acts")
+	reason := fs.String("reason", "agent gone", "why")
+	confirm := fs.Bool("confirm-agent-gone", false, "the node's agent is gone and will not come back to adopt its attempts (required)")
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 1 {
+		return usageError("node fence takes exactly one NODE_ID")
+	}
+	if !*confirm {
+		return usageError("node fence needs --confirm-agent-gone: the node's agent is gone and will not come back to adopt its attempts")
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	return client.print(http.MethodPost, "/api/nodes/"+url.PathEscape(positional[0])+"/fence",
+		map[string]any{"actor": *actor, "reason": *reason, "confirm_agent_gone": true})
 }

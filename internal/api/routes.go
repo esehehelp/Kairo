@@ -45,6 +45,7 @@ func (s *Server) routes() []route {
 		{"GET", "/api/nodes/quarantines", roleRead, s.listNodeQuarantines},
 		{"POST", "/api/nodes/{id}/quarantine", roleAdmin, s.quarantineNode},
 		{"DELETE", "/api/nodes/{id}/quarantine", roleAdmin, s.releaseNodeQuarantine},
+		{"POST", "/api/nodes/{id}/fence", roleAdmin, s.fenceNode},
 
 		{"GET", "/api/resources", roleRead, s.resourceStatus},
 		{"POST", "/api/resources/{id}/enable", roleAdmin, s.enableResource},

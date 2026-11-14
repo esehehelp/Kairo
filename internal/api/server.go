@@ -85,6 +85,7 @@ var errorCodes = []struct {
 	{"bench_conflict", http.StatusConflict, store.ErrBenchConflict},
 	{"gang_not_ready", http.StatusConflict, store.ErrGangNotReady},
 	{"gang_aborted", http.StatusConflict, store.ErrGangAborted},
+	{"executor_live", http.StatusConflict, store.ErrExecutorLive},
 	{"gate_closed", http.StatusLocked, store.ErrGateClosed},
 	{"observe_only", http.StatusLocked, errObserveOnly},
 }

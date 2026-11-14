@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"kairo/internal/id"
 )
@@ -623,6 +624,19 @@ func (s *Store) ReregisterExecutor(ctx context.Context, executorID string, adopt
 		return 0, nil, err
 	}
 	defer tx.Rollback()
+	n, adopted, err := reregisterExecutorTx(ctx, tx, executorID, adopt)
+	if err != nil {
+		return 0, nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, nil, err
+	}
+	return n, adopted, nil
+}
+
+// reregisterExecutorTx is ReregisterExecutor in tx: the leases made stale,
+// the attempts adopted.
+func reregisterExecutorTx(ctx context.Context, tx *sql.Tx, executorID string, adopt []AdoptedAttempt) (int, []string, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT a.id,a.execution_id,a.coordination_epoch,l.id,a.state,a.pid,a.process_identity FROM attempts a JOIN leases l ON l.attempt_id=a.id WHERE a.executor_id=$1 AND a.state IN('authorized','running','quiescing') AND l.state IN('prepared','active','releasing','revocation_requested')`, executorID)
 	if err != nil {
 		return 0, nil, err
@@ -726,8 +740,71 @@ func (s *Store) ReregisterExecutor(ctx context.Context, executorID string, adopt
 			return 0, nil, err
 		}
 	}
-	if err = tx.Commit(); err != nil {
-		return 0, nil, err
-	}
 	return len(values) + len(orphans), adopted, nil
+}
+
+// ErrExecutorLive: a node is not fenced while an executor of it polls.
+var ErrExecutorLive = errors.New("an executor of the node is still polling")
+
+// FenceNode settles what the executors of a node whose agent is gone and
+// will not come back as it was (the machine lost, its disk replaced) held,
+// as if each registered again adopting nothing: their attempts lost, the
+// executions terminal, every lease of theirs stale (event node_fenced). A
+// stale lease still holds its resources; `kairo resource reconcile
+// --confirm-process-absent` frees them once the operator has seen that
+// nothing of those attempts runs. Refused while an executor of the node has
+// polled within executorLiveWindow (its agent settles its own leases when it
+// registers). Returns the leases made stale per executor.
+func (s *Store) FenceNode(ctx context.Context, nodeID, actor, reason string) (map[string]int, error) {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	rows, err := tx.QueryContext(ctx, `SELECT id,last_seen_at FROM executors WHERE node_id=$1 ORDER BY id`, nodeID)
+	if err != nil {
+		return nil, err
+	}
+	type executor struct {
+		id   string
+		seen sql.NullString
+	}
+	var executors []executor
+	for rows.Next() {
+		var e executor
+		if err = rows.Scan(&e.id, &e.seen); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		executors = append(executors, e)
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	if len(executors) == 0 {
+		return nil, fmt.Errorf("%w: node %s has no executor", ErrNotFound, nodeID)
+	}
+	for _, e := range executors {
+		if !e.seen.Valid {
+			continue
+		}
+		if at, err := time.Parse(time.RFC3339Nano, e.seen.String); err == nil && time.Since(at) < executorLiveWindow {
+			return nil, fmt.Errorf("%w: executor %s polled %s ago; restart its agent instead, which settles its leases when it registers", ErrExecutorLive, e.id, time.Since(at).Round(time.Second))
+		}
+	}
+	stale := map[string]int{}
+	for _, e := range executors {
+		n, _, err := reregisterExecutorTx(ctx, tx, e.id, nil)
+		if err != nil {
+			return nil, err
+		}
+		stale[e.id] = n
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "node_fenced", nil, "node", nodeID, nil, map[string]any{"actor": actor, "reason": reason, "stale_leases": stale}); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return stale, nil
 }
