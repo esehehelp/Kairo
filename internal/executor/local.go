@@ -139,6 +139,8 @@ type Local struct {
 	deletions  round
 	evictions  round
 	scrubs     round
+	// sourceCleanups: unpacked code snapshots no longer used (source.go).
+	sourceCleanups round
 
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
@@ -252,6 +254,7 @@ func (e *Local) tick(ctx context.Context) error {
 	e.makeDeletions()
 	e.makeEvictions()
 	e.makeScrubs()
+	e.makeSourceCleanups()
 	e.endStep()
 	for {
 		reservation, err := e.reserveNext(ctx)

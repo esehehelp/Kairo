@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -536,4 +537,132 @@ func writeRootFile(dir *os.Root, name string, body []byte) error {
 		err = closeErr
 	}
 	return err
+}
+
+// SourceKeeper says which snapshots are in use: those of executions not yet
+// terminal.
+type SourceKeeper interface {
+	SourcesInUse(ctx context.Context, executorID string) ([]string, error)
+}
+
+const (
+	sourceCleanInterval = time.Hour
+	sourceCleanTimeout  = time.Hour
+	// sourceKeep: how long an unpacked snapshot no execution uses any more
+	// is kept after it was last launched in (a rerun soon after finds it).
+	sourceKeep = 3 * 24 * time.Hour
+	// sourceAsideKeep: how long a snapshot set aside as changed is kept
+	// (once its snapshot is not in use).
+	sourceAsideKeep = time.Hour
+	// sourcePartialKeep: how long what an unpack left half done is kept.
+	sourcePartialKeep = 24 * time.Hour
+)
+
+func (e *Local) makeSourceCleanups() {
+	e.startRound(&e.sourceCleanups, sourceCleanInterval, sourceCleanTimeout, e.cleanSources)
+}
+
+// cleanSources removes from <root>/sources of each usable local volatile
+// store this executor serves what is no longer used there (cleanSourcesIn),
+// never without the daemon's word on which snapshots are in use.
+func (e *Local) cleanSources(ctx context.Context) {
+	keeper, ok := e.Store.(SourceKeeper)
+	if !ok {
+		return
+	}
+	ids, err := keeper.SourcesInUse(ctx, e.ID)
+	if err != nil {
+		e.roundProblem(&e.sourceCleanups, "", "code snapshots in use not read", err)
+		return
+	}
+	e.roundProblem(&e.sourceCleanups, "", "", nil)
+	inUse := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		inUse[id] = true
+	}
+	for _, s := range e.servedStores() {
+		if _, local := s.fs.(localStoreFS); !s.usable || s.decl.Class != "volatile" || !local {
+			continue
+		}
+		e.cleanSourcesIn(filepath.Join(s.decl.Root, sourcesDirName), inUse, time.Now())
+	}
+}
+
+// cleanSourcesIn removes from base, of what Kairo names there (src_<id>
+// and what is beside it; nothing else is touched): an unpacked snapshot no
+// execution uses whose record says it was last launched in sourceKeep ago
+// or more (its record first, so a tree left half removed is taken as
+// changed), with its record; one set aside as changed sourceAsideKeep ago
+// whose snapshot no execution uses; a record without its tree; and what an
+// unpack left half done sourcePartialKeep ago.
+func (e *Local) cleanSourcesIn(base string, inUse map[string]bool, now time.Time) {
+	dir, err := os.OpenRoot(base)
+	if err != nil {
+		return
+	}
+	defer dir.Close()
+	entries, err := fs.ReadDir(dir.FS(), ".")
+	if err != nil {
+		e.roundProblem(&e.sourceCleanups, base, "code snapshots not listed", err)
+		return
+	}
+	idLen := len("src_") + 32
+	for _, entry := range entries {
+		name := entry.Name()
+		if len(name) < idLen || !sourcesnap.ValidID(name[:idLen]) || entry.Type()&fs.ModeSymlink != 0 {
+			continue
+		}
+		id, rest := name[:idLen], name[idLen:]
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		removed := ""
+		switch {
+		case rest == "" && entry.IsDir():
+			if inUse[id] {
+				continue
+			}
+			unlock := lockSourceDir(filepath.Join(base, id))
+			used := info.ModTime()
+			if state, err := dir.Lstat(id + stateSuffix); err == nil {
+				used = state.ModTime()
+			}
+			if now.Sub(used) >= sourceKeep {
+				_ = dir.Remove(id + stateSuffix)
+				removeUnpacked(dir, id)
+				removed = "unpacked code snapshot removed: not used"
+			}
+			unlock()
+		case rest == stateSuffix:
+			if _, err := dir.Lstat(id); errors.Is(err, fs.ErrNotExist) && !inUse[id] && now.Sub(info.ModTime()) >= sourcePartialKeep {
+				_ = dir.Remove(name)
+			}
+		case strings.HasPrefix(rest, changedInfix) && entry.IsDir():
+			at, err := strconv.ParseInt(rest[len(changedInfix):], 10, 64)
+			if err != nil || inUse[id] || now.Sub(time.Unix(0, at)) < sourceAsideKeep {
+				continue
+			}
+			removeUnpacked(dir, name)
+			removed = "code snapshot set aside as changed removed"
+		case strings.HasSuffix(rest, partialSuffix):
+			if now.Sub(info.ModTime()) < sourcePartialKeep {
+				continue
+			}
+			if entry.IsDir() {
+				removeUnpacked(dir, name)
+			} else {
+				_ = dir.Remove(name)
+			}
+		}
+		if removed == "" {
+			continue
+		}
+		if _, err := dir.Lstat(name); err == nil {
+			e.roundProblem(&e.sourceCleanups, name, "code snapshot not removed", errors.New("still there"))
+			continue
+		}
+		e.roundProblem(&e.sourceCleanups, name, "", nil)
+		e.Logger.Info(removed, "source_id", id, "path", filepath.Join(base, name))
+	}
 }

@@ -203,3 +203,23 @@ func sourceKnownTx(ctx context.Context, q queryer, id string) (bool, error) {
 	err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM source_snapshots WHERE id=$1)`, id).Scan(&known)
 	return known, err
 }
+
+// SourcesInUse are the snapshots of executions not yet terminal: what runs,
+// or is to run, in them. An executor keeps those unpacked
+// (executor/source.go).
+func (s *Store) SourcesInUse(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT source_snapshot_id FROM execution_requests WHERE source_snapshot_id IS NOT NULL AND state<>'terminal' ORDER BY source_snapshot_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}

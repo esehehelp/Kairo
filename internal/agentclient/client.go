@@ -678,6 +678,16 @@ func (s *LogShipper) shipFile(ctx context.Context, path, name string) error {
 	return nil
 }
 
+// SourcesInUse are the code snapshots of executions not yet terminal
+// (executor.SourceKeeper).
+func (c *Client) SourcesInUse(ctx context.Context, executorID string) ([]string, error) {
+	var out struct {
+		Sources []string `json:"sources"`
+	}
+	err := c.call(ctx, "sources-in-use", map[string]string{"executor_id": executorID}, &out)
+	return out.Sources, err
+}
+
 // FetchSource writes file ("pack" or "list") of code snapshot id, as the
 // daemon keeps it, to w (executor.SourceFetcher).
 func (c *Client) FetchSource(ctx context.Context, id, file string, w io.Writer) error {

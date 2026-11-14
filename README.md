@@ -1077,6 +1077,17 @@ unless its environment sets that or `PYTHONPYCACHEPREFIX`, so Python does
 not write its bytecode there. A confined attempt cannot write there at all.
 Not inside WSL yet (refused at launch).
 
+What is unpacked does not stay for good. Every hour each executor asks the
+daemon which snapshots executions not yet terminal use (agent operation
+`sources-in-use`) and, never without that answer, removes from
+`<root>/sources` of the volatile stores it serves: an unpacked snapshot none
+of them uses that was last launched in three days ago or more (its `.state`
+first, so a tree left half removed is taken as changed), a tree set aside
+as changed an hour ago once its snapshot is not in use, a `.state` without
+its tree, and what an unpack left half done a day ago. Nothing else there is
+touched. The daemon keeps every snapshot it was sent: they are the record of
+what each task ran.
+
 `kairo source list [--project P]` lists snapshots (newest first: project,
 source, files, size, git state), `kairo source show ID [--files]` one with
 the tasks bound to it, and `kairo source diff A B` the files added (`+`),

@@ -3,14 +3,17 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"kairo/internal/machine"
 	"kairo/internal/store"
@@ -268,5 +271,105 @@ func TestASnapshotUnpackedAtOnceByTwoExecutorsIsBroughtOnce(t *testing.T) {
 	entries, _ := os.ReadDir(filepath.Join(root, sourcesDirName))
 	if len(entries) != 2 {
 		t.Fatalf("beside the snapshot: %v", entries)
+	}
+}
+
+// keepingSources is fakeSources that says which snapshots are in use.
+type keepingSources struct {
+	*fakeSources
+	inUse []string
+	err   error
+}
+
+func (k *keepingSources) SourcesInUse(context.Context, string) ([]string, error) {
+	return k.inUse, k.err
+}
+
+// An unpacked snapshot no execution uses is removed once it was last
+// launched in long enough ago, read-only as it is; one in use, or launched
+// in lately, stays; a tree set aside as changed goes once its snapshot is
+// not in use, what an unpack left half done after a day; what Kairo does not
+// name there is never touched, and nothing is removed without the daemon's
+// word on what is in use.
+func TestUnpackedSnapshotsNoLongerUsedAreRemoved(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "volatile")
+	base := filepath.Join(root, sourcesDirName)
+	t.Cleanup(func() { makeTreeWritable(root) })
+	now := time.Now()
+	old, recent := now.Add(-sourceKeep-time.Hour), now.Add(-time.Hour)
+	id := func(c string) string { return "src_" + strings.Repeat(c, 32) }
+	tree := func(name string) {
+		t.Helper()
+		dir := filepath.Join(base, name, "pkg")
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "a.py"), []byte("a"), 0o444); err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range []string{dir, filepath.Dir(dir)} {
+			if err := os.Chmod(d, 0o555); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	file := func(name string, at time.Time) {
+		t.Helper()
+		p := filepath.Join(base, name)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(p, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// a, unused for long; b, in use; c, launched in lately
+	for c, used := range map[string]time.Time{"a": old, "b": old, "c": recent} {
+		tree(id(c))
+		file(id(c)+stateSuffix, used)
+	}
+	tree(fmt.Sprintf("%s%s%d", id("a"), changedInfix, now.Add(-2*time.Hour).UnixNano()))
+	tree(fmt.Sprintf("%s%s%d", id("b"), changedInfix, now.Add(-2*time.Hour).UnixNano()))
+	tree(fmt.Sprintf("%s%s%d", id("c"), changedInfix, now.Add(-time.Minute).UnixNano()))
+	file(id("d")+stateSuffix, old) // a record without its tree
+	file(id("e")+".0123456789ab"+packSuffix+partialSuffix, old)
+	file(id("e")+".ba9876543210"+packSuffix+partialSuffix, recent)
+	file("notes.txt", old)
+	tree("src_not-kairos")
+
+	fake := &keepingSources{fakeSources: &fakeSources{fakeStores: &fakeStores{}}, inUse: []string{id("b")}}
+	var logs bytes.Buffer
+	e := storesExecutor(t, fake, &logs)
+	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
+	before, _ := os.ReadDir(base)
+	fake.err = errors.New("daemon unreachable")
+	e.cleanSources(context.Background())
+	if after, _ := os.ReadDir(base); len(after) != len(before) {
+		t.Fatalf("removed without the daemon's word: %d of %d left", len(after), len(before))
+	}
+	fake.err = nil
+	e.cleanSources(context.Background())
+	var left []string
+	entries, _ := os.ReadDir(base)
+	for _, entry := range entries {
+		left = append(left, strings.NewReplacer(id("a"), "A", id("b"), "B", id("c"), "C", id("d"), "D", id("e"), "E").Replace(entry.Name()))
+	}
+	sort.Strings(left)
+	want := []string{"B", "B.changed-", "B.state", "C", "C.changed-", "C.state", "E.ba9876543210.tar.zst.partial", "notes.txt", "src_not-kairos"}
+	got := make([]string, len(left))
+	for i, name := range left {
+		if j := strings.Index(name, changedInfix); j >= 0 {
+			name = name[:j+len(changedInfix)]
+		}
+		got[i] = name
+	}
+	if strings.Join(got, " ") != strings.Join(want, " ") {
+		t.Fatalf("left %v\nwant %v\n%s", got, want, logs.String())
+	}
+	if !strings.Contains(logs.String(), "unpacked code snapshot removed") {
+		t.Fatalf("removal not logged:\n%s", logs.String())
 	}
 }
