@@ -41,6 +41,8 @@ type Server struct {
 	Logger      *slog.Logger
 
 	logMu sync.Mutex
+	// sourceMu: one snapshot sent is kept at a time (sources.go).
+	sourceMu sync.Mutex
 	// logDirMu guards logDir, the log directory resolved once it exists.
 	logDirMu sync.Mutex
 	logDir   string

@@ -90,6 +90,13 @@ func (s *Server) uploadSource(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%q is not a snapshot id", meta.ID))
 		return
 	}
+	snap := store.SourceSnapshot{ID: meta.ID, PackBytes: meta.PackBytes, PackSHA256: meta.PackSHA256, ListSHA256: meta.ListSHA256, List: meta.List,
+		Files: meta.Files, ContentBytes: meta.ContentBytes, Skipped: meta.Skipped, Project: meta.Project, SourceName: meta.SourceName,
+		OriginHost: meta.OriginHost, OriginRoot: meta.OriginRoot, GitHead: meta.GitHead, GitDirty: meta.GitDirty, CreatedBy: tokenName(r)}
+	if err = store.CheckSourceSnapshot(snap); err != nil {
+		writeError(w, err)
+		return
+	}
 	if _, err := s.Store.SourceSnapshotByID(r.Context(), meta.ID); err == nil {
 		writeJSON(w, http.StatusOK, map[string]any{"id": meta.ID, "stored": false})
 		return
@@ -127,24 +134,60 @@ func (s *Server) uploadSource(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: %v", store.ErrSourceInvalid, err))
 		return
 	}
-	pack := filepath.Join(dir, meta.ID+".tar.zst")
-	if err = os.WriteFile(pack+".files.tsv", []byte(meta.List), 0o644); err != nil {
+	if err = tmp.Close(); err != nil {
 		writeError(w, err)
 		return
 	}
-	tmp.Close()
+	// The same snapshot may come twice at once (the same files with other
+	// mtimes: another pack). The first to be recorded is the one kept; its
+	// files are never written over, or the recorded sha256s would no longer
+	// be theirs and every fetch of it fail.
+	s.sourceMu.Lock()
+	defer s.sourceMu.Unlock()
+	if _, err := s.Store.SourceSnapshotByID(r.Context(), meta.ID); err == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"id": meta.ID, "stored": false})
+		return
+	} else if !errors.Is(err, store.ErrNotFound) {
+		writeError(w, err)
+		return
+	}
+	pack := filepath.Join(dir, meta.ID+".tar.zst")
+	if err = writeFileAtomic(pack+".files.tsv", []byte(meta.List)); err != nil {
+		writeError(w, err)
+		return
+	}
 	if err = os.Rename(tmp.Name(), pack); err != nil {
 		writeError(w, err)
 		return
 	}
-	snap := store.SourceSnapshot{ID: meta.ID, PackBytes: meta.PackBytes, PackSHA256: meta.PackSHA256, ListSHA256: meta.ListSHA256, List: meta.List,
-		Files: meta.Files, ContentBytes: meta.ContentBytes, Skipped: meta.Skipped, Project: meta.Project, SourceName: meta.SourceName,
-		OriginHost: meta.OriginHost, OriginRoot: meta.OriginRoot, GitHead: meta.GitHead, GitDirty: meta.GitDirty, CreatedBy: tokenName(r)}
 	if err = s.Store.RecordSourceSnapshot(r.Context(), snap); err != nil {
 		writeError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": meta.ID, "stored": true})
+}
+
+// writeFileAtomic writes path whole or not at all (a file beside it renamed
+// over it).
+func writeFileAtomic(path string, body []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+"-*.partial")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(body)
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(f.Name(), path)
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+	}
+	return err
 }
 
 // checkSourcePack checks that the pack at path holds exactly the regular

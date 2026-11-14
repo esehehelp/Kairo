@@ -11,7 +11,9 @@ import (
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 
@@ -21,6 +23,13 @@ import (
 
 // testSourcePack is a snapshot of files (path to content): its pack and meta.
 func testSourcePack(t *testing.T, files map[string]string, paths ...string) ([]byte, SourceUpload) {
+	t.Helper()
+	return testSourcePackAt(t, 1, files, paths...)
+}
+
+// testSourcePackAt is testSourcePack of files whose mtime is mtime (ns):
+// the same snapshot, another pack and file list.
+func testSourcePackAt(t *testing.T, mtime int64, files map[string]string, paths ...string) ([]byte, SourceUpload) {
 	t.Helper()
 	var pack bytes.Buffer
 	zw, err := zstd.NewWriter(&pack)
@@ -32,14 +41,14 @@ func testSourcePack(t *testing.T, files map[string]string, paths ...string) ([]b
 	var content int64
 	for _, p := range paths {
 		body := files[p]
-		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: p, Size: int64(len(body)), Mode: 0o644, Format: tar.FormatPAX}); err != nil {
+		if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: p, Size: int64(len(body)), Mode: 0o644, ModTime: time.Unix(0, mtime), Format: tar.FormatPAX}); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := tw.Write([]byte(body)); err != nil {
 			t.Fatal(err)
 		}
 		sum := sha256.Sum256([]byte(body))
-		list += fmt.Sprintf("%s\t%d\t%s\t1\n", p, len(body), hex.EncodeToString(sum[:]))
+		list += fmt.Sprintf("%s\t%d\t%s\t%d\n", p, len(body), hex.EncodeToString(sum[:]), mtime)
 		content += int64(len(body))
 	}
 	if err := tw.Close(); err != nil {
@@ -128,5 +137,51 @@ func TestCodeSnapshotsAreSentCheckedAndFetched(t *testing.T) {
 	}
 	if status, _ := d.call(t, http.MethodGet, "/api/agent/sources/"+meta.ID+"/pack", d.admin, nil); status != http.StatusForbidden {
 		t.Fatalf("an operator token fetched as an agent: %d", status)
+	}
+}
+
+// The same snapshot sent twice at once as two packs (the same files, other
+// mtimes): one is kept, and the pack and list an agent fetches are the ones
+// recorded.
+func TestASnapshotSentTwiceAtOnceKeepsTheFilesItRecords(t *testing.T) {
+	d := newTestDaemon(t, false)
+	files := map[string]string{"src/a.py": "print('a')\n", "pyproject.toml": "[project]\n"}
+	node := d.token(t, "agent", store.RoleNode, "node")
+	for round := int64(0); round < 4; round++ {
+		files["round"] = fmt.Sprint(round)
+		var wg sync.WaitGroup
+		var id string
+		for i := int64(1); i <= 6; i++ {
+			pack, meta := testSourcePackAt(t, round*10+i, files, "pyproject.toml", "round", "src/a.py")
+			id = meta.ID
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if status, raw := d.sendSource(t, d.admin, meta, pack); status != http.StatusCreated && status != http.StatusOK {
+					t.Errorf("send: %d %s", status, raw)
+				}
+			}()
+		}
+		wg.Wait()
+		var shown struct {
+			Source store.SourceSnapshot `json:"source"`
+		}
+		status, raw := d.call(t, http.MethodGet, "/api/sources/"+id, d.admin, nil)
+		if status != http.StatusOK || json.Unmarshal(raw, &shown) != nil {
+			t.Fatalf("show: %d %s", status, raw)
+		}
+		for file, want := range map[string]string{"pack": shown.Source.PackSHA256, "list": shown.Source.ListSHA256} {
+			req, _ := http.NewRequest(http.MethodGet, d.server.URL+"/api/agent/sources/"+id+"/"+file, nil)
+			req.Header.Set("Authorization", "Bearer "+node)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			if sum := sha256.Sum256(got); resp.StatusCode != http.StatusOK || hex.EncodeToString(sum[:]) != want {
+				t.Fatalf("round %d: the %s fetched is not the one recorded (%d)", round, file, resp.StatusCode)
+			}
+		}
 	}
 }

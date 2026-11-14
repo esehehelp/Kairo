@@ -56,10 +56,9 @@ type LaunchSource struct {
 // ErrSourceInvalid is a snapshot that does not hold what it says.
 var ErrSourceInvalid = errors.New("invalid code snapshot")
 
-// RecordSourceSnapshot records a snapshot the daemon now keeps (its pack
-// checked against its file list by the caller). Its id must be its list's;
-// recording one already recorded is no error (the first record stays).
-func (s *Store) RecordSourceSnapshot(ctx context.Context, snap SourceSnapshot) error {
+// CheckSourceSnapshot checks what a snapshot says of itself: its id is its
+// file list's, the list has the sha256 given, and the pack is possible.
+func CheckSourceSnapshot(snap SourceSnapshot) error {
 	id, err := sourcesnap.ID(snap.List)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrSourceInvalid, err)
@@ -72,6 +71,16 @@ func (s *Store) RecordSourceSnapshot(ctx context.Context, snap SourceSnapshot) e
 		return fmt.Errorf("%w: the file list does not have the sha256 given", ErrSourceInvalid)
 	case !sha256Hex.MatchString(snap.PackSHA256) || snap.PackBytes <= 0 || snap.Files <= 0 || snap.ContentBytes < 0 || snap.Skipped < 0:
 		return fmt.Errorf("%w: impossible pack", ErrSourceInvalid)
+	}
+	return nil
+}
+
+// RecordSourceSnapshot records a snapshot the daemon now keeps (its pack
+// checked against its file list by the caller). Its id must be its list's;
+// recording one already recorded is no error (the first record stays).
+func (s *Store) RecordSourceSnapshot(ctx context.Context, snap SourceSnapshot) error {
+	if err := CheckSourceSnapshot(snap); err != nil {
+		return err
 	}
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
