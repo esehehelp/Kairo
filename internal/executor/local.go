@@ -66,6 +66,8 @@ type Local struct {
 	// running holds the attempts running here, launched or adopted: the pid
 	// of each one's shim.
 	running map[string]int
+	// sourceMu: one code snapshot brought at a time (source.go).
+	sourceMu sync.Mutex
 
 	// Prepared gang ranks waiting at the launch barrier, by lease ID.
 	pendingGang map[string]pendingGangRank
@@ -911,6 +913,15 @@ func (e *Local) start(launch *store.Launch) error {
 	cmd := e.command(launch)
 	if cmd.Err != nil {
 		return cmd.Err
+	}
+	if launch.Source != nil {
+		// run in its code snapshot, cwd relative to it (source.go)
+		dir, err := e.ensureSource(context.Background(), launch.Source)
+		if err != nil {
+			return fmt.Errorf("code snapshot %s: %w", launch.Source.ID, err)
+		}
+		cmd.Dir = filepath.Join(dir, filepath.FromSlash(launch.CWD))
+		cmd.Env = append(cmd.Env, "KAIRO_SOURCE_DIR="+dir, "KAIRO_SOURCE_ID="+launch.Source.ID)
 	}
 	e.forgetScratch(launch.Attempt.ID)
 	prepareProcessTree(cmd)

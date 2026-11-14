@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -22,10 +24,35 @@ const (
 	PolicyRunToCompletion = "RunToCompletion@v1"
 )
 
+var (
+	sourceName = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
+	snapshotID = regexp.MustCompile(`^src_[0-9a-f]{32}$`)
+)
+
 type Manifest struct {
 	SchemaVersion int     `toml:"schema_version" json:"schema_version"`
 	Project       Project `toml:"project" json:"project"`
-	Tasks         []Task  `toml:"tasks" json:"tasks"`
+	// Sources are [sources.NAME]: code a task runs in (its execution's
+	// source), snapshotted at apply. Absent from the JSON when none, so
+	// existing digests do not change.
+	Sources map[string]Source `toml:"sources" json:"sources,omitempty"`
+	Tasks   []Task            `toml:"tasks" json:"tasks"`
+	// Snapshots are the code snapshot each source was made into by the
+	// apply that sends them (kairo project apply makes them; not written in
+	// the file, not part of the digest).
+	Snapshots map[string]string `toml:"-" json:"snapshots,omitempty"`
+}
+
+// Source is [sources.NAME]: the files of Paths (relative to Root, a
+// directory or a file each, whole) but those Exclude names, on the machine
+// applying the project. Root is relative to the project file's directory
+// (default: that directory). An exclude pattern without a slash matches
+// any path element (".venv", "__pycache__", "*.pyc"); one with a slash the
+// whole relative path.
+type Source struct {
+	Root    string   `toml:"root" json:"root,omitempty"`
+	Paths   []string `toml:"paths" json:"paths"`
+	Exclude []string `toml:"exclude" json:"exclude,omitempty"`
 }
 
 type Project struct {
@@ -92,6 +119,11 @@ type Execution struct {
 	// kept; it is evicted when its store runs short of room and made again
 	// when an execution needs it. Absent from the JSON when false.
 	Regenerable bool `toml:"regenerable" json:"regenerable,omitempty"`
+	// Source names the project's [sources.NAME] the task runs in: its
+	// attempts run in the snapshot made of it when the task was declared,
+	// cwd relative to it (store/sources.go). Absent from the JSON when
+	// empty.
+	Source string `toml:"source" json:"source,omitempty"`
 }
 
 // Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
@@ -195,9 +227,54 @@ func Normalize(manifest Manifest) (Validated, error) {
 		return Validated{}, errors.New("at least one task is required")
 	}
 
+	for name, src := range manifest.Sources {
+		if !sourceName.MatchString(name) {
+			return Validated{}, fmt.Errorf("source name %q: letters, digits, '.', '_' and '-' only", name)
+		}
+		if len(src.Paths) == 0 {
+			return Validated{}, fmt.Errorf("source %q has no paths", name)
+		}
+		for i, p := range src.Paths {
+			clean := path.Clean(strings.ReplaceAll(strings.TrimSpace(p), `\`, "/"))
+			if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") || path.IsAbs(clean) || strings.Contains(clean, ":") {
+				return Validated{}, fmt.Errorf("source %q path %q is not a path under its root", name, p)
+			}
+			src.Paths[i] = clean
+		}
+		for _, pattern := range src.Exclude {
+			if _, err := path.Match(pattern, ""); err != nil {
+				return Validated{}, fmt.Errorf("source %q exclude %q: %w", name, pattern, err)
+			}
+		}
+		manifest.Sources[name] = src
+	}
+	for name, id := range manifest.Snapshots {
+		if _, ok := manifest.Sources[name]; !ok {
+			return Validated{}, fmt.Errorf("snapshot of %q, which is no [sources.%s]", name, name)
+		}
+		if !snapshotID.MatchString(id) {
+			return Validated{}, fmt.Errorf("snapshot %q of source %q is not a snapshot id", id, name)
+		}
+	}
 	taskNames := map[string]struct{}{}
 	for i := range manifest.Tasks {
 		task := &manifest.Tasks[i]
+		if task.Execution.Source != "" {
+			if _, ok := manifest.Sources[task.Execution.Source]; !ok {
+				return Validated{}, fmt.Errorf("task %q runs in source %q, which is no [sources.%s]", task.Name, task.Execution.Source, task.Execution.Source)
+			}
+			if strings.TrimSpace(task.Execution.CWD) == "" {
+				task.Execution.CWD = "."
+			}
+			cwd := path.Clean(strings.ReplaceAll(strings.TrimSpace(task.Execution.CWD), `\`, "/"))
+			if cwd == ".." || strings.HasPrefix(cwd, "../") || path.IsAbs(cwd) || strings.Contains(cwd, ":") {
+				return Validated{}, fmt.Errorf("task %q runs in source %q: its cwd %q must be a directory of the snapshot (relative)", task.Name, task.Execution.Source, task.Execution.CWD)
+			}
+			task.Execution.CWD = cwd
+			if task.Execution.Gang != nil {
+				return Validated{}, fmt.Errorf("task %q: a gang does not run in a source yet", task.Name)
+			}
+		}
 		task.Name = strings.TrimSpace(task.Name)
 		task.Queue = strings.TrimSpace(task.Queue)
 		task.Policy = strings.TrimSpace(task.Policy)
@@ -256,7 +333,12 @@ func Normalize(manifest Manifest) (Validated, error) {
 		}
 		taskDigests[task.Name] = digest(body)
 	}
+	// The snapshots an apply sends are not the declaration: the same file
+	// applied again with other code has the same digest.
+	snapshots := manifest.Snapshots
+	manifest.Snapshots = nil
 	normalized, err := json.Marshal(manifest)
+	manifest.Snapshots = snapshots
 	if err != nil {
 		return Validated{}, err
 	}

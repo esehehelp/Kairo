@@ -160,7 +160,7 @@ func serve(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	handler := (&api.Server{Store: st, ObserveOnly: daemonConfig.ObserveOnly, LogDirectory: daemonConfig.LogDirectory, Logger: logger}).Handler()
+	handler := (&api.Server{Store: st, ObserveOnly: daemonConfig.ObserveOnly, LogDirectory: daemonConfig.LogDirectory, SourceDirectory: daemonConfig.SourceDirectory, Logger: logger}).Handler()
 	server := &http.Server{
 		Addr:              daemonConfig.Listen,
 		Handler:           handler,

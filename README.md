@@ -398,6 +398,8 @@ shows.
 | POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
 | GET, POST | `/api/machines` (the machine declaration) | read, admin |
 | GET | `/api/stores`, `/api/data/objects` (`?project=&kind=&limit=`) | read |
+| POST, GET | `/api/sources` (code snapshots), `/api/sources/{id}` | admin, read |
+| GET | `/api/agent/sources/{id}/pack`, `/list` | node |
 | POST | `/api/data/imports`, `/api/data/fetches` | admin |
 | GET | `/api/hardware` (`?host=`) | read |
 | GET | `/api/hardware/samples`, `/api/hardware/leases` (`?since=&until=&step=&key=`) | read |
@@ -613,6 +615,12 @@ labels may take what is placed there.
   output directory, by its task while it is that task's latest run, by its
   object's name or id; an imported directory with `--delete-source`, by its
   name or id. Inputs are in the execution's digest only when there are some.
+- Source: `source = "NAME"` in a task's `[tasks.execution]` runs its
+  attempts in the code snapshot of the project's `[sources.NAME]` made when
+  the task was declared (Code snapshots, below), `cwd` relative to it
+  (default `.`; an absolute cwd, or one leaving the snapshot, is refused).
+  Not for a gang yet. In the task's digest only when set; the snapshot is
+  not.
 - Regenerable: `regenerable = true` in a task's `[tasks.execution]` says
   that what a run of it writes to its output directory can be made again by
   running the task again (a dataset built from sources kept elsewhere, say):
@@ -987,6 +995,68 @@ machine_conflict`. `GET /api/machines` answers `{"gpus", "undeclared",
 "hosts", "devices", "stores"}`, the devices with `host_id`, `device_id`,
 `kind`, `max_slowdown`, `control` and `controller`. A daemon older than stores
 refuses a declaration that has any (`stores` is an unknown field).
+
+### Code snapshots
+
+A task runs in the code it was declared with, kept by Kairo rather than
+named by a git commit (which a rewritten history loses): `kairo project
+apply` snapshots each source a task of the file names and the daemon keeps
+it, whatever later happens to the working tree or its git history.
+
+```toml
+[sources.neo-ime]
+root = "."            # relative to this file's directory (default)
+paths = ["src", "crates", "configs", "pyproject.toml", "uv.lock", "Cargo.toml", "Cargo.lock"]
+exclude = ["__pycache__", "*.pyc", "target", ".venv"]
+
+[[tasks]]
+name = "train-x"
+# ...
+[tasks.execution]
+source = "neo-ime"
+cwd = "."             # in the snapshot
+argv = ["uv", "run", "python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
+```
+
+A snapshot holds the regular files of `paths` (each a file or a directory,
+taken whole) under `root`, but those an `exclude` pattern names (one
+without a slash matches any path element, one with a slash the whole
+relative path); links and special files are not taken. It is packed as a
+data object is (a tar.zst and its file list: path, bytes, sha256 and mtime
+of each file) and named by the sha256 of its file list without the mtimes
+(`src_` and 32 hex digits): the same files make the same snapshot, made or
+sent again for nothing. The CLI sends the daemon each one it lacks (`POST
+/api/sources`, multipart: `meta`, the file list and what it was made from,
+then `pack`), which checks it (the pack's size and sha256, each file in it
+against the list, nothing else in it), keeps it in its `source_directory`
+(daemon configuration, default `sources` beside `log_directory`) and
+records it (table `source_snapshots`, with the project and source name, the
+host and directory it was made from and that directory's git HEAD and
+whether it had changes: for reference only; event
+`source_snapshot_recorded`). The apply then binds each task it declares
+(not one declared before, whose content is immutable) to the snapshot of
+its source, for good (`orchestration_tasks.source_snapshot_id`): a later
+apply with other code binds only the tasks it declares, and a rerun runs
+the code the task was declared with. A task naming a source whose snapshot
+the apply did not send (an older kairo) is refused.
+
+Each execution of the task runs in its snapshot
+(`execution_requests.source_snapshot_id`; an execution submitted through
+the API names one as `source_snapshot`). Its executor brings the snapshot to its node once
+(`GET /api/agent/sources/<id>/pack` and `/list`, checked against the size
+and sha256 recorded, each file against the list, as a brought input is),
+unpacks it under `<root>/sources/<id>` of the first volatile store it
+serves and starts the attempt there, `cwd` relative to it, with
+`KAIRO_SOURCE_DIR` and `KAIRO_SOURCE_ID` set. What is built or installed
+belongs outside it (a uv environment through `UV_PROJECT_ENVIRONMENT`, Rust
+through `CARGO_TARGET_DIR`, set in the task's env); a confined attempt
+cannot write there at all. Not inside WSL yet (refused at launch).
+
+`kairo source list [--project P]` lists snapshots (newest first: project,
+source, files, size, git state), `kairo source show ID [--files]` one with
+the tasks bound to it, and `kairo source diff A B` the files added (`+`),
+removed (`-`) and changed (`M`) from A to B (`GET /api/sources`,
+`/api/sources/<id>`).
 
 ### Data stores
 

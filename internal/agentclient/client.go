@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -675,4 +676,33 @@ func (s *LogShipper) shipFile(ctx context.Context, path, name string) error {
 		s.shipped[name] = offset
 	}
 	return nil
+}
+
+// FetchSource writes file ("pack" or "list") of code snapshot id, as the
+// daemon keeps it, to w (executor.SourceFetcher).
+func (c *Client) FetchSource(ctx context.Context, id, file string, w io.Writer) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.BaseURL+"/api/agent/sources/"+url.PathEscape(id)+"/"+url.PathEscape(file), nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		var e struct {
+			Error string `json:"error"`
+			Code  string `json:"code"`
+		}
+		_ = json.Unmarshal(raw, &e)
+		if sentinel := api.ErrorForCode(e.Code); sentinel != nil {
+			return sentinel
+		}
+		return &Error{Status: resp.StatusCode, Message: e.Error}
+	}
+	_, err = io.Copy(w, resp.Body)
+	return err
 }

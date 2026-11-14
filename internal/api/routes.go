@@ -18,6 +18,9 @@ func (s *Server) routes() []route {
 		{"GET", "/api/whoami", roleAny, s.whoami},
 
 		{"POST", "/api/projects", roleAdmin, s.applyProject},
+		{"POST", "/api/sources", roleAdmin, s.uploadSource},
+		{"GET", "/api/sources", roleRead, s.listSources},
+		{"GET", "/api/sources/{id}", roleRead, s.getSource},
 		{"GET", "/api/projects/{project}", roleRead, s.getProject},
 		{"GET", "/api/projects/{project}/tasks/{task}", roleRead, s.getTask},
 		{"POST", "/api/projects/{project}/tasks/{task}/cancel", roleAdmin, s.cancelTask},
@@ -74,6 +77,7 @@ func (s *Server) routes() []route {
 		{"POST", "/api/worker/bench/finish", roleWorker, s.workerBenchFinish},
 
 		{"POST", "/api/agent/logs", roleNode, s.agentLogAppend},
+		{"GET", "/api/agent/sources/{id}/{file}", roleNode, s.agentSourceFile},
 	}
 	for _, op := range append(s.agentOps(), s.controllerOps()...) {
 		routes = append(routes, route{"POST", "/api/agent/" + op.name, roleNode, op.handler})

@@ -65,6 +65,9 @@ type Launch struct {
 	// Store: the volatile store this attempt's scratch, output and cache
 	// directories are to go on ("" for the executor's first).
 	Store string `json:"store,omitempty"`
+	// Source: the code snapshot the attempt runs in (sources.go), CWD
+	// relative to it.
+	Source *LaunchSource `json:"source,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -675,6 +678,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 			}
 		}
 		launch.Env, launch.ScratchTmpdir, launch.Confine, launch.Store = env, scratchTmpdir, confine || s.confinesAll(time.Now()), storeID.String
+		if launch.Source, err = launchSourceTx(ctx, tx, executionID); err != nil {
+			return nil, err
+		}
 		return launch, tx.Commit()
 	}
 	if leaseState != "prepared" || executionState != "waiting" {
@@ -731,6 +737,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 			return nil, err
 		}
 	}
+	source, err := launchSourceTx(ctx, tx, executionID)
+	if err != nil {
+		return nil, err
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -755,6 +765,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		Inputs:               inputs,
 		Confine:              confine || s.confinesAll(time.Now()),
 		Store:                storeID.String,
+		Source:               source,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp

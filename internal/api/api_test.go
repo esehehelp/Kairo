@@ -34,7 +34,7 @@ func newTestDaemon(t *testing.T, observeOnly bool) *testDaemon {
 		t.Fatal(err)
 	}
 	logs := t.TempDir()
-	server := httptest.NewServer((&Server{Store: st, ObserveOnly: observeOnly, LogDirectory: logs}).Handler())
+	server := httptest.NewServer((&Server{Store: st, ObserveOnly: observeOnly, LogDirectory: logs, SourceDirectory: t.TempDir()}).Handler())
 	t.Cleanup(func() {
 		server.Close()
 		st.Close()

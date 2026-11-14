@@ -226,6 +226,15 @@ func init() {
 			},
 			aliases: map[string]string{"ls": "list", "show": "list", "add": "import"},
 		}},
+		{name: "source", summary: "code snapshots: the files tasks run in, made at project apply", group: &commandGroup{
+			note: "A task with [tasks.execution] source = NAME runs in the snapshot of [sources.NAME] made when it was declared (kairo project apply), its cwd relative to it.",
+			subs: []command{
+				{"list", "[--project P] [--limit N] [--json]", "snapshots, newest first: project, source, files, size, git state at apply", sourceList},
+				{"show", "ID [--files] [--json]", "a snapshot: where and when it was made, the tasks bound to it, its files", sourceShow},
+				{"diff", "A B", "the files added (+), removed (-) and changed (M) from snapshot A to B", sourceDiff},
+			},
+			aliases: map[string]string{"ls": "list"},
+		}},
 		{name: "hardware", summary: "device settings of hosts: show, set, reset and bench them", group: &commandGroup{
 			note: "DEVICE is a GPU UUID or cpu (a bench also takes disk:FILESYSTEM and net:NODE); a host's controller (kairo controller) carries the settings out.",
 			subs: []command{

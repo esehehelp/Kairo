@@ -165,8 +165,24 @@ func applyProjectTx(ctx context.Context, tx *sql.Tx, spec orchestration.Validate
 		if !errors.Is(err, sql.ErrNoRows) {
 			return ApplyResult{}, err
 		}
+		// bound to the snapshot this apply made of its source, for good
+		var snapshot any
+		if source := task.Execution.Source; source != "" {
+			id := spec.Manifest.Snapshots[source]
+			if id == "" {
+				return ApplyResult{}, fmt.Errorf("task %q runs in source %q, of which this apply sent no snapshot (apply with a kairo that makes them)", task.Name, source)
+			}
+			known, err := sourceKnownTx(ctx, tx, id)
+			if err != nil {
+				return ApplyResult{}, err
+			}
+			if !known {
+				return ApplyResult{}, fmt.Errorf("task %q: snapshot %s of source %q was not sent to the daemon", task.Name, id, source)
+			}
+			snapshot = id
+		}
 		stamp := now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_tasks(task_scope_id,project_scope_id,name,queue_name,policy_id,policy_version,spec_digest,spec_json,execution_template_json,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,'pending',$9,$10)`, scopes.Task.ID, projectScope.ID, task.Name, task.Queue, "RunToCompletion", spec.TaskDigests[task.Name], string(taskBody), string(executionBody), stamp, stamp); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_tasks(task_scope_id,project_scope_id,name,queue_name,policy_id,policy_version,spec_digest,spec_json,execution_template_json,state,created_at,updated_at,source_snapshot_id) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,'pending',$9,$10,$11)`, scopes.Task.ID, projectScope.ID, task.Name, task.Queue, "RunToCompletion", spec.TaskDigests[task.Name], string(taskBody), string(executionBody), stamp, stamp, snapshot); err != nil {
 			return ApplyResult{}, err
 		}
 		applied.Created = append(applied.Created, task.Name)
@@ -425,6 +441,9 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	}
 	spec, err := taskExecutionSpec(ScopePath{Project: task.project, Queue: task.queue, Task: task.name}, template, orchestrationClientRequestID(decisionKey), continuation)
 	if err != nil {
+		return plannedOrchestrationDecision{}, err
+	}
+	if spec.SourceSnapshot, err = taskSourceTx(ctx, tx, task.taskScopeID); err != nil {
 		return plannedOrchestrationDecision{}, err
 	}
 	// a rerun ordered to make temporal data again goes on the node that lacks it

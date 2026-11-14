@@ -83,6 +83,10 @@ func projectApply(args []string) error {
 	if err != nil {
 		return err
 	}
+	// the code each task runs in, as it is now (source_commands.go)
+	if err := snapshotSources(client, positional[0], &validated.Manifest); err != nil {
+		return err
+	}
 	payload, err := client.call(http.MethodPost, "/api/projects", validated.Manifest)
 	if err != nil {
 		if ae := (*apiError)(nil); errors.As(err, &ae) && ae.Status == http.StatusConflict {

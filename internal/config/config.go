@@ -24,6 +24,9 @@ type Config struct {
 	Listen               string `toml:"listen"`
 	AdvertiseURL         string `toml:"advertise_url"`
 	LogDirectory         string `toml:"log_directory"`
+	// SourceDirectory keeps the code snapshots kairo project apply sends
+	// (api/sources.go; default: sources beside log_directory).
+	SourceDirectory string `toml:"source_directory"`
 	// LogMinFreeMiB is the free space (MiB) the filesystem holding
 	// log_directory must have for an executor to launch (0: 1024).
 	LogMinFreeMiB              int  `toml:"log_min_free_mib"`
@@ -316,6 +319,9 @@ func defaults(c *Config) {
 	}
 	if c.LogDirectory == "" {
 		c.LogDirectory = "local/attempts-v3"
+	}
+	if c.SourceDirectory == "" {
+		c.SourceDirectory = filepath.Join(filepath.Dir(filepath.Clean(c.LogDirectory)), "sources")
 	}
 	if c.LogMinFreeMiB == 0 {
 		c.LogMinFreeMiB = DefaultLogMinFreeMiB

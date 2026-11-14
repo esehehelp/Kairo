@@ -33,6 +33,8 @@ type Server struct {
 	ObserveOnly bool
 	// LogDirectory receives attempt logs shipped by node agents.
 	LogDirectory string
+	// SourceDirectory keeps code snapshots (sources.go; "": none kept).
+	SourceDirectory string
 	// SlowRequest: a request that takes this long or longer is logged at
 	// WARN (timed; 0 is 2 s). Logger receives it (nil: slog's default).
 	SlowRequest time.Duration

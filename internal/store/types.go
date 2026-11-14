@@ -108,6 +108,9 @@ type ExecutionSpec struct {
 	// Regenerable: its run's output can be made again by rerunning its task
 	// (temporal.go). Left out of the digest when false.
 	Regenerable bool `json:"regenerable,omitempty"`
+	// SourceSnapshot: the code snapshot (sources.go) the execution runs in,
+	// cwd relative to it.
+	SourceSnapshot string `json:"source_snapshot,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the
