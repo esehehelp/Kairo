@@ -307,6 +307,17 @@ func loopback(listen string) bool {
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
 }
+
+// absPath is path made absolute against the working directory now: a
+// directory of attempt records and exit files is passed to processes that
+// run elsewhere (an attempt's shim runs in the attempt's cwd).
+func absPath(path string) string {
+	if abs, err := filepath.Abs(path); err == nil {
+		return abs
+	}
+	return path
+}
+
 func defaults(c *Config) {
 	if c.Listen == "" {
 		c.Listen = "127.0.0.1:7474"
@@ -323,6 +334,7 @@ func defaults(c *Config) {
 	if c.SourceDirectory == "" {
 		c.SourceDirectory = filepath.Join(filepath.Dir(filepath.Clean(c.LogDirectory)), "sources")
 	}
+	c.LogDirectory, c.SourceDirectory = absPath(c.LogDirectory), absPath(c.SourceDirectory)
 	if c.LogMinFreeMiB == 0 {
 		c.LogMinFreeMiB = DefaultLogMinFreeMiB
 	}
@@ -412,6 +424,7 @@ func LoadAgent(path string) (Agent, error) {
 	if a.LogDirectory == "" {
 		a.LogDirectory = "local/attempts-agent"
 	}
+	a.LogDirectory = absPath(a.LogDirectory)
 	switch {
 	case a.LogMinFreeMiB < 0:
 		return a, errors.New("log_min_free_mib must not be negative")
