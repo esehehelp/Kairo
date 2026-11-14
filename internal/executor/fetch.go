@@ -3,6 +3,7 @@ package executor
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -149,7 +150,7 @@ func (e *Local) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder,
 	if err != nil {
 		return made, err
 	}
-	made.Bytes, err = unpackChecked(ctx, dir, packName+partialSuffix, listName+partialSuffix, into)
+	made.Bytes, err = unpackChecked(ctx, dir, packName+partialSuffix, listName+partialSuffix, into, false)
 	into.Close()
 	if err != nil {
 		_ = dir.RemoveAll(unpacking)
@@ -173,8 +174,10 @@ func freeOn(ctx context.Context, s servedStore) int64 {
 
 // unpackChecked unpacks the pack packName (in dir) into into, checking each
 // regular file against the file list listName and that every file listed is
-// there, and returns the bytes unpacked.
-func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string, into *os.Root) (int64, error) {
+// there, and returns the bytes unpacked. With execBits (a code snapshot) a
+// file packed executable, or one beginning with "#!" (a pack made on Windows
+// has no execute bits), is made executable (0755).
+func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string, into *os.Root, execBits bool) (int64, error) {
 	listFile, err := dir.Open(listName)
 	if err != nil {
 		return 0, err
@@ -261,8 +264,8 @@ func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string,
 			if err != nil {
 				return total, err
 			}
-			hash := sha256.New()
-			n, err := io.Copy(io.MultiWriter(f, hash), io.LimitReader(tr, w.size+1))
+			hash, head := sha256.New(), &headWriter{}
+			n, err := io.Copy(io.MultiWriter(f, hash, head), io.LimitReader(tr, w.size+1))
 			if err == nil {
 				err = f.Sync()
 			}
@@ -274,6 +277,11 @@ func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string,
 			}
 			if n != w.size || hex.EncodeToString(hash.Sum(nil)) != w.sha {
 				return total, fmt.Errorf("%w: %s unpacked as %d bytes, sha256 %s; listed %d bytes, sha256 %s", errInputMismatch, name, n, hex.EncodeToString(hash.Sum(nil)), w.size, w.sha)
+			}
+			if execBits && (h.Mode&0o111 != 0 || bytes.HasPrefix(head.b, []byte("#!"))) {
+				if err := into.Chmod(local, 0o755); err != nil {
+					return total, err
+				}
 			}
 			mtime := time.Unix(0, w.mtime)
 			if err := into.Chtimes(local, mtime, mtime); err != nil {
@@ -291,6 +299,16 @@ func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string,
 		}
 	}
 	return total, nil
+}
+
+// headWriter keeps the first two bytes written to it.
+type headWriter struct{ b []byte }
+
+func (h *headWriter) Write(p []byte) (int, error) {
+	if n := 2 - len(h.b); n > 0 {
+		h.b = append(h.b, p[:min(n, len(p))]...)
+	}
+	return len(p), nil
 }
 
 // openObjectFile opens <root>/objects/<month>/name of a durable store: the

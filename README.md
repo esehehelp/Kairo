@@ -343,7 +343,9 @@ ca_file = "/etc/kairo/ca.pem"
 The rest (`log_directory`, `log_min_free_mib`, `observe_only`,
 `observation_interval_seconds`, `[node]`, `[bench]`, `[[executors]]`,
 `[[providers]]`) has the same form as in the daemon configuration
-(`examples/kairo.toml`). An
+(`examples/kairo.toml`). A relative `log_directory` (or `source_directory`)
+is taken against the working directory the daemon or agent starts in, once:
+attempts get absolute paths into it. An
 agent refuses an `http://` URL unless `insecure_http = true`. A host's device
 controller (`kairo controller`, see Hardware settings) connects the same way.
 
@@ -1027,13 +1029,15 @@ of each file) and named by the sha256 of its file list without the mtimes
 (`src_` and 32 hex digits): the same files make the same snapshot, made or
 sent again for nothing. The CLI sends the daemon each one it lacks (`POST
 /api/sources`, multipart: `meta`, the file list and what it was made from,
-then `pack`), which checks it (the pack's size and sha256, each file in it
-against the list, nothing else in it), keeps it in its `source_directory`
-(daemon configuration, default `sources` beside `log_directory`) and
-records it (table `source_snapshots`, with the project and source name, the
+then `pack`), which checks it (its id against its file list, the pack's
+size and sha256, each file in it against the list, nothing else in it),
+keeps it in its `source_directory` (daemon configuration, default `sources`
+beside `log_directory`) and records it (table `source_snapshots`, with the project and source name, the
 host and directory it was made from and that directory's git HEAD and
 whether it had changes: for reference only; event
-`source_snapshot_recorded`). The apply then binds each task it declares
+`source_snapshot_recorded`). The same snapshot sent twice at once (the same
+files with other mtimes: another pack) is kept once, the first recorded,
+and its files are never written over. The apply then binds each task it declares
 (not one declared before, whose content is immutable) to the snapshot of
 its source, for good (`orchestration_tasks.source_snapshot_id`): a later
 apply with other code binds only the tasks it declares, and a rerun runs
@@ -1047,10 +1051,26 @@ the API names one as `source_snapshot`). Its executor brings the snapshot to its
 and sha256 recorded, each file against the list, as a brought input is),
 unpacks it under `<root>/sources/<id>` of the first volatile store it
 serves and starts the attempt there, `cwd` relative to it, with
-`KAIRO_SOURCE_DIR` and `KAIRO_SOURCE_ID` set. What is built or installed
-belongs outside it (a uv environment through `UV_PROJECT_ENVIRONMENT`, Rust
-through `CARGO_TARGET_DIR`, set in the task's env); a confined attempt
-cannot write there at all. Not inside WSL yet (refused at launch).
+`KAIRO_SOURCE_DIR` and `KAIRO_SOURCE_ID` set. A file packed executable, or
+one that begins with `#!` (a snapshot made on Windows has no execute bits),
+is unpacked executable, so `./scripts/x.sh` runs on Linux.
+
+The unpacked snapshot is read-only: its files on every system, its
+directories too but on Windows (where that would not keep files from being
+made in them). That does not stop root on Linux, nor anything on Windows
+from adding files, so what it was made is recorded beside it
+(`<root>/sources/<id>.state`: each directory, and each file's size, mtime
+and mode), and before every launch in it the tree is checked against that
+record. One changed (a file added, removed or written) is set aside as
+`<id>.changed-<time>` (an attempt still running in it keeps it; the
+executor's log names the first paths that differ) and the snapshot is
+unpacked again, so every attempt starts in the files it was declared with.
+What is built or installed belongs outside it (a uv environment through
+`UV_PROJECT_ENVIRONMENT`, Rust through `CARGO_TARGET_DIR`, set in the
+task's env); an attempt in a snapshot gets `PYTHONDONTWRITEBYTECODE=1`
+unless its environment sets that or `PYTHONPYCACHEPREFIX`, so Python does
+not write its bytecode there. A confined attempt cannot write there at all.
+Not inside WSL yet (refused at launch).
 
 `kairo source list [--project P]` lists snapshots (newest first: project,
 source, files, size, git state), `kairo source show ID [--files]` one with

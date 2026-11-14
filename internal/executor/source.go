@@ -3,6 +3,7 @@ package executor
 import (
 	"archive/tar"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,8 +13,11 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/klauspost/compress/zstd"
@@ -203,9 +207,17 @@ type SourceFetcher interface {
 
 // ensureSource is where snapshot src is unpacked on this executor's node,
 // bringing it there first if it is not: under <root>/sources/<id> of the
-// first usable volatile store this executor serves. One at a time per
-// executor; a directory there is the snapshot (it is renamed into place only
-// once every file was checked).
+// first usable volatile store this executor serves. It is unpacked read-only
+// (directories too, but on Windows), and what it was made is recorded
+// beside it (<id>.state: each directory and file, with the size, mtime and
+// mode of each file); before every launch in it the tree is checked against
+// that record, since an attempt that is not confined can write there (root
+// on Linux whatever the modes): one changed (a file added, removed or
+// written) is set aside as <id>.changed-<time> (an attempt may still run in
+// it) and the snapshot unpacked again. One snapshot at a time per directory
+// in this process; a directory there is the snapshot (it is renamed into
+// place only once every file was checked; an unpack another process renamed
+// there first is taken).
 func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (string, error) {
 	if e.isWSL() {
 		return "", errors.New("code snapshots are not run inside WSL yet")
@@ -213,6 +225,9 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 	fetch, ok := e.Store.(SourceFetcher)
 	if !ok {
 		return "", errors.New("this executor cannot fetch code snapshots")
+	}
+	if !sourcesnap.ValidID(src.ID) {
+		return "", fmt.Errorf("%q is not a snapshot id", src.ID)
 	}
 	var s *servedStore
 	for _, served := range e.servedStores() {
@@ -227,13 +242,9 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 	if _, ok := s.fs.(localStoreFS); !ok {
 		return "", errors.New("code snapshots are unpacked on a local store only")
 	}
-	e.sourceMu.Lock()
-	defer e.sourceMu.Unlock()
 	base := filepath.Join(s.decl.Root, sourcesDirName)
 	final := filepath.Join(base, src.ID)
-	if info, err := os.Lstat(final); err == nil && info.IsDir() {
-		return final, nil
-	}
+	defer lockSourceDir(final)()
 	if err := os.MkdirAll(base, 0o755); err != nil {
 		return "", err
 	}
@@ -242,17 +253,39 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 		return "", err
 	}
 	defer dir.Close()
-	packName, listName, partial := src.ID+packSuffix+partialSuffix, src.ID+packSuffix+manifestSuffix+partialSuffix, src.ID+partialSuffix
+	here, changes, err := checkUnpacked(dir, src.ID)
+	if err != nil {
+		return "", fmt.Errorf("check the unpacked snapshot: %w", err)
+	}
+	if here && len(changes) == 0 {
+		markSourceUsed(dir, src.ID)
+		return final, nil
+	}
+	if here {
+		aside := fmt.Sprintf("%s%s%d", src.ID, changedInfix, time.Now().UnixNano())
+		if err := dir.Rename(src.ID, aside); err != nil {
+			return "", fmt.Errorf("the unpacked snapshot was changed in place (%s) and cannot be set aside: %w", strings.Join(changes, ", "), err)
+		}
+		_ = dir.Remove(src.ID + stateSuffix)
+		e.Logger.Warn("code snapshot was changed in place: set aside, unpacked again", "source_id", src.ID, "set_aside", filepath.Join(base, aside), "changes", strings.Join(changes, ", "))
+	}
+	token := make([]byte, 6)
+	if _, err := rand.Read(token); err != nil {
+		return "", err
+	}
+	tmp := src.ID + "." + hex.EncodeToString(token)
+	packName, listName, partial, statePartial := tmp+packSuffix+partialSuffix, tmp+packSuffix+manifestSuffix+partialSuffix, tmp+partialSuffix, tmp+stateSuffix+partialSuffix
 	defer func() {
 		_ = dir.Remove(packName)
 		_ = dir.Remove(listName)
-		_ = dir.RemoveAll(partial)
+		_ = dir.Remove(statePartial)
+		removeUnpacked(dir, partial)
 	}()
 	for _, f := range []struct {
 		name, file, sha string
 		bytes           int64
 	}{{listName, "list", src.ListSHA256, -1}, {packName, "pack", src.PackSHA256, src.PackBytes}} {
-		w, err := dir.OpenFile(f.name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+		w, err := dir.OpenFile(f.name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if err != nil {
 			return "", err
 		}
@@ -271,7 +304,6 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 			return "", fmt.Errorf("%w: the snapshot's %s is %d bytes, sha256 %s; recorded %d bytes, sha256 %s", errInputMismatch, f.file, counted.n, got, f.bytes, f.sha)
 		}
 	}
-	_ = dir.RemoveAll(partial)
 	if err := dir.Mkdir(partial, 0o755); err != nil {
 		return "", err
 	}
@@ -279,14 +311,229 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 	if err != nil {
 		return "", err
 	}
-	_, err = unpackChecked(ctx, dir, packName, listName, into)
+	_, err = unpackChecked(ctx, dir, packName, listName, into, true)
+	if err == nil {
+		err = makeReadOnly(into)
+	}
+	var state string
+	if err == nil {
+		state, err = treeState(into)
+	}
 	into.Close()
 	if err != nil {
 		return "", fmt.Errorf("unpack the snapshot: %w", err)
 	}
+	// the record first: a tree there without one is taken as changed
+	if err := writeRootFile(dir, statePartial, []byte(state)); err != nil {
+		return "", err
+	}
+	if err := dir.Rename(statePartial, src.ID+stateSuffix); err != nil {
+		return "", err
+	}
 	if err := dir.Rename(partial, src.ID); err != nil {
+		// unpacked there meanwhile by another process (the same files,
+		// modes and mtimes: the same record)?
+		if here, changes, checkErr := checkUnpacked(dir, src.ID); checkErr == nil && here && len(changes) == 0 {
+			markSourceUsed(dir, src.ID)
+			return final, nil
+		}
 		return "", err
 	}
 	e.Logger.Info("code snapshot brought", "source_id", src.ID, "path", final)
 	return final, nil
+}
+
+const (
+	// stateSuffix: the record of an unpacked snapshot, beside it.
+	stateSuffix = ".state"
+	// changedInfix names an unpacked snapshot set aside as changed.
+	changedInfix = ".changed-"
+	stateHeader  = "kairo source state 1"
+)
+
+// sourceDirLocks: one lock per directory a snapshot is unpacked in, shared
+// by every executor of this process (several may serve one store).
+var sourceDirLocks sync.Map
+
+func lockSourceDir(path string) (unlock func()) {
+	m, _ := sourceDirLocks.LoadOrStore(path, &sync.Mutex{})
+	mu := m.(*sync.Mutex)
+	mu.Lock()
+	return mu.Unlock
+}
+
+// markSourceUsed sets the mtime of a snapshot's record to now: when it was
+// last launched in.
+func markSourceUsed(dir *os.Root, id string) {
+	now := time.Now()
+	_ = dir.Chtimes(id+stateSuffix, now, now)
+}
+
+// makeReadOnly takes the write bits off every file under r and, but on
+// Windows (where a directory's read-only attribute does not keep files from
+// being made in it), every directory.
+func makeReadOnly(r *os.Root) error {
+	var dirs []string
+	err := fs.WalkDir(r.FS(), ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case d.IsDir():
+			dirs = append(dirs, name)
+			return nil
+		case info.Mode().IsRegular():
+			return r.Chmod(filepath.FromSlash(name), info.Mode().Perm()&^0o222)
+		default:
+			return fmt.Errorf("%w: %s is neither a directory nor a regular file", errInputMismatch, name)
+		}
+	})
+	if err != nil || runtime.GOOS == "windows" {
+		return err
+	}
+	for i := len(dirs) - 1; i >= 0; i-- {
+		if err := r.Chmod(filepath.FromSlash(dirs[i]), 0o555); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// removeUnpacked removes name (under dir) whole, read-only or not.
+func removeUnpacked(dir *os.Root, name string) {
+	if r, err := dir.OpenRoot(name); err == nil {
+		_ = fs.WalkDir(r.FS(), ".", func(p string, d fs.DirEntry, err error) error {
+			if err != nil || d.Type()&fs.ModeSymlink != 0 {
+				return nil
+			}
+			if info, err := d.Info(); err == nil {
+				_ = r.Chmod(filepath.FromSlash(p), info.Mode().Perm()|0o200)
+			}
+			return nil
+		})
+		r.Close()
+	}
+	_ = dir.RemoveAll(name)
+}
+
+// treeState is the record of the tree under r (see ensureSource): a line
+// per directory ("d", path) and regular file ("f", path, size, mtime in ns,
+// mode), in walk order; anything else is a "?" line.
+func treeState(r *os.Root) (string, error) {
+	var b strings.Builder
+	b.WriteString(stateHeader + "\n")
+	err := fs.WalkDir(r.FS(), ".", func(name string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if name == "." {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		switch {
+		case d.IsDir():
+			fmt.Fprintf(&b, "d\t%s\n", escapeListPath(name))
+		case info.Mode().IsRegular():
+			fmt.Fprintf(&b, "f\t%s\t%d\t%d\t%o\n", escapeListPath(name), info.Size(), info.ModTime().UnixNano(), info.Mode().Perm())
+		default:
+			fmt.Fprintf(&b, "?\t%s\t%s\n", escapeListPath(name), info.Mode().Type())
+		}
+		return nil
+	})
+	return b.String(), err
+}
+
+// checkUnpacked reports whether snapshot id is unpacked in dir and, if it
+// is, how its tree differs from its record (none: as it was unpacked).
+func checkUnpacked(dir *os.Root, id string) (here bool, changes []string, err error) {
+	info, err := dir.Lstat(id)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil, nil
+	}
+	if err != nil {
+		return false, nil, err
+	}
+	if !info.IsDir() || isLink(info) {
+		return true, []string{"not a directory"}, nil
+	}
+	want, err := dir.ReadFile(id + stateSuffix)
+	if errors.Is(err, fs.ErrNotExist) {
+		return true, []string{"no record of how it was unpacked"}, nil
+	}
+	if err != nil {
+		return true, nil, err
+	}
+	r, err := dir.OpenRoot(id)
+	if err != nil {
+		return true, nil, err
+	}
+	got, err := treeState(r)
+	r.Close()
+	if err != nil {
+		return true, nil, err
+	}
+	if got == string(want) {
+		return true, nil, nil
+	}
+	return true, stateChanges(string(want), got, 5), nil
+}
+
+// stateChanges names how record got differs from want: paths added,
+// removed or changed, at most max of them and then how many more.
+func stateChanges(want, got string, max int) []string {
+	entries := func(state string) map[string]string {
+		m := map[string]string{}
+		lines := strings.Split(strings.TrimSuffix(state, "\n"), "\n")
+		for _, line := range lines[min(1, len(lines)):] {
+			kind, rest, _ := strings.Cut(line, "\t")
+			name, attrs, _ := strings.Cut(rest, "\t")
+			m[name] = kind + "\t" + attrs
+		}
+		return m
+	}
+	w, g := entries(want), entries(got)
+	var all []string
+	for name, attrs := range g {
+		if old, ok := w[name]; !ok {
+			all = append(all, "added "+name)
+		} else if old != attrs {
+			all = append(all, "changed "+name)
+		}
+	}
+	for name := range w {
+		if _, ok := g[name]; !ok {
+			all = append(all, "removed "+name)
+		}
+	}
+	if len(all) == 0 {
+		all = append(all, "record differs")
+	}
+	sort.Strings(all)
+	if len(all) > max {
+		all = append(all[:max], fmt.Sprintf("%d more", len(all)-max))
+	}
+	return all
+}
+
+// writeRootFile writes name (under dir) whole, synced.
+func writeRootFile(dir *os.Root, name string, body []byte) error {
+	f, err := dir.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(body)
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	return err
 }

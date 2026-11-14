@@ -66,8 +66,6 @@ type Local struct {
 	// running holds the attempts running here, launched or adopted: the pid
 	// of each one's shim.
 	running map[string]int
-	// sourceMu: one code snapshot brought at a time (source.go).
-	sourceMu sync.Mutex
 
 	// Prepared gang ranks waiting at the launch barrier, by lease ID.
 	pendingGang map[string]pendingGangRank
@@ -802,6 +800,16 @@ func envName(kv string) string {
 	return name
 }
 
+// hasEnv reports whether env sets name (as the OS compares names).
+func hasEnv(env []string, name string) bool {
+	for _, kv := range env {
+		if envKey(envName(kv)) == envKey(name) {
+			return true
+		}
+	}
+	return false
+}
+
 // command builds the attempt's launcher. Its environment is the parent's,
 // then the execution's declared env, then Kairo's launch variables; a later
 // layer replaces a name of an earlier one, so declared env overrides PATH and
@@ -922,6 +930,12 @@ func (e *Local) start(launch *store.Launch) error {
 		}
 		cmd.Dir = filepath.Join(dir, filepath.FromSlash(launch.CWD))
 		cmd.Env = append(cmd.Env, "KAIRO_SOURCE_DIR="+dir, "KAIRO_SOURCE_ID="+launch.Source.ID)
+		// Python would write its bytecode beside the modules, into the
+		// snapshot (which is then unpacked again at the next launch): not
+		// written, unless the attempt's environment says where.
+		if !hasEnv(cmd.Env, "PYTHONDONTWRITEBYTECODE") && !hasEnv(cmd.Env, "PYTHONPYCACHEPREFIX") {
+			cmd.Env = append(cmd.Env, "PYTHONDONTWRITEBYTECODE=1")
+		}
 	}
 	e.forgetScratch(launch.Attempt.ID)
 	prepareProcessTree(cmd)
