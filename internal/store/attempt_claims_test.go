@@ -164,3 +164,35 @@ func TestTheLeaseHoldersProcessSeenOnAnotherNodesRowIsNotAClaim(t *testing.T) {
 		t.Fatalf("claims: %+v", got)
 	}
 }
+
+// A provider naming its claim with the id of another node's claim neither
+// renews that claim nor brings it back once cleared.
+func TestAClaimIdOfAnotherResourceIsNotTakenOver(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	if err := store.UpsertNode(ctx, Node{ID: "node2", Name: "node2", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertProvider(ctx, "gpu-provider-2", "node2", "nvidia", nil); err != nil {
+		t.Fatal(err)
+	}
+	declareTestGPU(t, store, "GPU-9", "node2")
+	identity := "foreign:104"
+	claim := func(resourceID string) ExternalClaim {
+		return ExternalClaim{ID: "clm-shared", ResourceID: resourceID, ClaimKind: "external_process", ProcessIdentity: &identity}
+	}
+	processPoll(t, store, "gpu-provider", "node", "gpu-0", "GPU-0", claim("gpu-0"))
+	processPoll(t, store, "gpu-provider", "node", "gpu-0", "GPU-0") // gone: cleared
+	processPoll(t, store, "gpu-provider-2", "node2", "gpu-9", "GPU-9", claim("gpu-9"))
+	for _, c := range openClaims(t, store) {
+		if c.ID == "clm-shared" {
+			t.Fatalf("another node's cleared claim brought back: %+v", c)
+		}
+	}
+	var resource string
+	var cleared *string
+	if err := store.db.QueryRowContext(ctx, `SELECT resource_id,cleared_at FROM external_claims WHERE id='clm-shared'`).Scan(&resource, &cleared); err != nil || resource != "gpu-0" || cleared == nil {
+		t.Fatalf("claim now on %s, cleared %v: %v", resource, cleared, err)
+	}
+}

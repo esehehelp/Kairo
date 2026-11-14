@@ -241,17 +241,27 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 				continue
 			}
 		}
-		seen[claim.ID] = true
 		if claim.FirstObservedAt == "" {
 			claim.FirstObservedAt = t
 		}
 		if claim.LastObservedAt == "" {
 			claim.LastObservedAt = t
 		}
-		_, err = tx.ExecContext(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,cleared_at=NULL`, claim.ID, claim.ResourceID, claim.ClaimKind, claim.ProcessIdentity, validJSON(claim.Evidence), claim.FirstObservedAt, claim.LastObservedAt)
+		// A claim id already held by another resource's claim is not this
+		// provider's to renew (or to bring back once cleared): left as it is.
+		var result sql.Result
+		result, err = tx.ExecContext(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES($1,$2,$3,$4,$5,$6,$7)
+			ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,cleared_at=NULL WHERE external_claims.resource_id=excluded.resource_id`,
+			claim.ID, claim.ResourceID, claim.ClaimKind, claim.ProcessIdentity, validJSON(claim.Evidence), claim.FirstObservedAt, claim.LastObservedAt)
 		if err != nil {
 			return err
 		}
+		if n, err := result.RowsAffected(); err != nil {
+			return err
+		} else if n == 0 {
+			continue
+		}
+		seen[claim.ID] = true
 	}
 	observed := map[string]bool{}
 	for _, o := range observations {
