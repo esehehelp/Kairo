@@ -973,8 +973,11 @@ scratch space), the `node`, a `root` directory (absolute:
 on (exactly the identity of a disk resource registered on the node, the one
 its admission accounting uses), `backend` (`local-fs`, the only one so far;
 omitted: `local-fs`), `reserve_free_bytes` (for a durable store the free space
-it keeps; for a volatile one the free space below which it evicts, see
-Evicting, a tenth of its total when unset) and optionally `executor`, the one
+it keeps: no copy is made there that would take it below; for a volatile one
+the free space below which it evicts, see Evicting, a tenth of its total when
+unset; for either, the free space a pack or a fetch onto it must leave on its
+filesystem, 1 GiB when unset, so what else is there, a running attempt's
+checkpoints or the system, never finds it full) and optionally `executor`, the one
 executor of the node whose namespace the root is in (a WSL executor's Linux
 paths; without it the root is in the node's own namespace). Ids are unique,
 and no two stores of one node are at one place or one inside the other,

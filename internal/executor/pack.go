@@ -520,8 +520,8 @@ func (e *Local) packDue(ctx context.Context) {
 			continue
 		}
 		if o.Bytes != nil {
-			if _, free, err := s.fs.Usage(ctx, s.decl.Root); err == nil && free < *o.Bytes {
-				e.packProblem(o.ObjectID, "not packed", fmt.Errorf("%d bytes free on %s, %d to pack", free, s.decl.ID, *o.Bytes))
+			if _, free, err := s.fs.Usage(ctx, s.decl.Root); err == nil && free-*o.Bytes < headroom(s) {
+				e.packProblem(o.ObjectID, "not packed", fmt.Errorf("%d bytes free on %s, %d to pack, %d to leave free", free, s.decl.ID, *o.Bytes, headroom(s)))
 				continue
 			}
 		}
@@ -549,6 +549,21 @@ func (e *Local) packDue(ctx context.Context) {
 
 // packImport packs an imported directory (store.ImportData) onto the store
 // it was ordered packed on, once there is room there for all it holds.
+// minHeadroom is the free space a pack or a fetch leaves on its store's
+// filesystem when the store declares no reserve_free_bytes.
+const minHeadroom = 1 << 30
+
+// headroom is the free space a pack or a fetch must leave on its store's
+// filesystem: the store's reserve_free_bytes, else minHeadroom. What else is
+// on that filesystem (a running attempt's checkpoints, the system) must not
+// find it full because Kairo packed or brought something there.
+func headroom(s servedStore) int64 {
+	if s.decl.ReserveFreeBytes > 0 {
+		return s.decl.ReserveFreeBytes
+	}
+	return minHeadroom
+}
+
 func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
 	if !served || !s.usable || s.decl.Root != o.Root || !e.due(&e.packs, o.ObjectID) {
 		return
@@ -556,8 +571,8 @@ func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore
 	size, err := s.fs.Size(ctx, o.Path)
 	if err == nil {
 		var free int64
-		if _, free, err = s.fs.Usage(ctx, s.decl.Root); err == nil && free < size {
-			err = fmt.Errorf("%d bytes free on %s, %d to pack", free, s.decl.ID, size)
+		if _, free, err = s.fs.Usage(ctx, s.decl.Root); err == nil && free-size < headroom(s) {
+			err = fmt.Errorf("%d bytes free on %s, %d to pack, %d to leave free", free, s.decl.ID, size, headroom(s))
 		}
 	}
 	started := time.Now()

@@ -100,8 +100,8 @@ func (e *Local) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder,
 	}
 	root := filepath.Clean(s.decl.Root)
 	made.Path = filepath.Join(root, inputsDirName, o.ObjectID)
-	if free := freeOn(ctx, s); free >= 0 && free < o.PackBytes+o.ContentBytes {
-		return made, fmt.Errorf("%d bytes free on %s, %d to bring", free, s.decl.ID, o.PackBytes+o.ContentBytes)
+	if free := freeOn(ctx, s); free >= 0 && free-(o.PackBytes+o.ContentBytes) < headroom(s) {
+		return made, fmt.Errorf("%d bytes free on %s, %d to bring, %d to leave free", free, s.decl.ID, o.PackBytes+o.ContentBytes, headroom(s))
 	}
 	r, err := openDirPath(root, false)
 	if err != nil {
