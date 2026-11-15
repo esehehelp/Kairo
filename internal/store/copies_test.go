@@ -10,6 +10,17 @@ import (
 	"kairo/internal/machine"
 )
 
+// copiesOnly are orders but the describe-only ones (descriptions.go).
+func copiesOnly(orders []CopyOrder) []CopyOrder {
+	var out []CopyOrder
+	for _, o := range orders {
+		if !o.DescribeOnly {
+			out = append(out, o)
+		}
+	}
+	return out
+}
+
 // insertPacked makes a packed object of executorID on storeID at root.
 func insertPacked(t *testing.T, store *Store, objectID, executorID, storeID, root, sha string) {
 	t.Helper()
@@ -138,7 +149,7 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 		t.Fatalf("recorded again: %v", err)
 	}
 	orders, err = store.CopiesToMake(ctx, "durable-exec")
-	if err != nil || len(orders) != 1 || orders[0].ObjectID != "obj_remote" {
+	if orders = copiesOnly(orders); err != nil || len(orders) != 1 || orders[0].ObjectID != "obj_remote" {
 		t.Fatalf("after the local copy was verified: %+v %v", orders, err)
 	}
 
@@ -278,7 +289,7 @@ func TestADurableObjectIsReplicatedToEveryDurableStore(t *testing.T) {
 	// a new object, nowhere durable yet, goes before the replica
 	insertPacked(t, store, "obj_b", "executor", "d-scratch", "D:/kairo", sha)
 	orders, err = store.CopiesToMake(ctx, "durable-exec")
-	if err != nil || len(orders) != 2 {
+	if orders = copiesOnly(orders); err != nil || len(orders) != 2 {
 		t.Fatalf("orders %+v %v", orders, err)
 	}
 	if orders[0].ObjectID != "obj_b" || orders[0].Source.Month != "" {
