@@ -2492,6 +2492,36 @@ the `CI_*` settings of CI on Kairo.
   state and CA in `%ProgramData%\Kairo` (readable by SYSTEM and Administrators
   only: the configuration holds its token), and the task `kairo-controller`.
 
+### Rebuilding an installation from its durable store
+
+What Kairo holds survives in its durable store: every copy is
+`<root>/objects/<YYYYMM>/<object id>.tar.zst` (tar, zstd) with its file list
+beside it (`.files.tsv`), readable without Kairo. Kairo keeps its own control
+plane there too: the tasks of project `kairo`, queue `control-backup` write
+the database dump (`kairo-<time>.dump`, `pg_dump -Fc`) and the daemon's state
+(`daemon-srv-kairo-<time>.tar.gz`: its configuration, TLS and code
+snapshots) to their run's output directory, which is packed and copied like
+any output; an import named `kairo-control-<time>` holds the same with every
+node's `/srv/kairo` (agent configuration and tokens, without binaries), the
+hosts' `/etc/kairo` and the Windows host's configuration directory. With
+nothing else left (no database, no daemon, no nodes):
+
+1. Find the newest dump: the file lists that name one
+   (`grep -l 'kairo-.*\.dump\|db/kairo\.dump' <root>/objects/*/*.files.tsv`),
+   and unpack that object (`zstd -dc OBJ.tar.zst | tar -x`).
+2. Build kairo from this repository; make an empty PostgreSQL database
+   (Database) and `pg_restore -d kairo` the dump into it.
+3. Put the daemon's state back (`/srv/kairo`: `kairo.toml`, `tls/`,
+   `sources/`) and start `kairo serve`; restore each node's agent
+   configuration (or issue new tokens) and start the agents.
+4. Declare the stores as before (the machine declaration is in the dump and
+   in the Windows configuration directory's `machines.toml`): the copies are
+   where the restored records say, so nothing is copied again.
+
+What the daemon recorded after the dump restored (an import, a copy) is not
+in it: its copy is on the durable store all the same, with its file list,
+but unknown to the restored daemon.
+
 ## Verification
 
 The Go tests need a PostgreSQL 17 server where they may create databases:
