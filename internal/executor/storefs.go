@@ -340,7 +340,20 @@ func (localStoreFS) Size(ctx context.Context, dir string) (int64, error) {
 		return 0, nil
 	}
 	if err != nil {
-		return 0, err
+		// an imported regular file (PackDir)
+		parent, name, regular, ferr := openFileParent(dir)
+		if ferr != nil || !regular {
+			if ferr == nil {
+				parent.Close()
+			}
+			return 0, err
+		}
+		defer parent.Close()
+		info, ferr := parent.Lstat(name)
+		if ferr != nil {
+			return 0, ferr
+		}
+		return info.Size(), nil
 	}
 	defer r.Close()
 	mounts, err := mountsUnderFn(dir)

@@ -79,6 +79,12 @@ type agentDescribedRequest struct {
 	StoreID    string `json:"store_id"`
 }
 
+type agentAbandonPackRequest struct {
+	ExecutorID string `json:"executor_id"`
+	ObjectID   string `json:"object_id"`
+	Reason     string `json:"reason"`
+}
+
 type agentRecordFetchRequest struct {
 	Made store.FetchMade `json:"made"`
 }
@@ -331,6 +337,13 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentDescribedRequest) (any, error) {
 				return okBody, s.Store.RecordDescribed(ctx, b.ExecutorID, b.ObjectID, b.StoreID)
+			}),
+		newAgentOp(s, "abandon-pack", observeRefused, nil,
+			func(ctx context.Context, b agentAbandonPackRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentAbandonPackRequest) (any, error) {
+				return okBody, s.Store.AbandonPack(ctx, b.ExecutorID, b.ObjectID, b.Reason)
 			}),
 		newAgentOp(s, "record-copy", observeRefused, nil,
 			func(ctx context.Context, b agentRecordCopyRequest) (string, error) {

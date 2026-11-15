@@ -28,8 +28,8 @@ func importedTree(t *testing.T, dir string) {
 }
 
 // A round packs an imported directory onto the store it was ordered packed
-// on (outside the store, only read); a directory missing fails and is tried
-// again later.
+// on (outside the store, only read); a directory gone (its volume there) is
+// abandoned, asked no more.
 func TestAnImportedDirectoryIsPacked(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
@@ -56,7 +56,7 @@ func TestAnImportedDirectoryIsPacked(t *testing.T) {
 	if !exists(filepath.Join(data, "meta.json")) {
 		t.Fatal("the imported directory was changed")
 	}
-	if !strings.Contains(logs.String(), "imported directory not packed") || !strings.Contains(logs.String(), "obj_gone") {
+	if len(fake.abandoned) != 1 || fake.abandoned[0] != "obj_gone" || !strings.Contains(logs.String(), "import abandoned") {
 		t.Fatalf("missing directory not warned:\n%s", logs.String())
 	}
 }

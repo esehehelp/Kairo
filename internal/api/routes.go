@@ -57,6 +57,7 @@ func (s *Server) routes() []route {
 		{"GET", "/api/stores", roleRead, s.storeStatus},
 		{"GET", "/api/data/objects", roleRead, s.listDataObjects},
 		{"POST", "/api/data/imports", roleAdmin, s.importData},
+		{"POST", "/api/data/objects/{id}/cancel", roleAdmin, s.cancelImport},
 		{"POST", "/api/data/fetches", roleAdmin, s.fetchData},
 		{"GET", "/api/hardware", roleRead, s.listHardware},
 		{"GET", "/api/hardware/samples", roleRead, s.hardwareSamples},

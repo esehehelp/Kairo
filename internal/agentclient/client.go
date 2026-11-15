@@ -198,6 +198,12 @@ func (c *Client) RecordDescribed(ctx context.Context, executorID, objectID, stor
 	return c.call(ctx, "record-described", map[string]string{"executor_id": executorID, "object_id": objectID, "store_id": storeID}, nil)
 }
 
+// AbandonPack records that the source of an import this executor was to
+// pack is gone.
+func (c *Client) AbandonPack(ctx context.Context, executorID, objectID, reason string) error {
+	return c.call(ctx, "abandon-pack", map[string]string{"executor_id": executorID, "object_id": objectID, "reason": reason}, nil)
+}
+
 // RecordCopy records a copy this executor wrote and read back.
 func (c *Client) RecordCopy(ctx context.Context, made store.CopyMade) error {
 	return c.call(ctx, "record-copy", map[string]any{"made": made}, nil)

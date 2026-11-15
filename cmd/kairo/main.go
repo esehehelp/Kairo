@@ -262,6 +262,32 @@ func serve(args []string) error {
 			}
 		}
 	}()
+	checkpointEvery, err := daemonConfig.Data.CheckpointEvery()
+	if err != nil {
+		return err
+	}
+	if checkpointEvery > 0 && !daemonConfig.ObserveOnly {
+		// Checkpoints of running work: a running checkpointable attempt is
+		// asked for one now and then; what it publishes is kept
+		// (api.protectCheckpoint).
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				commands, err := st.RequestDueCheckpoints(ctx, checkpointEvery)
+				if err != nil && ctx.Err() == nil {
+					logger.Error("checkpoints not requested", "error", err)
+				} else if len(commands) > 0 {
+					logger.Info("checkpoints requested to keep running work", "commands", len(commands), "every", checkpointEvery)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	if every := daemonConfig.ControlSnapshotEvery(); every > 0 && !daemonConfig.ObserveOnly {
 		// Kairo keeps itself: a control-snapshot task every interval, its
 		// output copied to every durable store like any other.

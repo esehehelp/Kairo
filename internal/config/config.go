@@ -204,6 +204,23 @@ type Data struct {
 	// ConfineFrom (RFC 3339 with an offset): every attempt launched from
 	// then on is confined, whether its execution asks or not.
 	ConfineFrom string `toml:"confine_from"`
+	// CheckpointInterval (a Go duration; default "2h", "0" never): a running
+	// checkpointable attempt that has not published a checkpoint for this
+	// long is asked for one, which is then kept like any data (README:
+	// Checkpoints of running work).
+	CheckpointInterval string `toml:"checkpoint_interval"`
+}
+
+// CheckpointEvery is CheckpointInterval parsed (0: never).
+func (d Data) CheckpointEvery() (time.Duration, error) {
+	if d.CheckpointInterval == "" {
+		return 2 * time.Hour, nil
+	}
+	every, err := time.ParseDuration(d.CheckpointInterval)
+	if err != nil || every < 0 {
+		return 0, fmt.Errorf("data.checkpoint_interval %q is not a duration such as \"2h\" (\"0\": never)", d.CheckpointInterval)
+	}
+	return every, nil
 }
 
 // ConfineTime is ConfineFrom parsed (zero: not set).
@@ -268,6 +285,9 @@ func Load(path string) (Config, error) {
 		return c, errors.New("log_min_free_mib must not be negative")
 	}
 	if _, err := c.Data.ScrubEvery(); err != nil {
+		return c, err
+	}
+	if _, err := c.Data.CheckpointEvery(); err != nil {
 		return c, err
 	}
 	if c.Data.ScrubBytesPerDay < 0 {

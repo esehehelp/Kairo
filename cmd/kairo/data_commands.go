@@ -76,6 +76,30 @@ func dataImport(args []string) error {
 	return nil
 }
 
+// dataCancel: kairo data cancel OBJECT...: abandon imports not packed yet.
+func dataCancel(args []string) error {
+	fs := newFlags("data cancel")
+	api := apiFlag(fs)
+	objects, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(objects) == 0 {
+		return usageError("data cancel takes the objects to cancel")
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	for _, objectID := range objects {
+		if _, err = client.call(http.MethodPost, "/api/data/objects/"+url.PathEscape(objectID)+"/cancel", map[string]string{}); err != nil {
+			return fmt.Errorf("%s: %w", objectID, err)
+		}
+		fmt.Println(objectID, "abandoned")
+	}
+	return nil
+}
+
 // dataList: kairo data list [--project P] [--kind K] [--limit N] [--json].
 func dataList(args []string) error {
 	fs := newFlags("data list")

@@ -135,14 +135,16 @@ func packKind(ctx context.Context, root string, kind dirKind, id, objectID strin
 	if err != nil {
 		return res, err
 	}
-	return packInto(ctx, r, root, sr, src, mounts, kind.marker, objectID, identity)
+	return packInto(ctx, r, root, sr, src, mounts, kind.marker, "", objectID, identity)
 }
 
 // PackDir packs an imported directory dir (store.ImportData: outside every
 // store; not Kairo's, only read) into <root>/packs as Pack packs a
 // directory of Kairo's: dir is opened one directory at a time from its
 // volume's root through handles (no link on its path), and there is no
-// marker to leave out.
+// marker to leave out. An imported regular file (a published checkpoint:
+// store.ProtectCheckpoint) is packed alone, by its name, opened through its
+// directory. Nothing there (fs.ErrNotExist) is errSourceGone.
 func (localStoreFS) PackDir(ctx context.Context, root, dir, objectID string) (packResult, error) {
 	return packDir(ctx, root, dir, objectID, false)
 }
@@ -164,21 +166,66 @@ func packDir(ctx context.Context, root, dir, objectID string, identity bool) (pa
 	}
 	defer r.Close()
 	sr, err := openDirPath(dir, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		return res, sourceGone(dir, err)
+	}
 	if err != nil {
-		return res, err
+		parent, name, regular, ferr := openFileParent(dir)
+		if ferr != nil {
+			return res, ferr
+		}
+		defer parent.Close()
+		if !regular {
+			return res, err
+		}
+		return packInto(ctx, r, root, parent, filepath.Dir(dir), nil, "", name, objectID, identity)
 	}
 	defer sr.Close()
 	mounts, err := mountsUnderFn(dir)
 	if err != nil {
 		return res, err
 	}
-	return packInto(ctx, r, root, sr, dir, mounts, "", objectID, identity)
+	return packInto(ctx, r, root, sr, dir, mounts, "", "", objectID, identity)
 }
 
-// packInto packs src (opened as sr; marker, if any, left out) into the packs
-// directory of the store opened as r at root, and reads the pack back; with
-// identity, only the file list is written and read back.
-func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src string, mounts []string, marker, objectID string, identity bool) (packResult, error) {
+// errSourceGone: what an import names is not there any more.
+var errSourceGone = errors.New("the imported path is gone")
+
+// sourceGone is err (a path missing on the way to p) as errSourceGone when
+// p's volume is there: an unplugged disk is not a deleted source.
+func sourceGone(p string, err error) error {
+	if !errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if _, verr := os.Stat(filepath.VolumeName(p) + string(filepath.Separator)); verr != nil {
+		return err
+	}
+	return fmt.Errorf("%w: %v", errSourceGone, err)
+}
+
+// openFileParent opens the directory holding p through handles and says
+// whether p is a regular file there (name its name); p missing is
+// errSourceGone.
+func openFileParent(p string) (*os.Root, string, bool, error) {
+	p = filepath.Clean(p)
+	parent, err := openDirPath(filepath.Dir(p), false)
+	if err != nil {
+		return nil, "", false, sourceGone(p, err)
+	}
+	name := filepath.Base(p)
+	info, err := parent.Lstat(name)
+	if err != nil {
+		parent.Close()
+		return nil, "", false, sourceGone(p, err)
+	}
+	return parent, name, info.Mode().IsRegular(), nil
+}
+
+// packInto packs src (opened as sr; marker, if any, left out; with only, just
+// that regular file of it) into the packs directory of the store opened as r
+// at root, and reads the pack back; with identity, only the file list is
+// written and read back.
+func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src string, mounts []string, marker, only, objectID string, identity bool) (packResult, error) {
 	var res packResult
 	err := r.Mkdir(packsDirName, 0o755)
 	if err != nil && !errors.Is(err, fs.ErrExist) {
@@ -192,7 +239,7 @@ func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src str
 	if err = checkParentNotMounted(root, dirKind{dir: packsDirName}); err != nil {
 		return res, err
 	}
-	res, err = writePack(ctx, sr, src, mounts, marker, pr, objectID+packSuffix, identity)
+	res, err = writePack(ctx, sr, src, mounts, marker, only, pr, objectID+packSuffix, identity)
 	if err != nil {
 		return res, err
 	}
@@ -253,7 +300,7 @@ func (c *countWriter) Write(p []byte) (int, error) {
 
 // writePack packs src (opened at srcPath) into packName and its file list in
 // packs, leaving out the marker at its top. See above for what goes in.
-func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []string, marker string, packs *os.Root, packName string, identity bool) (packResult, error) {
+func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []string, marker, only string, packs *os.Root, packName string, identity bool) (packResult, error) {
 	var res packResult
 	listName := packName + manifestSuffix
 	for _, name := range []string{packName + partialSuffix, listName + partialSuffix} {
@@ -304,6 +351,9 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 			if err := ctx.Err(); err != nil {
 				return res, err
 			}
+			if only != "" && (dir != "." || info.Name() != only) {
+				continue
+			}
 			rel := path.Join(dir, info.Name())
 			if !utf8.ValidString(rel) {
 				return res, fmt.Errorf("%w: %q", errPackName, rel)
@@ -336,6 +386,10 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 		for i := len(subdirs) - 1; i >= 0; i-- {
 			pending = append(pending, subdirs[i])
 		}
+	}
+	if only != "" && res.files != 1 {
+		// gone, or no longer a regular file, while it was packed
+		return res, fmt.Errorf("%w: %s", errSourceGone, filepath.Join(srcPath, only))
 	}
 	if err := tw.Close(); err != nil {
 		return res, err
@@ -589,6 +643,16 @@ func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore
 	}
 	if err == nil {
 		err = e.Store.RecordPack(ctx, packMade(e.ID, o, res))
+	}
+	if errors.Is(err, errSourceGone) {
+		// nothing left to pack: abandoned (store.AbandonPack), asked no more
+		if aerr := e.Store.AbandonPack(ctx, e.ID, o.ObjectID, err.Error()); aerr != nil {
+			e.packProblem(o.ObjectID, "imported path gone, not abandoned", aerr)
+			return
+		}
+		e.packProblem(o.ObjectID, "", nil)
+		e.Logger.Warn("import abandoned: its path is gone", "object_id", o.ObjectID, "path", o.Path, "error", err)
+		return
 	}
 	if err != nil {
 		e.packProblem(o.ObjectID, "imported directory not packed", err)

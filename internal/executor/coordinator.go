@@ -46,6 +46,8 @@ type Coordinator interface {
 	RecordCopy(ctx context.Context, made store.CopyMade) error
 	// RecordDescribed: a verified copy's description is written beside it.
 	RecordDescribed(ctx context.Context, executorID, objectID, storeID string) error
+	// AbandonPack: the source of an import to pack is gone.
+	AbandonPack(ctx context.Context, executorID, objectID, reason string) error
 	FetchesToMake(ctx context.Context, executorID string) ([]store.FetchOrder, error)
 	RecordFetch(ctx context.Context, made store.FetchMade) error
 	AuthorizePackRead(ctx context.Context, nodeID, objectID, token string) (store.PackRead, error)

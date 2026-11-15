@@ -197,9 +197,17 @@ func TestFileListEscapesWhatWouldBreakALine(t *testing.T) {
 // fakePacks orders packs and records what is made.
 type fakePacks struct {
 	*fakeOutputs
-	pmu    sync.Mutex
-	orders []store.PackOrder
-	made   []store.PackMade
+	pmu       sync.Mutex
+	orders    []store.PackOrder
+	made      []store.PackMade
+	abandoned []string
+}
+
+func (f *fakePacks) AbandonPack(_ context.Context, _, objectID, _ string) error {
+	f.pmu.Lock()
+	defer f.pmu.Unlock()
+	f.abandoned = append(f.abandoned, objectID)
+	return nil
 }
 
 func (f *fakePacks) PacksToMake(context.Context, string) ([]store.PackOrder, error) {

@@ -83,6 +83,7 @@ var errorCodes = []struct {
 	{"execution_started", http.StatusConflict, store.ErrExecutionStarted},
 	{"idempotency_conflict", http.StatusConflict, store.ErrIdempotencyConflict},
 	{"orchestration_conflict", http.StatusConflict, store.ErrOrchestrationConflict},
+	{"not_abandonable", http.StatusConflict, store.ErrNotAbandonable},
 	{"task_conflict", http.StatusConflict, store.ErrTaskConflict},
 	{"ownership_conflict", http.StatusConflict, store.ErrOwnershipConflict},
 	{"machine_conflict", http.StatusConflict, store.ErrMachineConflict},

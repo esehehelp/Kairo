@@ -23,6 +23,15 @@ func (s *Server) importData(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"objects": objects})
 }
 
+// cancelImport abandons an import not packed yet (kairo data cancel).
+func (s *Server) cancelImport(w http.ResponseWriter, r *http.Request) {
+	if err := s.Store.CancelImport(r.Context(), r.PathValue("id"), actorOr(r, "")); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // listDataObjects lists data objects, newest first (kairo data list):
 // ?project=, ?kind= and ?limit= narrow it.
 func (s *Server) listDataObjects(w http.ResponseWriter, r *http.Request) {

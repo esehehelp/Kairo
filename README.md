@@ -130,6 +130,9 @@ refuses a Task with no running attempt or whose execution is not
 checkpointable. `--wait` prints each published path (or the refusal) once
 acknowledged; `GET /api/commands/{id}` returns a command's state and payload.
 Workers whose SDK predates the command skip it, so it stays pending.
+The daemon asks for checkpoints the same way on its own (origin
+`data_protection`) and keeps what is published (Checkpoints of running
+work).
 
 `kairo task rerun PROJECT [QUEUE] TASK` runs the same declaration of a
 `failed`, `stopped`, `cancelled` or `blocked` Task again, as its next
@@ -1483,12 +1486,48 @@ removal is lost with it: import directories nothing writes in any more.
 From Git Bash a POSIX path is rewritten into Git's own directory before
 the CLI sees it (`/srv/x` becomes `C:/Program Files/Git/srv/x`): the CLI
 refuses one that looks so; run it with `MSYS_NO_PATHCONV=1`.
+A PATH may also be a regular file (a published checkpoint: Checkpoints of
+running work): it is packed alone, under its name, opened through its
+directory. An import whose path is gone while its volume is there (a disk
+that is not mounted is not a deleted source) is `abandoned` (event
+`import_abandoned`): nothing packs it any more and its source is settled
+`kept` with why, so the path can be imported again. `kairo data cancel
+OBJECT...` (`POST /api/data/objects/{id}/cancel`) abandons imports not
+packed yet the same way; a pack already being made when it is cancelled is
+still recorded when it is done, and copied.
 `kairo data list [--project P] [--kind output|scratch|import] [--limit N]
 [--json]` (`GET /api/data/objects`, `{"objects": [...]}`, newest first, 200
-by default) shows each object: kind, project, name, node, `packing` or
-`packed`, files, content and pack bytes, verified copies (and the path of
-one), and what became of its source (`present`, `deleting`, `deleted`,
-`kept`, `evicting`, `evicted`, with why).
+by default) shows each object: kind, project, name, node, `packing`,
+`packed` or `abandoned`, files, content and pack bytes, verified copies (and
+the path of one), and what became of its source (`present`, `deleting`,
+`deleted`, `kept`, `evicting`, `evicted`, with why).
+
+#### Checkpoints of running work
+
+A run's output directory is kept once the run has ended; the work of a run
+still going is kept through its checkpoints. When an attempt publishes a
+checkpoint (it acknowledges a suspend or a checkpoint command `checkpointed`
+with a `continuation_ref`) whose reference is an absolute path of its node
+(`D:\ckpt\run\step_200.pt`, `/srv/ckpt/run`; not a URI, not a UNC path), a
+file or a directory outside every store, the daemon imports it into the
+attempt's project as `checkpoints/<task>/<the path's last component>` (the
+task left out when the name would pass 200 characters), packed and copied to
+the durable stores like any import, the path only read and left where it is.
+A path is imported once (a repeated acknowledgement imports nothing again);
+one whose import was abandoned is imported anew. A checkpoint that cannot be
+imported (inside a store, overlapping an import, a WSL attempt's POSIX path
+on a Windows node) is logged and left; the acknowledgement stands whatever
+becomes of it.
+
+So that long work has checkpoints to keep, the daemon asks for them: every
+minute, each running checkpointable attempt that started at least
+`[data] checkpoint_interval` ago (daemon configuration, a Go duration;
+default `"2h"`, `"0"` never) and has had no checkpoint command in that time,
+nor any command in flight (a suspend included), gets a checkpoint command
+(origin `data_protection`, event `checkpoint_requested` with actor `kairo`),
+as `kairo task checkpoint` would make one: the attempt answers it at its next
+safe point and carries on. An attempt that does not take checkpoint commands
+leaves it pending, and is asked nothing more meanwhile.
 
 Brought inputs: an input not on the node an execution waits on is brought
 there once it is a packed object (a fetch, ordered as the daemon reconciles

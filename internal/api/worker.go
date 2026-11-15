@@ -1,7 +1,9 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"kairo/internal/store"
@@ -43,7 +45,33 @@ func (s *Server) workerAck(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
+	if body.Phase == "checkpointed" {
+		s.protectCheckpoint(r.Context(), worker.AttemptID, body.Payload)
+	}
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+}
+
+// protectCheckpoint keeps the checkpoint an attempt just published
+// (store.ProtectCheckpoint); the acknowledgement stands whatever becomes of
+// it.
+func (s *Server) protectCheckpoint(ctx context.Context, attemptID string, payload json.RawMessage) {
+	var body struct {
+		ContinuationRef string `json:"continuation_ref"`
+	}
+	if json.Unmarshal(payload, &body) != nil || body.ContinuationRef == "" {
+		return
+	}
+	logger := s.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	objectID, err := s.Store.ProtectCheckpoint(ctx, attemptID, body.ContinuationRef)
+	switch {
+	case err != nil:
+		logger.Warn("published checkpoint not kept", "attempt_id", attemptID, "ref", body.ContinuationRef, "error", err)
+	case objectID != "":
+		logger.Info("published checkpoint kept", "attempt_id", attemptID, "ref", body.ContinuationRef, "object_id", objectID)
+	}
 }
 
 func (s *Server) workerHeartbeat(w http.ResponseWriter, r *http.Request) {
