@@ -144,12 +144,15 @@ const unknownRoom = int64(1) << 62
 
 // copyRoomTx is what each of stores can still take: its free bytes as last
 // reported (usable), less its reserve_free_bytes and the packs of the copies
-// being made there; unknownRoom for one never reported usable.
+// being made there or verified there since that report (a report is minutes
+// old; copies made meanwhile are not in it); unknownRoom for one never
+// reported usable.
 func copyRoomTx(ctx context.Context, q queryer, stores []machine.Store) (map[string]int64, error) {
 	room := map[string]int64{}
 	for _, s := range stores {
 		var free sql.NullInt64
-		err := q.QueryRowContext(ctx, `SELECT free_bytes FROM store_observations WHERE store_id=$1 AND usable`, s.ID).Scan(&free)
+		var observed string
+		err := q.QueryRowContext(ctx, `SELECT free_bytes,observed_at FROM store_observations WHERE store_id=$1 AND usable`, s.ID).Scan(&free, &observed)
 		if errors.Is(err, sql.ErrNoRows) || err == nil && !free.Valid {
 			room[s.ID] = unknownRoom
 			continue
@@ -158,7 +161,8 @@ func copyRoomTx(ctx context.Context, q queryer, stores []machine.Store) (map[str
 			return nil, err
 		}
 		var copying int64
-		if err = q.QueryRowContext(ctx, `SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM object_copies c JOIN data_objects d ON d.id=c.object_id WHERE c.store_id=$1 AND c.state='copying'`, s.ID).Scan(&copying); err != nil {
+		if err = q.QueryRowContext(ctx, `SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM object_copies c JOIN data_objects d ON d.id=c.object_id
+			WHERE c.store_id=$1 AND (c.state='copying' OR c.state='verified' AND c.verified_at>$2)`, s.ID, observed).Scan(&copying); err != nil {
 			return nil, err
 		}
 		room[s.ID] = free.Int64 - s.ReserveFreeBytes - copying

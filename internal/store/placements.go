@@ -16,8 +16,9 @@ import (
 // (inputs.go): its data object is fetched from a verified copy on a durable
 // store (or, while it is still there, from the pack where it was made) and
 // unpacked under <root>/inputs/<object id> on a volatile store of the node
-// (the first by id an executor of the node that is not a WSL one serves), by
-// that executor, which checks the pack against its size and sha256 and each
+// (the first by id an executor of the node that is not a WSL one serves with
+// room for what it holds, else the first by id; a fetch still waiting for room
+// on its store moves to one with room: fetchRoomTx), by that executor, which checks the pack against its size and sha256 and each
 // file against the pack's file list (object_placements: fetching, then
 // ready). A fetch is ordered for each input an execution waiting on a node
 // lacks there (orderInputFetches), or by kairo data fetch. What is brought
@@ -62,10 +63,88 @@ func inputDirOf(root, objectID string) string {
 	return strings.TrimRight(root, `/\`) + sep + "inputs" + sep + objectID
 }
 
+// fetchRoomTx is what each volatile store of stores can still take for a
+// fetch: its free bytes as last reported (usable), less its
+// reserve_free_bytes (at least minFetchHeadroom) and what the fetches being
+// made there will unpack (but objectID's own); unknownRoom for one never
+// reported.
+func fetchRoomTx(ctx context.Context, q queryer, stores []machine.Store, objectID string) (map[string]int64, error) {
+	room := map[string]int64{}
+	for _, s := range stores {
+		var free sql.NullInt64
+		err := q.QueryRowContext(ctx, `SELECT free_bytes FROM store_observations WHERE store_id=$1 AND usable`, s.ID).Scan(&free)
+		if errors.Is(err, sql.ErrNoRows) || err == nil && !free.Valid {
+			room[s.ID] = unknownRoom
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var fetching int64
+		if err = q.QueryRowContext(ctx, `SELECT COALESCE(SUM(COALESCE(d.content_bytes,d.pack_bytes)),0)::bigint FROM object_placements p JOIN data_objects d ON d.id=p.object_id
+			WHERE p.store_id=$1 AND p.state='fetching' AND p.object_id<>$2`, s.ID, objectID).Scan(&fetching); err != nil {
+			return nil, err
+		}
+		reserve := s.ReserveFreeBytes
+		if reserve < minFetchHeadroom {
+			reserve = minFetchHeadroom
+		}
+		room[s.ID] = free.Int64 - reserve - fetching
+	}
+	return room, nil
+}
+
+// fetchMoveAfter: a fetch not ready this long after it was ordered, on a
+// store without room for it, is moved (moveWaitingFetchesTx).
+const fetchMoveAfter = time.Hour
+
+// minFetchHeadroom is what a fetch leaves free on a store declaring no
+// reserve (the agent's own check: executor/pack.go headroom).
+const minFetchHeadroom = 1 << 30
+
 // placementStoreTx is the volatile store of a node objects are brought to,
 // and the executor that brings them: the first store by id that an executor
 // of the node that is not a WSL one serves.
 func placementStoreTx(ctx context.Context, q queryer, declared []machine.Store, nodeID string) (machine.Store, string, bool, error) {
+	stores, err := placementStoresTx(ctx, q, declared, nodeID)
+	if err != nil || len(stores) == 0 {
+		return machine.Store{}, "", false, err
+	}
+	return stores[0].store, stores[0].executor, true, nil
+}
+
+// placementStoreWithRoomTx is the first store of placementStoresTx with room
+// for bytes (fetchRoomTx), else the first.
+func placementStoreWithRoomTx(ctx context.Context, q queryer, declared []machine.Store, nodeID, objectID string, bytes int64) (machine.Store, string, bool, error) {
+	stores, err := placementStoresTx(ctx, q, declared, nodeID)
+	if err != nil || len(stores) == 0 {
+		return machine.Store{}, "", false, err
+	}
+	all := make([]machine.Store, len(stores))
+	for i, s := range stores {
+		all[i] = s.store
+	}
+	room, err := fetchRoomTx(ctx, q, all, objectID)
+	if err != nil {
+		return machine.Store{}, "", false, err
+	}
+	for _, s := range stores {
+		if room[s.store.ID] >= bytes {
+			return s.store, s.executor, true, nil
+		}
+	}
+	return stores[0].store, stores[0].executor, true, nil
+}
+
+type placementStore struct {
+	store    machine.Store
+	executor string
+}
+
+// placementStoresTx are the volatile stores of a node objects can be brought
+// to, by id, each with the executor that brings them: one of the node that
+// is not a WSL one serving it.
+func placementStoresTx(ctx context.Context, q queryer, declared []machine.Store, nodeID string) ([]placementStore, error) {
 	var executorIDs []string
 	err := eachRow(ctx, q, `SELECT id FROM executors WHERE node_id=$1 ORDER BY id`, []any{nodeID}, func(rows *sql.Rows) error {
 		var id string
@@ -76,7 +155,7 @@ func placementStoreTx(ctx context.Context, q queryer, declared []machine.Store, 
 		return nil
 	})
 	if err != nil {
-		return machine.Store{}, "", false, err
+		return nil, err
 	}
 	stores := make([]machine.Store, 0, len(declared))
 	for _, d := range declared {
@@ -85,18 +164,90 @@ func placementStoreTx(ctx context.Context, q queryer, declared []machine.Store, 
 		}
 	}
 	sort.Slice(stores, func(i, j int) bool { return stores[i].ID < stores[j].ID })
+	var out []placementStore
 	for _, d := range stores {
 		for _, executorID := range executorIDs {
 			info, err := executorInfoTx(ctx, q, executorID)
 			if err != nil {
-				return machine.Store{}, "", false, err
+				return nil, err
 			}
 			if !info.wsl && info.serves(d, executorID) {
-				return d, executorID, true, nil
+				out = append(out, placementStore{d, executorID})
+				break
 			}
 		}
 	}
-	return machine.Store{}, "", false, nil
+	return out, nil
+}
+
+// moveWaitingFetchesTx moves each fetch executorID is to make whose store
+// has no room for what it unpacks (fetchRoomTx) to the first other volatile
+// store of the node it serves that has (event fetch_moved): a fetch waiting
+// for room it will not get would keep its execution waiting for good. Only
+// a fetch ordered fetchMoveAfter ago or more is moved: the agent checks the
+// room before it writes anything, but the daemon cannot tell a fetch it
+// refused from one it is writing (that store's free bytes fall as it
+// writes), and one being written is done well within that.
+func moveWaitingFetchesTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, declared []machine.Store, byID map[string]machine.Store) error {
+	type waiting struct {
+		objectID, storeID, projectID string
+		bytes                        int64
+	}
+	var fetches []waiting
+	err := eachRow(ctx, tx, `SELECT p.object_id,p.store_id,COALESCE(d.project_scope_id,''),COALESCE(d.content_bytes,d.pack_bytes,0) FROM object_placements p JOIN data_objects d ON d.id=p.object_id
+		WHERE p.executor_id=$1 AND p.state='fetching' AND p.created_at<$2 ORDER BY p.created_at,p.object_id`, []any{executorID, time.Now().UTC().Add(-fetchMoveAfter).Format(time.RFC3339Nano)}, func(rows *sql.Rows) error {
+		var w waiting
+		if err := rows.Scan(&w.objectID, &w.storeID, &w.projectID, &w.bytes); err != nil {
+			return err
+		}
+		fetches = append(fetches, w)
+		return nil
+	})
+	if err != nil || len(fetches) == 0 {
+		return err
+	}
+	stores, err := placementStoresTx(ctx, tx, declared, me.nodeID)
+	if err != nil {
+		return err
+	}
+	var mine []machine.Store
+	for _, s := range stores {
+		if s.executor == executorID {
+			mine = append(mine, s.store)
+		}
+	}
+	for _, w := range fetches {
+		room, err := fetchRoomTx(ctx, tx, mine, w.objectID)
+		if err != nil {
+			return err
+		}
+		if _, declaredHere := byID[w.storeID]; declaredHere && room[w.storeID] >= w.bytes {
+			continue
+		}
+		for _, s := range mine {
+			if s.ID == w.storeID || room[s.ID] < w.bytes {
+				continue
+			}
+			t := now()
+			result, err := tx.ExecContext(ctx, `UPDATE object_placements SET store_id=$1,root=$2,path=$3,token_hash=NULL,token_expires_at=NULL,updated_at=$4
+				WHERE object_id=$5 AND store_id=$6 AND executor_id=$7 AND state='fetching'
+				AND NOT EXISTS(SELECT 1 FROM object_placements o WHERE o.object_id=$5 AND o.store_id=$1)`, s.ID, s.Root, inputDirOf(s.Root, w.objectID), t, w.objectID, w.storeID, executorID)
+			if err != nil {
+				return err
+			}
+			if n, _ := result.RowsAffected(); n == 1 {
+				var project *string
+				if w.projectID != "" {
+					project = &w.projectID
+				}
+				if err = appendCoordinationEventTx(ctx, tx, "fetch_moved", project, "object", w.objectID, nil, map[string]any{"from": w.storeID, "to": s.ID, "bytes": w.bytes}); err != nil {
+					return err
+				}
+			}
+			break
+		}
+	}
+	return nil
 }
 
 // orderFetchTx orders an object brought to a node, unless it is there or
@@ -106,7 +257,11 @@ func orderFetchTx(ctx context.Context, tx *sql.Tx, declared []machine.Store, obj
 	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM object_placements p JOIN executors x ON x.id=p.executor_id WHERE p.object_id=$1 AND x.node_id=$2)`, objectID, nodeID).Scan(&there); err != nil || there {
 		return false, err
 	}
-	s, executorID, ok, err := placementStoreTx(ctx, tx, declared, nodeID)
+	var bytes int64
+	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(content_bytes,pack_bytes,0) FROM data_objects WHERE id=$1`, objectID).Scan(&bytes); err != nil {
+		return false, err
+	}
+	s, executorID, ok, err := placementStoreWithRoomTx(ctx, tx, declared, nodeID, objectID, bytes)
 	if err != nil || !ok {
 		return false, err
 	}
@@ -229,6 +384,9 @@ func (s *Store) FetchesToMake(ctx context.Context, executorID string) ([]FetchOr
 	byID := map[string]machine.Store{}
 	for _, d := range declared {
 		byID[d.ID] = d
+	}
+	if err = moveWaitingFetchesTx(ctx, tx, me, executorID, declared, byID); err != nil {
+		return nil, err
 	}
 	type row struct {
 		order                                          FetchOrder

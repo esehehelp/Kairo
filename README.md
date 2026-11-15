@@ -1307,8 +1307,9 @@ Copies to a durable store: each packed object is copied to the first durable
 store by id on the node its pack is on, else the first by id elsewhere (read
 through the pack's agent), not inside a WSL distro nor being moved, with room
 for it (its free bytes as last reported, less its `reserve_free_bytes` and
-the packs of the copies being made there; one never reported is taken as
-having room), then to every other durable store as a replica, so losing one
+the packs of the copies being made there or verified there since that
+report, which is minutes old; one never reported is taken as having room),
+then to every other durable store as a replica, so losing one
 store (a disk deleted or failed), or a whole host, loses nothing Kairo
 keeps: once an object has a verified copy, each other durable store an
 executor serves that has none of it takes one as it has room, smallest
@@ -1569,7 +1570,12 @@ tasks, for each input an execution waiting on a node lacks there; or by
 `kairo data fetch --project P --node N [--data NAME]... [OBJECT...]`,
 `POST /api/data/fetches`, `{"project", "node", "data", "objects"}`). It is
 brought to the node's first volatile store by id that an executor of the
-node that is not a WSL one serves, by that executor (table
+node that is not a WSL one serves with room for what it unpacks (its free
+bytes as last reported, less its `reserve_free_bytes`, at least 1 GiB, and
+what the fetches there will unpack), else the first, by that executor; a
+fetch not ready an hour after it was ordered, on a store without room for
+it, moves to the first other such store with room (event `fetch_moved`: an
+execution waiting on an input that never fits would wait for good) (table
 `object_placements`: `fetching`, then `ready` with its bytes; events
 `fetch_ordered`, `fetched`; agent operations `fetches-to-make` every minute,
 `record-fetch`): the object's pack is read from a verified durable copy (a
