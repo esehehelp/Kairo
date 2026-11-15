@@ -2454,6 +2454,38 @@ waits until it finishes as it did before (a force stop still ends it), and
 its run still finishes normally. A daemon from before submits benches as
 executions that are never suspended, which a newer driver runs as before.
 
+### Operating an installation (ops/)
+
+`ops/` holds what an operator runs; nothing an installation needs lives in
+the checkout. What is the operator machine's own is in the user's
+directories, as Go names them (`ops/site.sh`): the configuration directory
+(`%APPDATA%\kairo`, else `${XDG_CONFIG_HOME:-~/.config}/kairo`: the CLI's
+`token` and `ca.pem`, `site.env`, a Windows agent's `agent.toml`, the
+machine declaration) and the state directory (`%LOCALAPPDATA%\kairo`, else
+`${XDG_STATE_HOME:-~/.local/state}/kairo`: `builds/`, CI trees, `logs/`; a
+Windows agent's `attempts/`). `KAIRO_CONFIG_DIR` and `KAIRO_STATE_DIR`
+override them. `site.env` (shell variables) says how the site is reached:
+`KAIRO_PVE_HOST` (the Proxmox host of the daemon's and the database's
+containers), `KAIRO_DAEMON_VMID`, `KAIRO_DB_VMID`, `KAIRO_NODES` (`NODE=ssh:USER@HOST`
+or `NODE=pct:USER@HOST:VMID`, each Linux node whose agent ops/ replaces) and
+the `CI_*` settings of CI on Kairo.
+
+- `bash ops/build.sh`: the clean checkout's HEAD built for Windows and Linux
+  into `builds/kairo-<sha>.exe` and `kairo-<sha>-linux`.
+- `bash ops/deploy-daemon.sh SHA NAME`: a `pg_dump` first, then the daemon's
+  binary (the old one kept as `kairo.before-NAME`), restarted, then the CLI on
+  PATH.
+- `[ADOPT=1] bash ops/replace-linux-agents.sh SHA NODE...`: each node's agent
+  (the old binary kept as `bin/kairo.before-SHA`); a node holding a lease is
+  refused unless `ADOPT=1`; each must report within 2 minutes.
+- Windows, elevated: `ops/windows/install-agent.ps1 -New BUILD` installs the
+  agent as `%LOCALAPPDATA%\Programs\kairo\kairo-agent.exe` with
+  `supervise-agent.ps1` beside it (logs in `<state>/logs`, its configuration
+  `%APPDATA%\kairo\agent.toml`) and the S4U task `kairo-agent` that starts it
+  at boot (refused while the node holds a lease: an agent started with
+  another log directory cannot adopt); `ops/windows/replace-agent.ps1 -New
+  BUILD [-Adopting]` replaces it.
+
 ## Verification
 
 The Go tests need a PostgreSQL 17 server where they may create databases:
@@ -2496,12 +2528,13 @@ checks of one commit as Tasks of project `kairo-ci` (queue `ci`,
 `ci/tasks.toml.in` with the commit's short sha), so they run on this
 installation's own nodes, where the code runs, under the same admission as
 any work. The script copies the commit's tree (`git archive`) to each node the
-checks run on, as `local/ci-site.env` says:
+checks run on, as `site.env` says (Operating an installation), keeping the
+trees it sends in the state directory's `ci/`:
 
 ```sh
-CI_WINDOWS_ROOT=/d/Dev/Kairo/local/ci-windows  # where windows-local's checks unpack
-CI_PVE1_HOST=root@192.168.1.252                # the Proxmox host of pve1-work
-CI_PVE1_VMID=116                               # pve1-work's container
+CI_WINDOWS_ROOT=/c/Users/me/AppData/Local/kairo/ci-windows  # where windows-local's checks unpack
+CI_PVE1_HOST=root@192.168.1.252                             # the Proxmox host of pve1-work
+CI_PVE1_VMID=116                                            # pve1-work's container
 ```
 
 Each Task unpacks that tree into a fresh directory, runs `ci/check.sh CHECK`
