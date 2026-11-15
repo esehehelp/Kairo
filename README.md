@@ -1301,8 +1301,18 @@ files through handles): such an object stays `packing`, warned once.
 (`pack_bytes`, `packs`); until they are moved they are Kairo's bytes there.
 
 Copies to a durable store: each packed object is copied to the first durable
-store by id that is not inside a WSL distro (one copy for now), taken by one
-executor serving that store, never a WSL executor (`copies-to-make` every
+store by id, not inside a WSL distro nor being moved, with room for it (its
+free bytes as last reported, less its `reserve_free_bytes` and the packs of
+the copies being made there; one never reported is taken as having room),
+then to every other durable store as a replica, so losing one store (a disk
+deleted or failed) loses nothing Kairo keeps: once an object has a verified
+copy, each other durable store an executor serves that has none of it takes
+one as it has room, smallest objects first, up to 50 at a time, read from a
+durable copy on that executor's node (its pack may be gone; an object whose
+copies are all on other nodes is not replicated there). An object nowhere
+durable yet always goes before any replica, and the executor asks again after
+each copy, so none waits behind a long one. Each copy is taken by one
+executor serving its store, never a WSL executor (`copies-to-make` every
 minute, `record-copy`; table `object_copies`, `copying` then `verified`;
 events `copy_ordered`, `copy_verified`). A copy taken for a store the
 declaration no longer makes durable at that root, or that its executor no

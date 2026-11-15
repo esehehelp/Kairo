@@ -258,18 +258,29 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 				return nil, err
 			}
 		}
+		if err = orderReplicasTx(ctx, tx, me, executorID, targets, room, t); err != nil {
+			return nil, err
+		}
+	}
+	// a durable copy this executor can read where it is, for a replica
+	localCopies, err := localCopiesTx(ctx, tx, me, executorID, byID)
+	if err != nil {
+		return nil, err
 	}
 	type row struct {
 		order                         CopyOrder
 		sourceExecutor, sourceStoreID string
 		sourceRoot                    string
+		replica                       bool
 	}
 	var rows []row
-	err = eachRow(ctx, tx, `SELECT c.object_id,c.store_id,c.root,c.month,d.pack_bytes,d.pack_sha256,d.manifest_sha256,d.executor_id,d.store_id,d.root
-		FROM object_copies c JOIN data_objects d ON d.id=c.object_id WHERE c.executor_id=$1 AND c.state='copying' ORDER BY c.created_at,c.object_id`, []any{executorID}, func(r *sql.Rows) error {
+	// an object nowhere durable yet first, then the replicas
+	err = eachRow(ctx, tx, `SELECT c.object_id,c.store_id,c.root,c.month,d.pack_bytes,d.pack_sha256,d.manifest_sha256,d.executor_id,d.store_id,d.root,
+		EXISTS(SELECT 1 FROM object_copies v WHERE v.object_id=c.object_id AND v.state='verified') AS replica
+		FROM object_copies c JOIN data_objects d ON d.id=c.object_id WHERE c.executor_id=$1 AND c.state='copying' ORDER BY replica,c.created_at,c.object_id`, []any{executorID}, func(r *sql.Rows) error {
 		var x row
 		if err := r.Scan(&x.order.ObjectID, &x.order.StoreID, &x.order.Root, &x.order.Month, &x.order.PackBytes, &x.order.PackSHA256, &x.order.ManifestSHA256,
-			&x.sourceExecutor, &x.sourceStoreID, &x.sourceRoot); err != nil {
+			&x.sourceExecutor, &x.sourceStoreID, &x.sourceRoot, &x.replica); err != nil {
 			return err
 		}
 		rows = append(rows, x)
@@ -291,6 +302,12 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 			continue
 		}
 		o := x.order
+		if src, ok := localCopies[o.ObjectID]; ok && x.replica && src.StoreID != o.StoreID {
+			// read from a durable copy on this node: the pack may be gone
+			o.Source = src
+			out = append(out, o)
+			continue
+		}
 		o.Source = CopySource{StoreID: x.sourceStoreID, Root: x.sourceRoot}
 		source, err := executorInfoTx(ctx, tx, x.sourceExecutor)
 		if err != nil && !errors.Is(err, ErrNotFound) {

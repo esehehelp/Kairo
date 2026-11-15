@@ -248,3 +248,44 @@ func TestDurableCopiesAreDescribed(t *testing.T) {
 		t.Fatalf("orders once described %+v %v", orders, err)
 	}
 }
+
+// An object with a verified copy is copied to each other durable store the
+// executor serves too, read from that copy (its pack may be gone), after any
+// object nowhere durable yet; a store without room for it takes none.
+func TestADurableObjectIsReplicatedToEveryDurableStore(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	addTestDisk(t, store, "node", "D:")
+	ctx := context.Background()
+	if err := store.UpsertExecutor(ctx, Executor{ID: "durable-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	declareTestStore(t, store,
+		machine.Store{ID: "c-durable", Class: machine.StoreDurable, Node: "node", Root: "C:/_kairo-durable", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+	)
+	sha := strings.Repeat("cd", 32)
+	insertPacked(t, store, "obj_a", "executor", "d-scratch", "D:/kairo", sha)
+	orders, err := store.CopiesToMake(ctx, "durable-exec")
+	if err != nil || len(orders) != 1 || orders[0].StoreID != "c-durable" || orders[0].Source.Month != "" {
+		t.Fatalf("first copy %+v %v", orders, err)
+	}
+	if err = store.RecordCopy(ctx, CopyMade{ObjectID: "obj_a", StoreID: "c-durable", ExecutorID: "durable-exec", Path: "C:/_kairo-durable/objects/202611/obj_a.tar.zst",
+		ManifestPath: "C:/_kairo-durable/objects/202611/obj_a.tar.zst.files.tsv", Bytes: 100, SHA256: sha, ManifestSHA256: sha}); err != nil {
+		t.Fatal(err)
+	}
+	// a new object, nowhere durable yet, goes before the replica
+	insertPacked(t, store, "obj_b", "executor", "d-scratch", "D:/kairo", sha)
+	orders, err = store.CopiesToMake(ctx, "durable-exec")
+	if err != nil || len(orders) != 2 {
+		t.Fatalf("orders %+v %v", orders, err)
+	}
+	if orders[0].ObjectID != "obj_b" || orders[0].Source.Month != "" {
+		t.Fatalf("the object nowhere durable is not first: %+v", orders)
+	}
+	r := orders[1]
+	if r.ObjectID != "obj_a" || r.StoreID != "e-durable" || !r.Source.Local || r.Source.StoreID != "c-durable" || r.Source.Root != "C:/_kairo-durable" || r.Source.Month != "202611" {
+		t.Fatalf("replica %+v", r)
+	}
+}

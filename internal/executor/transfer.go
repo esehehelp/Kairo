@@ -73,22 +73,36 @@ func (e *Local) makeCopies() {
 // A failure is warned once per object (again when it changes) and tried
 // again later (roundProblem).
 func (e *Local) copyDue(ctx context.Context) {
-	orders, err := e.Store.CopiesToMake(ctx, e.ID)
-	if err != nil {
-		e.copyProblem("", "copies to make not read", err)
-		return
-	}
-	e.copyProblem("", "", nil)
-	served := map[string]servedStore{}
-	for _, s := range e.servedStores() {
-		served[s.decl.ID] = s
-	}
-	for _, o := range orders {
-		s, ok := served[o.StoreID]
-		if !ok || !s.usable || s.decl.Class != machine.StoreDurable || s.decl.Root != o.Root || !e.due(&e.copies, o.ObjectID) {
-			continue
+	// Asked again after each copy: what came due meanwhile (an object
+	// nowhere durable yet, which goes before any replica) is not left
+	// behind a long copy. A copy or description tried once in this round is
+	// not tried again in it.
+	tried := map[string]bool{}
+	for ctx.Err() == nil {
+		orders, err := e.Store.CopiesToMake(ctx, e.ID)
+		if err != nil {
+			e.copyProblem("", "copies to make not read", err)
+			return
 		}
-		if o.DescribeOnly {
+		e.copyProblem("", "", nil)
+		served := map[string]servedStore{}
+		for _, s := range e.servedStores() {
+			served[s.decl.ID] = s
+		}
+		var next *store.CopyOrder
+		for i, o := range orders {
+			key := o.ObjectID + "/" + o.StoreID
+			s, ok := served[o.StoreID]
+			if tried[key] || !ok || !s.usable || s.decl.Class != machine.StoreDurable || s.decl.Root != o.Root || !e.due(&e.copies, o.ObjectID) {
+				continue
+			}
+			if !o.DescribeOnly {
+				if next == nil {
+					next = &orders[i]
+				}
+				continue
+			}
+			tried[key] = true
 			err := describeCopy(s, o)
 			if err == nil {
 				err = e.Store.RecordDescribed(ctx, e.ID, o.ObjectID, o.StoreID)
@@ -98,8 +112,13 @@ func (e *Local) copyDue(ctx context.Context) {
 				continue
 			}
 			e.copyProblem(o.ObjectID, "", nil)
-			continue
 		}
+		if next == nil {
+			return
+		}
+		o := *next
+		tried[o.ObjectID+"/"+o.StoreID] = true
+		s := served[o.StoreID]
 		started := time.Now()
 		made, err := e.copyOne(ctx, s, o, served)
 		if err == nil && o.Description != nil {
@@ -116,7 +135,7 @@ func (e *Local) copyDue(ctx context.Context) {
 		}
 		e.copyProblem(o.ObjectID, "", nil)
 		e.Logger.Info("copy verified", "object_id", o.ObjectID, "store_id", o.StoreID, "path", made.Path, "bytes", made.Bytes,
-			"local", o.Source.Local, "seconds", time.Since(started).Seconds())
+			"local", o.Source.Local, "replica_of", o.Source.Month != "", "seconds", time.Since(started).Seconds())
 	}
 }
 
