@@ -220,6 +220,12 @@ func (c *Client) AdoptCopies(ctx context.Context, executorID, storeID, root stri
 	return out.Adopted, err
 }
 
+// ClaimShed claims the removal of a copy of a durable store below its
+// reserve; the files are removed only once it is claimed.
+func (c *Client) ClaimShed(ctx context.Context, executorID, objectID, storeID string) error {
+	return c.call(ctx, "claim-shed", map[string]string{"executor_id": executorID, "object_id": objectID, "store_id": storeID}, nil)
+}
+
 // RecordCopy records a copy this executor wrote and read back.
 func (c *Client) RecordCopy(ctx context.Context, made store.CopyMade) error {
 	return c.call(ctx, "record-copy", map[string]any{"made": made}, nil)

@@ -57,6 +57,9 @@ type CopyOrder struct {
 	// its description is to be written (RecordDescribed).
 	Description  *ObjectDescription `json:"description,omitempty"`
 	DescribeOnly bool               `json:"describe_only,omitempty"`
+	// Shed: the copy is to be removed, its store being below its reserve
+	// (shed.go): claimed first (ClaimShed), then its files removed.
+	Shed bool `json:"shed,omitempty"`
 }
 
 // CopyMade is a copy an executor wrote and read back: where, its size and
@@ -378,6 +381,17 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 		return nil, err
 	}
 	out = append(out, describe...)
+	if served {
+		room, err := copyRoomTx(ctx, tx, targets)
+		if err != nil {
+			return nil, err
+		}
+		shed, err := shedOrdersTx(ctx, tx, me, executorID, targets, room, byID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, shed...)
+	}
 	return out, tx.Commit()
 }
 

@@ -60,3 +60,31 @@ func TestADurableStoreIsListedAndItsDescriptionsRead(t *testing.T) {
 		t.Fatalf("a store with no objects yet: %v %v", copies, err)
 	}
 }
+
+// A shed copy's files go: the pack, its file list and its description;
+// nothing else of the month's directory.
+func TestAShedCopysFilesAreRemoved(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "_kairo-durable")
+	month := filepath.Join(root, "objects", "202611")
+	if err := os.MkdirAll(month, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"obj_a.tar.zst", "obj_a.tar.zst.files.tsv", "obj_a.tar.zst.object.json", "obj_b.tar.zst"} {
+		if err := os.WriteFile(filepath.Join(month, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := removeObjectCopy(root, "202611", "obj_a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeObjectCopy(root, "202611", "obj_a"); err != nil {
+		t.Fatalf("removed again: %v", err)
+	}
+	entries, _ := os.ReadDir(month)
+	if len(entries) != 1 || entries[0].Name() != "obj_b.tar.zst" {
+		t.Fatalf("left %v", entries)
+	}
+	if err := removeObjectCopy(root, "../x", "obj_a"); err == nil {
+		t.Fatal("a month outside the objects was taken")
+	}
+}

@@ -10,11 +10,12 @@ import (
 	"kairo/internal/machine"
 )
 
-// copiesOnly are orders but the describe-only ones (descriptions.go).
+// copiesOnly are orders but the describe-only ones (descriptions.go) and
+// the shed ones (shed.go).
 func copiesOnly(orders []CopyOrder) []CopyOrder {
 	var out []CopyOrder
 	for _, o := range orders {
-		if !o.DescribeOnly {
+		if !o.DescribeOnly && !o.Shed {
 			out = append(out, o)
 		}
 	}

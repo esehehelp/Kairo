@@ -96,6 +96,11 @@ func (e *Local) copyDue(ctx context.Context) {
 			if tried[key] || !ok || !s.usable || s.decl.Class != machine.StoreDurable || s.decl.Root != o.Root || !e.due(&e.copies, o.ObjectID) {
 				continue
 			}
+			if o.Shed {
+				tried[key] = true
+				e.shedCopy(ctx, s, o)
+				continue
+			}
 			if !o.DescribeOnly {
 				if next == nil {
 					next = &orders[i]
@@ -142,6 +147,45 @@ func (e *Local) copyDue(ctx context.Context) {
 // descriptionSuffix names a durable copy's description beside it
 // (store/descriptions.go).
 const descriptionSuffix = ".object.json"
+
+// shedCopy removes a copy of a durable store below its reserve
+// (store/shed.go): claimed first, so a copy the daemon no longer lets go is
+// left alone; its files then removed through the store's handles. Files a
+// failed removal leaves are adopted again by the next inventory.
+func (e *Local) shedCopy(ctx context.Context, s servedStore, o store.CopyOrder) {
+	if _, isLocal := s.fs.(localStoreFS); !isLocal {
+		return
+	}
+	if err := e.Store.ClaimShed(ctx, e.ID, o.ObjectID, o.StoreID); err != nil {
+		e.copyProblem(o.ObjectID, "copy not shed", err)
+		return
+	}
+	if err := removeObjectCopy(s.decl.Root, o.Month, o.ObjectID); err != nil {
+		e.copyProblem(o.ObjectID, "shed copy's files not removed", err)
+		return
+	}
+	e.copyProblem(o.ObjectID, "", nil)
+	e.Logger.Info("copy shed: its store is below its reserve", "object_id", o.ObjectID, "store_id", o.StoreID, "pack_bytes", o.PackBytes)
+}
+
+// removeObjectCopy removes the copy of id made in month on the durable store
+// at root: <id>.tar.zst, its file list and its description.
+func removeObjectCopy(root, month, id string) error {
+	if !machine.ValidMonth(month) || !machine.ScratchIDValid(id) {
+		return fmt.Errorf("%w: object %q, month %q", errOutsideRoot, id, month)
+	}
+	r, err := openDirPath(filepath.Join(root, "objects", month), false)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	for _, name := range []string{id + packSuffix + descriptionSuffix, id + packSuffix + manifestSuffix, id + packSuffix} {
+		if err := r.Remove(name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
 
 // describeCopy writes o's description beside its copy on s
 // (<root>/objects/<month>/<object id>.tar.zst.object.json), synced: what the

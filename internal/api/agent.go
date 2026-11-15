@@ -356,6 +356,13 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentAbandonPackRequest) (any, error) {
 				return okBody, s.Store.AbandonPack(ctx, b.ExecutorID, b.ObjectID, b.Reason)
 			}),
+		newAgentOp(s, "claim-shed", observeRefused, nil,
+			func(ctx context.Context, b agentDescribedRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentDescribedRequest) (any, error) {
+				return okBody, s.Store.ClaimShed(ctx, b.ExecutorID, b.ObjectID, b.StoreID)
+			}),
 		newAgentOp(s, "inventory-durable", observeRefused, nil,
 			func(ctx context.Context, b agentInventoryRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.Listing.ExecutorID)

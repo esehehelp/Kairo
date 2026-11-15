@@ -1336,6 +1336,15 @@ store catalogue ROOT` lists a durable store's copies from their descriptions
 alone). A copy made before descriptions is described afterwards (the same
 round hands out up to 200 describe-only orders a time; `record-described`,
 `object_copies.described_at`).
+A durable store whose room falls below zero (its free bytes under its
+`reserve_free_bytes`: the filesystem filling from outside) sheds copies: its
+executor is ordered (`Shed` in `copies-to-make`) to remove copies there of
+objects that keep at least two verified, undamaged copies on other durable
+stores, the newest first, up to 50 at a time and only as many as cover the
+shortfall; never a copy a replica or a fetch is reading. Each is claimed
+first (`claim-shed`: the record goes, the other copies counted again; event
+`copy_shed`), then its pack, file list and description are removed. Once
+there is room again the store takes replicas as before.
 The directory of a durable store is what it holds, whatever the records say:
 every hour each executor serving one on its own filesystems lists it (each
 `<root>/objects/<YYYYMM>/<object id>.tar.zst` with its file list beside it;
