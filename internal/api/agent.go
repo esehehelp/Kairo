@@ -73,6 +73,12 @@ type agentRecordCopyRequest struct {
 	Made store.CopyMade `json:"made"`
 }
 
+type agentDescribedRequest struct {
+	ExecutorID string `json:"executor_id"`
+	ObjectID   string `json:"object_id"`
+	StoreID    string `json:"store_id"`
+}
+
 type agentRecordFetchRequest struct {
 	Made store.FetchMade `json:"made"`
 }
@@ -318,6 +324,13 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentExecutorRequest) (any, error) {
 				copies, err := s.Store.CopiesToMake(ctx, b.ExecutorID)
 				return map[string]any{"copies": copies}, err
+			}),
+		newAgentOp(s, "record-described", observeRefused, nil,
+			func(ctx context.Context, b agentDescribedRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentDescribedRequest) (any, error) {
+				return okBody, s.Store.RecordDescribed(ctx, b.ExecutorID, b.ObjectID, b.StoreID)
 			}),
 		newAgentOp(s, "record-copy", observeRefused, nil,
 			func(ctx context.Context, b agentRecordCopyRequest) (string, error) {

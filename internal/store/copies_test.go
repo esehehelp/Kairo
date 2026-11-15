@@ -193,3 +193,58 @@ func TestCopiesGoToTheFirstDurableStoreWithRoom(t *testing.T) {
 		t.Fatalf("copies go to %v, want obj_a to c-durable (room for one) and obj_b to e-durable", to)
 	}
 }
+
+// A copy is described as it is written (its order carries the description:
+// whose it is and what it holds); one made without a description is
+// described afterwards (a describe-only order), and is no longer once that
+// is recorded, by an executor serving its store.
+func TestDurableCopiesAreDescribed(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	addTestDisk(t, store, "node", "D:")
+	ctx := context.Background()
+	if err := store.UpsertExecutor(ctx, Executor{ID: "durable-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	declareTestStore(t, store,
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+	)
+	sha := strings.Repeat("ab", 32)
+	insertPacked(t, store, "obj_a", "executor", "d-scratch", "D:/kairo", sha)
+	insertPacked(t, store, "obj_b", "executor", "d-scratch", "D:/kairo", sha)
+	orders, err := store.CopiesToMake(ctx, "durable-exec")
+	if err != nil || len(orders) != 2 {
+		t.Fatalf("orders %+v %v", orders, err)
+	}
+	for _, o := range orders {
+		d := o.Description
+		if o.DescribeOnly || d == nil || d.Format != DescriptionFormat || d.ObjectID != o.ObjectID || d.Kind != "output" || d.PackBytes != 100 ||
+			d.PackSHA256 != sha || d.Node != "node" || d.PackedOn != "d-scratch" || d.SourcePath != "D:/kairo" {
+			t.Fatalf("order %s describes %+v", o.ObjectID, d)
+		}
+	}
+	made := func(id string, described bool) CopyMade {
+		return CopyMade{ObjectID: id, StoreID: "e-durable", ExecutorID: "durable-exec", Path: "E:/kairo/objects/202611/" + id + ".tar.zst",
+			ManifestPath: "E:/kairo/objects/202611/" + id + ".tar.zst.files.tsv", Bytes: 100, SHA256: sha, ManifestSHA256: sha, Described: described}
+	}
+	if err = store.RecordCopy(ctx, made("obj_a", true)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordCopy(ctx, made("obj_b", false)); err != nil {
+		t.Fatal(err)
+	}
+	orders, err = store.CopiesToMake(ctx, "durable-exec")
+	if err != nil || len(orders) != 1 || orders[0].ObjectID != "obj_b" || !orders[0].DescribeOnly || orders[0].Description == nil || orders[0].Month != "202611" {
+		t.Fatalf("describe-only orders %+v %v", orders, err)
+	}
+	if err = store.RecordDescribed(ctx, "executor", "obj_b", "e-durable"); err == nil {
+		t.Fatal("recorded by an executor not serving the store")
+	}
+	if err = store.RecordDescribed(ctx, "durable-exec", "obj_b", "e-durable"); err != nil {
+		t.Fatal(err)
+	}
+	if orders, err = store.CopiesToMake(ctx, "durable-exec"); err != nil || len(orders) != 0 {
+		t.Fatalf("orders once described %+v %v", orders, err)
+	}
+}

@@ -52,6 +52,11 @@ type CopyOrder struct {
 	PackSHA256     string     `json:"pack_sha256"`
 	ManifestSHA256 string     `json:"manifest_sha256"`
 	Source         CopySource `json:"source"`
+	// Description: what the copy is to say of itself, written beside it
+	// (descriptions.go); DescribeOnly: the copy is there and verified, only
+	// its description is to be written (RecordDescribed).
+	Description  *ObjectDescription `json:"description,omitempty"`
+	DescribeOnly bool               `json:"describe_only,omitempty"`
 }
 
 // CopyMade is a copy an executor wrote and read back: where, its size and
@@ -65,6 +70,8 @@ type CopyMade struct {
 	Bytes          int64  `json:"bytes"`
 	SHA256         string `json:"sha256"`
 	ManifestSHA256 string `json:"manifest_sha256"`
+	// Described: its description was written beside it.
+	Described bool `json:"described,omitempty"`
 }
 
 // PackRead is the pack a token lets an agent hand over: on StoreID at Root.
@@ -305,6 +312,24 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 		}
 		out = append(out, o)
 	}
+	ids := make([]string, len(out))
+	for i, o := range out {
+		ids[i] = o.ObjectID
+	}
+	descriptions, err := describeObjectsTx(ctx, tx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if d, ok := descriptions[out[i].ObjectID]; ok {
+			out[i].Description = &d
+		}
+	}
+	describe, err := describeOrdersTx(ctx, tx, me, executorID)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, describe...)
 	return out, tx.Commit()
 }
 
@@ -371,12 +396,21 @@ func (s *Store) RecordCopy(ctx context.Context, made CopyMade) error {
 		return fmt.Errorf("%w: object %s copied as %d bytes, sha256 %s (list %s); packed as %d bytes, sha256 %s (list %s)",
 			ErrCopyMismatch, made.ObjectID, made.Bytes, made.SHA256, made.ManifestSHA256, packBytes, packSHA, listSHA)
 	}
+	t := now()
+	var described *string
+	if made.Described {
+		described = &t
+	}
 	if state == "verified" {
+		if described != nil {
+			if _, err = tx.ExecContext(ctx, `UPDATE object_copies SET described_at=COALESCE(described_at,$1) WHERE object_id=$2 AND store_id=$3`, t, made.ObjectID, made.StoreID); err != nil {
+				return err
+			}
+		}
 		return tx.Commit()
 	}
-	t := now()
-	if _, err = tx.ExecContext(ctx, `UPDATE object_copies SET state='verified',path=$1,manifest_path=$2,token_hash=NULL,token_expires_at=NULL,verified_at=$3,updated_at=$4 WHERE object_id=$5 AND store_id=$6`,
-		made.Path, made.ManifestPath, t, t, made.ObjectID, made.StoreID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE object_copies SET state='verified',path=$1,manifest_path=$2,token_hash=NULL,token_expires_at=NULL,verified_at=$3,updated_at=$4,described_at=$5 WHERE object_id=$6 AND store_id=$7`,
+		made.Path, made.ManifestPath, t, t, described, made.ObjectID, made.StoreID); err != nil {
 		return err
 	}
 	var project *string

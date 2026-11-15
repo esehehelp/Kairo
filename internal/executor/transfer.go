@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -87,8 +88,25 @@ func (e *Local) copyDue(ctx context.Context) {
 		if !ok || !s.usable || s.decl.Class != machine.StoreDurable || s.decl.Root != o.Root || !e.due(&e.copies, o.ObjectID) {
 			continue
 		}
+		if o.DescribeOnly {
+			err := describeCopy(s, o)
+			if err == nil {
+				err = e.Store.RecordDescribed(ctx, e.ID, o.ObjectID, o.StoreID)
+			}
+			if err != nil {
+				e.copyProblem(o.ObjectID, "not described", err)
+				continue
+			}
+			e.copyProblem(o.ObjectID, "", nil)
+			continue
+		}
 		started := time.Now()
 		made, err := e.copyOne(ctx, s, o, served)
+		if err == nil && o.Description != nil {
+			if err = describeCopy(s, o); err == nil {
+				made.Described = true
+			}
+		}
 		if err == nil {
 			err = e.Store.RecordCopy(ctx, made)
 		}
@@ -100,6 +118,51 @@ func (e *Local) copyDue(ctx context.Context) {
 		e.Logger.Info("copy verified", "object_id", o.ObjectID, "store_id", o.StoreID, "path", made.Path, "bytes", made.Bytes,
 			"local", o.Source.Local, "seconds", time.Since(started).Seconds())
 	}
+}
+
+// descriptionSuffix names a durable copy's description beside it
+// (store/descriptions.go).
+const descriptionSuffix = ".object.json"
+
+// describeCopy writes o's description beside its copy on s
+// (<root>/objects/<month>/<object id>.tar.zst.object.json), synced: what the
+// copy is, readable without the daemon. The copy must be there.
+func describeCopy(s servedStore, o store.CopyOrder) error {
+	if o.Description == nil {
+		return errors.New("no description to write")
+	}
+	if _, ok := s.fs.(localStoreFS); !ok {
+		return errCopyNotHere
+	}
+	if !validScratchID(o.ObjectID) || !machine.ValidMonth(o.Month) {
+		return fmt.Errorf("%w: object %q, month %q", errOutsideRoot, o.ObjectID, o.Month)
+	}
+	r, err := openDirPath(filepath.Clean(s.decl.Root), false)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	dir, err := openMade(r, objectsDirName, o.Month)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	packName := o.ObjectID + packSuffix
+	if fi, err := dir.Lstat(packName); err != nil || !fi.Mode().IsRegular() {
+		return fmt.Errorf("the copy %s is not there to describe", packName)
+	}
+	body, err := json.MarshalIndent(o.Description, "", "  ")
+	if err != nil {
+		return err
+	}
+	name := packName + descriptionSuffix
+	if err = writeRootFile(dir, name+partialSuffix, append(body, '\n')); err != nil {
+		return err
+	}
+	if err = dir.Rename(name+partialSuffix, name); err != nil {
+		return err
+	}
+	return syncRenamed(dir, name)
 }
 
 // copyOne writes and reads back one copy (see above) and returns what to

@@ -192,6 +192,12 @@ func (c *Client) CopiesToMake(ctx context.Context, executorID string) ([]store.C
 	return out.Copies, err
 }
 
+// RecordDescribed records that the description of a verified copy is written
+// beside it.
+func (c *Client) RecordDescribed(ctx context.Context, executorID, objectID, storeID string) error {
+	return c.call(ctx, "record-described", map[string]string{"executor_id": executorID, "object_id": objectID, "store_id": storeID}, nil)
+}
+
 // RecordCopy records a copy this executor wrote and read back.
 func (c *Client) RecordCopy(ctx context.Context, made store.CopyMade) error {
 	return c.call(ctx, "record-copy", map[string]any{"made": made}, nil)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -138,4 +139,87 @@ func optionalSize(bytes *int64) string {
 		return "-"
 	}
 	return formatSize(*bytes)
+}
+
+// storeCatalogue: kairo store catalogue ROOT [--json]. It reads a durable
+// store's directory alone, no daemon: the description beside each copy
+// (<root>/objects/<month>/<object id>.tar.zst.object.json), one line each,
+// then how many copies there have none.
+func storeCatalogue(args []string) error {
+	fs := newFlags("store catalogue")
+	asJSON := fs.Bool("json", false, "print the descriptions as a JSON array")
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 1 {
+		return usageError("store catalogue takes the durable store's root directory")
+	}
+	root := positional[0]
+	months, err := os.ReadDir(filepath.Join(root, "objects"))
+	if err != nil {
+		return err
+	}
+	var out []store.ObjectDescription
+	undescribed := 0
+	for _, month := range months {
+		if !month.IsDir() {
+			continue
+		}
+		dir := filepath.Join(root, "objects", month.Name())
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			return err
+		}
+		have := map[string]bool{}
+		for _, e := range entries {
+			have[e.Name()] = true
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".tar.zst") {
+				continue
+			}
+			if !have[name+".object.json"] {
+				undescribed++
+				continue
+			}
+			body, err := os.ReadFile(filepath.Join(dir, name+".object.json"))
+			if err != nil {
+				return err
+			}
+			var d store.ObjectDescription
+			if err = json.Unmarshal(body, &d); err != nil {
+				return fmt.Errorf("%s: %w", filepath.Join(dir, name+".object.json"), err)
+			}
+			out = append(out, d)
+		}
+	}
+	if *asJSON {
+		if out == nil {
+			out = []store.ObjectDescription{}
+		}
+		body, err := json.MarshalIndent(out, "", "  ")
+		if err != nil {
+			return err
+		}
+		_, err = fmt.Println(string(body))
+		return err
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "OBJECT\tKIND\tPROJECT\tNAME\tTASK\tSOURCE\tPACK\tCREATED")
+	str := func(s *string) string {
+		if s == nil {
+			return "-"
+		}
+		return *s
+	}
+	for _, d := range out {
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", d.ObjectID, d.Kind, str(d.Project), str(d.Name), str(d.Task), d.SourcePath, byteSize(d.PackBytes), d.CreatedAt)
+	}
+	if err = w.Flush(); err != nil {
+		return err
+	}
+	fmt.Printf("%d described, %d without a description (made before descriptions, or not described yet)\n", len(out), undescribed)
+	return nil
 }

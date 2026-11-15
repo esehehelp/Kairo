@@ -214,6 +214,7 @@ func init() {
 		{name: "store", summary: "the places Kairo keeps data in: what they hold, and kept scratch", group: &commandGroup{
 			subs: []command{
 				{"status", "[--json]", "per store: class, node, state, filesystem total and free, Kairo's bytes by class, external; kept scratch", storeStatus},
+				{"catalogue", "ROOT [--json]", "what a durable store's directory holds, read from the descriptions beside its copies (no daemon needed)", storeCatalogue},
 			},
 			aliases: map[string]string{"show": "status", "ls": "status", "list": "status", "get": "status"},
 		}},

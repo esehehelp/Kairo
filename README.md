@@ -1309,7 +1309,15 @@ declaration no longer makes durable at that root, or that its executor no
 longer serves, is given up at its executor's next round and taken again for
 the store declared now. It is written to
 `<root>/objects/<YYYYMM>/<object id>.tar.zst` with its file list beside it
-(the month the object was made). When the pack is on a store that executor
+(the month the object was made), and its description,
+`<object id>.tar.zst.object.json` (`format` `kairo object 1`: the object,
+its kind and lifecycle, project, name, the task whose run made it, what was
+packed and where, on which node and store, its size and sha256s, when it was
+made and packed): what the copy is, readable without the daemon (`kairo
+store catalogue ROOT` lists a durable store's copies from their descriptions
+alone). A copy made before descriptions is described afterwards (the same
+round hands out up to 200 describe-only orders a time; `record-described`,
+`object_copies.described_at`). When the pack is on a store that executor
 serves (the same node, its namespace), it is read there through handles;
 otherwise it is fetched from the agent of the pack's node, at the address its
 executor advertises (`pack_addr`, Agent configuration), over HTTPS trusting
@@ -2499,7 +2507,9 @@ the `CI_*` settings of CI on Kairo.
 
 What Kairo holds survives in its durable store: every copy is
 `<root>/objects/<YYYYMM>/<object id>.tar.zst` (tar, zstd) with its file list
-beside it (`.files.tsv`), readable without Kairo. Kairo keeps its own control
+beside it (`.files.tsv`) and its description (`.object.json`: whose it is,
+what it holds; `kairo store catalogue ROOT`), readable without Kairo. Kairo
+keeps its own control
 plane there too: the tasks of project `kairo`, queue `control-backup` write
 the database dump (`kairo-<time>.dump`, `pg_dump -Fc`) and the daemon's state
 (`daemon-srv-kairo-<time>.tar.gz`: its configuration, TLS and code
