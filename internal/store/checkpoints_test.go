@@ -41,6 +41,20 @@ func TestRunningWorkIsAskedForCheckpointsAndWhatItPublishesIsKept(t *testing.T) 
 	if _, err := store.testExec(`UPDATE attempts SET started_at='2026-01-01T00:00:00Z' WHERE id=$1`, attempt); err != nil {
 		t.Fatal(err)
 	}
+	// only a project that has published a path checkpoint is asked
+	if commands, err := store.RequestDueCheckpoints(ctx, time.Hour); err != nil || len(commands) != 0 {
+		t.Fatalf("asked a project that never published a path: %v %v", commands, err)
+	}
+	operator, err := store.CheckpointTask(ctx, "orchestrated", "train", "tester")
+	if err != nil || len(operator.Commands) != 1 {
+		t.Fatalf("operator checkpoint: %+v %v", operator, err)
+	}
+	if err = store.AckCommand(ctx, attempt, lease, epoch, operator.Commands[0], "checkpointed", json.RawMessage(`{"continuation_ref":"D:\\ckpt\\train\\step_100.pt"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.testExec(`UPDATE commands SET created_at='2026-01-01T00:00:00Z' WHERE id=$1`, operator.Commands[0]); err != nil {
+		t.Fatal(err)
+	}
 	commands, err := store.RequestDueCheckpoints(ctx, time.Hour)
 	if err != nil || len(commands) != 1 {
 		t.Fatalf("an attempt running for hours not asked: %v %v", commands, err)
@@ -49,7 +63,7 @@ func TestRunningWorkIsAskedForCheckpointsAndWhatItPublishesIsKept(t *testing.T) 
 		t.Fatalf("asked again while one is in flight: %v %v", again, err)
 	}
 	polled, err := store.PollCommands(ctx, attempt, lease, epoch)
-	if err != nil || len(polled) != 1 || polled[0].Kind != "checkpoint" || polled[0].Origin != "data_protection" {
+	if err != nil || len(polled) != 1 || polled[0].ID != commands[0] || polled[0].Kind != "checkpoint" || polled[0].Origin != "data_protection" {
 		t.Fatalf("poll: %+v %v", polled, err)
 	}
 	ref := "D:/ckpt/train/step_200.pt"

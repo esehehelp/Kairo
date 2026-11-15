@@ -20,7 +20,10 @@ import (
 // to the durable stores like any import, the path only read. A running
 // checkpointable attempt that has published none for a while is asked for
 // one (RequestDueCheckpoints: a checkpoint command, origin data_protection,
-// which the attempt answers at its next safe point and carries on).
+// which the attempt answers at its next safe point and carries on) when its
+// project has published a path checkpoint before: what a worker does for a
+// checkpoint is its own (one serving a model may stop the server and name
+// that by a URI), and only a path is kept.
 
 // ProtectCheckpoint imports the checkpoint ref attemptID published: the
 // object made (or the one already made of that path), "" when ref names no
@@ -83,7 +86,8 @@ func checkpointName(task, ref string) string {
 
 // RequestDueCheckpoints asks every running checkpointable attempt that has
 // run for every and has had no checkpoint asked of it for every (nor has one
-// in flight, nor a suspend) for a checkpoint: the commands made.
+// in flight, nor a suspend), of a project that has published a checkpoint
+// that is a path before, for a checkpoint: the commands made.
 func (s *Store) RequestDueCheckpoints(ctx context.Context, every time.Duration) ([]string, error) {
 	if every <= 0 {
 		return nil, nil
@@ -104,6 +108,9 @@ func (s *Store) RequestDueCheckpoints(ctx context.Context, every time.Duration) 
 		JOIN leases l ON l.attempt_id=a.id AND l.state='active'
 		WHERE e.state='started' AND e.checkpointable AND a.started_at IS NOT NULL AND a.started_at<$1
 		AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.attempt_id=a.id AND (c.state IN('pending','accepted','checkpointing') OR (c.kind='checkpoint' AND c.created_at>=$1)))
+		AND EXISTS (SELECT 1 FROM commands pc JOIN execution_requests pe ON pe.id=pc.execution_id
+			WHERE pe.project_scope_id=e.project_scope_id AND pc.state='checkpointed'
+			AND pc.payload_json ~ '"continuation_ref" *: *"([A-Za-z]:(/|\\\\)|/[^/])')
 		ORDER BY a.started_at,a.id`, []any{cutoff}, func(rows *sql.Rows) error {
 		var t target
 		if err := rows.Scan(&t.executionID, &t.attemptID, &t.leaseID, &t.projectID, &t.epoch); err != nil {

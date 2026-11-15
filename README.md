@@ -1526,7 +1526,11 @@ default `"2h"`, `"0"` never) and has had no checkpoint command in that time,
 nor any command in flight (a suspend included), gets a checkpoint command
 (origin `data_protection`, event `checkpoint_requested` with actor `kairo`),
 as `kairo task checkpoint` would make one: the attempt answers it at its next
-safe point and carries on. An attempt that does not take checkpoint commands
+safe point and carries on. Only attempts of a project that has published a
+checkpoint that is a path before (any of its commands acknowledged
+`checkpointed` with one) are asked: what a worker does for a checkpoint is
+its own, and one serving a model may stop its server and name that by a URI,
+which keeps nothing. An attempt that does not take checkpoint commands
 leaves it pending, and is asked nothing more meanwhile.
 
 Brought inputs: an input not on the node an execution waits on is brought
