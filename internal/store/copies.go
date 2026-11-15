@@ -13,7 +13,8 @@ import (
 )
 
 // A packed data object is copied to a durable store, the first declared by
-// id (one copy for now), by an executor serving that store: copied locally
+// id with room for it (one copy for now: copyTargetsTx, copyRoomTx), by an
+// executor serving that store: copied locally
 // when the pack is on a store of the same node in its namespace, else
 // fetched from the agent of the pack's node (the address its executor
 // advertises as pack_addr) with a token the daemon issued for that copy.
@@ -103,30 +104,59 @@ func (info executorInfo) serves(s machine.Store, executorID string) bool {
 	return s.Node == info.nodeID && (s.Executor == executorID || s.Executor == "" && !info.wsl)
 }
 
-// copyTargetTx is the durable store objects are copied to: the first
-// declared durable store by id that is not inside a WSL distro (copies are
-// not made there yet).
-func copyTargetTx(ctx context.Context, q queryer, declared []machine.Store) (machine.Store, bool, error) {
+// copyTargetsTx are the durable stores objects are copied to, in the order
+// they are taken: the declared durable stores by id but those inside a WSL
+// distro (copies are not made there yet) and those being moved.
+func copyTargetsTx(ctx context.Context, q queryer, declared []machine.Store) ([]machine.Store, error) {
 	var durable []machine.Store
 	for _, s := range declared {
-		if s.Class == machine.StoreDurable {
+		if s.Class == machine.StoreDurable && s.MovedFrom == "" {
 			durable = append(durable, s)
 		}
 	}
 	sort.Slice(durable, func(i, j int) bool { return durable[i].ID < durable[j].ID })
+	var out []machine.Store
 	for _, s := range durable {
 		if s.Executor != "" {
 			info, err := executorInfoTx(ctx, q, s.Executor)
 			if err != nil && !errors.Is(err, ErrNotFound) {
-				return machine.Store{}, false, err
+				return nil, err
 			}
 			if err != nil || info.wsl {
 				continue
 			}
 		}
-		return s, true, nil
+		out = append(out, s)
 	}
-	return machine.Store{}, false, nil
+	return out, nil
+}
+
+// unknownRoom: the room of a durable store never reported usable (it is
+// taken as having room: a copy there fails if it has none).
+const unknownRoom = int64(1) << 62
+
+// copyRoomTx is what each of stores can still take: its free bytes as last
+// reported (usable), less its reserve_free_bytes and the packs of the copies
+// being made there; unknownRoom for one never reported usable.
+func copyRoomTx(ctx context.Context, q queryer, stores []machine.Store) (map[string]int64, error) {
+	room := map[string]int64{}
+	for _, s := range stores {
+		var free sql.NullInt64
+		err := q.QueryRowContext(ctx, `SELECT free_bytes FROM store_observations WHERE store_id=$1 AND usable`, s.ID).Scan(&free)
+		if errors.Is(err, sql.ErrNoRows) || err == nil && !free.Valid {
+			room[s.ID] = unknownRoom
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		var copying int64
+		if err = q.QueryRowContext(ctx, `SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM object_copies c JOIN data_objects d ON d.id=c.object_id WHERE c.store_id=$1 AND c.state='copying'`, s.ID).Scan(&copying); err != nil {
+			return nil, err
+		}
+		room[s.ID] = free.Int64 - s.ReserveFreeBytes - copying
+	}
+	return room, nil
 }
 
 // CopiesToMake is what an executor is to copy now: the copies it has taken
@@ -153,16 +183,30 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 		byID[d.ID] = d
 	}
 	t := now()
-	target, ok, err := copyTargetTx(ctx, tx, declared)
+	targets, err := copyTargetsTx(ctx, tx, declared)
 	if err != nil {
 		return nil, err
 	}
-	if ok && me.serves(target, executorID) {
-		var due []struct{ id, created, projectID string }
-		err = eachRow(ctx, tx, `SELECT d.id,d.created_at,COALESCE(d.project_scope_id,'') FROM data_objects d
+	served := false
+	for _, target := range targets {
+		served = served || me.serves(target, executorID)
+	}
+	if served {
+		room, err := copyRoomTx(ctx, tx, targets)
+		if err != nil {
+			return nil, err
+		}
+		var due []struct {
+			id, created, projectID string
+			bytes                  int64
+		}
+		err = eachRow(ctx, tx, `SELECT d.id,d.created_at,COALESCE(d.project_scope_id,''),COALESCE(d.pack_bytes,0) FROM data_objects d
 			WHERE d.state='packed' AND d.lifecycle='durable' AND NOT EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id) ORDER BY d.packed_at,d.id`, nil, func(rows *sql.Rows) error {
-			var d struct{ id, created, projectID string }
-			if err := rows.Scan(&d.id, &d.created, &d.projectID); err != nil {
+			var d struct {
+				id, created, projectID string
+				bytes                  int64
+			}
+			if err := rows.Scan(&d.id, &d.created, &d.projectID, &d.bytes); err != nil {
 				return err
 			}
 			due = append(due, d)
@@ -172,6 +216,19 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 			return nil, err
 		}
 		for _, d := range due {
+			// the first durable store with room for it; another executor's
+			// to take when that one is not served here
+			var target machine.Store
+			found := false
+			for _, t := range targets {
+				if room[t.ID] >= d.bytes {
+					target, found = t, true
+					break
+				}
+			}
+			if !found || !me.serves(target, executorID) {
+				continue
+			}
 			month := d.created[0:4] + d.created[5:7]
 			// Another executor serving the store may take it at the same
 			// time: it is then that one's.
@@ -182,6 +239,9 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 			}
 			if n, _ := result.RowsAffected(); n == 0 {
 				continue
+			}
+			if room[target.ID] != unknownRoom {
+				room[target.ID] -= d.bytes
 			}
 			var project *string
 			if d.projectID != "" {

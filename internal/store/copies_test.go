@@ -156,3 +156,40 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 		t.Fatalf("the new first durable store: %+v %v", orders, err)
 	}
 }
+
+// A packed object goes to the first durable store by id with room for it:
+// its free bytes as last reported, less its reserve and the packs of the
+// copies being made there; a store never reported is taken as having room.
+func TestCopiesGoToTheFirstDurableStoreWithRoom(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	addTestDisk(t, store, "node", "D:")
+	ctx := context.Background()
+	if err := store.UpsertExecutor(ctx, Executor{ID: "durable-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	declareTestStore(t, store,
+		machine.Store{ID: "c-durable", Class: machine.StoreDurable, Node: "node", Root: "C:/_kairo-durable", Filesystem: "D:", ReserveFreeBytes: 1000},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+	)
+	sha := strings.Repeat("aa", 32)
+	insertPacked(t, store, "obj_a", "executor", "d-scratch", "D:/kairo", sha)
+	insertPacked(t, store, "obj_b", "executor", "d-scratch", "D:/kairo", sha)
+	// room for one pack of 100 bytes on c-durable: 1150 free, 1000 kept
+	free, total := int64(1150), int64(10000)
+	if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: "c-durable", ExecutorID: "durable-exec", Root: "C:/_kairo-durable", Usable: true, FreeBytes: &free, TotalBytes: &total}); err != nil {
+		t.Fatal(err)
+	}
+	orders, err := store.CopiesToMake(ctx, "durable-exec")
+	if err != nil || len(orders) != 2 {
+		t.Fatalf("orders %+v %v", orders, err)
+	}
+	to := map[string]string{}
+	for _, o := range orders {
+		to[o.ObjectID] = o.StoreID
+	}
+	if to["obj_a"] != "c-durable" || to["obj_b"] != "e-durable" {
+		t.Fatalf("copies go to %v, want obj_a to c-durable (room for one) and obj_b to e-durable", to)
+	}
+}
