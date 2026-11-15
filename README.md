@@ -1495,6 +1495,16 @@ that is not mounted is not a deleted source) is `abandoned` (event
 OBJECT...` (`POST /api/data/objects/{id}/cancel`) abandons imports not
 packed yet the same way; a pack already being made when it is cancelled is
 still recorded when it is done, and copied.
+An imported directory may still be written (a collector's): a file of it
+written within the last hour is packed from a copy made beside the pack,
+copied again (up to five times, a second apart) until a copy is read with
+nothing written to the file meanwhile, and otherwise taken as last read (a
+prefix of what an appended file becomes; counted as `changing` in the
+agent's log); a file gone between listing and reading is left out (counted
+skipped). An older file written while it is read fails that pack as an
+output's would; at the next round it is a recent one. A file packed as it
+changed no longer matches the pack's list, so `--delete-source` keeps the
+directory.
 `kairo data list [--project P] [--kind output|scratch|import] [--limit N]
 [--json]` (`GET /api/data/objects`, `{"objects": [...]}`, newest first, 200
 by default) shows each object: kind, project, name, node, `packing`,

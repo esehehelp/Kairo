@@ -79,6 +79,9 @@ type packResult struct {
 	packPath, manifestPath   string
 	packBytes, contentBytes  int64
 	files, skipped           int64
+	// changing: files of an import written all the while they were read,
+	// packed as last read (packLiveFile)
+	changing                 int64
 	packSHA256, manifestHash string
 	// listBody: the file list as written (an identity's, recorded with it)
 	listBody string
@@ -135,7 +138,7 @@ func packKind(ctx context.Context, root string, kind dirKind, id, objectID strin
 	if err != nil {
 		return res, err
 	}
-	return packInto(ctx, r, root, sr, src, mounts, kind.marker, "", objectID, identity)
+	return packInto(ctx, r, root, sr, src, mounts, packOpts{marker: kind.marker}, objectID, identity)
 }
 
 // PackDir packs an imported directory dir (store.ImportData: outside every
@@ -178,14 +181,14 @@ func packDir(ctx context.Context, root, dir, objectID string, identity bool) (pa
 		if !regular {
 			return res, err
 		}
-		return packInto(ctx, r, root, parent, filepath.Dir(dir), nil, "", name, objectID, identity)
+		return packInto(ctx, r, root, parent, filepath.Dir(dir), nil, packOpts{only: name, live: true}, objectID, identity)
 	}
 	defer sr.Close()
 	mounts, err := mountsUnderFn(dir)
 	if err != nil {
 		return res, err
 	}
-	return packInto(ctx, r, root, sr, dir, mounts, "", "", objectID, identity)
+	return packInto(ctx, r, root, sr, dir, mounts, packOpts{live: true}, objectID, identity)
 }
 
 // errSourceGone: what an import names is not there any more.
@@ -221,11 +224,18 @@ func openFileParent(p string) (*os.Root, string, bool, error) {
 	return parent, name, info.Mode().IsRegular(), nil
 }
 
-// packInto packs src (opened as sr; marker, if any, left out; with only, just
-// that regular file of it) into the packs directory of the store opened as r
-// at root, and reads the pack back; with identity, only the file list is
-// written and read back.
-func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src string, mounts []string, marker, only, objectID string, identity bool) (packResult, error) {
+// packOpts says what of a directory is packed: marker, if any, left out;
+// with only, just that regular file of it; live, an import's (outside every
+// store, which may still be written: packLiveFile).
+type packOpts struct {
+	marker, only string
+	live         bool
+}
+
+// packInto packs src (opened as sr; opts) into the packs directory of the
+// store opened as r at root, and reads the pack back; with identity, only the
+// file list is written and read back.
+func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src string, mounts []string, opts packOpts, objectID string, identity bool) (packResult, error) {
 	var res packResult
 	err := r.Mkdir(packsDirName, 0o755)
 	if err != nil && !errors.Is(err, fs.ErrExist) {
@@ -239,7 +249,7 @@ func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src str
 	if err = checkParentNotMounted(root, dirKind{dir: packsDirName}); err != nil {
 		return res, err
 	}
-	res, err = writePack(ctx, sr, src, mounts, marker, only, pr, objectID+packSuffix, identity)
+	res, err = writePack(ctx, sr, src, mounts, opts, pr, objectID+packSuffix, identity)
 	if err != nil {
 		return res, err
 	}
@@ -300,7 +310,8 @@ func (c *countWriter) Write(p []byte) (int, error) {
 
 // writePack packs src (opened at srcPath) into packName and its file list in
 // packs, leaving out the marker at its top. See above for what goes in.
-func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []string, marker, only string, packs *os.Root, packName string, identity bool) (packResult, error) {
+func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []string, opts packOpts, packs *os.Root, packName string, identity bool) (packResult, error) {
+	marker, only := opts.marker, opts.only
 	var res packResult
 	listName := packName + manifestSuffix
 	for _, name := range []string{packName + partialSuffix, listName + partialSuffix} {
@@ -372,7 +383,20 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 				}
 				subdirs = append(subdirs, rel)
 			case info.Mode().IsRegular():
-				line, size, err := packFile(src, tw, rel, info, stable)
+				var line string
+				var size int64
+				var err error
+				if opts.live && time.Since(info.ModTime()) < liveWindow {
+					line, size, err = packLiveFile(ctx, src, packs, packName+stageSuffix, tw, rel, &res)
+				} else {
+					line, size, err = packFile(src, tw, rel, info, stable)
+				}
+				if opts.live && errors.Is(err, fs.ErrNotExist) {
+					// gone since it was listed (nothing of it written): an
+					// import is what is there as it is read
+					res.skipped++
+					continue
+				}
 				if err != nil {
 					return res, err
 				}
@@ -500,6 +524,90 @@ func packFile(src *os.Root, tw *tar.Writer, rel string, info fs.FileInfo, stable
 		return "", 0, fmt.Errorf("%w: %s was written while it was read", errPackChanged, rel)
 	}
 	return fmt.Sprintf("%s\t%d\t%s\t%d", escapeListPath(rel), size, hex.EncodeToString(h.Sum(nil)), opened.ModTime().UnixNano()), size, nil
+}
+
+// An import's directory is not Kairo's and may still be written (a
+// collector's): a file of it written within liveWindow is copied aside
+// first (packLiveFile), so a write while it is packed does not spoil the pack.
+// One written while an older one is read fails the pack as for outputs; at the
+// next round it is a recent one.
+var (
+	liveWindow     = time.Hour
+	liveTries      = 5
+	liveRetryDelay = time.Second
+)
+
+// stageSuffix names the copy of a live file, beside the pack being made.
+const stageSuffix = ".stage"
+
+// packLiveFile packs rel, a file of an import written lately, from a copy
+// (stageName in packs): copied until one is read with nothing written to the
+// file meanwhile, at most liveTries times, the last copy taken as it was read
+// (counted in res.changing). A file gone is fs.ErrNotExist, nothing written.
+func packLiveFile(ctx context.Context, src *os.Root, packs *os.Root, stageName string, tw *tar.Writer, rel string, res *packResult) (string, int64, error) {
+	defer packs.Remove(stageName)
+	var size int64
+	var listed fs.FileInfo
+	stable := false
+	for try := 1; ; try++ {
+		fh, err := src.OpenFile(filepath.FromSlash(rel), os.O_RDONLY|markerOpenFlags, 0)
+		if err != nil {
+			return "", 0, err
+		}
+		before, err := fh.Stat()
+		if err == nil && !before.Mode().IsRegular() {
+			err = fmt.Errorf("%w: %s is not a regular file", errPackChanged, rel)
+		}
+		var st *os.File
+		if err == nil {
+			st, err = packs.OpenFile(stageName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		}
+		var n int64
+		var after fs.FileInfo
+		if err == nil {
+			n, err = io.Copy(st, fh)
+			if cerr := st.Close(); err == nil {
+				err = cerr
+			}
+		}
+		if err == nil {
+			after, err = fh.Stat()
+		}
+		fh.Close()
+		if err != nil {
+			return "", 0, err
+		}
+		size, listed = n, before
+		stable = before.Size() == n && after.Size() == n && after.ModTime().Equal(before.ModTime())
+		if stable || try >= liveTries {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return "", 0, ctx.Err()
+		case <-time.After(liveRetryDelay):
+		}
+	}
+	if !stable {
+		res.changing++
+	}
+	st, err := packs.Open(stageName)
+	if err != nil {
+		return "", 0, err
+	}
+	defer st.Close()
+	if err = tw.WriteHeader(&tar.Header{Typeflag: tar.TypeReg, Name: rel, Size: size, Mode: int64(listed.Mode().Perm()), ModTime: listed.ModTime(), Format: tar.FormatPAX}); err != nil {
+		return "", 0, err
+	}
+	var h hash.Hash = sha256.New()
+	n, err := io.Copy(tw, io.TeeReader(io.LimitReader(st, size), h))
+	if err != nil {
+		return "", 0, err
+	}
+	if n != size {
+		return "", 0, fmt.Errorf("%w: the copy of %s shrank from %d to %d bytes", errPackChanged, rel, size, n)
+	}
+	return fmt.Sprintf("%s\t%d\t%s\t%d", escapeListPath(rel), size, hex.EncodeToString(h.Sum(nil)), listed.ModTime().UnixNano()), size, nil
 }
 
 // escapeListPath writes a backslash, tab, CR or LF in a path as \\, \t, \r,
@@ -660,7 +768,7 @@ func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore
 	}
 	e.packProblem(o.ObjectID, "", nil)
 	e.Logger.Info("packed", "object_id", o.ObjectID, "kind", o.Kind, "path", o.Path, "files", res.files,
-		"content_bytes", res.contentBytes, "pack_bytes", res.packBytes, "skipped", res.skipped, "seconds", time.Since(started).Seconds())
+		"content_bytes", res.contentBytes, "pack_bytes", res.packBytes, "skipped", res.skipped, "changing", res.changing, "seconds", time.Since(started).Seconds())
 }
 
 // packMade is what is recorded of a pack (or an identity, o.Identity) made
