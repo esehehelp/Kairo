@@ -121,14 +121,22 @@ func TestARestartedAgentRecordsTheExitOfAnAttemptItAdopted(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	// finishAttempt records the exit first, then forgets the record, then
+	// the attempt: wait for the last, not just the first
+	for {
+		e.mu.Lock()
+		_, still := e.running["att"]
+		e.mu.Unlock()
+		if !still {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("still counted as running")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if _, err = os.Stat(recordPath(dir, "att")); !os.IsNotExist(err) {
 		t.Fatalf("record kept after the exit: %v", err)
-	}
-	e.mu.Lock()
-	_, still := e.running["att"]
-	e.mu.Unlock()
-	if still {
-		t.Fatal("still counted as running")
 	}
 }
 
