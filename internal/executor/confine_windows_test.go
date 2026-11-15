@@ -58,6 +58,28 @@ func TestAConfinedAttemptWritesOnlyWhereItIsHanded(t *testing.T) {
 	}
 }
 
+// A command the shim confines (its Env unset: the shim's own, the attempt's)
+// keeps that environment, not the token's default one.
+func TestAConfinedCommandKeepsTheShimsEnvironment(t *testing.T) {
+	scratch := t.TempDir()
+	t.Setenv("KAIRO_CONFINE_ENV_PROBE", "attempt-env")
+	cmd := exec.Command("cmd", "/c", "echo %KAIRO_CONFINE_ENV_PROBE%")
+	release, err := confineCommand(cmd, []string{scratch}, scratch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := cmd.CombinedOutput()
+	if release != nil {
+		release()
+	}
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if !strings.Contains(string(out), "attempt-env") {
+		t.Fatalf("the confined command lost the environment: %s", out)
+	}
+}
+
 // A confined launch without a scratch and an output directory is refused.
 func TestAConfinedLaunchNeedsAStore(t *testing.T) {
 	e := &Local{ID: "exec", Kind: "local"}

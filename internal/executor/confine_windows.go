@@ -4,6 +4,7 @@ package executor
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -31,6 +32,12 @@ func confineCommand(cmd *exec.Cmd, writable []string, _ string) (func(), error) 
 	token, err := lowIntegrityToken()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errConfineHere, err)
+	}
+	// with a token, os/exec takes a nil Env as that token's user's default
+	// environment (CreateEnvironmentBlock), not this process's: the shim's
+	// command would lose the attempt's (KAIRO_*, the declared env, TEMP)
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
 	}
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
