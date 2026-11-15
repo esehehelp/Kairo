@@ -146,8 +146,9 @@ func PackSource(ctx context.Context, root string, paths, exclude []string, dir s
 	tw := tar.NewWriter(zw)
 	var list strings.Builder
 	list.WriteString(manifestHeader + "\n")
+	stable := stableFileIDs(root)
 	for _, f := range files {
-		line, size, err := packFile(r, tw, f.rel, f.info)
+		line, size, err := packFile(r, tw, f.rel, f.info, stable)
 		if err != nil {
 			return sp, err
 		}

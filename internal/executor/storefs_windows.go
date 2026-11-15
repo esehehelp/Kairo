@@ -92,22 +92,40 @@ const markerOpenFlags = 0
 // clears the attribute first, which a hard link shares with the file
 // outside it points at, and on exFAT that file can only be the one deleted.
 func checkFilesystemType(root string) error {
-	path, err := windows.UTF16PtrFromString(root)
+	fsName, err := filesystemName(root)
 	if err != nil {
 		return err
 	}
-	volume := make([]uint16, windows.MAX_PATH+1)
-	if err = windows.GetVolumePathName(path, &volume[0], uint32(len(volume))); err != nil {
-		return fmt.Errorf("volume of %s: %w", root, err)
-	}
-	name := make([]uint16, windows.MAX_PATH+1)
-	if err = windows.GetVolumeInformation(&volume[0], nil, 0, nil, nil, nil, &name[0], uint32(len(name))); err != nil {
-		return fmt.Errorf("filesystem of %s: %w", root, err)
-	}
-	if fsName := windows.UTF16ToString(name); fsName != "NTFS" && fsName != "exFAT" {
+	if fsName != "NTFS" && fsName != "exFAT" {
 		return fmt.Errorf("root %s is on %s, not NTFS or exFAT (where a deletion never clears the read-only attribute of a file a hard link shares)", root, fsName)
 	}
 	return nil
+}
+
+// filesystemName is the name of the filesystem p is on (NTFS, exFAT, ...).
+func filesystemName(p string) (string, error) {
+	path, err := windows.UTF16PtrFromString(p)
+	if err != nil {
+		return "", err
+	}
+	volume := make([]uint16, windows.MAX_PATH+1)
+	if err = windows.GetVolumePathName(path, &volume[0], uint32(len(volume))); err != nil {
+		return "", fmt.Errorf("volume of %s: %w", p, err)
+	}
+	name := make([]uint16, windows.MAX_PATH+1)
+	if err = windows.GetVolumeInformation(&volume[0], nil, 0, nil, nil, nil, &name[0], uint32(len(name))); err != nil {
+		return "", fmt.Errorf("filesystem of %s: %w", p, err)
+	}
+	return windows.UTF16ToString(name), nil
+}
+
+// stableFileIDs reports whether the files under p keep one id that a
+// directory listing and an opened handle agree on: not on exFAT or FAT,
+// where an id is where a file's directory entry is and a listing need not
+// carry it. Unknown: taken as stable (the stricter check).
+func stableFileIDs(p string) bool {
+	name, err := filesystemName(p)
+	return err != nil || name != "exFAT" && name != "FAT32" && name != "FAT"
 }
 
 // placeOf: with checkResolvesTo a root's path is where it is, and roots are

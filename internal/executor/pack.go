@@ -283,6 +283,7 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 		}
 	}
 	tw := tar.NewWriter(zw)
+	stable := stableFileIDs(srcPath)
 	mounted := map[string]bool{}
 	for _, m := range mounts {
 		mounted[filepath.Clean(m)] = true
@@ -321,7 +322,7 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 				}
 				subdirs = append(subdirs, rel)
 			case info.Mode().IsRegular():
-				line, size, err := packFile(src, tw, rel, info)
+				line, size, err := packFile(src, tw, rel, info, stable)
 				if err != nil {
 					return res, err
 				}
@@ -394,10 +395,21 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 	return res, nil
 }
 
+// sameListedFile reports whether opened is the file listed: the same file
+// by its id, or, where ids are not stable (stableFileIDs: exFAT, FAT), one of
+// the size and mtime listed.
+func sameListedFile(listed, opened fs.FileInfo, stableIDs bool) bool {
+	if os.SameFile(listed, opened) {
+		return true
+	}
+	return !stableIDs && listed.Size() == opened.Size() && listed.ModTime().Equal(opened.ModTime())
+}
+
 // packFile writes the regular file rel (as info listed it) to tw and returns
-// its file list line and size. The file opened must be the one listed, must
-// hold no more than its size and keep its size and mtime while it is read.
-func packFile(src *os.Root, tw *tar.Writer, rel string, info fs.FileInfo) (string, int64, error) {
+// its file list line and size. The file opened must be the one listed
+// (sameListedFile), must hold no more than its size and keep its size and
+// mtime while it is read.
+func packFile(src *os.Root, tw *tar.Writer, rel string, info fs.FileInfo, stableIDs bool) (string, int64, error) {
 	fh, err := src.OpenFile(filepath.FromSlash(rel), os.O_RDONLY|markerOpenFlags, 0)
 	if err != nil {
 		return "", 0, err
@@ -407,7 +419,7 @@ func packFile(src *os.Root, tw *tar.Writer, rel string, info fs.FileInfo) (strin
 	if err != nil {
 		return "", 0, err
 	}
-	if !opened.Mode().IsRegular() || !os.SameFile(info, opened) {
+	if !opened.Mode().IsRegular() || !sameListedFile(info, opened, stableIDs) {
 		return "", 0, fmt.Errorf("%w: %s is not the file listed", errPackChanged, rel)
 	}
 	size := opened.Size()

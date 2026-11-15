@@ -90,6 +90,10 @@ func checkResolvesTo(root string) error {
 // any filesystem will do.
 func checkFilesystemType(string) error { return nil }
 
+// stableFileIDs: a file's device and inode are its id wherever it is listed
+// or opened.
+func stableFileIDs(string) bool { return true }
+
 // diskUsage is the total and the free bytes (available to an unprivileged
 // writer) of the filesystem holding dir.
 func diskUsage(dir string) (int64, int64, error) {
