@@ -76,9 +76,9 @@ var (
 
 // packResult is a pack made: its paths, sizes, contents and sha256s.
 type packResult struct {
-	packPath, manifestPath   string
-	packBytes, contentBytes  int64
-	files, skipped           int64
+	packPath, manifestPath  string
+	packBytes, contentBytes int64
+	files, skipped          int64
 	// changing: files of an import written all the while they were read,
 	// packed as last read (packLiveFile)
 	changing                 int64
