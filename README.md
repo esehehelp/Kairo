@@ -2484,7 +2484,13 @@ the `CI_*` settings of CI on Kairo.
   `%APPDATA%\kairo\agent.toml`) and the S4U task `kairo-agent` that starts it
   at boot (refused while the node holds a lease: an agent started with
   another log directory cannot adopt); `ops/windows/replace-agent.ps1 -New
-  BUILD [-Adopting]` replaces it.
+  BUILD [-Adopting]` replaces it. The agent runs as the user (its attempts
+  are the user's, WSL included), so its files are the user's.
+- Windows, elevated: `ops/windows/install-controller.ps1 -New BUILD [-Config
+  TOML] [-State JSON] [-CA PEM]` installs the device controller, which runs
+  as SYSTEM: `%ProgramFiles%\Kairo\kairo-controller.exe`, its configuration,
+  state and CA in `%ProgramData%\Kairo` (readable by SYSTEM and Administrators
+  only: the configuration holds its token), and the task `kairo-controller`.
 
 ## Verification
 
