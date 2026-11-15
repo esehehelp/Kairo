@@ -246,10 +246,7 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 	base := filepath.Join(s.decl.Root, sourcesDirName)
 	final := filepath.Join(base, src.ID)
 	defer lockSourceDir(final)()
-	if err := os.MkdirAll(base, 0o755); err != nil {
-		return "", err
-	}
-	dir, err := os.OpenRoot(base)
+	dir, err := openSourcesDir(s.decl.Root, true)
 	if err != nil {
 		return "", err
 	}
@@ -352,6 +349,25 @@ const (
 	stateHeader  = "kairo source state 1"
 )
 
+// openSourcesDir opens <root>/sources of a local store through plain
+// directories only (openDirPath, openPlainDir): a link anywhere on the way,
+// the sources directory itself one, is refused, so what is unpacked or
+// removed there is never somewhere else. With create, a missing sources
+// directory is made in the store's root (which must be there).
+func openSourcesDir(root string, create bool) (*os.Root, error) {
+	r, err := openDirPath(root, false)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	if create {
+		if err := r.Mkdir(sourcesDirName, 0o755); err != nil && !errors.Is(err, fs.ErrExist) {
+			return nil, err
+		}
+	}
+	return openPlainDir(r, sourcesDirName)
+}
+
 // sourceDirLocks: one lock per directory a snapshot is unpacked in, shared
 // by every executor of this process (several may serve one store).
 var sourceDirLocks sync.Map
@@ -404,19 +420,26 @@ func makeReadOnly(r *os.Root) error {
 	return nil
 }
 
-// removeUnpacked removes name (under dir) whole, read-only or not.
+// removeUnpacked removes name (under dir) whole, read-only or not. Only its
+// directories are made writable first (and not on Windows, where they are
+// never made read-only and a read-only file is removed as it is): a file's
+// own mode does not keep it from being removed, and a file there may be a
+// hard link to one elsewhere, which has the same mode. A name that is a link
+// is removed as the link.
 func removeUnpacked(dir *os.Root, name string) {
-	if r, err := dir.OpenRoot(name); err == nil {
-		_ = fs.WalkDir(r.FS(), ".", func(p string, d fs.DirEntry, err error) error {
-			if err != nil || d.Type()&fs.ModeSymlink != 0 {
+	if runtime.GOOS != "windows" {
+		if r, err := openPlainDir(dir, name); err == nil {
+			_ = fs.WalkDir(r.FS(), ".", func(p string, d fs.DirEntry, err error) error {
+				if err != nil || !d.IsDir() {
+					return nil
+				}
+				if info, err := d.Info(); err == nil {
+					_ = r.Chmod(filepath.FromSlash(p), info.Mode().Perm()|0o700)
+				}
 				return nil
-			}
-			if info, err := d.Info(); err == nil {
-				_ = r.Chmod(filepath.FromSlash(p), info.Mode().Perm()|0o200)
-			}
-			return nil
-		})
-		r.Close()
+			})
+			r.Close()
+		}
 	}
 	_ = dir.RemoveAll(name)
 }
@@ -545,6 +568,9 @@ type SourceKeeper interface {
 	SourcesInUse(ctx context.Context, executorID string) ([]string, error)
 }
 
+// The daemon's own executors (kairo serve) clean up as an agent's do.
+var _ SourceKeeper = (*store.Store)(nil)
+
 const (
 	sourceCleanInterval = time.Hour
 	sourceCleanTimeout  = time.Hour
@@ -584,20 +610,27 @@ func (e *Local) cleanSources(ctx context.Context) {
 		if _, local := s.fs.(localStoreFS); !s.usable || s.decl.Class != "volatile" || !local {
 			continue
 		}
-		e.cleanSourcesIn(filepath.Join(s.decl.Root, sourcesDirName), inUse, time.Now())
+		e.cleanSourcesIn(s.decl.Root, inUse, time.Now())
 	}
 }
 
-// cleanSourcesIn removes from base, of what Kairo names there (src_<id>
-// and what is beside it; nothing else is touched): an unpacked snapshot no
-// execution uses whose record says it was last launched in sourceKeep ago
-// or more (its record first, so a tree left half removed is taken as
-// changed), with its record; one set aside as changed sourceAsideKeep ago
-// whose snapshot no execution uses; a record without its tree; and what an
-// unpack left half done sourcePartialKeep ago.
-func (e *Local) cleanSourcesIn(base string, inUse map[string]bool, now time.Time) {
-	dir, err := os.OpenRoot(base)
+// cleanSourcesIn removes from <root>/sources (opened as openSourcesDir
+// does: never through a link), of what Kairo names there (src_<id> and what
+// is beside it; nothing else is touched): an unpacked snapshot no execution
+// uses whose record says it was last launched in sourceKeep ago or more (its
+// record first, so a tree left half removed is taken as changed), with its
+// record; one set aside as changed sourceAsideKeep ago whose snapshot no
+// execution uses; a record without its tree; and what an unpack left half
+// done sourcePartialKeep ago.
+func (e *Local) cleanSourcesIn(root string, inUse map[string]bool, now time.Time) {
+	base := filepath.Join(root, sourcesDirName)
+	dir, err := openSourcesDir(root, false)
+	if errors.Is(err, fs.ErrNotExist) {
+		e.roundProblem(&e.sourceCleanups, base, "", nil)
+		return
+	}
 	if err != nil {
+		e.roundProblem(&e.sourceCleanups, base, "code snapshots not cleaned up", err)
 		return
 	}
 	defer dir.Close()
@@ -606,6 +639,7 @@ func (e *Local) cleanSourcesIn(base string, inUse map[string]bool, now time.Time
 		e.roundProblem(&e.sourceCleanups, base, "code snapshots not listed", err)
 		return
 	}
+	e.roundProblem(&e.sourceCleanups, base, "", nil)
 	idLen := len("src_") + 32
 	for _, entry := range entries {
 		name := entry.Name()

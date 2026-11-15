@@ -92,14 +92,14 @@ func TestATaskIsBoundToTheSnapshotItWasDeclaredWith(t *testing.T) {
 		t.Fatalf("launch of %s: %+v cwd %q", task, launch.Source, launch.CWD)
 	}
 	// both executions are not terminal: both snapshots in use, until one is
-	inUse, err := store.SourcesInUse(ctx)
+	inUse, err := store.SourcesInUse(ctx, "exec")
 	if err != nil || len(inUse) != 2 || inUse[0] != min(first, second) || inUse[1] != max(first, second) {
 		t.Fatalf("in use %v %v", inUse, err)
 	}
 	if _, err := store.testExec(`UPDATE execution_requests SET state='terminal' WHERE id=$1`, launch.Execution.ID); err != nil {
 		t.Fatal(err)
 	}
-	if inUse, err = store.SourcesInUse(ctx); err != nil || len(inUse) != 1 || inUse[0] == want {
+	if inUse, err = store.SourcesInUse(ctx, "exec"); err != nil || len(inUse) != 1 || inUse[0] == want {
 		t.Fatalf("in use once %s's execution ended: %v %v", task, inUse, err)
 	}
 	snap, err := store.SourceSnapshotByID(ctx, first)

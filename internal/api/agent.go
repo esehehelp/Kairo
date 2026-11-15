@@ -355,7 +355,7 @@ func (s *Server) agentOps() []agentOp {
 		// An observe-only daemon orders no eviction.
 		newAgentOp(s, "sources-in-use", observeAllowed, nil, byExecutor,
 			func(ctx context.Context, b agentExecutorRequest) (any, error) {
-				ids, err := s.Store.SourcesInUse(ctx)
+				ids, err := s.Store.SourcesInUse(ctx, b.ExecutorID)
 				return map[string]any{"sources": ids}, err
 			}),
 		newAgentOp(s, "evictions-to-make", observeEmpty, map[string]any{"evictions": []store.EvictionOrder{}}, byExecutor,

@@ -1085,8 +1085,11 @@ of them uses that was last launched in three days ago or more (its `.state`
 first, so a tree left half removed is taken as changed), a tree set aside
 as changed an hour ago once its snapshot is not in use, a `.state` without
 its tree, and what an unpack left half done a day ago. Nothing else there is
-touched. The daemon keeps every snapshot it was sent: they are the record of
-what each task ran.
+touched: `<root>/sources` is reached through plain directories only (a link
+on the way, or `sources` itself a link, is refused, for unpacking too), and
+a file in a removed tree is removed as it is, never made writable first (it
+may be a hard link to one elsewhere). The daemon keeps every snapshot it was
+sent: they are the record of what each task ran.
 
 `kairo source list [--project P]` lists snapshots (newest first: project,
 source, files, size, git state), `kairo source show ID [--files]` one with

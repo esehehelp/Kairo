@@ -76,6 +76,10 @@ func TestACodeSnapshotIsPackedAndBroughtWhereItRuns(t *testing.T) {
 
 	root := filepath.Join(t.TempDir(), "volatile")
 	t.Cleanup(func() { makeTreeWritable(root) })
+	// the store's root, as refreshing the stores makes a volatile one's
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	fake := &fakeSources{fakeStores: &fakeStores{}, files: map[string]string{sp.ID + "/pack": sp.PackPath, sp.ID + "/list": sp.ListPath}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
@@ -146,6 +150,10 @@ func snapshotFixture(t *testing.T, files map[string]string) (*store.LaunchSource
 	}
 	root := filepath.Join(t.TempDir(), "volatile")
 	t.Cleanup(func() { makeTreeWritable(root) })
+	// the store's root, as refreshing the stores makes a volatile one's
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
 	fake := &fakeSources{fakeStores: &fakeStores{}, files: map[string]string{sp.ID + "/pack": sp.PackPath, sp.ID + "/list": sp.ListPath}}
 	executor := func(logs *bytes.Buffer) *Local {
 		e := storesExecutor(t, fake, logs)
@@ -289,8 +297,9 @@ func (k *keepingSources) SourcesInUse(context.Context, string) ([]string, error)
 // launched in long enough ago, read-only as it is; one in use, or launched
 // in lately, stays; a tree set aside as changed goes once its snapshot is
 // not in use, what an unpack left half done after a day; what Kairo does not
-// name there is never touched, and nothing is removed without the daemon's
-// word on what is in use.
+// name there is never touched (a file elsewhere hard linked into a removed
+// tree keeps its mode), and nothing is removed without the daemon's word on
+// what is in use.
 func TestUnpackedSnapshotsNoLongerUsedAreRemoved(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "volatile")
 	base := filepath.Join(root, sourcesDirName)
@@ -298,6 +307,14 @@ func TestUnpackedSnapshotsNoLongerUsedAreRemoved(t *testing.T) {
 	now := time.Now()
 	old, recent := now.Add(-sourceKeep-time.Hour), now.Add(-time.Hour)
 	id := func(c string) string { return "src_" + strings.Repeat(c, 32) }
+	// outside: a read-only file elsewhere, hard linked into every tree
+	outside := filepath.Join(root, "outside.txt")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outside, []byte("o"), 0o444); err != nil {
+		t.Fatal(err)
+	}
 	tree := func(name string) {
 		t.Helper()
 		dir := filepath.Join(base, name, "pkg")
@@ -305,6 +322,9 @@ func TestUnpackedSnapshotsNoLongerUsedAreRemoved(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(dir, "a.py"), []byte("a"), 0o444); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Link(outside, filepath.Join(dir, "linked.txt")); err != nil {
 			t.Fatal(err)
 		}
 		for _, d := range []string{dir, filepath.Dir(dir)} {
@@ -371,5 +391,69 @@ func TestUnpackedSnapshotsNoLongerUsedAreRemoved(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "unpacked code snapshot removed") {
 		t.Fatalf("removal not logged:\n%s", logs.String())
+	}
+	if info, err := os.Stat(outside); err != nil {
+		t.Fatal(err)
+	} else if info.Mode().Perm() != 0o444 {
+		t.Fatalf("the file hard linked into removed trees is now %v, want 0444", info.Mode().Perm())
+	}
+}
+
+// linkDir makes link a link to the directory target: a symbolic link or, on
+// Windows without the right to make one, a junction. The test is skipped if
+// neither can be made.
+func linkDir(t *testing.T, target, link string) {
+	t.Helper()
+	err := os.Symlink(target, link)
+	if err == nil {
+		return
+	}
+	if runtime.GOOS != "windows" {
+		t.Skipf("no symbolic link: %v", err)
+	}
+	if out, err := exec.Command("cmd", "/c", "mklink", "/J", link, target).CombinedOutput(); err != nil {
+		t.Skipf("no junction: %v %s", err, out)
+	}
+}
+
+// A sources directory that is a link is neither cleaned up nor unpacked in:
+// old snapshots where it points are left as they are (and the problem is
+// reported), and the launch is refused.
+func TestASourcesDirectoryThatIsALinkIsNotUsed(t *testing.T) {
+	src, fake, root, executor := snapshotFixture(t, map[string]string{"src/a.py": "print('a')\n"})
+	elsewhere := filepath.Join(t.TempDir(), "elsewhere")
+	victim := filepath.Join(elsewhere, "src_"+strings.Repeat("a", 32))
+	if err := os.MkdirAll(filepath.Join(victim, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(victim, "pkg", "a.py"), []byte("a"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-sourceKeep - time.Hour)
+	if err := os.WriteFile(victim+stateSuffix, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(victim+stateSuffix, old, old); err != nil {
+		t.Fatal(err)
+	}
+	linkDir(t, elsewhere, filepath.Join(root, sourcesDirName))
+
+	var logs bytes.Buffer
+	e := executor(&logs)
+	e.Store = &keepingSources{fakeSources: fake}
+	e.cleanSources(context.Background())
+	for _, p := range []string{filepath.Join(victim, "pkg", "a.py"), victim + stateSuffix} {
+		if _, err := os.Stat(p); err != nil {
+			t.Fatalf("removed through the link: %v\n%s", err, logs.String())
+		}
+	}
+	if !strings.Contains(logs.String(), "code snapshots not cleaned up") {
+		t.Fatalf("the link not reported:\n%s", logs.String())
+	}
+	if dir, err := e.ensureSource(context.Background(), src); err == nil {
+		t.Fatalf("unpacked through the link in %s", dir)
+	}
+	if entries, _ := os.ReadDir(elsewhere); len(entries) != 2 {
+		t.Fatalf("written through the link: %v", entries)
 	}
 }

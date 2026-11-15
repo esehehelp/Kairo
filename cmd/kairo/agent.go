@@ -21,6 +21,13 @@ import (
 	"kairo/internal/tlsutil"
 )
 
+// An agent's executors bring code snapshots and clean them up through the
+// daemon (executor/source.go).
+var _ interface {
+	executor.SourceFetcher
+	executor.SourceKeeper
+} = (*agentclient.Client)(nil)
+
 // agentCommand runs this host as a remote node: its providers observe local
 // GPUs/CPU/RAM/disk and its executors launch attempts here, while every
 // coordination decision (reservation, fencing, quiescence, release) is made by
