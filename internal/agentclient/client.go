@@ -204,6 +204,22 @@ func (c *Client) AbandonPack(ctx context.Context, executorID, objectID, reason s
 	return c.call(ctx, "abandon-pack", map[string]string{"executor_id": executorID, "object_id": objectID, "reason": reason}, nil)
 }
 
+// InventoryDurable reports what a durable store's directory holds.
+func (c *Client) InventoryDurable(ctx context.Context, l store.DurableListing) (store.DurableInventory, error) {
+	var out store.DurableInventory
+	err := c.call(ctx, "inventory-durable", map[string]any{"listing": l}, &out)
+	return out, err
+}
+
+// AdoptCopies records copies found on a durable store that the daemon lacks.
+func (c *Client) AdoptCopies(ctx context.Context, executorID, storeID, root string, copies []store.AdoptedCopy) (int, error) {
+	var out struct {
+		Adopted int `json:"adopted"`
+	}
+	err := c.call(ctx, "adopt-copies", map[string]any{"executor_id": executorID, "store_id": storeID, "root": root, "copies": copies}, &out)
+	return out.Adopted, err
+}
+
 // RecordCopy records a copy this executor wrote and read back.
 func (c *Client) RecordCopy(ctx context.Context, made store.CopyMade) error {
 	return c.call(ctx, "record-copy", map[string]any{"made": made}, nil)

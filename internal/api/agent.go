@@ -85,6 +85,17 @@ type agentAbandonPackRequest struct {
 	Reason     string `json:"reason"`
 }
 
+type agentInventoryRequest struct {
+	Listing store.DurableListing `json:"listing"`
+}
+
+type agentAdoptRequest struct {
+	ExecutorID string              `json:"executor_id"`
+	StoreID    string              `json:"store_id"`
+	Root       string              `json:"root"`
+	Copies     []store.AdoptedCopy `json:"copies"`
+}
+
 type agentRecordFetchRequest struct {
 	Made store.FetchMade `json:"made"`
 }
@@ -344,6 +355,21 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentAbandonPackRequest) (any, error) {
 				return okBody, s.Store.AbandonPack(ctx, b.ExecutorID, b.ObjectID, b.Reason)
+			}),
+		newAgentOp(s, "inventory-durable", observeRefused, nil,
+			func(ctx context.Context, b agentInventoryRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.Listing.ExecutorID)
+			},
+			func(ctx context.Context, b agentInventoryRequest) (any, error) {
+				return s.Store.InventoryDurable(ctx, b.Listing)
+			}),
+		newAgentOp(s, "adopt-copies", observeRefused, nil,
+			func(ctx context.Context, b agentAdoptRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentAdoptRequest) (any, error) {
+				n, err := s.Store.AdoptCopies(ctx, b.ExecutorID, b.StoreID, b.Root, b.Copies)
+				return map[string]int{"adopted": n}, err
 			}),
 		newAgentOp(s, "record-copy", observeRefused, nil,
 			func(ctx context.Context, b agentRecordCopyRequest) (string, error) {

@@ -48,6 +48,9 @@ type Coordinator interface {
 	RecordDescribed(ctx context.Context, executorID, objectID, storeID string) error
 	// AbandonPack: the source of an import to pack is gone.
 	AbandonPack(ctx context.Context, executorID, objectID, reason string) error
+	// InventoryDurable and AdoptCopies: what a durable store's directory holds.
+	InventoryDurable(ctx context.Context, l store.DurableListing) (store.DurableInventory, error)
+	AdoptCopies(ctx context.Context, executorID, storeID, root string, copies []store.AdoptedCopy) (int, error)
 	FetchesToMake(ctx context.Context, executorID string) ([]store.FetchOrder, error)
 	RecordFetch(ctx context.Context, made store.FetchMade) error
 	AuthorizePackRead(ctx context.Context, nodeID, objectID, token string) (store.PackRead, error)

@@ -37,8 +37,8 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 			servedIDs = append(servedIDs, s.ID)
 		}
 	}
-	if len(served) < 2 {
-		return nil // nowhere here to replicate between
+	if len(served) == 0 {
+		return nil // nowhere here to replicate to
 	}
 	type candidate struct {
 		id, created, projectID string

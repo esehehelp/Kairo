@@ -1334,7 +1334,23 @@ made and packed): what the copy is, readable without the daemon (`kairo
 store catalogue ROOT` lists a durable store's copies from their descriptions
 alone). A copy made before descriptions is described afterwards (the same
 round hands out up to 200 describe-only orders a time; `record-described`,
-`object_copies.described_at`). When the pack is on a store that executor
+`object_copies.described_at`).
+The directory of a durable store is what it holds, whatever the records say:
+every hour each executor serving one on its own filesystems lists it (each
+`<root>/objects/<YYYYMM>/<object id>.tar.zst` with its file list beside it;
+partial files left out; a root not there is not listed, so an unmounted disk
+is no empty store) and reports the listing (`inventory-durable`). A copy the
+records lack there (a database restored from an older control snapshot, the
+copy made after it) is adopted from its description (`adopt-copies`, 200 a
+time, event `copy_adopted`): the object recorded as described, `packed`, its
+source settled `kept` ("adopted from durable store ..."), the copy
+`verified`; a description that is not Kairo's, of a temporal object, or of a
+copy differing from the object recorded is refused (the agent's log says
+why). A verified copy recorded there before the listing began and not in it
+is marked damaged (`check_problem`, event `copy_damaged`), as a failed
+read-back would mark it; a listing with nothing in it, or without most of the
+verified copies recorded there, is not believed and changes nothing.
+When the pack is on a store that executor
 serves (the same node, its namespace), it is read there through handles;
 otherwise it is fetched from the agent of the pack's node, at the address its
 executor advertises (`pack_addr`, Agent configuration), over HTTPS trusting
@@ -2628,8 +2644,11 @@ no daemon, no nodes):
    where the restored records say, so nothing is copied again.
 
 What the daemon recorded after the dump restored (an import, a copy) is not
-in it: its copy is on the durable store all the same, with its file list,
-but unknown to the restored daemon.
+in it, but its copy is on the durable stores all the same, with its file
+list and description: within the hour each agent's inventory of its durable
+stores adopts it (Data stores: the directory of a durable store is what it
+holds). A run, task or import that was under way is not adopted; declare it
+again.
 
 ## Verification
 

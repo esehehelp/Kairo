@@ -49,6 +49,9 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	addTestDisk(t, store, "remote", "/")
+	if err := store.UpsertNode(ctx, Node{ID: "third", Name: "third", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
 	// the test inventory's "executor" is a WSL one: the node's stores naming no
 	// executor are served by durable-exec
 	if err := store.UpsertExecutor(ctx, Executor{ID: "durable-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {

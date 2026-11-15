@@ -139,6 +139,8 @@ type Local struct {
 	deletions  round
 	evictions  round
 	scrubs     round
+	// inventories: listing durable stores, adopting copies (inventory.go).
+	inventories round
 	// sourceCleanups: unpacked code snapshots no longer used (source.go).
 	sourceCleanups round
 
@@ -254,6 +256,7 @@ func (e *Local) tick(ctx context.Context) error {
 	e.makeDeletions()
 	e.makeEvictions()
 	e.makeScrubs()
+	e.makeInventories()
 	e.makeSourceCleanups()
 	e.endStep()
 	for {
