@@ -81,6 +81,11 @@ func TestStoreValidation(t *testing.T) {
 		{"POSIX whitespace", store(base + "root = \"/srv/my scratch\"\n"), "whitespace or a backslash"},
 		{"POSIX backslash", store(base + "root = \"/srv/a\\\\b\"\n"), "whitespace or a backslash"},
 		{"control character", store(base + "root = \"D:/k\\u0001\"\n"), "control character"},
+		// A store is moved by a rename: within its drive, and not into itself.
+		{"moved from another drive", store(base + "root = \"D:/_k\"\nmoved_from = \"E:/k\"\n"), "not on the drive of root"},
+		{"moved from a POSIX path", store(base + "root = \"D:/_k\"\nmoved_from = \"/srv/k\"\n"), "not paths of one kind"},
+		{"moved into itself", store(base + "root = \"D:/k/inner\"\nmoved_from = \"D:/k\"\n"), "one inside the other"},
+		{"moved from a relative path", store(base + "root = \"D:/_k\"\nmoved_from = \"k\"\n"), "moved_from: root \"k\" is not an absolute path"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := Parse(nodes + c.stores)
@@ -96,6 +101,39 @@ func TestStoreValidation(t *testing.T) {
 	}
 	if _, err := Parse(nodes + store(base+"root = \"D:/k\"\n") + durable("D:/kept")); err != nil {
 		t.Fatalf("roots side by side: %v", err)
+	}
+	// moved_from: on the drive, or where the store is already (no move)
+	for _, from := range []string{"D:/kairo-store", "d:/_K"} {
+		spec, err := Parse(nodes + store(base+"root = \"D:/_k\"\nmoved_from = \""+from+"\"\n"))
+		if err != nil || spec.Stores[0].MovedFrom != from {
+			t.Fatalf("moved_from %s: %+v %v", from, spec.Stores, err)
+		}
+	}
+}
+
+// A path recorded under one root is the same path under another, in its own
+// separators; one not under the root is not rebased.
+func TestRebasePath(t *testing.T) {
+	for _, c := range []struct{ p, from, to, want string }{
+		{`D:\kairo-store\scratch\att_1`, "D:/kairo-store", "D:/_kairo-volatile", `D:\_kairo-volatile\scratch\att_1`},
+		{"E:/kairo/objects/202611/obj_1.tar.zst", "E:/kairo", "E:/_kairo-durable", "E:/_kairo-durable/objects/202611/obj_1.tar.zst"},
+		{`d:\KAIRO\Packs\x`, "D:/kairo/", `D:\_k`, `D:\_k\Packs\x`},
+		{"D:/kairo-store", "D:/kairo-store", "D:/_kairo-volatile", "D:/_kairo-volatile"},
+		{"/srv/kairo-store/outputs/run_1", "/srv/kairo-store", "/srv/_kairo", "/srv/_kairo/outputs/run_1"},
+		{"/srv/kairo-store/./outputs//run_1", "/srv/kairo-store", "/srv/_kairo", "/srv/_kairo/outputs/run_1"},
+	} {
+		if got, ok := RebasePath(c.p, c.from, c.to); !ok || got != c.want {
+			t.Errorf("RebasePath(%q, %q, %q) = %q %v, want %q", c.p, c.from, c.to, got, ok, c.want)
+		}
+	}
+	for _, c := range [][3]string{
+		{"D:/kairo-store2/x", "D:/kairo-store", "D:/_k"},
+		{"E:/kairo/x", "D:/kairo", "D:/_k"},
+		{"/data/in", "/srv/kairo-store", "/srv/_k"},
+	} {
+		if got, ok := RebasePath(c[0], c[1], c[2]); ok {
+			t.Errorf("RebasePath(%q, %q, %q) = %q, want not under the root", c[0], c[1], c[2], got)
+		}
 	}
 }
 

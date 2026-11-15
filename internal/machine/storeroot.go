@@ -41,6 +41,37 @@ func PathUnder(p, root string) bool {
 	return k == r || strings.HasPrefix(k, strings.TrimSuffix(r, "/")+"/")
 }
 
+// RebasePath is p, a path recorded under the root from, under the root to
+// instead (the same path below the root), in p's separators; false when p
+// is not from or under it (PathUnder).
+func RebasePath(p, from, to string) (string, bool) {
+	if !PathUnder(p, from) {
+		return "", false
+	}
+	below := func(q string) []string {
+		var out []string
+		for _, name := range strings.Split(strings.ReplaceAll(q, `\`, "/"), "/") {
+			if name != "" && name != "." {
+				out = append(out, name)
+			}
+		}
+		return out
+	}
+	rest := below(p)[len(below(from)):]
+	sep := "/"
+	if strings.Contains(p, `\`) {
+		sep = `\`
+	}
+	out := strings.TrimRight(to, `/\`)
+	if sep == `\` {
+		out = strings.ReplaceAll(out, "/", `\`)
+	}
+	if len(rest) == 0 {
+		return out, true
+	}
+	return out + sep + strings.Join(rest, sep), true
+}
+
 // RootsOverlap reports whether two roots are one place or one holds the
 // other.
 func RootsOverlap(a, b string) bool { return PathUnder(a, b) || PathUnder(b, a) }

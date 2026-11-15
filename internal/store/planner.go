@@ -170,6 +170,9 @@ type planCandidate struct {
 	// inputsWait: why it is not admitted yet for its inputs (inputs.go);
 	// empty when it has none, or each is where it is planned.
 	inputsWait string
+	// storeWait: why it is not admitted yet for the store it names (its
+	// store is being moved: stores_moved.go).
+	storeWait string
 	// endsIn is how long it is expected to run once admitted (0: no
 	// estimate, it may use nothing held for others).
 	endsIn time.Duration
@@ -1030,6 +1033,9 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 	if c.inputsWait != "" {
 		return planPlacement{wait: planWait{reason: "inputs_not_ready", message: c.inputsWait}}, time.Time{}
 	}
+	if c.storeWait != "" {
+		return planPlacement{wait: planWait{reason: "store_moving", message: c.storeWait}}, time.Time{}
+	}
 	if notBefore, ok := instant.Parse(deref(c.execution.NotBefore)); ok && notBefore.After(p.m.stamp) {
 		return p.notYet(c, ranks, options, notBefore)
 	}
@@ -1612,6 +1618,9 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 		ids = append(ids, c.execution.ID)
 	}
 	if err = loadInputsWaits(ctx, tx, candidates, ids); err != nil {
+		return nil, err
+	}
+	if err = loadStoreMoveWaits(ctx, tx, candidates, ids); err != nil {
 		return nil, err
 	}
 	for _, gang := range members {

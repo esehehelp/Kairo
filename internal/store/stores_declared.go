@@ -43,7 +43,8 @@ func declaredStores(ctx context.Context, q queryer) ([]machine.Store, error) {
 }
 
 // NodeStores are the stores declared on a node (a node agent asks for its
-// own when it starts, and again now and then).
+// own when it starts, and again now and then); one being moved says what its
+// move still waits for (MoveWait, storeMoveWait).
 func (s *Store) NodeStores(ctx context.Context, nodeID string) ([]machine.Store, error) {
 	all, err := declaredStores(ctx, s.db)
 	if err != nil {
@@ -51,9 +52,15 @@ func (s *Store) NodeStores(ctx context.Context, nodeID string) ([]machine.Store,
 	}
 	out := []machine.Store{}
 	for _, store := range all {
-		if store.Node == nodeID {
-			out = append(out, store)
+		if store.Node != nodeID {
+			continue
 		}
+		if store.MovedFrom != "" {
+			if store.MoveWait, err = storeMoveWait(ctx, s.db, store); err != nil {
+				return nil, err
+			}
+		}
+		out = append(out, store)
 	}
 	return out, nil
 }
@@ -120,6 +127,9 @@ func storeChangesTx(ctx context.Context, tx *sql.Tx, spec machine.Spec) ([]Store
 		to := raw.Normalized()
 		from, existed := before[to.ID]
 		delete(before, to.ID)
+		if err := checkStoreMove(from, existed, &to); err != nil {
+			return nil, 0, err
+		}
 		switch {
 		case !existed:
 			changes = append(changes, StoreChange{Store: to.ID, To: &to})

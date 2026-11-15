@@ -40,6 +40,10 @@ type StoreObservation struct {
 	// the whole of <root>/outputs was read.
 	Outputs        map[string]int64 `json:"outputs,omitempty"`
 	OutputsScanned bool             `json:"outputs_scanned,omitempty"`
+	// MovedFrom: the store being moved from there is at Root now, moved by
+	// its executor (the move's marker found there): the move is over
+	// (completeStoreMove).
+	MovedFrom string `json:"moved_from,omitempty"`
 }
 
 // StoreStaleAfter is how old a store's latest observation may be before its
@@ -68,6 +72,11 @@ func (s *Store) StoreNode(ctx context.Context, storeID string) (string, error) {
 // two reports of one store (by two executors of its node) go one after the
 // other.
 func (s *Store) RecordStoreObservation(ctx context.Context, obs StoreObservation) error {
+	if obs.MovedFrom != "" {
+		if err := s.completeStoreMove(ctx, obs); err != nil {
+			return err
+		}
+	}
 	tx, err := s.beginUnlockedWrite(ctx)
 	if err != nil {
 		return err
@@ -268,7 +277,11 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 		return len(out) - 1
 	}
 	for _, d := range declared {
-		add(StoreStatus{Store: d, State: "unknown", Kept: []KeptScratch{}, Missing: []KeptScratch{}, Damaged: []DamagedCopy{}})
+		state := "unknown"
+		if d.MovedFrom != "" {
+			state = "moving"
+		}
+		add(StoreStatus{Store: d, State: state, Kept: []KeptScratch{}, Missing: []KeptScratch{}, Damaged: []DamagedCopy{}})
 	}
 	err = eachRow(ctx, tx, `SELECT store_id,COALESCE(SUM(bytes) FILTER (WHERE state IN('active','deleting')),0)::bigint,COALESCE(SUM(bytes) FILTER (WHERE state='kept'),0)::bigint
 		FROM attempt_scratch GROUP BY store_id`, nil, func(rows *sql.Rows) error {
@@ -382,6 +395,9 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 			st.State = "stale"
 		default:
 			st.State = "ready"
+		}
+		if st.MovedFrom != "" {
+			st.State = "moving"
 		}
 		return nil
 	})

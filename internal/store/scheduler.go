@@ -689,6 +689,14 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err = validateLeaseGatesTx(ctx, tx, reservation.Lease.ID); err != nil {
 		return nil, err
 	}
+	// Its store is being moved (admitted just before the move was declared):
+	// not launched now; the executor releases the reservation and the
+	// execution waits again (store_moving).
+	if moving, err := storeBeingMovedTx(ctx, tx, storeID.String); err != nil {
+		return nil, err
+	} else if moving != "" {
+		return nil, fmt.Errorf("%w: %s", ErrGateClosed, moving)
+	}
 	// Launch barrier: a gang rank launches only once every rank is prepared.
 	gang, err := gangLaunchGateTx(ctx, tx, reservation.Lease.ID)
 	if err != nil {

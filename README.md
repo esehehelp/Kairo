@@ -737,7 +737,7 @@ Every waiting execution's latest reason is kept: `task show` prints it under
 `waiting:` (for example `gpu_leased: pve0: 1 GPU(s) of >= 11.0 GiB needed, 0
 usable; leased by glm/maya-r3 (priority -100)`), and `task list` adds its
 code to the NOTE (`execution waiting: insufficient_ram`). The codes are
-`no_executor`, `not_before`, `inputs_not_ready`, `awaiting_executor`, `gpu_leased`, `held_for_higher_priority`,
+`no_executor`, `not_before`, `inputs_not_ready`, `store_moving`, `awaiting_executor`, `gpu_leased`, `held_for_higher_priority`,
 `gpu_memory_low`, `insufficient_gpu`, `insufficient_cpu`, `insufficient_ram`,
 `insufficient_disk`, `external_claim`, `unattributed_activity`,
 `stale_observation`, `disk_low_watermark` and `preempting`.
@@ -989,12 +989,15 @@ a space, with `~` as in a short 8.3 name, a `:` or a character names cannot
 hold). The agent also compares where the roots really are (Data stores). A
 store is replaced as a whole
 on apply (`+ store`, `~ store`, `- store`; event `store_declaration_changed`);
-dropping one deletes nothing. `machine show` adds the stores.
+dropping one deletes nothing, and a store declared at another root leaves
+what it has at the old one there, untouched and no longer used. To take it
+along, declare the new root with `moved_from` naming the root it is at
+(Data stores: moving a store). `machine show` adds the stores.
 
 `POST /api/machines` takes `{"nodes": [{"id", "gpus"}], "hosts": [{"id",
 "nodes", "controller", "max_slowdown", "devices": [{"id", "max_slowdown",
 "control"}]}], "stores": [{"id", "class", "node", "executor", "root",
-"filesystem", "backend", "reserve_free_bytes"}], "dry_run"}` and answers
+"filesystem", "backend", "reserve_free_bytes", "moved_from"}], "dry_run"}` and answers
 `{"changes": [{"uuid", "from", "to"}], "unchanged", "host_changes": [{"host",
 "from", "to"}], "unchanged_hosts", "store_changes": [{"store", "from", "to"}],
 "unchanged_stores", "cleared_settings", "dry_run"}`; a leased GPU is `409
@@ -1149,8 +1152,9 @@ mode, say) is not taken as missing.
 `kairo store status [--json]` (`GET /api/stores`, `{"stores": [...]}`) shows
 each store: class, node (and executor), `state` (`unknown`: never reported,
 no agent serves it or one older than stores; `ready`; `unusable`, with the
-`problem`; `stale`: no report for 15 minutes; `undeclared`: no longer
-declared but still holding kept scratch), the filesystem's total and free,
+`problem`; `stale`: no report for 15 minutes; `moving`: being moved, see
+below; `undeclared`: no longer declared but still holding kept scratch), the
+filesystem's total and free,
 Kairo's bytes by class (`scratch_active_bytes`, `scratch_kept_bytes`,
 `output_bytes` with the number of `outputs`, the run output directories as
 the last report found them, shown as `OUTPUTS`, `pack_bytes` with the number
@@ -1164,6 +1168,33 @@ minus Kairo's classes), then the kept scratch of each store and the
 report of a store is the table `store_observations`. An agent older than
 stores leaves its stores `unknown`; a daemon older than stores answers the
 agent's `stores` with 404, and the agent runs without stores (warned once).
+
+Moving a store: a store declared at another root with `moved_from` naming
+the root it is at (`root = "D:/_kairo-volatile"`, `moved_from =
+"D:/kairo-store"`; nothing else of it changed, one drive or filesystem) is
+being moved, by a rename: nothing is copied. Until it is over, every record
+of it (scratch, run outputs, objects and their packs, copies, objects
+brought there or fetched from it) stays at the old root, so nothing reads,
+writes or deletes there or at the new one; an execution naming the store
+waits (`store_moving`) and one admitted just before is not launched (its
+reservation is released and it waits); its root cannot change again; and
+the node is told what still uses it where it is: executions using it (naming
+it, or with their scratch there) that hold a lease, running, starting or
+lost and not reconciled (their processes may still write there), scratch
+being deleted, objects being packed, deleted, evicted or packed for
+transfer there, copies being made there, objects being brought there or
+evicted, or fetched from it. Once nothing does, the executor serving it
+writes the marker `.kairo-store-move` (the store, both roots) into the old
+root and renames it to the new one, which must not be there yet (the parent
+must; Windows refuses the rename while anything there is open, and it is
+tried again at the next refresh); a new root that is there already without
+that marker is not taken for the store. Meanwhile the store is unusable
+(`kairo store status`: `moving`, with what it waits for). Its next report
+says it moved, and the daemon rebases every record of it onto the new root
+(paths in their own separators) in one transaction (event `store_moved`);
+the executor then removes the marker. `moved_from` left in the declaration
+once moved says nothing more, so the same file applies again unchanged.
+An agent older than this does not move a store: deploy the agents first.
 
 Scratch: an attempt launched by an executor that serves a usable volatile
 store (the first by id when there are several) gets a scratch directory

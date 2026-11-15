@@ -33,6 +33,9 @@ type servedStore struct {
 	fs      storeFS
 	usable  bool
 	problem string
+	// movedFrom: the store was moved here from there (storemove.go), which
+	// its observations say until the daemon records it here.
+	movedFrom string
 }
 
 func (e *Local) isWSL() bool { return e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2" }
@@ -81,6 +84,18 @@ func (e *Local) refreshStores(ctx context.Context) {
 			continue
 		}
 		s := servedStore{decl: decl.Normalized(), fs: fs, usable: true}
+		if decl.MovedFrom != "" {
+			moved, problem := e.moveStore(fs, s.decl)
+			if !moved {
+				s.usable, s.problem = false, problem
+				e.Logger.Info("store being moved: not used meanwhile", "executor_id", e.ID, "store_id", decl.ID, "problem", problem)
+				served = append(served, s)
+				continue
+			}
+			s.movedFrom = decl.MovedFrom
+		} else if _, local := fs.(localStoreFS); local {
+			dropMoveMarker(decl.Root)
+		}
 		// A durable store's root is never made: one missing may be a disk
 		// not mounted, and what went there would be on another.
 		if err := fs.Ensure(ctx, decl.Root, decl.Filesystem, decl.Class != machine.StoreDurable); err != nil {
@@ -162,7 +177,7 @@ func (e *Local) reportStores() {
 
 // observeStore is what a served store holds now.
 func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObservation {
-	obs := store.StoreObservation{StoreID: s.decl.ID, ExecutorID: e.ID, Root: s.decl.Root, Usable: s.usable, Problem: s.problem}
+	obs := store.StoreObservation{StoreID: s.decl.ID, ExecutorID: e.ID, Root: s.decl.Root, Usable: s.usable, Problem: s.problem, MovedFrom: s.movedFrom}
 	if !s.usable {
 		return obs
 	}

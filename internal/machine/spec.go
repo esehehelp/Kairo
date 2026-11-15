@@ -68,6 +68,15 @@ type Store struct {
 	Filesystem       string `toml:"filesystem" json:"filesystem"`
 	Backend          string `toml:"backend" json:"backend"`
 	ReserveFreeBytes int64  `toml:"reserve_free_bytes" json:"reserve_free_bytes,omitempty"`
+	// MovedFrom: the root the store's data is at now, to be moved to Root
+	// (the same filesystem; Kairo renames it there and records it there:
+	// Data stores, moving a store). Left in the declaration once moved, it
+	// says nothing more.
+	MovedFrom string `toml:"moved_from" json:"moved_from,omitempty"`
+	// MoveWait is never declared: what a node is told of a store being moved
+	// (NodeStores) while the move must wait (what still uses the store where
+	// it is), empty once its executor may move it.
+	MoveWait string `toml:"-" json:"move_wait,omitempty"`
 }
 
 // Normalized is s with its backend defaulted.
@@ -124,12 +133,39 @@ func (s Spec) validateStores() error {
 		case store.ReserveFreeBytes < 0:
 			return fmt.Errorf("store %s: reserve_free_bytes is negative", store.ID)
 		}
+		if store.MovedFrom != "" {
+			if err := checkStoreRoot(store.MovedFrom); err != nil {
+				return fmt.Errorf("store %s: moved_from: %w", store.ID, err)
+			}
+			if err := checkMove(store.MovedFrom, store.Root); err != nil {
+				return fmt.Errorf("store %s: %w", store.ID, err)
+			}
+		}
 		for _, other := range roots[store.Node] {
 			if RootsOverlap(store.Root, other.Root) {
 				return fmt.Errorf("stores %s and %s have nested roots %s and %s on node %s (one place, or one inside the other)", other.ID, store.ID, other.Root, store.Root, store.Node)
 			}
 		}
 		roots[store.Node] = append(roots[store.Node], store)
+	}
+	return nil
+}
+
+// checkMove checks that a store's data at from can be renamed to root: one
+// family of path, on one drive (a rename never crosses filesystems; on a
+// POSIX node the executor finds out), neither inside the other. From the
+// same place as root it is no move at all, which is not refused.
+func checkMove(from, root string) error {
+	f, r := StoreRootKey(from), StoreRootKey(root)
+	switch {
+	case f == r:
+		return nil
+	case strings.HasPrefix(from, "/") != strings.HasPrefix(root, "/"):
+		return fmt.Errorf("moved_from %s and root %s are not paths of one kind of node", from, root)
+	case !strings.HasPrefix(from, "/") && f[:1] != r[:1]:
+		return fmt.Errorf("moved_from %s is not on the drive of root %s (a store is moved only within its filesystem)", from, root)
+	case RootsOverlap(from, root):
+		return fmt.Errorf("moved_from %s and root %s are one inside the other", from, root)
 	}
 	return nil
 }
