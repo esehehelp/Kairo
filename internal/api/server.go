@@ -35,6 +35,11 @@ type Server struct {
 	LogDirectory string
 	// SourceDirectory keeps code snapshots (sources.go; "": none kept).
 	SourceDirectory string
+	// DumpDatabase writes the database's dump (pg_dump -Fc) for the control
+	// snapshot (control.go; nil: none); ControlFiles go into it too (the
+	// daemon's configuration and TLS).
+	DumpDatabase func(ctx context.Context, w io.Writer) error
+	ControlFiles []string
 	// SlowRequest: a request that takes this long or longer is logged at
 	// WARN (timed; 0 is 2 s). Logger receives it (nil: slog's default).
 	SlowRequest time.Duration

@@ -19,6 +19,7 @@ func (s *Server) routes() []route {
 
 		{"POST", "/api/projects", roleAdmin, s.applyProject},
 		{"POST", "/api/sources", roleAdmin, s.uploadSource},
+		{"GET", "/api/control/snapshot", roleAdmin, s.controlSnapshot},
 		{"GET", "/api/sources", roleRead, s.listSources},
 		{"GET", "/api/sources/{id}", roleRead, s.getSource},
 		{"GET", "/api/projects/{project}", roleRead, s.getProject},
@@ -70,6 +71,7 @@ func (s *Server) routes() []route {
 		{"GET", "/api/worker/commands", roleWorker, s.workerPoll},
 		{"POST", "/api/worker/commands/{command}/acks", roleWorker, s.workerAck},
 		{"GET", "/api/worker/bench", roleWorker, s.workerBenchStatus},
+		{"GET", "/api/worker/control-snapshot", roleWorker, s.workerControlSnapshot},
 		{"POST", "/api/worker/bench/settings", roleWorker, s.workerBenchSetting},
 		{"GET", "/api/worker/bench/cpu-energy", roleWorker, s.workerBenchCPUEnergy},
 		{"POST", "/api/worker/bench/start", roleWorker, s.workerBenchStart},

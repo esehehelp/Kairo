@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -160,7 +161,14 @@ func serve(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	handler := (&api.Server{Store: st, ObserveOnly: daemonConfig.ObserveOnly, LogDirectory: daemonConfig.LogDirectory, SourceDirectory: daemonConfig.SourceDirectory, Logger: logger}).Handler()
+	pgDump := daemonConfig.PGDump
+	if pgDump == "" {
+		pgDump = "pg_dump"
+	}
+	// what a control snapshot carries beside the dump (README: Kairo keeps itself)
+	controlFiles := []string{*configPath, daemonConfig.TLSCertFile, daemonConfig.TLSKeyFile, daemonConfig.TLSCAFile, daemonConfig.DatabasePasswordFile}
+	handler := (&api.Server{Store: st, ObserveOnly: daemonConfig.ObserveOnly, LogDirectory: daemonConfig.LogDirectory, SourceDirectory: daemonConfig.SourceDirectory, Logger: logger,
+		DumpDatabase: func(ctx context.Context, w io.Writer) error { return pgDumpTo(ctx, pgDump, dsn, w) }, ControlFiles: controlFiles}).Handler()
 	server := &http.Server{
 		Addr:              daemonConfig.Listen,
 		Handler:           handler,
@@ -254,6 +262,27 @@ func serve(args []string) error {
 			}
 		}
 	}()
+	if every := daemonConfig.ControlSnapshotEvery(); every > 0 && !daemonConfig.ObserveOnly {
+		// Kairo keeps itself: a control-snapshot task every interval, its
+		// output copied to every durable store like any other.
+		go func() {
+			ticker := time.NewTicker(time.Minute)
+			defer ticker.Stop()
+			for {
+				name, err := st.ControlSnapshotTask(ctx, time.Now(), every)
+				if err != nil && ctx.Err() == nil {
+					logger.Error("control snapshot not declared", "error", err)
+				} else if name != "" {
+					logger.Info("control snapshot declared", "project", store.ControlProject, "task", name)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
 	if !daemonConfig.ObserveOnly {
 		// Node quarantine: suspend or terminate what runs on quarantined nodes.
 		go func() {

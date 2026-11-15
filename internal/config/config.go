@@ -27,6 +27,13 @@ type Config struct {
 	// SourceDirectory keeps the code snapshots kairo project apply sends
 	// (api/sources.go; default: sources beside log_directory).
 	SourceDirectory string `toml:"source_directory"`
+	// ControlSnapshotMinutes: how often the control plane is snapshotted
+	// into the durable store (README: Kairo keeps itself); 0: every 60,
+	// negative: never.
+	ControlSnapshotMinutes int `toml:"control_snapshot_minutes"`
+	// PGDump: the pg_dump that dumps the database for a control snapshot
+	// (default: pg_dump on PATH).
+	PGDump string `toml:"pg_dump"`
 	// LogMinFreeMiB is the free space (MiB) the filesystem holding
 	// log_directory must have for an executor to launch (0: 1024).
 	LogMinFreeMiB              int  `toml:"log_min_free_mib"`
@@ -90,6 +97,18 @@ func (b Bench) Attributes(labels map[string]string) map[string]any {
 // DatabaseURLEnv names the environment variable that may give the database
 // instead of database_url (so its password need not be in the file).
 const DatabaseURLEnv = "KAIRO_DATABASE_URL"
+
+// ControlSnapshotEvery is how often the control plane is snapshotted (0:
+// never).
+func (c Config) ControlSnapshotEvery() time.Duration {
+	switch {
+	case c.ControlSnapshotMinutes < 0:
+		return 0
+	case c.ControlSnapshotMinutes == 0:
+		return time.Hour
+	}
+	return time.Duration(c.ControlSnapshotMinutes) * time.Minute
+}
 
 // Database returns the connection string of the daemon's database: the
 // configured database_url or KAIRO_DATABASE_URL (not both), with the

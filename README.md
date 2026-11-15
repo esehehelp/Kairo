@@ -2513,30 +2513,59 @@ the `CI_*` settings of CI on Kairo.
   state and CA in `%ProgramData%\Kairo` (readable by SYSTEM and Administrators
   only: the configuration holds its token), and the task `kairo-controller`.
 
+### Kairo keeps itself
+
+The control plane is data like any other, so Kairo keeps it the same way.
+Every `control_snapshot_minutes` (daemon configuration; default 60, a
+negative value never) the daemon declares a task of project `kairo`, queue
+`control-snapshot`, named `snapshot-<UTC slot>` (`snapshot-20261116T0100Z`):
+`kairo control snapshot`, run with the `kairo_binary` that the node of the
+first durable store reports (`[bench]`), on an executor of its
+`executor_labels`. Nothing runs while no durable store is declared or its
+node reports no kairo. Its priority is above everything and it reserves no
+CPU, RAM or GPU (the daemon dumps; the task only writes what it is sent), so
+nothing holds it back and it never suspends anything to fit. The task asks the daemon for the snapshot with its
+attempt token (`GET /api/worker/control-snapshot`, only for an attempt of
+that queue) and writes it to its run's output directory as
+`kairo-control-<time>.tar`, which is packed when the run ends and copied to
+every durable store like any output. The tar holds:
+
+| entry | what |
+|---|---|
+| `SNAPSHOT.txt` | when, and the daemon's version |
+| `kairo.dump` | the database (`pg_dump -Fc`: the daemon runs `pg_dump`, or the configuration's `pg_dump`, with the password in `PGPASSWORD`) |
+| `sources/...` | the code snapshots (`source_directory`) |
+| `config/...` | the daemon's configuration file, TLS certificate, key and CA, and `database_password_file`, by base name |
+
+The command keeps the file only whole and holding a non-empty dump (else it
+fails and the task with it); inside an attempt without an output directory it
+refuses, since nothing would keep what it wrote. An operator takes one with
+an admin token (`kairo control snapshot --out DIR`, `GET
+/api/control/snapshot`). The snapshot holds the server's key and the
+database password: the durable stores must be as private as the daemon.
+
 ### Rebuilding an installation from its durable store
 
 What Kairo holds survives in its durable store: every copy is
 `<root>/objects/<YYYYMM>/<object id>.tar.zst` (tar, zstd) with its file list
 beside it (`.files.tsv`) and its description (`.object.json`: whose it is,
-what it holds; `kairo store catalogue ROOT`), readable without Kairo. Kairo
-keeps its own control
-plane there too: the tasks of project `kairo`, queue `control-backup` write
-the database dump (`kairo-<time>.dump`, `pg_dump -Fc`) and the daemon's state
-(`daemon-srv-kairo-<time>.tar.gz`: its configuration, TLS and code
-snapshots) to their run's output directory, which is packed and copied like
-any output; an import named `kairo-control-<time>` holds the same with every
-node's `/srv/kairo` (agent configuration and tokens, without binaries), the
-hosts' `/etc/kairo` and the Windows host's configuration directory. With
-nothing else left (no database, no daemon, no nodes):
+what it holds; `kairo store catalogue ROOT`), readable without Kairo. Its own
+control plane is among them (Kairo keeps itself): the newest
+`kairo-control-<time>.tar` of project `kairo`. (Before that was built in, the
+tasks of queue `control-backup` wrote `kairo-<time>.dump` and
+`daemon-srv-kairo-<time>.tar.gz`, and imports named `kairo-control-<time>`
+held the same with every node's `/srv/kairo`, the hosts' `/etc/kairo` and the
+Windows host's configuration directory.) With nothing else left (no database,
+no daemon, no nodes):
 
-1. Find the newest dump: the file lists that name one
-   (`grep -l 'kairo-.*\.dump\|db/kairo\.dump' <root>/objects/*/*.files.tsv`),
-   and unpack that object (`zstd -dc OBJ.tar.zst | tar -x`).
+1. Find the newest snapshot: the file lists that name one
+   (`grep -l 'kairo-control-.*\.tar\|kairo-.*\.dump' <root>/objects/*/*.files.tsv`),
+   unpack that object (`zstd -dc OBJ.tar.zst | tar -x`) and the snapshot in it.
 2. Build kairo from this repository; make an empty PostgreSQL database
    (Database) and `pg_restore -d kairo` the dump into it.
-3. Put the daemon's state back (`/srv/kairo`: `kairo.toml`, `tls/`,
-   `sources/`) and start `kairo serve`; restore each node's agent
-   configuration (or issue new tokens) and start the agents.
+3. Put the daemon's state back (`config/` and `sources/` as the
+   configuration names them) and start `kairo serve`; restore each node's
+   agent configuration (or issue new tokens) and start the agents.
 4. Declare the stores as before (the machine declaration is in the dump and
    in the Windows configuration directory's `machines.toml`): the copies are
    where the restored records say, so nothing is copied again.
