@@ -204,16 +204,16 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 			return nil, err
 		}
 		var due []struct {
-			id, created, projectID string
-			bytes                  int64
+			id, created, projectID, node string
+			bytes                        int64
 		}
-		err = eachRow(ctx, tx, `SELECT d.id,d.created_at,COALESCE(d.project_scope_id,''),COALESCE(d.pack_bytes,0) FROM data_objects d
+		err = eachRow(ctx, tx, `SELECT d.id,d.created_at,COALESCE(d.project_scope_id,''),COALESCE(d.pack_bytes,0),COALESCE(x.node_id,'') FROM data_objects d LEFT JOIN executors x ON x.id=d.executor_id
 			WHERE d.state='packed' AND d.lifecycle='durable' AND NOT EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id) ORDER BY d.packed_at,d.id`, nil, func(rows *sql.Rows) error {
 			var d struct {
-				id, created, projectID string
-				bytes                  int64
+				id, created, projectID, node string
+				bytes                        int64
 			}
-			if err := rows.Scan(&d.id, &d.created, &d.projectID, &d.bytes); err != nil {
+			if err := rows.Scan(&d.id, &d.created, &d.projectID, &d.bytes, &d.node); err != nil {
 				return err
 			}
 			due = append(due, d)
@@ -223,13 +223,19 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 			return nil, err
 		}
 		for _, d := range due {
-			// the first durable store with room for it; another executor's
-			// to take when that one is not served here
+			// the first durable store with room for it on the pack's node,
+			// else the first elsewhere (read through the pack's agent);
+			// another executor's to take when that one is not served here
 			var target machine.Store
 			found := false
-			for _, t := range targets {
-				if room[t.ID] >= d.bytes {
-					target, found = t, true
+			for _, local := range []bool{true, false} {
+				for _, t := range targets {
+					if (t.Node == d.node) == local && room[t.ID] >= d.bytes {
+						target, found = t, true
+						break
+					}
+				}
+				if found {
 					break
 				}
 			}
@@ -308,6 +314,27 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 			out = append(out, o)
 			continue
 		}
+		if x.replica {
+			// else from one on another node, through its pack server
+			src, node, found, err := remoteCopyTx(ctx, tx, me, executorID, o.ObjectID, byID)
+			if err != nil {
+				return nil, err
+			}
+			if found {
+				token, hash, err := newSecret("kairo_pack_")
+				if err != nil {
+					return nil, err
+				}
+				if _, err = tx.ExecContext(ctx, `UPDATE object_copies SET token_hash=$1,token_expires_at=$2,source_store_id=$3,source_root=$4,source_month=$5,source_node_id=$6,updated_at=$7 WHERE object_id=$8 AND store_id=$9`,
+					hash, expires, src.StoreID, src.Root, src.Month, node, t, o.ObjectID, o.StoreID); err != nil {
+					return nil, err
+				}
+				src.Token = token
+				o.Source = src
+				out = append(out, o)
+				continue
+			}
+		}
 		o.Source = CopySource{StoreID: x.sourceStoreID, Root: x.sourceRoot}
 		source, err := executorInfoTx(ctx, tx, x.sourceExecutor)
 		if err != nil && !errors.Is(err, ErrNotFound) {
@@ -358,8 +385,15 @@ func (s *Store) AuthorizePackRead(ctx context.Context, nodeID, objectID, token s
 	var read PackRead
 	var expires string
 	err := s.db.QueryRowContext(ctx, `SELECT d.store_id,d.root,c.token_expires_at FROM data_objects d JOIN executors x ON x.id=d.executor_id
-		JOIN object_copies c ON c.object_id=d.id AND c.state='copying' AND c.token_hash=$1
+		JOIN object_copies c ON c.object_id=d.id AND c.state='copying' AND c.token_hash=$1 AND c.source_store_id IS NULL
 		WHERE d.id=$2 AND d.state='packed' AND x.node_id=$3`, hashToken(token), objectID, nodeID).Scan(&read.StoreID, &read.Root, &expires)
+	if errors.Is(err, sql.ErrNoRows) {
+		// a replica's, read from a durable copy on this node (replicas.go)
+		var month sql.NullString
+		err = s.db.QueryRowContext(ctx, `SELECT c.source_store_id,c.source_root,c.source_month,c.token_expires_at FROM object_copies c
+			WHERE c.object_id=$1 AND c.token_hash=$2 AND c.state='copying' AND c.source_node_id=$3`, objectID, hashToken(token), nodeID).Scan(&read.StoreID, &read.Root, &month, &expires)
+		read.Month = month.String
+	}
 	if errors.Is(err, sql.ErrNoRows) {
 		// a fetch's (placements.go): read from the store it was issued for,
 		// on that node

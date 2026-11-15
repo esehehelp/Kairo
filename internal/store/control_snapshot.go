@@ -51,16 +51,25 @@ func (s *Store) ControlSnapshotTask(ctx context.Context, at time.Time, every tim
 		tx.Rollback()
 		return "", err
 	}
-	bench, err := nodeBenchTx(ctx, tx, targets[0].Node)
-	tx.Rollback()
-	if err != nil {
-		return "", err
+	// the first durable store whose node reports its kairo
+	var bench NodeBench
+	var node string
+	for _, target := range targets {
+		if bench, err = nodeBenchTx(ctx, tx, target.Node); err != nil {
+			tx.Rollback()
+			return "", err
+		}
+		if bench.Kairo != "" {
+			node = target.Node
+			break
+		}
 	}
-	if bench.Kairo == "" {
+	tx.Rollback()
+	if node == "" {
 		return "", nil
 	}
 	execution := orchestration.Execution{SchemaVersion: 2, Priority: ControlPriority,
-		Argv: []string{bench.Kairo, "control", "snapshot"}, CWD: benchCWD(bench), Executor: benchSelector(targets[0].Node, bench)}
+		Argv: []string{bench.Kairo, "control", "snapshot"}, CWD: benchCWD(bench), Executor: benchSelector(node, bench)}
 	declaration, err := orchestration.Normalize(orchestration.Manifest{SchemaVersion: orchestration.SchemaVersion, Project: orchestration.Project{Name: ControlProject},
 		Tasks: []orchestration.Task{{Name: name, Queue: ControlQueue, DependsOn: []string{}, Policy: orchestration.PolicyRunToCompletion, Execution: execution}}})
 	if err != nil {

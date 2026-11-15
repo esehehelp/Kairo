@@ -56,7 +56,7 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 	}
 	declareTestStore(t, store,
 		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "z-durable", Class: machine.StoreDurable, Node: "remote", Root: "/srv/durable", Filesystem: "/"},
+		machine.Store{ID: "z-durable", Class: machine.StoreDurable, Node: "third", Root: "/srv/durable", Filesystem: "/"},
 		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "r-pool", Class: machine.StoreVolatile, Node: "remote", Root: "/srv/kairo", Filesystem: "/"},
 	)
@@ -153,18 +153,24 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 		t.Fatalf("after the local copy was verified: %+v %v", orders, err)
 	}
 
-	// a durable store declared ahead of it takes new objects; the copied one
-	// is not copied again
+	// a durable store on the pack's node takes a new object before one
+	// elsewhere, read where it is; the copied one is not copied again
 	declareTestStore(t, store,
 		machine.Store{ID: "a-durable", Class: machine.StoreDurable, Node: "remote", Root: "/srv/first", Filesystem: "/"},
 		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "r-pool", Class: machine.StoreVolatile, Node: "remote", Root: "/srv/kairo", Filesystem: "/"},
 	)
-	insertPacked(t, store, "obj_new", "executor", "d-scratch", "D:/kairo", shaLocal)
+	insertPacked(t, store, "obj_new", "remote-exec", "r-pool", "/srv/kairo", shaLocal)
 	orders, err = store.CopiesToMake(ctx, "remote-exec")
-	if err != nil || len(orders) != 1 || orders[0].ObjectID != "obj_new" || orders[0].StoreID != "a-durable" || orders[0].Source.Local {
-		t.Fatalf("the new first durable store: %+v %v", orders, err)
+	var newOrders []CopyOrder
+	for _, o := range copiesOnly(orders) {
+		if o.ObjectID == "obj_new" {
+			newOrders = append(newOrders, o)
+		}
+	}
+	if err != nil || len(newOrders) != 1 || newOrders[0].StoreID != "a-durable" || !newOrders[0].Source.Local {
+		t.Fatalf("the durable store on the pack's node: %+v %v", orders, err)
 	}
 }
 
@@ -298,5 +304,60 @@ func TestADurableObjectIsReplicatedToEveryDurableStore(t *testing.T) {
 	r := orders[1]
 	if r.ObjectID != "obj_a" || r.StoreID != "e-durable" || !r.Source.Local || r.Source.StoreID != "c-durable" || r.Source.Root != "C:/_kairo-durable" || r.Source.Month != "202611" {
 		t.Fatalf("replica %+v", r)
+	}
+}
+
+// A durable store on another node takes a replica of an object whose copies
+// are all elsewhere, read from one of them through the pack server of the
+// agent that made it, with a token only that agent's node can use.
+func TestAReplicaIsReadFromADurableCopyOnAnotherNode(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	addTestDisk(t, store, "node", "D:")
+	ctx := context.Background()
+	if err := store.UpsertExecutor(ctx, Executor{ID: "durable-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows","pack_addr":"10.0.0.1:7475"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertNode(ctx, Node{ID: "remote", Name: "remote", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertExecutor(ctx, Executor{ID: "remote-exec", NodeID: "remote", Kind: "linux", Attributes: json.RawMessage(`{"pack_addr":"10.0.0.2:7475"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	addTestDisk(t, store, "remote", "/")
+	declareTestStore(t, store,
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "p-durable", Class: machine.StoreDurable, Node: "remote", Root: "/srv/_kairo-durable", Filesystem: "/"},
+	)
+	sha := strings.Repeat("ef", 32)
+	insertPacked(t, store, "obj_x", "executor", "d-scratch", "D:/kairo", sha)
+	// its first copy on its own node's store, though p-durable sorts first
+	orders, err := store.CopiesToMake(ctx, "durable-exec")
+	if orders = copiesOnly(orders); err != nil || len(orders) != 1 || orders[0].StoreID != "e-durable" || !orders[0].Source.Local {
+		t.Fatalf("first copy %+v %v", orders, err)
+	}
+	if orders, err = store.CopiesToMake(ctx, "remote-exec"); err != nil || len(copiesOnly(orders)) != 0 {
+		t.Fatalf("a replica before any verified copy: %+v %v", orders, err)
+	}
+	if err = store.RecordCopy(ctx, CopyMade{ObjectID: "obj_x", StoreID: "e-durable", ExecutorID: "durable-exec", Path: "E:/kairo/objects/202611/obj_x.tar.zst",
+		ManifestPath: "E:/kairo/objects/202611/obj_x.tar.zst.files.tsv", Bytes: 100, SHA256: sha, ManifestSHA256: sha}); err != nil {
+		t.Fatal(err)
+	}
+	orders, err = store.CopiesToMake(ctx, "remote-exec")
+	if orders = copiesOnly(orders); err != nil || len(orders) != 1 {
+		t.Fatalf("replica %+v %v", orders, err)
+	}
+	o := orders[0]
+	if o.StoreID != "p-durable" || o.Source.Local || o.Source.StoreID != "e-durable" || o.Source.Root != "E:/kairo" || o.Source.Month != "202611" ||
+		o.Source.Addr != "10.0.0.1:7475" || !strings.HasPrefix(o.Source.Token, "kairo_pack_") {
+		t.Fatalf("replica source %+v", o)
+	}
+	if _, err = store.AuthorizePackRead(ctx, "remote", "obj_x", o.Source.Token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("read on the replica's own node: %v", err)
+	}
+	read, err := store.AuthorizePackRead(ctx, "node", "obj_x", o.Source.Token)
+	if err != nil || read.StoreID != "e-durable" || read.Root != "E:/kairo" || read.Month != "202611" {
+		t.Fatalf("read of the durable copy: %+v %v", read, err)
 	}
 }

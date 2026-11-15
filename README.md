@@ -1304,15 +1304,19 @@ files through handles): such an object stays `packing`, warned once.
 (`pack_bytes`, `packs`); until they are moved they are Kairo's bytes there.
 
 Copies to a durable store: each packed object is copied to the first durable
-store by id, not inside a WSL distro nor being moved, with room for it (its
-free bytes as last reported, less its `reserve_free_bytes` and the packs of
-the copies being made there; one never reported is taken as having room),
-then to every other durable store as a replica, so losing one store (a disk
-deleted or failed) loses nothing Kairo keeps: once an object has a verified
-copy, each other durable store an executor serves that has none of it takes
-one as it has room, smallest objects first, up to 50 at a time, read from a
-durable copy on that executor's node (its pack may be gone; an object whose
-copies are all on other nodes is not replicated there). An object nowhere
+store by id on the node its pack is on, else the first by id elsewhere (read
+through the pack's agent), not inside a WSL distro nor being moved, with room
+for it (its free bytes as last reported, less its `reserve_free_bytes` and
+the packs of the copies being made there; one never reported is taken as
+having room), then to every other durable store as a replica, so losing one
+store (a disk deleted or failed), or a whole host, loses nothing Kairo
+keeps: once an object has a verified copy, each other durable store an
+executor serves that has none of it takes one as it has room, smallest
+objects first, up to 50 at a time, read from a durable copy on that
+executor's node (its pack may be gone), else from one on another node
+through the pack server of the agent that made that copy (its `pack_addr`;
+the token, for that copy, is good only on that copy's node:
+`object_copies.source_*`). An object nowhere
 durable yet always goes before any replica, and the executor asks again after
 each copy, so none waits behind a long one. Each copy is taken by one
 executor serving its store, never a WSL executor (`copies-to-make` every
@@ -2572,8 +2576,8 @@ The control plane is data like any other, so Kairo keeps it the same way.
 Every `control_snapshot_minutes` (daemon configuration; default 60, a
 negative value never) the daemon declares a task of project `kairo`, queue
 `control-snapshot`, named `snapshot-<UTC slot>` (`snapshot-20261116T0100Z`):
-`kairo control snapshot`, run with the `kairo_binary` that the node of the
-first durable store reports (`[bench]`), on an executor of its
+`kairo control snapshot`, run with the `kairo_binary` (`[bench]`) of the node
+of the first durable store whose node reports one, on an executor of its
 `executor_labels`. Nothing runs while no durable store is declared or its
 node reports no kairo. Its priority is above everything and it reserves no
 CPU, RAM or GPU (the daemon dumps; the task only writes what it is sent), so

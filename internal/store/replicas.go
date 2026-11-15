@@ -16,7 +16,10 @@ import (
 // objects first, a few at a time (replicaBatch); an object nowhere durable
 // yet is always copied before any replica (CopiesToMake). A replica is read
 // from a durable copy on the node of the executor making it (the pack may be
-// gone by then); one whose copies are all on other nodes is not ordered here.
+// gone by then), else from one on another node, through the pack server of
+// the agent that made that copy (pack_addr), with a token for that copy
+// (object_copies.source_*): so every durable store, on whatever node, holds
+// every durable object.
 
 // replicaBatch bounds the replicas one CopiesToMake orders.
 const replicaBatch = 50
@@ -46,7 +49,8 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 	err := eachRow(ctx, tx, `SELECT d.id,d.created_at,COALESCE(d.project_scope_id,''),COALESCE(d.pack_bytes,0),
 		COALESCE((SELECT string_agg(c.store_id,',') FROM object_copies c WHERE c.object_id=d.id),'')
 		FROM data_objects d WHERE d.state='packed' AND d.lifecycle='durable'
-		AND EXISTS(SELECT 1 FROM object_copies v WHERE v.object_id=d.id AND v.state='verified' AND v.store_id=ANY($1::text[]))
+		AND EXISTS(SELECT 1 FROM object_copies v JOIN executors x ON x.id=v.executor_id WHERE v.object_id=d.id AND v.state='verified' AND v.check_problem IS NULL
+			AND (v.store_id=ANY($1::text[]) OR COALESCE(x.attributes_json::jsonb->>'pack_addr','')<>''))
 		AND (SELECT COUNT(*) FROM object_copies c WHERE c.object_id=d.id AND c.store_id=ANY($1::text[]))<$2
 		ORDER BY d.pack_bytes,d.id LIMIT 2000`, []any{servedIDs, len(served)}, func(rows *sql.Rows) error {
 		var c candidate
@@ -96,6 +100,30 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 		}
 	}
 	return nil
+}
+
+// remoteCopyTx is a verified copy of objectID on a durable store as declared
+// that executor me does not serve, made by an executor whose node's pack
+// server serves it (its pack_addr): where a replica is read when no copy is
+// on me's node.
+func remoteCopyTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID, objectID string, byID map[string]machine.Store) (CopySource, string, bool, error) {
+	var src CopySource
+	var node string
+	found := false
+	err := eachRow(ctx, tx, `SELECT c.store_id,c.root,c.month,x.node_id,COALESCE(x.attributes_json::jsonb->>'pack_addr','') FROM object_copies c JOIN executors x ON x.id=c.executor_id
+		WHERE c.object_id=$1 AND c.state='verified' AND c.check_problem IS NULL ORDER BY c.store_id`, []any{objectID}, func(rows *sql.Rows) error {
+		var storeID, root, month, nodeID, addr string
+		if err := rows.Scan(&storeID, &root, &month, &nodeID, &addr); err != nil {
+			return err
+		}
+		d, ok := byID[storeID]
+		if found || addr == "" || !ok || d.Class != machine.StoreDurable || d.Root != root || d.MovedFrom != "" || d.Node != nodeID || me.serves(d, executorID) {
+			return nil
+		}
+		src, node, found = CopySource{StoreID: storeID, Root: root, Month: month, Addr: addr}, nodeID, true
+		return nil
+	})
+	return src, node, found, err
 }
 
 // localCopiesTx is, for each object executor me is copying, a verified copy
