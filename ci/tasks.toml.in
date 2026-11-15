@@ -57,8 +57,8 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-windows"
 [tasks.execution]
-argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d /d/kairo-ci/run/@SHA@-windows.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /d/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh windows"]
-cwd = "D:/kairo-ci"
+argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d @CI_WINDOWS_ROOT@/run/@SHA@-windows.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf @CI_WINDOWS_ROOT@/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh windows"]
+cwd = "@CI_WINDOWS_DIR@"
 [tasks.execution.executor]
 labels = { environment = "windows" }
 [tasks.execution.capacity]
@@ -69,8 +69,8 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-wsl"
 [tasks.execution]
-argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d /d/kairo-ci/run/@SHA@-wsl.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /d/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh wsl"]
-cwd = "D:/kairo-ci"
+argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d @CI_WINDOWS_ROOT@/run/@SHA@-wsl.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf @CI_WINDOWS_ROOT@/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh wsl"]
+cwd = "@CI_WINDOWS_DIR@"
 [tasks.execution.executor]
 labels = { environment = "windows" }
 [tasks.execution.capacity]
@@ -81,8 +81,8 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-sdk-python"
 [tasks.execution]
-argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d /d/kairo-ci/run/@SHA@-sdk-python.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /d/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh sdk-python"]
-cwd = "D:/kairo-ci"
+argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d @CI_WINDOWS_ROOT@/run/@SHA@-sdk-python.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf @CI_WINDOWS_ROOT@/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh sdk-python"]
+cwd = "@CI_WINDOWS_DIR@"
 [tasks.execution.executor]
 labels = { environment = "windows" }
 [tasks.execution.capacity]
@@ -93,8 +93,8 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-sdk-rust"
 [tasks.execution]
-argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d /d/kairo-ci/run/@SHA@-sdk-rust.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /d/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; CARGO_TARGET_DIR=/d/kairo-ci/cache/cargo-target bash ci/check.sh sdk-rust"]
-cwd = "D:/kairo-ci"
+argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d @CI_WINDOWS_ROOT@/run/@SHA@-sdk-rust.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf @CI_WINDOWS_ROOT@/src/@SHA@.tar -C \"$d\"; cd \"$d\"; CARGO_TARGET_DIR=@CI_WINDOWS_ROOT@/cache/cargo-target bash ci/check.sh sdk-rust"]
+cwd = "@CI_WINDOWS_DIR@"
 [tasks.execution.executor]
 labels = { environment = "windows" }
 [tasks.execution.capacity]

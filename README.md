@@ -2468,9 +2468,9 @@ any work. The script copies the commit's tree (`git archive`) to each node the
 checks run on, as `local/ci-site.env` says:
 
 ```sh
-CI_WINDOWS_ROOT=/d/kairo-ci          # where windows-local's checks unpack
-CI_PVE1_HOST=root@192.168.1.252      # the Proxmox host of pve1-work
-CI_PVE1_VMID=116                     # pve1-work's container
+CI_WINDOWS_ROOT=/d/Dev/Kairo/local/ci-windows  # where windows-local's checks unpack
+CI_PVE1_HOST=root@192.168.1.252                # the Proxmox host of pve1-work
+CI_PVE1_VMID=116                               # pve1-work's container
 ```
 
 Each Task unpacks that tree into a fresh directory, runs `ci/check.sh CHECK`

@@ -20,7 +20,7 @@ done
 main=$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")
 site=${KAIRO_CI_SITE:-$main/local/ci-site.env}
 [ -f "$site" ] || { echo "$site is missing (see README, CI on Kairo)" >&2; exit 2; }
-# CI_WINDOWS_ROOT: where windows-local's checks unpack (/d/kairo-ci); CI_PVE1_HOST: the Proxmox host of pve1-work
+# CI_WINDOWS_ROOT: where windows-local's checks unpack (a POSIX path, /d/...); CI_PVE1_HOST: the Proxmox host of pve1-work
 # (root@...); CI_PVE1_VMID: pve1-work's container.
 . "$site"
 sha=$(git rev-parse --short=12 "$rev^{commit}")
@@ -39,7 +39,7 @@ scp -q -o BatchMode=yes "$tar" "$CI_PVE1_HOST:/tmp/kairo-ci-$sha.tar"
 ssh -o BatchMode=yes "$CI_PVE1_HOST" "pct push $CI_PVE1_VMID /tmp/kairo-ci-$sha.tar /srv/kairo-ci/src/$sha.tar --perms 644 && rm /tmp/kairo-ci-$sha.tar"
 
 manifest=$work/kairo-ci-$sha.toml
-sed "s/@SHA@/$sha/g" ci/tasks.toml.in > "$manifest"
+sed -e "s/@SHA@/$sha/g" -e "s|@CI_WINDOWS_ROOT@|$CI_WINDOWS_ROOT|g" -e "s|@CI_WINDOWS_DIR@|$(cygpath -m "$CI_WINDOWS_ROOT")|g" ci/tasks.toml.in > "$manifest"
 kairo project apply "$manifest"
 if [ -z "$wait" ]; then
   echo "declared; follow with: kairo task list kairo-ci | grep $sha"
