@@ -56,6 +56,9 @@ type PackOrder struct {
 	Transfer       bool   `json:"transfer,omitempty"`
 	Drop           bool   `json:"drop,omitempty"`
 	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	// Since: a run snapshot (runsnapshots.go) holds the files of its run's
+	// output directory changed after this time (RFC 3339; "" every file).
+	Since string `json:"since,omitempty"`
 }
 
 // PackMade is a pack an executor made for an object: where (the pack and its
@@ -212,17 +215,21 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 			return nil, err
 		}
 	}
+	// Snapshots of the runs still going (runsnapshots.go).
+	if err = s.orderRunSnapshotsTx(ctx, tx, declared, executorID); err != nil {
+		return nil, err
+	}
 	// Every order still to be packed, while the declaration still makes its
 	// directory Kairo's on a volatile store (one changed since waits).
 	out := []PackOrder{}
 	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,x.node_id,
 		CASE WHEN d.kind='output' THEN (SELECT o.bytes FROM run_outputs o WHERE o.run_id=d.source_id AND o.store_id=d.store_id)
-		ELSE (SELECT k.bytes FROM attempt_scratch k WHERE k.attempt_id=d.source_id) END,d.lifecycle
+		ELSE (SELECT k.bytes FROM attempt_scratch k WHERE k.attempt_id=d.source_id) END,d.lifecycle,COALESCE(d.snapshot_since,'')
 		FROM data_objects d JOIN executors x ON x.id=d.executor_id WHERE d.executor_id=$1 AND d.state='packing' ORDER BY d.created_at,d.id`, []any{executorID}, func(rows *sql.Rows) error {
 		var o PackOrder
 		var nodeID, lifecycle string
 		var bytes sql.NullInt64
-		if err := rows.Scan(&o.ObjectID, &o.Kind, &o.SourceID, &o.StoreID, &o.Root, &o.Path, &nodeID, &bytes, &lifecycle); err != nil {
+		if err := rows.Scan(&o.ObjectID, &o.Kind, &o.SourceID, &o.StoreID, &o.Root, &o.Path, &nodeID, &bytes, &lifecycle, &o.Since); err != nil {
 			return err
 		}
 		o.Identity = lifecycle == LifecycleTemporal

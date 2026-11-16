@@ -109,7 +109,16 @@ func (localStoreFS) Identify(ctx context.Context, root string, kind dirKind, id,
 	return packKind(ctx, root, kind, id, objectID, true)
 }
 
+// PackSince: see storeFS.
+func (localStoreFS) PackSince(ctx context.Context, root string, kind dirKind, id, objectID string, since time.Time) (packResult, error) {
+	return packKindOpts(ctx, root, kind, id, objectID, false, packOpts{marker: kind.marker, live: true, since: since})
+}
+
 func packKind(ctx context.Context, root string, kind dirKind, id, objectID string, identity bool) (packResult, error) {
+	return packKindOpts(ctx, root, kind, id, objectID, identity, packOpts{marker: kind.marker})
+}
+
+func packKindOpts(ctx context.Context, root string, kind dirKind, id, objectID string, identity bool, opts packOpts) (packResult, error) {
 	var res packResult
 	if !validScratchID(id) || !validScratchID(objectID) {
 		return res, fmt.Errorf("%w: id %q, object %q", errOutsideRoot, id, objectID)
@@ -138,7 +147,7 @@ func packKind(ctx context.Context, root string, kind dirKind, id, objectID strin
 	if err != nil {
 		return res, err
 	}
-	return packInto(ctx, r, root, sr, src, mounts, packOpts{marker: kind.marker}, objectID, identity)
+	return packInto(ctx, r, root, sr, src, mounts, opts, objectID, identity)
 }
 
 // PackDir packs an imported directory dir (store.ImportData: outside every
@@ -230,6 +239,9 @@ func openFileParent(p string) (*os.Root, string, bool, error) {
 type packOpts struct {
 	marker, only string
 	live         bool
+	// since: only regular files changed after it (a run snapshot); zero,
+	// every file
+	since time.Time
 }
 
 // packInto packs src (opened as sr; opts) into the packs directory of the
@@ -289,6 +301,10 @@ func (wslStoreFS) Pack(context.Context, string, dirKind, string, string) (packRe
 }
 
 func (wslStoreFS) PackDir(context.Context, string, string, string) (packResult, error) {
+	return packResult{}, errPackNotHere
+}
+
+func (wslStoreFS) PackSince(context.Context, string, dirKind, string, string, time.Time) (packResult, error) {
 	return packResult{}, errPackNotHere
 }
 
@@ -383,6 +399,9 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 				}
 				subdirs = append(subdirs, rel)
 			case info.Mode().IsRegular():
+				if !opts.since.IsZero() && !info.ModTime().After(opts.since) {
+					continue // unchanged since the run's previous snapshot
+				}
 				var line string
 				var size int64
 				var err error
@@ -670,6 +689,10 @@ func (e *Local) packDue(ctx context.Context) {
 			e.packImport(ctx, o, s, ok)
 			continue
 		}
+		if o.Kind == store.ObjectRunSnapshot {
+			e.packRunSnapshot(ctx, o, s, ok)
+			continue
+		}
 		kind, known := kindOf(o.Kind)
 		switch {
 		case !known:
@@ -769,6 +792,36 @@ func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore
 	e.packProblem(o.ObjectID, "", nil)
 	e.Logger.Info("packed", "object_id", o.ObjectID, "kind", o.Kind, "path", o.Path, "files", res.files,
 		"content_bytes", res.contentBytes, "pack_bytes", res.packBytes, "skipped", res.skipped, "changing", res.changing, "seconds", time.Since(started).Seconds())
+}
+
+// packRunSnapshot packs the files of a running run's output directory
+// changed since its previous snapshot (store/runsnapshots.go): while the run
+// writes there, files still being written are packed from copies.
+func (e *Local) packRunSnapshot(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
+	if !served || !s.usable || s.decl.Root != o.Root || !e.due(&e.packs, o.ObjectID) {
+		return
+	}
+	var since time.Time
+	if o.Since != "" {
+		t, err := time.Parse(time.RFC3339Nano, o.Since)
+		if err != nil {
+			e.packProblem(o.ObjectID, "run snapshot not packed", err)
+			return
+		}
+		since = t
+	}
+	started := time.Now()
+	res, err := s.fs.PackSince(ctx, s.decl.Root, kindOutput, store.RunOfSnapshot(o.SourceID), o.ObjectID, since)
+	if err == nil {
+		err = e.Store.RecordPack(ctx, packMade(e.ID, o, res))
+	}
+	if err != nil {
+		e.packProblem(o.ObjectID, "run snapshot not packed", err)
+		return
+	}
+	e.packProblem(o.ObjectID, "", nil)
+	e.Logger.Info("run snapshot packed", "object_id", o.ObjectID, "source_id", o.SourceID, "files", res.files, "content_bytes", res.contentBytes,
+		"pack_bytes", res.packBytes, "changing", res.changing, "seconds", time.Since(started).Seconds())
 }
 
 // packMade is what is recorded of a pack (or an identity, o.Identity) made

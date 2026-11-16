@@ -58,6 +58,8 @@ func sourceOwnership(declared []machine.Store, kind, nodeID, storeID, root, path
 		return scratchOwnership(declared, nodeID, storeID, root, path, sourceID)
 	case ObjectImport:
 		return importOwnership(declared, nodeID, storeID, root, path)
+	case ObjectRunSnapshot:
+		return outputOwnership(declared, nodeID, storeID, root, path, RunOfSnapshot(sourceID))
 	}
 	return outputOwnership(declared, nodeID, storeID, root, path, sourceID)
 }
@@ -194,6 +196,9 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 		}
 		if kind == ObjectImport && !deleteSource {
 			return fmt.Errorf("%w: object %s was imported without delete_source: its directory is not to be deleted", ErrStaleEpoch, settled.ObjectID)
+		}
+		if kind == ObjectRunSnapshot {
+			return fmt.Errorf("%w: object %s is a run snapshot: its run's output directory is not to be deleted", ErrStaleEpoch, settled.ObjectID)
 		}
 		if why := sourceOwnership(declared, kind, nodeID, storeID, root, path, sourceID); why != "" {
 			return fmt.Errorf("%w: object %s's source is not deleted: %s", ErrStaleEpoch, settled.ObjectID, why)

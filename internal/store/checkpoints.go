@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"kairo/internal/id"
+	"kairo/internal/machine"
 )
 
 // Checkpoints of running work (README: Checkpoints of running work). A run
@@ -51,6 +52,17 @@ func (s *Store) ProtectCheckpoint(ctx context.Context, attemptID, ref string) (s
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
+	}
+	// one inside a store (the run's output directory) is kept by the run's
+	// snapshots (runsnapshots.go), ordered once it is published
+	declared, err := declaredStores(ctx, s.db)
+	if err != nil {
+		return "", err
+	}
+	for _, d := range declared {
+		if d.Node == node && machine.PathUnder(ref, d.Root) {
+			return "", nil
+		}
 	}
 	objects, err := s.ImportData(ctx, ImportRequest{Project: project, Node: node, Paths: []string{ref}, Name: checkpointName(task, ref)})
 	if err != nil {

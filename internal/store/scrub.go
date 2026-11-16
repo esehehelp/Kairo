@@ -29,6 +29,9 @@ type DataPolicy struct {
 	// (Launch.Confine), whether its execution asked or not. Zero: only those
 	// that ask.
 	ConfineFrom time.Time
+	// RunSnapshotInterval: how often a running run's output directory is
+	// snapshotted, and after each checkpoint (runsnapshots.go); zero, never.
+	RunSnapshotInterval time.Duration
 }
 
 // confinesAll reports whether every launch at t is confined.

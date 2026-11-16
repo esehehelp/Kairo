@@ -155,7 +155,7 @@ func (s *Store) AdoptCopies(ctx context.Context, executorID, storeID, root strin
 			return 0, fmt.Errorf("object %s: description format %q, not %q", d.ObjectID, d.Format, DescriptionFormat)
 		case !machine.ScratchIDValid(d.ObjectID) || !machine.ValidMonth(c.Month):
 			return 0, fmt.Errorf("object %q in month %q is not an object's copy", d.ObjectID, c.Month)
-		case d.Kind != ObjectOutput && d.Kind != ObjectScratch && d.Kind != ObjectImport:
+		case d.Kind != ObjectOutput && d.Kind != ObjectScratch && d.Kind != ObjectImport && d.Kind != ObjectRunSnapshot:
 			return 0, fmt.Errorf("object %s: unknown kind %q", d.ObjectID, d.Kind)
 		case d.Lifecycle != LifecycleDurable:
 			return 0, fmt.Errorf("object %s is %s: only durable objects are on durable stores", d.ObjectID, d.Lifecycle)

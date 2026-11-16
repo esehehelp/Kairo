@@ -209,6 +209,22 @@ type Data struct {
 	// long is asked for one, which is then kept like any data (README:
 	// Checkpoints of running work).
 	CheckpointInterval string `toml:"checkpoint_interval"`
+	// RunSnapshotInterval (a Go duration; default "30m", "0" never): how
+	// often a running run's output directory is snapshotted, and after each
+	// checkpoint it publishes (README: Data stores, run snapshots).
+	RunSnapshotInterval string `toml:"run_snapshot_interval"`
+}
+
+// RunSnapshotEvery is RunSnapshotInterval parsed (0: never).
+func (d Data) RunSnapshotEvery() (time.Duration, error) {
+	if d.RunSnapshotInterval == "" {
+		return 30 * time.Minute, nil
+	}
+	every, err := time.ParseDuration(d.RunSnapshotInterval)
+	if err != nil || every < 0 {
+		return 0, fmt.Errorf("data.run_snapshot_interval %q is not a duration such as \"30m\" (\"0\": never)", d.RunSnapshotInterval)
+	}
+	return every, nil
 }
 
 // CheckpointEvery is CheckpointInterval parsed (0: never).
@@ -288,6 +304,9 @@ func Load(path string) (Config, error) {
 		return c, err
 	}
 	if _, err := c.Data.CheckpointEvery(); err != nil {
+		return c, err
+	}
+	if _, err := c.Data.RunSnapshotEvery(); err != nil {
 		return c, err
 	}
 	if c.Data.ScrubBytesPerDay < 0 {

@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"time"
 )
 
 // A store's root belongs to Kairo. Under it an attempt's scratch is
@@ -114,6 +115,10 @@ type storeFS interface {
 	// list alone (pack.go).
 	Identify(ctx context.Context, root string, kind dirKind, id, objectID string) (packResult, error)
 	IdentifyDir(ctx context.Context, root, dir, objectID string) (packResult, error)
+	// PackSince packs the files of the directory of id of kind changed after
+	// since (every file when zero), as files still being written are
+	// (packLiveFile): a running run's snapshot (store/runsnapshots.go).
+	PackSince(ctx context.Context, root string, kind dirKind, id, objectID string, since time.Time) (packResult, error)
 	// Size is the bytes of the regular files under dir (links not followed,
 	// mount points not entered); 0 for a directory that is gone.
 	Size(ctx context.Context, dir string) (int64, error)

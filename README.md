@@ -1547,6 +1547,29 @@ by default) shows each object: kind, project, name, node, `packing`,
 the path of one), and what became of its source (`present`, `deleting`,
 `deleted`, `kept`, `evicting`, `evicted`, with why).
 
+#### Run snapshots
+
+Whatever a run Kairo launched writes is Kairo's to keep from the moment it is
+written, not only once the run has ended (with `[data] confine_from` every
+attempt writes only where Kairo hands it: Admission, Confinement). While a
+run has not ended, its output directory is packed again and again, each time
+only the files changed since the run's previous snapshot (the first, every
+file): a data object of kind `run-snapshot`, source `<run id>~<n>`
+(`data_objects.snapshot_since`), packed by its executor (files written
+within the last hour from copies, as an import's are), copied to the
+durable stores and replicated like any object. One is ordered every
+`[data] run_snapshot_interval` (daemon configuration, a Go duration;
+default `"30m"`, `"0"` never) while its latest attempt runs, and as soon as
+that attempt publishes a checkpoint (a checkpoint command or a suspend
+acknowledged `checkpointed`) after the previous snapshot; one at a time per
+run (event `pack_ordered` with `reason` `periodic` or `checkpoint`). The
+directory itself stays the run's: a snapshot never deletes it (once copied
+only its pack goes, the source settled `kept`), and the run's output object
+is packed whole when the run ends. A checkpoint published as a path inside a
+store (the run's output directory) is kept by these snapshots rather than
+imported. Restoring a run's output as of a snapshot is unpacking its
+snapshots in order (a file deleted meanwhile is still in the earlier ones).
+
 #### Checkpoints of running work
 
 A run's output directory is kept once the run has ended; the work of a run

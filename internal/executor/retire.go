@@ -155,8 +155,12 @@ func (e *Local) deleteDue(ctx context.Context) {
 	}
 	for _, o := range orders {
 		s, ok := served[o.StoreID]
-		if o.Kind == store.ObjectImport {
+		if o.Kind == store.ObjectImport || o.Kind == store.ObjectRunSnapshot {
+			// a run snapshot's directory is the run's: only its pack goes
 			if ok && s.usable && s.decl.Root == o.Root && e.due(&e.deletions, o.ObjectID) {
+				if o.Kind == store.ObjectRunSnapshot {
+					o.DeleteSource = false
+				}
 				e.retireImport(ctx, o, s)
 			}
 			continue
