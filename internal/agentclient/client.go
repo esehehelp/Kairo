@@ -226,6 +226,11 @@ func (c *Client) ClaimShed(ctx context.Context, executorID, objectID, storeID st
 	return c.call(ctx, "claim-shed", map[string]string{"executor_id": executorID, "object_id": objectID, "store_id": storeID}, nil)
 }
 
+// InputGone reports an input whose path is not there at launch.
+func (c *Client) InputGone(ctx context.Context, executorID, objectID, path string) error {
+	return c.call(ctx, "input-gone", map[string]string{"executor_id": executorID, "object_id": objectID, "path": path}, nil)
+}
+
 // RecordCopy records a copy this executor wrote and read back.
 func (c *Client) RecordCopy(ctx context.Context, made store.CopyMade) error {
 	return c.call(ctx, "record-copy", map[string]any{"made": made}, nil)

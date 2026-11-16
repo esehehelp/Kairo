@@ -85,6 +85,12 @@ type agentAbandonPackRequest struct {
 	Reason     string `json:"reason"`
 }
 
+type agentInputGoneRequest struct {
+	ExecutorID string `json:"executor_id"`
+	ObjectID   string `json:"object_id"`
+	Path       string `json:"path"`
+}
+
 type agentInventoryRequest struct {
 	Listing store.DurableListing `json:"listing"`
 }
@@ -355,6 +361,13 @@ func (s *Server) agentOps() []agentOp {
 			},
 			func(ctx context.Context, b agentAbandonPackRequest) (any, error) {
 				return okBody, s.Store.AbandonPack(ctx, b.ExecutorID, b.ObjectID, b.Reason)
+			}),
+		newAgentOp(s, "input-gone", observeRefused, nil,
+			func(ctx context.Context, b agentInputGoneRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentInputGoneRequest) (any, error) {
+				return okBody, s.Store.InputGone(ctx, b.ExecutorID, b.ObjectID, b.Path)
 			}),
 		newAgentOp(s, "claim-shed", observeRefused, nil,
 			func(ctx context.Context, b agentDescribedRequest) (string, error) {

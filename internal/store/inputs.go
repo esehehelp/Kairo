@@ -42,6 +42,9 @@ type LaunchInput struct {
 	Name    string `json:"name"`
 	Path    string `json:"path,omitempty"`
 	Problem string `json:"problem,omitempty"`
+	// Object: the data object read at Path (InputGone, when Path is not
+	// there).
+	Object string `json:"object,omitempty"`
 }
 
 // inputPlace is where an input can be read: on node, at path; a run's
@@ -283,7 +286,10 @@ func resolveInputsTx(ctx context.Context, q *sql.Tx, executionID, projectScopeID
 		}
 		for _, p := range src.places {
 			if p.node == me.nodeID && sameNamespace(ctx, q, declared, p, me, executorID) {
-				li.Path = p.path
+				li.Path, li.Object = p.path, p.object
+				if li.Object == "" {
+					li.Object = src.objectID
+				}
 				if p.object != "" {
 					read = append(read, p.object)
 				}

@@ -305,3 +305,39 @@ func TestADurableStoresIntakeCanBeImported(t *testing.T) {
 		}
 	}
 }
+
+// An imported source found gone at launch is settled deleted, so its input is
+// brought from a durable copy instead of read where it was; another path
+// changes nothing.
+func TestAnImportedSourceFoundGoneIsNoLongerReadInPlace(t *testing.T) {
+	store := importFixture(t)
+	ctx := context.Background()
+	imported, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"D:/data/gone"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectID := imported[0].ObjectID
+	if err = store.InputGone(ctx, "win-exec", objectID, "D:/data/elsewhere"); err != nil {
+		t.Fatal(err)
+	}
+	state := func() string {
+		t.Helper()
+		var s string
+		if err := store.db.QueryRowContext(ctx, `SELECT source_state FROM data_objects WHERE id=$1`, objectID).Scan(&s); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	if got := state(); got != "present" {
+		t.Fatalf("another path changed the source: %s", got)
+	}
+	if err = store.InputGone(ctx, "win-exec", objectID, `D:\data\gone`); err != nil {
+		t.Fatal(err)
+	}
+	if got := state(); got != "deleted" {
+		t.Fatalf("a source found gone is %s", got)
+	}
+	if err = store.InputGone(ctx, "win-exec", objectID, "D:/data/gone"); err != nil {
+		t.Fatalf("reported again: %v", err)
+	}
+}

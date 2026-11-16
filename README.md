@@ -1601,6 +1601,14 @@ its own, and one serving a model may stop its server and name that by a URI,
 which keeps nothing. An attempt that does not take checkpoint commands
 leaves it pending, and is asked nothing more meanwhile.
 
+An input read in place whose path is not there when its attempt is to start
+(deleted from outside Kairo: its volume is there, the path is not) aborts
+that launch, and the executor reports it (`input-gone`, event
+`input_gone`): an imported source is settled `deleted` ("gone from its
+path"), a run's output directory `missing`, a brought copy forgotten. The
+record no longer offers that place, so a rerun waits for the object to be
+brought from a durable copy (below).
+
 Brought inputs: an input not on the node an execution waits on is brought
 there once it is a packed object (a fetch, ordered as the daemon reconciles
 tasks, for each input an execution waiting on a node lacks there; or by

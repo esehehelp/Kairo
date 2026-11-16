@@ -784,6 +784,16 @@ func (e *Local) checkInputs(launch *store.Launch) error {
 		}
 		r, err := openDirPath(in.Path, false)
 		if err != nil {
+			if errors.Is(sourceGone(in.Path, err), errSourceGone) && in.Object != "" {
+				// deleted from outside Kairo: the record is put right, so the
+				// next plan brings it from a durable copy (store.InputGone)
+				ctx, cancel := context.WithTimeout(context.Background(), scratchCallTimeout)
+				if gerr := e.Store.InputGone(ctx, e.ID, in.Object, in.Path); gerr != nil {
+					e.Logger.Warn("input gone, not recorded", "object_id", in.Object, "path", in.Path, "error", gerr)
+				}
+				cancel()
+				return fmt.Errorf("input %s (%s) is gone from there; rerun to have it brought from a durable copy: %w", in.Name, in.Path, err)
+			}
 			return fmt.Errorf("input %s (%s): %w", in.Name, in.Path, err)
 		}
 		r.Close()
