@@ -16,9 +16,10 @@ import (
 // (inputs.go): its data object is fetched from a verified copy on a durable
 // store (or, while it is still there, from the pack where it was made) and
 // unpacked under <root>/inputs/<object id> on a volatile store of the node
-// (the first by id an executor of the node that is not a WSL one serves with
-// room for what it holds, else the first by id; a fetch still waiting for room
-// on its store moves to one with room: fetchRoomTx), by that executor, which checks the pack against its size and sha256 and each
+// (of those an executor of the node that is not a WSL one serves, the one
+// with the most room for what it holds, the first by id among equals; a fetch
+// still waiting for room on its store moves to the one with the most room:
+// fetchRoomTx), by that executor, which checks the pack against its size and sha256 and each
 // file against the pack's file list (object_placements: fetching, then
 // ready). A fetch is ordered for each input an execution waiting on a node
 // lacks there (orderInputFetches), or by kairo data fetch. What is brought
@@ -113,8 +114,13 @@ func placementStoreTx(ctx context.Context, q queryer, declared []machine.Store, 
 	return stores[0].store, stores[0].executor, true, nil
 }
 
-// placementStoreWithRoomTx is the first store of placementStoresTx with room
-// for bytes (fetchRoomTx), else the first.
+// placementStoreWithRoomTx is the store of placementStoresTx with the most
+// room (fetchRoomTx), the first by id among equals: the volatile stores of a
+// node are one pool, none preferred for its id (user 2026-11-16: 「Volatileに
+// node以外の区別はしない方が正しい」; bringing to the first by id with room
+// filled a system drive that sorts first). bytes is what it unpacks: a store
+// with room for it is taken before one without, which is taken only when
+// none has room.
 func placementStoreWithRoomTx(ctx context.Context, q queryer, declared []machine.Store, nodeID, objectID string, bytes int64) (machine.Store, string, bool, error) {
 	stores, err := placementStoresTx(ctx, q, declared, nodeID)
 	if err != nil || len(stores) == 0 {
@@ -128,12 +134,13 @@ func placementStoreWithRoomTx(ctx context.Context, q queryer, declared []machine
 	if err != nil {
 		return machine.Store{}, "", false, err
 	}
-	for _, s := range stores {
-		if room[s.store.ID] >= bytes {
-			return s.store, s.executor, true, nil
+	best := stores[0]
+	for _, s := range stores[1:] {
+		if room[s.store.ID] > room[best.store.ID] {
+			best = s
 		}
 	}
-	return stores[0].store, stores[0].executor, true, nil
+	return best.store, best.executor, true, nil
 }
 
 type placementStore struct {
@@ -181,8 +188,9 @@ func placementStoresTx(ctx context.Context, q queryer, declared []machine.Store,
 }
 
 // moveWaitingFetchesTx moves each fetch executorID is to make whose store
-// has no room for what it unpacks (fetchRoomTx) to the first other volatile
-// store of the node it serves that has (event fetch_moved): a fetch waiting
+// has no room for what it unpacks (fetchRoomTx) to the other volatile store
+// of the node it serves with the most room, if one has room for it (event
+// fetch_moved): a fetch waiting
 // for room it will not get would keep its execution waiting for good. Only
 // a fetch ordered fetchMoveAfter ago or more is moved: the agent checks the
 // room before it writes anything, but the daemon cannot tell a fetch it
@@ -224,10 +232,17 @@ func moveWaitingFetchesTx(ctx context.Context, tx *sql.Tx, me executorInfo, exec
 		if _, declaredHere := byID[w.storeID]; declaredHere && room[w.storeID] >= w.bytes {
 			continue
 		}
+		// the other store with the most room for it (one pool: placementStoreWithRoomTx)
+		var to []machine.Store
 		for _, s := range mine {
 			if s.ID == w.storeID || room[s.ID] < w.bytes {
 				continue
 			}
+			if len(to) == 0 || room[s.ID] > room[to[0].ID] {
+				to = []machine.Store{s}
+			}
+		}
+		for _, s := range to {
 			t := now()
 			result, err := tx.ExecContext(ctx, `UPDATE object_placements SET store_id=$1,root=$2,path=$3,token_hash=NULL,token_expires_at=NULL,updated_at=$4
 				WHERE object_id=$5 AND store_id=$6 AND executor_id=$7 AND state='fetching'

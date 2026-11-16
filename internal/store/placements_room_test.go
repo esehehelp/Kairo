@@ -9,9 +9,10 @@ import (
 	"kairo/internal/machine"
 )
 
-// An object is brought to the first volatile store of the node with room for
-// what it unpacks; a fetch long waiting on a store without room moves to one
-// with room (event fetch_moved), and is ordered there.
+// An object is brought to the volatile store of the node with the most room
+// for what it unpacks (the first by id among equals); a fetch long waiting on
+// a store without room moves to one with room (event fetch_moved), and is
+// ordered there.
 func TestAFetchGoesWhereThereIsRoom(t *testing.T) {
 	store := importFixture(t)
 	ctx := context.Background()
@@ -114,6 +115,31 @@ func TestAFetchGoesWhereThereIsRoom(t *testing.T) {
 	var events int
 	if err = store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM coordination_events WHERE event_type='fetch_moved' AND aggregate_id=$1`, first).Scan(&events); err != nil || events != 1 {
 		t.Fatalf("fetch_moved events %d %v", events, err)
+	}
+	// both with room: the one with the most, whatever its id (the volatile stores of a node are one pool)
+	report := func(storeID, root string, gib int64) {
+		t.Helper()
+		free := gib << 30
+		if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: storeID, ExecutorID: "exec2", Root: root, Usable: true, FreeBytes: &free, TotalBytes: &free}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	report("a-small", "/srv/kairo-store", 3)
+	report("b-big", "/big/kairo-store", 5)
+	third := packed("D:/data/third", "third")
+	if _, err := store.FetchData(ctx, FetchRequest{Project: "imp", Node: "node2", Objects: []string{third}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := storeOf(third); got != "b-big" {
+		t.Fatalf("a fetch went to %s, not the store with the most room", got)
+	}
+	report("a-small", "/srv/kairo-store", 9)
+	fourth := packed("D:/data/fourth", "fourth")
+	if _, err := store.FetchData(ctx, FetchRequest{Project: "imp", Node: "node2", Objects: []string{fourth}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := storeOf(fourth); got != "a-small" {
+		t.Fatalf("a fetch went to %s, not the store with the most room", got)
 	}
 }
 

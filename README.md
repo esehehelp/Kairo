@@ -1618,12 +1618,14 @@ there once it is a packed object (a fetch, ordered as the daemon reconciles
 tasks, for each input an execution waiting on a node lacks there; or by
 `kairo data fetch --project P --node N [--data NAME]... [OBJECT...]`,
 `POST /api/data/fetches`, `{"project", "node", "data", "objects"}`). It is
-brought to the node's first volatile store by id that an executor of the
-node that is not a WSL one serves with room for what it unpacks (its free
-bytes as last reported, less its `reserve_free_bytes`, at least 1 GiB, and
-what the fetches there will unpack), else the first, by that executor; a
-fetch not ready an hour after it was ordered, on a store without room for
-it, moves to the first other such store with room (event `fetch_moved`: an
+brought to the volatile store of the node, among those an executor of the
+node that is not a WSL one serves, with the most room for what it unpacks
+(its free bytes as last reported, less its `reserve_free_bytes`, at least
+1 GiB, and what the fetches there will unpack; the first by id among equals),
+by that executor: the volatile stores of a node are one pool, none preferred
+for its id; a fetch not ready an hour after it was ordered, on a store without
+room for it, moves to the other such store with the most room, if one has
+room for it (event `fetch_moved`: an
 execution waiting on an input that never fits would wait for good) (table
 `object_placements`: `fetching`, then `ready` with its bytes; events
 `fetch_ordered`, `fetched`; agent operations `fetches-to-make` every minute,
