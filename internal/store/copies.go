@@ -382,11 +382,7 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 	}
 	out = append(out, describe...)
 	if served {
-		room, err := copyRoomTx(ctx, tx, targets)
-		if err != nil {
-			return nil, err
-		}
-		shed, err := shedOrdersTx(ctx, tx, me, executorID, targets, room, byID)
+		shed, err := shedOrdersTx(ctx, tx, me, executorID, targets, byID)
 		if err != nil {
 			return nil, err
 		}

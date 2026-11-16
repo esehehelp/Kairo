@@ -9,12 +9,13 @@ import (
 	"kairo/internal/machine"
 )
 
-// A durable store below its reserve sheds copies (README: Data stores): its
-// room (copyRoomTx) is below zero when its free bytes fell under its
-// reserve_free_bytes (copies made before the room counted those verified
-// since a report; or the filesystem filling from outside). Its executor is
-// then ordered to remove copies of objects that have at least minOtherCopies
-// verified, undamaged copies on other durable stores as declared, the newest
+// A durable store below its reserve sheds copies (README: Data stores): when
+// its free bytes as last reported, less the copies being made there or
+// verified there since, plus the copies shed there since (a report is minutes
+// old: without these, every round would see the same shortfall again), fall
+// more than shedMinShort under its reserve_free_bytes, its executor is
+// ordered to remove copies of objects that have at least minOtherCopies
+// verified, undamaged copies on other durable stores as declared, the biggest
 // first, until what they hold covers the shortfall, shedBatch at a time; not
 // a copy a replica or a fetch is reading. It claims each (ClaimShed: the
 // record goes, the other copies checked again under the daemon's write lock)
@@ -26,13 +27,46 @@ const (
 	shedBatch      = 50
 )
 
+// shedMinShort: a shortfall this small is left alone (a pack being made on
+// the same filesystem comes and goes).
+var shedMinShort int64 = 1 << 30
+
+// shedShortTx is how far store s is under its reserve, as shedding counts it.
+func shedShortTx(ctx context.Context, tx *sql.Tx, s machine.Store) (int64, error) {
+	var free sql.NullInt64
+	var observed string
+	err := tx.QueryRowContext(ctx, `SELECT free_bytes,observed_at FROM store_observations WHERE store_id=$1 AND usable`, s.ID).Scan(&free, &observed)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && !free.Valid {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var taken, shed int64
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM object_copies c JOIN data_objects d ON d.id=c.object_id
+		WHERE c.store_id=$1 AND (c.state='copying' OR c.state='verified' AND c.verified_at>$2)`, s.ID, observed).Scan(&taken); err != nil {
+		return 0, err
+	}
+	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM coordination_events e JOIN data_objects d ON d.id=e.aggregate_id
+		WHERE e.event_type='copy_shed' AND e.payload_json::jsonb->>'store_id'=$1 AND e.created_at>$2`, s.ID, observed).Scan(&shed); err != nil {
+		return 0, err
+	}
+	return s.ReserveFreeBytes - (free.Int64 - taken + shed), nil
+}
+
 // shedOrdersTx are the copies executor me is to remove from the durable
 // stores it serves that are below their reserve.
-func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets []machine.Store, room map[string]int64, byID map[string]machine.Store) ([]CopyOrder, error) {
+func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets []machine.Store, byID map[string]machine.Store) ([]CopyOrder, error) {
 	var out []CopyOrder
 	for _, s := range targets {
-		short := -room[s.ID]
-		if !me.serves(s, executorID) || room[s.ID] == unknownRoom || short <= 0 {
+		if !me.serves(s, executorID) {
+			continue
+		}
+		short, err := shedShortTx(ctx, tx, s)
+		if err != nil {
+			return nil, err
+		}
+		if short <= shedMinShort {
 			continue
 		}
 		var others []string
@@ -41,12 +75,12 @@ func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID s
 				others = append(others, d.ID)
 			}
 		}
-		err := eachRow(ctx, tx, `SELECT c.object_id,c.month,c.root,COALESCE(d.pack_bytes,0) FROM object_copies c JOIN data_objects d ON d.id=c.object_id
+		err = eachRow(ctx, tx, `SELECT c.object_id,c.month,c.root,COALESCE(d.pack_bytes,0) FROM object_copies c JOIN data_objects d ON d.id=c.object_id
 			WHERE c.store_id=$1 AND c.state='verified'
 			AND (SELECT COUNT(*) FROM object_copies o WHERE o.object_id=c.object_id AND o.store_id=ANY($2::text[]) AND o.state='verified' AND o.check_problem IS NULL)>=$3
 			AND NOT EXISTS(SELECT 1 FROM object_copies r WHERE r.object_id=c.object_id AND r.state='copying' AND (r.source_store_id=c.store_id OR r.source_store_id IS NULL))
 			AND NOT EXISTS(SELECT 1 FROM object_placements p WHERE p.object_id=c.object_id AND p.state='fetching' AND p.source_store_id=c.store_id)
-			ORDER BY c.verified_at DESC,c.object_id LIMIT $4`, []any{s.ID, others, minOtherCopies, shedBatch}, func(rows *sql.Rows) error {
+			ORDER BY d.pack_bytes DESC,c.verified_at DESC,c.object_id LIMIT $4`, []any{s.ID, others, minOtherCopies, shedBatch}, func(rows *sql.Rows) error {
 			if short <= 0 {
 				return nil
 			}
