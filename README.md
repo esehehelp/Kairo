@@ -1987,6 +1987,16 @@ all, it does not adopt the attempts it finds (they are lost): their
 processes go on unwatched until they end or are stopped by hand, which is
 what `--confirm-process-absent` is there to check.
 
+Reconcile waits for fresh, unclaimed observations of every resource, which a
+node that no longer exists never sends. `kairo node retire NODE_ID
+--confirm-node-gone [--reason R]` (`POST /api/nodes/{id}/retire`, admin) is
+for a node gone for good (its container deleted, its host decommissioned):
+it fences the node as above (refused the same while an executor of it
+polls), then releases every stale lease of its executors without those
+observations (events `stale_lease_reconciled`, `node_retired`), quiesces its
+lost attempts and disables its executors and the node. Its stores stay
+declared until the machine declaration drops them.
+
 ### Force stop
 
 `kairo task pause --force|-f [--grace 30s] [--reason ...] PROJECT QUEUE TASK`

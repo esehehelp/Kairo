@@ -265,6 +265,7 @@ func init() {
 				{"release", "NODE_ID|--all", "end a node quarantine", bind(nodeAction, "release")},
 				{"quarantine-status", "", "current node quarantines (JSON)", bind(nodeAction, "quarantine-status")},
 				{"fence", "NODE_ID --confirm-agent-gone [--reason R]", "make the leases of a node whose agent is gone stale", bind(nodeAction, "fence")},
+				{"retire", "NODE_ID --confirm-node-gone [--reason R]", "a node gone for good: fence it, release its stale leases, disable it", bind(nodeAction, "retire")},
 			},
 			aliases: map[string]string{"status": "quarantine-status", "ls": "quarantine-status", "list": "quarantine-status", "enable": "release"},
 		}},

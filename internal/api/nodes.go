@@ -91,3 +91,35 @@ func (s *Server) fenceNode(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"node": id, "stale_leases": stale})
 }
+
+// retireNode: a node gone for good (store.RetireNode).
+func (s *Server) retireNode(w http.ResponseWriter, r *http.Request) {
+	if s.ObserveOnly {
+		writeError(w, errObserveOnly)
+		return
+	}
+	var body struct {
+		Actor           string `json:"actor"`
+		Reason          string `json:"reason"`
+		ConfirmNodeGone bool   `json:"confirm_node_gone"`
+	}
+	if err := decodeOptional(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	id := r.PathValue("id")
+	switch {
+	case id == "all":
+		writeError(w, errors.New("a node is retired by its id, one at a time"))
+		return
+	case !body.ConfirmNodeGone:
+		writeError(w, errors.New("retiring a node needs confirm_node_gone: the node (its container or host) is gone for good"))
+		return
+	}
+	released, err := s.Store.RetireNode(r.Context(), id, actorOr(r, body.Actor), body.Reason)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"node": id, "released_leases": released})
+}
