@@ -1492,7 +1492,11 @@ for what it holds; then it is copied to a durable store and read back like
 every object. A path must be absolute, in the namespace of that store (a
 drive path on a Windows store, a POSIX one on a Linux store), one spelling of
 one place (as a root), not a filesystem's root, inside no store of the node
-and holding none, and not inside, at or around a directory being imported on
+and holding none (but for a durable store's intake: a path strictly inside
+`<root>/intake` of a durable store may be imported, and deleted once copied
+with `--delete-source`; what is put there to be kept is inside a durable
+store, which nothing else deletes, until Kairo has it as objects), and not
+inside, at or around a directory being imported on
 the node (still to be packed, or copied and not yet deleted or kept); a store
 later declared over it stops its packing and deletion, and a declaration
 under which a directory being deleted would no longer be outside every store

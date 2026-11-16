@@ -290,3 +290,18 @@ func TestAnExecutionNamesTheStoreItsDirectoriesGoOn(t *testing.T) {
 		t.Fatalf("pinned to a durable store's node: %s %v", got.ExecutorSelector, err)
 	}
 }
+
+// A durable store's intake is where an import may name paths inside a store:
+// strictly inside <root>/intake, nowhere else in the store.
+func TestADurableStoresIntakeCanBeImported(t *testing.T) {
+	store := importFixture(t)
+	ctx := context.Background()
+	if _, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"E:/kairo/intake/neo-ime/results"}}); err != nil {
+		t.Fatalf("intake refused: %v", err)
+	}
+	for _, p := range []string{"E:/kairo/intake", "E:/kairo/objects/202611", "E:/kairo/elsewhere", "D:/kairo/intake/x"} {
+		if _, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{p}}); !errors.Is(err, ErrImportRefused) {
+			t.Fatalf("%s: %v, want refused", p, err)
+		}
+	}
+}

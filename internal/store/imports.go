@@ -84,7 +84,9 @@ func checkDataName(name string) error {
 // importOwnership says why an imported directory is no longer to be packed
 // or deleted as ordered ("" while it is): the store its pack is made on is
 // still declared volatile on the node at the root, and the directory is
-// inside no store of the node and holds none.
+// inside no store of the node and holds none, but for a durable store's
+// intake (intakeOf): what is put there is imported, and removed once copied,
+// inside the durable store, where nothing else deletes it meanwhile.
 func importOwnership(declared []machine.Store, nodeID, storeID, root, dir string) string {
 	var store *machine.Store
 	for i := range declared {
@@ -105,11 +107,27 @@ func importOwnership(declared []machine.Store, nodeID, storeID, root, dir string
 		return dir + " is not a directory an import can name"
 	}
 	for _, other := range declared {
-		if other.Node == nodeID && machine.RootsOverlap(dir, other.Root) {
+		if other.Node == nodeID && machine.RootsOverlap(dir, other.Root) && !inIntake(other, dir) {
 			return dir + " overlaps store " + other.ID + " (" + other.Class + ", " + other.Root + ")"
 		}
 	}
 	return ""
+}
+
+// IntakeDir is the directory of a durable store's root an import may name
+// paths under (README: Data stores, intake).
+const IntakeDir = "intake"
+
+// intakeOf is the intake of the store at root.
+func intakeOf(root string) string {
+	return strings.TrimRight(root, `/\`) + "/" + IntakeDir
+}
+
+// inIntake: dir is strictly inside the intake of durable store s, not being
+// moved.
+func inIntake(s machine.Store, dir string) bool {
+	in := intakeOf(s.Root)
+	return s.Class == machine.StoreDurable && s.MovedFrom == "" && machine.PathUnder(dir, in) && machine.StoreRootKey(dir) != machine.StoreRootKey(in)
 }
 
 // driveOf is the drive letter of a drive path ("" for a POSIX one), folded.
