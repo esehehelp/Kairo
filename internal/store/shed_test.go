@@ -32,7 +32,7 @@ func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 		t.Helper()
 		if _, err := store.testExec(`INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,path,manifest_path,created_at,updated_at,verified_at)
 			VALUES($1,$2,'durable-exec',$3,'202611','verified',$4,$5,$6,$6,$6)`, id, storeID, root, root+"/objects/202611/"+id+".tar.zst", root+"/objects/202611/"+id+".tar.zst.files.tsv",
-			"2026-11-16T0"+id[len(id)-1:]+":00:00Z"); err != nil {
+			"2026-11-0"+id[len(id)-1:]+"T00:00:00Z"); err != nil {
 			t.Fatal(err)
 		}
 	}
