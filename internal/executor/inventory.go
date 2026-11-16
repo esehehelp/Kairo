@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -33,6 +34,7 @@ func (e *Local) makeInventories() {
 }
 
 func (e *Local) inventoryDue(ctx context.Context) {
+	e.checkInPlaceSources(ctx)
 	for _, s := range e.servedStores() {
 		if !s.usable || s.decl.Class != machine.StoreDurable || s.decl.MovedFrom != "" {
 			continue
@@ -59,6 +61,35 @@ func (e *Local) inventoryDue(ctx context.Context) {
 			e.Logger.Info("copies found on a durable store adopted", "store_id", s.decl.ID, "adopted", adopted, "not adopted", refused)
 		}
 		e.roundProblem(&e.inventories, s.decl.ID, "", nil)
+	}
+}
+
+// checkInPlaceSources reports each path of this node inputs are read in place
+// at that is gone (its volume there): store.InputGone, so inputs are brought
+// from a durable copy instead (README: Data stores). A WSL executor's paths
+// are the distro's: not looked at from here.
+func (e *Local) checkInPlaceSources(ctx context.Context) {
+	if e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2" {
+		return
+	}
+	sources, err := e.Store.InPlaceSources(ctx, e.ID)
+	if err != nil {
+		e.roundProblem(&e.inventories, "", "in-place sources not read", err)
+		return
+	}
+	gone := 0
+	for _, src := range sources {
+		if _, err := os.Lstat(src.Path); err == nil || !errors.Is(sourceGone(src.Path, err), errSourceGone) {
+			continue
+		}
+		if err := e.Store.InputGone(ctx, e.ID, src.ObjectID, src.Path); err != nil {
+			e.roundProblem(&e.inventories, src.ObjectID, "gone source not recorded", err)
+			continue
+		}
+		gone++
+	}
+	if gone > 0 {
+		e.Logger.Warn("sources read in place are gone: recorded, brought from durable copies instead", "count", gone)
 	}
 }
 

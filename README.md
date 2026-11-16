@@ -1607,7 +1607,11 @@ that launch, and the executor reports it (`input-gone`, event
 `input_gone`): an imported source is settled `deleted` ("gone from its
 path"), a run's output directory `missing`, a brought copy forgotten. The
 record no longer offers that place, so a rerun waits for the object to be
-brought from a durable copy (below).
+brought from a durable copy (below). Every executor also checks, at each
+inventory round (at its start and hourly), every path of its node the records
+offer for reading in place (`in-place-sources`) and reports those gone the
+same way, so a path deleted meanwhile is mostly known before a launch needs
+it.
 
 Brought inputs: an input not on the node an execution waits on is brought
 there once it is a packed object (a fetch, ordered as the daemon reconciles

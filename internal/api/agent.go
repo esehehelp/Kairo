@@ -362,6 +362,14 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentAbandonPackRequest) (any, error) {
 				return okBody, s.Store.AbandonPack(ctx, b.ExecutorID, b.ObjectID, b.Reason)
 			}),
+		newAgentOp(s, "in-place-sources", observeEmpty, map[string]any{"sources": []store.InPlaceSource{}}, byExecutor,
+			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+				sources, err := s.Store.InPlaceSources(ctx, b.ExecutorID)
+				if sources == nil {
+					sources = []store.InPlaceSource{}
+				}
+				return map[string]any{"sources": sources}, err
+			}),
 		newAgentOp(s, "input-gone", observeRefused, nil,
 			func(ctx context.Context, b agentInputGoneRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.ExecutorID)

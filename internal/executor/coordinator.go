@@ -52,6 +52,7 @@ type Coordinator interface {
 	ClaimShed(ctx context.Context, executorID, objectID, storeID string) error
 	// InputGone: an input's path is not there at launch.
 	InputGone(ctx context.Context, executorID, objectID, path string) error
+	InPlaceSources(ctx context.Context, executorID string) ([]store.InPlaceSource, error)
 	// InventoryDurable and AdoptCopies: what a durable store's directory holds.
 	InventoryDurable(ctx context.Context, l store.DurableListing) (store.DurableInventory, error)
 	AdoptCopies(ctx context.Context, executorID, storeID, root string, copies []store.AdoptedCopy) (int, error)

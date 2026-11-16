@@ -87,3 +87,36 @@ func (s *Store) InputGone(ctx context.Context, executorID, objectID, path string
 	}
 	return tx.Commit()
 }
+
+// InPlaceSource is a path Kairo's records say an object can be read at, on
+// the node of the executor asking (InPlaceSources).
+type InPlaceSource struct {
+	ObjectID string `json:"object_id"`
+	Path     string `json:"path"`
+}
+
+// InPlaceSources are the paths on executorID's node that inputs are read in
+// place at: imported sources still settled there, the output directories of
+// packed runs, brought copies; for its executor to check they are still
+// there (InputGone for those that are not).
+func (s *Store) InPlaceSources(ctx context.Context, executorID string) ([]InPlaceSource, error) {
+	me, err := executorInfoTx(ctx, s.db, executorID)
+	if err != nil {
+		return nil, err
+	}
+	var out []InPlaceSource
+	err = eachRow(ctx, s.db, `SELECT d.id,d.source_path FROM data_objects d JOIN executors x ON x.id=d.executor_id
+		WHERE x.node_id=$1 AND d.kind='import' AND (d.source_state='present' OR d.source_state='kept' AND NOT d.delete_source)
+		UNION ALL SELECT d.id,o.path FROM run_outputs o JOIN executors x ON x.id=o.executor_id JOIN data_objects d ON d.kind='output' AND d.source_id=o.run_id AND d.store_id=o.store_id
+		WHERE x.node_id=$1 AND o.state='active'
+		UNION ALL SELECT p.object_id,p.path FROM object_placements p JOIN executors x ON x.id=p.executor_id WHERE x.node_id=$1 AND p.state='ready'`,
+		[]any{me.nodeID}, func(rows *sql.Rows) error {
+			var src InPlaceSource
+			if err := rows.Scan(&src.ObjectID, &src.Path); err != nil {
+				return err
+			}
+			out = append(out, src)
+			return nil
+		})
+	return out, err
+}

@@ -231,6 +231,15 @@ func (c *Client) InputGone(ctx context.Context, executorID, objectID, path strin
 	return c.call(ctx, "input-gone", map[string]string{"executor_id": executorID, "object_id": objectID, "path": path}, nil)
 }
 
+// InPlaceSources are the paths of this node inputs are read in place at.
+func (c *Client) InPlaceSources(ctx context.Context, executorID string) ([]store.InPlaceSource, error) {
+	var out struct {
+		Sources []store.InPlaceSource `json:"sources"`
+	}
+	err := c.call(ctx, "in-place-sources", map[string]string{"executor_id": executorID}, &out)
+	return out.Sources, err
+}
+
 // RecordCopy records a copy this executor wrote and read back.
 func (c *Client) RecordCopy(ctx context.Context, made store.CopyMade) error {
 	return c.call(ctx, "record-copy", map[string]any{"made": made}, nil)
