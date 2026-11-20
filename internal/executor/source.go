@@ -262,7 +262,7 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 	}
 	if here {
 		aside := fmt.Sprintf("%s%s%d", src.ID, changedInfix, time.Now().UnixNano())
-		if err := dir.Rename(src.ID, aside); err != nil {
+		if err := renameSettled(ctx, dir, src.ID, aside, nil); err != nil {
 			return "", fmt.Errorf("the unpacked snapshot was changed in place (%s) and cannot be set aside: %w", strings.Join(changes, ", "), err)
 		}
 		_ = dir.Remove(src.ID + stateSuffix)
@@ -326,15 +326,23 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 	if err := writeRootFile(dir, statePartial, []byte(state)); err != nil {
 		return "", err
 	}
-	if err := dir.Rename(statePartial, src.ID+stateSuffix); err != nil {
+	if err := renameSettled(ctx, dir, statePartial, src.ID+stateSuffix, nil); err != nil {
 		return "", err
 	}
-	if err := dir.Rename(partial, src.ID); err != nil {
-		// unpacked there meanwhile by another process (the same files,
-		// modes and mtimes: the same record)?
-		if here, changes, checkErr := checkUnpacked(dir, src.ID); checkErr == nil && here && len(changes) == 0 {
+	// unpacked there meanwhile by another process (the same files, modes
+	// and mtimes: the same record)?
+	there := func() bool {
+		here, changes, err := checkUnpacked(dir, src.ID)
+		return err == nil && here && len(changes) == 0
+	}
+	if err := renameSettled(ctx, dir, partial, src.ID, there); err != nil {
+		if there() {
 			markSourceUsed(dir, src.ID)
 			return final, nil
+		}
+		// no record without its tree
+		if _, statErr := dir.Lstat(src.ID); errors.Is(statErr, fs.ErrNotExist) {
+			_ = dir.Remove(src.ID + stateSuffix)
 		}
 		return "", err
 	}

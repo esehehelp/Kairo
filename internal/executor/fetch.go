@@ -156,7 +156,7 @@ func (e *Local) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder,
 		_ = dir.RemoveAll(unpacking)
 		return made, err
 	}
-	if err = dir.Rename(unpacking, o.ObjectID); err != nil {
+	if err = renameSettled(ctx, dir, unpacking, o.ObjectID, nil); err != nil {
 		return made, err
 	}
 	_ = dir.Remove(packName + partialSuffix)
