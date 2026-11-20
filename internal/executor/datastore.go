@@ -181,18 +181,25 @@ func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObse
 	if !s.usable {
 		return obs
 	}
+	e.scanStore(ctx, s, &obs)
+	// Sample after the scan so free space reflects changes made while scanning.
 	if total, free, err := s.fs.Usage(ctx, s.decl.Root); err == nil {
 		obs.TotalBytes, obs.FreeBytes = &total, &free
 	} else {
 		obs.Problem = "usage: " + err.Error()
 	}
+	return obs
+}
+
+// scanStore measures what Kairo holds in scratch and output directories.
+func (e *Local) scanStore(ctx context.Context, s servedStore, obs *store.StoreObservation) {
 	started := time.Now()
 	ids, unread, err := s.fs.List(ctx, s.decl.Root)
 	if err != nil {
 		if obs.Problem == "" {
 			obs.Problem = "scratch: " + err.Error()
 		}
-		return obs
+		return
 	}
 	obs.Scratch = map[string]int64{}
 	for _, id := range ids {
@@ -226,7 +233,6 @@ func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObse
 		obs.Problem = "outputs: " + err.Error()
 	}
 	obs.ScanSeconds = time.Since(started).Seconds()
-	return obs
 }
 
 // scratchSize measures a scratch directory: an attempt running here at every

@@ -130,6 +130,51 @@ func TestStoresServedMadeAndChecked(t *testing.T) {
 	}
 }
 
+type observedStoreFS struct {
+	localStoreFS
+	sized    int64
+	listErr  error
+	usageErr error
+}
+
+func (f *observedStoreFS) List(context.Context, string) ([]string, []string, error) {
+	return []string{"att_1"}, nil, f.listErr
+}
+
+func (f *observedStoreFS) ListKind(context.Context, string, dirKind) ([]string, []string, error) {
+	return []string{"run_1"}, nil, nil
+}
+
+func (f *observedStoreFS) Size(context.Context, string) (int64, error) {
+	f.sized++
+	return 10, nil
+}
+
+func (f *observedStoreFS) Usage(context.Context, string) (int64, int64, error) {
+	return 100, 100 - 10*f.sized, f.usageErr
+}
+
+func TestStoreUsageIsSampledAfterScanningScratchAndOutputs(t *testing.T) {
+	e := &Local{ID: "exec"}
+	fs := &observedStoreFS{}
+	s := servedStore{decl: machine.Store{ID: "data"}, fs: fs, usable: true}
+	obs := e.observeStore(context.Background(), s)
+	if obs.FreeBytes == nil || *obs.FreeBytes != 80 || !obs.ScratchScanned || !obs.OutputsScanned || obs.Problem != "" {
+		t.Fatalf("observation: %+v, sized %d", obs, fs.sized)
+	}
+
+	fs.listErr = errors.New("cannot list")
+	obs = e.observeStore(context.Background(), s)
+	if obs.FreeBytes == nil || obs.ScratchScanned || obs.Problem != "scratch: cannot list" {
+		t.Fatalf("observation with scratch error: %+v", obs)
+	}
+	fs.usageErr = errors.New("cannot stat")
+	obs = e.observeStore(context.Background(), s)
+	if obs.FreeBytes != nil || obs.Problem != "usage: cannot stat" {
+		t.Fatalf("observation with usage error: %+v", obs)
+	}
+}
+
 // placedFS is a storeFS whose roots are where places says.
 type placedFS struct {
 	storeFS

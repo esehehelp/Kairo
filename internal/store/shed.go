@@ -18,9 +18,9 @@ import (
 // verified, undamaged copies on other durable stores as declared, the biggest
 // first, until what they hold covers the shortfall, shedBatch at a time; not
 // a copy a replica or a fetch is reading. It claims each (ClaimShed: the
-// record goes, the other copies checked again under the daemon's write lock)
-// before it removes the files; one whose files outlive a failed removal is
-// adopted again by the next inventory, and shed again.
+// record goes after rechecking the other copies and readers under the
+// daemon's write lock) before it removes the files; one whose files outlive
+// a failed removal is adopted again by the next inventory, and shed again.
 
 const (
 	minOtherCopies = 2
@@ -94,23 +94,14 @@ var ErrShedRefused = errors.New("copy not to be shed")
 // ClaimShed: executorID is about to remove its copy of objectID on durable
 // store storeID; the record goes first, if the object still has
 // minOtherCopies verified, undamaged copies on other durable stores as
-// declared (ErrShedRefused otherwise: the files are not to be removed).
+// declared and no replica or fetch is reading from it (ErrShedRefused
+// otherwise: the files are not to be removed).
 func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID string) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var owner, state string
-	var projectID *string
-	err = tx.QueryRowContext(ctx, `SELECT c.executor_id,c.state,d.project_scope_id FROM object_copies c JOIN data_objects d ON d.id=c.object_id WHERE c.object_id=$1 AND c.store_id=$2 FOR UPDATE OF c`,
-		objectID, storeID).Scan(&owner, &state, &projectID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil // claimed before (a retried call)
-	}
-	if err != nil {
-		return err
-	}
 	me, err := executorInfoTx(ctx, tx, executorID)
 	if err != nil {
 		return err
@@ -131,16 +122,36 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 		}
 		others = append(others, d.ID)
 	}
-	if !served || state != "verified" {
-		return fmt.Errorf("%w: the copy of %s on %s is %s, and executor %s serves the store: %v", ErrShedRefused, objectID, storeID, state, executorID, served)
+	if !served {
+		return fmt.Errorf("%w: executor %s does not serve durable store %s", ErrShedRefused, executorID, storeID)
+	}
+	var state string
+	var projectID *string
+	err = tx.QueryRowContext(ctx, `SELECT c.state,d.project_scope_id FROM object_copies c JOIN data_objects d ON d.id=c.object_id WHERE c.object_id=$1 AND c.store_id=$2 FOR UPDATE OF c`,
+		objectID, storeID).Scan(&state, &projectID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // claimed before (a retried call)
+	}
+	if err != nil {
+		return err
+	}
+	if state != "verified" {
+		return fmt.Errorf("%w: the copy of %s on %s is %s", ErrShedRefused, objectID, storeID, state)
 	}
 	var count int
-	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM object_copies WHERE object_id=$1 AND store_id=ANY($2::text[]) AND state='verified' AND check_problem IS NULL`,
-		objectID, others).Scan(&count); err != nil {
+	var reading bool
+	if err = tx.QueryRowContext(ctx, `SELECT
+		(SELECT COUNT(*) FROM object_copies WHERE object_id=$1 AND store_id=ANY($2::text[]) AND state='verified' AND check_problem IS NULL),
+		EXISTS(SELECT 1 FROM object_copies WHERE object_id=$1 AND state='copying' AND (source_store_id=$3 OR source_store_id IS NULL))
+		OR EXISTS(SELECT 1 FROM object_placements WHERE object_id=$1 AND state='fetching' AND source_store_id=$3)`,
+		objectID, others, storeID).Scan(&count, &reading); err != nil {
 		return err
 	}
 	if count < minOtherCopies {
 		return fmt.Errorf("%w: %s has %d other good copies, not %d", ErrShedRefused, objectID, count, minOtherCopies)
+	}
+	if reading {
+		return fmt.Errorf("%w: a replica or fetch is reading the copy of %s on %s", ErrShedRefused, objectID, storeID)
 	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_id=$1 AND store_id=$2`, objectID, storeID); err != nil {
 		return err
