@@ -145,32 +145,21 @@ func copyTargetsTx(ctx context.Context, q queryer, declared []machine.Store) ([]
 // taken as having room: a copy there fails if it has none).
 const unknownRoom = int64(1) << 62
 
-// copyRoomTx is what each of stores can still take: its free bytes as last
-// reported (usable), less its reserve_free_bytes and the packs of the copies
-// being made there or verified there since that report (a report is minutes
-// old; copies made meanwhile are not in it); unknownRoom for one never
-// reported usable.
-func copyRoomTx(ctx context.Context, q queryer, stores []machine.Store) (map[string]int64, error) {
-	room := map[string]int64{}
-	for _, s := range stores {
-		var free sql.NullInt64
-		var observed string
-		err := q.QueryRowContext(ctx, `SELECT free_bytes,observed_at FROM store_observations WHERE store_id=$1 AND usable`, s.ID).Scan(&free, &observed)
-		if errors.Is(err, sql.ErrNoRows) || err == nil && !free.Valid {
-			room[s.ID] = unknownRoom
-			continue
-		}
-		if err != nil {
-			return nil, err
-		}
-		var copying int64
-		if err = q.QueryRowContext(ctx, `SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM object_copies c JOIN data_objects d ON d.id=c.object_id
-			WHERE c.store_id=$1 AND (c.state='copying' OR c.state='verified' AND c.verified_at>$2)`, s.ID, observed).Scan(&copying); err != nil {
-			return nil, err
-		}
-		room[s.ID] = free.Int64 - s.ReserveFreeBytes - copying
+// copyRoomTx is a store's room above its reserve. The last report is minutes
+// old, so subtract copies in flight or verified since it and add copies shed
+// since it. A store never reported usable has unknownRoom.
+func copyRoomTx(ctx context.Context, tx *sql.Tx, s machine.Store) (int64, error) {
+	var free int64
+	err := tx.QueryRowContext(ctx, `SELECT o.free_bytes
+		- (SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM object_copies c JOIN data_objects d ON d.id=c.object_id
+		   WHERE c.store_id=o.store_id AND (c.state='copying' OR c.state='verified' AND c.verified_at::timestamptz>o.observed_at::timestamptz))
+		+ (SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM coordination_events e JOIN data_objects d ON d.id=e.aggregate_id
+		   WHERE e.event_type='copy_shed' AND e.payload_json::jsonb->>'store_id'=o.store_id AND e.created_at::timestamptz>o.observed_at::timestamptz)
+		FROM store_observations o WHERE o.store_id=$1 AND o.usable AND o.free_bytes IS NOT NULL`, s.ID).Scan(&free)
+	if errors.Is(err, sql.ErrNoRows) {
+		return unknownRoom, nil
 	}
-	return room, nil
+	return free - s.ReserveFreeBytes, err
 }
 
 // CopiesToMake is what an executor is to copy now: the copies it has taken
@@ -206,9 +195,12 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 		served = served || me.serves(target, executorID)
 	}
 	if served {
-		room, err := copyRoomTx(ctx, tx, targets)
-		if err != nil {
-			return nil, err
+		room := map[string]int64{}
+		for _, target := range targets {
+			room[target.ID], err = copyRoomTx(ctx, tx, target)
+			if err != nil {
+				return nil, err
+			}
 		}
 		var due []struct {
 			id, created, projectID, node string

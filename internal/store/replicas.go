@@ -11,15 +11,14 @@ import (
 // Replicas: a durable object is kept on every durable store, not on one
 // only, so that losing a store (a disk deleted or failed) loses none of what
 // Kairo keeps. Once an object has its first verified copy, each other
-// durable store without a copy of it takes one, as it has room for (its
-// last report, less its reserve and the copies being made there), smallest
-// objects first, a few at a time (replicaBatch); an object nowhere durable
-// yet is always copied before any replica (CopiesToMake). A replica is read
-// from a durable copy on the node of the executor making it (the pack may be
-// gone by then), else from one on another node, through the pack server of
-// the agent that made that copy (pack_addr), with a token for that copy
-// (object_copies.source_*): so every durable store, on whatever node, holds
-// every durable object.
+// durable store without a copy of it takes one if it has room above the
+// reserve and shedding margin and has not shed that object in the last
+// 24 hours. The smallest objects go first, a few at a time (replicaBatch).
+// An object nowhere durable yet goes before any replica (CopiesToMake).
+// A replica is read from a durable copy on the node of the executor making
+// it (the pack may be gone by then), else from one on another node, through
+// the pack server of the agent that made that copy (pack_addr), with a
+// token for that copy (object_copies.source_*).
 
 // replicaBatch bounds the replicas one CopiesToMake orders.
 const replicaBatch = 50
@@ -27,40 +26,54 @@ const replicaBatch = 50
 // orderReplicasTx orders, for executor me, replicas of objects with a
 // verified copy on a durable store it serves onto the durable stores it serves
 // without a copy of them (targets in order, room as copyRoomTx says, less
-// what it orders).
+// the shedding margin and what it orders).
 func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets []machine.Store, room map[string]int64, t string) error {
-	var served []machine.Store
-	var servedIDs []string
+	var eligible []machine.Store
+	var servedIDs, eligibleIDs []string
 	for _, s := range targets {
-		if me.serves(s, executorID) {
-			served = append(served, s)
-			servedIDs = append(servedIDs, s.ID)
+		if !me.serves(s, executorID) {
+			continue
+		}
+		servedIDs = append(servedIDs, s.ID)
+		if room[s.ID] != unknownRoom {
+			// The margin also excludes stores already below their reserve.
+			room[s.ID] -= shedMinShort
+		}
+		if room[s.ID] >= 0 {
+			eligible = append(eligible, s)
+			eligibleIDs = append(eligibleIDs, s.ID)
 		}
 	}
-	if len(served) == 0 {
+	if len(eligible) == 0 {
 		return nil // nowhere here to replicate to
 	}
 	type candidate struct {
 		id, created, projectID string
 		bytes                  int64
-		on                     map[string]bool
+		blocked                map[string]bool
 	}
 	var candidates []candidate
-	err := eachRow(ctx, tx, `SELECT d.id,d.created_at,COALESCE(d.project_scope_id,''),COALESCE(d.pack_bytes,0),
-		COALESCE((SELECT string_agg(c.store_id,',') FROM object_copies c WHERE c.object_id=d.id),'')
-		FROM data_objects d WHERE d.state='packed' AND d.lifecycle='durable'
+	err := eachRow(ctx, tx, `SELECT d.id,d.created_at,COALESCE(d.project_scope_id,''),COALESCE(d.pack_bytes,0),COALESCE(b.stores,'')
+		FROM data_objects d CROSS JOIN LATERAL (
+			SELECT string_agg(store_id,',') AS stores, COUNT(*) AS n FROM (
+				SELECT c.store_id FROM object_copies c WHERE c.object_id=d.id AND c.store_id=ANY($1::text[])
+				UNION
+				SELECT e.payload_json::jsonb->>'store_id' FROM coordination_events e WHERE e.event_type='copy_shed' AND e.aggregate_id=d.id
+				AND e.payload_json::jsonb->>'store_id'=ANY($1::text[]) AND e.created_at::timestamptz>$3::text::timestamptz-INTERVAL '24 hours'
+			) blocked
+		) b
+		WHERE d.state='packed' AND d.lifecycle='durable' AND b.n<$2
 		AND EXISTS(SELECT 1 FROM object_copies v JOIN executors x ON x.id=v.executor_id WHERE v.object_id=d.id AND v.state='verified' AND v.check_problem IS NULL
-			AND (v.store_id=ANY($1::text[]) OR COALESCE(x.attributes_json::jsonb->>'pack_addr','')<>''))
-		AND (SELECT COUNT(*) FROM object_copies c WHERE c.object_id=d.id AND c.store_id=ANY($1::text[]))<$2
-		ORDER BY d.pack_bytes,d.id LIMIT 2000`, []any{servedIDs, len(served)}, func(rows *sql.Rows) error {
+			AND (v.store_id=ANY($4::text[]) OR COALESCE(x.attributes_json::jsonb->>'pack_addr','')<>''))
+		ORDER BY d.pack_bytes,d.id LIMIT 2000`, []any{eligibleIDs, len(eligible), t, servedIDs}, func(rows *sql.Rows) error {
 		var c candidate
-		var on string
-		if err := rows.Scan(&c.id, &c.created, &c.projectID, &c.bytes, &on); err != nil {
+		var blocked string
+		if err := rows.Scan(&c.id, &c.created, &c.projectID, &c.bytes, &blocked); err != nil {
 			return err
 		}
-		c.on = map[string]bool{}
-		for _, id := range strings.Split(on, ",") {
-			c.on[id] = true
+		c.blocked = map[string]bool{}
+		for _, id := range strings.Split(blocked, ",") {
+			c.blocked[id] = true
 		}
 		candidates = append(candidates, c)
 		return nil
@@ -73,8 +86,8 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 		if ordered >= replicaBatch {
 			break
 		}
-		for _, target := range served {
-			if c.on[target.ID] || room[target.ID] < c.bytes {
+		for _, target := range eligible {
+			if c.blocked[target.ID] || room[target.ID] < c.bytes {
 				continue
 			}
 			month := c.created[0:4] + c.created[5:7]
