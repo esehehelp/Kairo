@@ -91,8 +91,10 @@ func TestADurableStoresDirectoryIsAdoptedAndChecked(t *testing.T) {
 	if err = store.db.QueryRowContext(ctx, `SELECT check_problem FROM object_copies WHERE object_id='obj_k' AND store_id='e-durable'`).Scan(&problem); err != nil || problem == nil {
 		t.Fatalf("obj_k not marked: %v %v", problem, err)
 	}
-	// an empty directory (a disk not mounted) is not believed
+	// an empty directory (a disk not mounted) is not believed: listed after
+	// every copy was recorded
 	listing.Copies = map[string]string{}
+	listing.ListedAt = time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)
 	if _, err = store.InventoryDurable(ctx, listing); err == nil {
 		t.Fatal("an empty listing of a store with copies was believed")
 	}
