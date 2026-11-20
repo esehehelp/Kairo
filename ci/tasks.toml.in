@@ -4,7 +4,8 @@
 # tree. Attempts are confined (README: Confinement): those are the only places they may write, and on Windows they run
 # at Low integrity, where Git Bash does not start, so the Windows checks run ci/check.ps1 in PowerShell. Priority -500:
 # CI waits for everyone's work and preempts nothing (the lowest serving is -100). The checks on pve1-work reserve
-# 3 GiB of its 4 GiB each, so the planner runs them one at a time; those on windows-local run beside each other.
+# 3 GiB of its 4 GiB each, so the planner runs them one at a time (on pve1-work itself, which has the test PostgreSQL
+# and /srv/kairo-ci, not on another node of site pve1); those on windows-local run beside each other.
 schema_version = 1
 
 [project]
@@ -27,6 +28,7 @@ argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=
 cwd = "/srv/kairo-ci"
 [tasks.execution.executor]
 labels = { site = "pve1" }
+node = "pve1-work"
 [tasks.execution.capacity]
 cpu_millis = 6000
 ram_bytes = 3221225472
@@ -39,6 +41,7 @@ argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=
 cwd = "/srv/kairo-ci"
 [tasks.execution.executor]
 labels = { site = "pve1" }
+node = "pve1-work"
 [tasks.execution.capacity]
 cpu_millis = 6000
 ram_bytes = 3221225472
@@ -51,6 +54,7 @@ argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; c=$KAIRO_CACHE_DIR; trap 'r
 cwd = "/srv/kairo-ci"
 [tasks.execution.executor]
 labels = { site = "pve1" }
+node = "pve1-work"
 [tasks.execution.capacity]
 cpu_millis = 4000
 ram_bytes = 3221225472

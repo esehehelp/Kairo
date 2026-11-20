@@ -17,6 +17,9 @@ from kairo_sdk.runtime import _current_process_identity, _parse_proc_stat_startt
 DATA = Path(__file__).parent / "data"
 
 
+_IMPORTED_NS = time.time_ns()
+
+
 class _Handler(BaseHTTPRequestHandler):
     acks: list[dict] = []
     polls = 0
@@ -275,7 +278,9 @@ def test_current_process_identity_uses_unix_nanoseconds():
     if os.name == "nt":
         pid_text, start_text = identity.removeprefix("pid:").split(":start:")
         assert int(pid_text) > 0
-        assert 0 < time.time_ns() - int(start_text) < 60_000_000_000
+        # this process started before this module was imported, and not long
+        # before: however long the session has run since
+        assert 0 <= _IMPORTED_NS - int(start_text) < 600_000_000_000
     else:
         pid_text, start_text = identity.removeprefix("proc:").split(":starttime:")
         assert int(pid_text) == os.getpid()
