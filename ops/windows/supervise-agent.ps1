@@ -28,9 +28,26 @@ function Find-Agent {
     Where-Object { $_.CommandLine -like '* agent --config *' -and $_.CommandLine.Contains($cfg) } | Select-Object -First 1
 }
 
+# The agent process this supervisor watches: when it is gone, its exit code and time are logged (issue #19: an agent
+# that exits without a line of its own, killed from outside say, leaves at least that). The handle is taken while it
+# runs, or the exit code cannot be read afterwards.
+function Watch-Agent([int]$id) {
+  try { $p = Get-Process -Id $id -ErrorAction Stop; $null = $p.Handle; return $p } catch { return $null }
+}
+function Log-Exit($p) {
+  if (-not $p) { return }
+  try {
+    $p.WaitForExit(1000) | Out-Null
+    $code = $p.ExitCode
+    Log ("agent pid {0} exited with code {1} (0x{2:X8}) at {3:o}" -f $p.Id, $code, $code, $p.ExitTime)
+  } catch { Log "agent pid $($p.Id) is gone; its exit code cannot be read ($($_.Exception.Message))" }
+}
+
 $starts = New-Object System.Collections.Generic.List[datetime]
 $held = $false
-Log "supervisor started (agent=$((Find-Agent).ProcessId))"
+$found = Find-Agent
+$agent = if ($found) { Watch-Agent $found.ProcessId } else { $null }
+Log "supervisor started (agent=$($found.ProcessId))"
 while ($true) {
   if (Test-Path $hold) {
     if (-not $held) { Log 'hold file present: not starting the agent' }
@@ -38,7 +55,13 @@ while ($true) {
   } else {
     if ($held) { Log 'hold file gone' }
     $held = $false
-    if (-not (Find-Agent)) {
+    $running = Find-Agent
+    if ($running -and (-not $agent -or $agent.Id -ne $running.ProcessId)) {
+      $agent = Watch-Agent $running.ProcessId  # one started by replace-agent.ps1
+    }
+    if (-not $running) {
+      Log-Exit $agent
+      $agent = $null
       # more than 5 starts in 10 minutes: wait 5 minutes before the next
       $recent = @($starts | Where-Object { $_ -gt (Get-Date).AddMinutes(-10) })
       if ($recent.Count -ge 5) {
@@ -51,6 +74,8 @@ while ($true) {
       $p = Start-Process -FilePath $exe -ArgumentList "agent --config `"$cfg`"" -WorkingDirectory $state -WindowStyle Hidden -PassThru `
         -RedirectStandardOutput (Join-Path $logs "agent-$ts.stdout.log") `
         -RedirectStandardError (Join-Path $logs "agent-$ts.stderr.log")
+      $null = $p.Handle
+      $agent = $p
       $starts.Add((Get-Date))
       Log "agent not running; started pid $($p.Id) (logs agent-$ts.*)"
     }
