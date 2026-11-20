@@ -144,9 +144,9 @@ func TestAnInputIsBroughtToTheNodeItIsReadOn(t *testing.T) {
 
 // An execution whose executor selector names no node is planned onto a node
 // that holds its inputs only when an executor there matches its labels; else
-// onto a node with such an executor (the inputs are brought there), and when
-// no node has one it is left unpinned (issue #17: it was pinned to the
-// inputs' node and waited no_executor for good).
+// onto a node with such an executor (the inputs are brought there); with
+// none anywhere it stays on the inputs' node (issue #17: it was pinned to the
+// inputs' node and waited no_executor for good while another node had one).
 func TestAnInputPinsOnlyANodeTheLabelsMatch(t *testing.T) {
 	store := importFixture(t)
 	ctx := context.Background()
@@ -199,7 +199,7 @@ func TestAnInputPinsOnlyANodeTheLabelsMatch(t *testing.T) {
 	if node := pinned("on-linux", `{"environment":"linux"}`); node != "node2" {
 		t.Fatalf("labels only another node matches: pinned to %q", node)
 	}
-	if node := pinned("on-nothing", `{"environment":"macos"}`); node != "" {
+	if node := pinned("on-nothing", `{"environment":"macos"}`); node != "node" {
 		t.Fatalf("labels no node matches: pinned to %q", node)
 	}
 }

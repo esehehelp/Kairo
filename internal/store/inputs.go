@@ -407,10 +407,11 @@ func selectorNodesTx(ctx context.Context, q queryer, selector string) (map[strin
 // (spec.Store), else, with inputs, onto the best node for them
 // (inputsNodesTx) that has an executor its labels match, else onto the
 // first node that has one (the inputs are brought there), unless its
-// executor selector names a node itself. A node no executor of which the
-// labels match would never take it: with none anywhere it is left unpinned,
-// to wait for one (no_executor). A gang is not pinned: its ranks go on
-// distinct nodes (rank 0 reads the inputs).
+// executor selector names a node itself: a node no executor of which the
+// labels match would never take it (issue #17). With no such node anywhere
+// it goes on the best node for its inputs, to wait there for an executor
+// (no_executor) and say what its inputs wait for. A gang is not pinned: its
+// ranks go on distinct nodes (rank 0 reads the inputs).
 func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *ExecutionSpec) error {
 	if len(spec.Inputs) == 0 && spec.Store == "" || spec.Gang != nil {
 		return nil
@@ -459,14 +460,17 @@ func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *Execut
 		return err
 	}
 	match, matching, err := selectorNodesTx(ctx, q, string(spec.ExecutorSelector))
-	if err != nil || len(matching) == 0 {
+	if err != nil {
 		return err
 	}
-	node := matching[0]
-	for _, n := range best {
-		if match[n] {
-			node = n
-			break
+	node := best[0]
+	if len(matching) > 0 {
+		node = matching[0]
+		for _, n := range best {
+			if match[n] {
+				node = n
+				break
+			}
 		}
 	}
 	selector["node"] = node
