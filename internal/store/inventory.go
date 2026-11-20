@@ -448,9 +448,13 @@ func validateEpochTx(ctx context.Context, tx *sql.Tx, attemptID, leaseID string,
 	return nil
 }
 
-// ReconcileResource releases stale coordination only after fresh provider
-// evidence shows every resource in the lease unclaimed and no registered
-// process remains. Lease expiry alone is intentionally insufficient.
+// ReconcileResource releases stale coordination only after provider
+// evidence taken since the lease went stale covers every resource in the
+// lease, nothing of its attempt is seen on them, and no registered process
+// remains. Lease expiry alone is intentionally insufficient. A claim that is
+// not the attempt's (another program's process, unattributed activity) does
+// not hold the lease: the claim keeps the device from being placed on by
+// itself (issue #20).
 func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confirmProcessAbsent ...bool) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -481,14 +485,26 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 	}
 	t := now()
 	for _, x := range leases {
-		var unsafe int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1) WHERE li.lease_id=$1 AND li.resource_id IS NOT NULL AND (o.id IS NULL OR (o.valid_until)::timestamptz<=($2)::timestamptz OR (o.observed_at)::timestamptz<=(l.stale_at)::timestamptz OR EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("li.resource_id")+` AND c.cleared_at IS NULL))`, x.lease, t).Scan(&unsafe); err != nil {
+		var unobserved int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1) WHERE li.lease_id=$1 AND li.resource_id IS NOT NULL AND (o.id IS NULL OR (o.valid_until)::timestamptz<=($2)::timestamptz OR (o.observed_at)::timestamptz<=(l.stale_at)::timestamptz)`, x.lease, t).Scan(&unobserved); err != nil {
 			return err
 		}
-		if unsafe > 0 {
-			return fmt.Errorf("stale lease %s still lacks fresh unclaimed observations", x.lease)
+		if unobserved > 0 {
+			return fmt.Errorf("stale lease %s still lacks fresh observations of its resources taken after it went stale", x.lease)
 		}
 		if x.attempt.Valid {
+			// a process of the attempt still on its device: by the
+			// KAIRO_ATTEMPT_ID it carries, or as one of its registered
+			// processes
+			var seen int
+			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN external_claims c ON c.resource_id IN `+sameDevice("li.resource_id")+`
+				WHERE li.lease_id=$1 AND c.cleared_at IS NULL AND (c.evidence_json::jsonb->>'attempt_id'=$2
+				OR c.process_identity IN (SELECT process_identity FROM attempt_processes WHERE attempt_id=$2))`, x.lease, x.attempt.String).Scan(&seen); err != nil {
+				return err
+			}
+			if seen > 0 {
+				return fmt.Errorf("stale lease %s: a process of attempt %s is still seen on its resources", x.lease, x.attempt.String)
+			}
 			if len(confirmProcessAbsent) == 0 || !confirmProcessAbsent[0] {
 				return fmt.Errorf("stale attempt %s requires explicit process-absence confirmation", x.attempt.String)
 			}

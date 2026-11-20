@@ -2,6 +2,8 @@ package store
 
 import (
 	"context"
+	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -74,6 +76,56 @@ func TestLostAttemptRequiresExplicitAbsenceEvenWithoutProcessRow(t *testing.T) {
 	}
 	if err = store.ReconcileResource(ctx, "gpu-0", true); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A claim on the device that is not the lost attempt's (another program's
+// process, unattributed activity) does not hold its stale lease; a process
+// of the attempt still seen there does (issue #20).
+func TestReconcileIsHeldOnlyByTheLostAttemptsOwnClaims(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	if _, _, err := store.SubmitExecution(ctx, schedulerExecutionSpec("lost-with-claims")); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := store.ReserveNext(ctx, "executor")
+	if err != nil || reservation == nil {
+		t.Fatalf("reserve: %+v %v", reservation, err)
+	}
+	if err = store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := store.AuthorizeLaunch(ctx, reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count, markErr := store.MarkExecutorUnknown(ctx, "executor"); markErr != nil || count != 1 {
+		t.Fatalf("mark unknown: count=%d err=%v", count, markErr)
+	}
+	refreshSchedulerGPU(t, store)
+	foreign := "pid:77:start:1"
+	for _, c := range []ExternalClaim{
+		{ID: "claim-foreign", ResourceID: "gpu-0", ClaimKind: "external_process", ProcessIdentity: &foreign, Evidence: json.RawMessage(`{"pid":"77"}`)},
+		{ID: "claim-unattributed", ResourceID: "gpu-0", ClaimKind: "unattributed_activity", Evidence: json.RawMessage(`{"reason":"significant_vram_without_attributed_process"}`)},
+		{ID: "claim-its-own", ResourceID: "gpu-0", ClaimKind: "external_process", ProcessIdentity: &foreign, Evidence: json.RawMessage(`{"pid":"78","attempt_id":"` + launch.Attempt.ID + `"}`)},
+	} {
+		if err = store.ObserveClaim(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = store.ReconcileResource(ctx, "gpu-0", true); err == nil || !strings.Contains(err.Error(), launch.Attempt.ID) {
+		t.Fatalf("released while a process of the lost attempt is seen: %v", err)
+	}
+	if _, err = store.db.ExecContext(ctx, `UPDATE external_claims SET cleared_at=$1 WHERE id='claim-its-own'`, now()); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ReconcileResource(ctx, "gpu-0", true); err != nil {
+		t.Fatalf("held by claims that are not the attempt's: %v", err)
+	}
+	var state string
+	if err = store.db.QueryRowContext(ctx, `SELECT state FROM leases WHERE id=$1`, reservation.Lease.ID).Scan(&state); err != nil || state != "released" {
+		t.Fatalf("lease %s %v", state, err)
 	}
 }
 

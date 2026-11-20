@@ -490,7 +490,13 @@ becomes stale: when the executor's agent registers again without adopting
 its attempt, or when an operator fences the node of an agent that is gone
 (`kairo node fence`, Node fence below). Time alone never makes a lease stale
 or free: a stale lease holds its resources until `kairo resource reconcile
-RESOURCE_ID --confirm-process-absent` releases it.
+RESOURCE_ID --confirm-process-absent` releases it. Reconcile needs an
+observation of each of the lease's resources taken after it went stale, in
+which no process of its attempt is seen (one carrying its
+`KAIRO_ATTEMPT_ID`, or one of its registered processes). A claim that is not
+the attempt's (another program's process, unattributed activity, a game)
+does not hold the lease: the claim keeps the device from being placed on by
+itself, and is not something the operator has to wait out.
 
 What an exited attempt left running (its launcher exited and its exit is
 recorded, yet a process of its tree runs: one it started without
@@ -2001,8 +2007,8 @@ all, it does not adopt the attempts it finds (they are lost): their
 processes go on unwatched until they end or are stopped by hand, which is
 what `--confirm-process-absent` is there to check.
 
-Reconcile waits for fresh, unclaimed observations of every resource, which a
-node that no longer exists never sends. `kairo node retire NODE_ID
+Reconcile waits for fresh observations of every resource, which a node that
+no longer exists never sends. `kairo node retire NODE_ID
 --confirm-node-gone [--reason R]` (`POST /api/nodes/{id}/retire`, admin) is
 for a node gone for good (its container deleted, its host decommissioned):
 it fences the node as above (refused the same while an executor of it
