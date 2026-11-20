@@ -454,6 +454,9 @@ func checkAgainstList(ctx context.Context, sr *os.Root, src, marker string, list
 			case marker != "" && dir == "." && info.Name() == marker:
 			case isLink(info):
 				return fmt.Errorf("%w: %s is a link (not packed)", errSourceChanged, rel)
+			case marker != "" && dir == "." && reservedWindowsPath(rel):
+				// To keep the marker until last, deletion must address this entry by name.
+				return fmt.Errorf("%w: %s is a reserved Windows name (cannot delete through handles)", errSourceChanged, rel)
 			case info.IsDir():
 				if mounted[filepath.Join(src, filepath.FromSlash(rel))] {
 					return fmt.Errorf("%w: %s is a mount point (not packed)", errSourceChanged, rel)
@@ -464,7 +467,7 @@ func checkAgainstList(ctx context.Context, sr *os.Root, src, marker string, list
 				if !ok {
 					return fmt.Errorf("%w: %s is not in its pack", errSourceChanged, rel)
 				}
-				fh, err := sr.OpenFile(filepath.FromSlash(rel), os.O_RDONLY|markerOpenFlags, 0)
+				fh, err := openTreeEntry(sr, filepath.FromSlash(rel), os.O_RDONLY|markerOpenFlags)
 				if errors.Is(err, fs.ErrNotExist) {
 					continue
 				}

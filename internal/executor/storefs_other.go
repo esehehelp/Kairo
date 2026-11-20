@@ -24,6 +24,10 @@ const markerOpenFlags = syscall.O_NONBLOCK
 // isLink reports whether fi (from Lstat) is a symbolic link.
 func isLink(fi os.FileInfo) bool { return fi.Mode()&os.ModeSymlink != 0 }
 
+func openTreeEntry(r *os.Root, name string, flags int) (*os.File, error) {
+	return r.OpenFile(name, flags, 0)
+}
+
 // deviceOf is the device of the filesystem fi is on (a mount point has
 // another than its parent).
 func deviceOf(fi os.FileInfo) uint64 {

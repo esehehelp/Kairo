@@ -705,11 +705,18 @@ func readBatch(dir *os.Root) ([]string, error) {
 	return names, err
 }
 
+// reservedWindowsPath reports whether a slash-separated path is rejected by
+// os.Root on Windows solely because a component is a reserved device name.
+func reservedWindowsPath(name string) bool {
+	return runtime.GOOS == "windows" && fs.ValidPath(name) &&
+		!strings.ContainsAny(name, "\\:?\x00") && !filepath.IsLocal(name)
+}
+
 // eachEntry calls fn with each entry of name, a directory under r (as Lstat
 // sees it: links not followed), read a batch at a time, the deadline checked
 // between batches; a directory gone meanwhile has none.
 func eachEntry(ctx context.Context, r *os.Root, name string, fn func(fs.FileInfo)) error {
-	f, err := r.Open(name)
+	f, err := openTreeEntry(r, name, os.O_RDONLY)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil
 	}

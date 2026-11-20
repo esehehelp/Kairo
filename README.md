@@ -1067,7 +1067,9 @@ unpacks it under `<root>/sources/<id>` of the first volatile store it
 serves and starts the attempt there, `cwd` relative to it, with
 `KAIRO_SOURCE_DIR` and `KAIRO_SOURCE_ID` set. A file packed executable, or
 one that begins with `#!` (a snapshot made on Windows has no execute bits),
-is unpacked executable, so `./scripts/x.sh` runs on Linux.
+is unpacked executable, so `./scripts/x.sh` runs on Linux. On Windows,
+entries with reserved device names that cannot be created through store
+handles are checked but skipped, with their paths logged.
 
 The unpacked snapshot is read-only: its files on every system, its
 directories too but on Windows (where that would not keep files from being
@@ -1282,7 +1284,9 @@ sorted by its path (relative, `/`-separated; a backslash, tab, CR or LF in it
 written `\\`, `\t`, `\r`, `\n`), the format neo-ime's own packs on the durable
 store use. Directories are packed with their mode and mtime; links, special
 files and mount points are skipped (counted, never followed or entered), and
-the marker is left out. The directory is reached as the store's rules say: the
+the marker is left out. Windows reserved device names such as `aux` are
+packed by their literal names through directory handles, without following
+reparse points. The directory is reached as the store's rules say: the
 executor derives it from the root, the object's kind and its id (never a path
 it is sent), opens it one directory at a time through handles and checks its
 marker names it; a file must be the one listed, keep its size and mtime
@@ -1403,9 +1407,11 @@ be listed with the size and mtime it was packed with (stat'ed through its
 handle), and nothing else may be there but directories: a file written or
 added since, a link, a special file or a mount point (none of which the pack
 holds) keeps the source, with why, and its pack is removed all the same (the
-copy holds it). Files listed but gone are no matter (a deletion cut short
-removed them). A source an attempt this executor launched still runs in
-waits. A marker that cannot be read now (denied, in use, an I/O error) or a
+copy holds it). On Windows a reserved device name directly in the source
+also keeps it if the name cannot be removed through its directory handle
+without deleting the marker first. Files listed but gone are no matter (a
+deletion cut short removed them). A source an attempt this executor launched
+still runs in waits. A marker that cannot be read now (denied, in use, an I/O error) or a
 directory replaced while it was opened is a failure tried again, not a
 reason to keep. It first claims the deletion
 (`deleting`, taken only while there is a verified copy that no read-back has
@@ -1640,8 +1646,10 @@ with its file list (resumed with a range request when cut short), checked
 against the pack's size and sha256 and the list's sha256, and unpacked into
 `<root>/inputs/<object id>.partial`: only directories and regular files at
 relative paths inside it (written through a handle on it, so nothing
-escapes), each file's size and sha256 checked against the list and its
-mtime set as packed, every listed file there; then it is renamed
+escapes), each file's size and sha256 checked against the list, every listed
+file there, and the mtime set as packed for files written. On Windows only,
+paths with reserved device names that cannot be created through store
+handles are checked but skipped, with their paths logged. Then it is renamed
 `<root>/inputs/<object id>`, the pack and list are removed and it is
 recorded ready. A fetch that fails is warned once and tried again later.
 What is brought stays, read in place by every later execution on that node

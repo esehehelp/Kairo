@@ -507,7 +507,7 @@ func sameListedFile(listed, opened fs.FileInfo, stableIDs bool) bool {
 // (sameListedFile), must hold no more than its size and keep its size and
 // mtime while it is read.
 func packFile(src *os.Root, tw *tar.Writer, rel string, info fs.FileInfo, stableIDs bool) (string, int64, error) {
-	fh, err := src.OpenFile(filepath.FromSlash(rel), os.O_RDONLY|markerOpenFlags, 0)
+	fh, err := openTreeEntry(src, filepath.FromSlash(rel), os.O_RDONLY|markerOpenFlags)
 	if err != nil {
 		return "", 0, err
 	}
@@ -569,7 +569,7 @@ func packLiveFile(ctx context.Context, src *os.Root, packs *os.Root, stageName s
 	var listed fs.FileInfo
 	stable := false
 	for try := 1; ; try++ {
-		fh, err := src.OpenFile(filepath.FromSlash(rel), os.O_RDONLY|markerOpenFlags, 0)
+		fh, err := openTreeEntry(src, filepath.FromSlash(rel), os.O_RDONLY|markerOpenFlags)
 		if err != nil {
 			return "", 0, err
 		}

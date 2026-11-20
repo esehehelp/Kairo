@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
@@ -23,6 +25,63 @@ func isLink(fi os.FileInfo) bool {
 		return true
 	}
 	return false
+}
+
+// openTreeEntry reads through os.Root unless it refuses a reserved name.
+// Native handle-relative opens bypass DOS device names without reopening
+// an absolute path whose ancestors could have been replaced by links.
+func openTreeEntry(r *os.Root, name string, flags int) (*os.File, error) {
+	rel := filepath.ToSlash(name)
+	if !reservedWindowsPath(rel) {
+		return r.OpenFile(name, flags, 0)
+	}
+	f, err := r.Open(".")
+	if err != nil {
+		return nil, err
+	}
+	for part := range strings.SplitSeq(rel, "/") {
+		next, err := openLiteralChild(f, part)
+		f.Close()
+		if err != nil {
+			return nil, &os.PathError{Op: "openat", Path: name, Err: err}
+		}
+		f = next
+	}
+	return f, nil
+}
+
+// openLiteralChild opens one validated component, refusing every reparse
+// point on the handle itself, before it can be read or used as a parent.
+func openLiteralChild(parent *os.File, name string) (*os.File, error) {
+	ntName, err := windows.NewNTUnicodeString(name)
+	if err != nil {
+		return nil, err
+	}
+	attrs := windows.OBJECT_ATTRIBUTES{RootDirectory: windows.Handle(parent.Fd()), ObjectName: ntName, Attributes: windows.OBJ_DONT_REPARSE}
+	attrs.Length = uint32(unsafe.Sizeof(attrs))
+	var h windows.Handle
+	err = windows.NtCreateFile(&h, windows.FILE_GENERIC_READ, &attrs, &windows.IO_STATUS_BLOCK{}, nil, 0,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE, windows.FILE_OPEN,
+		windows.FILE_SYNCHRONOUS_IO_NONALERT|windows.FILE_OPEN_REPARSE_POINT, 0, 0)
+	runtime.KeepAlive(parent)
+	if err != nil {
+		if err == windows.STATUS_REPARSE_POINT_ENCOUNTERED {
+			return nil, errScratchLink
+		}
+		if status, ok := err.(windows.NTStatus); ok {
+			err = status.Errno()
+		}
+		return nil, err
+	}
+	var info windows.ByHandleFileInformation
+	if err = windows.GetFileInformationByHandle(h, &info); err == nil && info.FileAttributes&windows.FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+		err = errScratchLink
+	}
+	if err != nil {
+		windows.CloseHandle(h)
+		return nil, err
+	}
+	return os.NewFile(uintptr(h), filepath.Join(parent.Name(), name)), nil
 }
 
 // deviceOf: a volume mounted inside another is a reparse point (isLink), so
