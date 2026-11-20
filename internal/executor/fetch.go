@@ -100,9 +100,6 @@ func (e *Local) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder,
 	}
 	root := filepath.Clean(s.decl.Root)
 	made.Path = filepath.Join(root, inputsDirName, o.ObjectID)
-	if free := freeOn(ctx, s); free >= 0 && free-(o.PackBytes+o.ContentBytes) < headroom(s) {
-		return made, fmt.Errorf("%d bytes free on %s, %d to bring, %d to leave free", free, s.decl.ID, o.PackBytes+o.ContentBytes, headroom(s))
-	}
 	r, err := openDirPath(root, false)
 	if err != nil {
 		return made, err
@@ -119,6 +116,10 @@ func (e *Local) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder,
 		return made, err
 	}
 	packName := o.ObjectID + packSuffix
+	needed := fetchBytesNeeded(dir, packName, o)
+	if free := freeOn(ctx, s); free >= 0 && free-needed < headroom(s) {
+		return made, fmt.Errorf("%d bytes free on %s, %d to bring, %d to leave free", free, s.decl.ID, needed, headroom(s))
+	}
 	listName := packName + manifestSuffix
 	copyOrder := store.CopyOrder{ObjectID: o.ObjectID, PackBytes: o.PackBytes, PackSHA256: o.PackSHA256, ManifestSHA256: o.ManifestSHA256, Source: o.Source}
 	if err = e.fetch(ctx, copyOrder, served, dir, packName, listName); err != nil {
@@ -166,6 +167,16 @@ func (e *Local) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder,
 		e.Logger.Warn("input entries skipped: reserved Windows names", "object_id", o.ObjectID, "paths", skipped)
 	}
 	return made, nil
+}
+
+// fetchBytesNeeded counts both the pack and unpacked tree, except pack bytes
+// already on disk.
+func fetchBytesNeeded(dir *os.Root, packName string, o store.FetchOrder) int64 {
+	pack := o.PackBytes
+	if fi, err := dir.Lstat(packName + partialSuffix); err == nil && fi.Mode().IsRegular() && !isLink(fi) {
+		pack -= min(pack, fi.Size())
+	}
+	return pack + o.ContentBytes
 }
 
 // freeOn is the free bytes of a store's filesystem (-1 when unknown).

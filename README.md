@@ -1172,7 +1172,8 @@ at a time. A report that read the whole `<root>/scratch` marks a recorded
 scratch at that root it did not find `missing` (bytes 0, listed by
 `kairo store status`, never taken as deleted: Kairo did not delete it) until
 it is found again; a directory there whose marker cannot be read now (its
-mode, say) is not taken as missing.
+mode, say) is not taken as missing. The executor samples filesystem usage
+last, after scanning scratch and outputs.
 
 `kairo store status [--json]` (`GET /api/stores`, `{"stores": [...]}`) shows
 each store: class, node (and executor), `state` (`unknown`: never reported,
@@ -1363,8 +1364,9 @@ since, plus the copies shed there since: the report is minutes old) sheds
 copies: its executor is ordered (`Shed` in `copies-to-make`) to remove
 copies there of objects that keep at least two verified, undamaged copies on
 other durable stores, the biggest first, up to 50 at a time and only as many
-as cover the shortfall; never a copy a replica or a fetch is reading. Each is claimed
-first (`claim-shed`: the record goes, the other copies counted again; event
+as cover the shortfall; never a copy a replica or a fetch is reading. Each is
+claimed first by an executor serving the store (`claim-shed`: other copies
+and active readers are checked again before the record goes; event
 `copy_shed`), then its pack, file list and description are removed. Replicas
 leave at least 1 GiB free above the reserve and do not return to a store
 that shed the same object in the last 24 hours.
@@ -1643,9 +1645,10 @@ tasks, for each input an execution waiting on a node lacks there; or by
 `kairo data fetch --project P --node N [--data NAME]... [OBJECT...]`,
 `POST /api/data/fetches`, `{"project", "node", "data", "objects"}`). It is
 brought to the volatile store of the node, among those an executor of the
-node that is not a WSL one serves, with the most room for what it unpacks
-(its free bytes as last reported, less its `reserve_free_bytes`, at least
-1 GiB, and what the fetches there will unpack; the first by id among equals),
+node that is not a WSL one serves, with the most room for its pack and
+unpacked tree (its free bytes as last reported, less its `reserve_free_bytes`,
+at least 1 GiB, and the pack and tree sizes of pending fetches there; the
+first by id among equals),
 by that executor: the volatile stores of a node are one pool, none preferred
 for its id; a fetch not ready an hour after it was ordered, on a store without
 room for it, moves to the other such store with the most room, if one has
@@ -1669,7 +1672,9 @@ file there, and the mtime set as packed for files written. On Windows only,
 paths with reserved device names that cannot be created through store
 handles are checked but skipped, with their paths logged. Then it is renamed
 `<root>/inputs/<object id>`, the pack and list are removed and it is
-recorded ready. A fetch that fails is warned once and tried again later.
+recorded ready. The executor checks room for the rest of the pack and the
+unpacked tree. An already unpacked tree needs no more room to be recorded.
+A fetch that fails is warned once and tried again later.
 What is brought stays, read in place by every later execution on that node
 that names it, and is counted as the store's `CACHE` bytes, until it is
 evicted.

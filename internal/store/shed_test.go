@@ -87,8 +87,39 @@ func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 	if err := store.ClaimShed(ctx, "executor", "obj_1", "c-durable"); !errors.Is(err, ErrShedRefused) {
 		t.Fatalf("claimed by an executor not serving the store: %v", err)
 	}
+	// Readers that start after the order must still prevent the claim.
+	for _, source := range []any{"c-durable", nil} {
+		if _, err := store.testExec(`INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,source_store_id,created_at,updated_at)
+			VALUES('obj_1','g-durable','durable-exec','G:/kairo','202611','copying',$1,$2,$2)`, source, now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.ClaimShed(ctx, "durable-exec", "obj_1", "c-durable"); !errors.Is(err, ErrShedRefused) {
+			t.Fatalf("claimed while a replica reads from %v: %v", source, err)
+		}
+		if _, err := store.testExec(`DELETE FROM object_copies WHERE object_id='obj_1' AND store_id='g-durable'`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	path := "D:/kairo/inputs/obj_1"
+	if _, err := store.testExec(`INSERT INTO object_placements(object_id,store_id,executor_id,root,path,state,created_at,updated_at)
+		VALUES('obj_1','d-scratch','durable-exec','D:/kairo',$1,'fetching',$2,$2)`, path, now()); err != nil {
+		t.Fatal(err)
+	}
+	fetches, err := store.FetchesToMake(ctx, "durable-exec")
+	if err != nil || len(fetches) != 1 || !fetches[0].Source.Local || fetches[0].Source.StoreID != "c-durable" {
+		t.Fatalf("local fetch: %+v %v", fetches, err)
+	}
+	if err := store.ClaimShed(ctx, "durable-exec", "obj_1", "c-durable"); !errors.Is(err, ErrShedRefused) {
+		t.Fatalf("claimed while a fetch is reading: %v", err)
+	}
+	if err := store.RecordFetch(ctx, FetchMade{ObjectID: "obj_1", StoreID: "d-scratch", ExecutorID: "durable-exec", Path: path, Bytes: 10}); err != nil {
+		t.Fatal(err)
+	}
 	if err := store.ClaimShed(ctx, "durable-exec", "obj_1", "c-durable"); err != nil {
 		t.Fatal(err)
+	}
+	if err := store.ClaimShed(ctx, "executor", "obj_1", "c-durable"); !errors.Is(err, ErrShedRefused) {
+		t.Fatalf("missing copy claimed by an executor not serving the store: %v", err)
 	}
 	if err := store.ClaimShed(ctx, "durable-exec", "obj_1", "c-durable"); err != nil {
 		t.Fatalf("claimed again: %v", err)

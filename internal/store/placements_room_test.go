@@ -10,9 +10,9 @@ import (
 )
 
 // An object is brought to the volatile store of the node with the most room
-// for what it unpacks (the first by id among equals); a fetch long waiting on
-// a store without room moves to one with room (event fetch_moved), and is
-// ordered there.
+// for its pack and unpacked tree (the first by id among equals); a fetch
+// long waiting on a store without room moves to one with room (event
+// fetch_moved), and is ordered there.
 func TestAFetchGoesWhereThereIsRoom(t *testing.T) {
 	store := importFixture(t)
 	ctx := context.Background()
@@ -79,8 +79,8 @@ func TestAFetchGoesWhereThereIsRoom(t *testing.T) {
 	if got := storeOf(first); got != "a-small" {
 		t.Fatalf("first fetch on %s", got)
 	}
-	// a-small has room for 500 bytes past its reserve: 900 do not fit
-	free, total := int64(1500), int64(100000)
+	// a-small has room for the 900-byte tree, but not also its 100-byte pack.
+	free, total := int64(minFetchHeadroom+950), int64(2*minFetchHeadroom)
 	if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: "a-small", ExecutorID: "exec2", Root: "/srv/kairo-store", Usable: true, FreeBytes: &free, TotalBytes: &total}); err != nil {
 		t.Fatal(err)
 	}
@@ -117,15 +117,15 @@ func TestAFetchGoesWhereThereIsRoom(t *testing.T) {
 		t.Fatalf("fetch_moved events %d %v", events, err)
 	}
 	// both with room: the one with the most, whatever its id (the volatile stores of a node are one pool)
-	report := func(storeID, root string, gib int64) {
+	report := func(storeID, root string, room int64) {
 		t.Helper()
-		free := gib << 30
+		free := minFetchHeadroom + room
 		if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: storeID, ExecutorID: "exec2", Root: root, Usable: true, FreeBytes: &free, TotalBytes: &free}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	report("a-small", "/srv/kairo-store", 3)
-	report("b-big", "/big/kairo-store", 5)
+	report("a-small", "/srv/kairo-store", 1500)
+	report("b-big", "/big/kairo-store", 5000)
 	third := packed("D:/data/third", "third")
 	if _, err := store.FetchData(ctx, FetchRequest{Project: "imp", Node: "node2", Objects: []string{third}}); err != nil {
 		t.Fatal(err)
@@ -133,7 +133,8 @@ func TestAFetchGoesWhereThereIsRoom(t *testing.T) {
 	if got := storeOf(third); got != "b-big" {
 		t.Fatalf("a fetch went to %s, not the store with the most room", got)
 	}
-	report("a-small", "/srv/kairo-store", 9)
+	// b-big has 2000 bytes left after its three pending fetches, not 2300.
+	report("a-small", "/srv/kairo-store", 2150)
 	fourth := packed("D:/data/fourth", "fourth")
 	if _, err := store.FetchData(ctx, FetchRequest{Project: "imp", Node: "node2", Objects: []string{fourth}}); err != nil {
 		t.Fatal(err)

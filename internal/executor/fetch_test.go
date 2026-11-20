@@ -3,6 +3,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"math"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -117,12 +118,47 @@ func TestAnObjectIsBroughtFromItsDurableCopy(t *testing.T) {
 	if !strings.Contains(logs.String(), "obj_bad") {
 		t.Fatalf("the bad copy was not warned of:\n%s", logs.String())
 	}
-	// asked again (not recorded, say): taken as it is
+	// Asked again (not recorded, say): no room is needed for an unpacked tree.
+	e.stores[0].decl.ReserveFreeBytes = math.MaxInt64
 	fake.orders, fake.made = []store.FetchOrder{order}, nil
 	e.fetches = round{}
 	e.fetchDue(ctx)
 	if len(fake.made) != 1 || fake.made[0].Bytes != res.contentBytes {
 		t.Fatalf("again: %+v", fake.made)
+	}
+}
+
+func TestFetchNeedsRoomOnlyForTheRestOfItsPackAndTheTree(t *testing.T) {
+	dir, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	order := store.FetchOrder{PackBytes: 100, ContentBytes: 900}
+	pack := "obj_d" + packSuffix
+	partial := pack + partialSuffix
+	check := func(want int64) {
+		t.Helper()
+		if got := fetchBytesNeeded(dir, pack, order); got != want {
+			t.Fatalf("needs %d bytes, want %d", got, want)
+		}
+	}
+	check(1000)
+	if err := dir.Mkdir(partial, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	check(1000)
+	if err := dir.Remove(partial); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		size int
+		want int64
+	}{{40, 960}, {100, 900}, {110, 900}} {
+		if err := dir.WriteFile(partial, make([]byte, tc.size), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		check(tc.want)
 	}
 }
 
