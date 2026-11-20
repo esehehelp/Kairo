@@ -330,54 +330,87 @@ func sameNamespace(ctx context.Context, q queryer, declared []machine.Store, p i
 	return err == nil && !other.wsl && !me.wsl
 }
 
-// inputsNodeTx is the node an execution with inputs is planned onto: the
-// first (by id) every input is on, else the first the first input is on,
-// else the node its data object was made on ("" when none is known).
-func inputsNodeTx(ctx context.Context, q queryer, declared []machine.Store, projectScopeID string, inputs []datainput.Input) (string, error) {
+// inputsNodesTx are the nodes an execution with inputs is best planned
+// onto, best first: those (by id) every input is on, then those any input is
+// on (the first input's first), then the nodes the inputs' data objects were
+// made on.
+func inputsNodesTx(ctx context.Context, q queryer, declared []machine.Store, projectScopeID string, inputs []datainput.Input) ([]string, error) {
 	var sources []inputSource
 	for _, in := range inputs {
 		src, err := inputSourceTx(ctx, q, declared, projectScopeID, in)
 		if err != nil {
-			return "", err
+			return nil, err
 		}
 		sources = append(sources, src)
 	}
-	nodes := map[string]bool{}
-	for _, p := range sources[0].places {
-		nodes[p.node] = true
-	}
 	var common []string
-	for n := range nodes {
+	for _, p := range sources[0].places {
 		all := true
 		for _, src := range sources[1:] {
-			all = all && src.on(n)
+			all = all && src.on(p.node)
 		}
 		if all {
-			common = append(common, n)
+			common = append(common, p.node)
 		}
 	}
 	sort.Strings(common)
-	if len(common) > 0 {
-		return common[0], nil
-	}
-	if len(sources[0].places) > 0 {
-		return sources[0].places[0].node, nil
-	}
-	if sources[0].objectID != "" {
-		var node string
-		err := q.QueryRowContext(ctx, `SELECT x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id WHERE d.id=$1`, sources[0].objectID).Scan(&node)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return "", err
+	var out []string
+	seen := map[string]bool{}
+	add := func(node string) {
+		if node != "" && !seen[node] {
+			seen[node] = true
+			out = append(out, node)
 		}
-		return node, nil
 	}
-	return "", nil
+	for _, n := range common {
+		add(n)
+	}
+	for _, src := range sources {
+		for _, p := range src.places {
+			add(p.node)
+		}
+	}
+	for _, src := range sources {
+		if src.objectID == "" {
+			continue
+		}
+		var node string
+		err := q.QueryRowContext(ctx, `SELECT x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id WHERE d.id=$1`, src.objectID).Scan(&node)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+		add(node)
+	}
+	return out, nil
+}
+
+// selectorNodesTx are the nodes (by id) with an enabled executor that
+// matches an executor selector naming no node.
+func selectorNodesTx(ctx context.Context, q queryer, selector string) (map[string]bool, []string, error) {
+	match := map[string]bool{}
+	var nodes []string
+	err := eachRow(ctx, q, `SELECT node_id,attributes_json FROM executors WHERE enabled ORDER BY node_id,id`, nil, func(rows *sql.Rows) error {
+		var node, attributes string
+		if err := rows.Scan(&node, &attributes); err != nil {
+			return err
+		}
+		if !match[node] && selectorMatches(selector, node, attributes) {
+			match[node] = true
+			nodes = append(nodes, node)
+		}
+		return nil
+	})
+	return match, nodes, err
 }
 
 // pinInputNodeTx plans an execution onto the node of the store it names
-// (spec.Store), else, with inputs, onto the node they are on
-// (inputsNodeTx), unless its executor selector names a node itself. A gang
-// is not pinned: its ranks go on distinct nodes (rank 0 reads the inputs).
+// (spec.Store), else, with inputs, onto the best node for them
+// (inputsNodesTx) that has an executor its labels match, else onto the
+// first node that has one (the inputs are brought there), unless its
+// executor selector names a node itself. A node no executor of which the
+// labels match would never take it: with none anywhere it is left unpinned,
+// to wait for one (no_executor). A gang is not pinned: its ranks go on
+// distinct nodes (rank 0 reads the inputs).
 func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *ExecutionSpec) error {
 	if len(spec.Inputs) == 0 && spec.Store == "" || spec.Gang != nil {
 		return nil
@@ -421,9 +454,20 @@ func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *Execut
 	if err != nil {
 		return err
 	}
-	node, err := inputsNodeTx(ctx, q, declared, projectScopeID, spec.Inputs)
-	if err != nil || node == "" {
+	best, err := inputsNodesTx(ctx, q, declared, projectScopeID, spec.Inputs)
+	if err != nil || len(best) == 0 {
 		return err
+	}
+	match, matching, err := selectorNodesTx(ctx, q, string(spec.ExecutorSelector))
+	if err != nil || len(matching) == 0 {
+		return err
+	}
+	node := matching[0]
+	for _, n := range best {
+		if match[n] {
+			node = n
+			break
+		}
 	}
 	selector["node"] = node
 	body, err := json.Marshal(selector)

@@ -141,3 +141,65 @@ func TestAnInputIsBroughtToTheNodeItIsReadOn(t *testing.T) {
 	}
 	_ = sql.ErrNoRows
 }
+
+// An execution whose executor selector names no node is planned onto a node
+// that holds its inputs only when an executor there matches its labels; else
+// onto a node with such an executor (the inputs are brought there), and when
+// no node has one it is left unpinned (issue #17: it was pinned to the
+// inputs' node and waited no_executor for good).
+func TestAnInputPinsOnlyANodeTheLabelsMatch(t *testing.T) {
+	store := importFixture(t)
+	ctx := context.Background()
+	if err := store.UpsertNode(ctx, Node{ID: "node2", Name: "node2", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertExecutor(ctx, Executor{ID: "exec2", NodeID: "node2", Kind: "linux", Attributes: json.RawMessage(`{"environment":"linux"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	addTestDisk(t, store, "node2", "/")
+	spec := storesSpec(
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "n2-scratch", Class: machine.StoreVolatile, Node: "node2", Root: "/srv/kairo-store", Filesystem: "/"},
+	)
+	spec.Nodes = append(spec.Nodes, machine.Node{ID: "node2"})
+	if _, err := store.ApplyMachines(ctx, spec, false); err != nil {
+		t.Fatal(err)
+	}
+	imported, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"D:/data/sumire"}, Name: "sumire", DeleteSource: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectID := imported[0].ObjectID
+	sha := strings.Repeat("ab", 32)
+	if err := store.RecordPack(ctx, PackMade{ObjectID: objectID, ExecutorID: "win-exec", PackPath: "D:/kairo/packs/" + objectID + ".tar.zst",
+		ManifestPath: "D:/kairo/packs/" + objectID + ".tar.zst.files.tsv", PackBytes: 100, ContentBytes: 900, Files: 3, PackSHA256: sha, ManifestSHA256: sha}); err != nil {
+		t.Fatal(err)
+	}
+	pinned := func(name, labels string) string {
+		t.Helper()
+		reader := schedulerExecutionSpec(name)
+		reader.Scope.Project = "imp"
+		reader.ExecutorSelector = json.RawMessage(`{"labels":` + labels + `}`)
+		reader.Exclusive, reader.Checkpointable, reader.Preemptible = []ExclusiveRequest{}, false, false
+		reader.Inputs = []datainput.Input{{Name: "data", Data: "sumire"}}
+		execution, _, err := store.SubmitExecution(ctx, reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var selector string
+		if err := store.db.QueryRowContext(ctx, `SELECT executor_selector_json FROM execution_requests WHERE id=$1`, execution.ID).Scan(&selector); err != nil {
+			t.Fatal(err)
+		}
+		return selectorNode(selector)
+	}
+	if node := pinned("on-windows", `{"environment":"windows"}`); node != "node" {
+		t.Fatalf("labels the inputs' node matches: pinned to %q", node)
+	}
+	if node := pinned("on-linux", `{"environment":"linux"}`); node != "node2" {
+		t.Fatalf("labels only another node matches: pinned to %q", node)
+	}
+	if node := pinned("on-nothing", `{"environment":"macos"}`); node != "" {
+		t.Fatalf("labels no node matches: pinned to %q", node)
+	}
+}
