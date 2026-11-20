@@ -10,6 +10,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -177,6 +179,118 @@ func TestPackPacksADirectoryWithItsFileList(t *testing.T) {
 	}
 	if _, err := fs.Pack(ctx, root, kindOutput, "../x", "obj_4"); !errors.Is(err, errOutsideRoot) {
 		t.Fatalf("a path as id: %v", err)
+	}
+}
+
+func TestPackAndUnpackReservedWindowsNames(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	fs := localStoreFS{}
+	dir, err := fs.CreateKind(ctx, root, kindScratch, "att_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	literal := dir
+	if runtime.GOOS == "windows" {
+		literal = `\\?\` + dir
+	}
+	files := map[string]string{
+		"pytest/aux/nested/data": "aux contents",
+		"pytest/aux.txt":         "extension",
+		"pytest/CoM¹":            "superscript",
+		"pytest/LPT9":            "digit",
+		"ordinary":               "ordinary contents",
+	}
+	for name, body := range files {
+		p := filepath.Join(literal, filepath.FromSlash(name))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	res, err := fs.Pack(ctx, root, kindScratch, "att_1", "obj_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reserved []string
+	if runtime.GOOS == "windows" {
+		reserved = []string{"pytest/aux", "pytest/aux/nested", "pytest/aux/nested/data", "pytest/CoM¹", "pytest/LPT9"}
+		if !filepath.IsLocal("aux.txt") {
+			reserved = append(reserved, "pytest/aux.txt")
+		}
+	}
+	// The reader used to inspect the tar does not apply the unpacker's path checks.
+	t.Setenv("GODEBUG", "tarinsecurepath=1")
+	entries := unpack(t, res.packPath)
+	if _, ok := entries["pytest/aux/"]; !ok || res.files != int64(len(files)) || res.skipped != 0 {
+		t.Fatalf("entries %v, files %d, skipped %d", entries, res.files, res.skipped)
+	}
+	for name, body := range files {
+		if entries[name] != body || !strings.Contains(res.listBody, "\n"+name+"\t") {
+			t.Fatalf("%q missing from pack or file list: %v\n%s", name, entries, res.listBody)
+		}
+	}
+	packs, err := os.OpenRoot(filepath.Dir(res.packPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer packs.Close()
+	dest := t.TempDir()
+	into, err := os.OpenRoot(dest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer into.Close()
+	t.Setenv("GODEBUG", "tarinsecurepath=0")
+	var skipped []string
+	n, err := unpackChecked(ctx, packs, filepath.Base(res.packPath), filepath.Base(res.manifestPath), into, false, &skipped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(skipped)
+	sort.Strings(reserved)
+	if !slices.Equal(skipped, reserved) {
+		t.Fatalf("skipped %q, want %q", skipped, reserved)
+	}
+	for _, name := range skipped {
+		if _, err := os.Lstat(`\\?\` + filepath.Join(dest, filepath.FromSlash(name))); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("skipped entry %q on disk: %v", name, err)
+		}
+		delete(files, name)
+	}
+	var wantBytes int64
+	for name, want := range files {
+		got, err := into.ReadFile(filepath.FromSlash(name))
+		if err != nil || string(got) != want {
+			t.Fatalf("%s: %q %v, want %q", name, got, err, want)
+		}
+		wantBytes += int64(len(want))
+	}
+	if n != wantBytes {
+		t.Fatalf("unpacked %d bytes, want %d", n, wantBytes)
+	}
+	if runtime.GOOS == "windows" {
+		// A skipped file still has to match the manifest hash.
+		badList := strings.Replace(res.listBody, sha256Hex("aux contents"), sha256Hex("wrong"), 1)
+		if err := writeNew(packs, "bad.tsv", []byte(badList)); err != nil {
+			t.Fatal(err)
+		}
+		other, err := os.OpenRoot(t.TempDir())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer other.Close()
+		if _, err := unpackChecked(ctx, packs, filepath.Base(res.packPath), "bad.tsv", other, false, &skipped); !errors.Is(err, errInputMismatch) {
+			t.Fatalf("unpacked a skipped file with the wrong hash: %v", err)
+		}
+	}
+	if err := checkPacked(ctx, root, kindScratch, "att_1", "obj_1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.RemoveKind(ctx, root, kindScratch, dir, "att_1", false); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -87,6 +87,31 @@ func TestRemoveScratchNeverFollowsAJunction(t *testing.T) {
 	}
 }
 
+// The literal-name open must refuse a junction, including one swapped in
+// after a pack listed a plain directory.
+func TestOpenTreeEntryRefusesReservedNameJunction(t *testing.T) {
+	dir := t.TempDir()
+	outside, _ := outsideTree(t)
+	mklinkJunction(t, filepath.Join(dir, "junction"), outside)
+	if err := os.Rename(filepath.Join(dir, "junction"), `\\?\`+filepath.Join(dir, "aux")); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	for _, name := range []string{"aux", `aux\child`} {
+		f, err := openTreeEntry(root, name, os.O_RDONLY)
+		if f != nil {
+			f.Close()
+		}
+		if !errors.Is(err, errScratchLink) {
+			t.Fatalf("open %s: %v, want a link refusal", name, err)
+		}
+	}
+}
+
 // A root on NTFS or exFAT is taken; on exFAT a deletion's clearing of the
 // read-only attribute can only reach the file deleted (no hard links). The
 // exFAT case runs where a drive is exFAT.

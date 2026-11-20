@@ -150,7 +150,8 @@ func (e *Local) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder,
 	if err != nil {
 		return made, err
 	}
-	made.Bytes, err = unpackChecked(ctx, dir, packName+partialSuffix, listName+partialSuffix, into, false)
+	var skipped []string
+	made.Bytes, err = unpackChecked(ctx, dir, packName+partialSuffix, listName+partialSuffix, into, false, &skipped)
 	into.Close()
 	if err != nil {
 		_ = dir.RemoveAll(unpacking)
@@ -161,6 +162,9 @@ func (e *Local) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder,
 	}
 	_ = dir.Remove(packName + partialSuffix)
 	_ = dir.Remove(listName + partialSuffix)
+	if len(skipped) != 0 {
+		e.Logger.Warn("input entries skipped: reserved Windows names", "object_id", o.ObjectID, "paths", skipped)
+	}
 	return made, nil
 }
 
@@ -176,8 +180,9 @@ func freeOn(ctx context.Context, s servedStore) int64 {
 // regular file against the file list listName and that every file listed is
 // there, and returns the bytes unpacked. With execBits (a code snapshot) a
 // file packed executable, or one beginning with "#!" (a pack made on Windows
-// has no execute bits), is made executable (0755).
-func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string, into *os.Root, execBits bool) (int64, error) {
+// has no execute bits), is made executable (0755). Reserved Windows names
+// os.Root cannot create are checked but not written, and listed in skipped.
+func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string, into *os.Root, execBits bool, skipped *[]string) (int64, error) {
 	listFile, err := dir.Open(listName)
 	if err != nil {
 		return 0, err
@@ -237,16 +242,24 @@ func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string,
 		if errors.Is(err, io.EOF) {
 			break
 		}
-		if err != nil {
+		if err != nil && !errors.Is(err, tar.ErrInsecurePath) {
 			return total, err
 		}
 		name := strings.TrimSuffix(h.Name, "/")
+		skip := reservedWindowsPath(name)
+		if err != nil && !skip {
+			return total, err
+		}
 		if name == "" || path.IsAbs(name) || path.Clean(name) != name || name == ".." || strings.HasPrefix(name, "../") || strings.Contains(name, "\\") {
 			return total, fmt.Errorf("%w: entry %q", errInputMismatch, h.Name)
 		}
 		local := filepath.FromSlash(name)
 		switch h.Typeflag {
 		case tar.TypeDir:
+			if skip {
+				*skipped = append(*skipped, name)
+				continue
+			}
 			if err := into.MkdirAll(local, 0o755); err != nil {
 				return total, err
 			}
@@ -255,28 +268,43 @@ func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string,
 			if !ok {
 				return total, fmt.Errorf("%w: %s is not in the file list", errInputMismatch, name)
 			}
-			if parent := filepath.Dir(local); parent != "." {
-				if err := into.MkdirAll(parent, 0o755); err != nil {
+			var dst io.Writer = io.Discard
+			var f *os.File
+			if skip && seen[name] {
+				return total, fmt.Errorf("%w: %s is in the pack twice", errInputMismatch, name)
+			}
+			if !skip {
+				if parent := filepath.Dir(local); parent != "." {
+					if err := into.MkdirAll(parent, 0o755); err != nil {
+						return total, err
+					}
+				}
+				f, err = into.OpenFile(local, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+				if err != nil {
 					return total, err
 				}
-			}
-			f, err := into.OpenFile(local, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
-			if err != nil {
-				return total, err
+				dst = f
 			}
 			hash, head := sha256.New(), &headWriter{}
-			n, err := io.Copy(io.MultiWriter(f, hash, head), io.LimitReader(tr, w.size+1))
-			if err == nil {
-				err = f.Sync()
-			}
-			if closeErr := f.Close(); err == nil {
-				err = closeErr
+			n, err := io.Copy(io.MultiWriter(dst, hash, head), io.LimitReader(tr, w.size+1))
+			if f != nil {
+				if err == nil {
+					err = f.Sync()
+				}
+				if closeErr := f.Close(); err == nil {
+					err = closeErr
+				}
 			}
 			if err != nil {
 				return total, err
 			}
 			if n != w.size || hex.EncodeToString(hash.Sum(nil)) != w.sha {
 				return total, fmt.Errorf("%w: %s unpacked as %d bytes, sha256 %s; listed %d bytes, sha256 %s", errInputMismatch, name, n, hex.EncodeToString(hash.Sum(nil)), w.size, w.sha)
+			}
+			seen[name] = true
+			if skip {
+				*skipped = append(*skipped, name)
+				continue
 			}
 			if execBits && (h.Mode&0o111 != 0 || bytes.HasPrefix(head.b, []byte("#!"))) {
 				if err := into.Chmod(local, 0o755); err != nil {
@@ -287,7 +315,6 @@ func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string,
 			if err := into.Chtimes(local, mtime, mtime); err != nil {
 				return total, err
 			}
-			seen[name] = true
 			total += n
 		default:
 			return total, fmt.Errorf("%w: %s is neither a directory nor a regular file", errInputMismatch, name)

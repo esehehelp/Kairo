@@ -310,7 +310,8 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 	if err != nil {
 		return "", err
 	}
-	_, err = unpackChecked(ctx, dir, packName, listName, into, true)
+	var skipped []string
+	_, err = unpackChecked(ctx, dir, packName, listName, into, true, &skipped)
 	if err == nil {
 		err = makeReadOnly(into)
 	}
@@ -345,6 +346,9 @@ func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (stri
 			_ = dir.Remove(src.ID + stateSuffix)
 		}
 		return "", err
+	}
+	if len(skipped) != 0 {
+		e.Logger.Warn("code snapshot entries skipped: reserved Windows names", "source_id", src.ID, "paths", skipped)
 	}
 	e.Logger.Info("code snapshot brought", "source_id", src.ID, "path", final)
 	return final, nil
