@@ -507,7 +507,13 @@ which no process of its attempt is seen (one carrying its
 `KAIRO_ATTEMPT_ID`, or one of its registered processes). A claim that is not
 the attempt's (another program's process, unattributed activity, a game)
 does not hold the lease: the claim keeps the device from being placed on by
-itself, and is not something the operator has to wait out.
+itself, and is not something the operator has to wait out. Nothing can still
+run under the stale lease of an attempt that never started its command (lost
+before its activation: its shim starts the command only on the go-ahead its
+agent sends after the activation, and an agent gone takes that go-ahead with
+it), nor under one of no attempt; the daemon releases those itself, once each
+of their resources has been observed since (event `stale_lease_reconciled`,
+`by: daemon`), and reconcile needs no confirmation for them.
 
 What an exited attempt left running (its launcher exited and its exit is
 recorded, yet a process of its tree runs: one it started without

@@ -343,6 +343,27 @@ func serve(args []string) error {
 		}()
 	}
 	if !daemonConfig.ObserveOnly {
+		// Stale leases nothing can still run under (no attempt, or one that
+		// never started its command) are released once their resources are
+		// observed again, without an operator.
+		go func() {
+			ticker := time.NewTicker(10 * time.Second)
+			defer ticker.Stop()
+			for {
+				if n, err := st.ReconcileUnstartedLeases(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("unstarted stale lease reconciliation failed", "error", err)
+				} else if n > 0 {
+					logger.Info("stale leases of what never started released", "count", n)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-ticker.C:
+				}
+			}
+		}()
+	}
+	if !daemonConfig.ObserveOnly {
 		// The operating-point policy asks for device settings within each
 		// device's max_slowdown, and ends bench runs whose execution ended.
 		go (&hwpolicy.Policy{Store: st, Logger: logger}).Run(ctx)

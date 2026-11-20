@@ -47,7 +47,12 @@ func TestExecutorRestartMakesOrphanReservationStale(t *testing.T) {
 	}
 }
 
-func TestLostAttemptRequiresExplicitAbsenceEvenWithoutProcessRow(t *testing.T) {
+// An attempt lost before its activation never started its command (its shim
+// waits for the go-ahead sent after the activation): its stale lease needs
+// no process-absence confirmation, and the daemon releases it by itself once
+// its resources are observed again (issue #19). An activated one still needs
+// the operator's confirmation.
+func TestALostAttemptThatNeverStartedIsReleasedWithoutAnOperator(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)
 	ctx := context.Background()
@@ -70,9 +75,52 @@ func TestLostAttemptRequiresExplicitAbsenceEvenWithoutProcessRow(t *testing.T) {
 	if err = store.ReconcileResource(ctx, "gpu-0", true); err == nil {
 		t.Fatal("stale lease accepted an observation from before identity loss")
 	}
+	if n, err := store.ReconcileUnstartedLeases(ctx); err != nil || n != 0 {
+		t.Fatalf("released before an observation since it went stale: %d %v", n, err)
+	}
 	refreshSchedulerGPU(t, store)
+	if n, err := store.ReconcileUnstartedLeases(ctx); err != nil || n != 1 {
+		t.Fatalf("released %d %v, want 1", n, err)
+	}
+	var state string
+	if err = store.db.QueryRowContext(ctx, `SELECT state FROM leases WHERE id=$1`, reservation.Lease.ID).Scan(&state); err != nil || state != "released" {
+		t.Fatalf("lease %s %v", state, err)
+	}
+	if n, err := store.ReconcileUnstartedLeases(ctx); err != nil || n != 0 {
+		t.Fatalf("released again: %d %v", n, err)
+	}
+}
+
+func TestLostAttemptRequiresExplicitAbsenceOnceActivated(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	if _, _, err := store.SubmitExecution(ctx, schedulerExecutionSpec("activated")); err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := store.ReserveNext(ctx, "executor")
+	if err != nil || reservation == nil {
+		t.Fatalf("reserve: %+v %v", reservation, err)
+	}
+	if err = store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := store.AuthorizeLaunch(ctx, reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ActivateLaunch(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, 4321, "pid:4321:start:1"); err != nil {
+		t.Fatal(err)
+	}
+	if count, markErr := store.MarkExecutorUnknown(ctx, "executor"); markErr != nil || count != 1 {
+		t.Fatalf("mark unknown: count=%d err=%v", count, markErr)
+	}
+	refreshSchedulerGPU(t, store)
+	if n, err := store.ReconcileUnstartedLeases(ctx); err != nil || n != 0 {
+		t.Fatalf("released an activated attempt's lease by itself: %d %v", n, err)
+	}
 	if err = store.ReconcileResource(ctx, "gpu-0"); err == nil {
-		t.Fatal("lost attempt without a registered process was released without explicit absence confirmation")
+		t.Fatal("lost activated attempt was released without explicit absence confirmation")
 	}
 	if err = store.ReconcileResource(ctx, "gpu-0", true); err != nil {
 		t.Fatal(err)
@@ -117,7 +165,7 @@ func TestReconcileIsHeldOnlyByTheLostAttemptsOwnClaims(t *testing.T) {
 	if err = store.ReconcileResource(ctx, "gpu-0", true); err == nil || !strings.Contains(err.Error(), launch.Attempt.ID) {
 		t.Fatalf("released while a process of the lost attempt is seen: %v", err)
 	}
-	if _, err = store.db.ExecContext(ctx, `UPDATE external_claims SET cleared_at=$1 WHERE id='claim-its-own'`, now()); err != nil {
+	if _, err = store.testExec(`UPDATE external_claims SET cleared_at=$1 WHERE id='claim-its-own'`, now()); err != nil {
 		t.Fatal(err)
 	}
 	if err = store.ReconcileResource(ctx, "gpu-0", true); err != nil {

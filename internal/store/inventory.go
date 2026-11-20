@@ -459,91 +459,24 @@ func validateEpochTx(ctx context.Context, tx *sql.Tx, attemptID, leaseID string,
 // remains. Lease expiry alone is intentionally insufficient. A claim that is
 // not the attempt's (another program's process, unattributed activity) does
 // not hold the lease: the claim keeps the device from being placed on by
-// itself (issue #20).
+// itself (issue #20). The operator confirms the attempt's processes are
+// absent, unless it never started its command (attemptNeverStartedTx).
 func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confirmProcessAbsent ...bool) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT DISTINCT l.id,l.attempt_id,l.coordination_epoch FROM leases l JOIN lease_items li ON li.lease_id=l.id WHERE li.resource_id=$1 AND l.state='stale'`, resourceID)
+	leases, err := staleLeasesTx(ctx, tx, `SELECT DISTINCT l.id,l.attempt_id,l.coordination_epoch FROM leases l JOIN lease_items li ON li.lease_id=l.id WHERE li.resource_id=$1 AND l.state='stale'`, resourceID)
 	if err != nil {
 		return err
 	}
-	type stale struct {
-		lease   string
-		attempt sql.NullString
-		epoch   int64
-	}
-	var leases []stale
-	for rows.Next() {
-		var x stale
-		if err := rows.Scan(&x.lease, &x.attempt, &x.epoch); err != nil {
-			rows.Close()
-			return err
-		}
-		leases = append(leases, x)
-	}
-	rows.Close()
 	if len(leases) == 0 {
 		return ErrNotFound
 	}
-	t := now()
+	confirmed := len(confirmProcessAbsent) > 0 && confirmProcessAbsent[0]
 	for _, x := range leases {
-		var unobserved int
-		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1) WHERE li.lease_id=$1 AND li.resource_id IS NOT NULL AND (o.id IS NULL OR (o.valid_until)::timestamptz<=($2)::timestamptz OR (o.observed_at)::timestamptz<=(l.stale_at)::timestamptz)`, x.lease, t).Scan(&unobserved); err != nil {
-			return err
-		}
-		if unobserved > 0 {
-			return fmt.Errorf("stale lease %s still lacks fresh observations of its resources taken after it went stale", x.lease)
-		}
-		if x.attempt.Valid {
-			// a process of the attempt still on its device: by the
-			// KAIRO_ATTEMPT_ID it carries, or as one of its registered
-			// processes
-			var seen int
-			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN external_claims c ON c.resource_id IN `+sameDevice("li.resource_id")+`
-				WHERE li.lease_id=$1 AND c.cleared_at IS NULL AND (c.evidence_json::jsonb->>'attempt_id'=$2
-				OR c.process_identity IN (SELECT process_identity FROM attempt_processes WHERE attempt_id=$2))`, x.lease, x.attempt.String).Scan(&seen); err != nil {
-				return err
-			}
-			if seen > 0 {
-				return fmt.Errorf("stale lease %s: a process of attempt %s is still seen on its resources", x.lease, x.attempt.String)
-			}
-			if len(confirmProcessAbsent) == 0 || !confirmProcessAbsent[0] {
-				return fmt.Errorf("stale attempt %s requires explicit process-absence confirmation", x.attempt.String)
-			}
-			var processes int
-			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM attempt_processes WHERE attempt_id=$1 AND exited_at IS NULL`, x.attempt.String).Scan(&processes); err != nil {
-				return err
-			}
-			if processes > 0 {
-				if _, err = tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=$1,last_seen_at=$2 WHERE attempt_id=$3 AND exited_at IS NULL`, t, t, x.attempt.String); err != nil {
-					return err
-				}
-			}
-		}
-		if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=$1 WHERE id=$2 AND state='stale'`, t, x.lease); err != nil {
-			return err
-		}
-		var executionID, projectID string
-		if x.attempt.Valid {
-			if _, err = tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',quiesced_at=$1,exited_at=COALESCE(exited_at,$2) WHERE id=$3 AND state='lost'`, t, t, x.attempt.String); err != nil {
-				return err
-			}
-			if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM attempts WHERE id=$1`, x.attempt.String).Scan(&executionID); err != nil {
-				return err
-			}
-			if _, err = tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',blocker_reason=NULL,updated_at=$1 WHERE execution_id=$2 AND attempt_id=$3`, t, executionID, x.attempt.String); err != nil {
-				return err
-			}
-		} else if err = tx.QueryRowContext(ctx, `SELECT execution_id FROM leases WHERE id=$1`, x.lease).Scan(&executionID); err != nil {
-			return err
-		}
-		if err = tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=$1`, executionID).Scan(&projectID); err != nil {
-			return err
-		}
-		if err = appendCoordinationEventTx(ctx, tx, "stale_lease_reconciled", &projectID, "lease", x.lease, &x.epoch, map[string]string{"resource_id": resourceID, "execution_id": executionID}); err != nil {
+		if err = reconcileStaleLeaseTx(ctx, tx, x, confirmed, map[string]any{"resource_id": resourceID}); err != nil {
 			return err
 		}
 	}
@@ -551,4 +484,146 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 		return err
 	}
 	return tx.Commit()
+}
+
+// unstartedStaleLeases are the stale leases nothing can still run under:
+// those of no attempt (a daemon that died between reserving and creating
+// one) and those of an attempt that never started its command
+// (attemptNeverStartedTx).
+const unstartedStaleLeases = `SELECT l.id,l.attempt_id,l.coordination_epoch FROM leases l LEFT JOIN attempts a ON a.id=l.attempt_id
+	WHERE l.state='stale' AND (l.attempt_id IS NULL OR a.pid IS NULL AND NOT EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=a.id))
+	ORDER BY l.id`
+
+// ReconcileUnstartedLeases releases, without an operator, the stale leases
+// nothing can still run under (unstartedStaleLeases), once each of their
+// resources has been observed since they went stale with nothing of the
+// attempt on it (issue #19: a launch cut short by its agent's exit held the
+// node until a manual reconcile). It returns how many it released.
+func (s *Store) ReconcileUnstartedLeases(ctx context.Context) (int, error) {
+	// looked for first without the decision lock: there are seldom any
+	var some bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(`+unstartedStaleLeases+`)`).Scan(&some); err != nil || !some {
+		return 0, err
+	}
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	leases, err := staleLeasesTx(ctx, tx, unstartedStaleLeases)
+	if err != nil {
+		return 0, err
+	}
+	released := 0
+	for _, x := range leases {
+		err = reconcileStaleLeaseTx(ctx, tx, x, false, map[string]any{"by": "daemon", "reason": "nothing of it started"})
+		if errors.Is(err, errNotReconciled) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		released++
+	}
+	if released == 0 {
+		return 0, nil
+	}
+	if err = clearReleasedLeaseSettingsTx(ctx, tx); err != nil {
+		return 0, err
+	}
+	return released, tx.Commit()
+}
+
+// staleLease is a stale lease to reconcile.
+type staleLease struct {
+	lease   string
+	attempt sql.NullString
+	epoch   int64
+}
+
+func staleLeasesTx(ctx context.Context, tx *sql.Tx, query string, args ...any) ([]staleLease, error) {
+	var leases []staleLease
+	err := eachRow(ctx, tx, query, args, func(rows *sql.Rows) error {
+		var x staleLease
+		if err := rows.Scan(&x.lease, &x.attempt, &x.epoch); err != nil {
+			return err
+		}
+		leases = append(leases, x)
+		return nil
+	})
+	return leases, err
+}
+
+// errNotReconciled: a stale lease that may not be released yet.
+var errNotReconciled = errors.New("stale lease not reconciled")
+
+// attemptNeverStartedTx reports whether an attempt never started its
+// command: it was never activated (no pid) and registered no process. Its
+// shim starts the command only on the go-ahead its agent sends after the
+// activation (executor/shim.go), so nothing of it can be running.
+func attemptNeverStartedTx(ctx context.Context, tx *sql.Tx, attemptID string) (bool, error) {
+	var never bool
+	err := tx.QueryRowContext(ctx, `SELECT a.pid IS NULL AND NOT EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=a.id) FROM attempts a WHERE a.id=$1`, attemptID).Scan(&never)
+	return never, err
+}
+
+// reconcileStaleLeaseTx releases stale lease x (ReconcileResource), or says
+// why not (errNotReconciled); detail goes into its event.
+func reconcileStaleLeaseTx(ctx context.Context, tx *sql.Tx, x staleLease, confirmed bool, detail map[string]any) error {
+	t := now()
+	var unobserved int
+	if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN leases l ON l.id=li.lease_id LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=li.resource_id ORDER BY id DESC LIMIT 1) WHERE li.lease_id=$1 AND li.resource_id IS NOT NULL AND (o.id IS NULL OR (o.valid_until)::timestamptz<=($2)::timestamptz OR (o.observed_at)::timestamptz<=(l.stale_at)::timestamptz)`, x.lease, t).Scan(&unobserved); err != nil {
+		return err
+	}
+	if unobserved > 0 {
+		return fmt.Errorf("%w: stale lease %s still lacks fresh observations of its resources taken after it went stale", errNotReconciled, x.lease)
+	}
+	if x.attempt.Valid {
+		// a process of the attempt still on its device: by the
+		// KAIRO_ATTEMPT_ID it carries, or as one of its registered
+		// processes
+		var seen int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM lease_items li JOIN external_claims c ON c.resource_id IN `+sameDevice("li.resource_id")+`
+			WHERE li.lease_id=$1 AND c.cleared_at IS NULL AND (c.evidence_json::jsonb->>'attempt_id'=$2
+			OR c.process_identity IN (SELECT process_identity FROM attempt_processes WHERE attempt_id=$2))`, x.lease, x.attempt.String).Scan(&seen); err != nil {
+			return err
+		}
+		if seen > 0 {
+			return fmt.Errorf("%w: stale lease %s: a process of attempt %s is still seen on its resources", errNotReconciled, x.lease, x.attempt.String)
+		}
+		if !confirmed {
+			never, err := attemptNeverStartedTx(ctx, tx, x.attempt.String)
+			if err != nil {
+				return err
+			}
+			if !never {
+				return fmt.Errorf("%w: stale attempt %s requires explicit process-absence confirmation", errNotReconciled, x.attempt.String)
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=$1,last_seen_at=$2 WHERE attempt_id=$3 AND exited_at IS NULL`, t, t, x.attempt.String); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=$1 WHERE id=$2 AND state='stale'`, t, x.lease); err != nil {
+		return err
+	}
+	var executionID, projectID string
+	if x.attempt.Valid {
+		if _, err := tx.ExecContext(ctx, `UPDATE attempts SET state='quiesced',quiesced_at=$1,exited_at=COALESCE(exited_at,$2) WHERE id=$3 AND state='lost'`, t, t, x.attempt.String); err != nil {
+			return err
+		}
+		if err := tx.QueryRowContext(ctx, `SELECT execution_id FROM attempts WHERE id=$1`, x.attempt.String).Scan(&executionID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE pause_targets SET state='quiesced',blocker_reason=NULL,updated_at=$1 WHERE execution_id=$2 AND attempt_id=$3`, t, executionID, x.attempt.String); err != nil {
+			return err
+		}
+	} else if err := tx.QueryRowContext(ctx, `SELECT execution_id FROM leases WHERE id=$1`, x.lease).Scan(&executionID); err != nil {
+		return err
+	}
+	if err := tx.QueryRowContext(ctx, `SELECT project_scope_id FROM execution_requests WHERE id=$1`, executionID).Scan(&projectID); err != nil {
+		return err
+	}
+	detail["execution_id"] = executionID
+	return appendCoordinationEventTx(ctx, tx, "stale_lease_reconciled", &projectID, "lease", x.lease, &x.epoch, detail)
 }
