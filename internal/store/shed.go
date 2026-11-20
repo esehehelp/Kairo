@@ -31,27 +31,15 @@ const (
 // the same filesystem comes and goes).
 var shedMinShort int64 = 1 << 30
 
-// shedShortTx is how far store s is under its reserve, as shedding counts it.
-func shedShortTx(ctx context.Context, tx *sql.Tx, s machine.Store) (int64, error) {
-	room, err := copyRoomTx(ctx, tx, s)
-	if err != nil || room == unknownRoom {
-		return 0, err
-	}
-	return -room, nil
-}
-
 // shedOrdersTx are the copies executor me is to remove from the durable
 // stores it serves that are below their reserve.
-func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets []machine.Store, byID map[string]machine.Store) ([]CopyOrder, error) {
+func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets []machine.Store, byID map[string]machine.Store, room map[string]int64) ([]CopyOrder, error) {
 	var out []CopyOrder
 	for _, s := range targets {
 		if !me.serves(s, executorID) {
 			continue
 		}
-		short, err := shedShortTx(ctx, tx, s)
-		if err != nil {
-			return nil, err
-		}
+		short := -room[s.ID]
 		if short <= shedMinShort {
 			continue
 		}
@@ -61,7 +49,7 @@ func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID s
 				others = append(others, d.ID)
 			}
 		}
-		err = eachRow(ctx, tx, `SELECT c.object_id,c.month,c.root,COALESCE(d.pack_bytes,0) FROM object_copies c JOIN data_objects d ON d.id=c.object_id
+		err := eachRow(ctx, tx, `SELECT c.object_id,c.month,c.root,COALESCE(d.pack_bytes,0) FROM object_copies c JOIN data_objects d ON d.id=c.object_id
 			WHERE c.store_id=$1 AND c.state='verified'
 			AND (SELECT COUNT(*) FROM object_copies o WHERE o.object_id=c.object_id AND o.store_id=ANY($2::text[]) AND o.state='verified' AND o.check_problem IS NULL)>=$3
 			AND NOT EXISTS(SELECT 1 FROM object_copies r WHERE r.object_id=c.object_id AND r.state='copying' AND (r.source_store_id=c.store_id OR r.source_store_id IS NULL))

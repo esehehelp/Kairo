@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"kairo/internal/machine"
 )
@@ -105,6 +106,10 @@ func (s *Store) InventoryDurable(ctx context.Context, l DurableListing) (Durable
 			out.Unknown = append(out.Unknown, id)
 		}
 	}
+	listedAt, err := time.Parse(time.RFC3339Nano, l.ListedAt)
+	if err != nil {
+		return out, fmt.Errorf("listing of %s: %w", l.StoreID, err)
+	}
 	verified := 0
 	var missing []string
 	for id, r := range records {
@@ -112,8 +117,14 @@ func (s *Store) InventoryDurable(ctx context.Context, l DurableListing) (Durable
 			continue
 		}
 		verified++
-		if _, listed := l.Copies[id]; !listed && !r.problem && r.updated < l.ListedAt {
-			missing = append(missing, id)
+		if _, listed := l.Copies[id]; !listed && !r.problem {
+			updated, err := time.Parse(time.RFC3339Nano, r.updated)
+			if err != nil {
+				return out, err
+			}
+			if updated.Before(listedAt) {
+				missing = append(missing, id)
+			}
 		}
 	}
 	switch {

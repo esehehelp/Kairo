@@ -171,9 +171,8 @@ func TestScratchMissingFromTheReport(t *testing.T) {
 	}
 }
 
-// A report does not wait for the decision lock (no decision reads it), only
-// for another report of the same store: two at once would lock the same
-// records in different orders.
+// A report does not wait for the decision lock. It takes the store row
+// lock, so two reports of the same store cannot update its records at once.
 func TestStoreReportsDoNotWaitForDecisions(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)

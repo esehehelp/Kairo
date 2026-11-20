@@ -7,10 +7,18 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"kairo/internal/pgtest"
 )
 
 func TestAPITokenLifecycle(t *testing.T) {
-	store := openCoordinationStore(t)
+	t.Parallel()
+	counter := &statementCounter{}
+	store, err := open(pgtest.DSN(t), true, counter)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
 	ctx := context.Background()
 	admin, plain, err := store.CreateAPIToken(ctx, "operator", RoleAdmin, "")
 	if err != nil {
@@ -19,9 +27,24 @@ func TestAPITokenLifecycle(t *testing.T) {
 	if !strings.HasPrefix(plain, "kairo_admin_") || admin.Role != RoleAdmin || admin.NodeID != nil {
 		t.Fatalf("token %q %+v", plain, admin)
 	}
-	got, err := store.AuthenticateAPIToken(ctx, plain)
+	holder, err := store.beginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback()
+	authCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	got, err := store.AuthenticateAPIToken(authCtx, plain)
 	if err != nil || got.ID != admin.ID || got.Name != "operator" {
-		t.Fatalf("authenticate: %+v %v", got, err)
+		t.Fatalf("authenticate while a decision holds the lock: %+v %v", got, err)
+	}
+	counter.n.Store(0)
+	got, err = store.AuthenticateAPIToken(authCtx, plain)
+	if n := counter.n.Load(); err != nil || got.LastUsedAt == nil || n != 1 {
+		t.Fatalf("authentication with recent use: %+v %v (%d statements)", got, err, n)
+	}
+	if err = holder.Rollback(); err != nil {
+		t.Fatal(err)
 	}
 	if _, _, err = store.CreateAPIToken(ctx, "operator", RoleRead, ""); err == nil || !strings.Contains(err.Error(), `an active token named "operator" already exists`) {
 		t.Fatalf("second active token of a name: %v", err)

@@ -194,8 +194,9 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 	for _, target := range targets {
 		served = served || me.serves(target, executorID)
 	}
+	// Both copy and shed orders use the same room estimate for each store.
+	room := map[string]int64{}
 	if served {
-		room := map[string]int64{}
 		for _, target := range targets {
 			room[target.ID], err = copyRoomTx(ctx, tx, target)
 			if err != nil {
@@ -301,8 +302,14 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 		// a copy taken for a store no longer so is given up (nothing of it was
 		// verified), so the object is copied where the declaration says now.
 		if d, ok := byID[x.order.StoreID]; !ok || d.Class != machine.StoreDurable || d.Root != x.order.Root || !me.serves(d, executorID) {
-			if _, err = tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_id=$1 AND store_id=$2 AND executor_id=$3 AND state='copying'`, x.order.ObjectID, x.order.StoreID, executorID); err != nil {
+			result, err := tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_id=$1 AND store_id=$2 AND executor_id=$3 AND state='copying'`, x.order.ObjectID, x.order.StoreID, executorID)
+			if err != nil {
 				return nil, err
+			}
+			if n, _ := result.RowsAffected(); n == 1 {
+				if free, ok := room[x.order.StoreID]; ok && free != unknownRoom {
+					room[x.order.StoreID] += x.order.PackBytes
+				}
 			}
 			continue
 		}
@@ -374,7 +381,7 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 	}
 	out = append(out, describe...)
 	if served {
-		shed, err := shedOrdersTx(ctx, tx, me, executorID, targets, byID)
+		shed, err := shedOrdersTx(ctx, tx, me, executorID, targets, byID, room)
 		if err != nil {
 			return nil, err
 		}

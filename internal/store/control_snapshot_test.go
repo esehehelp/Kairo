@@ -39,8 +39,18 @@ func TestControlSnapshotTaskOnceASlotOnTheFirstDurableStoresNode(t *testing.T) {
 	if err != nil || name != "snapshot-20261116T0100Z" {
 		t.Fatalf("declared %q %v", name, err)
 	}
-	if again, err := store.ControlSnapshotTask(ctx, at.Add(30*time.Minute), time.Hour); err != nil || again != "" {
-		t.Fatalf("the slot's task declared again: %q %v", again, err)
+	holder, err := store.beginWrite(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Rollback()
+	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if again, err := store.ControlSnapshotTask(readCtx, at.Add(30*time.Minute), time.Hour); err != nil || again != "" {
+		t.Fatalf("checking the existing slot while a decision holds the lock: %q %v", again, err)
+	}
+	if err = holder.Rollback(); err != nil {
+		t.Fatal(err)
 	}
 	var queue, template string
 	if err = store.db.QueryRowContext(ctx, `SELECT queue_name,execution_template_json FROM orchestration_tasks WHERE name=$1`, name).Scan(&queue, &template); err != nil {

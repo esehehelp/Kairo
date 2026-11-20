@@ -50,7 +50,8 @@ func TestARunningRunsOutputIsSnapshotted(t *testing.T) {
 	if got := snapshots(); len(got) != 0 {
 		t.Fatalf("a run just started was snapshotted: %+v", got)
 	}
-	if _, err := store.testExec(`UPDATE run_outputs SET created_at='2026-01-01T00:00:00Z' WHERE run_id=$1`, launch.RunID); err != nil {
+	old := time.Now().Add(-2 * time.Hour).In(time.FixedZone("", 12*3600)).Format(time.RFC3339Nano)
+	if _, err := store.testExec(`UPDATE run_outputs SET created_at=$1 WHERE run_id=$2`, old, launch.RunID); err != nil {
 		t.Fatal(err)
 	}
 	got := snapshots()
@@ -62,26 +63,43 @@ func TestARunningRunsOutputIsSnapshotted(t *testing.T) {
 		t.Fatalf("a second snapshot while one is packing: %+v", again)
 	}
 	sha := strings.Repeat("ab", 32)
-	if err := store.RecordPack(ctx, PackMade{ObjectID: first.ObjectID, ExecutorID: "executor", PackPath: "D:/kairo/packs/" + first.ObjectID + ".tar.zst",
-		ManifestPath: "D:/kairo/packs/" + first.ObjectID + ".tar.zst.files.tsv", PackBytes: 100, ContentBytes: 50, Files: 1, PackSHA256: sha, ManifestSHA256: sha}); err != nil {
-		t.Fatal(err)
+	recordPack := func(o PackOrder) {
+		t.Helper()
+		if err := store.RecordPack(ctx, PackMade{ObjectID: o.ObjectID, ExecutorID: "executor", PackPath: "D:/kairo/packs/" + o.ObjectID + ".tar.zst",
+			ManifestPath: "D:/kairo/packs/" + o.ObjectID + ".tar.zst.files.tsv", PackBytes: 100, ContentBytes: 50, Files: 1, PackSHA256: sha, ManifestSHA256: sha}); err != nil {
+			t.Fatal(err)
+		}
 	}
+	recordPack(first)
 	if got = snapshots(); len(got) != 0 {
 		t.Fatalf("snapshotted again within the interval: %+v", got)
 	}
-	// a checkpoint published since: snapshotted at once, from the first
-	stamp := now()
+	// A checkpoint later in the same second still calls for another snapshot.
+	firstAt := time.Now().UTC().Add(-time.Minute).Truncate(time.Second)
+	since := firstAt.Format(time.RFC3339Nano)
+	if _, err := store.testExec(`UPDATE data_objects SET created_at=$1 WHERE id=$2`, since, first.ObjectID); err != nil {
+		t.Fatal(err)
+	}
+	stamp := firstAt.Add(500 * time.Millisecond).Format(time.RFC3339Nano)
 	if _, err := store.testExec(`INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at)
 		VALUES($1,$2,$3,$4,$5,'checkpoint','operator_checkpoint','test','checkpointed',$6,$6)`,
 		id.New("cmd"), launch.Execution.ID, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, stamp); err != nil {
 		t.Fatal(err)
 	}
 	got = snapshots()
-	if len(got) != 1 || got[0].SourceID != launch.RunID+"~2" || got[0].Since == "" {
+	if len(got) != 1 || got[0].SourceID != launch.RunID+"~2" || got[0].Since != since {
 		t.Fatalf("after a checkpoint %+v", got)
 	}
 	if RunOfSnapshot(got[0].SourceID) != launch.RunID {
 		t.Fatalf("run of %s", got[0].SourceID)
+	}
+	second := got[0]
+	recordPack(second)
+	if _, err := store.testExec(`UPDATE data_objects SET created_at=$1 WHERE id=$2`, firstAt.Add(750*time.Millisecond).Format(time.RFC3339Nano), second.ObjectID); err != nil {
+		t.Fatal(err)
+	}
+	if got = snapshots(); len(got) != 0 {
+		t.Fatalf("snapshotted again for a checkpoint already covered: %+v", got)
 	}
 	// its directory is the run's: never claimed for deletion
 	if err := store.SettleDeletion(ctx, ObjectDeletion{ObjectID: first.ObjectID, ExecutorID: "executor", State: SourceDeleting}); err == nil {

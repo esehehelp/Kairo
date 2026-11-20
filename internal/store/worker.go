@@ -761,6 +761,17 @@ func (s *Store) FenceNode(ctx context.Context, nodeID, actor, reason string) (ma
 		return nil, err
 	}
 	defer tx.Rollback()
+	stale, err := fenceNodeTx(ctx, tx, nodeID, actor, reason)
+	if err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return stale, nil
+}
+
+func fenceNodeTx(ctx context.Context, tx *sql.Tx, nodeID, actor, reason string) (map[string]int, error) {
 	rows, err := tx.QueryContext(ctx, `SELECT id,last_seen_at FROM executors WHERE node_id=$1 ORDER BY id`, nodeID)
 	if err != nil {
 		return nil, err
@@ -801,9 +812,6 @@ func (s *Store) FenceNode(ctx context.Context, nodeID, actor, reason string) (ma
 		stale[e.id] = n
 	}
 	if err = appendCoordinationEventTx(ctx, tx, "node_fenced", nil, "node", nodeID, nil, map[string]any{"actor": actor, "reason": reason, "stale_leases": stale}); err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
 	return stale, nil

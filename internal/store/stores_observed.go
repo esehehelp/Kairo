@@ -66,11 +66,11 @@ func (s *Store) StoreNode(ctx context.Context, storeID string) (string, error) {
 // record whose directory was not found marked missing (bytes 0; Kairo did not
 // delete it, so it is not deleted). Bytes found under the root without any
 // record (a scratch whose recording failed) are kept as unrecorded. An
-// observation of a root the store is no longer declared at is refused. No
-// decision reads any of this, so it is written without the decision lock
-// (beginUnlockedWrite); the store's declaration row is locked instead, so
-// two reports of one store (by two executors of its node) go one after the
-// other.
+// observation of a root the store is no longer declared at is refused.
+// Space decisions read committed reports without locking them. Reports take
+// no decision lock: they lock the machine_stores row first to serialize
+// reports and declaration changes for one store, and change shared records
+// with single statements that recheck their conditions under row locks.
 func (s *Store) RecordStoreObservation(ctx context.Context, obs StoreObservation) error {
 	if obs.MovedFrom != "" {
 		if err := s.completeStoreMove(ctx, obs); err != nil {

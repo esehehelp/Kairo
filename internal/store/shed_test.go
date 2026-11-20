@@ -78,6 +78,27 @@ func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// Dropping an obsolete order credits its bytes. Shedding still uses the
+	// observation read before it, even if a report changes the room mid-pass.
+	insertPacked(t, store, "obj_old", "executor", "d-scratch", "D:/kairo", sha)
+	for _, query := range []string{
+		`INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,created_at,updated_at)
+			VALUES('obj_old','c-durable','durable-exec','C:/old','202611','copying','2026-11-01T00:00:00Z','2026-11-01T00:00:00Z')`,
+		`CREATE FUNCTION change_room() RETURNS trigger LANGUAGE plpgsql AS $$
+			BEGIN UPDATE store_observations SET free_bytes=0 WHERE store_id=OLD.store_id; RETURN OLD; END; $$`,
+		`CREATE TRIGGER change_room AFTER DELETE ON object_copies FOR EACH ROW WHEN (OLD.object_id='obj_old') EXECUTE FUNCTION change_room()`,
+	} {
+		if _, err := store.testExec(query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	observe(reserve - shedMinShort + 50)
+	if shed := shedOrders(); len(shed) != 0 {
+		t.Fatalf("shed after dropping an obsolete copy order: %+v", shed)
+	}
+	if _, err := store.testExec(`DELETE FROM data_objects WHERE id='obj_old'`); err != nil {
+		t.Fatal(err)
+	}
 	// The shortfall exceeds the threshold. Obj_1 is the biggest that may go.
 	observe(reserve - shedMinShort - 50)
 	shed := shedOrders()

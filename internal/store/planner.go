@@ -119,7 +119,7 @@ type planLease struct {
 	epoch                                                            int64
 	priority                                                         int
 	gang                                                             bool
-	startedAt                                                        string
+	startedAt                                                        time.Time
 	// victim: a running cooperative attempt that priority preemption may
 	// suspend; suspending: it already has a live suspend command.
 	victim, suspending, allowsUnattributed bool
@@ -163,10 +163,11 @@ type planRank struct {
 
 type planCandidate struct {
 	executionCandidate
-	label  string
-	demand planDemand
-	gangID string
-	ranks  []planRank
+	label     string
+	demand    planDemand
+	gangID    string
+	ranks     []planRank
+	submitted time.Time
 	// inputsWait: why it is not admitted yet for its inputs (inputs.go);
 	// empty when it has none, or each is where it is planned.
 	inputsWait string
@@ -437,14 +438,15 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 	for rows.Next() {
 		l := &planLease{capacity: map[capKey]int64{}, used: map[capKey]int64{}}
 		var executorEnabled, checkpointable, preemptible bool
-		var leaseState, attemptState, executionState string
+		var leaseState, attemptState, executionState, started string
 		var u usage
 		if err = rows.Scan(&l.id, &l.executionID, &l.attemptID, &l.executorID, &l.nodeID, &executorEnabled, &leaseState, &l.epoch, &attemptState,
-			&l.priority, &checkpointable, &preemptible, &executionState, &l.projectID, &l.label, &l.startedAt, &l.gang, &l.allowsUnattributed,
+			&l.priority, &checkpointable, &preemptible, &executionState, &l.projectID, &l.label, &started, &l.gang, &l.allowsUnattributed,
 			&u.ram, &u.disk, &u.at, &l.cpuLendable, &l.queueID, &l.taskID, &l.argvJSON, &l.attemptStarted, &l.attemptExited); err != nil {
 			rows.Close()
 			return err
 		}
+		l.startedAt, _ = time.Parse(time.RFC3339Nano, started)
 		l.victim = l.attemptID != "" && leaseState == "active" && attemptState == "running" && executionState == "started" && checkpointable && preemptible && executorEnabled
 		running[l.id] = attemptState == "running" || attemptState == "quiescing"
 		usages[l.id] = u
@@ -969,8 +971,9 @@ func (p *planner) order(candidates []*planCandidate, visit func(*planCandidate) 
 				}
 				continue
 			}
-			if a.SubmittedAt != b.SubmittedAt {
-				if a.SubmittedAt < b.SubmittedAt {
+			at, bt := remaining[i].submitted, remaining[best].submitted
+			if !at.Equal(bt) {
+				if at.Before(bt) {
 					best = i
 				}
 				continue
@@ -1439,8 +1442,8 @@ func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot
 		if x.gang != y.gang {
 			return !x.gang // a gang victim stops every rank
 		}
-		if x.startedAt != y.startedAt {
-			return x.startedAt > y.startedAt
+		if !x.startedAt.Equal(y.startedAt) {
+			return x.startedAt.After(y.startedAt)
 		}
 		return x.id < y.id
 	})
@@ -1588,6 +1591,7 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 		if err := scanCandidate(rows, &c.executionCandidate, &c.gangID); err != nil {
 			return err
 		}
+		c.submitted, _ = time.Parse(time.RFC3339Nano, c.execution.SubmittedAt)
 		if c.gangID != "" {
 			gangIDs = append(gangIDs, c.gangID)
 		}

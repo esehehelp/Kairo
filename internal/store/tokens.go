@@ -135,7 +135,20 @@ func (s *Store) AuthenticateAPIToken(ctx context.Context, token string) (APIToke
 	}
 	// last_used_at is informational; write it at most once a minute.
 	t := time.Now().UTC()
-	if _, err = s.exec(ctx, `UPDATE api_tokens SET last_used_at=$1 WHERE id=$2 AND (last_used_at IS NULL OR (last_used_at)::timestamptz<($3)::timestamptz)`, t.Format(time.RFC3339Nano), value.ID, t.Add(-time.Minute).Format(time.RFC3339Nano)); err != nil {
+	if value.LastUsedAt != nil {
+		if used, err := time.Parse(time.RFC3339Nano, *value.LastUsedAt); err == nil && t.Sub(used) < time.Minute {
+			return value, nil
+		}
+	}
+	tx, err := s.beginUnlockedWrite(ctx)
+	if err != nil {
+		return APIToken{}, err
+	}
+	defer tx.Rollback()
+	if _, err = tx.ExecContext(ctx, `UPDATE api_tokens SET last_used_at=$1 WHERE id=$2 AND revoked_at IS NULL AND (last_used_at IS NULL OR last_used_at::timestamptz<=$3::text::timestamptz)`, t.Format(time.RFC3339Nano), value.ID, t.Add(-time.Minute).Format(time.RFC3339Nano)); err != nil {
+		return APIToken{}, err
+	}
+	if err = tx.Commit(); err != nil {
 		return APIToken{}, err
 	}
 	return value, nil

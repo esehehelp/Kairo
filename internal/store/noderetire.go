@@ -18,14 +18,14 @@ import (
 // registers it anew), and event node_retired says what was released. The
 // node's stores stay declared until the machine declaration drops them.
 func (s *Store) RetireNode(ctx context.Context, nodeID, actor, reason string) (int, error) {
-	if _, err := s.FenceNode(ctx, nodeID, actor, reason); err != nil {
-		return 0, err
-	}
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	if _, err := fenceNodeTx(ctx, tx, nodeID, actor, reason); err != nil {
+		return 0, err
+	}
 	type stale struct {
 		lease, executionID string
 		attempt            sql.NullString

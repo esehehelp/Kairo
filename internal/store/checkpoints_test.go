@@ -52,7 +52,19 @@ func TestRunningWorkIsAskedForCheckpointsAndWhatItPublishesIsKept(t *testing.T) 
 	if err = store.AckCommand(ctx, attempt, lease, epoch, operator.Commands[0], "checkpointed", json.RawMessage(`{"continuation_ref":"D:\\ckpt\\train\\step_100.pt"}`)); err != nil {
 		t.Fatal(err)
 	}
+	// These offsets reverse the order of the timestamp strings around the cutoff.
+	recent := time.Now().In(time.FixedZone("", -12*3600)).Format(time.RFC3339Nano)
+	if _, err = store.testExec(`UPDATE commands SET created_at=$1 WHERE id=$2`, recent, operator.Commands[0]); err != nil {
+		t.Fatal(err)
+	}
+	if commands, err := store.RequestDueCheckpoints(ctx, time.Hour); err != nil || len(commands) != 0 {
+		t.Fatalf("asked after a recent checkpoint: %v %v", commands, err)
+	}
 	if _, err = store.testExec(`UPDATE commands SET created_at='2026-01-01T00:00:00Z' WHERE id=$1`, operator.Commands[0]); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour).In(time.FixedZone("", 12*3600)).Format(time.RFC3339Nano)
+	if _, err = store.testExec(`UPDATE attempts SET started_at=$1 WHERE id=$2`, old, attempt); err != nil {
 		t.Fatal(err)
 	}
 	commands, err := store.RequestDueCheckpoints(ctx, time.Hour)
