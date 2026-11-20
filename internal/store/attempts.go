@@ -121,13 +121,30 @@ func (s *Store) ListAttemptsPage(ctx context.Context, filter AttemptFilter) (out
 // recorded by its executor ("" for a stream with no recorded path), or
 // ErrNotFound for an unknown attempt.
 func (s *Store) AttemptLogPaths(ctx context.Context, attemptID string) (stdout, stderr string, err error) {
-	var out, errPath sql.NullString
-	err = s.db.QueryRowContext(ctx, `SELECT stdout_path,stderr_path FROM attempts WHERE id=$1`, attemptID).Scan(&out, &errPath)
+	logs, err := s.AttemptLogs(ctx, attemptID)
+	return logs.StdoutPath, logs.StderrPath, err
+}
+
+// AttemptLogs includes the execution outcome and scratch location to explain
+// a missing log path.
+type AttemptLogs struct {
+	StdoutPath, StderrPath string
+	Terminal               bool
+	TerminalCause          string
+	ScratchPath            string
+	ScratchKept            bool
+}
+
+// AttemptLogs reads the log paths and outcome together so a launch finishing
+// during the read cannot be mistaken for one that never recorded a log.
+func (s *Store) AttemptLogs(ctx context.Context, attemptID string) (AttemptLogs, error) {
+	var v AttemptLogs
+	err := s.db.QueryRowContext(ctx, `SELECT COALESCE(a.stdout_path,''),COALESCE(a.stderr_path,''),e.state='terminal',COALESCE(e.terminal_cause,''),COALESCE(k.path,''),COALESCE(k.state='kept',false)
+		FROM attempts a JOIN execution_requests e ON e.id=a.execution_id
+		LEFT JOIN attempt_scratch k ON k.attempt_id=a.id AND k.state IN('active','kept')
+		WHERE a.id=$1`, attemptID).Scan(&v.StdoutPath, &v.StderrPath, &v.Terminal, &v.TerminalCause, &v.ScratchPath, &v.ScratchKept)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", ErrNotFound
+		return AttemptLogs{}, ErrNotFound
 	}
-	if err != nil {
-		return "", "", err
-	}
-	return out.String, errPath.String, nil
+	return v, err
 }

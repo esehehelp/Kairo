@@ -18,6 +18,8 @@ const (
 	// defaultLogLimit and maxLogLimit bound one GET /api/attempts/{id}/log.
 	defaultLogLimit = 1 << 20
 	maxLogLimit     = 8 << 20
+	// CodeNoLog means an ended execution's attempt has no path for the stream.
+	CodeNoLog = "no_log"
 )
 
 // attemptLog serves a slice of an attempt's stdout or stderr log as raw
@@ -28,8 +30,9 @@ const (
 // carries the file's current size and Kairo-Log-Next-Offset the offset where
 // the next read continues (the first byte served is at that offset minus the
 // body's length). An offset at or past the end returns an empty body, so a
-// follower polls from the next offset. A recorded log that does not exist yet
-// (a node agent ships one once it has bytes) reads as empty.
+// follower polls from the next offset. A log that has not arrived yet reads
+// as empty. After the execution ends, an unrecorded stream returns 409 no_log
+// with the cause and any recorded scratch location.
 func (s *Server) attemptLog(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	stream := query.Get("stream")
@@ -61,30 +64,42 @@ func (s *Server) attemptLog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	attemptID := r.PathValue("id")
-	stdoutPath, stderrPath, err := s.Store.AttemptLogPaths(r.Context(), attemptID)
+	logs, err := s.Store.AttemptLogs(r.Context(), attemptID)
 	if err != nil {
 		writeError(w, err)
 		return
 	}
-	path := stdoutPath
+	path := logs.StdoutPath
 	if stream == "stderr" {
-		path = stderrPath
+		path = logs.StderrPath
 	}
-	if path == "" {
-		writeError(w, fmt.Errorf("%w: attempt %s has no %s log", store.ErrNotFound, attemptID, stream))
-		return
-	}
-	local, err := s.logFile(path)
-	if err != nil {
-		writeError(w, fmt.Errorf("%w: the %s log of attempt %s", err, stream, attemptID))
+	if path == "" && logs.Terminal {
+		reason := logs.TerminalCause
+		if reason == "" {
+			reason = "execution ended without recording a log path"
+		}
+		if logs.ScratchKept {
+			reason += "; scratch kept at " + logs.ScratchPath
+		} else if logs.ScratchPath != "" {
+			reason += "; scratch recorded at " + logs.ScratchPath
+		}
+		writeJSON(w, http.StatusConflict, map[string]string{"error": reason, "code": CodeNoLog})
 		return
 	}
 	var size int64
 	var body []byte
-	f, err := os.Open(local)
+	var f *os.File
+	if path != "" {
+		local, pathErr := s.logFile(path)
+		if pathErr != nil {
+			writeError(w, fmt.Errorf("%w: the %s log of attempt %s", pathErr, stream, attemptID))
+			return
+		}
+		f, err = os.Open(local)
+	}
 	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		// Recorded but not shipped yet: an empty log so far.
+	case path == "" || errors.Is(err, fs.ErrNotExist):
+		// Not recorded or shipped yet: an empty log so far.
 		if tail >= 0 {
 			offset = 0
 		}

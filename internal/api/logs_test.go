@@ -91,12 +91,69 @@ func TestAttemptLogServesRecordedPaths(t *testing.T) {
 	}
 }
 
-func TestAttemptLogWithoutRecordedPathIsNotFound(t *testing.T) {
-	d := newTestDaemon(t, false)
-	id := d.workerLaunch(t).Attempt.ID
-	response, body := d.getLog(t, d.admin, "/api/attempts/"+id+"/log")
-	if response.StatusCode != http.StatusNotFound {
-		t.Fatalf("unrecorded log: %d %s", response.StatusCode, body)
+func TestAttemptLogWithoutRecordedPath(t *testing.T) {
+	for _, lost := range []bool{false, true} {
+		name := "aborted"
+		if lost {
+			name = "lost"
+		}
+		t.Run(name, func(t *testing.T) {
+			d := newTestDaemon(t, false)
+			declareStoreNode(t, d)
+			ctx := context.Background()
+			if _, _, err := d.store.SubmitExecution(ctx, store.ExecutionSpec{ClientRequestID: "launch", Scope: store.ScopePath{Project: "p"}, Argv: []string{"run"}, CWD: "."}); err != nil {
+				t.Fatal(err)
+			}
+			reservation, err := d.store.ReserveNext(ctx, "e")
+			if err != nil || reservation == nil {
+				t.Fatalf("reserve: %+v %v", reservation, err)
+			}
+			if err = d.store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+				t.Fatal(err)
+			}
+			launch, err := d.store.AuthorizeLaunch(ctx, reservation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id, lease, epoch := launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch
+			path := "/api/attempts/" + id + "/log"
+			read := d.token(t, "dashboard", store.RoleRead, "")
+			response, body := d.getLog(t, read, path+"?tail=10")
+			if response.StatusCode != http.StatusOK || body != "" || response.Header.Get("Kairo-Log-Next-Offset") != "0" {
+				t.Fatalf("pending log: %d %q next=%q", response.StatusCode, body, response.Header.Get("Kairo-Log-Next-Offset"))
+			}
+			checkNoLog := func(want string) {
+				t.Helper()
+				for _, stream := range []string{"stdout", "stderr"} {
+					status, body := d.call(t, http.MethodGet, path+"?stream="+stream, read, nil)
+					if got := expectError(t, stream, status, body, http.StatusConflict, "no_log"); got.Error != want {
+						t.Fatalf("%s: %q, want %q", stream, got.Error, want)
+					}
+				}
+			}
+			if lost {
+				scratch := "D:/kairo/scratch/" + id
+				if err = d.store.RecordAttemptScratch(ctx, store.AttemptScratch{AttemptID: id, LeaseID: lease, Epoch: epoch, StoreID: "scratch", ExecutorID: "e", Root: "D:/kairo", Path: scratch}); err != nil {
+					t.Fatal(err)
+				}
+				if n, _, err := d.store.ReregisterExecutor(ctx, "e", nil); n != 1 || err != nil {
+					t.Fatalf("lose attempt: %d %v", n, err)
+				}
+				checkNoLog("executor_identity_lost; scratch recorded at " + scratch)
+				if err = d.store.SettleScratch(ctx, store.ScratchSettled{AttemptID: id, State: "kept"}); err != nil {
+					t.Fatal(err)
+				}
+				checkNoLog("executor_identity_lost; scratch kept at " + scratch)
+			} else {
+				reason := "launch failed before activation: snapshot unavailable"
+				if err = d.store.ReleaseReservation(ctx, lease, epoch, reason); err != nil {
+					t.Fatal(err)
+				}
+				checkNoLog("launch_aborted: " + reason)
+			}
+			status, bodyBytes := d.call(t, http.MethodGet, "/api/attempts/att_unknown/log", read, nil)
+			expectError(t, "unknown attempt", status, bodyBytes, http.StatusNotFound, "not_found")
+		})
 	}
 }
 

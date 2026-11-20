@@ -24,6 +24,7 @@ type contractAPI struct {
 	details  map[string]map[string]any // task name -> TaskDetail
 	attempts map[string][]map[string]any
 	logs     map[string]map[string][]byte // attempt -> stream -> bytes
+	noLogs   map[string]string            // attempt -> terminal reason for streams with no path
 	version  string
 	requests []string
 	// projectFailures answers the next N project polls with this status.
@@ -177,6 +178,10 @@ func (f *contractAPI) serveLog(w http.ResponseWriter, r *http.Request, attempt s
 	stream := r.URL.Query().Get("stream")
 	data, ok := f.logs[attempt][stream]
 	if !ok {
+		if reason := f.noLogs[attempt]; reason != "" {
+			writeJSONResponse(w, http.StatusConflict, map[string]string{"error": reason, "code": "no_log"})
+			return
+		}
 		notFoundJSON(w, "attempt has no "+stream+" log")
 		return
 	}

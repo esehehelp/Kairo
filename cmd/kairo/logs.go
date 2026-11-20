@@ -11,9 +11,11 @@ import (
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
+	"kairo/internal/api"
 	"kairo/internal/store"
 )
 
@@ -326,26 +328,44 @@ func showLogs(ctx context.Context, client *apiClient, resolve func() ([]logTarge
 	out := &logWriter{}
 	labelled := len(targets) > 1 || *opts.attempt == "all"
 	offsets := map[string]int64{}
+	var logErr error
 	for _, target := range targets {
+		clear(offsets)
+		var reason, missingStream string
+		missing := 0
 		for _, stream := range streams {
-			if len(streams) > 1 || labelled {
-				out.header(target, stream, labelled)
-			}
-			end, err := printTailLines(client, target.attemptID, stream, *opts.tail, out)
+			header := len(streams) > 1 || labelled
+			end, err := printTailLines(client, target.attemptID, stream, *opts.tail, func(data []byte) {
+				if header {
+					out.header(target, stream, labelled)
+					header = false
+				}
+				out.write(stream, data)
+			})
 			if ctx.Err() != nil {
 				return nil
 			}
 			if routeMissing(err) {
 				return err
 			}
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "kairo: %s of %s: %v\n", stream, target.attemptID, err)
+			if why := noLogReason(err); why != "" {
+				reason, missingStream = why, stream
+				missing++
+			} else if err != nil {
+				logErr = errors.Join(logErr, fmt.Errorf("%s of %s: %w", stream, target.attemptID, err))
+			} else {
+				offsets[stream] = end
 			}
-			offsets[stream] = end
+		}
+		if missing > 0 {
+			if missing == len(streams) {
+				missingStream = ""
+			}
+			out.noLog(target, missingStream, reason)
 		}
 	}
-	if !*opts.follow {
-		return nil
+	if logErr != nil || !*opts.follow || len(offsets) == 0 {
+		return logErr
 	}
 	return followLogs(ctx, client, targets[0], streams, offsets, out, true)
 }
@@ -366,11 +386,24 @@ func (w *logWriter) write(stream string, data []byte) {
 	w.stream = stream
 }
 
-func (w *logWriter) header(target logTarget, stream string, labelled bool) {
+func (w *logWriter) endLine() {
 	if w.partial {
 		_, _ = os.Stdout.Write([]byte("\n"))
 		w.partial = false
 	}
+}
+
+func (w *logWriter) noLog(target logTarget, stream, reason string) {
+	w.endLine()
+	if stream != "" {
+		stream += " "
+	}
+	reason = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ").Replace(reason)
+	fmt.Fprintf(os.Stdout, "attempt %s wrote no %slog: %s\n", target.attemptID, stream, reason)
+}
+
+func (w *logWriter) header(target logTarget, stream string, labelled bool) {
+	w.endLine()
 	label := ""
 	if labelled && target.label != "" {
 		label = target.label + " "
@@ -405,6 +438,14 @@ func fetchLog(client *apiClient, attemptID, stream string, params url.Values) (l
 		return logChunk{}, errors.New("log response without Kairo-Log-Size/Kairo-Log-Next-Offset; " + olderDaemonHint())
 	}
 	return logChunk{data: body, next: next, size: size}, nil
+}
+
+func noLogReason(err error) string {
+	var ae *apiError
+	if errors.As(err, &ae) && ae.Status == http.StatusConflict && ae.Code == api.CodeNoLog {
+		return ae.Message
+	}
+	return ""
 }
 
 // fetchTail is the last n bytes of a log (at most maxLogChunk) in one call.
@@ -451,9 +492,9 @@ func printTailBytes(client *apiClient, attemptID, stream string, n int64, out *l
 
 // printTailLines prints the last n lines of a log (all of it for n == 0) and
 // returns the offset just after what it printed.
-func printTailLines(client *apiClient, attemptID, stream string, n int, out *logWriter) (int64, error) {
+func printTailLines(client *apiClient, attemptID, stream string, n int, write func([]byte)) (int64, error) {
 	if n == 0 {
-		end, _, err := readLog(client, attemptID, stream, 0, func(data []byte) { out.write(stream, data) })
+		end, _, err := readLog(client, attemptID, stream, 0, write)
 		return end, err
 	}
 	want := int64(max(64<<10, n*256))
@@ -466,7 +507,7 @@ func printTailLines(client *apiClient, attemptID, stream string, n int, out *log
 		lines := lastLines(chunk.data, n)
 		// The tail holds n whole lines, or it is the whole log, or the cap.
 		if len(lines) < len(chunk.data) || chunk.start() == 0 || want >= maxLogChunk {
-			out.write(stream, lines)
+			write(lines)
 			return chunk.next, nil
 		}
 		want *= 4
@@ -495,13 +536,20 @@ func lastLines(data []byte, n int) []byte {
 func followLogs(ctx context.Context, client *apiClient, target logTarget, streams []string, offsets map[string]int64, out *logWriter, untilEnded bool) error {
 	quiet := 0
 	failing := false
+	reportedNoLog := len(offsets) < len(streams)
 	for {
 		if !sleepFunc(ctx, logPollInterval) {
 			return nil
 		}
 		grew := false
+		var pollErr error
+		var reason, missingStream string
 		for _, stream := range streams {
-			next, size, err := readLog(client, target.attemptID, stream, offsets[stream], func(data []byte) {
+			offset, ok := offsets[stream]
+			if !ok {
+				continue
+			}
+			next, size, err := readLog(client, target.attemptID, stream, offset, func(data []byte) {
 				if len(data) > 0 && len(streams) > 1 && out.stream != stream {
 					out.header(target, stream, false)
 				}
@@ -510,15 +558,29 @@ func followLogs(ctx context.Context, client *apiClient, target logTarget, stream
 			if ctx.Err() != nil {
 				return nil
 			}
-			if err == nil && size < offsets[stream] {
+			if why := noLogReason(err); why != "" {
+				if !untilEnded {
+					return err
+				}
+				delete(offsets, stream)
+				reason, missingStream = why, stream
+				continue
+			}
+			if err == nil && size < offset {
 				// The log was replaced (shipped anew): start over.
 				next = 0
 			}
-			grew = grew || next > offsets[stream]
+			grew = grew || next > offset
 			offsets[stream] = next
 			if err != nil {
 				if routeMissing(err) {
 					return err
+				}
+				if untilEnded {
+					pollErr = fmt.Errorf("%s of %s: %w", stream, target.attemptID, err)
+					if !transient(err) {
+						return pollErr
+					}
 				}
 				if !notFound(err) && !failing {
 					fmt.Fprintf(os.Stderr, "kairo: %s of %s: %v (retrying)\n", stream, target.attemptID, err)
@@ -527,6 +589,16 @@ func followLogs(ctx context.Context, client *apiClient, target logTarget, stream
 				continue
 			}
 			failing = false
+		}
+		if reason != "" && !reportedNoLog {
+			if len(offsets) == 0 {
+				missingStream = ""
+			}
+			out.noLog(target, missingStream, reason)
+			reportedNoLog = true
+		}
+		if len(offsets) == 0 {
+			return nil
 		}
 		if grew || !untilEnded {
 			quiet = 0
@@ -542,7 +614,7 @@ func followLogs(ctx context.Context, client *apiClient, target logTarget, stream
 		}
 		// Exited: one more quiet poll lets late (shipped) output arrive.
 		if quiet++; quiet >= 2 {
-			return nil
+			return pollErr
 		}
 	}
 }

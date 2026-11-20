@@ -36,6 +36,47 @@ func claimIdentities(t *testing.T, store *Store) map[string]string {
 	return out
 }
 
+func TestClaimFirstObservedAtTracksTheCurrentEpisode(t *testing.T) {
+	for _, batch := range []bool{true, false} {
+		name := "ObserveClaim"
+		if batch {
+			name = "ApplyObservationBatch"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := openCoordinationStore(t)
+			setupSchedulerInventory(t, store)
+			ctx := context.Background()
+			claim := ExternalClaim{ID: "claim-gpu-0-unattributed", ResourceID: "gpu-0", ClaimKind: "unattributed_activity"}
+			observe := func(at, wantFirst string) {
+				t.Helper()
+				claim.FirstObservedAt, claim.LastObservedAt = at, at
+				if batch {
+					processPoll(t, store, "gpu-provider", "node", "gpu-0", "GPU-0", claim)
+				} else if err := store.ObserveClaim(ctx, claim); err != nil {
+					t.Fatal(err)
+				}
+				got := openClaims(t, store)
+				if len(got) != 1 || got[0].ID != claim.ID || got[0].FirstObservedAt != wantFirst || got[0].LastObservedAt != at {
+					t.Fatalf("claims: %+v, want first %s and last %s", got, wantFirst, at)
+				}
+			}
+			first, again := "2026-10-25T21:26:00Z", "2026-11-21T10:00:00Z"
+			observe(first, first)
+			observe("2026-10-25T21:27:00Z", first)
+			if batch {
+				processPoll(t, store, "gpu-provider", "node", "gpu-0", "GPU-0")
+			} else if err := store.ClearClaim(ctx, claim.ID); err != nil {
+				t.Fatal(err)
+			}
+			if got := openClaims(t, store); len(got) != 0 {
+				t.Fatalf("claim not cleared: %+v", got)
+			}
+			observe(again, again)
+			observe("2026-11-21T10:01:00Z", again)
+		})
+	}
+}
+
 func TestTheLeaseHoldersProcessTreeIsNotAClaim(t *testing.T) {
 	store, _, launch := startCooperativeExecution(t, "process-tree")
 	processPoll(t, store, "gpu-provider", "node", "gpu-0", "GPU-0",

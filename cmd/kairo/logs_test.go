@@ -96,6 +96,114 @@ func TestTaskLogsTailsBothStreamsOfTheLatestAttempt(t *testing.T) {
 	}
 }
 
+func TestTaskLogsReportsNoLogOncePerAttempt(t *testing.T) {
+	f := logsFixture()
+	delete(f.logs, "att_1")
+	delete(f.logs["att_g1"], "stdout")
+	f.noLogs = map[string]string{
+		"att_1":  "launch_aborted: launch failed before activation:\nsnapshot unavailable",
+		"att_g1": "executor_identity_lost; scratch kept at D:/kairo/scratch/att_g1",
+	}
+	server := f.serve(t)
+	clock := useFakeClock(t, base)
+	clock.stopAfter = 1
+	aborted := "attempt att_1 wrote no log: launch_aborted: launch failed before activation: snapshot unavailable\n"
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"train", "--attempt", "1", "-f"}, aborted},
+		{[]string{"train", "--attempt", "1", "--stream", "stderr", "--tail", "0"}, aborted},
+		{[]string{"train", "--attempt", "all", "--tail", "1"}, aborted + "==> #2 stdout (att_2) <==\nline 100\n==> #2 stderr (att_2) <==\nwarn\n"},
+		{[]string{"gang", "--rank", "1"}, "attempt att_g1 wrote no log: executor_identity_lost; scratch kept at D:/kairo/scratch/att_g1\n"},
+	} {
+		out, err := captureStdout(t, func() error {
+			return run(append([]string{"task", "logs", "--api", server.URL, "p"}, tc.args...))
+		})
+		if err != nil || out != tc.want {
+			t.Fatalf("%v: %v %q, want %q", tc.args, err, out, tc.want)
+		}
+	}
+	if clock.sleeps != 0 {
+		t.Fatalf("follow polled an attempt with no log: %d sleeps", clock.sleeps)
+	}
+}
+
+func TestTaskLogsDoesNotHideRealErrors(t *testing.T) {
+	f := logsFixture()
+	delete(f.logs["att_2"], "stderr")
+	server := f.serve(t)
+	out, err := captureStdout(t, func() error {
+		return run([]string{"task", "logs", "--api", server.URL, "p", "train", "--tail", "1"})
+	})
+	if !notFound(err) || exitCode(err) == 0 || out != "==> stdout (att_2) <==\nline 100\n" {
+		t.Fatalf("real log error: %v %q", err, out)
+	}
+
+	f.appendLog("att_2", "stderr", "warn\n")
+	clock := useFakeClock(t, base)
+	clock.stopAfter = 2
+	clock.onSleep = func(n int) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		delete(f.logs, "att_2")
+	}
+	out, err = captureStdout(t, func() error {
+		return run([]string{"task", "logs", "--api", server.URL, "p", "train", "--stream", "stderr", "-f"})
+	})
+	if !notFound(err) || exitCode(err) == 0 || out != "warn\n" || clock.sleeps != 1 {
+		t.Fatalf("real log error while following: %v %q, %d polls", err, out, clock.sleeps)
+	}
+}
+
+func TestTaskLogsFollowStopsWhenLaunchFails(t *testing.T) {
+	f := logsFixture()
+	f.logs["att_2"] = map[string][]byte{"stdout": nil, "stderr": nil}
+	clock := useFakeClock(t, base)
+	clock.stopAfter = 2
+	clock.onSleep = func(n int) {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		delete(f.logs, "att_2")
+		f.noLogs = map[string]string{"att_2": "executor_identity_lost"}
+	}
+	server := f.serve(t)
+	out, err := captureStdout(t, func() error {
+		return run([]string{"task", "logs", "--api", server.URL, "p", "train", "-f"})
+	})
+	want := "==> stdout (att_2) <==\n==> stderr (att_2) <==\nattempt att_2 wrote no log: executor_identity_lost\n"
+	if err != nil || out != want || clock.sleeps != 1 {
+		t.Fatalf("follow: %v %q, %d polls", err, out, clock.sleeps)
+	}
+}
+
+func TestTaskLogsFollowsTheStreamThatHasALog(t *testing.T) {
+	f := logsFixture()
+	delete(f.logs["att_1"], "stderr")
+	f.noLogs = map[string]string{"att_1": "process_exit"}
+	f.attempts["exe_1"] = []map[string]any{{"id": "att_1", "execution_id": "exe_1", "state": "exited"}}
+	clock := useFakeClock(t, base)
+	clock.stopAfter = 4
+	clock.onSleep = func(n int) {
+		if n == 1 {
+			f.appendLog("att_1", "stdout", "late output\n")
+		}
+	}
+	server := f.serve(t)
+	out, err := captureStdout(t, func() error {
+		return run([]string{"task", "logs", "--api", server.URL, "p", "train", "--attempt", "1", "-f"})
+	})
+	want := "==> stdout (att_1) <==\nfirst run\nattempt att_1 wrote no stderr log: process_exit\nlate output\n"
+	if err != nil || out != want || clock.sleeps != 3 {
+		t.Fatalf("follow with one missing stream: %v %q, %d polls", err, out, clock.sleeps)
+	}
+	for _, request := range f.seen() {
+		if strings.Contains(request, "offset=") && strings.Contains(request, "stream=stderr") {
+			t.Fatalf("polled missing stderr: %s", request)
+		}
+	}
+}
+
 func TestTaskLogsGangRank(t *testing.T) {
 	server := logsFixture().serve(t)
 	out, err := captureStdout(t, func() error {

@@ -284,7 +284,8 @@ func (c *apiClient) print(method, path string, body any) error {
 
 // apiError is a non-2xx response.
 type apiError struct {
-	Status int
+	Status        int
+	Code, Message string
 	// RouteMissing: the daemon's mux, not a handler, answered: the daemon does
 	// not know the route, so it is likely older than this CLI.
 	RouteMissing bool
@@ -323,7 +324,7 @@ func httpError(status int, payload []byte) error {
 		if code == "" {
 			code = strings.ToLower(http.StatusText(status))
 		}
-		return &apiError{Status: status, text: fmt.Sprintf("HTTP %d %s: %s", status, code, wire.Error)}
+		return &apiError{Status: status, Code: wire.Code, Message: wire.Error, text: fmt.Sprintf("HTTP %d %s: %s", status, code, wire.Error)}
 	}
 	text := strings.TrimSpace(string(payload))
 	if len(text) > 200 {
