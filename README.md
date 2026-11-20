@@ -155,10 +155,12 @@ draw and the power limit in force, `289/320 W`, a cpu's CPU package draw;
 CLOCKS: a GPU's SM clock, P-state and active clock event reasons, `1905 MHz
 P2 sw-power`; see Power and energy) and the tasks holding it (with the lease
 state unless `active`); then the external claims with their evidence, and the
-GPUs reported but not declared for their node. `--json` prints the response of
-`GET /api/resources` instead, whose resources also carry `total_bytes`,
-`free_bytes`, `utilization`, `reserved`, `holders` and `device` (the latest
-sample). `kairo doctor` ends with the same table.
+GPUs reported but not declared for their node. A claim's `since` is when the
+current episode was first observed; it starts over if the claim clears and
+returns. `--json` prints the response of `GET /api/resources` instead, whose
+resources also carry `total_bytes`, `free_bytes`, `utilization`, `reserved`,
+`holders` and `device` (the latest sample). `kairo doctor` ends with the same
+table.
 
 Resource observations describe the present: only each resource's latest one
 is used, and the daemon prunes the others once they are an hour old. Device
@@ -222,6 +224,12 @@ be left out of task commands for Tasks declared by a ProjectSpec.
 | `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | state changes, progress (once a minute per Task) and a summary every 10 min; with `--exit-when-idle` it exits when nothing is pending or running (1 if a watched Task did not succeed) |
 | `kairo execution logs EXECUTION_ID`, `kairo logs ATTEMPT_ID` | the same logs by execution or attempt |
 | `kairo version` | the CLI's and the daemon's build; `doctor` warns when they differ |
+
+If an ended attempt has no log for the requested streams, `task logs` prints
+one line for that attempt with the reason and the scratch path if known.
+This is not an error, and `-f` stops once there is no stream left to follow.
+If just one stream is missing, the CLI reports it and still reads the other.
+Log lookup and read failures still exit nonzero.
 
 A pending or running Task held back by a closed gate of its project, queue or
 task keeps its state; its note says `paused: task gate closed by alice` once
@@ -445,10 +453,13 @@ attempt's log as the daemon holds it (written by its own executor or shipped
 by an agent), as raw bytes: `stream` defaults to `stderr`, `limit` to 1 MiB
 (at most 8 MiB); `tail=N` instead returns the last N bytes. `Kairo-Log-Size`
 is the current size and `Kairo-Log-Next-Offset` where to continue (the body
-started at that offset minus its length); an offset past the end or a log
-not written yet returns an empty
-body, and an unknown attempt or log is `not_found`. Only files inside the
-daemon's `log_directory` are served. `kairo logs
+started at that offset minus its length). An offset past the end, a stream
+not yet recorded for a live execution, or a recorded log not yet shipped
+returns an empty body. If the execution is terminal and the stream has no
+recorded path, the response is `409 no_log`; its JSON `error` gives the
+terminal cause and the scratch path if recorded and still present in the
+store as active or kept. An unknown attempt still returns `404 not_found`.
+Only files inside the daemon's `log_directory` are served. `kairo logs
 [--stream stdout|stderr] [--tail N] [--follow] ATTEMPT_ID` prints it (`--tail`
 the last N bytes, `--follow` polls every 2 s until Ctrl-C), and the Python
 SDK's `KairoClient.attempt_log` reads one slice.

@@ -251,7 +251,9 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		// provider's to renew (or to bring back once cleared): left as it is.
 		var result sql.Result
 		result, err = tx.ExecContext(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES($1,$2,$3,$4,$5,$6,$7)
-			ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,cleared_at=NULL WHERE external_claims.resource_id=excluded.resource_id`,
+			ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,
+			first_observed_at=CASE WHEN external_claims.cleared_at IS NOT NULL THEN excluded.first_observed_at ELSE external_claims.first_observed_at END,
+			cleared_at=NULL WHERE external_claims.resource_id=excluded.resource_id`,
 			claim.ID, claim.ResourceID, claim.ClaimKind, claim.ProcessIdentity, validJSON(claim.Evidence), claim.FirstObservedAt, claim.LastObservedAt)
 		if err != nil {
 			return err
@@ -329,7 +331,10 @@ func (s *Store) ObserveClaim(ctx context.Context, c ExternalClaim) error {
 	if c.LastObservedAt == "" {
 		c.LastObservedAt = t
 	}
-	_, err := s.exec(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES($1,$2,$3,$4,$5,$6,$7) ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,cleared_at=NULL`, c.ID, c.ResourceID, c.ClaimKind, c.ProcessIdentity, validJSON(c.Evidence), c.FirstObservedAt, c.LastObservedAt)
+	_, err := s.exec(ctx, `INSERT INTO external_claims(id,resource_id,claim_kind,process_identity,evidence_json,first_observed_at,last_observed_at) VALUES($1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT(id) DO UPDATE SET evidence_json=excluded.evidence_json,last_observed_at=excluded.last_observed_at,
+		first_observed_at=CASE WHEN external_claims.cleared_at IS NOT NULL THEN excluded.first_observed_at ELSE external_claims.first_observed_at END,
+		cleared_at=NULL`, c.ID, c.ResourceID, c.ClaimKind, c.ProcessIdentity, validJSON(c.Evidence), c.FirstObservedAt, c.LastObservedAt)
 	return err
 }
 func (s *Store) ClearClaim(ctx context.Context, claimID string) error {
