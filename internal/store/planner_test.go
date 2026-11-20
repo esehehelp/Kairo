@@ -17,6 +17,20 @@ type planCluster struct {
 	ctx   context.Context
 }
 
+func TestPlannerOrdersEqualRequestsBySubmissionTime(t *testing.T) {
+	c := newPlanCluster(t)
+	c.node("a", 0, 2000, 8, 100)
+	first := c.submit(planSpec("first", "p", 1, 0, 1000, 1))
+	second := c.submit(planSpec("second", "p", 1, 0, 1000, 1))
+	if _, err := c.store.testExec(`UPDATE execution_requests SET submitted_at=CASE WHEN id=$1 THEN '2026-11-19T12:00:00Z'
+		ELSE '2026-11-19T12:00:00.5Z' END WHERE id IN($1,$2)`, first.ID, second.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := c.reserve("exec-a"); got == nil || got.Execution.ID != first.ID {
+		t.Fatalf("reserved %+v, want %s", got, first.ID)
+	}
+}
+
 func newPlanCluster(t *testing.T) *planCluster {
 	return &planCluster{t: t, store: openCoordinationStore(t), ctx: context.Background()}
 }

@@ -2045,10 +2045,10 @@ no longer exists never sends. `kairo node retire NODE_ID
 --confirm-node-gone [--reason R]` (`POST /api/nodes/{id}/retire`, admin) is
 for a node gone for good (its container deleted, its host decommissioned):
 it fences the node as above (refused the same while an executor of it
-polls), then releases every stale lease of its executors without those
+polls), releases every stale lease of its executors without those
 observations (events `stale_lease_reconciled`, `node_retired`), quiesces its
-lost attempts and disables its executors and the node. Its stores stay
-declared until the machine declaration drops them.
+lost attempts and disables its executors and the node, all in one transaction.
+Its stores stay declared until the machine declaration drops them.
 
 ### Force stop
 
@@ -2589,14 +2589,14 @@ The first `kairo serve` creates the schema; a later one applies the numbered
 migrations it lacks (`schema_version`), and refuses a database that has
 tables but no Kairo schema, or a schema newer than itself.
 
-Writes are serialized: every transaction that writes (a planning pass, a
-lease reservation, a launch, a pause, a heartbeat, an observation batch, a
-token) first takes one transaction-scoped advisory lock, so Kairo's
-decisions run one at a time, as if there were a single connection, however
-many connections the daemon's pool holds and however many processes (the
-daemon, `kairo token`, `kairo db`) share the database. Reads (status, lists,
-logs) take no lock and run alongside. Connections are read-only unless such
-a transaction makes them writable, so a write that bypasses the lock fails.
+Writing transactions (a planning pass, a lease reservation, a launch, a
+pause, a heartbeat, an observation batch, issuing or revoking a token) take
+one transaction-scoped advisory lock, so Kairo's decisions run one at a time
+no matter how many connections or processes share the database. Reads
+(status, lists, logs) take no lock and run alongside. Store reports and the
+once-a-minute refresh of a token's last-used time write without the advisory
+lock. Authentication checks for revocation on every request. Connections
+are read-only unless a transaction explicitly makes them writable.
 Each statement is a round trip to the server: a planning pass costs a fixed
 20 or so whatever the number of waiting executions (it reads the names of
 the scopes its leases and candidates are in, not of every scope), a

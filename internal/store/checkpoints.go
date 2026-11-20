@@ -118,8 +118,8 @@ func (s *Store) RequestDueCheckpoints(ctx context.Context, every time.Duration) 
 	err = eachRow(ctx, tx, `SELECT e.id,a.id,l.id,e.project_scope_id,a.coordination_epoch FROM execution_requests e
 		JOIN attempts a ON a.execution_id=e.id AND a.state='running'
 		JOIN leases l ON l.attempt_id=a.id AND l.state='active'
-		WHERE e.state='started' AND e.checkpointable AND a.started_at IS NOT NULL AND a.started_at<$1
-		AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.attempt_id=a.id AND (c.state IN('pending','accepted','checkpointing') OR (c.kind='checkpoint' AND c.created_at>=$1)))
+		WHERE e.state='started' AND e.checkpointable AND a.started_at IS NOT NULL AND a.started_at::timestamptz<$1::text::timestamptz
+		AND NOT EXISTS (SELECT 1 FROM commands c WHERE c.attempt_id=a.id AND (c.state IN('pending','accepted','checkpointing') OR (c.kind='checkpoint' AND c.created_at::timestamptz>=$1::text::timestamptz)))
 		AND EXISTS (SELECT 1 FROM commands pc JOIN execution_requests pe ON pe.id=pc.execution_id
 			WHERE pe.project_scope_id=e.project_scope_id AND pc.state='checkpointed'
 			AND pc.payload_json ~ '"continuation_ref" *: *"([A-Za-z]:(/|\\\\)|/[^/])')

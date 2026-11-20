@@ -201,7 +201,7 @@ func moveWaitingFetchesTx(ctx context.Context, tx *sql.Tx, me executorInfo, exec
 	}
 	var fetches []waiting
 	err := eachRow(ctx, tx, `SELECT p.object_id,p.store_id,COALESCE(d.project_scope_id,''),COALESCE(d.pack_bytes,0)+COALESCE(d.content_bytes,0) FROM object_placements p JOIN data_objects d ON d.id=p.object_id
-		WHERE p.executor_id=$1 AND p.state='fetching' AND p.created_at<$2 ORDER BY p.created_at,p.object_id`, []any{executorID, time.Now().UTC().Add(-fetchMoveAfter).Format(time.RFC3339Nano)}, func(rows *sql.Rows) error {
+		WHERE p.executor_id=$1 AND p.state='fetching' AND p.created_at::timestamptz<$2::text::timestamptz ORDER BY p.created_at,p.object_id`, []any{executorID, time.Now().UTC().Add(-fetchMoveAfter).Format(time.RFC3339Nano)}, func(rows *sql.Rows) error {
 		var w waiting
 		if err := rows.Scan(&w.objectID, &w.storeID, &w.projectID, &w.bytes); err != nil {
 			return err

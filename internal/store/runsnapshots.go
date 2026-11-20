@@ -43,7 +43,7 @@ func (s *Store) orderRunSnapshotsTx(ctx context.Context, tx *sql.Tx, declared []
 	if every <= 0 {
 		return nil
 	}
-	cutoff := time.Now().UTC().Add(-every).Format(time.RFC3339Nano)
+	cutoff := time.Now().UTC().Add(-every)
 	type running struct {
 		runID, storeID, root, path, nodeID, projectID, created, attemptID string
 		last                                                              sql.NullString
@@ -52,7 +52,7 @@ func (s *Store) orderRunSnapshotsTx(ctx context.Context, tx *sql.Tx, declared []
 	}
 	var runs []running
 	err := eachRow(ctx, tx, `SELECT o.run_id,o.store_id,o.root,o.path,x.node_id,e.project_scope_id,o.created_at,a.id,
-		(SELECT MAX(d.created_at) FROM data_objects d WHERE d.kind='run-snapshot' AND d.store_id=o.store_id AND left(d.source_id,length(o.run_id)+1)=o.run_id||'~'),
+		(SELECT d.created_at FROM data_objects d WHERE d.kind='run-snapshot' AND d.store_id=o.store_id AND left(d.source_id,length(o.run_id)+1)=o.run_id||'~' ORDER BY d.created_at::timestamptz DESC LIMIT 1),
 		(SELECT COUNT(*) FROM data_objects d WHERE d.kind='run-snapshot' AND d.store_id=o.store_id AND left(d.source_id,length(o.run_id)+1)=o.run_id||'~'),
 		EXISTS(SELECT 1 FROM data_objects d WHERE d.kind='run-snapshot' AND d.store_id=o.store_id AND left(d.source_id,length(o.run_id)+1)=o.run_id||'~' AND d.state='packing')
 		FROM run_outputs o JOIN attempts a ON a.id=o.last_attempt_id JOIN execution_requests e ON e.id=a.execution_id JOIN executors x ON x.id=o.executor_id
@@ -85,17 +85,21 @@ func (s *Store) orderRunSnapshotsTx(ctx context.Context, tx *sql.Tx, declared []
 		if r.last.Valid {
 			since = r.last.String
 		}
+		sinceTime, err := time.Parse(time.RFC3339Nano, since)
+		if err != nil {
+			return err
+		}
 		var state string
 		if err = tx.QueryRowContext(ctx, `SELECT state FROM attempts WHERE id=$1`, r.attemptID).Scan(&state); err != nil {
 			return err
 		}
 		var checkpointed bool
 		// a checkpoint the run's latest attempt published since
-		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM commands c WHERE c.attempt_id=$1 AND c.state='checkpointed' AND c.updated_at>$2)`,
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM commands c WHERE c.attempt_id=$1 AND c.state='checkpointed' AND c.updated_at::timestamptz>$2::text::timestamptz)`,
 			r.attemptID, since).Scan(&checkpointed); err != nil {
 			return err
 		}
-		periodic := (state == "running" || state == "quiescing") && since < cutoff
+		periodic := (state == "running" || state == "quiescing") && sinceTime.Before(cutoff)
 		if !periodic && !checkpointed {
 			continue
 		}

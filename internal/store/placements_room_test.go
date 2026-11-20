@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"kairo/internal/machine"
 )
@@ -98,7 +99,8 @@ func TestAFetchGoesWhereThereIsRoom(t *testing.T) {
 	if got := storeOf(first); got != "a-small" {
 		t.Fatalf("a fetch just ordered was moved to %s", got)
 	}
-	if _, err = store.testExec(`UPDATE object_placements SET created_at='2026-01-01T00:00:00Z' WHERE object_id=$1`, first); err != nil {
+	old := time.Now().Add(-2 * fetchMoveAfter).In(time.FixedZone("", 12*3600)).Format(time.RFC3339Nano)
+	if _, err = store.testExec(`UPDATE object_placements SET created_at=$1 WHERE object_id=$2`, old, first); err != nil {
 		t.Fatal(err)
 	}
 	if orders, err = store.FetchesToMake(ctx, "exec2"); err != nil {

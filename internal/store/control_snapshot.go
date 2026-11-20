@@ -41,6 +41,13 @@ func (s *Store) ControlSnapshotTask(ctx context.Context, at time.Time, every tim
 	if err != nil {
 		return "", err
 	}
+	var exists bool
+	err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id
+		WHERE p.kind='project' AND p.external_key=$1 AND t.name=$2)`, ControlProject, name).Scan(&exists)
+	if err != nil || exists {
+		tx.Rollback()
+		return "", err
+	}
 	declared, err := declaredStores(ctx, tx)
 	if err != nil {
 		tx.Rollback()

@@ -80,7 +80,10 @@ func TestADurableStoresDirectoryIsAdoptedAndChecked(t *testing.T) {
 
 	// obj_k is gone from the directory: marked damaged
 	listing.Copies = map[string]string{"obj_a": "202611", "obj_lost": "202611"}
-	listing.ListedAt = time.Now().UTC().Add(time.Second).Format(time.RFC3339Nano)
+	listing.ListedAt = "2026-11-19T12:00:00.5Z"
+	if _, err = store.testExec(`UPDATE object_copies SET updated_at='2026-11-19T12:00:00Z' WHERE object_id='obj_k'`); err != nil {
+		t.Fatal(err)
+	}
 	if inv, err = store.InventoryDurable(ctx, listing); err != nil || inv.Missing != 1 {
 		t.Fatalf("a recorded copy gone: %+v %v", inv, err)
 	}

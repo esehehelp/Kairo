@@ -43,10 +43,10 @@ var (
 	ErrGangAborted = errors.New("gang placement was aborted")
 )
 
-// decisionLock is the key of the transaction-scoped advisory lock that every
-// writing transaction takes before anything else (beginWrite). Kairo's
-// decisions (admission, leases, launch, gates, preemption, quarantine,
-// commands, device settings, machine apply, orchestration) read state and
+// decisionLock is the key of the transaction-scoped advisory lock that
+// beginWrite takes before anything else. Kairo's decisions (admission,
+// leases, launch, gates, preemption, quarantine, commands, device settings,
+// machine apply, orchestration) read state and
 // write what follows from it; holding one lock for the whole transaction runs
 // them one at a time, as if there were a single connection, whatever the
 // pool size and however many processes share the database. Reads take no
@@ -66,7 +66,8 @@ const maxConns = 16
 type Store struct {
 	// db is the pool. Its connections are read-only by default
 	// (default_transaction_read_only): read through it directly or with
-	// beginRead; write only through beginWrite or exec.
+	// beginRead; write through beginWrite or exec, except as documented
+	// by beginUnlockedWrite.
 	db     *sql.DB
 	policy SchedulingPolicy
 	// lastPass is when ReserveNext last completed a whole planning pass
@@ -234,7 +235,7 @@ func migrateTo(ctx context.Context, tx *sql.Tx, create bool, target int) error {
 }
 
 // checkDatabase refuses a database whose text does not compare byte by byte
-// (times and identifiers are compared as text) or is not UTF-8.
+// (identifiers and some timestamps are compared as text) or is not UTF-8.
 func checkDatabase(ctx context.Context, tx *sql.Tx) error {
 	var encoding string
 	var bytewise bool
@@ -247,20 +248,17 @@ func checkDatabase(ctx context.Context, tx *sql.Tx) error {
 	return nil
 }
 
-// beginWrite begins a transaction that may write: the way to write. It
-// takes the decision lock first, so writing transactions never overlap.
+// beginWrite begins a writing transaction. It takes the decision lock first,
+// so decisions never overlap.
 func (s *Store) beginWrite(ctx context.Context) (*sql.Tx, error) { return beginWriteDB(ctx, s.db) }
 
-// beginUnlockedWrite begins a writing transaction without the decision
-// lock, for what agents observe of stores (RecordStoreObservation), which no
-// decision reads: admission, leases, launches and the rest never look at
-// store observations or at scratch bytes and presence, so a report need not
-// wait for a decision nor make one wait. The scratch records it shares with
-// decisions (recording and settling scratch, under the lock) it changes only
-// with single statements whose conditions PostgreSQL checks again under the
-// row lock, so neither side loses the other's change; it locks the store's
-// declaration row first, so two reports of one store never lock the records
-// in different orders. Nothing else may use it.
+// beginUnlockedWrite is only for RecordStoreObservation and the single
+// statement that refreshes api_tokens.last_used_at, which no decision uses.
+// Copy room, shedding, fetch room and evictions read committed store
+// observations without locking them. Writers that lock a machine_stores row
+// must do so before touching its attempt_scratch, run_outputs or
+// store_observations rows. Reports change shared rows with single statements
+// whose conditions PostgreSQL rechecks under the row lock.
 func (s *Store) beginUnlockedWrite(ctx context.Context) (*sql.Tx, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

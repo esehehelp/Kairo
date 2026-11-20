@@ -35,11 +35,7 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 			continue
 		}
 		servedIDs = append(servedIDs, s.ID)
-		if room[s.ID] != unknownRoom {
-			// The margin also excludes stores already below their reserve.
-			room[s.ID] -= shedMinShort
-		}
-		if room[s.ID] >= 0 {
+		if room[s.ID] == unknownRoom || room[s.ID] >= shedMinShort {
 			eligible = append(eligible, s)
 			eligibleIDs = append(eligibleIDs, s.ID)
 		}
@@ -87,7 +83,12 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 			break
 		}
 		for _, target := range eligible {
-			if c.blocked[target.ID] || room[target.ID] < c.bytes {
+			available := room[target.ID]
+			if available != unknownRoom {
+				// The margin limits replicas, not the room shedding sees.
+				available -= shedMinShort
+			}
+			if c.blocked[target.ID] || available < c.bytes {
 				continue
 			}
 			month := c.created[0:4] + c.created[5:7]
