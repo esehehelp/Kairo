@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"syscall"
 	"unsafe"
 
@@ -63,8 +64,22 @@ func lowIntegrityToken() (windows.Token, error) {
 		low.Close()
 		return 0, err
 	}
-	label := windows.Tokenmandatorylabel{Label: windows.SIDAndAttributes{Sid: sid, Attributes: windows.SE_GROUP_INTEGRITY}}
-	if err := windows.SetTokenInformation(low, windows.TokenIntegrityLevel, (*byte)(unsafe.Pointer(&label)), uint32(unsafe.Sizeof(label))+windows.GetLengthSid(sid)); err != nil {
+	// TOKEN_MANDATORY_LABEL followed by its SID in one buffer: the length
+	// passed covers both, so all of it must be ours (issue #9: the kernel
+	// probes that many bytes from the label).
+	sidLen := windows.GetLengthSid(sid)
+	head := unsafe.Sizeof(windows.Tokenmandatorylabel{})
+	buf := make([]byte, head+uintptr(sidLen))
+	inBuf := (*windows.SID)(unsafe.Pointer(&buf[head]))
+	if err := windows.CopySid(sidLen, inBuf, sid); err != nil {
+		low.Close()
+		return 0, err
+	}
+	label := (*windows.Tokenmandatorylabel)(unsafe.Pointer(&buf[0]))
+	label.Label = windows.SIDAndAttributes{Sid: inBuf, Attributes: windows.SE_GROUP_INTEGRITY}
+	err = windows.SetTokenInformation(low, windows.TokenIntegrityLevel, &buf[0], uint32(len(buf)))
+	runtime.KeepAlive(buf)
+	if err != nil {
 		low.Close()
 		return 0, fmt.Errorf("lower the token to Low integrity: %w", err)
 	}
