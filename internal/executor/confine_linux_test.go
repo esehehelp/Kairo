@@ -17,8 +17,14 @@ func TestAConfinedAttemptWritesOnlyWhereItIsHanded(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("confining needs root (mounts in a namespace of its own)")
 	}
-	// not under /tmp, which the attempt sees as a directory of its scratch
-	base, err := os.MkdirTemp("/var/tmp", "kairo-confine-")
+	// not under /tmp, which the attempt sees as a directory of its scratch;
+	// run as a confined attempt itself (kairo-ci), only its scratch is
+	// writable
+	parent := "/var/tmp"
+	if s := os.Getenv("KAIRO_SCRATCH"); s != "" {
+		parent = s
+	}
+	base, err := os.MkdirTemp(parent, "kairo-confine-")
 	if err != nil {
 		t.Fatal(err)
 	}
