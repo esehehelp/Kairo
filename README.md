@@ -1308,8 +1308,8 @@ store by id on the node its pack is on, else the first by id elsewhere (read
 through the pack's agent), not inside a WSL distro nor being moved, with room
 for it (its free bytes as last reported, less its `reserve_free_bytes` and
 the packs of the copies being made there or verified there since that
-report, which is minutes old; one never reported is taken as having room),
-then to every other durable store as a replica, so losing one
+report, plus the packs shed since it; one never reported is taken as having
+room), then to every other durable store as a replica, so losing one
 store (a disk deleted or failed), or a whole host, loses nothing Kairo
 keeps: once an object has a verified copy, each other durable store an
 executor serves that has none of it takes one as it has room, smallest
@@ -1344,8 +1344,9 @@ copies there of objects that keep at least two verified, undamaged copies on
 other durable stores, the biggest first, up to 50 at a time and only as many
 as cover the shortfall; never a copy a replica or a fetch is reading. Each is claimed
 first (`claim-shed`: the record goes, the other copies counted again; event
-`copy_shed`), then its pack, file list and description are removed. Once
-there is room again the store takes replicas as before.
+`copy_shed`), then its pack, file list and description are removed. Replicas
+leave at least 1 GiB free above the reserve and do not return to a store
+that shed the same object in the last 24 hours.
 The directory of a durable store is what it holds, whatever the records say:
 every hour each executor serving one on its own filesystems lists it (each
 `<root>/objects/<YYYYMM>/<object id>.tar.zst` with its file list beside it;
@@ -1652,13 +1653,15 @@ Evicting: a volatile store whose free space, as its executor last reported
 it, is below its floor (its declared `reserve_free_bytes`, else a tenth of
 its total) has things evicted until it would be back above it (agent
 operations `evictions-to-make` every minute, `settle-eviction`; events
-`eviction_ordered`, `evicted`, `eviction_kept`), each only what can be had
-again: what was brought there first (it can be brought again from its
-durable copy), then temporal data on it of that executor (it can be made
-again by its task), each least recently used first (the later of when it
-was made, or brought there, and when an attempt was last handed it as an
-input, `data_objects.last_used_at`), and never one a task pending or running,
-or an execution not yet ended, names as an input. Each is claimed first
+`eviction_ordered`, `evicted`, `eviction_kept`). Both claimed evictions and
+bytes evicted since that report count toward covering the shortfall. Only
+what can be had again is evicted: what was brought there first (it can be
+brought again from its durable copy), then temporal data on it of that
+executor (it can be made again by its task), each least recently used first
+(the later of when it was made, or brought there, and when an attempt was
+last handed it as an input, `data_objects.last_used_at`), and never one a
+pending or running task, or an execution not yet ended, names as an input.
+Each is claimed first
 (placement `evicting`, or source `evicting`: not read in place nor handed to
 an attempt from then on, and a declaration under which it would no longer be
 Kairo's is refused), then deleted by the executor: a brought object's

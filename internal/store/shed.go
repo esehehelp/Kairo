@@ -33,25 +33,11 @@ var shedMinShort int64 = 1 << 30
 
 // shedShortTx is how far store s is under its reserve, as shedding counts it.
 func shedShortTx(ctx context.Context, tx *sql.Tx, s machine.Store) (int64, error) {
-	var free sql.NullInt64
-	var observed string
-	err := tx.QueryRowContext(ctx, `SELECT free_bytes,observed_at FROM store_observations WHERE store_id=$1 AND usable`, s.ID).Scan(&free, &observed)
-	if errors.Is(err, sql.ErrNoRows) || err == nil && !free.Valid {
-		return 0, nil
-	}
-	if err != nil {
+	room, err := copyRoomTx(ctx, tx, s)
+	if err != nil || room == unknownRoom {
 		return 0, err
 	}
-	var taken, shed int64
-	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM object_copies c JOIN data_objects d ON d.id=c.object_id
-		WHERE c.store_id=$1 AND (c.state='copying' OR c.state='verified' AND c.verified_at>$2)`, s.ID, observed).Scan(&taken); err != nil {
-		return 0, err
-	}
-	if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM(d.pack_bytes),0)::bigint FROM coordination_events e JOIN data_objects d ON d.id=e.aggregate_id
-		WHERE e.event_type='copy_shed' AND e.payload_json::jsonb->>'store_id'=$1 AND e.created_at>$2`, s.ID, observed).Scan(&shed); err != nil {
-		return 0, err
-	}
-	return s.ReserveFreeBytes - (free.Int64 - taken + shed), nil
+	return -room, nil
 }
 
 // shedOrdersTx are the copies executor me is to remove from the durable

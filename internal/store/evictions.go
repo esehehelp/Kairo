@@ -97,7 +97,8 @@ func (s *Store) EvictionsToMake(ctx context.Context, executorID string) ([]Evict
 		}
 		out = append(out, claimed...)
 		var total, free sql.NullInt64
-		err = tx.QueryRowContext(ctx, `SELECT total_bytes,free_bytes FROM store_observations WHERE store_id=$1 AND usable`, d.ID).Scan(&total, &free)
+		var observed string
+		err = tx.QueryRowContext(ctx, `SELECT total_bytes,free_bytes,observed_at FROM store_observations WHERE store_id=$1 AND usable`, d.ID).Scan(&total, &free, &observed)
 		if errors.Is(err, sql.ErrNoRows) || err == nil && (!total.Valid || !free.Valid) {
 			continue
 		}
@@ -108,6 +109,16 @@ func (s *Store) EvictionsToMake(ctx context.Context, executorID string) ([]Evict
 		for _, o := range claimed {
 			need -= o.Bytes
 		}
+		if need <= 0 {
+			continue
+		}
+		// The last report does not include the space cleared by later evictions.
+		var evicted int64
+		if err = tx.QueryRowContext(ctx, `SELECT COALESCE(SUM((payload_json::jsonb->>'bytes')::bigint),0)::bigint FROM coordination_events
+			WHERE event_type='evicted' AND payload_json::jsonb->>'store_id'=$1 AND created_at::timestamptz>$2::text::timestamptz`, d.ID, observed).Scan(&evicted); err != nil {
+			return nil, err
+		}
+		need -= evicted
 		if need <= 0 {
 			continue
 		}
@@ -238,6 +249,7 @@ func (s *Store) SettleEviction(ctx context.Context, settled EvictionSettled) err
 	}
 	defer tx.Rollback()
 	t := now()
+	storeID := settled.StoreID
 	var nodeID string
 	var bytes int64
 	switch settled.Kind {
@@ -263,7 +275,7 @@ func (s *Store) SettleEviction(ctx context.Context, settled EvictionSettled) err
 			_, err = tx.ExecContext(ctx, `UPDATE object_placements SET state='ready',updated_at=$1 WHERE object_id=$2 AND store_id=$3`, t, settled.ObjectID, settled.StoreID)
 		}
 	case EvictTemporal:
-		var executorID, state, kind, sourceID, storeID string
+		var executorID, state, kind, sourceID string
 		err = tx.QueryRowContext(ctx, `SELECT d.executor_id,d.source_state,d.kind,d.source_id,d.store_id,COALESCE(d.content_bytes,0),x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id
 			WHERE d.id=$1 FOR UPDATE OF d`, settled.ObjectID).Scan(&executorID, &state, &kind, &sourceID, &storeID, &bytes, &nodeID)
 		if errors.Is(err, sql.ErrNoRows) {
@@ -295,15 +307,17 @@ func (s *Store) SettleEviction(ctx context.Context, settled EvictionSettled) err
 		return err
 	}
 	event := "eviction_kept"
+	payload := map[string]any{"kind": settled.Kind, "store_id": storeID, "reason": settled.Reason}
 	if settled.Evicted {
 		event = "evicted"
+		payload["bytes"] = bytes
 		if _, err = tx.ExecContext(ctx, `INSERT INTO node_trims(node_id,requested_at,requested_bytes,updated_at) VALUES($1,$2,$3,$4)
 			ON CONFLICT(node_id) DO UPDATE SET requested_at=excluded.requested_at,requested_bytes=node_trims.requested_bytes+excluded.requested_bytes,updated_at=excluded.updated_at`,
 			nodeID, t, bytes, t); err != nil {
 			return err
 		}
 	}
-	if err = appendCoordinationEventTx(ctx, tx, event, nil, "object", settled.ObjectID, nil, map[string]any{"kind": settled.Kind, "store_id": settled.StoreID, "reason": settled.Reason}); err != nil {
+	if err = appendCoordinationEventTx(ctx, tx, event, nil, "object", settled.ObjectID, nil, payload); err != nil {
 		return err
 	}
 	return tx.Commit()

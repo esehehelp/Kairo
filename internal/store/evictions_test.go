@@ -124,8 +124,12 @@ regenerable = true
 	if got := evictions(); len(got) != 0 {
 		t.Fatalf("evicted above the floor: %v", got)
 	}
-	// 200 short: the placement (50), then t3 (300; t2 is read, t1 read lately)
-	observe(800)
+	// 340 short: the placement (50), then t3 (300; t2 is read, t1 read lately).
+	observe(660)
+	// A later fractional second sorts before the whole second as text.
+	if _, err := store.testExec(`UPDATE store_observations SET observed_at='2000-01-01T00:00:00Z' WHERE store_id='d-scratch'`); err != nil {
+		t.Fatal(err)
+	}
 	want := "placement:dur,temporal:t3"
 	if got := strings.Join(evictions(), ","); got != want {
 		t.Fatalf("evictions %s, want %s", got, want)
@@ -155,14 +159,23 @@ regenerable = true
 	if err := store.SettleEviction(ctx, EvictionSettled{ObjectID: ids["t3"], Kind: EvictTemporal, StoreID: "d-scratch", ExecutorID: "executor", Evicted: true}); err == nil {
 		t.Fatal("settled by an executor not its own")
 	}
-	for _, s := range []EvictionSettled{
-		{ObjectID: ids["dur"], Kind: EvictPlacement, StoreID: "d-scratch", ExecutorID: "win-exec", Evicted: true},
-		{ObjectID: ids["t3"], Kind: EvictTemporal, StoreID: "d-scratch", ExecutorID: "win-exec", Evicted: true},
-		{ObjectID: ids["t3"], Kind: EvictTemporal, StoreID: "d-scratch", ExecutorID: "win-exec", Evicted: true},
-	} {
-		if err := store.SettleEviction(ctx, s); err != nil {
+	settle := func(name, kind string) {
+		t.Helper()
+		if err := store.SettleEviction(ctx, EvictionSettled{ObjectID: ids[name], Kind: kind, StoreID: "d-scratch", ExecutorID: "win-exec", Evicted: true}); err != nil {
 			t.Fatal(err)
 		}
+		if _, err := store.testExec(`UPDATE coordination_events SET created_at='2000-01-01T00:00:00.1Z' WHERE event_type='evicted' AND aggregate_id=$1`, ids[name]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settle("t3", EvictTemporal)
+	if got := strings.Join(evictions(), ","); got != "placement:dur" {
+		t.Fatalf("after the temporal eviction settled: %s", got)
+	}
+	settle("dur", EvictPlacement)
+	settle("t3", EvictTemporal)
+	if got := evictions(); len(got) != 0 {
+		t.Fatalf("evicted again on the same report: %v", got)
 	}
 	var placements int
 	var sourceState string
@@ -176,8 +189,9 @@ regenerable = true
 	if err := store.db.QueryRowContext(ctx, `SELECT requested_bytes FROM node_trims WHERE node_id='node'`).Scan(&trim); err != nil || trim != 350 {
 		t.Fatalf("trim %d %v", trim, err)
 	}
-	// still short as last reported: t1 next (t2 is read); kept, it is not
-	// ordered again for a while
+	// A fresh report is still short: t1 next (t2 is read). If kept, it is
+	// not ordered again for a while.
+	observe(660)
 	if got := strings.Join(evictions(), ","); got != "temporal:t1" {
 		t.Fatalf("evictions %s", got)
 	}
