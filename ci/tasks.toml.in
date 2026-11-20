@@ -1,8 +1,10 @@
 # Kairo's CI as Kairo tasks: the checks of one commit (@SHA@, filled in by ci/kairo-ci.sh), each a Task of project
-# kairo-ci that unpacks the commit's tree (copied to each node by ci/kairo-ci.sh) into a fresh directory, runs
-# ci/check.sh CHECK from that tree, and removes the directory. Priority -500: CI waits for everyone's work and preempts
-# nothing (the lowest serving is -100). The checks on pve1-work reserve 3 GiB of its 4 GiB each, so the planner runs
-# them one at a time; those on windows-local run beside each other.
+# kairo-ci that unpacks the commit's tree (copied to each node by ci/kairo-ci.sh) into its scratch (KAIRO_SCRATCH), runs
+# the check from that tree with the build caches in the project's cache directory (KAIRO_CACHE_DIR), and removes the
+# tree. Attempts are confined (README: Confinement): those are the only places they may write, and on Windows they run
+# at Low integrity, where Git Bash does not start, so the Windows checks run ci/check.ps1 in PowerShell. Priority -500:
+# CI waits for everyone's work and preempts nothing (the lowest serving is -100). The checks on pve1-work reserve
+# 3 GiB of its 4 GiB each, so the planner runs them one at a time; those on windows-local run beside each other.
 schema_version = 1
 
 [project]
@@ -21,7 +23,7 @@ preemptible = false
 [[tasks]]
 name = "@SHA@-linux"
 [tasks.execution]
-argv = ["runuser", "-u", "ci", "--", "bash", "-c", "set -e; d=$(mktemp -d /srv/kairo-ci/run/@SHA@-linux.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; HOME=/home/ci GOCACHE=/srv/kairo-ci/cache/ci-build GOMODCACHE=/srv/kairo-ci/cache/ci-mod bash ci/check.sh linux"]
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; trap 'rm -rf \"$d\" \"$t\"' EXIT; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; chmod 755 \"$KAIRO_SCRATCH\" \"$c\"; chown -R ci:ci \"$d\" \"$t\"; chown ci:ci \"$c/ci-build\" \"$c/ci-mod\"; cd \"$d\"; setpriv --reuid=ci --regid=ci --init-groups env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux"]
 cwd = "/srv/kairo-ci"
 [tasks.execution.executor]
 labels = { site = "pve1" }
@@ -33,7 +35,7 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-linux-race"
 [tasks.execution]
-argv = ["runuser", "-u", "ci", "--", "bash", "-c", "set -e; d=$(mktemp -d /srv/kairo-ci/run/@SHA@-linux-race.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; HOME=/home/ci GOCACHE=/srv/kairo-ci/cache/ci-build GOMODCACHE=/srv/kairo-ci/cache/ci-mod bash ci/check.sh linux-race"]
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; trap 'rm -rf \"$d\" \"$t\"' EXIT; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; chmod 755 \"$KAIRO_SCRATCH\" \"$c\"; chown -R ci:ci \"$d\" \"$t\"; chown ci:ci \"$c/ci-build\" \"$c/ci-mod\"; cd \"$d\"; setpriv --reuid=ci --regid=ci --init-groups env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux-race"]
 cwd = "/srv/kairo-ci"
 [tasks.execution.executor]
 labels = { site = "pve1" }
@@ -45,7 +47,7 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-linux-root"
 [tasks.execution]
-argv = ["bash", "-c", "set -e; d=$(mktemp -d /srv/kairo-ci/run/@SHA@-linux-root.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; GOCACHE=/srv/kairo-ci/cache/root-build GOMODCACHE=/srv/kairo-ci/cache/root-mod bash ci/check.sh linux-root"]
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; c=$KAIRO_CACHE_DIR; trap 'rm -rf \"$d\"' EXIT; mkdir -p \"$d\"; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; GOCACHE=\"$c/root-build\" GOMODCACHE=\"$c/root-mod\" bash ci/check.sh linux-root"]
 cwd = "/srv/kairo-ci"
 [tasks.execution.executor]
 labels = { site = "pve1" }
@@ -57,7 +59,7 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-windows"
 [tasks.execution]
-argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d @CI_WINDOWS_ROOT@/run/@SHA@-windows.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf @CI_WINDOWS_ROOT@/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh windows"]
+argv = ["C:/Program Files/PowerShell/7/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $d=Join-Path $env:KAIRO_SCRATCH 'src'; New-Item -ItemType Directory -Force $d | Out-Null; & 'C:/Windows/System32/tar.exe' -xf '@CI_WINDOWS_DIR@/src/@SHA@.tar' -C $d; if ($LASTEXITCODE) { exit $LASTEXITCODE }; & 'C:/Program Files/PowerShell/7/pwsh.exe' -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $d 'ci/check.ps1') windows; $code=$LASTEXITCODE; Set-Location $env:KAIRO_SCRATCH; Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue; exit $code"]
 cwd = "@CI_WINDOWS_DIR@"
 [tasks.execution.executor]
 labels = { environment = "windows" }
@@ -69,7 +71,7 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-wsl"
 [tasks.execution]
-argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d @CI_WINDOWS_ROOT@/run/@SHA@-wsl.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf @CI_WINDOWS_ROOT@/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh wsl"]
+argv = ["C:/Program Files/PowerShell/7/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $d=Join-Path $env:KAIRO_SCRATCH 'src'; New-Item -ItemType Directory -Force $d | Out-Null; & 'C:/Windows/System32/tar.exe' -xf '@CI_WINDOWS_DIR@/src/@SHA@.tar' -C $d; if ($LASTEXITCODE) { exit $LASTEXITCODE }; & 'C:/Program Files/PowerShell/7/pwsh.exe' -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $d 'ci/check.ps1') wsl; $code=$LASTEXITCODE; Set-Location $env:KAIRO_SCRATCH; Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue; exit $code"]
 cwd = "@CI_WINDOWS_DIR@"
 [tasks.execution.executor]
 labels = { environment = "windows" }
@@ -81,7 +83,7 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-sdk-python"
 [tasks.execution]
-argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d @CI_WINDOWS_ROOT@/run/@SHA@-sdk-python.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf @CI_WINDOWS_ROOT@/src/@SHA@.tar -C \"$d\"; cd \"$d\"; bash ci/check.sh sdk-python"]
+argv = ["C:/Program Files/PowerShell/7/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $d=Join-Path $env:KAIRO_SCRATCH 'src'; New-Item -ItemType Directory -Force $d | Out-Null; & 'C:/Windows/System32/tar.exe' -xf '@CI_WINDOWS_DIR@/src/@SHA@.tar' -C $d; if ($LASTEXITCODE) { exit $LASTEXITCODE }; & 'C:/Program Files/PowerShell/7/pwsh.exe' -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $d 'ci/check.ps1') sdk-python; $code=$LASTEXITCODE; Set-Location $env:KAIRO_SCRATCH; Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue; exit $code"]
 cwd = "@CI_WINDOWS_DIR@"
 [tasks.execution.executor]
 labels = { environment = "windows" }
@@ -93,7 +95,7 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-sdk-rust"
 [tasks.execution]
-argv = ["C:/Program Files/Git/bin/bash.exe", "-c", "set -e; d=$(mktemp -d @CI_WINDOWS_ROOT@/run/@SHA@-sdk-rust.XXXXXX); trap 'rm -rf \"$d\"' EXIT; tar -xf @CI_WINDOWS_ROOT@/src/@SHA@.tar -C \"$d\"; cd \"$d\"; CARGO_TARGET_DIR=@CI_WINDOWS_ROOT@/cache/cargo-target bash ci/check.sh sdk-rust"]
+argv = ["C:/Program Files/PowerShell/7/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $d=Join-Path $env:KAIRO_SCRATCH 'src'; New-Item -ItemType Directory -Force $d | Out-Null; & 'C:/Windows/System32/tar.exe' -xf '@CI_WINDOWS_DIR@/src/@SHA@.tar' -C $d; if ($LASTEXITCODE) { exit $LASTEXITCODE }; & 'C:/Program Files/PowerShell/7/pwsh.exe' -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $d 'ci/check.ps1') sdk-rust; $code=$LASTEXITCODE; Set-Location $env:KAIRO_SCRATCH; Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue; exit $code"]
 cwd = "@CI_WINDOWS_DIR@"
 [tasks.execution.executor]
 labels = { environment = "windows" }

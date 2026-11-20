@@ -2803,9 +2803,14 @@ CI_PVE1_HOST=root@192.168.1.252                             # the Proxmox host o
 CI_PVE1_VMID=116                                            # pve1-work's container
 ```
 
-Each Task unpacks that tree into a fresh directory, runs `ci/check.sh CHECK`
-from it (the checks are those of the commit, and nothing a running check reads
-changes under it), and removes the directory: `<sha>-linux` (gofmt, `go vet`
+Each Task unpacks that tree into its scratch (`KAIRO_SCRATCH`), runs
+`ci/check.sh CHECK` from it (the checks are those of the commit, and nothing a
+running check reads changes under it) with Go's, uv's and cargo's caches in
+the project's cache directory (`KAIRO_CACHE_DIR`), and removes the tree: its
+attempts are confined like any (Confinement), so those are the only places
+they may write. On windows-local they run at Low integrity, where Git Bash
+does not start, so the Windows checks run `ci/check.ps1 CHECK` in
+PowerShell instead of `ci/check.sh`. The checks: `<sha>-linux` (gofmt, `go vet`
 for Linux and Windows, `go test`), `<sha>-linux-race` and `<sha>-linux-root`
 (the executor, process and provider tests as root) on pve1-work, the first two
 as an unprivileged user (`ci`) so the tests of unreadable and undeletable
