@@ -21,7 +21,8 @@ import (
 //   SNAPSHOT.txt   when, which daemon
 //   kairo.dump     the database (DumpDatabase: pg_dump -Fc)
 //   sources/...    the code snapshots (SourceDirectory)
-//   config/...     ControlFiles (the daemon's configuration and TLS), by base name
+//   config/...     ControlFiles (the daemon's configuration and TLS
+//                  certificates; never its key or the database password), by base name
 // handed to an attempt of project kairo, queue control-snapshot (`kairo
 // control snapshot`, GET /api/worker/control-snapshot) or an admin (GET
 // /api/control/snapshot).

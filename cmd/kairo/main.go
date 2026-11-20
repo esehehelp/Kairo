@@ -169,8 +169,16 @@ func serve(args []string) error {
 	if pgDump == "" {
 		pgDump = "pg_dump"
 	}
-	// what a control snapshot carries beside the dump (README: Kairo keeps itself)
-	controlFiles := []string{*configPath, daemonConfig.TLSCertFile, daemonConfig.TLSKeyFile, daemonConfig.TLSCAFile, daemonConfig.DatabasePasswordFile}
+	// what a control snapshot carries beside the dump (README: Kairo keeps
+	// itself): never a secret. The TLS key and database_password_file are
+	// left out, and so is the configuration when its database_url holds a
+	// password (issue #11: the snapshot is copied to every durable store).
+	controlFiles := []string{daemonConfig.TLSCertFile, daemonConfig.TLSCAFile}
+	if config.HasPassword(daemonConfig.DatabaseURL) {
+		logger.Warn("database_url holds a password: the configuration is left out of control snapshots (keep the password in database_password_file)")
+	} else {
+		controlFiles = append([]string{*configPath}, controlFiles...)
+	}
 	handler := (&api.Server{Store: st, ObserveOnly: daemonConfig.ObserveOnly, LogDirectory: daemonConfig.LogDirectory, SourceDirectory: daemonConfig.SourceDirectory, Logger: logger,
 		DumpDatabase: func(ctx context.Context, w io.Writer) error { return pgDumpTo(ctx, pgDump, dsn, w) }, ControlFiles: controlFiles}).Handler()
 	server := &http.Server{

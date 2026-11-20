@@ -237,3 +237,21 @@ func TestDataScrubSettings(t *testing.T) {
 		}
 	}
 }
+
+// A control snapshot leaves the configuration out when its database_url
+// holds a password (issue #11): HasPassword tells.
+func TestHasPassword(t *testing.T) {
+	for dsn, want := range map[string]bool{
+		"postgres://kairo@192.168.1.248:5432/kairo?sslmode=require": false,
+		"postgres://kairo:secret@192.168.1.248:5432/kairo":          true,
+		"postgresql://kairo@host/kairo?password=secret":             true,
+		"host=127.0.0.1 user=kairo dbname=kairo":                    false,
+		"host=127.0.0.1 user=kairo password=secret dbname=kairo":    true,
+		"postgres://%zz": true,
+		"":               false,
+	} {
+		if got := HasPassword(dsn); got != want {
+			t.Errorf("HasPassword(%q) = %v, want %v", dsn, got, want)
+		}
+	}
+}

@@ -2681,14 +2681,18 @@ every durable store like any output. The tar holds:
 | `SNAPSHOT.txt` | when, and the daemon's version |
 | `kairo.dump` | the database (`pg_dump -Fc`: the daemon runs `pg_dump`, or the configuration's `pg_dump`, with the password in `PGPASSWORD`) |
 | `sources/...` | the code snapshots (`source_directory`) |
-| `config/...` | the daemon's configuration file, TLS certificate, key and CA, and `database_password_file`, by base name |
+| `config/...` | the daemon's configuration file and its TLS certificate and CA, by base name |
 
 The command keeps the file only whole and holding a non-empty dump (else it
 fails and the task with it); inside an attempt without an output directory it
 refuses, since nothing would keep what it wrote. An operator takes one with
 an admin token (`kairo control snapshot --out DIR`, `GET
-/api/control/snapshot`). The snapshot holds the server's key and the
-database password: the durable stores must be as private as the daemon.
+/api/control/snapshot`). The snapshot holds no secret, since it is copied
+to every durable store: the server's TLS key (`tls_key_file`) and
+`database_password_file` are never in it, nor is the configuration file when
+its `database_url` holds a password (the daemon logs that it leaves it out;
+keep the password in `database_password_file`). Keep the key and the
+password apart, or make new ones when rebuilding.
 
 ### Rebuilding an installation from its durable store
 
@@ -2710,8 +2714,11 @@ no daemon, no nodes):
 2. Build kairo from this repository; make an empty PostgreSQL database
    (Database) and `pg_restore -d kairo` the dump into it.
 3. Put the daemon's state back (`config/` and `sources/` as the
-   configuration names them) and start `kairo serve`; restore each node's
-   agent configuration (or issue new tokens) and start the agents.
+   configuration names them), with the TLS key and the database password
+   from where they were kept apart (or a new key, its certificate issued
+   again, and a new password: `ALTER ROLE kairo PASSWORD ...`), and start
+   `kairo serve`; restore each node's agent configuration (or issue new
+   tokens) and start the agents.
 4. Declare the stores as before (the machine declaration is in the dump and
    in the Windows configuration directory's `machines.toml`): the copies are
    where the restored records say, so nothing is copied again.

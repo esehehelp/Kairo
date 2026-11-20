@@ -135,6 +135,29 @@ func (c Config) Database() (string, error) {
 	return WithPassword(dsn, strings.TrimRight(password, "\r"))
 }
 
+// HasPassword reports whether the connection string dsn carries a password
+// (one it cannot read is taken to).
+func HasPassword(dsn string) bool {
+	if strings.HasPrefix(dsn, "postgres://") || strings.HasPrefix(dsn, "postgresql://") {
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return true
+		}
+		if u.User != nil {
+			if _, set := u.User.Password(); set {
+				return true
+			}
+		}
+		return u.Query().Has("password")
+	}
+	for _, field := range strings.Fields(dsn) {
+		if strings.HasPrefix(field, "password=") {
+			return true
+		}
+	}
+	return false
+}
+
 // WithPassword returns the connection string dsn with password, which it
 // must not have already.
 func WithPassword(dsn, password string) (string, error) {
