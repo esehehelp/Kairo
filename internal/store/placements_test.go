@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -105,12 +106,26 @@ func TestAnInputIsBroughtToTheNodeItIsReadOn(t *testing.T) {
 	if _, err := store.AuthorizePackRead(ctx, "node2", objectID, f.Source.Token); err == nil {
 		t.Fatal("another node's agent hands the copy over")
 	}
+	placement := func(node, state, path string) PlacementStatus {
+		t.Helper()
+		got, err := store.DataPlacement(ctx, objectID, node)
+		if err != nil || got.State != state || got.Path != path {
+			t.Fatalf("placement on %s: %+v %v, want %s %q", node, got, err, state, path)
+		}
+		return got
+	}
+	placement("node2", "fetching", "")
+	placement("node", "failed", "")
+	if _, err := store.DataPlacement(ctx, "obj_missing", "node2"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown object: %v", err)
+	}
 	if err := store.RecordFetch(ctx, FetchMade{ObjectID: objectID, StoreID: "n2-scratch", ExecutorID: "exec2", Path: "/srv/kairo-store/elsewhere", Bytes: 900}); err == nil {
 		t.Fatal("recorded somewhere else than <root>/inputs/<object id>")
 	}
 	if err := store.RecordFetch(ctx, FetchMade{ObjectID: objectID, StoreID: "n2-scratch", ExecutorID: "exec2", Path: "/srv/kairo-store/inputs/" + objectID, Bytes: 900}); err != nil {
 		t.Fatal(err)
 	}
+	placement("node2", "ready", "/srv/kairo-store/inputs/"+objectID)
 	if _, err := store.AuthorizePackRead(ctx, "node", objectID, f.Source.Token); err == nil {
 		t.Fatal("a fetch's token works once it is done")
 	}

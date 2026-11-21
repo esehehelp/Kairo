@@ -160,6 +160,65 @@ count = 1
 	if run, err := runIDTx(ctx, store.db, member); err != nil || run != leader.ID+"-rank1" || !machine.ScratchIDValid(run) {
 		t.Fatalf("rank 1's run: %q %v", run, err)
 	}
+
+	// Output objects are found by their run, not by the path or the attempt.
+	for _, row := range []struct{ id, kind, source, execution string }{
+		{"obj_first", "output", first.RunID, first.Execution.ID},
+		{"obj_rerun", "output", rerun.RunID, rerun.Execution.ID},
+		{"obj_direct", "output", direct.ID, direct.ID},
+		{"obj_rank", "output", leader.ID + "-rank1", member},
+		{"obj_snapshot", "run-snapshot", first.RunID + "~1", first.Execution.ID},
+	} {
+		if _, err := store.testExec(`INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,created_at,updated_at)
+			SELECT $1,$2,$3,'scratch','executor','/store','/unrelated',project_scope_id,'packed','2026-01-01','2026-01-01'
+			FROM execution_requests WHERE id=$4`, row.id, row.kind, row.source, row.execution); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := store.testExec(`INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,path,check_problem,created_at,updated_at) VALUES
+		('obj_first','backup','executor','/backup','202601','verified','/backup/good',NULL,'2026-01-01','2026-01-01'),
+		('obj_first','other','executor','/other','202601','verified','/other/damaged','damaged','2026-01-01','2026-01-01')`); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := store.GetTaskDetail(ctx, "runs", "train")
+	if err != nil || len(detail.Executions) != 4 {
+		t.Fatalf("task detail: %+v %v", detail, err)
+	}
+	for i, execution := range detail.Executions {
+		want := "obj_first"
+		if i >= 2 {
+			want = "obj_rerun"
+		}
+		if len(execution.Outputs) != 1 || execution.Outputs[0].ID != want || execution.Outputs[0].State != "packed" || execution.Outputs[0].Lifecycle != "durable" {
+			t.Fatalf("execution %s outputs: %+v, want %s", execution.ExecutionID, execution.Outputs, want)
+		}
+		if o := execution.Outputs[0]; want == "obj_first" && (o.Copies != 1 || len(o.Locations) != 1 || o.Locations[0] != (OutputCopy{StoreID: "backup", Path: "/backup/good"})) {
+			t.Fatalf("output copies: %+v", o)
+		}
+	}
+	for _, tc := range []struct {
+		filter DataObjectFilter
+		want   string
+	}{
+		{DataObjectFilter{Project: "runs", Task: "train"}, "obj_rerun,obj_first"},
+		{DataObjectFilter{Project: "runs", Task: "train", Limit: 1}, "obj_rerun"},
+		{DataObjectFilter{Project: "runs", Task: "train", Execution: continued.Execution.ID}, "obj_first"},
+		{DataObjectFilter{Project: "runs", Task: "train", Kind: "run-snapshot"}, ""},
+		{DataObjectFilter{Project: "elsewhere", Task: "train"}, ""},
+		{DataObjectFilter{Task: "missing", Execution: continued.Execution.ID}, ""},
+		{DataObjectFilter{Execution: direct.ID}, "obj_direct"},
+		{DataObjectFilter{Execution: leader.ID}, "obj_rank"},
+		{DataObjectFilter{Execution: member}, "obj_rank"},
+	} {
+		objects, err := store.DataObjects(ctx, tc.filter)
+		var ids []string
+		for _, o := range objects {
+			ids = append(ids, o.ID)
+		}
+		if err != nil || strings.Join(ids, ",") != tc.want {
+			t.Fatalf("list %+v: %v %v, want %s", tc.filter, ids, err, tc.want)
+		}
+	}
 }
 
 func outputOf(launch *Launch, storeID string) RunOutput {

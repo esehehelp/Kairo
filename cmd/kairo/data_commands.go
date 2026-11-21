@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"kairo/internal/store"
 )
@@ -100,12 +102,14 @@ func dataCancel(args []string) error {
 	return nil
 }
 
-// dataList: kairo data list [--project P] [--kind K] [--limit N] [--json].
+// dataList lists data objects, optionally narrowed to a task or execution's outputs.
 func dataList(args []string) error {
 	fs := newFlags("data list")
 	api := apiFlag(fs)
 	project := fs.String("project", "", "only this project's objects")
 	kind := fs.String("kind", "", "only objects of this kind: output, scratch or import")
+	task := fs.String("task", "", "only outputs of tasks with this name")
+	execution := fs.String("execution", "", "only outputs of the run this execution belongs to")
 	limit := fs.Int("limit", 200, "at most this many objects, newest first")
 	asJSON := fs.Bool("json", false, "print the daemon's response")
 	positional, err := parseFlags(fs, args)
@@ -125,6 +129,12 @@ func dataList(args []string) error {
 	}
 	if *kind != "" {
 		query.Set("kind", *kind)
+	}
+	if *task != "" {
+		query.Set("task", *task)
+	}
+	if *execution != "" {
+		query.Set("execution", *execution)
 	}
 	payload, err := client.call(http.MethodGet, withQuery("/api/data/objects", query), nil)
 	if routeMissing(err) {
@@ -191,12 +201,14 @@ func valueOr(p *string) string {
 	return *p
 }
 
-// dataFetch: kairo data fetch --project P --node N [--data NAME]... [OBJECT...].
+// dataFetch orders objects brought to a node and can wait for their paths.
 func dataFetch(args []string) error {
 	fs := newFlags("data fetch")
 	api := apiFlag(fs)
 	project := fs.String("project", "", "the project the data belongs to (required)")
 	node := fs.String("node", "", "the node to bring it to (required)")
+	wait := fs.Bool("wait", false, "wait until the objects are unpacked and print their paths")
+	timeout := fs.Duration("timeout", 0, "give up waiting after this long, exit 2 (0: never)")
 	var names stringList
 	fs.Var(&names, "data", "a data object by name (the newest packed); repeatable")
 	objects, err := parseFlags(fs, args)
@@ -206,7 +218,19 @@ func dataFetch(args []string) error {
 	if *project == "" || *node == "" || len(names)+len(objects) == 0 {
 		return usageError("data fetch needs --project, --node and --data NAME or an OBJECT id")
 	}
-	client, err := newAPIClient(*api)
+	if *timeout < 0 || (*timeout != 0 && !*wait) {
+		return usageError("data fetch --timeout must be non-negative and used with --wait")
+	}
+	var client *apiClient
+	if *wait {
+		var stop context.CancelFunc
+		_, client, stop, err = newInterruptibleClient(*api)
+		if err == nil {
+			defer stop()
+		}
+	} else {
+		client, err = newAPIClient(*api)
+	}
 	if err != nil {
 		return err
 	}
@@ -220,12 +244,65 @@ func dataFetch(args []string) error {
 	if err != nil {
 		return err
 	}
+	if *wait {
+		return waitForFetches(client, *node, *timeout, body.Objects)
+	}
 	for _, o := range body.Objects {
 		state := "ordered"
 		if !o.Ordered {
 			state = "there or on its way already"
 		}
 		fmt.Println(o.ObjectID + ": " + state)
+	}
+	return nil
+}
+
+func waitForFetches(client *apiClient, node string, timeout time.Duration, pending []store.FetchedObject) error {
+	ctx := client.ctx
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+		client.ctx = ctx
+	}
+	stopped := func() error {
+		if ctx.Err() == context.DeadlineExceeded {
+			return withCode(fmt.Errorf("timed out waiting for data on node %s", node), waitTimeout)
+		}
+		return exitWith(130)
+	}
+	query := url.Values{"node": {node}}
+	for len(pending) != 0 {
+		still := pending[:0]
+		for _, o := range pending {
+			var status store.PlacementStatus
+			path := withQuery("/api/data/objects/"+url.PathEscape(o.ObjectID)+"/placement", query)
+			err := client.callJSON(http.MethodGet, path, nil, &status)
+			switch {
+			case ctx.Err() != nil:
+				return stopped()
+			case routeMissing(err):
+				return fmt.Errorf("the daemon does not report fetch status: %s", olderDaemonHint())
+			case err != nil:
+				return err
+			}
+			switch status.State {
+			case "ready":
+				fmt.Println(o.ObjectID + ": " + status.Path)
+			case "fetching":
+				still = append(still, o)
+			default:
+				problem := status.Problem
+				if problem == "" {
+					problem = status.State
+				}
+				return fmt.Errorf("fetch %s on node %s: %s", o.ObjectID, node, problem)
+			}
+		}
+		pending = still
+		if len(pending) > 0 && !sleepFunc(ctx, 2*time.Second) {
+			return stopped()
+		}
 	}
 	return nil
 }

@@ -352,12 +352,14 @@ type DataObject struct {
 	PackedAt            *string `json:"packed_at,omitempty"`
 }
 
-// DataObjectFilter narrows kairo data list: a project, a kind, and at most
-// Limit objects (newest first; 0: 200).
+// DataObjectFilter narrows kairo data list. Task and Execution select run
+// outputs; Limit is the most objects to return (newest first; 0: 200).
 type DataObjectFilter struct {
-	Project string
-	Kind    string
-	Limit   int
+	Project   string
+	Kind      string
+	Task      string
+	Execution string
+	Limit     int
 }
 
 // DataObjects lists data objects, newest first.
@@ -366,13 +368,22 @@ func (s *Store) DataObjects(ctx context.Context, filter DataObjectFilter) ([]Dat
 	if limit <= 0 {
 		limit = 200
 	}
+	where := `WHERE ($1='' OR p.external_key=$1) AND ($2='' OR d.kind=$2)`
+	args := []any{filter.Project, filter.Kind, limit}
+	if filter.Task != "" || filter.Execution != "" {
+		where += ` AND d.kind='output' AND d.source_id IN (
+			SELECT ` + executionRunID + ` FROM execution_requests e` + executionRunJoins + `
+			LEFT JOIN orchestration_tasks t ON t.task_scope_id=o.task_scope_id
+			WHERE ($4='' OR t.name=$4) AND ($5='' OR e.id=$5 OR g.leader_execution_id=$5))`
+		args = append(args, filter.Task, filter.Execution)
+	}
 	out := []DataObject{}
 	err := eachRow(ctx, s.db, `SELECT d.id,d.kind,d.name,p.external_key,x.node_id,d.store_id,d.source_id,d.source_path,d.state,d.source_state,d.source_reason,d.delete_source,d.lifecycle,
 			d.regenerated_as,d.regeneration_problem,d.files,d.content_bytes,d.pack_bytes,d.created_at,d.packed_at,
 			(SELECT COUNT(*) FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL),
 			(SELECT c.path FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL ORDER BY c.store_id LIMIT 1)
 		FROM data_objects d JOIN executors x ON x.id=d.executor_id LEFT JOIN coordination_scopes p ON p.id=d.project_scope_id
-		WHERE ($1='' OR p.external_key=$1) AND ($2='' OR d.kind=$2) ORDER BY d.created_at DESC,d.id DESC LIMIT $3`, []any{filter.Project, filter.Kind, limit}, func(rows *sql.Rows) error {
+		`+where+` ORDER BY d.created_at DESC,d.id DESC LIMIT $3`, args, func(rows *sql.Rows) error {
 		var o DataObject
 		var name, project, reason, packedAt, copyPath, again, problem sql.NullString
 		var files, content, pack sql.NullInt64
