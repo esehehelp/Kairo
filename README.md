@@ -336,8 +336,9 @@ own process's `KAIRO_*` variables to an attempt.
 `kairo tls init --dir DIR --host H...` writes `ca.pem`, `ca-key.pem`,
 `server.pem` and `server-key.pem` (ECDSA P-256; the server certificate covers
 every `--host`, IP or DNS name). `kairo tls issue --dir DIR --host H...`
-re-issues the server certificate from the same CA, for a new address. Keep
-`ca-key.pem` on the daemon host only. Private keys and token files written by
+re-issues the server certificate from the same CA, for a new address. Kairo
+never reads `ca-key.pem` while it runs: keep it on one admin machine, out of
+the daemon's directory and of every host that runs work. Private keys and token files written by
 `kairo` are restricted to the current user, and the daemon restricts its
 `database_password_file` the same way at start: anyone who can write the
 database can mint tokens, so its credentials are kept like a private key. On Windows, where file modes are ignored, this replaces the
@@ -347,6 +348,21 @@ The daemon refuses to start when its certificate does not chain to
 `tls_ca_file` or does not cover the `advertise_url` host. During a CA rotation
 `tls_ca_file` (and an agent's `ca_file`) may hold the old and the new CA;
 attempts receive every certificate in it.
+
+The CA `kairo tls init` makes has path length 0, so it cannot cross-sign its
+successor. A CA is rotated through such a bundle, without stopping work:
+
+1. Make the new CA (`kairo tls init` in a new directory). Put the old and the
+   new CA together in every CA file: the daemon's `tls_ca_file`, each agent's
+   and each controller's `ca_file`, and the CLI's. Restart them (agents adopt
+   their attempts).
+2. Wait until no attempt launched before step 1 runs. An attempt keeps the CA
+   it was given at launch (`KAIRO_API_CA`), so one that has only the old CA
+   would fail its next call once the daemon presents the new certificate.
+3. Give the daemon, and each agent's `[packs]`, a certificate of the new CA
+   (`kairo tls issue --dir NEW --host H...`). Leave the new CA alone in every
+   CA file and restart again.
+4. Delete the old CA's key, and the old server and pack keys.
 
 Daemon configuration:
 
