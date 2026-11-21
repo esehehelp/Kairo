@@ -156,7 +156,16 @@ published instead of from the start: the latest, or the one of that command
 checkpoint's reference (`KAIRO_CONTINUATION_REF`), as after a checkpointed
 suspend, planned onto the node of the attempt that published it, since the
 reference is a path there; the CLI prints the checkpoint. A Task that
-published none, or a command that is not one of its checkpoints, is refused. `kairo project prune [--write]
+published none, or a command that is not one of its checkpoints, is refused.
+`--source current|SNAPSHOT` (a Task that runs in a source) runs it in
+another snapshot of its source than the one it was declared with: `current`,
+the snapshot the project's latest `project apply` sent for that source
+(applying the same file again with fixed code leaves the Task as declared,
+so this is how the fix reaches it), or a snapshot of that source by id. The
+new Execution records the snapshot it runs in, the Task stays bound to its
+own, and dependants and inputs keep naming the same Task. A snapshot the
+daemon does not keep, or one of another source, is refused. The two options
+go together: fixed code going on from a checkpoint. `kairo project prune [--write]
 FILE` reports (or, with `--write`, rewrites FILE to) the Tasks that can still
 run and the dependencies they need, keeping each kept Task's digest.
 

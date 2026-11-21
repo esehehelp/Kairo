@@ -41,6 +41,8 @@ type RerunResult struct {
 	Unblocked []string `json:"unblocked"`
 	// FromCheckpoint is the checkpoint a rerun from one goes on from.
 	FromCheckpoint *RerunCheckpoint `json:"from_checkpoint,omitempty"`
+	// SourceSnapshot is the snapshot a rerun in another one runs in.
+	SourceSnapshot string `json:"source_snapshot,omitempty"`
 }
 
 // RerunCheckpoint is the checkpoint a rerun goes on from: the command
@@ -173,15 +175,26 @@ func (s *Store) CancelTask(ctx context.Context, project, name, actor string, dry
 // still unsuccessful). A repeated request ID is answered with the first
 // answer and reruns nothing.
 func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID string) (RerunResult, error) {
-	return s.RerunTaskFrom(ctx, project, name, actor, requestID, "")
+	return s.RerunTaskWith(ctx, project, name, actor, requestID, RerunOptions{})
 }
 
-// RerunTaskFrom is RerunTask going on from a checkpoint the task published
-// (from: "latest", or the id of the command acknowledged checkpointed with
-// it; "" for none): the rerun's execution is a continuation of that
-// checkpoint's reference, on the node of the attempt that published it (a
-// path there), as after a checkpointed suspend (issue #18). Not for a gang.
-func (s *Store) RerunTaskFrom(ctx context.Context, project, name, actor, requestID, from string) (RerunResult, error) {
+// RerunOptions change what a rerun runs.
+type RerunOptions struct {
+	// FromCheckpoint: go on from a checkpoint the task published ("latest",
+	// or the id of the command acknowledged checkpointed with it): the
+	// rerun's execution is a continuation of that checkpoint's reference, on
+	// the node of the attempt that published it (a path there), as after a
+	// checkpointed suspend (issue #18). Not for a gang.
+	FromCheckpoint string
+	// Source: run in another snapshot of the task's source than the one it
+	// was declared with: "current", the one the project's latest apply sent
+	// for that source, or a snapshot id (issue #15: code fixed after the task
+	// failed). The execution records the snapshot it runs in.
+	Source string
+}
+
+// RerunTaskWith is RerunTask with options.
+func (s *Store) RerunTaskWith(ctx context.Context, project, name, actor, requestID string, opts RerunOptions) (RerunResult, error) {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return RerunResult{}, err
@@ -234,16 +247,20 @@ func (s *Store) RerunTaskFrom(ctx context.Context, project, name, actor, request
 	if !errors.Is(err, sql.ErrNoRows) {
 		return RerunResult{}, err
 	}
+	var template orchestration.Execution
+	var templateBody string
+	if err = tx.QueryRowContext(ctx, `SELECT execution_template_json FROM orchestration_tasks WHERE task_scope_id=$1`, task.scopeID).Scan(&templateBody); err != nil {
+		return RerunResult{}, err
+	}
+	if err = json.Unmarshal([]byte(templateBody), &template); err != nil {
+		return RerunResult{}, err
+	}
+	snapshot, err := rerunSnapshotTx(ctx, tx, task, template, strings.TrimSpace(opts.Source))
+	if err != nil {
+		return RerunResult{}, err
+	}
 	var checkpoint *RerunCheckpoint
-	if from = strings.TrimSpace(from); from != "" {
-		var body string
-		if err = tx.QueryRowContext(ctx, `SELECT execution_template_json FROM orchestration_tasks WHERE task_scope_id=$1`, task.scopeID).Scan(&body); err != nil {
-			return RerunResult{}, err
-		}
-		var template orchestration.Execution
-		if err = json.Unmarshal([]byte(body), &template); err != nil {
-			return RerunResult{}, err
-		}
+	if from := strings.TrimSpace(opts.FromCheckpoint); from != "" {
 		if template.Gang != nil || !template.Checkpointable {
 			return RerunResult{}, taskConflict{fmt.Sprintf("task %s is not a checkpointable single execution; it is not rerun from a checkpoint", name)}
 		}
@@ -263,11 +280,11 @@ func (s *Store) RerunTaskFrom(ctx context.Context, project, name, actor, request
 		}
 		checkpoint = &RerunCheckpoint{CommandID: cp.commandID, ContinuationRef: cp.ref, Node: cp.node}
 	}
-	ordinal, err := markTaskRerunTx(ctx, tx, task.scopeID, requestID, actor, checkpoint)
+	ordinal, err := markTaskRerunTx(ctx, tx, task.scopeID, requestID, actor, checkpoint, snapshot)
 	if err != nil {
 		return RerunResult{}, err
 	}
-	out := RerunResult{Task: name, State: "pending", Ordinal: ordinal, Unblocked: []string{}, FromCheckpoint: checkpoint}
+	out := RerunResult{Task: name, State: "pending", Ordinal: ordinal, Unblocked: []string{}, FromCheckpoint: checkpoint, SourceSnapshot: snapshot}
 	dependents, err := tx.QueryContext(ctx, `WITH RECURSIVE dependents(id) AS (
 	 SELECT task_scope_id FROM orchestration_task_dependencies WHERE dependency_task_scope_id=$1
 	 UNION SELECT d.task_scope_id FROM orchestration_task_dependencies d JOIN dependents ON d.dependency_task_scope_id=dependents.id
@@ -323,7 +340,7 @@ func (s *Store) RerunTaskFrom(ctx context.Context, project, name, actor, request
 // markTaskRerunTx puts a task back to pending with the ordinal its rerun
 // execution gets: past every decision ever planned for it, abandoned ones
 // included, so the decision is new and nothing earlier is read as its outcome.
-func markTaskRerunTx(ctx context.Context, tx *sql.Tx, taskScopeID, requestID, actor string, checkpoint *RerunCheckpoint) (int, error) {
+func markTaskRerunTx(ctx context.Context, tx *sql.Tx, taskScopeID, requestID, actor string, checkpoint *RerunCheckpoint, snapshot string) (int, error) {
 	var ordinal int
 	if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(execution_ordinal)+1,0) FROM orchestration_decisions WHERE task_scope_id=$1`, taskScopeID).Scan(&ordinal); err != nil {
 		return 0, err
@@ -344,7 +361,7 @@ func markTaskRerunTx(ctx context.Context, tx *sql.Tx, taskScopeID, requestID, ac
 	if checkpoint != nil {
 		node, commandID, ref = checkpoint.Node, checkpoint.CommandID, checkpoint.ContinuationRef
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_reruns(task_scope_id,execution_ordinal,request_id,actor,predecessor_execution_id,created_at,node_id,checkpoint_command_id,continuation_ref) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, taskScopeID, ordinal, requestID, actor, predecessor, stamp, node, commandID, ref); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_reruns(task_scope_id,execution_ordinal,request_id,actor,predecessor_execution_id,created_at,node_id,checkpoint_command_id,continuation_ref,source_snapshot_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, taskScopeID, ordinal, requestID, actor, predecessor, stamp, node, commandID, ref, nullable(snapshot)); err != nil {
 		return 0, err
 	}
 	return ordinal, nil
@@ -355,13 +372,16 @@ func markTaskRerunTx(ctx context.Context, tx *sql.Tx, taskScopeID, requestID, ac
 // that checkpoint, whose reference is returned as the continuation.
 func rerunTriggerTx(ctx context.Context, tx *sql.Tx, taskScopeID string, ordinal int) (map[string]any, *string, error) {
 	var requestID string
-	var predecessor, commandID, ref sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT request_id,predecessor_execution_id,checkpoint_command_id,continuation_ref FROM orchestration_task_reruns WHERE task_scope_id=$1 AND execution_ordinal=$2`, taskScopeID, ordinal).Scan(&requestID, &predecessor, &commandID, &ref); err != nil {
+	var predecessor, commandID, ref, snapshot sql.NullString
+	if err := tx.QueryRowContext(ctx, `SELECT request_id,predecessor_execution_id,checkpoint_command_id,continuation_ref,source_snapshot_id FROM orchestration_task_reruns WHERE task_scope_id=$1 AND execution_ordinal=$2`, taskScopeID, ordinal).Scan(&requestID, &predecessor, &commandID, &ref, &snapshot); err != nil {
 		return nil, nil, err
 	}
 	trigger := map[string]any{"request_id": requestID}
 	if predecessor.Valid {
 		trigger["predecessor_execution_id"] = predecessor.String
+	}
+	if snapshot.Valid {
+		trigger["source_snapshot_id"] = snapshot.String
 	}
 	if !ref.Valid {
 		return trigger, nil, nil
@@ -458,4 +478,36 @@ func (s *Store) GetCommand(ctx context.Context, commandID string) (Command, erro
 	}
 	c.Payload = json.RawMessage(payload)
 	return c, err
+}
+
+// rerunSnapshotTx is the snapshot a rerun of task runs in instead of its own
+// (RerunOptions.Source; "" for its own): the one the project's latest apply
+// sent for the task's source ("current"), or a snapshot of that source by id.
+func rerunSnapshotTx(ctx context.Context, tx *sql.Tx, task taskRow, template orchestration.Execution, source string) (string, error) {
+	if source == "" {
+		return "", nil
+	}
+	if template.Source == "" {
+		return "", taskConflict{fmt.Sprintf("task %s runs in no source; it has no snapshot to change", task.name)}
+	}
+	if source == "current" {
+		var id string
+		err := tx.QueryRowContext(ctx, `SELECT snapshot_id FROM project_sources WHERE project_scope_id=$1 AND source_name=$2`, task.projectID, template.Source).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return "", taskConflict{fmt.Sprintf("project %s has applied no snapshot of source %q yet", task.project, template.Source)}
+		}
+		return id, err
+	}
+	var project, sourceName sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT project,source_name FROM source_snapshots WHERE id=$1`, source).Scan(&project, &sourceName)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", taskConflict{fmt.Sprintf("snapshot %s is not one the daemon keeps", source)}
+	}
+	if err != nil {
+		return "", err
+	}
+	if project.Valid && project.String != task.project || sourceName.Valid && sourceName.String != template.Source {
+		return "", taskConflict{fmt.Sprintf("snapshot %s is of %s source %q, not of %s source %q", source, project.String, sourceName.String, task.project, template.Source)}
+	}
+	return source, nil
 }

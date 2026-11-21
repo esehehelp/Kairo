@@ -374,6 +374,7 @@ func taskRerun(args []string) error {
 	actor := fs.String("actor", defaultActor(), "audit actor")
 	requestID := fs.String("request-id", id.New("cli"), "idempotency request ID")
 	fromCheckpoint := fs.String("from-checkpoint", "", "go on from a checkpoint the task published: latest, or a checkpoint command's id")
+	source := fs.String("source", "", "run in another snapshot of the task's source: current (the latest apply's), or a snapshot id")
 	positional, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -391,6 +392,9 @@ func taskRerun(args []string) error {
 	if *fromCheckpoint != "" {
 		body["from_checkpoint"] = *fromCheckpoint
 	}
+	if *source != "" {
+		body["source"] = *source
+	}
 	err = client.callJSON(http.MethodPost, ref.path()+"/rerun", body, &result)
 	if notFound(err) {
 		return fmt.Errorf("%w (%v)", ref.notFound(), err)
@@ -406,6 +410,11 @@ func taskRerun(args []string) error {
 		fmt.Printf("from checkpoint %s (command %s) on %s\n", cp.ContinuationRef, cp.CommandID, cp.Node)
 	} else if *fromCheckpoint != "" {
 		return fmt.Errorf("the daemon ignored --from-checkpoint (it is older than this CLI): the rerun runs from the start")
+	}
+	if result.SourceSnapshot != "" {
+		fmt.Printf("in snapshot %s\n", result.SourceSnapshot)
+	} else if *source != "" {
+		return fmt.Errorf("the daemon ignored --source (it is older than this CLI): the rerun runs in the task's own snapshot")
 	}
 	for _, name := range result.Unblocked {
 		fmt.Println("unblocked", name)

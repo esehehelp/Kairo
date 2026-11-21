@@ -136,6 +136,21 @@ func applyProjectTx(ctx context.Context, tx *sql.Tx, spec orchestration.Validate
 	}
 	applied := ApplyResult{Created: []string{}}
 	var conflicts []string
+	// the snapshot each source was applied with last (kairo task rerun
+	// --source current runs in it), whatever the tasks bound to it
+	for name, id := range spec.Manifest.Snapshots {
+		known, err := sourceKnownTx(ctx, tx, id)
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		if !known {
+			continue // a task that runs in it is refused below, saying why
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO project_sources(project_scope_id,source_name,snapshot_id,applied_at) VALUES($1,$2,$3,$4)
+			ON CONFLICT(project_scope_id,source_name) DO UPDATE SET snapshot_id=excluded.snapshot_id,applied_at=excluded.applied_at`, projectScope.ID, name, id, now()); err != nil {
+			return ApplyResult{}, err
+		}
+	}
 
 	taskScopes := make(map[string]string, len(spec.Manifest.Tasks))
 	for _, task := range spec.Manifest.Tasks {
@@ -527,6 +542,11 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	}
 	if spec.SourceSnapshot, err = taskSourceTx(ctx, tx, task.taskScopeID); err != nil {
 		return plannedOrchestrationDecision{}, err
+	}
+	// a rerun in another snapshot of the task's source (kairo task rerun
+	// --source) runs in it; the execution records which
+	if id, _ := trigger["source_snapshot_id"].(string); reason == "rerun" && id != "" {
+		spec.SourceSnapshot = id
 	}
 	// a rerun ordered to make temporal data again goes on the node that lacks
 	// it, one from a checkpoint on the node of the checkpoint; so does a
