@@ -1,0 +1,1 @@
+ALTER TABLE nodes ADD COLUMN booted_at TEXT;

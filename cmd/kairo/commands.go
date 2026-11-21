@@ -352,10 +352,7 @@ func resourceAction(action string, args []string) error {
 	if action == "quarantine" {
 		body = map[string]string{"reason": *reason}
 	} else if action == "reconcile" {
-		if !*confirmAbsent {
-			return usageError("resource reconcile requires --confirm-process-absent")
-		}
-		body = map[string]bool{"confirm_process_absent": true}
+		body = map[string]bool{"confirm_process_absent": *confirmAbsent}
 	}
 	client, err := newAPIClient(*api)
 	if err != nil {

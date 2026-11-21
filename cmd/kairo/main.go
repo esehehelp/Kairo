@@ -343,17 +343,16 @@ func serve(args []string) error {
 		}()
 	}
 	if !daemonConfig.ObserveOnly {
-		// Stale leases nothing can still run under (no attempt, or one that
-		// never started its command) are released once their resources are
-		// observed again, without an operator.
+		// Release stale leases that cannot still have processes once their
+		// resources are observed again.
 		go func() {
 			ticker := time.NewTicker(10 * time.Second)
 			defer ticker.Stop()
 			for {
-				if n, err := st.ReconcileUnstartedLeases(ctx); err != nil && ctx.Err() == nil {
-					logger.Error("unstarted stale lease reconciliation failed", "error", err)
+				if n, err := st.ReconcileSafeStaleLeases(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("stale lease reconciliation failed", "error", err)
 				} else if n > 0 {
-					logger.Info("stale leases of what never started released", "count", n)
+					logger.Info("stale leases released without confirmation", "count", n)
 				}
 				select {
 				case <-ctx.Done():

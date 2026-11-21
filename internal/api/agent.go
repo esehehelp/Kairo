@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -22,9 +23,10 @@ import (
 // the executor, lease, attempt, provider or log it names.
 
 type agentRegisterRequest struct {
-	Node      store.Node       `json:"node"`
-	Executors []store.Executor `json:"executors"`
-	Providers []agentProvider  `json:"providers"`
+	Node          store.Node       `json:"node"`
+	Executors     []store.Executor `json:"executors"`
+	Providers     []agentProvider  `json:"providers"`
+	UptimeSeconds *float64         `json:"uptime_seconds,omitempty"`
 	// Adopt lists the attempts the agent still runs (store.ReregisterExecutor).
 	Adopt []store.AdoptedAttempt `json:"adopt,omitempty"`
 }
@@ -579,6 +581,15 @@ func (s *Server) agentOps() []agentOp {
 func (s *Server) agentRegister(ctx context.Context, b agentRegisterRequest) (any, error) {
 	if b.Node.ID == "" || b.Node.Name == "" {
 		return nil, errors.New("node.id and node.name are required")
+	}
+	if b.UptimeSeconds != nil {
+		nanos := math.Ceil(*b.UptimeSeconds * float64(time.Second))
+		if !(nanos > 0 && nanos < float64(math.MaxInt64)) {
+			return nil, errors.New("uptime_seconds must be positive and fit in a duration")
+		}
+		// Use the daemon's clock, which also stamps attempt activation.
+		bootedAt := time.Now().UTC().Add(-time.Duration(nanos)).Format(time.RFC3339Nano)
+		b.Node.BootedAt = &bootedAt
 	}
 	b.Node.Enabled = true
 	if err := s.Store.UpsertNode(ctx, b.Node); err != nil {
