@@ -268,11 +268,11 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		// A rerun runs the declaration again from an ordinal past every earlier
 		// execution, which is never read as the task's outcome again.
 		if task.rerunOrdinal != nil && (err != nil || current.Ordinal < *task.rerunOrdinal) {
-			trigger, err := rerunTriggerTx(ctx, tx, task.taskScopeID, *task.rerunOrdinal)
+			trigger, continuation, err := rerunTriggerTx(ctx, tx, task.taskScopeID, *task.rerunOrdinal)
 			if err != nil {
 				return err
 			}
-			if err := planTaskExecution(ctx, tx, task, *task.rerunOrdinal, "rerun", trigger, nil); err != nil {
+			if err := planTaskExecution(ctx, tx, task, *task.rerunOrdinal, "rerun", trigger, continuation); err != nil {
 				return err
 			}
 			continue
@@ -322,6 +322,40 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 				return err
 			}
 			continue
+		}
+		// A lost attempt of a task declared continue_after_loss: once nothing of
+		// it can run any more (its lease released: by the daemon after a reboot
+		// or a launch cut short, or by kairo resource reconcile), the task goes
+		// on from its latest published checkpoint, on the node that published
+		// it (the reference is a path there); with none it is blocked as any.
+		if !gang.gang && current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" {
+			var template orchestration.Execution
+			if err := json.Unmarshal([]byte(task.template), &template); err != nil {
+				return err
+			}
+			if template.ContinueAfterLoss {
+				if (current.AttemptState != nil && *current.AttemptState == "lost") || (current.LeaseState != nil && *current.LeaseState != "released") {
+					if err := updateTaskState(ctx, tx, task.taskScopeID, "running", map[string]any{"reason": "attempt identity lost: goes on from its latest checkpoint once its lease is released", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
+						return err
+					}
+					continue
+				}
+				checkpoint, found, err := taskCheckpointTx(ctx, tx, task.taskScopeID, "")
+				if err != nil {
+					return err
+				}
+				if found {
+					trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "attempt_lost", "command_id": checkpoint.commandID, "continuation_ref": checkpoint.ref, "node": checkpoint.node}
+					if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "loss_continuation", trigger, &checkpoint.ref); err != nil {
+						return err
+					}
+					continue
+				}
+				if err := updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "attempt identity lost; no checkpoint to continue from", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
+					return err
+				}
+				continue
+			}
 		}
 		if current.AttemptState != nil && *current.AttemptState == "lost" {
 			if err := updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "attempt identity lost", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
@@ -422,6 +456,34 @@ func latestAttemptCommand(ctx context.Context, tx *sql.Tx, attemptID string) (st
 	return id, origin, state, err
 }
 
+// taskCheckpoint is a checkpoint a task published: the command acknowledged
+// checkpointed with it (a suspend's or a checkpoint command's), its
+// reference, and the node of the attempt that published it (a path there).
+type taskCheckpoint struct {
+	commandID, ref, node string
+}
+
+// taskCheckpointTx is the task's latest published checkpoint, or the one of
+// command commandID when it names one; found is false when there is none.
+func taskCheckpointTx(ctx context.Context, q queryer, taskScopeID, commandID string) (taskCheckpoint, bool, error) {
+	query := `SELECT c.id,c.payload_json::jsonb->>'continuation_ref',x.node_id FROM commands c
+		JOIN orchestration_task_executions te ON te.execution_id=c.execution_id
+		JOIN attempts a ON a.id=c.attempt_id JOIN executors x ON x.id=a.executor_id
+		WHERE te.task_scope_id=$1 AND c.state='checkpointed' AND COALESCE(c.payload_json::jsonb->>'continuation_ref','')<>''`
+	args := []any{taskScopeID}
+	if commandID != "" {
+		query += ` AND c.id=$2`
+		args = append(args, commandID)
+	}
+	query += ` ORDER BY c.updated_at::timestamptz DESC,c.id DESC LIMIT 1`
+	var cp taskCheckpoint
+	err := q.QueryRowContext(ctx, query, args...).Scan(&cp.commandID, &cp.ref, &cp.node)
+	if errors.Is(err, sql.ErrNoRows) {
+		return taskCheckpoint{}, false, nil
+	}
+	return cp, err == nil, err
+}
+
 func planTaskExecution(ctx context.Context, tx *sql.Tx, task orchestrationTaskRow, ordinal int, reason string, trigger map[string]any, continuation *string) error {
 	_, err := planTaskExecutionDecision(ctx, tx, task, ordinal, reason, trigger, continuation)
 	return err
@@ -446,13 +508,22 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	if spec.SourceSnapshot, err = taskSourceTx(ctx, tx, task.taskScopeID); err != nil {
 		return plannedOrchestrationDecision{}, err
 	}
-	// a rerun ordered to make temporal data again goes on the node that lacks it
+	// a rerun ordered to make temporal data again goes on the node that lacks
+	// it, one from a checkpoint on the node of the checkpoint; so does a
+	// continuation after a loss (its reference is a path there)
 	if reason == "rerun" {
 		node, err := rerunNodeTx(ctx, tx, task.taskScopeID, ordinal)
 		if err != nil {
 			return plannedOrchestrationDecision{}, err
 		}
 		if node != "" && spec.Gang == nil {
+			if err = pinNodeSpec(&spec, node); err != nil {
+				return plannedOrchestrationDecision{}, err
+			}
+		}
+	}
+	if reason == "loss_continuation" {
+		if node, _ := trigger["node"].(string); node != "" && spec.Gang == nil {
 			if err = pinNodeSpec(&spec, node); err != nil {
 				return plannedOrchestrationDecision{}, err
 			}

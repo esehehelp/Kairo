@@ -373,6 +373,7 @@ func taskRerun(args []string) error {
 	api := apiFlag(fs)
 	actor := fs.String("actor", defaultActor(), "audit actor")
 	requestID := fs.String("request-id", id.New("cli"), "idempotency request ID")
+	fromCheckpoint := fs.String("from-checkpoint", "", "go on from a checkpoint the task published: latest, or a checkpoint command's id")
 	positional, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -386,7 +387,11 @@ func taskRerun(args []string) error {
 		return err
 	}
 	var result store.RerunResult
-	err = client.callJSON(http.MethodPost, ref.path()+"/rerun", map[string]string{"actor": *actor, "request_id": *requestID}, &result)
+	body := map[string]string{"actor": *actor, "request_id": *requestID}
+	if *fromCheckpoint != "" {
+		body["from_checkpoint"] = *fromCheckpoint
+	}
+	err = client.callJSON(http.MethodPost, ref.path()+"/rerun", body, &result)
 	if notFound(err) {
 		return fmt.Errorf("%w (%v)", ref.notFound(), err)
 	}
@@ -397,6 +402,11 @@ func taskRerun(args []string) error {
 		result.Task = ref.task
 	}
 	fmt.Printf("rerun %s (execution #%d)\n", result.Task, result.Ordinal)
+	if cp := result.FromCheckpoint; cp != nil {
+		fmt.Printf("from checkpoint %s (command %s) on %s\n", cp.ContinuationRef, cp.CommandID, cp.Node)
+	} else if *fromCheckpoint != "" {
+		return fmt.Errorf("the daemon ignored --from-checkpoint (it is older than this CLI): the rerun runs from the start")
+	}
 	for _, name := range result.Unblocked {
 		fmt.Println("unblocked", name)
 	}
