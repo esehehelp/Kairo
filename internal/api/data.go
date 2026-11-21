@@ -33,10 +33,10 @@ func (s *Server) cancelImport(w http.ResponseWriter, r *http.Request) {
 }
 
 // listDataObjects lists data objects, newest first (kairo data list):
-// ?project=, ?kind= and ?limit= narrow it.
+// ?project=, ?kind=, ?task=, ?execution= and ?limit= narrow it.
 func (s *Server) listDataObjects(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	filter := store.DataObjectFilter{Project: q.Get("project"), Kind: q.Get("kind")}
+	filter := store.DataObjectFilter{Project: q.Get("project"), Kind: q.Get("kind"), Task: q.Get("task"), Execution: q.Get("execution")}
 	if v := q.Get("limit"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n < 1 || n > 10000 {
@@ -51,6 +51,21 @@ func (s *Server) listDataObjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"objects": objects})
+}
+
+// getDataPlacement reports where an object is being unpacked on a node.
+func (s *Server) getDataPlacement(w http.ResponseWriter, r *http.Request) {
+	node := r.URL.Query().Get("node")
+	if node == "" {
+		writeError(w, errors.New("node is required"))
+		return
+	}
+	placement, err := s.Store.DataPlacement(r.Context(), r.PathValue("id"), node)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, placement)
 }
 
 // fetchData orders data objects brought to a node (kairo data fetch).

@@ -32,33 +32,30 @@ type RunOutput struct {
 	Path       string `json:"path"`
 }
 
-// runIDTx is the run executionID belongs to: for a Task's execution, the
-// latest of the Task's executions up to it that is not a continuation (its
-// initial execution or the rerun it continues); for a direct execution, the
-// execution itself. A gang rank other than 0 belongs to its leader's run, as
-// <run>-rank<r>.
+// A run starts at the latest execution that is not a continuation, or at
+// the execution itself for direct work. Gang ranks share the leader's run
+// but have separate output directories. Keep writes and lookups in step.
+const executionRunJoins = `
+	LEFT JOIN gang_members gm ON gm.execution_id=e.id
+	LEFT JOIN execution_gangs g ON g.id=gm.gang_id
+	LEFT JOIN orchestration_task_executions o ON o.execution_id=COALESCE(g.leader_execution_id,e.id)` + taskRunStartJoin
+
+const taskRunStartJoin = `
+	LEFT JOIN LATERAL (
+		SELECT s.execution_id FROM orchestration_task_executions s
+		WHERE s.task_scope_id=o.task_scope_id AND s.execution_ordinal<=o.execution_ordinal AND s.reason<>'continuation'
+		ORDER BY s.execution_ordinal DESC LIMIT 1
+	) run_start ON true`
+
+const executionRunID = `COALESCE(run_start.execution_id,g.leader_execution_id,e.id) || CASE WHEN gm.rank>0 THEN '-rank' || gm.rank::text ELSE '' END`
+
 func runIDTx(ctx context.Context, q queryer, executionID string) (string, error) {
-	base, suffix := executionID, ""
-	var leader string
-	var rank int
-	err := q.QueryRowContext(ctx, `SELECT g.leader_execution_id,gm.rank FROM gang_members gm JOIN execution_gangs g ON g.id=gm.gang_id WHERE gm.execution_id=$1`, executionID).Scan(&leader, &rank)
-	switch {
-	case err == nil && rank > 0:
-		base, suffix = leader, fmt.Sprintf("-rank%d", rank)
-	case err != nil && !errors.Is(err, sql.ErrNoRows):
-		return "", err
+	var runID string
+	err := q.QueryRowContext(ctx, `SELECT `+executionRunID+` FROM execution_requests e`+executionRunJoins+` WHERE e.id=$1`, executionID).Scan(&runID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return executionID, nil
 	}
-	var start string
-	err = q.QueryRowContext(ctx, `SELECT s.execution_id FROM orchestration_task_executions o
-		JOIN orchestration_task_executions s ON s.task_scope_id=o.task_scope_id AND s.execution_ordinal<=o.execution_ordinal AND s.reason<>'continuation'
-		WHERE o.execution_id=$1 ORDER BY s.execution_ordinal DESC LIMIT 1`, base).Scan(&start)
-	switch {
-	case err == nil:
-		base = start
-	case !errors.Is(err, sql.ErrNoRows):
-		return "", err
-	}
-	return base + suffix, nil
+	return runID, err
 }
 
 // outputOwnership says why path is not, as declared now, the output

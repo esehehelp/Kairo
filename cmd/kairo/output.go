@@ -65,6 +65,7 @@ type taskExecution struct {
 	Attempts []attemptInfo        `json:"attempts"` // at most one
 	Gang     []store.TaskGangRank `json:"gang"`
 	Waiting  []map[string]any     `json:"waiting"`
+	Outputs  []store.TaskOutput   `json:"outputs"`
 }
 
 type attemptInfo struct {

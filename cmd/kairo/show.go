@@ -106,6 +106,16 @@ func renderExecution(w io.Writer, e taskExecution, now time.Time) {
 		fmt.Fprintf(w, "  %-11s %s\n", label+":", fmt.Sprintf(format, args...))
 	}
 	line("id", "%s", e.ExecutionID)
+	for _, output := range e.Outputs {
+		text := fmt.Sprintf("%s  %s  %s  verified copies: %d", output.ID, output.State, output.Lifecycle, output.Copies)
+		if output.ExecutionID != e.ExecutionID {
+			text += "  (" + output.ExecutionID + ")"
+		}
+		line("output", "%s", text)
+		for _, copy := range output.Locations {
+			fmt.Fprintf(w, "              %s: %s\n", copy.StoreID, copy.Path)
+		}
+	}
 	var times []string
 	if e.SubmittedAt != nil {
 		times = append(times, "submitted "+longStamp(e.SubmittedAt))

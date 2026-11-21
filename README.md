@@ -227,7 +227,7 @@ be left out of task commands for Tasks declared by a ProjectSpec.
 | Command | What it prints |
 |---|---|
 | `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress or pause) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
-| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, log paths and sizes, log issues, the energy its GPUs used (`energy: GPU 1.23 kWh (partial)`), the most RAM its processes were seen to use beside what it reserved (`ram: peak 9.0 GiB seen (sampled every 15 s)`), gang ranks, and why a waiting execution waits |
+| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, output objects (ID, state, lifecycle and verified copy locations; `outputs` in JSON), log paths and sizes, log issues, the energy its GPUs used (`energy: GPU 1.23 kWh (partial)`), the most RAM its processes were seen to use beside what it reserved (`ram: peak 9.0 GiB seen (sampled every 15 s)`), gang ranks, and why a waiting execution waits |
 | `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | the last N lines (default 50, `0` all) of the latest attempt's logs, also for attempts on agent nodes; `-f` follows until the attempt has exited and its logs stopped growing |
 | `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | one line per state change (`10:01:33 hello running -> succeeded`), `DOWN`/`UP` while the daemon is unreachable, `STALL` when a running Task's logs stop growing for D; exits 0 when all succeeded (or started), 1 when one ended otherwise, 2 on timeout, 3 on a usage or lookup error |
 | `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | state changes, progress (once a minute per Task) and a summary every 10 min; with `--exit-when-idle` it exits when nothing is pending or running (1 if a watched Task did not succeed) |
@@ -1600,12 +1600,17 @@ skipped). An older file written while it is read fails that pack as an
 output's would; at the next round it is a recent one. A file packed as it
 changed no longer matches the pack's list, so `--delete-source` keeps the
 directory.
-`kairo data list [--project P] [--kind output|scratch|import] [--limit N]
-[--json]` (`GET /api/data/objects`, `{"objects": [...]}`, newest first, 200
-by default) shows each object: kind, project, name, node, `packing`,
-`packed` or `abandoned`, files, content and pack bytes, verified copies (and
-the path of one), and what became of its source (`present`, `deleting`,
-`deleted`, `kept`, `evicting`, `evicted`, with why).
+`kairo data list [--project P] [--kind output|scratch|import] [--task NAME]
+[--execution ID] [--limit N] [--json]` (`GET /api/data/objects`, `{"objects": [...]}`,
+newest first, 200 by default) shows each object: kind, project, name, node,
+`packing`, `packed` or `abandoned`, files, content and pack bytes, verified
+copies (and the path of one), and what became of its source (`present`,
+`deleting`, `deleted`, `kept`, `evicting`, `evicted`, with why).
+`--task` (`task` in the query) selects outputs of all runs of the named task;
+use `--project` to narrow that name to one project. `--execution` (`execution`
+in the query) selects outputs of the run that execution belongs to, even
+for a continuation. A gang leader includes its ranks' outputs. These
+filters also apply with `--json`.
 
 #### Run snapshots
 
@@ -1676,10 +1681,18 @@ it.
 Brought inputs: an input not on the node an execution waits on is brought
 there once it is a packed object (a fetch, ordered as the daemon reconciles
 tasks, for each input an execution waiting on a node lacks there; or by
-`kairo data fetch --project P --node N [--data NAME]... [OBJECT...]`,
-`POST /api/data/fetches`, `{"project", "node", "data", "objects"}`). It is
-brought to the volatile store of the node, among those an executor of the
-node that is not a WSL one serves, with the most room for its pack and
+`kairo data fetch --project P --node N [--data NAME]... [OBJECT...] [--wait [--timeout D]]`,
+`POST /api/data/fetches`, `{"project", "node", "data", "objects"}`). Without
+`--wait`, the command returns as soon as it has asked for the fetch. With
+`--wait`, it checks the placement on that node every 2 s
+(`GET /api/data/objects/{id}/placement?node=N`) and prints `OBJECT: PATH`
+once the object is unpacked. It exits non-zero if the fetch cannot finish
+(for example, no placement was ordered or the pack is gone). Executors
+retry recoverable errors. `--timeout` limits the wait (exit 2 on timeout;
+0 or omitted means no limit) without cancelling the fetch.
+
+The object is brought to the volatile store of the node, among those an
+executor of the node that is not a WSL one serves, with the most room for its pack and
 unpacked tree (its free bytes as last reported, less its `reserve_free_bytes`,
 at least 1 GiB, and the pack and tree sizes of pending fetches there; the
 first by id among equals),
