@@ -2820,8 +2820,10 @@ nothing of this installation on GitHub's hosted runners
 `linux-race` and `linux-root` on Ubuntu with PostgreSQL 17 as a service
 (role `kairo`, a superuser), `windows` on Windows with the image's
 PostgreSQL, and `sdk-python` and `sdk-rust` on Ubuntu. There is no
-self-hosted runner and no secret: a pull request from a fork runs there with
-a read-only token, never on the installation's machines. The checks that need
+self-hosted runner and no secret, so nothing of the installation is reachable
+from there. The repository is private (2026-11-21), so the runs count against
+the account's Actions minutes: about 20 billed minutes a run, the Windows job
+counting twice. The checks that need
 the real environment (WSL, the LXC on pve1, the hardware) run on Kairo itself
 (below), before a deploy and before a large branch is merged. Deploying is
 not done from GitHub.
