@@ -153,7 +153,7 @@ func init() {
 				{"pause", "PROJECT [QUEUE] TASK [--force [--grace D] [--reason R]] [--no-wait]", "checkpoint and pause a task, or end it with --force", scope("task", "pause")},
 				{"resume", "PROJECT [QUEUE] TASK", "resume a paused task", scope("task", "resume")},
 				{"cancel", "PROJECT [QUEUE] TASK [--dry-run]", "cancel a task that is not running (pause --force a running one)", taskCancel},
-				{"rerun", "PROJECT [QUEUE] TASK", "run a failed, blocked, stopped or cancelled task again", taskRerun},
+				{"rerun", "PROJECT [QUEUE] TASK [--from-checkpoint latest|COMMAND_ID]", "run a failed, blocked, stopped or cancelled task again (from a checkpoint it published)", taskRerun},
 				{"checkpoint", "PROJECT [QUEUE] TASK [--wait] [--timeout D]", "have a running task publish a checkpoint and carry on", taskCheckpoint},
 			},
 			aliases: map[string]string{

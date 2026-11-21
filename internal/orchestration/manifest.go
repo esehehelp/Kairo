@@ -124,6 +124,13 @@ type Execution struct {
 	// cwd relative to it (store/sources.go). Absent from the JSON when
 	// empty.
 	Source string `toml:"source" json:"source,omitempty"`
+	// ContinueAfterLoss: when an attempt of the task is lost (its node lost
+	// power, its agent went away) the task goes on from its latest published
+	// checkpoint, on the node that published it, once nothing of the lost
+	// attempt can still run (its lease released), instead of being blocked
+	// (store/orchestration.go). Checkpointable only, not a gang. Absent from
+	// the JSON when false.
+	ContinueAfterLoss bool `toml:"continue_after_loss" json:"continue_after_loss,omitempty"`
 }
 
 // Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
@@ -432,6 +439,9 @@ func normalizeExecution(value *Execution) error {
 	}
 	if value.Regenerable && value.Gang != nil {
 		return errors.New("regenerable is for a single execution, not a gang")
+	}
+	if value.ContinueAfterLoss && (!value.Checkpointable || value.Gang != nil) {
+		return errors.New("continue_after_loss is for a checkpointable single execution (it goes on from a checkpoint), not a gang")
 	}
 	if value.Executor.Labels == nil {
 		value.Executor.Labels = map[string]string{}

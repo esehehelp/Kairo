@@ -78,8 +78,9 @@ The initial `RunToCompletion@v1` policy waits for every dependency to succeed,
 submits the Task's initial Execution, and marks the Task successful only after
 a zero exit, Attempt quiescence, and Lease release. A checkpointed cooperative
 suspend with an opaque continuation creates the next immutable Execution.
-Lost Attempt identity blocks the Task, and an unsuccessful dependency blocks
-its dependants. See `examples/project-spec.toml` for the declaration format.
+Lost Attempt identity blocks the Task (unless it is declared
+`continue_after_loss`, below), and an unsuccessful dependency blocks its
+dependants. See `examples/project-spec.toml` for the declaration format.
 Besides `labels`, `[tasks.execution.executor]` may name a `node` (only that
 node's executors take the task), and an `[[tasks.execution.exclusive]]`
 request a `device` (one GPU by its UUID, `count = 1`), as the tasks of
@@ -139,7 +140,15 @@ work).
 Execution (reason `rerun`), once all of its executions have ended. Dependants
 that were blocked only because a dependency did not succeed return to
 `pending` and run if their dependencies now succeed. A changed declaration
-still needs a new Task name. `kairo project prune [--write]
+still needs a new Task name. `--from-checkpoint latest|COMMAND_ID` (a
+checkpointable Task that is not a gang) runs it from a checkpoint it
+published instead of from the start: the latest, or the one of that command
+(a suspend or checkpoint command acknowledged `checkpointed`; `GET
+/api/commands/{id}`). The new Execution is a continuation of that
+checkpoint's reference (`KAIRO_CONTINUATION_REF`), as after a checkpointed
+suspend, planned onto the node of the attempt that published it, since the
+reference is a path there; the CLI prints the checkpoint. A Task that
+published none, or a command that is not one of its checkpoints, is refused. `kairo project prune [--write]
 FILE` reports (or, with `--write`, rewrites FILE to) the Tasks that can still
 run and the dependencies they need, keeping each kept Task's digest.
 
@@ -667,6 +676,18 @@ labels may take what is placed there.
   that output is temporal data (Data stores: temporal data), not copied to a
   durable store, and the task may be rerun by Kairo to make it again where
   it is read. Not for a gang. In the execution's digest only when set.
+- Continue after loss: `continue_after_loss = true` in a checkpointable
+  task's `[tasks.execution]` (not a gang) makes a lost attempt (its node
+  lost power, its agent went away: `executor_identity_lost`) go on instead
+  of blocking the task. The task stays `running` until nothing of the lost
+  attempt can still run, that is until its stale lease is released (by the
+  daemon, for an attempt that never started its command or whose node
+  rebooted since, or by `kairo resource reconcile`), then goes on from the
+  latest checkpoint it published (a suspend's, an operator's or a
+  `data_protection` checkpoint command's) as a continuation (reason
+  `loss_continuation`) on the node that published it, as `kairo task rerun
+  --from-checkpoint latest` would. With no checkpoint published it is
+  blocked as without the setting. In the task's digest only when set.
 - Store: `store = "ID"` in `[tasks.execution]` (or an execution manifest)
   names the volatile store (Machine declaration) its attempts' scratch, run
   output and cache directories go on, instead of the first their executor

@@ -125,7 +125,7 @@ func regenerateTx(ctx context.Context, tx *sql.Tx, objectID, node string) error 
 	if runs, err := producerRunsOnTx(ctx, tx, producer.String, node); err != nil || !runs {
 		return err
 	}
-	ordinal, err := markTaskRerunTx(ctx, tx, producer.String, regenerationRequest(objectID), "kairo")
+	ordinal, err := markTaskRerunTx(ctx, tx, producer.String, regenerationRequest(objectID), "kairo", nil)
 	if err != nil {
 		return err
 	}

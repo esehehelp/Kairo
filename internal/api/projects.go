@@ -130,12 +130,15 @@ func (s *Server) rerunTask(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Actor     string `json:"actor"`
 		RequestID string `json:"request_id"`
+		// FromCheckpoint: "latest" or a checkpoint command's id, to go on
+		// from that checkpoint (store.RerunTaskFrom).
+		FromCheckpoint string `json:"from_checkpoint"`
 	}
 	if err := decodeOptional(r, &body); err != nil {
 		writeError(w, err)
 		return
 	}
-	result, err := s.Store.RerunTask(r.Context(), r.PathValue("project"), r.PathValue("task"), actorOr(r, body.Actor), strings.TrimSpace(body.RequestID))
+	result, err := s.Store.RerunTaskFrom(r.Context(), r.PathValue("project"), r.PathValue("task"), actorOr(r, body.Actor), strings.TrimSpace(body.RequestID), body.FromCheckpoint)
 	if err != nil {
 		writeError(w, err)
 		return
