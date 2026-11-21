@@ -26,15 +26,23 @@ func projectValidate(args []string) error {
 	if err != nil {
 		return err
 	}
+	external := validated.ExternalDependencies()
 	if !*asJSON {
 		fmt.Printf("ok %s: %d tasks, digest %s\n", validated.Manifest.Project.Name, len(validated.Manifest.Tasks), shortDigest(validated.Digest))
+		if len(external) > 0 {
+			fmt.Printf("depends on tasks this file does not declare (the project's, checked when applied): %s\n", strings.Join(external, ", "))
+		}
 		return nil
 	}
+	if external == nil {
+		external = []string{}
+	}
 	body, err := json.MarshalIndent(map[string]any{
-		"ok":          true,
-		"project":     validated.Manifest.Project.Name,
-		"spec_digest": validated.Digest,
-		"tasks":       validated.Manifest.Tasks,
+		"ok":                    true,
+		"project":               validated.Manifest.Project.Name,
+		"spec_digest":           validated.Digest,
+		"tasks":                 validated.Manifest.Tasks,
+		"external_dependencies": external,
 	}, "", "  ")
 	if err != nil {
 		return err

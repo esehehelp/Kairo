@@ -191,6 +191,25 @@ func applyProjectTx(ctx context.Context, tx *sql.Tx, spec orchestration.Validate
 		// Every conflicting task is named, so the operator sees them all at once.
 		return ApplyResult{}, fmt.Errorf("%w: %s", ErrOrchestrationConflict, strings.Join(conflicts, ", "))
 	}
+	// A dependency the file does not declare is a task the project already
+	// has, declared by another file (issue #12): it is depended on as one the
+	// file declares (succeeded: satisfied; not: the dependant is blocked).
+	var unknown []string
+	for _, name := range spec.ExternalDependencies() {
+		var scopeID string
+		err := tx.QueryRowContext(ctx, `SELECT task_scope_id FROM orchestration_tasks WHERE project_scope_id=$1 AND name=$2`, projectScope.ID, name).Scan(&scopeID)
+		if errors.Is(err, sql.ErrNoRows) {
+			unknown = append(unknown, name)
+			continue
+		}
+		if err != nil {
+			return ApplyResult{}, err
+		}
+		taskScopes[name] = scopeID
+	}
+	if len(unknown) > 0 {
+		return ApplyResult{}, fmt.Errorf("depends on %s, which neither this file nor an earlier apply of project %s declares", strings.Join(unknown, ", "), spec.Manifest.Project.Name)
+	}
 	for _, task := range spec.Manifest.Tasks {
 		for _, dependency := range task.DependsOn {
 			if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_task_dependencies(task_scope_id,dependency_task_scope_id) VALUES($1,$2) ON CONFLICT DO NOTHING`, taskScopes[task.Name], taskScopes[dependency]); err != nil {

@@ -72,7 +72,15 @@ which execution should run next.
 `project apply` stores the declaration once; the daemon performs subsequent
 reconciliation. Applying the same normalized declaration is idempotent. A
 declared Task is immutable; a later complete ProjectSpec may add Tasks but
-cannot mutate an existing Task, and omission does not cancel it.
+cannot mutate an existing Task, and omission does not cancel it. A Task's
+`depends_on` (and so a `task = "T"` input) may name a Task the file does not
+declare but the project already has, declared by another file (a judge
+comparing a new experiment's run with an earlier one's, say): the daemon
+resolves it when applying and refuses the apply if the project has no such
+Task; it is then depended on as one of the file's own. `kairo project
+validate` lists such names (`external_dependencies` with `--json`). They
+cannot close a cycle, since a Task declared before depends only on Tasks
+declared before it.
 
 The initial `RunToCompletion@v1` policy waits for every dependency to succeed,
 submits the Task's initial Execution, and marks the Task successful only after
