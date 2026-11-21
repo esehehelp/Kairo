@@ -202,6 +202,26 @@ type Validated struct {
 	TaskDigests map[string]string
 }
 
+// ExternalDependencies are the tasks the file's tasks depend on that it does
+// not declare (by name, sorted): tasks of the project declared by another
+// file, which the daemon resolves when applying.
+func (v Validated) ExternalDependencies() []string {
+	declared := map[string]bool{}
+	for _, task := range v.Manifest.Tasks {
+		declared[task.Name] = true
+	}
+	var out []string
+	for _, task := range v.Manifest.Tasks {
+		for _, dependency := range task.DependsOn {
+			if !declared[dependency] && !slices.Contains(out, dependency) {
+				out = append(out, dependency)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Parse reads a ProjectSpec TOML file. A top-level [defaults] table (queue,
 // policy, execution) is expanded into every Task before validation, so the
 // normalized spec, its digest and every Task digest are the same as for the
@@ -317,11 +337,13 @@ func Normalize(manifest Manifest) (Validated, error) {
 			}
 		}
 	}
+	// A dependency the file does not declare names a task the project already
+	// has, declared by another file: the daemon resolves it when applying, and
+	// refuses the apply if the project has no such task (issue #12). It
+	// cannot close a cycle: a task declared before depends only on tasks
+	// declared before it.
 	for _, task := range manifest.Tasks {
 		for _, dependency := range task.DependsOn {
-			if _, exists := taskNames[dependency]; !exists {
-				return Validated{}, fmt.Errorf("task %q depends on unknown task %q", task.Name, dependency)
-			}
 			if dependency == task.Name {
 				return Validated{}, fmt.Errorf("task %q cannot depend on itself", task.Name)
 			}

@@ -371,6 +371,54 @@ func (s *Store) FetchData(ctx context.Context, req FetchRequest) ([]FetchedObjec
 	return out, tx.Commit()
 }
 
+// PlacementStatus is the state of a fetch on a node. Its path is only
+// available once the object is ready to read.
+type PlacementStatus struct {
+	State   string `json:"state"`
+	Path    string `json:"path,omitempty"`
+	Problem string `json:"problem,omitempty"`
+}
+
+// DataPlacement reads the placement on a node and checks whether a pending
+// fetch still has a pack to read. Executors retry errors that may clear.
+func (s *Store) DataPlacement(ctx context.Context, objectID, node string) (PlacementStatus, error) {
+	var status PlacementStatus
+	var objectState, lifecycle, transfer, sourceState string
+	var verifiedCopy bool
+	err := s.db.QueryRowContext(ctx, `SELECT d.state,d.lifecycle,COALESCE(d.transfer_state,''),d.source_state,
+		EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL),
+		COALESCE(p.state,''),COALESCE(CASE WHEN p.state='ready' THEN p.path END,'')
+		FROM data_objects d LEFT JOIN LATERAL (
+			SELECT p.state,p.path FROM object_placements p JOIN executors x ON x.id=p.executor_id
+			WHERE p.object_id=d.id AND x.node_id=$2
+			ORDER BY CASE p.state WHEN 'ready' THEN 0 WHEN 'fetching' THEN 1 ELSE 2 END,p.store_id LIMIT 1
+		) p ON true WHERE d.id=$1`, objectID, node).Scan(&objectState, &lifecycle, &transfer, &sourceState, &verifiedCopy, &status.State, &status.Path)
+	if errors.Is(err, sql.ErrNoRows) {
+		return status, fmt.Errorf("%w: object %s", ErrNotFound, objectID)
+	}
+	if err != nil || status.State == "ready" {
+		return status, err
+	}
+	switch {
+	case objectState == "abandoned":
+		return PlacementStatus{State: "abandoned", Problem: "the object was abandoned"}, nil
+	case objectState != "packed":
+		status.Problem = "the object is not packed"
+	case status.State == "":
+		status.Problem = "no placement was ordered or it was removed"
+	case status.State == "evicting":
+		status.Problem = "the placement is being evicted"
+	case lifecycle == LifecycleTemporal && transfer != transferPacking && transfer != transferPacked:
+		status.Problem = "the object has no transfer pack"
+	case sourceState != "present" && sourceState != SourceDeleting && !verifiedCopy:
+		status.Problem = "there is no pack to fetch"
+	}
+	if status.Problem != "" {
+		status.State = "failed"
+	}
+	return status, nil
+}
+
 // FetchesToMake is what an executor is to bring now: its placements being
 // fetched whose object is packed, each with where to read the pack: a
 // verified durable copy or the pack where it was made, on a store this

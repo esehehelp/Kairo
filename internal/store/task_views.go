@@ -285,9 +285,25 @@ type TaskExecutionDetail struct {
 	TaskExecution
 	Attempts []AttemptDetail `json:"attempts"`
 	Gang     []TaskGangRank  `json:"gang,omitempty"`
+	Outputs  []TaskOutput    `json:"outputs,omitempty"`
 	// Waiting says why an execution that has not started waits, besides its
 	// dependencies.
 	Waiting []WaitReason `json:"waiting,omitempty"`
+}
+
+// TaskOutput is a run's output from one store, with its verified copies.
+type TaskOutput struct {
+	ID          string       `json:"id"`
+	ExecutionID string       `json:"execution_id"`
+	State       string       `json:"state"`
+	Lifecycle   string       `json:"lifecycle"`
+	Copies      int          `json:"copies"`
+	Locations   []OutputCopy `json:"locations,omitempty"`
+}
+
+type OutputCopy struct {
+	StoreID string `json:"store_id"`
+	Path    string `json:"path"`
 }
 
 // AttemptDetail is an attempt with its log paths and node. The API fills in
@@ -326,7 +342,7 @@ type WaitReason struct {
 }
 
 // GetTaskDetail reads one task in a fixed number of queries: the attempts,
-// gang ranks and admission blocks of all its executions are read at once.
+// outputs, gang ranks and admission blocks of all its executions are read at once.
 func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDetail, error) {
 	task, err := loadTaskTx(ctx, s.db, project, name)
 	if err != nil {
@@ -399,8 +415,12 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 			closed = append(closed, WaitReason{ReasonCode: "scope_gate_closed", Scope: gate.Scope, Detail: who, CreatedAt: gate.ClosedAt})
 		}
 	}
+	outputs, err := s.taskOutputs(ctx, task.scopeID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
 	for _, execution := range detail.TaskStatus.Executions {
-		item := TaskExecutionDetail{TaskExecution: execution, Attempts: attempts[execution.ExecutionID], Gang: gangs[execution.ExecutionID]}
+		item := TaskExecutionDetail{TaskExecution: execution, Attempts: attempts[execution.ExecutionID], Gang: gangs[execution.ExecutionID], Outputs: outputs[execution.ExecutionID]}
 		if item.Attempts == nil {
 			item.Attempts = []AttemptDetail{}
 		}
@@ -410,6 +430,33 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 		detail.Executions = append(detail.Executions, item)
 	}
 	return detail, nil
+}
+
+func (s *Store) taskOutputs(ctx context.Context, taskScopeID string) (map[string][]TaskOutput, error) {
+	out := map[string][]TaskOutput{}
+	err := eachRow(ctx, s.db, `SELECT o.execution_id,e.id,d.id,d.state,d.lifecycle,
+		COALESCE((SELECT json_agg(json_build_object('store_id',c.store_id,'path',c.path) ORDER BY c.store_id)
+			FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL),'[]')
+		FROM orchestration_task_executions o
+		LEFT JOIN execution_gangs g ON g.leader_execution_id=o.execution_id
+		LEFT JOIN gang_members gm ON gm.gang_id=g.id
+		JOIN execution_requests e ON e.id=COALESCE(gm.execution_id,o.execution_id)`+taskRunStartJoin+`
+		JOIN data_objects d ON d.kind='output' AND d.source_id=`+executionRunID+`
+		WHERE o.task_scope_id=$1 ORDER BY o.execution_id,COALESCE(gm.rank,0),d.created_at,d.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		var executionID string
+		var output TaskOutput
+		var locations []byte
+		if err := rows.Scan(&executionID, &output.ExecutionID, &output.ID, &output.State, &output.Lifecycle, &locations); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(locations, &output.Locations); err != nil {
+			return err
+		}
+		output.Copies = len(output.Locations)
+		out[executionID] = append(out[executionID], output)
+		return nil
+	})
+	return out, err
 }
 
 func (s *Store) taskRefs(ctx context.Context, query, taskScopeID string) ([]TaskRef, error) {

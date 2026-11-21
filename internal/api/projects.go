@@ -133,12 +133,15 @@ func (s *Server) rerunTask(w http.ResponseWriter, r *http.Request) {
 		// FromCheckpoint: "latest" or a checkpoint command's id, to go on
 		// from that checkpoint (store.RerunTaskFrom).
 		FromCheckpoint string `json:"from_checkpoint"`
+		// Source: "current" or a snapshot id, to run in that snapshot of
+		// the task's source instead of its own.
+		Source string `json:"source"`
 	}
 	if err := decodeOptional(r, &body); err != nil {
 		writeError(w, err)
 		return
 	}
-	result, err := s.Store.RerunTaskFrom(r.Context(), r.PathValue("project"), r.PathValue("task"), actorOr(r, body.Actor), strings.TrimSpace(body.RequestID), body.FromCheckpoint)
+	result, err := s.Store.RerunTaskWith(r.Context(), r.PathValue("project"), r.PathValue("task"), actorOr(r, body.Actor), strings.TrimSpace(body.RequestID), store.RerunOptions{FromCheckpoint: body.FromCheckpoint, Source: body.Source})
 	if err != nil {
 		writeError(w, err)
 		return

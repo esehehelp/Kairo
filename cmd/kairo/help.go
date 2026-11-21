@@ -147,13 +147,13 @@ func init() {
 			note: "QUEUE may be left out for tasks declared by a ProjectSpec: it is looked up.",
 			subs: []command{
 				{"list", "PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]", "tasks as a table (default: live and updated in the last 24h)", taskList},
-				{"show", "PROJECT [QUEUE] TASK [--json]", "one task: spec, dependencies, executions, attempts, log paths", taskShow},
+				{"show", "PROJECT [QUEUE] TASK [--json]", "one task: spec, dependencies, executions, attempts, log paths and output objects", taskShow},
 				{"logs", "PROJECT [QUEUE] TASK [--tail N] [-f] [--stream S] [--attempt A] [--rank R]", "print or follow attempt logs", taskLogs},
 				{"wait", "PROJECT [QUEUE] TASK [TASK...] | PROJECT --match PREFIX [--until terminal|started] [--timeout D]", "wait for tasks, one line per state change (exit 0 ok, 1 failed, 2 timeout, 3 error)", taskWait},
 				{"pause", "PROJECT [QUEUE] TASK [--force [--grace D] [--reason R]] [--no-wait]", "checkpoint and pause a task, or end it with --force", scope("task", "pause")},
 				{"resume", "PROJECT [QUEUE] TASK", "resume a paused task", scope("task", "resume")},
 				{"cancel", "PROJECT [QUEUE] TASK [--dry-run]", "cancel a task that is not running (pause --force a running one)", taskCancel},
-				{"rerun", "PROJECT [QUEUE] TASK [--from-checkpoint latest|COMMAND_ID]", "run a failed, blocked, stopped or cancelled task again (from a checkpoint it published)", taskRerun},
+				{"rerun", "PROJECT [QUEUE] TASK [--from-checkpoint latest|COMMAND_ID] [--source current|SNAPSHOT]", "run a failed, blocked, stopped or cancelled task again (from a checkpoint, in newer code)", taskRerun},
 				{"checkpoint", "PROJECT [QUEUE] TASK [--wait] [--timeout D]", "have a running task publish a checkpoint and carry on", taskCheckpoint},
 			},
 			aliases: map[string]string{
@@ -222,8 +222,8 @@ func init() {
 			note: "An import packs directories of a node (outside every store) onto its volatile store and copies them to a durable store; with --delete-source each is deleted once its copy is verified.",
 			subs: []command{
 				{"import", "--project P --node N [--name NAME] [--delete-source | --regenerable-by TASK] [--json] PATH...", "import directories of a node: packed, copied to a durable store, read back", dataImport},
-				{"list", "[--project P] [--kind K] [--limit N] [--json]", "data objects, newest first: source, pack, verified copies, what became of the source", dataList},
-				{"fetch", "--project P --node N [--data NAME]... [OBJECT...]", "bring data objects to a node (unpacked under <root>/inputs/<object id>) for its executions to read", dataFetch},
+				{"list", "[--project P] [--kind K] [--task NAME] [--execution ID] [--limit N] [--json]", "data objects, newest first; --task and --execution select run outputs", dataList},
+				{"fetch", "--project P --node N [--data NAME]... [OBJECT...] [--wait [--timeout D]]", "bring data objects to a node; --wait prints their paths once unpacked (exit 2 on timeout)", dataFetch},
 				{"cancel", "OBJECT...", "abandon imports not packed yet (their paths are left as they are)", dataCancel},
 			},
 			aliases: map[string]string{"ls": "list", "show": "list", "add": "import"},

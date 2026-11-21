@@ -160,11 +160,11 @@ func TestARerunGoesOnFromACheckpoint(t *testing.T) {
 	if err := store.ReconcileResource(ctx, "gpu-0", true); err != nil {
 		t.Fatal(err)
 	}
-	_, err := store.RerunTaskFrom(ctx, "orchestrated", "prepare", "tester", "", "latest")
+	_, err := store.RerunTaskWith(ctx, "orchestrated", "prepare", "tester", "", RerunOptions{FromCheckpoint: "latest"})
 	taskConflictError(t, err, "task prepare is succeeded")
-	_, err = store.RerunTaskFrom(ctx, "orchestrated", "train", "tester", "", "cmd_not_a_checkpoint")
+	_, err = store.RerunTaskWith(ctx, "orchestrated", "train", "tester", "", RerunOptions{FromCheckpoint: "cmd_not_a_checkpoint"})
 	taskConflictError(t, err, "cmd_not_a_checkpoint is not a checkpoint task train published")
-	out, err := store.RerunTaskFrom(ctx, "orchestrated", "train", "tester", "", "latest")
+	out, err := store.RerunTaskWith(ctx, "orchestrated", "train", "tester", "", RerunOptions{FromCheckpoint: "latest"})
 	if err != nil || out.FromCheckpoint == nil || out.FromCheckpoint.ContinuationRef != "/srv/ckpt/step-300" || out.FromCheckpoint.Node != "node" || out.FromCheckpoint.CommandID == "" {
 		t.Fatalf("rerun from the latest checkpoint: %+v %v", out, err)
 	}
