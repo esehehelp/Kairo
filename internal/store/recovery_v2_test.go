@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestExecutorRestartMakesOrphanReservationStale(t *testing.T) {
@@ -75,55 +76,100 @@ func TestALostAttemptThatNeverStartedIsReleasedWithoutAnOperator(t *testing.T) {
 	if err = store.ReconcileResource(ctx, "gpu-0", true); err == nil {
 		t.Fatal("stale lease accepted an observation from before identity loss")
 	}
-	if n, err := store.ReconcileUnstartedLeases(ctx); err != nil || n != 0 {
+	if n, err := store.ReconcileSafeStaleLeases(ctx); err != nil || n != 0 {
 		t.Fatalf("released before an observation since it went stale: %d %v", n, err)
 	}
 	refreshSchedulerGPU(t, store)
-	if n, err := store.ReconcileUnstartedLeases(ctx); err != nil || n != 1 {
+	if n, err := store.ReconcileSafeStaleLeases(ctx); err != nil || n != 1 {
 		t.Fatalf("released %d %v, want 1", n, err)
 	}
 	var state string
 	if err = store.db.QueryRowContext(ctx, `SELECT state FROM leases WHERE id=$1`, reservation.Lease.ID).Scan(&state); err != nil || state != "released" {
 		t.Fatalf("lease %s %v", state, err)
 	}
-	if n, err := store.ReconcileUnstartedLeases(ctx); err != nil || n != 0 {
+	assertReconcileReason(t, store, reservation.Lease.ID, "never started")
+	if n, err := store.ReconcileSafeStaleLeases(ctx); err != nil || n != 0 {
 		t.Fatalf("released again: %d %v", n, err)
 	}
 }
 
-func TestLostAttemptRequiresExplicitAbsenceOnceActivated(t *testing.T) {
-	store := openCoordinationStore(t)
-	setupSchedulerInventory(t, store)
-	ctx := context.Background()
-	if _, _, err := store.SubmitExecution(ctx, schedulerExecutionSpec("activated")); err != nil {
-		t.Fatal(err)
+func TestReconcileActivatedAttemptAfterNodeRegistration(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		bootFromStart time.Duration
+		wantReboot    bool
+		manual        bool
+	}{
+		{name: "unknown"},
+		{name: "before-start", bootFromStart: -time.Minute},
+		{name: "within-margin", bootFromStart: time.Minute},
+		{name: "at-margin", bootFromStart: 2 * time.Minute},
+		{name: "after-margin", bootFromStart: 2*time.Minute + time.Second, wantReboot: true},
+		{name: "manual-after-reboot", bootFromStart: 3 * time.Minute, wantReboot: true, manual: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := openCoordinationStore(t)
+			setupSchedulerInventory(t, store)
+			ctx := t.Context()
+			launch := startRunningExecution(t, store, tc.name)
+			// Use different offsets so comparing the timestamp text would fail.
+			started := time.Now().Add(-time.Hour).Truncate(time.Second).In(time.FixedZone("JST", 9*3600))
+			if _, err := store.testExec(`UPDATE attempts SET started_at=$1 WHERE id=$2`, started.Format(time.RFC3339Nano), launch.Attempt.ID); err != nil {
+				t.Fatal(err)
+			}
+			if tc.bootFromStart != 0 {
+				bootedAt := started.Add(tc.bootFromStart).UTC().Format(time.RFC3339Nano)
+				if err := store.UpsertNode(ctx, Node{ID: "node", Name: "node", OS: "windows", Architecture: "amd64", Enabled: true, BootedAt: &bootedAt}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if n, _, err := store.ReregisterExecutor(ctx, "executor", nil); err != nil || n != 1 {
+				t.Fatalf("register executor: %d stale leases, %v", n, err)
+			}
+			if n, err := store.ReconcileSafeStaleLeases(ctx); err != nil || n != 0 {
+				t.Fatalf("released before fresh observations: %d %v", n, err)
+			}
+			refreshSchedulerGPU(t, store)
+			if !tc.wantReboot {
+				if n, err := store.ReconcileSafeStaleLeases(ctx); err != nil || n != 0 {
+					t.Fatalf("released without proof of reboot: %d %v", n, err)
+				}
+				if err := store.ReconcileResource(ctx, "gpu-0"); err == nil || !strings.Contains(err.Error(), "requires explicit process-absence confirmation") {
+					t.Fatalf("reconcile without confirmation: %v", err)
+				}
+				if err := store.ReconcileResource(ctx, "gpu-0", true); err != nil {
+					t.Fatal(err)
+				}
+				return
+			}
+			if tc.manual {
+				if err := store.ReconcileResource(ctx, "gpu-0"); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := store.ObserveClaim(ctx, ExternalClaim{ID: "own-claim", ResourceID: "gpu-0", ClaimKind: "external_process", Evidence: json.RawMessage(`{"attempt_id":"` + launch.Attempt.ID + `"}`)}); err != nil {
+					t.Fatal(err)
+				}
+				if n, err := store.ReconcileSafeStaleLeases(ctx); err != nil || n != 0 {
+					t.Fatalf("released with a claim of the attempt: %d %v", n, err)
+				}
+				if err := store.ClearClaim(ctx, "own-claim"); err != nil {
+					t.Fatal(err)
+				}
+				if n, err := store.ReconcileSafeStaleLeases(ctx); err != nil || n != 1 {
+					t.Fatalf("released after reboot: %d %v, want 1", n, err)
+				}
+			}
+			assertReconcileReason(t, store, launch.Lease.ID, "node rebooted since it started")
+		})
 	}
-	reservation, err := store.ReserveNext(ctx, "executor")
-	if err != nil || reservation == nil {
-		t.Fatalf("reserve: %+v %v", reservation, err)
-	}
-	if err = store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
-		t.Fatal(err)
-	}
-	launch, err := store.AuthorizeLaunch(ctx, reservation)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err = store.ActivateLaunch(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, launch.AuthorizationToken, 4321, "pid:4321:start:1"); err != nil {
-		t.Fatal(err)
-	}
-	if count, markErr := store.MarkExecutorUnknown(ctx, "executor"); markErr != nil || count != 1 {
-		t.Fatalf("mark unknown: count=%d err=%v", count, markErr)
-	}
-	refreshSchedulerGPU(t, store)
-	if n, err := store.ReconcileUnstartedLeases(ctx); err != nil || n != 0 {
-		t.Fatalf("released an activated attempt's lease by itself: %d %v", n, err)
-	}
-	if err = store.ReconcileResource(ctx, "gpu-0"); err == nil {
-		t.Fatal("lost activated attempt was released without explicit absence confirmation")
-	}
-	if err = store.ReconcileResource(ctx, "gpu-0", true); err != nil {
-		t.Fatal(err)
+}
+
+func assertReconcileReason(t *testing.T, store *Store, leaseID, want string) {
+	t.Helper()
+	var reason string
+	if err := store.db.QueryRow(`SELECT payload_json::jsonb->>'reason' FROM coordination_events WHERE event_type='stale_lease_reconciled' AND aggregate_id=$1`, leaseID).Scan(&reason); err != nil || reason != want {
+		t.Fatalf("reconcile reason = %q (%v), want %q", reason, err, want)
 	}
 }
 

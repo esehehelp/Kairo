@@ -441,6 +441,41 @@ func TestClientTrustsOnlyTheDaemonCA(t *testing.T) {
 }
 
 // The node token never follows a redirect.
+func TestRegistrationReportsUptimeWhenKnown(t *testing.T) {
+	reported := make(chan *float64, 1)
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			UptimeSeconds *float64 `json:"uptime_seconds"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Error(err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		reported <- request.UptimeSeconds
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer ts.Close()
+	before, known := uptimeSeconds()
+	if _, err := New(ts.URL, "test-token", nil).Register(t.Context(), store.Node{ID: "node"}, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	seconds := <-reported
+	if !known {
+		if seconds != nil {
+			t.Fatal("registration reported unknown uptime")
+		}
+		return
+	}
+	if seconds == nil {
+		t.Fatal("registration omitted known uptime")
+	}
+	after, _ := uptimeSeconds()
+	if *seconds < before || *seconds > after {
+		t.Fatalf("registration uptime = %g; want between %g and %g seconds", *seconds, before, after)
+	}
+}
+
 func TestClientDoesNotFollowRedirects(t *testing.T) {
 	var leaked bool
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

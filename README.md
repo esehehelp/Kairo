@@ -500,9 +500,10 @@ absence show resources unclaimed. A lease its executor cannot vouch for
 becomes stale: when the executor's agent registers again without adopting
 its attempt, or when an operator fences the node of an agent that is gone
 (`kairo node fence`, Node fence below). Time alone never makes a lease stale
-or free: a stale lease holds its resources until `kairo resource reconcile
-RESOURCE_ID --confirm-process-absent` releases it. Reconcile needs an
-observation of each of the lease's resources taken after it went stale, in
+or free: a stale lease holds its resources until reconciled. If the daemon
+cannot prove that the attempt's processes are gone, an operator must use
+`kairo resource reconcile RESOURCE_ID --confirm-process-absent`. Reconcile
+needs an observation of each resource taken after the lease went stale, in
 which no process of its attempt is seen (one carrying its
 `KAIRO_ATTEMPT_ID`, or one of its registered processes). A claim that is not
 the attempt's (another program's process, unattributed activity, a game)
@@ -511,9 +512,15 @@ itself, and is not something the operator has to wait out. Nothing can still
 run under the stale lease of an attempt that never started its command (lost
 before its activation: its shim starts the command only on the go-ahead its
 agent sends after the activation, and an agent gone takes that go-ahead with
-it), nor under one of no attempt; the daemon releases those itself, once each
-of their resources has been observed since (event `stale_lease_reconciled`,
-`by: daemon`), and reconcile needs no confirmation for them.
+it), nor under one of no attempt or one whose node rebooted after it started.
+At registration, Linux and Windows agents report uptime that counts sleep
+and hibernation, so resuming is not mistaken for rebooting. The daemon uses
+its own clock to estimate the boot time and stamp the attempt's start. It
+requires the boot time to be more than two minutes later than the start to
+allow for timing uncertainty. The daemon releases these leases itself once
+each resource has a fresh observation taken since the lease went stale and
+no process of the attempt is seen (event `stale_lease_reconciled`,
+`by: daemon`). Manual reconcile needs no confirmation for them either.
 
 What an exited attempt left running (its launcher exited and its exit is
 recorded, yet a process of its tree runs: one it started without
@@ -2033,12 +2040,12 @@ node's executors is lost, its execution terminal (`executor_identity_lost`),
 and every lease of theirs stale (event `node_fenced`, with the stale leases
 per executor). It is refused (409 `executor_live`) while an executor of the
 node has polled within the last minute: a live agent settles its own leases
-when it restarts. A stale lease still holds its resources; once nothing of
-those attempts runs, `kairo resource reconcile RESOURCE_ID
---confirm-process-absent` releases it. Should the agent come back after
-all, it does not adopt the attempts it finds (they are lost): their
+when it restarts. A stale lease holds its resources until reconciled. If the
+agent comes back after a reboot, the daemon can release the leases of
+attempts that predate the boot, as described above. A mere agent restart
+won't let it adopt attempts already marked lost by the fence: any surviving
 processes go on unwatched until they end or are stopped by hand, which is
-what `--confirm-process-absent` is there to check.
+what `kairo resource reconcile RESOURCE_ID --confirm-process-absent` checks.
 
 Reconcile waits for fresh observations of every resource, which a node that
 no longer exists never sends. `kairo node retire NODE_ID

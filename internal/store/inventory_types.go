@@ -9,6 +9,7 @@ type Node struct {
 	Architecture string          `json:"architecture"`
 	Attributes   json.RawMessage `json:"attributes"`
 	Enabled      bool            `json:"enabled"`
+	BootedAt     *string         `json:"-"`
 }
 
 type Executor struct {

@@ -117,6 +117,9 @@ func (c *Client) RegisterAdopting(ctx context.Context, node store.Node, executor
 	if len(adopt) > 0 {
 		body["adopt"] = adopt
 	}
+	if seconds, ok := uptimeSeconds(); ok {
+		body["uptime_seconds"] = seconds
+	}
 	err = c.call(ctx, "register", body, &out)
 	return out.StaleLeases, out.Adopted, err
 }

@@ -23,7 +23,7 @@ func (s *Store) UpsertNode(ctx context.Context, n Node) error {
 		return errors.New("node id, name, os, and architecture are required")
 	}
 	t := now()
-	_, err := s.exec(ctx, `INSERT INTO nodes(id,name,os,architecture,attributes_json,enabled,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT(id) DO UPDATE SET name=excluded.name,os=excluded.os,architecture=excluded.architecture,attributes_json=excluded.attributes_json,enabled=excluded.enabled,updated_at=excluded.updated_at`, n.ID, n.Name, n.OS, n.Architecture, validJSON(n.Attributes), n.Enabled, t, t)
+	_, err := s.exec(ctx, `INSERT INTO nodes(id,name,os,architecture,attributes_json,enabled,created_at,updated_at,booted_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT(id) DO UPDATE SET name=excluded.name,os=excluded.os,architecture=excluded.architecture,attributes_json=excluded.attributes_json,enabled=excluded.enabled,updated_at=excluded.updated_at,booted_at=COALESCE(excluded.booted_at,nodes.booted_at)`, n.ID, n.Name, n.OS, n.Architecture, validJSON(n.Attributes), n.Enabled, t, t, n.BootedAt)
 	return err
 }
 func (s *Store) UpsertExecutor(ctx context.Context, e Executor) error {
@@ -460,7 +460,7 @@ func validateEpochTx(ctx context.Context, tx *sql.Tx, attemptID, leaseID string,
 // not the attempt's (another program's process, unattributed activity) does
 // not hold the lease: the claim keeps the device from being placed on by
 // itself (issue #20). The operator confirms the attempt's processes are
-// absent, unless it never started its command (attemptNeverStartedTx).
+// absent, unless the attempt never started its command or its node rebooted.
 func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confirmProcessAbsent ...bool) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -486,23 +486,26 @@ func (s *Store) ReconcileResource(ctx context.Context, resourceID string, confir
 	return tx.Commit()
 }
 
-// unstartedStaleLeases are the stale leases nothing can still run under:
-// those of no attempt (a daemon that died between reserving and creating
-// one) and those of an attempt that never started its command
-// (attemptNeverStartedTx).
-const unstartedStaleLeases = `SELECT l.id,l.attempt_id,l.coordination_epoch FROM leases l LEFT JOIN attempts a ON a.id=l.attempt_id
-	WHERE l.state='stale' AND (l.attempt_id IS NULL OR a.pid IS NULL AND NOT EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=a.id))
+const attemptNodeJoins = ` LEFT JOIN executors e ON e.id=a.executor_id LEFT JOIN nodes n ON n.id=e.node_id`
+
+// The shim waits for activation (a pid) before starting the command. A boot
+// after activation also proves absence, with a margin for timing uncertainty.
+const attemptCannotRunReason = `CASE
+	WHEN a.pid IS NULL AND NOT EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=a.id) THEN 'never started'
+	WHEN n.booted_at::timestamptz > a.started_at::timestamptz + interval '2 minutes' THEN 'node rebooted since it started'
+	END`
+
+const safeStaleLeases = `SELECT l.id,l.attempt_id,l.coordination_epoch FROM leases l LEFT JOIN attempts a ON a.id=l.attempt_id` + attemptNodeJoins + `
+	WHERE l.state='stale' AND (l.attempt_id IS NULL OR (` + attemptCannotRunReason + `) IS NOT NULL)
 	ORDER BY l.id`
 
-// ReconcileUnstartedLeases releases, without an operator, the stale leases
-// nothing can still run under (unstartedStaleLeases), once each of their
-// resources has been observed since they went stale with nothing of the
-// attempt on it (issue #19: a launch cut short by its agent's exit held the
-// node until a manual reconcile). It returns how many it released.
-func (s *Store) ReconcileUnstartedLeases(ctx context.Context) (int, error) {
+// ReconcileSafeStaleLeases releases stale leases that cannot still have
+// processes, once each resource is observed after the lease went stale with
+// nothing of the attempt on it. It returns how many it released.
+func (s *Store) ReconcileSafeStaleLeases(ctx context.Context) (int, error) {
 	// looked for first without the decision lock: there are seldom any
 	var some bool
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(`+unstartedStaleLeases+`)`).Scan(&some); err != nil || !some {
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(`+safeStaleLeases+`)`).Scan(&some); err != nil || !some {
 		return 0, err
 	}
 	tx, err := s.beginWrite(ctx)
@@ -510,13 +513,13 @@ func (s *Store) ReconcileUnstartedLeases(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
-	leases, err := staleLeasesTx(ctx, tx, unstartedStaleLeases)
+	leases, err := staleLeasesTx(ctx, tx, safeStaleLeases)
 	if err != nil {
 		return 0, err
 	}
 	released := 0
 	for _, x := range leases {
-		err = reconcileStaleLeaseTx(ctx, tx, x, false, map[string]any{"by": "daemon", "reason": "nothing of it started"})
+		err = reconcileStaleLeaseTx(ctx, tx, x, false, map[string]any{"by": "daemon"})
 		if errors.Is(err, errNotReconciled) {
 			continue
 		}
@@ -557,14 +560,10 @@ func staleLeasesTx(ctx context.Context, tx *sql.Tx, query string, args ...any) (
 // errNotReconciled: a stale lease that may not be released yet.
 var errNotReconciled = errors.New("stale lease not reconciled")
 
-// attemptNeverStartedTx reports whether an attempt never started its
-// command: it was never activated (no pid) and registered no process. Its
-// shim starts the command only on the go-ahead its agent sends after the
-// activation (executor/shim.go), so nothing of it can be running.
-func attemptNeverStartedTx(ctx context.Context, tx *sql.Tx, attemptID string) (bool, error) {
-	var never bool
-	err := tx.QueryRowContext(ctx, `SELECT a.pid IS NULL AND NOT EXISTS(SELECT 1 FROM attempt_processes ap WHERE ap.attempt_id=a.id) FROM attempts a WHERE a.id=$1`, attemptID).Scan(&never)
-	return never, err
+func attemptCannotRunTx(ctx context.Context, tx *sql.Tx, attemptID string) (sql.NullString, error) {
+	var reason sql.NullString
+	err := tx.QueryRowContext(ctx, `SELECT `+attemptCannotRunReason+` FROM attempts a`+attemptNodeJoins+` WHERE a.id=$1`, attemptID).Scan(&reason)
+	return reason, err
 }
 
 // reconcileStaleLeaseTx releases stale lease x (ReconcileResource), or says
@@ -591,18 +590,20 @@ func reconcileStaleLeaseTx(ctx context.Context, tx *sql.Tx, x staleLease, confir
 		if seen > 0 {
 			return fmt.Errorf("%w: stale lease %s: a process of attempt %s is still seen on its resources", errNotReconciled, x.lease, x.attempt.String)
 		}
-		if !confirmed {
-			never, err := attemptNeverStartedTx(ctx, tx, x.attempt.String)
-			if err != nil {
-				return err
-			}
-			if !never {
-				return fmt.Errorf("%w: stale attempt %s requires explicit process-absence confirmation", errNotReconciled, x.attempt.String)
-			}
+		reason, err := attemptCannotRunTx(ctx, tx, x.attempt.String)
+		if err != nil {
+			return err
+		}
+		if reason.Valid {
+			detail["reason"] = reason.String
+		} else if !confirmed {
+			return fmt.Errorf("%w: stale attempt %s requires explicit process-absence confirmation", errNotReconciled, x.attempt.String)
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE attempt_processes SET exited_at=$1,last_seen_at=$2 WHERE attempt_id=$3 AND exited_at IS NULL`, t, t, x.attempt.String); err != nil {
 			return err
 		}
+	} else {
+		detail["reason"] = "no attempt"
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=$1 WHERE id=$2 AND state='stale'`, t, x.lease); err != nil {
 		return err
