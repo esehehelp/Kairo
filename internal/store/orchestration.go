@@ -357,7 +357,8 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 				continue
 			}
 		}
-		if current.AttemptState != nil && *current.AttemptState == "lost" {
+		// lost, or lost and reconciled before this pass saw it (no exit then)
+		if (current.AttemptState != nil && *current.AttemptState == "lost") || (current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" && current.ExitCode == nil) {
 			if err := updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "attempt identity lost", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
 				return err
 			}

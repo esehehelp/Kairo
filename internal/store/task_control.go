@@ -236,8 +236,12 @@ func (s *Store) RerunTaskFrom(ctx context.Context, project, name, actor, request
 	}
 	var checkpoint *RerunCheckpoint
 	if from = strings.TrimSpace(from); from != "" {
+		var body string
+		if err = tx.QueryRowContext(ctx, `SELECT execution_template_json FROM orchestration_tasks WHERE task_scope_id=$1`, task.scopeID).Scan(&body); err != nil {
+			return RerunResult{}, err
+		}
 		var template orchestration.Execution
-		if err = json.Unmarshal([]byte(task.spec), &template); err != nil {
+		if err = json.Unmarshal([]byte(body), &template); err != nil {
 			return RerunResult{}, err
 		}
 		if template.Gang != nil || !template.Checkpointable {
