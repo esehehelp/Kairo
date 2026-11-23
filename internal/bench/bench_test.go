@@ -252,6 +252,9 @@ func short(c *Config) { c.Seconds, c.Interval = 0.2, 0.05 }
 func TestCPUComputeRecordsWork(t *testing.T) {
 	cfg := mustDefaults(t, "cpu-compute")
 	short(&cfg)
+	// long enough for three intervals on a slow shared runner, whose chunks
+	// can take longer than an interval (GitHub's Windows runner made 2 in 0.2 s)
+	cfg.Seconds = 0.6
 	cfg.Threads = 2
 	out, err := run(t, cfg)
 	if err != nil {
