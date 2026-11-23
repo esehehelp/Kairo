@@ -242,7 +242,8 @@ func (e *Local) containerCommand(launch *store.Launch) (*exec.Cmd, error) {
 }
 
 // translatePaths rewrites the values of env that are a node path in paths,
-// or under one, to the path in the container (the longest match first).
+// or under one, to the path in the container (the longest match first;
+// node paths are a Linux node's).
 func translatePaths(env []string, paths map[string]string) []string {
 	nodes := make([]string, 0, len(paths))
 	for p := range paths {
@@ -258,13 +259,8 @@ func translatePaths(env []string, paths map[string]string) []string {
 				out[i] = name + "=" + paths[node]
 				break
 			}
-			for _, sep := range []string{"/", string(filepath.Separator)} {
-				if rest, ok := strings.CutPrefix(value, strings.TrimSuffix(node, sep)+sep); ok {
-					out[i] = name + "=" + paths[node] + "/" + filepath.ToSlash(rest)
-					break
-				}
-			}
-			if out[i] != kv {
+			if rest, ok := strings.CutPrefix(value, strings.TrimSuffix(node, "/")+"/"); ok {
+				out[i] = name + "=" + paths[node] + "/" + rest
 				break
 			}
 		}

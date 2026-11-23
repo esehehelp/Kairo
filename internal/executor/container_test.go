@@ -17,14 +17,14 @@ func TestTranslatePaths(t *testing.T) {
 		"/srv/store/scratch/att_1":       "/kairo/scratch",
 		"/srv/store/outputs/exe_1":       "/kairo/output",
 		"/srv/store/outputs/exe_1-inner": "/kairo/inputs/inner",
-		`D:\store\cache\p`:               "/kairo/cache",
+		"/srv/store/cache/p":             "/kairo/cache",
 	}
 	got := translatePaths([]string{
 		"KAIRO_SCRATCH=/srv/store/scratch/att_1",
 		"KAIRO_CONTINUATION_REF=/srv/store/outputs/exe_1/ckpt/step_10.pt",
 		"KAIRO_INPUT_INNER=/srv/store/outputs/exe_1-inner",
-		`KAIRO_CACHE_DIR=D:\store\cache\p`,
-		`X=D:\store\cache\p\torch`,
+		"KAIRO_CACHE_DIR=/srv/store/cache/p/",
+		"X=/srv/store/cache/p/torch",
 		"OTHER=/srv/store/outputs/exe_10",
 		"PLAIN=value",
 	}, paths)
@@ -32,7 +32,7 @@ func TestTranslatePaths(t *testing.T) {
 		"KAIRO_SCRATCH=/kairo/scratch",
 		"KAIRO_CONTINUATION_REF=/kairo/output/ckpt/step_10.pt",
 		"KAIRO_INPUT_INNER=/kairo/inputs/inner",
-		"KAIRO_CACHE_DIR=/kairo/cache",
+		"KAIRO_CACHE_DIR=/kairo/cache/",
 		"X=/kairo/cache/torch",
 		"OTHER=/srv/store/outputs/exe_10",
 		"PLAIN=value",
