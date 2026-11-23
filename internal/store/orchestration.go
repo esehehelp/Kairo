@@ -196,8 +196,17 @@ func applyProjectTx(ctx context.Context, tx *sql.Tx, spec orchestration.Validate
 			}
 			snapshot = id
 		}
+		// bound to the digest this apply resolved its image to, for good
+		var image any
+		if name := task.Execution.Image; name != "" {
+			pin := spec.Manifest.ImagePins[name]
+			if pin == "" {
+				return ApplyResult{}, fmt.Errorf("task %q runs in image %q, of which this apply sent no digest (apply with a kairo that resolves them)", task.Name, name)
+			}
+			image = pin
+		}
 		stamp := now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_tasks(task_scope_id,project_scope_id,name,queue_name,policy_id,policy_version,spec_digest,spec_json,execution_template_json,state,created_at,updated_at,source_snapshot_id) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,'pending',$9,$10,$11)`, scopes.Task.ID, projectScope.ID, task.Name, task.Queue, "RunToCompletion", spec.TaskDigests[task.Name], string(taskBody), string(executionBody), stamp, stamp, snapshot); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO orchestration_tasks(task_scope_id,project_scope_id,name,queue_name,policy_id,policy_version,spec_digest,spec_json,execution_template_json,state,created_at,updated_at,source_snapshot_id,image_ref) VALUES($1,$2,$3,$4,$5,1,$6,$7,$8,'pending',$9,$10,$11,$12)`, scopes.Task.ID, projectScope.ID, task.Name, task.Queue, "RunToCompletion", spec.TaskDigests[task.Name], string(taskBody), string(executionBody), stamp, stamp, snapshot, image); err != nil {
 			return ApplyResult{}, err
 		}
 		applied.Created = append(applied.Created, task.Name)
@@ -541,6 +550,9 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 		return plannedOrchestrationDecision{}, err
 	}
 	if spec.SourceSnapshot, err = taskSourceTx(ctx, tx, task.taskScopeID); err != nil {
+		return plannedOrchestrationDecision{}, err
+	}
+	if spec.Image, err = taskImageTx(ctx, tx, task.taskScopeID); err != nil {
 		return plannedOrchestrationDecision{}, err
 	}
 	// a rerun in another snapshot of the task's source (kairo task rerun

@@ -143,6 +143,9 @@ type Local struct {
 	inventories round
 	// sourceCleanups: unpacked code snapshots no longer used (source.go).
 	sourceCleanups round
+	// containerSweeps: instances of attempts no longer running here
+	// (container_linux.go).
+	containerSweeps round
 
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
@@ -258,6 +261,9 @@ func (e *Local) tick(ctx context.Context) error {
 	e.makeScrubs()
 	e.makeInventories()
 	e.makeSourceCleanups()
+	if e.runsContainers() {
+		e.startRound(&e.containerSweeps, containerSweepInterval, containerSweepTimeout, e.sweepContainers)
+	}
 	e.endStep()
 	for {
 		reservation, err := e.reserveNext(ctx)
@@ -836,24 +842,11 @@ func hasEnv(env []string, name string) bool {
 // wsl.exe joins the arguments into a line for the default shell, which expands
 // $VAR and re-splits quoted words.
 func (e *Local) command(launch *store.Launch) *exec.Cmd {
-	launchEnv := e.launchEnv(launch)
-	// own is what the attempt is given on top of the parent's environment:
-	// the declared env in name order without the names Kairo sets, then
-	// Kairo's; given holds its names.
+	own := e.attemptEnv(launch)
 	given := map[string]bool{}
-	for _, kv := range launchEnv {
-		given[envKey(envName(kv))] = true
-	}
-	own := make([]string, 0, len(launch.Env)+len(launchEnv))
-	for _, name := range envspec.Names(launch.Env) {
-		if !given[envKey(name)] {
-			own = append(own, name+"="+launch.Env[name])
-		}
-	}
 	for _, kv := range own {
 		given[envKey(envName(kv))] = true
 	}
-	own = append(own, launchEnv...)
 	parent := make([]string, 0, len(os.Environ()))
 	wslenv := ""
 	for _, kv := range os.Environ() {
@@ -891,6 +884,26 @@ func (e *Local) command(launch *store.Launch) *exec.Cmd {
 	}
 	cmd.Env = append(parent, own...)
 	return cmd
+}
+
+// attemptEnv is what the attempt is given on top of the environment it
+// starts from (its executor's on a host, its image's in a container): the
+// declared env in name order without the names Kairo sets, then Kairo's
+// launch variables. It takes the launch's scratch, output and cache
+// directories (launchEnv): call it once per launch.
+func (e *Local) attemptEnv(launch *store.Launch) []string {
+	launchEnv := e.launchEnv(launch)
+	given := map[string]bool{}
+	for _, kv := range launchEnv {
+		given[envKey(envName(kv))] = true
+	}
+	own := make([]string, 0, len(launch.Env)+len(launchEnv))
+	for _, name := range envspec.Names(launch.Env) {
+		if !given[envKey(name)] {
+			own = append(own, name+"="+launch.Env[name])
+		}
+	}
+	return append(own, launchEnv...)
 }
 
 // openAttemptLog opens an attempt's log for its process to write, after
@@ -934,34 +947,47 @@ func (e *Local) start(launch *store.Launch) error {
 			e.mu.Unlock()
 		}
 	}()
-	cmd := e.command(launch)
-	if cmd.Err != nil {
-		return cmd.Err
-	}
-	if launch.Source != nil {
-		// run in its code snapshot, cwd relative to it (source.go)
-		dir, err := e.ensureSource(context.Background(), launch.Source)
-		if err != nil {
-			return fmt.Errorf("code snapshot %s: %w", launch.Source.ID, err)
-		}
-		cmd.Dir = filepath.Join(dir, filepath.FromSlash(launch.CWD))
-		cmd.Env = append(cmd.Env, "KAIRO_SOURCE_DIR="+dir, "KAIRO_SOURCE_ID="+launch.Source.ID)
-		// Python would write its bytecode beside the modules, into the
-		// snapshot (which is then unpacked again at the next launch): not
-		// written, unless the attempt's environment says where.
-		if !hasEnv(cmd.Env, "PYTHONDONTWRITEBYTECODE") && !hasEnv(cmd.Env, "PYTHONPYCACHEPREFIX") {
-			cmd.Env = append(cmd.Env, "PYTHONDONTWRITEBYTECODE=1")
-		}
-	}
-	e.forgetScratch(launch.Attempt.ID)
-	prepareProcessTree(cmd)
+	var cmd *exec.Cmd
 	var conf *confinement
-	if launch.Confine {
-		c, err := e.confine(cmd)
+	if launch.Image != "" || e.runsContainers() {
+		// in a container of its image, which is its confinement
+		// (container.go)
+		c, err := e.containerCommand(launch)
 		if err != nil {
 			return err
 		}
-		conf = c
+		cmd = c
+		e.forgetScratch(launch.Attempt.ID)
+		prepareProcessTree(cmd)
+	} else {
+		cmd = e.command(launch)
+		if cmd.Err != nil {
+			return cmd.Err
+		}
+		if launch.Source != nil {
+			// run in its code snapshot, cwd relative to it (source.go)
+			dir, err := e.ensureSource(context.Background(), launch.Source)
+			if err != nil {
+				return fmt.Errorf("code snapshot %s: %w", launch.Source.ID, err)
+			}
+			cmd.Dir = filepath.Join(dir, filepath.FromSlash(launch.CWD))
+			cmd.Env = append(cmd.Env, "KAIRO_SOURCE_DIR="+dir, "KAIRO_SOURCE_ID="+launch.Source.ID)
+			// Python would write its bytecode beside the modules, into the
+			// snapshot (which is then unpacked again at the next launch): not
+			// written, unless the attempt's environment says where.
+			if !hasEnv(cmd.Env, "PYTHONDONTWRITEBYTECODE") && !hasEnv(cmd.Env, "PYTHONPYCACHEPREFIX") {
+				cmd.Env = append(cmd.Env, "PYTHONDONTWRITEBYTECODE=1")
+			}
+		}
+		e.forgetScratch(launch.Attempt.ID)
+		prepareProcessTree(cmd)
+		if launch.Confine {
+			c, err := e.confine(cmd)
+			if err != nil {
+				return err
+			}
+			conf = c
+		}
 	}
 	id := launch.Attempt.ID
 	job := ""
@@ -1096,6 +1122,10 @@ func (e *Local) finishAttempt(r AttemptRecord, exit int, closeLogs func()) {
 		time.Sleep(delay)
 	}
 	forgetRecord(e.LogDir, r.AttemptID)
+	if e.runsContainers() {
+		// what its container was made from (its spec holds its token)
+		_ = os.RemoveAll(e.containerDir(r.AttemptID))
+	}
 	e.mu.Lock()
 	delete(e.running, r.AttemptID)
 	delete(e.outputRuns, r.AttemptID)

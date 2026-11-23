@@ -44,6 +44,9 @@ func renderTask(w io.Writer, project string, t *taskDetail, now time.Time) {
 		if len(e.Executor.Labels) > 0 {
 			line("executor", "%s", keyValues(e.Executor.Labels))
 		}
+		if e.Image != "" {
+			line("image", "%s  %s", e.Image, t.Image)
+		}
 		if r := resourceSummary(e); r != "" {
 			line("resources", "%s", r)
 		}

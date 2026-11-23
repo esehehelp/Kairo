@@ -14,6 +14,7 @@ import (
 	"kairo/internal/datainput"
 	"kairo/internal/envspec"
 	"kairo/internal/id"
+	"kairo/internal/imageref"
 	"kairo/internal/instant"
 )
 
@@ -47,6 +48,21 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 	var selector map[string]any
 	if !json.Valid(spec.ExecutorSelector) || json.Unmarshal(spec.ExecutorSelector, &selector) != nil || selector == nil {
 		return ExecutionSpec{}, nil, "", errors.New("executor selector must be a JSON object")
+	}
+	// An execution in an image runs on an executor that runs containers,
+	// and only it does (selectorMatches): the selector says which, from the
+	// image, never from the caller.
+	delete(selector, "container")
+	if spec.Image = strings.TrimSpace(spec.Image); spec.Image != "" {
+		ref, err := imageref.ParsePinned(spec.Image)
+		if err != nil {
+			return ExecutionSpec{}, nil, "", err
+		}
+		if spec.Gang != nil {
+			return ExecutionSpec{}, nil, "", errors.New("image is for a single execution, not a gang (yet)")
+		}
+		spec.Image = ref.Pinned()
+		selector["container"] = true
 	}
 	canonicalSelector, err := json.Marshal(selector)
 	if err != nil {
@@ -119,7 +135,8 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		Store                string            `json:",omitempty"`
 		Regenerable          bool              `json:",omitempty"`
 		SourceSnapshot       string            `json:",omitempty"`
-	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy, spec.Inputs, spec.Confine, spec.Store, spec.Regenerable, spec.SourceSnapshot}
+		Image                string            `json:",omitempty"`
+	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy, spec.Inputs, spec.Confine, spec.Store, spec.Regenerable, spec.SourceSnapshot, spec.Image}
 	normalized, err := json.Marshal(digestValue)
 	if err != nil {
 		return ExecutionSpec{}, nil, "", err
@@ -381,7 +398,7 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 			}
 		}
 		executionID, stamp := id.New("exe"), now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir,not_before,start_by,finish_by,inputs_json,confine,store_id,regenerable,source_snapshot_id) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir, nullable(spec.NotBefore), nullable(spec.StartBy), nullable(spec.FinishBy), inputs, spec.Confine, nullable(spec.Store), spec.Regenerable, nullable(spec.SourceSnapshot)); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir,not_before,start_by,finish_by,inputs_json,confine,store_id,regenerable,source_snapshot_id,image_ref) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir, nullable(spec.NotBefore), nullable(spec.StartBy), nullable(spec.FinishBy), inputs, spec.Confine, nullable(spec.Store), spec.Regenerable, nullable(spec.SourceSnapshot), nullable(spec.Image)); err != nil {
 			return "", err
 		}
 		if err = insertExecutionResourcesTx(ctx, tx, executionID, spec); err != nil {

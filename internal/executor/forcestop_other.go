@@ -26,11 +26,12 @@ func attachTree(*exec.Cmd, string) (*treeHandle, error) { return nil, nil }
 func (h *treeHandle) close() {}
 
 // RunHelper runs a helper subcommand of this binary when args name one (an
-// attempt's shim, shim.go; the confining launcher, confine_linux.go) and
-// does not return then.
+// attempt's shim, shim.go; the confining launcher, confine_linux.go; a
+// container's runner and init, container_linux.go) and does not return then.
 func RunHelper(args []string) {
 	runShim(args)
 	runConfineHelper(args)
+	runContainerHelpers(args)
 }
 
 // stopTreeGracefully sends SIGTERM to the launcher's process group and to every
