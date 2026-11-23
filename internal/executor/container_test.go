@@ -80,3 +80,17 @@ func TestContainerLaunchesAreRefusedElsewhere(t *testing.T) {
 		t.Fatalf("instance %q", got)
 	}
 }
+
+// The OCI remote of a registry is found by its address, as Incus 7 lists
+// it (Addrs) and as Incus 6 did (Addr), the first by name.
+func TestFindOCIRemote(t *testing.T) {
+	list := `{"images":{"Addrs":["https://images.linuxcontainers.org"],"Protocol":"simplestreams"},
+		"kairo-docker-io":{"Addrs":["https://docker.io"],"Protocol":"oci"},
+		"docker":{"Addrs":["https://docker.io/"],"Protocol":"oci"},
+		"old":{"Addr":"https://ghcr.io","Protocol":"oci"}}`
+	for addr, want := range map[string]string{"https://docker.io": "docker", "https://ghcr.io": "old", "https://quay.io": ""} {
+		if got, err := findOCIRemote([]byte(list), addr); err != nil || got != want {
+			t.Errorf("findOCIRemote(%s) = %q, %v; want %q", addr, got, err, want)
+		}
+	}
+}

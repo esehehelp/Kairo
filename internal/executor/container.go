@@ -322,3 +322,34 @@ func replaceEnv(env []string, name, value string) []string {
 	}
 	return append(env, name+"="+value)
 }
+
+// findOCIRemote is the first (by name) OCI remote at addr in what `incus
+// remote list --format json` printed ("" when there is none): its address
+// is Addrs in Incus 7, Addr before.
+func findOCIRemote(list []byte, addr string) (string, error) {
+	var remotes map[string]struct {
+		Addr     string   `json:"Addr"`
+		Addrs    []string `json:"Addrs"`
+		Protocol string   `json:"Protocol"`
+	}
+	if err := json.Unmarshal(list, &remotes); err != nil {
+		return "", fmt.Errorf("incus remote list: %w", err)
+	}
+	names := make([]string, 0, len(remotes))
+	for name := range remotes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		r := remotes[name]
+		if r.Protocol != "oci" {
+			continue
+		}
+		for _, a := range append(r.Addrs, r.Addr) {
+			if a != "" && strings.TrimSuffix(a, "/") == addr {
+				return name, nil
+			}
+		}
+	}
+	return "", nil
+}
