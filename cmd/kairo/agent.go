@@ -89,13 +89,15 @@ func agentCommand(args []string) error {
 	}
 	executors := make([]store.Executor, 0, len(cfg.Executors))
 	for _, e := range cfg.Executors {
-		labels := e.Labels
+		labels, err := e.Attributes()
+		if err != nil {
+			return err
+		}
 		// Executors outside a WSL distro advertise this agent's pack server:
 		// other agents fetch from it the packs they make.
 		if cfg.Packs.Addr != "" && e.Kind != "wsl2" && e.Labels["environment"] != "wsl2" {
-			labels = map[string]string{"pack_addr": cfg.Packs.Addr}
-			for k, v := range e.Labels {
-				labels[k] = v
+			if _, ok := labels["pack_addr"]; !ok {
+				labels["pack_addr"] = cfg.Packs.Addr
 			}
 		}
 		attrs, _ := json.Marshal(labels)

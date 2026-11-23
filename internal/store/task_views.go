@@ -265,6 +265,8 @@ type TaskDetail struct {
 	Dependents   []TaskRef             `json:"dependents"`
 	Executions   []TaskExecutionDetail `json:"executions"`
 	Gates        []TaskGate            `json:"gates"`
+	// Image is the image the task is bound to, pinned by digest (images.go).
+	Image string `json:"image,omitempty"`
 }
 
 type TaskRef struct {
@@ -356,6 +358,9 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 		return TaskDetail{}, ErrNotFound
 	}
 	detail := TaskDetail{TaskStatus: tasks[0], Spec: json.RawMessage(task.spec), Executions: []TaskExecutionDetail{}, Gates: []TaskGate{}}
+	if detail.Image, err = taskImageTx(ctx, s.db, task.scopeID); err != nil {
+		return TaskDetail{}, err
+	}
 	if detail.Dependencies, err = s.taskRefs(ctx, `SELECT t.name,t.state FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.dependency_task_scope_id WHERE d.task_scope_id=$1 ORDER BY t.name`, task.scopeID); err != nil {
 		return TaskDetail{}, err
 	}

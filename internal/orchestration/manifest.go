@@ -16,6 +16,7 @@ import (
 
 	"kairo/internal/datainput"
 	"kairo/internal/envspec"
+	"kairo/internal/imageref"
 	"kairo/internal/instant"
 )
 
@@ -36,11 +37,26 @@ type Manifest struct {
 	// source), snapshotted at apply. Absent from the JSON when none, so
 	// existing digests do not change.
 	Sources map[string]Source `toml:"sources" json:"sources,omitempty"`
-	Tasks   []Task            `toml:"tasks" json:"tasks"`
+	// Images are [images.NAME]: the container image a task runs in (its
+	// execution's image), pinned to a digest at apply. Absent from the JSON
+	// when none, so existing digests do not change.
+	Images map[string]Image `toml:"images" json:"images,omitempty"`
+	Tasks  []Task           `toml:"tasks" json:"tasks"`
 	// Snapshots are the code snapshot each source was made into by the
 	// apply that sends them (kairo project apply makes them; not written in
 	// the file, not part of the digest).
 	Snapshots map[string]string `toml:"-" json:"snapshots,omitempty"`
+	// ImagePins are the digest each image's reference named when the apply
+	// that sends them resolved it (registry/repository@sha256:...; kairo
+	// project apply resolves them; not written in the file, not part of the
+	// digest).
+	ImagePins map[string]string `toml:"-" json:"image_pins,omitempty"`
+}
+
+// Image is [images.NAME]: an OCI image reference (a tag, resolved to its
+// digest at apply, or a digest).
+type Image struct {
+	Ref string `toml:"ref" json:"ref"`
 }
 
 // Source is [sources.NAME]: the files of Paths (relative to Root, a
@@ -124,6 +140,11 @@ type Execution struct {
 	// cwd relative to it (store/sources.go). Absent from the JSON when
 	// empty.
 	Source string `toml:"source" json:"source,omitempty"`
+	// Image names the project's [images.NAME] the task runs in: its attempts
+	// run in a container of the image its reference named when the task was
+	// declared, on an executor that runs containers (executor/container.go).
+	// Absent from the JSON when empty.
+	Image string `toml:"image" json:"image,omitempty"`
 	// ContinueAfterLoss: when an attempt of the task is lost (its node lost
 	// power, its agent went away) the task goes on from its latest published
 	// checkpoint, on the node that published it, once nothing of the lost
@@ -283,9 +304,45 @@ func Normalize(manifest Manifest) (Validated, error) {
 			return Validated{}, fmt.Errorf("snapshot %q of source %q is not a snapshot id", id, name)
 		}
 	}
+	for name, img := range manifest.Images {
+		if !sourceName.MatchString(name) {
+			return Validated{}, fmt.Errorf("image name %q: letters, digits, '.', '_' and '-' only", name)
+		}
+		ref, err := imageref.Parse(img.Ref)
+		if err != nil {
+			return Validated{}, fmt.Errorf("image %q: %w", name, err)
+		}
+		manifest.Images[name] = Image{Ref: ref.String()}
+	}
+	for name, pin := range manifest.ImagePins {
+		img, ok := manifest.Images[name]
+		if !ok {
+			return Validated{}, fmt.Errorf("pin of %q, which is no [images.%s]", name, name)
+		}
+		pinned, err := imageref.ParsePinned(pin)
+		if err != nil {
+			return Validated{}, fmt.Errorf("pin of image %q: %w", name, err)
+		}
+		declared, _ := imageref.Parse(img.Ref)
+		if !imageref.SameRepository(declared, pinned) || declared.Digest != "" && declared.Digest != pinned.Digest {
+			return Validated{}, fmt.Errorf("pin %s of image %q is not of %s", pin, name, img.Ref)
+		}
+		manifest.ImagePins[name] = pinned.Pinned()
+	}
 	taskNames := map[string]struct{}{}
 	for i := range manifest.Tasks {
 		task := &manifest.Tasks[i]
+		if task.Execution.Image != "" {
+			if _, ok := manifest.Images[task.Execution.Image]; !ok {
+				return Validated{}, fmt.Errorf("task %q runs in image %q, which is no [images.%s]", task.Name, task.Execution.Image, task.Execution.Image)
+			}
+			if task.Execution.Gang != nil {
+				return Validated{}, fmt.Errorf("task %q: a gang does not run in an image yet", task.Name)
+			}
+			if task.Execution.Source == "" && !path.IsAbs(strings.TrimSpace(task.Execution.CWD)) {
+				return Validated{}, fmt.Errorf("task %q runs in image %q without a source: its cwd %q must be an absolute path in the image", task.Name, task.Execution.Image, task.Execution.CWD)
+			}
+		}
 		if task.Execution.Source != "" {
 			if _, ok := manifest.Sources[task.Execution.Source]; !ok {
 				return Validated{}, fmt.Errorf("task %q runs in source %q, which is no [sources.%s]", task.Name, task.Execution.Source, task.Execution.Source)
@@ -362,12 +419,13 @@ func Normalize(manifest Manifest) (Validated, error) {
 		}
 		taskDigests[task.Name] = digest(body)
 	}
-	// The snapshots an apply sends are not the declaration: the same file
-	// applied again with other code has the same digest.
-	snapshots := manifest.Snapshots
-	manifest.Snapshots = nil
+	// The snapshots and image pins an apply sends are not the declaration:
+	// the same file applied again with other code, or once a tag names
+	// another image, has the same digest.
+	snapshots, pins := manifest.Snapshots, manifest.ImagePins
+	manifest.Snapshots, manifest.ImagePins = nil, nil
 	normalized, err := json.Marshal(manifest)
-	manifest.Snapshots = snapshots
+	manifest.Snapshots, manifest.ImagePins = snapshots, pins
 	if err != nil {
 		return Validated{}, err
 	}

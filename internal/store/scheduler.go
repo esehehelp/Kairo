@@ -68,6 +68,9 @@ type Launch struct {
 	// Source: the code snapshot the attempt runs in (sources.go), CWD
 	// relative to it.
 	Source *LaunchSource `json:"source,omitempty"`
+	// Image: the container image the attempt runs in, pinned by digest
+	// (images.go); "" for one that runs on its executor's host.
+	Image string `json:"image,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -290,19 +293,31 @@ func writeReservationTx(ctx context.Context, tx *sql.Tx, executorID string, cand
 	return &Reservation{Lease: lease, Execution: candidate.execution, Argv: candidate.execution.Argv, CWD: candidate.execution.CWD, Resources: resources, GateGenerations: gateGenerations}, nil
 }
 
+// ContainerRuntimeAttribute is the executor attribute naming the container
+// runtime it runs attempts in ("incus"); an executor without it runs them
+// on its host.
+const ContainerRuntimeAttribute = "runtime"
+
 // selectorMatches reports whether an executor of node nodeID with the
-// attributes executorJSON matches an executor selector: its labels and, when
-// it names one, its node.
+// attributes executorJSON matches an executor selector: its labels, when it
+// names one its node, and whether it runs containers (the selector's
+// "container", set for an execution in an image: such an execution runs
+// only on an executor with a container runtime, and nothing else does).
 func selectorMatches(selectorJSON, nodeID, executorJSON string) bool {
 	var selector struct {
-		Labels map[string]string `json:"labels"`
-		Node   string            `json:"node"`
+		Labels    map[string]string `json:"labels"`
+		Node      string            `json:"node"`
+		Container bool              `json:"container"`
 	}
 	var attributes map[string]any
 	if json.Unmarshal([]byte(selectorJSON), &selector) != nil || json.Unmarshal([]byte(executorJSON), &attributes) != nil {
 		return false
 	}
 	if selector.Node != "" && selector.Node != nodeID {
+		return false
+	}
+	runtime, _ := attributes[ContainerRuntimeAttribute].(string)
+	if selector.Container != (runtime != "") {
 		return false
 	}
 	for key, want := range selector.Labels {
@@ -681,6 +696,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		if launch.Source, err = launchSourceTx(ctx, tx, executionID); err != nil {
 			return nil, err
 		}
+		if launch.Image, err = launchImageTx(ctx, tx, executionID); err != nil {
+			return nil, err
+		}
 		return launch, tx.Commit()
 	}
 	if leaseState != "prepared" || executionState != "waiting" {
@@ -749,6 +767,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err != nil {
 		return nil, err
 	}
+	image, err := launchImageTx(ctx, tx, executionID)
+	if err != nil {
+		return nil, err
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -774,6 +796,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		Confine:              confine || s.confinesAll(time.Now()),
 		Store:                storeID.String,
 		Source:               source,
+		Image:                image,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp

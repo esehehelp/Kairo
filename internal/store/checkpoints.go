@@ -34,14 +34,21 @@ func (s *Store) ProtectCheckpoint(ctx context.Context, attemptID, ref string) (s
 		return "", nil
 	}
 	var node, project, task string
-	err := s.db.QueryRowContext(ctx, `SELECT x.node_id,p.external_key,COALESCE(t.name,e.id) FROM attempts a JOIN executors x ON x.id=a.executor_id
+	var image sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT x.node_id,p.external_key,COALESCE(t.name,e.id),e.image_ref FROM attempts a JOIN executors x ON x.id=a.executor_id
 		JOIN execution_requests e ON e.id=a.execution_id JOIN coordination_scopes p ON p.id=e.project_scope_id
-		LEFT JOIN orchestration_tasks t ON t.task_scope_id=e.task_scope_id WHERE a.id=$1`, attemptID).Scan(&node, &project, &task)
+		LEFT JOIN orchestration_tasks t ON t.task_scope_id=e.task_scope_id WHERE a.id=$1`, attemptID).Scan(&node, &project, &task, &image)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", fmt.Errorf("%w: attempt %s", ErrNotFound, attemptID)
 	}
 	if err != nil {
 		return "", err
+	}
+	// An attempt in a container names its own paths (/kairo/output/...),
+	// not the node's: what it writes is in its run's output directory, kept
+	// by the run's snapshots (runsnapshots.go), ordered once it is published.
+	if image.Valid {
+		return "", nil
 	}
 	// once a path: a repeated acknowledgement imports nothing again
 	var existing string

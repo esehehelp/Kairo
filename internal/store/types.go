@@ -111,6 +111,12 @@ type ExecutionSpec struct {
 	// SourceSnapshot: the code snapshot (sources.go) the execution runs in,
 	// cwd relative to it.
 	SourceSnapshot string `json:"source_snapshot,omitempty"`
+	// Image: the container image the execution runs in, an OCI reference
+	// pinned by digest (registry/repository@sha256:...); only an executor
+	// that runs containers takes it, and such an executor takes nothing
+	// else (the executor selector's "container", set from it). Left out of
+	// the digest when empty.
+	Image string `json:"image,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the

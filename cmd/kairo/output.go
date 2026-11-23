@@ -104,6 +104,7 @@ type taskDetail struct {
 	Dependencies []store.TaskRef     `json:"dependencies"`
 	Dependents   []store.TaskRef     `json:"dependents"`
 	Gates        []store.TaskGate    `json:"gates"`
+	Image        string              `json:"image"`
 }
 
 // taskResult is the part of a task's result the CLI shows.

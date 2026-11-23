@@ -1,0 +1,547 @@
+//go:build linux
+
+package executor
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"debug/elf"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"kairo/internal/imageref"
+)
+
+// runContainerHelpers runs a container's runner or init (container.go) when
+// args name one, and never returns then.
+func runContainerHelpers(args []string) {
+	if len(args) < 3 {
+		return
+	}
+	switch args[1] {
+	case containerRunArg:
+		os.Exit(containerRun(args[2]))
+	case containerInitArg:
+		os.Exit(containerInit(args[2]))
+	}
+}
+
+func readContainerSpec(p string) (containerSpec, error) {
+	var spec containerSpec
+	body, err := os.ReadFile(p)
+	if err != nil {
+		return spec, err
+	}
+	if err := json.Unmarshal(body, &spec); err != nil {
+		return spec, fmt.Errorf("%s: %w", p, err)
+	}
+	if spec.Instance == "" || len(spec.Argv) == 0 {
+		return spec, fmt.Errorf("%s: no instance or argv", p)
+	}
+	return spec, nil
+}
+
+// incusCommand runs the incus client with stdin (nil: none) and returns
+// what it printed; a failure says what it printed on stderr.
+var incusCommand = func(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "incus", args...)
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+	}
+	var out, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil {
+		return out.Bytes(), fmt.Errorf("incus %s: %w: %s", strings.Join(args[:min(2, len(args))], " "), err, strings.TrimSpace(stderr.String()))
+	}
+	return out.Bytes(), nil
+}
+
+// incusNotFound reports whether a failed incus call failed for want of
+// the instance.
+func incusNotFound(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), "not found")
+}
+
+// containerRun is the runner: it makes the attempt's instance, starts it,
+// passes on the signals it is sent, waits for it to stop and exits with the
+// exit the container wrote (-1 when it wrote none: killed). It deletes the
+// instance (whatever the container wrote outside what Kairo handed it goes
+// with it) and its spec, which holds the attempt's token.
+func containerRun(specPath string) int {
+	logf := func(format string, a ...any) {
+		// the container appends to the same log: write at its end
+		_, _ = os.Stderr.Seek(0, io.SeekEnd)
+		fmt.Fprintf(os.Stderr, "kairo container: "+format+"\n", a...)
+	}
+	spec, err := readContainerSpec(specPath)
+	if err != nil {
+		logf("%v", err)
+		return shimNotStarted
+	}
+	if os.Getenv("HOME") == "" {
+		// incus keeps its remotes under HOME; a service may have none
+		_ = os.Setenv("HOME", "/root")
+	}
+	sigs := make(chan os.Signal, 8)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	exit, err := runInstance(context.Background(), spec, sigs, logf)
+	if err != nil {
+		logf("%v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	if _, err := incusCommand(ctx, nil, "delete", "--force", spec.Instance); err != nil && !incusNotFound(err) {
+		logf("instance %s not deleted: %v", spec.Instance, err)
+	}
+	_ = os.Remove(specPath)
+	return exit
+}
+
+// runInstance makes, starts and waits for the attempt's instance.
+func runInstance(ctx context.Context, spec containerSpec, sigs <-chan os.Signal, logf func(string, ...any)) (int, error) {
+	ref, err := imageref.ParsePinned(spec.Image)
+	if err != nil {
+		return shimNotStarted, err
+	}
+	remote, err := ociRemote(ctx, ref.Registry)
+	if err != nil {
+		return shimNotStarted, err
+	}
+	devices := map[string]map[string]string{}
+	for i, m := range spec.Mounts {
+		devices[fmt.Sprintf("kairo-%d", i)] = map[string]string{"type": "disk", "source": m.Source, "path": m.Path, "readonly": strconv.FormatBool(m.ReadOnly)}
+	}
+	if len(spec.GPUs) > 0 {
+		gpus, driver, err := gpuDevices(spec.GPUs, spec.DriverRoot)
+		if err != nil {
+			return shimNotStarted, err
+		}
+		for name, d := range gpus {
+			devices[name] = d
+		}
+		devices["kairo-nvidia"] = map[string]string{"type": "disk", "source": driver, "path": containerNVIDIA, "readonly": "true"}
+	}
+	body, err := json.Marshal(map[string]any{
+		"config": map[string]string{
+			// nested in an unprivileged container (a Proxmox LXC), the
+			// container cannot have a uid map of its own: it is the outer
+			// container's root, unprivileged on the host
+			"security.privileged":          "true",
+			"oci.entrypoint":               containerRoot + "/bin/kairo " + containerInitArg + " " + containerSpecIn,
+			"environment.KAIRO_ATTEMPT_ID": spec.AttemptID,
+			"raw.lxc":                      "lxc.mount.entry = tmpfs dev/shm tmpfs rw,nosuid,nodev,size=" + containerShm + ",create=dir 0 0",
+			"boot.autostart":               "false",
+		},
+		"devices": devices,
+	})
+	if err != nil {
+		return shimNotStarted, err
+	}
+	logf("instance %s of %s", spec.Instance, spec.Image)
+	if _, err := incusCommand(ctx, body, "init", remote+":"+ref.Repository+"@"+ref.Digest, spec.Instance, "--quiet"); err != nil {
+		return shimNotStarted, err
+	}
+	if _, err := incusCommand(ctx, nil, "start", spec.Instance); err != nil {
+		return shimNotStarted, err
+	}
+	warned := false
+	for {
+		st, err := instanceState(ctx, spec.Instance)
+		if incusNotFound(err) {
+			break
+		}
+		if err != nil && !warned {
+			logf("state of %s not read: %v", spec.Instance, err)
+			warned = true
+		}
+		if err == nil && st.Status == "Stopped" {
+			break
+		}
+		select {
+		case sig := <-sigs:
+			if s, ok := sig.(syscall.Signal); ok && st.PID > 0 {
+				_ = syscall.Kill(st.PID, s)
+			}
+		case <-time.After(time.Second):
+		}
+	}
+	code, ok := readExitFile(filepath.Join(spec.RunDir, "exit"))
+	if !ok {
+		logf("the container stopped without writing its exit")
+		return -1, nil
+	}
+	return code, nil
+}
+
+type incusState struct {
+	Status string `json:"status"`
+	PID    int    `json:"pid"`
+}
+
+func instanceState(ctx context.Context, instance string) (incusState, error) {
+	var st incusState
+	out, err := incusCommand(ctx, nil, "query", "/1.0/instances/"+instance+"/state")
+	if err != nil {
+		return st, err
+	}
+	return st, json.Unmarshal(out, &st)
+}
+
+// ociRemote is the incus remote of an OCI registry, added when there is
+// none.
+func ociRemote(ctx context.Context, registry string) (string, error) {
+	want := "https://" + registry
+	find := func() (string, error) {
+		out, err := incusCommand(ctx, nil, "remote", "list", "--format", "json")
+		if err != nil {
+			return "", err
+		}
+		var remotes map[string]struct {
+			Addr     string `json:"Addr"`
+			Protocol string `json:"Protocol"`
+		}
+		if err := json.Unmarshal(out, &remotes); err != nil {
+			return "", fmt.Errorf("incus remote list: %w", err)
+		}
+		for name, r := range remotes {
+			if r.Protocol == "oci" && strings.TrimSuffix(r.Addr, "/") == want {
+				return name, nil
+			}
+		}
+		return "", nil
+	}
+	if name, err := find(); err != nil || name != "" {
+		return name, err
+	}
+	name := "kairo-" + strings.NewReplacer(".", "-", ":", "-").Replace(registry)
+	if _, err := incusCommand(ctx, nil, "remote", "add", name, want, "--protocol=oci"); err != nil {
+		// another runner may have added it meanwhile
+		if found, ferr := find(); ferr == nil && found != "" {
+			return found, nil
+		}
+		return "", err
+	}
+	return name, nil
+}
+
+// gpuDevices are the devices of the leased GPUs (by UUID) and the NVIDIA
+// control devices, and the directory of this node's driver files.
+func gpuDevices(uuids []string, driverRoot string) (map[string]map[string]string, string, error) {
+	minors, err := nvidiaMinors()
+	if err != nil {
+		return nil, "", err
+	}
+	devices := map[string]map[string]string{}
+	for i, u := range uuids {
+		minor, ok := minors[u]
+		if !ok {
+			return nil, "", fmt.Errorf("GPU %s is not on this node", u)
+		}
+		dev := "/dev/nvidia" + minor
+		devices[fmt.Sprintf("kairo-gpu-%d", i)] = map[string]string{"type": "unix-char", "source": dev, "path": dev}
+	}
+	for _, name := range []string{"nvidiactl", "nvidia-uvm", "nvidia-uvm-tools"} {
+		if _, err := os.Stat("/dev/" + name); err == nil {
+			devices["kairo-"+name] = map[string]string{"type": "unix-char", "source": "/dev/" + name, "path": "/dev/" + name}
+		}
+	}
+	dir, err := driverDir(driverRoot)
+	if err != nil {
+		return nil, "", err
+	}
+	return devices, dir, nil
+}
+
+// nvidiaMinors maps each GPU's UUID to its device minor (/dev/nvidia<minor>).
+func nvidiaMinors() (map[string]string, error) {
+	infos, _ := filepath.Glob("/proc/driver/nvidia/gpus/*/information")
+	if len(infos) == 0 {
+		return nil, errors.New("no NVIDIA GPU on this node (/proc/driver/nvidia/gpus)")
+	}
+	out := map[string]string{}
+	for _, p := range infos {
+		f, err := os.Open(p)
+		if err != nil {
+			return nil, err
+		}
+		var uuid, minor string
+		sc := bufio.NewScanner(f)
+		for sc.Scan() {
+			key, value, ok := strings.Cut(sc.Text(), ":")
+			if !ok {
+				continue
+			}
+			switch strings.TrimSpace(key) {
+			case "GPU UUID":
+				uuid = strings.TrimSpace(value)
+			case "Device Minor":
+				minor = strings.TrimSpace(value)
+			}
+		}
+		f.Close()
+		if uuid != "" && minor != "" {
+			out[uuid] = minor
+		}
+	}
+	return out, nil
+}
+
+var driverVersion = regexp.MustCompile(`Kernel Module(?:\s+for\s+\S+)?\s+([0-9]+(?:\.[0-9]+)+)`)
+
+// driverDir puts together, once per driver version, the driver's libraries
+// and programs a container with a GPU is handed (mounted read-only at
+// /kairo/nvidia: lib on LD_LIBRARY_PATH, bin on PATH), as
+// nvidia-container-cli lists them: each linked (copied across
+// filesystems), with links of their sonames.
+func driverDir(root string) (string, error) {
+	body, err := os.ReadFile("/proc/driver/nvidia/version")
+	if err != nil {
+		return "", fmt.Errorf("NVIDIA driver version: %w", err)
+	}
+	m := driverVersion.FindSubmatch(body)
+	if m == nil {
+		return "", fmt.Errorf("NVIDIA driver version not found in %q", strings.TrimSpace(string(body)))
+	}
+	dir := filepath.Join(root, string(m[1]))
+	if _, err := os.Stat(filepath.Join(dir, ".complete")); err == nil {
+		return dir, nil
+	}
+	list := func(what string) ([]string, error) {
+		out, err := exec.Command("nvidia-container-cli", "list", what).Output()
+		if err != nil {
+			return nil, fmt.Errorf("nvidia-container-cli list %s (GPU containers need libnvidia-container-tools): %w", what, err)
+		}
+		return strings.Fields(string(out)), nil
+	}
+	libs, err := list("--libraries")
+	if err != nil {
+		return "", err
+	}
+	bins, err := list("--binaries")
+	if err != nil {
+		return "", err
+	}
+	tmp := fmt.Sprintf("%s.partial-%d", dir, os.Getpid())
+	_ = os.RemoveAll(tmp)
+	for _, d := range []string{filepath.Join(tmp, "lib"), filepath.Join(tmp, "bin")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			return "", err
+		}
+	}
+	for _, lib := range libs {
+		base := filepath.Base(lib)
+		if err := linkOrCopy(lib, filepath.Join(tmp, "lib", base)); err != nil {
+			return "", err
+		}
+		soname := elfSoname(lib)
+		for _, name := range []string{soname, devName(soname)} {
+			if name == "" || name == base {
+				continue
+			}
+			if _, err := os.Lstat(filepath.Join(tmp, "lib", name)); err == nil {
+				continue
+			}
+			if err := os.Symlink(base, filepath.Join(tmp, "lib", name)); err != nil {
+				return "", err
+			}
+		}
+	}
+	for _, bin := range bins {
+		if err := linkOrCopy(bin, filepath.Join(tmp, "bin", filepath.Base(bin))); err != nil {
+			return "", err
+		}
+	}
+	if err := os.WriteFile(filepath.Join(tmp, ".complete"), []byte(string(m[1])+"\n"), 0o644); err != nil {
+		return "", err
+	}
+	if err := os.Rename(tmp, dir); err != nil {
+		_ = os.RemoveAll(tmp)
+		if _, serr := os.Stat(filepath.Join(dir, ".complete")); serr == nil {
+			return dir, nil // made meanwhile by another runner
+		}
+		return "", err
+	}
+	return dir, nil
+}
+
+// elfSoname is a shared library's DT_SONAME ("" when it has none).
+func elfSoname(p string) string {
+	f, err := elf.Open(p)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	names, err := f.DynString(elf.DT_SONAME)
+	if err != nil || len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+// devName is libfoo.so of libfoo.so.1 ("" for a name that has no version).
+func devName(soname string) string {
+	if i := strings.Index(soname, ".so."); i >= 0 {
+		return soname[:i+3]
+	}
+	return ""
+}
+
+// linkOrCopy hard-links src to dst, or copies it when they are on
+// different filesystems.
+func linkOrCopy(src, dst string) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fi.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// containerInit is the container's first process: it confines the
+// container, starts the attempt's argv in its own process group, passes the
+// signals it is sent to that group, reaps whatever ends in the container
+// and, once the argv has exited, writes its exit and exits with it (which
+// stops the container and ends whatever still runs there).
+func containerInit(specPath string) int {
+	spec, err := readContainerSpec(specPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "kairo container:", err)
+		return writeShimExit(containerExitIn, shimNotStarted)
+	}
+	if err := confineMounts(spec.Writable, spec.Tmp); err != nil {
+		fmt.Fprintln(os.Stderr, "kairo container: confine:", err)
+		return writeShimExit(containerExitIn, shimNotConfined)
+	}
+	stdout, stderr := openContainerLog(containerStdout, os.Stdout), openContainerLog(containerStderr, os.Stderr)
+	env := containerEnv(os.Environ(), spec.Env, len(spec.GPUs) > 0)
+	// argv[0] is looked up on the attempt's PATH
+	_ = os.Setenv("PATH", containerEnvValue(env, "PATH"))
+	argv0, err := exec.LookPath(spec.Argv[0])
+	if err != nil && !errors.Is(err, exec.ErrDot) {
+		fmt.Fprintln(stderr, "kairo container:", err)
+		return writeShimExit(containerExitIn, shimNotStarted)
+	}
+	cmd := &exec.Cmd{Path: argv0, Args: spec.Argv, Dir: spec.CWD, Env: env, Stdout: stdout, Stderr: stderr,
+		SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
+	sigs := make(chan os.Signal, 8)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	if err := cmd.Start(); err != nil {
+		fmt.Fprintln(stderr, "kairo container: start:", err)
+		return writeShimExit(containerExitIn, shimNotStarted)
+	}
+	pid := cmd.Process.Pid
+	go func() {
+		for sig := range sigs {
+			if s, ok := sig.(syscall.Signal); ok {
+				_ = syscall.Kill(-pid, s)
+			}
+		}
+	}()
+	return writeShimExit(containerExitIn, reapUntil(pid))
+}
+
+// reapUntil reaps the container's processes until pid exits, and returns
+// its exit (-1 when a signal ended it, as exec's ExitCode says).
+func reapUntil(pid int) int {
+	for {
+		var ws syscall.WaitStatus
+		wpid, err := syscall.Wait4(-1, &ws, 0, nil)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			return -1
+		}
+		if wpid == pid {
+			if ws.Exited() {
+				return ws.ExitStatus()
+			}
+			return -1
+		}
+	}
+}
+
+// openContainerLog opens a log mounted in the container to append to it
+// (the runner writes at its end too), else falls back to the console.
+func openContainerLog(p string, fallback *os.File) *os.File {
+	f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		fmt.Fprintf(fallback, "kairo container: %s: %v\n", p, err)
+		return fallback
+	}
+	return f
+}
+
+// The sweep of instances left behind: a runner killed (the kill of a force
+// stop, the OOM killer) deletes no instance. Every containerSweepInterval
+// the executor deletes the stopped instances of its attempts (kairo-att-...)
+// that no longer run here, and what they were made from. One still running
+// is left alone: what an exited attempt left running is ended as on a host
+// (its processes carry its KAIRO_ATTEMPT_ID), which stops it.
+const (
+	containerSweepInterval = 10 * time.Minute
+	containerSweepTimeout  = 5 * time.Minute
+)
+
+func (e *Local) sweepContainers(ctx context.Context) {
+	out, err := incusCommand(ctx, nil, "list", "--format", "json")
+	if err != nil {
+		e.roundProblem(&e.containerSweeps, "", "containers not listed", err)
+		return
+	}
+	var instances []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(out, &instances); err != nil {
+		e.roundProblem(&e.containerSweeps, "", "containers not listed", err)
+		return
+	}
+	e.roundProblem(&e.containerSweeps, "", "", nil)
+	for _, in := range instances {
+		rest, ok := strings.CutPrefix(in.Name, "kairo-att-")
+		if !ok || in.Status != "Stopped" {
+			continue
+		}
+		attempt := "att_" + rest
+		e.mu.Lock()
+		_, running := e.running[attempt]
+		e.mu.Unlock()
+		if running {
+			continue
+		}
+		if _, err := incusCommand(ctx, nil, "delete", "--force", in.Name); err != nil && !incusNotFound(err) {
+			e.roundProblem(&e.containerSweeps, in.Name, "container not deleted", err)
+			continue
+		}
+		_ = os.RemoveAll(e.containerDir(attempt))
+		e.Logger.Info("container of an attempt no longer running deleted", "instance", in.Name, "attempt_id", attempt)
+	}
+}

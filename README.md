@@ -703,6 +703,11 @@ labels may take what is placed there.
   (default `.`; an absolute cwd, or one leaving the snapshot, is refused).
   Not for a gang yet. In the task's digest only when set; the snapshot is
   not.
+- Image: `image = "NAME"` in a task's `[tasks.execution]` runs its attempts
+  in a container of the project's `[images.NAME]`, by the digest its
+  reference named when the task was declared (Containers, below), on an
+  executor that runs containers; such an executor runs nothing else. Not
+  for a gang yet. In the task's digest only when set; the digest is not.
 - Regenerable: `regenerable = true` in a task's `[tasks.execution]` says
   that what a run of it writes to its output directory can be made again by
   running the task again (a dataset built from sources kept elsewhere, say):
@@ -1191,6 +1196,118 @@ source, files, size, git state), `kairo source show ID [--files]` one with
 the tasks bound to it, and `kairo source diff A B` the files added (`+`),
 removed (`-`) and changed (`M`) from A to B (`GET /api/sources`,
 `/api/sources/<id>`).
+
+### Containers
+
+A code snapshot fixes the code a task runs; what it runs on (Python and its
+packages, system libraries) is the host's, and changes under it. A task
+can instead run in a container of an image, fixed by its digest:
+
+```toml
+[images.torch]
+ref = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"   # a tag, or name@sha256:...
+
+[[tasks]]
+name = "train-x"
+# ...
+[tasks.execution]
+image = "torch"
+source = "neo-ime"     # mounted read-only at /kairo/src; cwd relative to it
+cwd = "."
+argv = ["python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
+```
+
+A reference is read as docker reads one (no registry: Docker Hub, where a
+one-word repository is under `library/`; no tag: `latest`). `kairo project
+apply` asks each image's registry what its reference names now (the
+registry API, anonymously, with the bearer token a registry asks for to
+pull a public image) and sends the digest with the declaration
+(`image_pins`, not part of its digest, as snapshots are not); the daemon
+binds each task it declares to that digest for good
+(`orchestration_tasks.image_ref`, `registry/repository@sha256:...`): a
+later apply, after the tag was pushed again, binds only the tasks it
+declares. Each execution records the image it runs in
+(`execution_requests.image_ref`; an execution submitted through the API
+names one as `image`, pinned) and `kairo task show` prints it (`image:`). A
+task without a source runs in the image's own files and needs an absolute
+`cwd` there.
+
+Only an executor that runs containers takes an execution in an image, and
+it takes nothing else: an executor of kind `incus` registers the attribute
+`runtime = "incus"` (a label `runtime` is refused: only the kind sets it),
+and the execution's selector carries `"container": true`, set from its
+image (never from the caller). An executor of kind `incus` runs on Linux,
+beside the node's other executors if it has some:
+
+```toml
+[[executors]]
+id = "pve0-ctr"
+kind = "incus"
+labels = { environment = "linux", site = "pve0" }
+```
+
+It needs Incus 6.3 or later (OCI images; Debian 13's 6.0 LTS has none, the
+Zabbly packages do) with a storage pool and a network in its default
+profile, and, for GPUs, `nvidia-container-cli` (`libnvidia-container-tools`)
+and the driver's user-space files on the node. Inside a Proxmox LXC
+(unprivileged, `features: nesting=1,keyctl=1`) the container is privileged
+within it (`security.privileged`: the LXC has one uid map only), which keeps
+it unprivileged on the host.
+
+The attempt's launcher is still its shim, which runs the agent's binary as
+the runner (`__kairo-incus-run`): it makes the instance `kairo-<attempt
+id>` from the image (`incus init REMOTE:REPOSITORY@DIGEST`, adding an OCI
+remote for the registry the first time), starts it, passes on to its first
+process what it is sent to stop it (SIGTERM of a force stop or a
+quarantine), waits for it to stop, reads the exit the container wrote,
+deletes the instance and exits with that exit (-1 when it wrote none). An
+agent restarted meanwhile adopts the attempt as any (Agent restarts). In
+the container the same binary, mounted read-only, is the first process
+(`__kairo-container-init`): it confines the container as a confined host
+attempt is confined (everything read-only but what Kairo hands it, `/tmp` a
+directory of its scratch, `/proc` and `/dev/shm` writable; Admission,
+Confinement), starts the argv in a process group of its own with its
+directory, its output appended to the attempt's logs, passes signals on to
+that group, reaps what ends in the container and writes the argv's exit;
+its own exit stops the container and ends whatever still runs there. What
+the attempt writes outside what Kairo hands it goes with the instance.
+What Kairo hands it is mounted under `/kairo`, at the same paths on every
+node, so a continuation finds its run's files where its checkpoint names
+them:
+
+| path | what |
+|---|---|
+| `/kairo/scratch` | `KAIRO_SCRATCH`, `TMPDIR`, `TMP`, `TEMP` (its `tmp/` is `/tmp`) |
+| `/kairo/output` | `KAIRO_OUTPUT_DIR` |
+| `/kairo/cache` | `KAIRO_CACHE_DIR` |
+| `/kairo/src` | `KAIRO_SOURCE_DIR`, the code snapshot, read-only |
+| `/kairo/inputs/<name>` | `KAIRO_INPUT_<NAME>`, read-only |
+| `/kairo/nvidia` | the node's NVIDIA driver files, with a GPU, read-only |
+| `/kairo/run`, `/kairo/log`, `/kairo/bin` | the init's spec and exit, the logs, the binary |
+
+The environment is the image's, then the declared env, then Kairo's (its
+paths those above, a path under one rewritten too: a continuation's
+`KAIRO_CONTINUATION_REF`); the agent's own does not reach the container.
+`/dev/shm` is a tmpfs of up to half the memory (PyTorch's data loader
+workers share batches through it; what is written there is memory). A
+leased GPU is handed as its device (`/dev/nvidia<minor>`, found by its
+UUID) with the control devices, and the driver's libraries and programs, as
+`nvidia-container-cli list` names them, put together once per driver
+version in `<log dir>/containers/nvidia/<version>` (linked, with their
+sonames) and mounted at `/kairo/nvidia` (`lib` first on `LD_LIBRARY_PATH`,
+`bin` last on `PATH`); `CUDA_VISIBLE_DEVICES` names it by UUID as on a
+host. Device access is not fenced in a nested container (no cgroup device
+program loads there): a GPU is the attempt's because Kairo leased it, as on
+a host. The container's processes carry `KAIRO_ATTEMPT_ID` like any
+attempt's, so its GPU processes are the attempt's, its memory is sampled
+as its, and a force stop and the end of what an exited attempt left running
+reach them. A checkpoint a container publishes names a path in it
+(`/kairo/output/...`): it is not imported (Checkpoints of running work) but
+kept by the run's snapshots, which its publication orders. Every 10
+minutes the executor deletes the stopped instances of attempts no longer
+running there (a runner that was killed deleted none). Not for a gang, not
+on Windows or in WSL, and no state of a running container is kept yet:
+work goes on from its own checkpoints, as on a host.
 
 ### Data stores
 

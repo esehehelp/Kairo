@@ -148,7 +148,11 @@ func serve(args []string) error {
 	var adopted []string
 	for _, e := range daemonConfig.Executors {
 		enabled := e.Enabled == nil || *e.Enabled
-		attrs, _ := json.Marshal(e.Labels)
+		labels, err := e.Attributes()
+		if err != nil {
+			return err
+		}
+		attrs, _ := json.Marshal(labels)
 		if err := st.UpsertExecutor(context.Background(), store.Executor{ID: e.ID, NodeID: daemonConfig.Node.ID, Kind: e.Kind, Attributes: attrs, Enabled: enabled}); err != nil {
 			return err
 		}

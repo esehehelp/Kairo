@@ -3,6 +3,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"net/url"
 	"os"
@@ -299,6 +300,41 @@ type Executor struct {
 	Labels  map[string]string `toml:"labels"`
 	Enabled *bool             `toml:"enabled"`
 }
+
+// KindIncus is an executor that runs every attempt in an Incus container
+// of the attempt's image (executor/container.go), on Linux.
+const KindIncus = "incus"
+
+// Attributes are what the executor registers to be matched by executor
+// selectors: its labels, and "runtime" naming its container runtime when it
+// runs containers (store.ContainerRuntimeAttribute), which only its kind
+// sets.
+func (e Executor) Attributes() (map[string]string, error) {
+	out := make(map[string]string, len(e.Labels)+1)
+	maps.Copy(out, e.Labels)
+	if _, ok := e.Labels["runtime"]; ok {
+		return nil, fmt.Errorf("executor %s: label runtime is set by its kind, not declared", e.ID)
+	}
+	if e.Kind == KindIncus {
+		out["runtime"] = KindIncus
+	}
+	return out, nil
+}
+
+// checkExecutors refuses executors whose attributes cannot be made, or
+// that run containers on a system without Incus.
+func checkExecutors(executors []Executor) error {
+	for _, e := range executors {
+		if _, err := e.Attributes(); err != nil {
+			return err
+		}
+		if e.Kind == KindIncus && runtime.GOOS != "linux" {
+			return fmt.Errorf("executor %s: kind incus runs on Linux only", e.ID)
+		}
+	}
+	return nil
+}
+
 type Provider struct {
 	ID                    string   `toml:"id"`
 	Kind                  string   `toml:"kind"`
@@ -340,6 +376,9 @@ func Load(path string) (Config, error) {
 	// `kairo agent` instead.
 	if c.Node.ID == "" || c.Node.Name == "" {
 		return c, errors.New("node.id and node.name are required")
+	}
+	if err := checkExecutors(c.Executors); err != nil {
+		return c, err
 	}
 	return c, validateTransport(c)
 }
@@ -539,6 +578,9 @@ func LoadAgent(path string) (Agent, error) {
 	}
 	if len(a.Executors) == 0 {
 		return a, errors.New("at least one executor is required")
+	}
+	if err := checkExecutors(a.Executors); err != nil {
+		return a, err
 	}
 	return a, nil
 }

@@ -184,7 +184,12 @@ func forgetRecord(logDir, attemptID string) {
 
 // readExit returns the exit the attempt's shim wrote, if it did.
 func readExit(logDir, attemptID string) (int, bool) {
-	body, err := os.ReadFile(exitPath(logDir, attemptID))
+	return readExitFile(exitPath(logDir, attemptID))
+}
+
+// readExitFile returns the exit written to path, if one was.
+func readExitFile(path string) (int, bool) {
+	body, err := os.ReadFile(path)
 	if err != nil {
 		return 0, false
 	}
