@@ -23,16 +23,18 @@ import (
 //
 // The attempt's launcher is still its shim (shim.go), which runs this
 // binary as containerRunArg, the runner (container_linux.go): it makes the
-// instance kairo-<attempt id> from the image, starts it, passes on what it is
-// sent to stop it, waits for it to stop, reads the exit the container wrote,
-// deletes the instance and exits with that exit; so the shim, adoption,
-// force stop and quiescence are as for a host attempt. In the container
-// this binary runs as containerInitArg, its first process: it confines the
-// container as a confined host attempt is confined (confineMounts: all
-// read-only but what Kairo hands it), starts the attempt's argv with its
-// environment and directory, its output going to the attempt's logs, passes
-// signals to its process group, reaps orphans, and writes the argv's exit to
-// /kairo/run/exit before it exits, which stops the container.
+// instance kairo-<attempt id> from the image, starts it, waits for it to
+// stop, reads the exit the container wrote, deletes the instance and exits
+// with that exit; so the shim, adoption and quiescence are as for a host
+// attempt. In the container this binary runs as containerInitArg under
+// Incus's own init: it confines the container as a confined host attempt is
+// confined (confineMounts: all read-only but what Kairo hands it), starts
+// the attempt's argv with its environment and directory, its output going
+// to the attempt's logs, reaps orphans, and writes the argv's exit to
+// /kairo/run/exit before it exits, which stops the container. The argv's
+// processes carry the attempt's KAIRO_ATTEMPT_ID and neither init does: a
+// force stop reaches the argv as it reaches a host attempt's processes,
+// while the inits stay to see it end.
 //
 // What Kairo hands an attempt is mounted under /kairo, at the same paths
 // on every node, so a continuation finds its run's files where its

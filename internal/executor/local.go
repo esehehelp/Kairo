@@ -1122,11 +1122,13 @@ func (e *Local) finishAttempt(r AttemptRecord, exit int, closeLogs func()) {
 		time.Sleep(delay)
 	}
 	forgetRecord(e.LogDir, r.AttemptID)
-	if e.runsContainers() {
-		// what its container was made from (its spec holds its token)
-		_ = os.RemoveAll(e.containerDir(r.AttemptID))
-	}
 	e.mu.Lock()
+	if e.runsContainers() {
+		// what its container was made from (its spec holds its token); its
+		// instance, left by a runner that was killed, at the next sweep
+		_ = os.RemoveAll(e.containerDir(r.AttemptID))
+		e.containerSweeps.at = time.Time{}
+	}
 	delete(e.running, r.AttemptID)
 	delete(e.outputRuns, r.AttemptID)
 	e.mu.Unlock()
