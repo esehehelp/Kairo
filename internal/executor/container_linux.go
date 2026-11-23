@@ -75,10 +75,13 @@ func incusNotFound(err error) bool {
 }
 
 // containerRun is the runner: it makes the attempt's instance, starts it,
-// passes on the signals it is sent, waits for it to stop and exits with the
-// exit the container wrote (-1 when it wrote none: killed). It deletes the
-// instance (whatever the container wrote outside what Kairo handed it goes
-// with it) and its spec, which holds the attempt's token.
+// waits for it to stop and exits with the exit the container wrote (-1 when
+// it wrote none: killed). It deletes the instance (whatever the container
+// wrote outside what Kairo handed it goes with it) and its spec, which holds
+// the attempt's token. What stops an attempt (a force stop, a quarantine)
+// reaches the container's processes directly, as it reaches a host
+// attempt's: they carry its KAIRO_ATTEMPT_ID. The runner only outlives the
+// signal it is sent with them, so as to see the container stop.
 func containerRun(specPath string) int {
 	logf := func(format string, a ...any) {
 		// the container appends to the same log: write at its end
@@ -96,7 +99,11 @@ func containerRun(specPath string) int {
 	}
 	sigs := make(chan os.Signal, 8)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	exit, err := runInstance(context.Background(), spec, sigs, logf)
+	go func() {
+		for range sigs {
+		}
+	}()
+	exit, err := runInstance(context.Background(), spec, logf)
 	if err != nil {
 		logf("%v", err)
 	}
@@ -110,7 +117,7 @@ func containerRun(specPath string) int {
 }
 
 // runInstance makes, starts and waits for the attempt's instance.
-func runInstance(ctx context.Context, spec containerSpec, sigs <-chan os.Signal, logf func(string, ...any)) (int, error) {
+func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...any)) (int, error) {
 	ref, err := imageref.ParsePinned(spec.Image)
 	if err != nil {
 		return shimNotStarted, err
@@ -138,11 +145,15 @@ func runInstance(ctx context.Context, spec containerSpec, sigs <-chan os.Signal,
 			// nested in an unprivileged container (a Proxmox LXC), the
 			// container cannot have a uid map of its own: it is the outer
 			// container's root, unprivileged on the host
-			"security.privileged":          "true",
-			"oci.entrypoint":               containerRoot + "/bin/kairo " + containerInitArg + " " + containerSpecIn,
-			"environment.KAIRO_ATTEMPT_ID": spec.AttemptID,
-			"raw.lxc":                      "lxc.mount.entry = tmpfs dev/shm tmpfs rw,nosuid,nodev,size=" + containerShm + ",create=dir 0 0",
-			"boot.autostart":               "false",
+			"security.privileged": "true",
+			// Incus's own init is the container's first process and runs
+			// this one: neither carries the attempt's KAIRO_ATTEMPT_ID (only
+			// the argv's environment does), so a stop sent to the attempt's
+			// processes reaches the argv and not them (Incus's init would end
+			// the container before the exit is written)
+			"oci.entrypoint": containerRoot + "/bin/kairo " + containerInitArg + " " + containerSpecIn,
+			"raw.lxc":        "lxc.mount.entry = tmpfs dev/shm tmpfs rw,nosuid,nodev,size=" + containerShm + ",create=dir 0 0",
+			"boot.autostart": "false",
 		},
 		"devices": devices,
 	})
@@ -169,13 +180,7 @@ func runInstance(ctx context.Context, spec containerSpec, sigs <-chan os.Signal,
 		if err == nil && st.Status == "Stopped" {
 			break
 		}
-		select {
-		case sig := <-sigs:
-			if s, ok := sig.(syscall.Signal); ok && st.PID > 0 {
-				_ = syscall.Kill(st.PID, s)
-			}
-		case <-time.After(time.Second):
-		}
+		time.Sleep(time.Second)
 	}
 	code, ok := readExitFile(filepath.Join(spec.RunDir, "exit"))
 	if !ok {
@@ -187,7 +192,6 @@ func runInstance(ctx context.Context, spec containerSpec, sigs <-chan os.Signal,
 
 type incusState struct {
 	Status string `json:"status"`
-	PID    int    `json:"pid"`
 }
 
 func instanceState(ctx context.Context, instance string) (incusState, error) {
@@ -412,11 +416,12 @@ func linkOrCopy(src, dst string) error {
 	return out.Close()
 }
 
-// containerInit is the container's first process: it confines the
-// container, starts the attempt's argv in its own process group, passes the
-// signals it is sent to that group, reaps whatever ends in the container
-// and, once the argv has exited, writes its exit and exits with it (which
-// stops the container and ends whatever still runs there).
+// containerInit runs under Incus's init, the container's first process: it
+// confines the container, starts the attempt's argv in its own process
+// group, reaps whatever ends in the container and, once the argv has
+// exited, writes its exit and exits with it (which stops the container and
+// ends whatever still runs there). A signal that stops the attempt reaches
+// the argv directly (runInstance); the init outlives it.
 func containerInit(specPath string) int {
 	spec, err := readContainerSpec(specPath)
 	if err != nil {
@@ -438,26 +443,28 @@ func containerInit(specPath string) int {
 	}
 	cmd := &exec.Cmd{Path: argv0, Args: spec.Argv, Dir: spec.CWD, Env: env, Stdout: stdout, Stderr: stderr,
 		SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
+	// caught, not ignored: the argv starts with the default dispositions
 	sigs := make(chan os.Signal, 8)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	go func() {
+		for range sigs {
+		}
+	}()
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(stderr, "kairo container: start:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
-	pid := cmd.Process.Pid
-	go func() {
-		for sig := range sigs {
-			if s, ok := sig.(syscall.Signal); ok {
-				_ = syscall.Kill(-pid, s)
-			}
-		}
-	}()
-	return writeShimExit(containerExitIn, reapUntil(pid))
+	exit, sig := reapUntil(cmd.Process.Pid)
+	if sig != 0 {
+		fmt.Fprintf(stderr, "kairo container: %s ended by signal %d (%v)\n", spec.Argv[0], int(sig), sig)
+	}
+	return writeShimExit(containerExitIn, exit)
 }
 
 // reapUntil reaps the container's processes until pid exits, and returns
-// its exit (-1 when a signal ended it, as exec's ExitCode says).
-func reapUntil(pid int) int {
+// its exit (-1 when a signal ended it, as exec's ExitCode says, with the
+// signal).
+func reapUntil(pid int) (int, syscall.Signal) {
 	for {
 		var ws syscall.WaitStatus
 		wpid, err := syscall.Wait4(-1, &ws, 0, nil)
@@ -465,13 +472,13 @@ func reapUntil(pid int) int {
 			continue
 		}
 		if err != nil {
-			return -1
+			return -1, 0
 		}
 		if wpid == pid {
 			if ws.Exited() {
-				return ws.ExitStatus()
+				return ws.ExitStatus(), 0
 			}
-			return -1
+			return -1, ws.Signal()
 		}
 	}
 }

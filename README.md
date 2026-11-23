@@ -1257,19 +1257,25 @@ it unprivileged on the host.
 The attempt's launcher is still its shim, which runs the agent's binary as
 the runner (`__kairo-incus-run`): it makes the instance `kairo-<attempt
 id>` from the image (`incus init REMOTE:REPOSITORY@DIGEST`, adding an OCI
-remote for the registry the first time), starts it, passes on to its first
-process what it is sent to stop it (SIGTERM of a force stop or a
-quarantine), waits for it to stop, reads the exit the container wrote,
-deletes the instance and exits with that exit (-1 when it wrote none). An
-agent restarted meanwhile adopts the attempt as any (Agent restarts). In
-the container the same binary, mounted read-only, is the first process
-(`__kairo-container-init`): it confines the container as a confined host
-attempt is confined (everything read-only but what Kairo hands it, `/tmp` a
-directory of its scratch, `/proc` and `/dev/shm` writable; Admission,
-Confinement), starts the argv in a process group of its own with its
-directory, its output appended to the attempt's logs, passes signals on to
-that group, reaps what ends in the container and writes the argv's exit;
-its own exit stops the container and ends whatever still runs there. What
+remote for the registry the first time), starts it, waits for it to stop,
+reads the exit the container wrote, deletes the instance and exits with
+that exit (-1 when it wrote none). An agent restarted meanwhile adopts the
+attempt as any (Agent restarts). In the container the same binary, mounted
+read-only, runs under Incus's own init (`__kairo-container-init`): it
+confines the container as a confined host attempt is confined (everything
+read-only but what Kairo hands it, `/tmp` a directory of its scratch,
+`/proc` and `/dev/shm` writable; Admission, Confinement), starts the argv in
+a process group of its own with its directory, its output appended to the
+attempt's logs, reaps what ends in the container and writes the argv's exit
+(and, on the attempt's stderr, the signal that ended it, if one did); its
+own exit stops the container and ends whatever still runs there. A force
+stop, a quarantine or the end of what an exited attempt left running
+reaches the argv's processes directly, as it reaches a host attempt's (they
+carry `KAIRO_ATTEMPT_ID`), and nothing passes it on: neither init carries
+that id, so both stay to see the argv end (Incus's init would end the
+container before the exit is written), and so does the runner, which then
+deletes the instance; one killed with the attempt leaves it to the sweep
+below. What
 the attempt writes outside what Kairo hands it goes with the instance.
 What Kairo hands it is mounted under `/kairo`, at the same paths on every
 node, so a continuation finds its run's files where its checkpoint names
@@ -1304,8 +1310,9 @@ as its, and a force stop and the end of what an exited attempt left running
 reach them. A checkpoint a container publishes names a path in it
 (`/kairo/output/...`): it is not imported (Checkpoints of running work) but
 kept by the run's snapshots, which its publication orders. Every 10
-minutes the executor deletes the stopped instances of attempts no longer
-running there (a runner that was killed deleted none). Not for a gang, not
+minutes, and soon after an attempt there ends, the executor deletes the
+stopped instances of attempts no longer running there (a runner that was
+killed deleted none). Not for a gang, not
 on Windows or in WSL, and no state of a running container is kept yet:
 work goes on from its own checkpoints, as on a host.
 
