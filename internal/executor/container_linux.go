@@ -208,19 +208,7 @@ func ociRemote(ctx context.Context, registry string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		var remotes map[string]struct {
-			Addr     string `json:"Addr"`
-			Protocol string `json:"Protocol"`
-		}
-		if err := json.Unmarshal(out, &remotes); err != nil {
-			return "", fmt.Errorf("incus remote list: %w", err)
-		}
-		for name, r := range remotes {
-			if r.Protocol == "oci" && strings.TrimSuffix(r.Addr, "/") == want {
-				return name, nil
-			}
-		}
-		return "", nil
+		return findOCIRemote(out, want)
 	}
 	if name, err := find(); err != nil || name != "" {
 		return name, err
