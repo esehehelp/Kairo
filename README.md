@@ -27,6 +27,84 @@ domain-specific state. DAG topology is static: there is no dynamic fan-out,
 runtime DAG mutation, artifact-derived topology, metric gate, cron scheduling,
 or cleanup language.
 
+## Architecture
+
+A map of the whole; each part is described in full in the section named.
+
+Processes:
+
+- `kairo serve`, the daemon: the API, planning and every reconciliation,
+  with its state in PostgreSQL (Database). It may run executors of its own;
+  a control-only daemon runs none.
+- `kairo agent`, on every host that runs work: its executors (each a way of
+  running attempts on its node), its providers (GPUs, CPU and RAM,
+  filesystems) and its pack server (Data stores).
+- `kairo controller`, one per physical host: the device settings and
+  container trims (Hardware settings).
+- The CLI, and the worker SDKs (Python, Rust) in the attempts' processes
+  (Worker SDK).
+
+Layers:
+
+| layer | what it holds | packages | sections |
+|---|---|---|---|
+| orchestration | ProjectSpec, Tasks (immutable), the policy's decisions, reruns | `orchestration`, `store` (orchestration, task_control, task_views) | Start, Following tasks from the CLI |
+| coordination | Executions (one-shot), Attempts, Leases, Commands, scope gates, gangs, quarantines, force stops | `store` (execution, scheduler, worker, scopes, gang, quarantine, forcestop), `execution` | Coordination model, Gang executions |
+| planning | one pass over the installation: placement, backfill, preemption, run-time estimates, admission accounting | `store` (planner, preemption, estimate) | Admission, Run-time estimates |
+| execution | launch, shim and adoption, confinement, containers, force stop, quiescence, usage, observation | `executor`, `processidentity`, `provider`, `agentclient` | Agent restarts, Containers, Force stop |
+| data | stores; scratch, output and cache directories; data objects, packs, copies, replicas; imports, run snapshots, checkpoints, temporal data; fetches, eviction, read-back, inventory | `store` (packs, copies, replicas, deletions, imports, inputs, placements, evictions, temporal, regenerate, transfer, runsnapshots, checkpoints, inventory_durable, scrub, shed, control_snapshot), `executor` (datastore, pack, transfer, fetch, retire, evict, inventory, storefs), `machine`, `datainput` | Data stores, Kairo keeps itself |
+| provenance | code snapshots, container images by digest | `sourcesnap`, `imageref`, `store` (sources, images) | Code snapshots, Containers |
+| hardware | machine declaration, device settings, operating-point policy, benches, power and energy | `machine`, `devicecontrol`, `hwpolicy`, `hwbench`, `bench`, `cpupower`, `store` (device, device_policy, device_samples, hardware_bench, hardware_history, hosts) | Machine declaration, Hardware settings, Hardware benchmarks, Power and energy |
+| access | the HTTP API, tokens, TLS, private files | `api`, `tlsutil`, `secfile`, `store` (tokens) | Authentication and TLS, API |
+| support | configuration, env rules, ids, times, external commands, build stamp, tests | `config`, `envspec`, `id`, `instant`, `extcmd`, `buildinfo`, `conformance`, `pgtest`, `sqliteimport` | Verification |
+
+The life of an execution:
+
+1. `kairo project apply` stores the declaration and binds each new Task to
+   its code snapshot and image.
+2. The orchestration policy submits the Task's Execution once its
+   dependencies have succeeded.
+3. A planning pass places it and reserves a Lease on a node (or says why it
+   waits).
+4. That node's executor prepares the lease, is authorized to launch an
+   Attempt, starts its shim and activates it; the shim then starts the
+   command (confined when the execution is, or the data policy confines
+   every launch).
+5. The executor records the exit, and the lease is released once every
+   process of the attempt is absent.
+6. The policy decides what follows: success, a continuation after a
+   checkpoint, or a blocked Task.
+7. Throughout, what the run writes is packed, copied to the durable stores
+   and kept.
+
+The agent protocol:
+
+- Agents dial the daemon; the daemon never dials them.
+- An agent registers its node, executors and providers, naming the
+  attempts it adopts.
+- Each executor then ticks every 250 ms. In each tick it reports
+  observations, carries out what it is ordered (quiescence checks,
+  terminations, force stops, packs, copies, fetches, deletions, evictions,
+  read-backs, scratch settlement) and reserves its next execution.
+- Every operation is `POST /api/agent/<operation>`, checked against the node
+  owning what it names.
+- An order can be carried out twice with the same result, and lease epochs
+  fence what a stale caller does.
+
+Invariants every change keeps:
+
+- The daemon decides and agents carry out and report facts. Kairo never
+  interprets a project's state: exit 0 is not the work's success.
+- A declared Task is immutable, and an Execution starts at most once.
+- A lease is released only once every process of its attempt is absent and
+  observations since show its resources unclaimed. Time alone never frees
+  one.
+- Kairo touches only its own under a store's root. On a durable store it
+  removes only its own writes it never recorded, and, to stay above a
+  store's reserve, copies kept verified on two other durable stores.
+- Every attempt writes only where Kairo hands it (Confinement). What it
+  writes is Kairo's to keep from the moment it is written.
+
 ## Start
 
 The daemon keeps its state in a PostgreSQL database (see Database below);
