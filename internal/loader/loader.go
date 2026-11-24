@@ -169,7 +169,19 @@ func (l *Loader) produce(ctx context.Context, gen *generation, positions []Posit
 	if err != nil {
 		return err
 	}
-	defer in.Close()
+	// the inputs are closed only once the goroutine reading them is done:
+	// on every way out, the goroutines of this generation are told to end
+	// and waited for
+	ctx, cancel := context.WithCancel(ctx)
+	orderDone := make(chan struct{})
+	started := false
+	defer func() {
+		cancel()
+		if started {
+			<-orderDone
+		}
+		in.Close()
+	}()
 	order := newOrderer(in, l.Spec.Block, l.Spec.Seed)
 	if err := order.seek(ctx, start); err != nil {
 		return err
@@ -181,7 +193,9 @@ func (l *Loader) produce(ctx context.Context, gen *generation, positions []Posit
 		out = runStage(ctx, st, out, errs, l.Stderr)
 	}
 	orderErr := make(chan error, 1)
+	started = true
 	go func() {
+		defer close(orderDone)
 		defer close(groups)
 		for {
 			g, rec, ok, err := order.next(ctx)
