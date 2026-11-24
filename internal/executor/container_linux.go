@@ -16,6 +16,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -409,6 +410,9 @@ func containerInit(specPath string) int {
 		return writeShimExit(containerExitIn, shimNotConfined)
 	}
 	stdout, stderr := openContainerLog(containerStdout, os.Stdout), openContainerLog(containerStderr, os.Stderr)
+	if !waitForNetwork("/sys/class/net", "/proc/net/route", "/proc/net/ipv6_route", networkWait) {
+		fmt.Fprintln(stderr, "kairo container: no default route after", networkWait, "(starting without one)")
+	}
 	env := containerEnv(os.Environ(), spec.Env, len(spec.GPUs) > 0)
 	// argv[0] is looked up on the attempt's PATH
 	_ = os.Setenv("PATH", containerEnvValue(env, "PATH"))
@@ -435,6 +439,51 @@ func containerInit(specPath string) int {
 		fmt.Fprintf(stderr, "kairo container: %s ended by signal %d (%v)\n", spec.Argv[0], int(sig), sig)
 	}
 	return writeShimExit(containerExitIn, exit)
+}
+
+// networkWait bounds how long the init waits for the container's network:
+// a Proxmox container's address comes by DHCP a few seconds after it starts.
+const networkWait = 30 * time.Second
+
+// waitForNetwork waits, up to limit, until the container has a default
+// route (IPv4 or IPv6) when it has an interface other than loopback; true
+// when it has one, or no network to wait for.
+func waitForNetwork(netDir, route4, route6 string, limit time.Duration) bool {
+	ifaces, _ := os.ReadDir(netDir)
+	if !slices.ContainsFunc(ifaces, func(e os.DirEntry) bool { return e.Name() != "lo" }) {
+		return true
+	}
+	deadline := time.Now().Add(limit)
+	for {
+		if hasDefaultRoute(route4, route6) {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// hasDefaultRoute reports whether /proc/net/route has a default route
+// (destination 00000000) or /proc/net/ipv6_route one (destination ::/0 on
+// an interface other than lo).
+func hasDefaultRoute(route4, route6 string) bool {
+	if body, err := os.ReadFile(route4); err == nil {
+		for _, line := range strings.Split(string(body), "\n")[1:] {
+			if f := strings.Fields(line); len(f) > 1 && f[1] == "00000000" {
+				return true
+			}
+		}
+	}
+	if body, err := os.ReadFile(route6); err == nil {
+		for _, line := range strings.Split(string(body), "\n") {
+			if f := strings.Fields(line); len(f) == 10 && f[0] == strings.Repeat("0", 32) && f[1] == "00" && f[9] != "lo" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // reapUntil reaps the container's processes until pid exits, and returns
