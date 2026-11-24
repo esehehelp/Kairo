@@ -25,8 +25,8 @@ func TestARegenerableTasksOutputIsTemporal(t *testing.T) {
 	}
 	declareTestStore(t, store,
 		machine.Store{ID: "w-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "executor", Root: "/var/kairo", Filesystem: "/"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "/"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "/"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "D:/kairo", Filesystem: "/"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "win-exec", Root: "E:/kairo", Filesystem: "/"},
 	)
 	if _, err := store.ApplyProject(ctx, projectSpec(t, `schema_version = 1
 [project]

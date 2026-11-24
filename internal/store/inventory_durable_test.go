@@ -24,8 +24,8 @@ func TestADurableStoresDirectoryIsAdoptedAndChecked(t *testing.T) {
 		t.Fatal(err)
 	}
 	declareTestStore(t, store,
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "durable-exec", Root: "D:/kairo", Filesystem: "D:"},
 	)
 	sha := strings.Repeat("ab", 32)
 	for _, id := range []string{"obj_a", "obj_k"} {

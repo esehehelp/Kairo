@@ -12,16 +12,16 @@ import (
 )
 
 // retireFixture: a direct execution's run whose output directory on
-// d-scratch (served by "executor", the test's WSL executor, so the stores
-// name it) was packed as obj_out and copied to e-durable, not yet verified.
+// d-scratch was packed as obj_out by "executor" and copied to e-durable,
+// not yet verified.
 func retireFixture(t *testing.T) (*Store, *Launch, string) {
 	t.Helper()
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)
 	addTestDisk(t, store, "node", "D:")
 	ctx := context.Background()
-	// "executor" (a WSL one in the test inventory) packs on d-scratch;
-	// durable-exec serves both stores, which name no executor
+	// "executor" packs on d-scratch; durable-exec, which also serves both
+	// stores, copies
 	if err := store.UpsertExecutor(ctx, Executor{ID: "durable-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}

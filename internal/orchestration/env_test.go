@@ -131,7 +131,6 @@ cwd = "/work"
 	for _, env := range []string{
 		"[tasks.execution.env]\nKAIRO_TOKEN = \"x\"\n",
 		"[tasks.execution.env]\nkairo_api_url = \"x\"\n",
-		"[tasks.execution.env]\nWslEnv = \"x\"\n",
 		"[tasks.execution.env]\n\"A=B\" = \"x\"\n",
 		"[tasks.execution.env]\n\" A\" = \"x\"\n",
 		"[tasks.execution.env]\n\"\" = \"x\"\n",

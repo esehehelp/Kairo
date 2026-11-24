@@ -23,7 +23,7 @@ func TestRunningWorkIsAskedForCheckpointsAndWhatItPublishesIsKept(t *testing.T) 
 	if err := store.UpsertExecutor(ctx, Executor{ID: "win-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	declareTestStore(t, store, machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"})
+	declareTestStore(t, store, machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "D:/kairo", Filesystem: "D:"})
 	if _, err := store.ApplyProject(ctx, projectSpec(t, orchestrationManifest())); err != nil {
 		t.Fatal(err)
 	}

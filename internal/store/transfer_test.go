@@ -31,8 +31,8 @@ func TestTemporalDataIsBroughtFromWhereItIs(t *testing.T) {
 	}
 	addTestDisk(t, store, "node2", "/")
 	spec := storesSpec(
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "win-exec", Root: "E:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "n2-scratch", Class: machine.StoreVolatile, Node: "node2", Root: "/srv/kairo-store", Filesystem: "/"},
 	)
 	spec.Nodes = append(spec.Nodes, machine.Node{ID: "node2"})

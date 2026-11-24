@@ -11,9 +11,9 @@ import (
 	"kairo/internal/machine"
 )
 
-// importFixture: node "node" with the test's WSL executor ("executor") and a
+// importFixture: node "node" with the test's executor ("executor") and a
 // Windows one ("win-exec"), a volatile store on D: and a durable one on E:
-// (neither naming an executor, so win-exec serves both), and project "imp".
+// (both naming win-exec, which alone serves them), and project "imp".
 func importFixture(t *testing.T) *Store {
 	t.Helper()
 	store := openCoordinationStore(t)
@@ -24,8 +24,8 @@ func importFixture(t *testing.T) *Store {
 		t.Fatal(err)
 	}
 	declareTestStore(t, store,
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "win-exec", Root: "E:/kairo", Filesystem: "D:"},
 	)
 	if _, err := store.ApplyProject(ctx, projectSpec(t, `schema_version = 1
 [project]
@@ -100,12 +100,12 @@ func TestAnImportNamesDirectoriesOutsideEveryStore(t *testing.T) {
 		}
 	}
 	if others, err := store.PacksToMake(ctx, "executor"); err != nil || len(others) != 0 {
-		t.Fatalf("the WSL executor packs nothing: %+v %v", others, err)
+		t.Fatalf("an executor serving no store packs nothing: %+v %v", others, err)
 	}
 	declareTestStore(t, store,
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "f-data", Class: machine.StoreVolatile, Node: "node", Root: "F:/data", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "win-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "f-data", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "F:/data", Filesystem: "D:"},
 	)
 	if orders, err = store.PacksToMake(ctx, "win-exec"); err != nil || len(orders) != 2 {
 		t.Fatalf("an import inside a store declared since is not packed: %+v %v", orders, err)
@@ -179,9 +179,9 @@ func TestAnImportedDirectoryIsDeletedOnlyWhenAskedFor(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.ApplyMachines(ctx, storesSpec(
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "data", Class: machine.StoreVolatile, Node: "node", Root: "D:/data", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "win-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "data", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "D:/data", Filesystem: "D:"},
 	), false); !errors.Is(err, ErrMachineConflict) || !strings.Contains(err.Error(), deleted[0].ObjectID) {
 		t.Fatalf("declaration over a directory being deleted: %v", err)
 	}
@@ -232,9 +232,9 @@ func TestAnImportIsPackedOnTheStoreOfItsFilesystem(t *testing.T) {
 	ctx := context.Background()
 	addTestDisk(t, store, "node", "F:")
 	declareTestStore(t, store,
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "f-models", Class: machine.StoreVolatile, Node: "node", Root: "F:/kairo-store", Filesystem: "F:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "win-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "f-models", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "F:/kairo-store", Filesystem: "F:"},
 	)
 	objects, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"F:/Strata-data", "D:/data/x", "G:/elsewhere"}})
 	if err != nil {

@@ -25,10 +25,10 @@ func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 		t.Fatal(err)
 	}
 	declareTestStore(t, store,
-		machine.Store{ID: "c-durable", Class: machine.StoreDurable, Node: "node", Root: "C:/_kairo-durable", Filesystem: "D:", ReserveFreeBytes: reserve},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "f-durable", Class: machine.StoreDurable, Node: "node", Root: "F:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "c-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "C:/_kairo-durable", Filesystem: "D:", ReserveFreeBytes: reserve},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "f-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "F:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "durable-exec", Root: "D:/kairo", Filesystem: "D:"},
 	)
 	sha := strings.Repeat("aa", 32)
 	verified := func(id, storeID, root string) {

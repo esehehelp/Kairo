@@ -54,15 +54,14 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	addTestDisk(t, store, "third", "/")
-	// the test inventory's "executor" is a WSL one: the node's stores naming no
-	// executor are served by durable-exec
+	// the node's stores name durable-exec, the one executor serving them
 	if err := store.UpsertExecutor(ctx, Executor{ID: "durable-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	declareTestStore(t, store,
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "E:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "z-durable", Class: machine.StoreDurable, Node: "third", Root: "/srv/durable", Filesystem: "/"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "durable-exec", Root: "D:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "r-pool", Class: machine.StoreVolatile, Node: "remote", Root: "/srv/kairo", Filesystem: "/"},
 	)
 	shaLocal, shaRemote := strings.Repeat("aa", 32), strings.Repeat("bb", 32)
@@ -70,9 +69,9 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 	insertPacked(t, store, "obj_remote", "remote-exec", "r-pool", "/srv/kairo", shaRemote)
 
 	// only an executor serving the first durable store (e-durable) takes them:
-	// not the remote one, nor the WSL one of the node
+	// not the remote one, nor the node's other one
 	if orders, err := store.CopiesToMake(ctx, "executor"); err != nil || len(orders) != 0 {
-		t.Fatalf("the WSL executor took %+v %v", orders, err)
+		t.Fatalf("an executor not serving the store took %+v %v", orders, err)
 	}
 	if orders, err := store.CopiesToMake(ctx, "remote-exec"); err != nil || len(orders) != 0 {
 		t.Fatalf("the remote executor took %+v %v", orders, err)
@@ -162,8 +161,8 @@ func TestCopiesGoToTheDurableStoreLocallyOrWithAToken(t *testing.T) {
 	// elsewhere, read where it is; the copied one is not copied again
 	declareTestStore(t, store,
 		machine.Store{ID: "a-durable", Class: machine.StoreDurable, Node: "remote", Root: "/srv/first", Filesystem: "/"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "durable-exec", Root: "D:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "r-pool", Class: machine.StoreVolatile, Node: "remote", Root: "/srv/kairo", Filesystem: "/"},
 	)
 	insertPacked(t, store, "obj_new", "remote-exec", "r-pool", "/srv/kairo", shaLocal)
@@ -191,9 +190,9 @@ func TestCopiesGoToTheFirstDurableStoreWithRoom(t *testing.T) {
 		t.Fatal(err)
 	}
 	declareTestStore(t, store,
-		machine.Store{ID: "c-durable", Class: machine.StoreDurable, Node: "node", Root: "C:/_kairo-durable", Filesystem: "D:", ReserveFreeBytes: 1000},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "c-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "C:/_kairo-durable", Filesystem: "D:", ReserveFreeBytes: 1000},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "durable-exec", Root: "D:/kairo", Filesystem: "D:"},
 	)
 	sha := strings.Repeat("aa", 32)
 	insertPacked(t, store, "obj_a", "executor", "d-scratch", "D:/kairo", sha)
@@ -229,8 +228,8 @@ func TestDurableCopiesAreDescribed(t *testing.T) {
 		t.Fatal(err)
 	}
 	declareTestStore(t, store,
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "durable-exec", Root: "D:/kairo", Filesystem: "D:"},
 	)
 	sha := strings.Repeat("ab", 32)
 	insertPacked(t, store, "obj_a", "executor", "d-scratch", "D:/kairo", sha)
@@ -283,9 +282,9 @@ func TestADurableObjectIsReplicatedToEveryDurableStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	declareTestStore(t, store,
-		machine.Store{ID: "c-durable", Class: machine.StoreDurable, Node: "node", Root: "C:/_kairo-durable", Filesystem: "D:"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "c-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "C:/_kairo-durable", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "durable-exec", Root: "D:/kairo", Filesystem: "D:"},
 	)
 	sha := strings.Repeat("cd", 32)
 	insertPacked(t, store, "obj_a", "executor", "d-scratch", "D:/kairo", sha)
@@ -331,8 +330,8 @@ func TestAReplicaIsReadFromADurableCopyOnAnotherNode(t *testing.T) {
 	}
 	addTestDisk(t, store, "remote", "/")
 	declareTestStore(t, store,
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
-		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "E:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "durable-exec", Root: "D:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "p-durable", Class: machine.StoreDurable, Node: "remote", Root: "/srv/_kairo-durable", Filesystem: "/"},
 	)
 	sha := strings.Repeat("ef", 32)
