@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -60,6 +61,9 @@ var (
 	pctLock = "/run/lock/kairo-pct.lock"
 	// pctConfigDir holds the host's container configurations.
 	pctConfigDir = "/etc/pve/lxc"
+	// resolvConf is the host's resolver configuration, whose nameservers a
+	// container is given.
+	resolvConf = "/etc/resolv.conf"
 	// pctDestroyRetry spaces out the tries to destroy a container whose disk
 	// is still in use.
 	pctDestroyRetry = 3 * time.Second
@@ -234,6 +238,10 @@ func pctCreateArgs(spec containerSpec, template string) ([]string, error) {
 	}
 	if s.Net != "" {
 		args = append(args, "--net0", s.Net)
+		// an application container is not handed the host's resolvers
+		if ns := hostNameservers(resolvConf); len(ns) > 0 {
+			args = append(args, "--nameserver", strings.Join(ns, " "))
+		}
 	}
 	mounts := slices.Clone(spec.Mounts)
 	var devices []string
@@ -490,4 +498,24 @@ func (e *storeWorker) sweepPCT(ctx context.Context) {
 		_ = os.RemoveAll(e.containerDir(attempt))
 		e.Logger.Info("container of an attempt no longer running destroyed", "vmid", vmid, "attempt_id", attempt)
 	}
+}
+
+// hostNameservers are the nameservers of the host's resolver configuration
+// a container can reach: not the host's own loopback ones.
+func hostNameservers(path string) []string {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+		if ip := net.ParseIP(fields[1]); ip != nil && !ip.IsLoopback() {
+			out = append(out, fields[1])
+		}
+	}
+	return out
 }

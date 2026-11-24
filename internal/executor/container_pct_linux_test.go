@@ -214,3 +214,17 @@ func TestDestroyPCTRetriesWhileItsDiskIsInUse(t *testing.T) {
 		t.Fatalf("destroy after %d tries: %v", tries, err)
 	}
 }
+
+// A container is given the host's nameservers, but not its loopback ones.
+func TestHostNameservers(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "resolv.conf")
+	if err := os.WriteFile(p, []byte("search lan\nnameserver 127.0.0.53\nnameserver 192.0.2.1\nnameserver ::1\nnameserver 2001:db8::1\noptions edns0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := hostNameservers(p); !slices.Equal(got, []string{"192.0.2.1", "2001:db8::1"}) {
+		t.Fatalf("nameservers %v", got)
+	}
+	if got := hostNameservers(filepath.Join(t.TempDir(), "none")); got != nil {
+		t.Fatalf("no file: %v", got)
+	}
+}
