@@ -14,8 +14,9 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
+
+	"kairo/internal/store/dbtx"
 )
 
 // migrations are the schema's numbered steps (NNNN_name.sql), applied in
@@ -25,7 +26,7 @@ import (
 var migrationFiles embed.FS
 
 var (
-	ErrNotFound              = errors.New("not found")
+	ErrNotFound              = dbtx.ErrNotFound
 	ErrIdempotencyConflict   = errors.New("idempotency key was already used for different content")
 	ErrGateClosed            = errors.New("coordination admission gate is closed")
 	ErrExecutionStarted      = errors.New("execution has already started")
@@ -43,21 +44,9 @@ var (
 	ErrGangAborted = errors.New("gang placement was aborted")
 )
 
-// decisionLock is the key of the transaction-scoped advisory lock that
-// beginWrite takes before anything else. Kairo's decisions (admission,
-// leases, launch, gates, preemption, quarantine, commands, device settings,
-// machine apply, orchestration) read state and
-// write what follows from it; holding one lock for the whole transaction runs
-// them one at a time, as if there were a single connection, whatever the
-// pool size and however many processes share the database. Reads take no
-// lock and run concurrently.
-const decisionLock int64 = 0x4b4149524f // "KAIRO"
-
-// LockStatement makes a transaction writable (connections default to
-// read-only, so a write outside beginWrite fails) and takes the decision
-// lock, in one round trip. Tools that write with a connection of their own
-// (the SQLite import) begin with it too.
-var LockStatement = "SET TRANSACTION READ WRITE; SELECT pg_advisory_xact_lock(" + strconv.FormatInt(decisionLock, 10) + ")"
+// LockStatement makes a transaction writable and takes the decision lock
+// (dbtx.LockStatement), for tools that write with a connection of their own.
+var LockStatement = dbtx.LockStatement
 
 // maxConns bounds the pool. Writers wait for each other on the decision
 // lock, so more connections only serve more concurrent reads.
@@ -272,17 +261,7 @@ func (s *Store) beginUnlockedWrite(ctx context.Context) (*sql.Tx, error) {
 }
 
 // beginWriteDB is beginWrite on a pool (Open migrates through it).
-func beginWriteDB(ctx context.Context, db *sql.DB) (*sql.Tx, error) {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, LockStatement); err != nil {
-		tx.Rollback()
-		return nil, err
-	}
-	return tx, nil
-}
+func beginWriteDB(ctx context.Context, db *sql.DB) (*sql.Tx, error) { return dbtx.BeginWrite(ctx, db) }
 
 // beginRead begins a read-only transaction whose statements all see one
 // snapshot; it takes no lock.
@@ -306,17 +285,7 @@ func (s *Store) exec(ctx context.Context, query string, args ...any) (sql.Result
 
 func (s *Store) Close() error { return s.db.Close() }
 
-func now() string { return time.Now().UTC().Format(time.RFC3339Nano) }
-
-// bind appends v to args and returns its placeholder ($n), for a query built
-// piece by piece.
-func bind(args *[]any, v any) string {
-	*args = append(*args, v)
-	return "$" + strconv.Itoa(len(*args))
-}
-
-// uniqueViolation reports whether err is a unique constraint's refusal.
-func uniqueViolation(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "23505"
-}
+// The shared SQL helpers (dbtx), by the names the store uses.
+func now() string                    { return dbtx.Now() }
+func bind(args *[]any, v any) string { return dbtx.Bind(args, v) }
+func uniqueViolation(err error) bool { return dbtx.UniqueViolation(err) }

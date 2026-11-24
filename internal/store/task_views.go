@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"kairo/internal/store/dbtx"
 )
 
 // TaskStates are the states a declared task can be in.
@@ -118,17 +120,7 @@ func progressSummary(progress string) json.RawMessage {
 
 // eachRow runs a query and calls scan on each of its rows.
 func eachRow(ctx context.Context, q queryer, query string, args []any, scan func(*sql.Rows) error) error {
-	rows, err := q.QueryContext(ctx, query, args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	for rows.Next() {
-		if err = scan(rows); err != nil {
-			return err
-		}
-	}
-	return rows.Err()
+	return dbtx.EachRow(ctx, q, query, args, scan)
 }
 
 func (s *Store) GetProjectStatus(ctx context.Context, project string) (ProjectStatus, error) {

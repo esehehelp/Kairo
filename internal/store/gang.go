@@ -34,6 +34,7 @@ import (
 	"time"
 
 	"kairo/internal/id"
+	"kairo/internal/store/dbtx"
 )
 
 // GangPrepareTimeout is how long a placement may wait for every rank to be
@@ -77,10 +78,7 @@ func gangOfExecutionTx(ctx context.Context, q queryer, executionID string) (gang
 	return gangID, rank, leaderID, err
 }
 
-type queryer interface {
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}
+type queryer = dbtx.Queryer
 
 // candidateColumns reads an executionCandidate (scanCandidate) from
 // execution_requests e.
