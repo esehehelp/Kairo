@@ -16,3 +16,5 @@ const (
 )
 
 func (e *storeWorker) sweepContainers(context.Context) {}
+
+func (e *storeWorker) sweepPCT(context.Context) {}

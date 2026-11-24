@@ -35,6 +35,8 @@ func runContainerHelpers(args []string) {
 		os.Exit(containerRun(args[2]))
 	case containerInitArg:
 		os.Exit(containerInit(args[2]))
+	case pctRunArg:
+		os.Exit(pctRun(args[2]))
 	}
 }
 

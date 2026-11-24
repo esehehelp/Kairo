@@ -42,10 +42,14 @@ type instanceSweeper interface {
 
 // backend is this executor's backend, from its kind.
 func (e *Local) backend() backend {
-	if e.Kind == config.KindIncus {
+	switch e.Kind {
+	case config.KindIncus:
 		return incusBackend{e}
+	case config.KindPCT:
+		return pctBackend{e}
+	default:
+		return hostBackend{e}
 	}
-	return hostBackend{e}
 }
 
 // refuseImage refuses an execution in an image on a backend that runs no
@@ -135,7 +139,7 @@ func (hostBackend) ended(string) {}
 type incusBackend struct{ e *Local }
 
 func (b incusBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, error) {
-	cmd, err := b.e.containerCommand(launch)
+	cmd, err := b.e.containerCommand(launch, containerOptions{runArg: containerRunArg})
 	return cmd, nil, err
 }
 
@@ -152,3 +156,30 @@ func (b incusBackend) ended(attemptID string) {
 }
 
 func (b incusBackend) sweep(ctx context.Context) { b.e.storeWork().sweepContainers(ctx) }
+
+// pctBackend runs every attempt in a Proxmox VE container of its image, in
+// VMIDs 1000-1999, made for it and destroyed after it
+// (container_pct_linux.go). Its agent runs on the Proxmox host.
+type pctBackend struct{ e *Local }
+
+func (b pctBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, error) {
+	settings, err := pctSettingsOf(b.e.Attributes)
+	if err != nil {
+		return nil, nil, err
+	}
+	cmd, err := b.e.containerCommand(launch, containerOptions{runArg: pctRunArg, logDir: true, pct: settings})
+	return cmd, nil, err
+}
+
+func (pctBackend) liveness(_ context.Context, pid int, identity string) (processidentity.Liveness, error) {
+	return processidentity.HostProcessLiveness(pid, identity)
+}
+
+// ended removes what the attempt's container was made from and has its
+// container, left by a runner that was killed, swept at the next tick.
+func (b pctBackend) ended(attemptID string) {
+	_ = os.RemoveAll(b.e.containerDir(attemptID))
+	b.e.storeWork().sweepSoon()
+}
+
+func (b pctBackend) sweep(ctx context.Context) { b.e.storeWork().sweepPCT(ctx) }
