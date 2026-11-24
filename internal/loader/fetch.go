@@ -1,0 +1,281 @@
+package loader
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// File is one file of raw data as Kairo identifies it: where it is fetched
+// from, its size and sha256, and the sha256 of each ChunkBytes of it (the
+// last chunk the rest). No byte of a chunk is used before the chunk is
+// checked.
+type File struct {
+	Name       string   `json:"name"`
+	URL        string   `json:"url,omitempty"`
+	Size       int64    `json:"size"`
+	SHA256     string   `json:"sha256"`
+	ChunkBytes int64    `json:"chunk_bytes"`
+	Chunks     []string `json:"chunks"`
+}
+
+// DefaultChunkBytes is the chunk a file is checked by.
+const DefaultChunkBytes = 4 << 20
+
+var hexSHA256 = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// check: f's chunks cover its size, each a sha256.
+func (f File) check() error {
+	if f.Name == "" || f.Size < 0 || f.ChunkBytes < 1 || !hexSHA256.MatchString(f.SHA256) {
+		return fmt.Errorf("file %q: a name, a size, a chunk size and a sha256 are needed", f.Name)
+	}
+	if want := (f.Size + f.ChunkBytes - 1) / f.ChunkBytes; int64(len(f.Chunks)) != want {
+		return fmt.Errorf("file %s: %d chunk hashes for %d bytes in chunks of %d (%d)", f.Name, len(f.Chunks), f.Size, f.ChunkBytes, want)
+	}
+	for i, c := range f.Chunks {
+		if !hexSHA256.MatchString(c) {
+			return fmt.Errorf("file %s: chunk %d's hash is not a sha256", f.Name, i)
+		}
+	}
+	return nil
+}
+
+// chunkSize is the size of chunk i of f.
+func (f File) chunkSize(i int) int64 {
+	if rest := f.Size - int64(i)*f.ChunkBytes; rest < f.ChunkBytes {
+		return rest
+	}
+	return f.ChunkBytes
+}
+
+// ErrChanged: the bytes of a file are not those its identity lists (fetched
+// twice): what it was made from is not there any more.
+var ErrChanged = errors.New("raw data changed")
+
+// Origin gives the bytes of a file as stored, from a byte offset on
+// (unchecked: Fetch checks them).
+type Origin interface {
+	ReadFrom(ctx context.Context, f File, offset int64) (io.ReadCloser, error)
+	String() string
+}
+
+// Fetcher reads files from an origin, checking each chunk, and reading again
+// what failed: an error of the origin is tried again after a growing pause
+// (Problem says what), bytes not matching their hash are fetched once more
+// before ErrChanged.
+type Fetcher struct {
+	Origin Origin
+	// Retry is the first pause after a failure (default 1 s), doubling up to
+	// MaxRetry (default 5 min).
+	Retry, MaxRetry time.Duration
+	// Problem, when set, hears each failure and, with a nil error, that the
+	// file is being read again.
+	Problem func(f File, err error)
+}
+
+// Open reads f from chunk on.
+func (x *Fetcher) Open(ctx context.Context, f File, chunk int) (io.ReadCloser, error) {
+	if err := f.check(); err != nil {
+		return nil, err
+	}
+	if chunk < 0 || chunk > len(f.Chunks) {
+		return nil, fmt.Errorf("file %s has no chunk %d", f.Name, chunk)
+	}
+	return &checkedReader{ctx: ctx, x: x, f: f, chunk: chunk}, nil
+}
+
+// checkedReader gives a file's bytes a checked chunk at a time.
+type checkedReader struct {
+	ctx      context.Context
+	x        *Fetcher
+	f        File
+	chunk    int    // the next chunk to read
+	buf      []byte // the checked chunk being given
+	body     io.ReadCloser
+	mismatch int // chunk read again for not matching, +1
+}
+
+func (c *checkedReader) Read(p []byte) (int, error) {
+	for len(c.buf) == 0 {
+		if c.chunk >= len(c.f.Chunks) {
+			return 0, io.EOF
+		}
+		if err := c.fill(); err != nil {
+			return 0, err
+		}
+	}
+	n := copy(p, c.buf)
+	c.buf = c.buf[n:]
+	return n, nil
+}
+
+// fill reads and checks the next chunk, reading again until it is had,
+// the bytes are not the file's, or the context ends.
+func (c *checkedReader) fill() error {
+	pause := c.x.Retry
+	if pause <= 0 {
+		pause = time.Second
+	}
+	maxPause := c.x.MaxRetry
+	if maxPause <= 0 {
+		maxPause = 5 * time.Minute
+	}
+	failed := false
+	for {
+		data, err := c.readChunk()
+		if err == nil {
+			sum := sha256.Sum256(data)
+			if hex.EncodeToString(sum[:]) == c.f.Chunks[c.chunk] {
+				if failed && c.x.Problem != nil {
+					c.x.Problem(c.f, nil)
+				}
+				c.buf, c.chunk, c.mismatch = data, c.chunk+1, 0
+				return nil
+			}
+			c.closeBody()
+			if c.mismatch == c.chunk+1 {
+				return fmt.Errorf("%w: %s chunk %d from %s is not what was identified", ErrChanged, c.f.Name, c.chunk, c.x.Origin)
+			}
+			c.mismatch = c.chunk + 1
+			err = fmt.Errorf("%s chunk %d from %s does not match its sha256: reading it again", c.f.Name, c.chunk, c.x.Origin)
+		}
+		c.closeBody()
+		failed = true
+		if c.x.Problem != nil {
+			c.x.Problem(c.f, err)
+		}
+		select {
+		case <-c.ctx.Done():
+			return c.ctx.Err()
+		case <-time.After(pause):
+		}
+		if pause *= 2; pause > maxPause {
+			pause = maxPause
+		}
+	}
+}
+
+// readChunk reads the next chunk's bytes from the origin, opening it there
+// when no body is open.
+func (c *checkedReader) readChunk() ([]byte, error) {
+	if c.body == nil {
+		body, err := c.x.Origin.ReadFrom(c.ctx, c.f, int64(c.chunk)*c.f.ChunkBytes)
+		if err != nil {
+			return nil, err
+		}
+		c.body = body
+	}
+	data := make([]byte, c.f.chunkSize(c.chunk))
+	if _, err := io.ReadFull(c.body, data); err != nil {
+		return nil, fmt.Errorf("%s chunk %d from %s: %w", c.f.Name, c.chunk, c.x.Origin, err)
+	}
+	return data, nil
+}
+
+func (c *checkedReader) closeBody() {
+	if c.body != nil {
+		c.body.Close()
+		c.body = nil
+	}
+}
+
+func (c *checkedReader) Close() error {
+	c.closeBody()
+	return nil
+}
+
+// DirOrigin reads files under a directory, by name.
+type DirOrigin struct{ Root string }
+
+func (d DirOrigin) ReadFrom(_ context.Context, f File, offset int64) (io.ReadCloser, error) {
+	if !filepath.IsLocal(filepath.FromSlash(f.Name)) {
+		return nil, fmt.Errorf("file %q is not under %s", f.Name, d.Root)
+	}
+	file, err := os.Open(filepath.Join(d.Root, filepath.FromSlash(f.Name)))
+	if err != nil {
+		return nil, err
+	}
+	if _, err := file.Seek(offset, io.SeekStart); err != nil {
+		file.Close()
+		return nil, err
+	}
+	return file, nil
+}
+
+func (d DirOrigin) String() string { return d.Root }
+
+// HTTPOrigin reads files from their URL with a range request.
+type HTTPOrigin struct{ Client *http.Client }
+
+func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (io.ReadCloser, error) {
+	if !strings.HasPrefix(f.URL, "https://") && !strings.HasPrefix(f.URL, "http://") {
+		return nil, fmt.Errorf("file %s has no http(s) URL", f.Name)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.URL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if offset > 0 {
+		req.Header.Set("Range", "bytes="+strconv.FormatInt(offset, 10)+"-")
+	}
+	client := h.Client
+	if client == nil {
+		client = http.DefaultClient
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case resp.StatusCode == http.StatusPartialContent && offset > 0:
+		return resp.Body, nil
+	case resp.StatusCode == http.StatusOK:
+		if _, err := io.CopyN(io.Discard, resp.Body, offset); err != nil { // no ranges there
+			resp.Body.Close()
+			return nil, err
+		}
+		return resp.Body, nil
+	}
+	resp.Body.Close()
+	return nil, fmt.Errorf("%s: %s", f.URL, resp.Status)
+}
+
+func (h HTTPOrigin) String() string { return "upstream" }
+
+// Identify reads r to its end and makes the identity of a file of that
+// content: its size, sha256 and chunk hashes.
+func Identify(r io.Reader, name string, chunkBytes int64) (File, error) {
+	if chunkBytes < 1 {
+		chunkBytes = DefaultChunkBytes
+	}
+	f := File{Name: name, ChunkBytes: chunkBytes}
+	whole := sha256.New()
+	buf := make([]byte, chunkBytes)
+	for {
+		n, err := io.ReadFull(r, buf)
+		if n > 0 {
+			sum := sha256.Sum256(buf[:n])
+			f.Chunks = append(f.Chunks, hex.EncodeToString(sum[:]))
+			whole.Write(buf[:n])
+			f.Size += int64(n)
+		}
+		if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
+			break
+		}
+		if err != nil {
+			return File{}, err
+		}
+	}
+	f.SHA256 = hex.EncodeToString(whole.Sum(nil))
+	return f, nil
+}

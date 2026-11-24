@@ -278,6 +278,12 @@ func init() {
 			args: "--config DAEMON.toml", help: "run the daemon"},
 		{name: "agent", summary: "run this host as a remote node (--config AGENT.toml)", run: agentCommand,
 			args: "--config AGENT.toml", help: "run this host as a remote node: its providers and executors report to the daemon"},
+		{name: "loader", summary: "streams: raw records in a fixed, resumable order, handed to ranks over a socket (issue #43)", group: &commandGroup{
+			subs: []command{
+				{"serve", "--spec SPEC.json --listen unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--origin http|dir:DIR]", "make a stream for the ranks of an attempt", loaderServe},
+				{"identify", "[--chunk-bytes N] [--name NAME] PATH|URL...", "print the identity of files (size, sha256, chunk hashes), as a stream's spec lists them", loaderIdentify},
+			},
+		}},
 		{name: "controller", summary: "run this host's device controller (--config CONTROLLER.toml)", run: controllerCommand,
 			args: "--config CONTROLLER.toml", help: "keep this host's controlled devices at their desired settings (elevated / root)"},
 		{name: "token", summary: "create, list or revoke API tokens (direct database access)", group: &commandGroup{
