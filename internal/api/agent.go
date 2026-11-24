@@ -14,192 +14,15 @@ import (
 	"strings"
 	"time"
 
+	"kairo/internal/agentops"
 	"kairo/internal/store"
 )
 
 // The agent API lets a node agent on another host drive the coordination
 // operations the daemon's in-process executors call on the store. A node token
 // is bound to one node: every operation is checked against the node that owns
-// the executor, lease, attempt, provider or log it names.
-
-type agentRegisterRequest struct {
-	Node          store.Node       `json:"node"`
-	Executors     []store.Executor `json:"executors"`
-	Providers     []agentProvider  `json:"providers"`
-	UptimeSeconds *float64         `json:"uptime_seconds,omitempty"`
-	// Adopt lists the attempts the agent still runs (store.ReregisterExecutor).
-	Adopt []store.AdoptedAttempt `json:"adopt,omitempty"`
-}
-
-type agentProvider struct {
-	ID   string `json:"id"`
-	Kind string `json:"kind"`
-}
-
-type agentObservationRequest struct {
-	ProviderID   string                   `json:"provider_id"`
-	Resources    []store.ResourceInstance `json:"resources"`
-	Observations []store.Observation      `json:"observations"`
-	Claims       []store.ExternalClaim    `json:"claims"`
-}
-
-type agentExecutorRequest struct {
-	ExecutorID string `json:"executor_id"`
-}
-
-type agentNodeRequest struct {
-	NodeID string `json:"node_id"`
-}
-
-type agentStoreObservationRequest struct {
-	Observation store.StoreObservation `json:"observation"`
-}
-
-type agentAttemptScratchRequest struct {
-	Scratch store.AttemptScratch `json:"scratch"`
-}
-
-type agentSettleScratchRequest struct {
-	Settled store.ScratchSettled `json:"settled"`
-}
-
-type agentRunOutputRequest struct {
-	Output store.RunOutput `json:"output"`
-}
-
-type agentRecordPackRequest struct {
-	Made store.PackMade `json:"made"`
-}
-
-type agentRecordCopyRequest struct {
-	Made store.CopyMade `json:"made"`
-}
-
-type agentDescribedRequest struct {
-	ExecutorID string `json:"executor_id"`
-	ObjectID   string `json:"object_id"`
-	StoreID    string `json:"store_id"`
-}
-
-type agentAbandonPackRequest struct {
-	ExecutorID string `json:"executor_id"`
-	ObjectID   string `json:"object_id"`
-	Reason     string `json:"reason"`
-}
-
-type agentInputGoneRequest struct {
-	ExecutorID string `json:"executor_id"`
-	ObjectID   string `json:"object_id"`
-	Path       string `json:"path"`
-}
-
-type agentInventoryRequest struct {
-	Listing store.DurableListing `json:"listing"`
-}
-
-type agentAdoptRequest struct {
-	ExecutorID string              `json:"executor_id"`
-	StoreID    string              `json:"store_id"`
-	Root       string              `json:"root"`
-	Copies     []store.AdoptedCopy `json:"copies"`
-}
-
-type agentRecordFetchRequest struct {
-	Made store.FetchMade `json:"made"`
-}
-
-type agentSettleDeletionRequest struct {
-	Settled store.ObjectDeletion `json:"settled"`
-}
-
-type agentSettleEvictionRequest struct {
-	Settled store.EvictionSettled `json:"settled"`
-}
-
-type agentRecordScrubRequest struct {
-	Result store.ScrubResult `json:"result"`
-}
-
-type agentPackReadRequest struct {
-	NodeID   string `json:"node_id"`
-	ObjectID string `json:"object_id"`
-	Token    string `json:"token"`
-}
-
-type agentUnlaunchedRequest struct {
-	ExecutorID       string  `json:"executor_id"`
-	OlderThanSeconds float64 `json:"older_than_seconds"`
-}
-
-type agentLeaseRequest struct {
-	LeaseID string `json:"lease_id"`
-	Epoch   int64  `json:"epoch"`
-	Reason  string `json:"reason,omitempty"`
-}
-
-type agentAuthorizeRequest struct {
-	Reservation store.Reservation `json:"reservation"`
-}
-
-type agentActivateRequest struct {
-	AttemptID       string `json:"attempt_id"`
-	LeaseID         string `json:"lease_id"`
-	Epoch           int64  `json:"epoch"`
-	Token           string `json:"token"`
-	PID             int    `json:"pid"`
-	ProcessIdentity string `json:"process_identity"`
-}
-
-type agentLogPathsRequest struct {
-	AttemptID  string `json:"attempt_id"`
-	Epoch      int64  `json:"epoch"`
-	StdoutPath string `json:"stdout_path"`
-	StderrPath string `json:"stderr_path"`
-}
-
-type agentLogProblemRequest struct {
-	AttemptID string           `json:"attempt_id"`
-	Problem   store.LogProblem `json:"problem"`
-}
-
-type agentProcessExitedRequest struct {
-	AttemptID string `json:"attempt_id"`
-	Role      string `json:"role"`
-	Rank      int    `json:"rank"`
-	Identity  string `json:"identity"`
-}
-
-type agentTerminalRequest struct {
-	AttemptID  string `json:"attempt_id"`
-	LeaseID    string `json:"lease_id"`
-	Epoch      int64  `json:"epoch"`
-	ExitCode   int    `json:"exit_code"`
-	ExitSignal string `json:"exit_signal"`
-}
-
-type agentAttemptLeaseRequest struct {
-	AttemptID string `json:"attempt_id"`
-	LeaseID   string `json:"lease_id"`
-	Epoch     int64  `json:"epoch"`
-}
-
-type agentAttemptRequest struct {
-	AttemptID string `json:"attempt_id"`
-}
-
-// agentAttemptUsage is what an attempt's process tree uses now; a field left
-// out is not known.
-type agentAttemptUsage struct {
-	AttemptID        string `json:"attempt_id"`
-	RAMBytes         *int64 `json:"ram_bytes"`
-	DiskWrittenBytes *int64 `json:"disk_written_bytes"`
-}
-
-type agentForceStopAck struct {
-	AttemptID string          `json:"attempt_id"`
-	Phase     string          `json:"phase"`
-	Detail    json.RawMessage `json:"detail,omitempty"`
-}
+// the executor, lease, attempt, provider or log it names. The operations are
+// declared once, in internal/agentops, which the agents' client calls too.
 
 // AgentLogAppend ships a slice of an attempt log. Offset is the byte offset of
 // Data in the node-side file, which makes a retried append idempotent.
@@ -211,25 +34,17 @@ type AgentLogAppend struct {
 
 var attemptLogName = regexp.MustCompile(`^([A-Za-z0-9_-]+)\.(stdout|stderr)\.log$`)
 
-// How an operation behaves when the daemon is observe-only, mirroring an
-// in-process executor that only observes.
-const (
-	observeAllowed = iota // observation and facts about processes already running
-	observeEmpty          // polls answer with nothing to do
-	observeRefused        // actuation is refused (423)
-)
-
 type agentOp struct {
 	name    string
 	handler http.HandlerFunc
 }
 
-// newAgentOp decodes the request once, checks that the caller's node owns
-// the object it names (owner returns that node), applies the observe-only
-// rule, and runs the operation.
-func newAgentOp[T any](s *Server, name string, observe int, empty any, owner func(context.Context, T) (string, error), run func(context.Context, T) (any, error)) agentOp {
-	return agentOp{name: name, handler: func(w http.ResponseWriter, r *http.Request) {
-		var body T
+// handle serves op: it decodes the request once, checks that the caller's
+// node owns the object it names (owner returns that node), applies op's
+// observe-only rule, and runs the operation.
+func handle[Req, Resp any](s *Server, op agentops.Op[Req, Resp], owner func(context.Context, Req) (string, error), run func(context.Context, Req) (Resp, error)) agentOp {
+	return agentOp{name: op.Name, handler: func(w http.ResponseWriter, r *http.Request) {
+		var body Req
 		if err := decode(r, &body); err != nil {
 			writeError(w, err)
 			return
@@ -243,11 +58,11 @@ func newAgentOp[T any](s *Server, name string, observe int, empty any, owner fun
 			writeError(w, fmt.Errorf("%w: belongs to node %s", ErrForbidden, node))
 			return
 		}
-		if s.ObserveOnly && observe == observeEmpty {
-			writeJSON(w, http.StatusOK, empty)
+		if s.ObserveOnly && op.Observe == agentops.Empty {
+			writeJSON(w, http.StatusOK, op.Empty)
 			return
 		}
-		if s.ObserveOnly && observe == observeRefused {
+		if s.ObserveOnly && op.Observe == agentops.Refused {
 			writeError(w, errObserveOnly)
 			return
 		}
@@ -262,337 +77,327 @@ func newAgentOp[T any](s *Server, name string, observe int, empty any, owner fun
 
 var okBody = map[string]bool{"ok": true}
 
+// recorded is the answer of an operation that only records, once it has.
+func recorded(err error) (agentops.OK, error) { return agentops.OK{OK: true}, err }
+
 func (s *Server) agentOps() []agentOp {
-	byExecutor := func(ctx context.Context, b agentExecutorRequest) (string, error) {
+	byExecutor := func(ctx context.Context, b agentops.ExecutorRequest) (string, error) {
 		return s.Store.ExecutorNode(ctx, b.ExecutorID)
 	}
-	byLease := func(ctx context.Context, b agentLeaseRequest) (string, error) {
+	byNode := func(_ context.Context, b agentops.NodeRequest) (string, error) { return b.NodeID, nil }
+	byLease := func(ctx context.Context, b agentops.LeaseRequest) (string, error) {
 		return s.Store.LeaseNode(ctx, b.LeaseID)
 	}
+	byInput := func(ctx context.Context, b agentops.InputPathRequest) (string, error) {
+		return s.Store.ExecutorNode(ctx, b.ExecutorID)
+	}
+	byObjectStore := func(ctx context.Context, b agentops.ObjectStoreRequest) (string, error) {
+		return s.Store.ExecutorNode(ctx, b.ExecutorID)
+	}
 	return []agentOp{
-		newAgentOp(s, "register", observeAllowed, nil,
-			func(_ context.Context, b agentRegisterRequest) (string, error) { return b.Node.ID, nil },
+		handle(s, agentops.Register,
+			func(_ context.Context, b agentops.RegisterRequest) (string, error) { return b.Node.ID, nil },
 			s.agentRegister),
-		newAgentOp(s, "observations", observeAllowed, nil,
-			func(ctx context.Context, b agentObservationRequest) (string, error) {
+		handle(s, agentops.Observations,
+			func(ctx context.Context, b agentops.ObservationRequest) (string, error) {
 				return s.Store.ProviderNode(ctx, b.ProviderID)
 			},
-			func(ctx context.Context, b agentObservationRequest) (any, error) {
-				return okBody, s.Store.ApplyObservationBatch(ctx, b.ProviderID, b.Resources, b.Observations, b.Claims)
+			func(ctx context.Context, b agentops.ObservationRequest) (agentops.OK, error) {
+				return recorded(s.Store.ApplyObservationBatch(ctx, b.ProviderID, b.Resources, b.Observations, b.Claims))
 			}),
-		newAgentOp(s, "reserve-next", observeEmpty, map[string]any{"reservation": nil}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.ReserveNext, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.ReservationAnswer, error) {
 				reservation, err := s.Store.ReserveNext(ctx, b.ExecutorID)
-				return map[string]any{"reservation": reservation}, err
+				return agentops.ReservationAnswer{Reservation: reservation}, err
 			}),
-		newAgentOp(s, "ensure-preemption", observeEmpty, map[string]any{"commands": []string{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.EnsurePreemption, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.CommandsAnswer, error) {
 				commands, err := s.Store.EnsurePriorityPreemption(ctx, b.ExecutorID)
-				return map[string]any{"commands": commands}, err
+				return agentops.CommandsAnswer{Commands: commands}, err
 			}),
-		// An observe-only daemon gives an agent no stores: it then neither
-		// makes a root nor a scratch, nor deletes anything.
-		newAgentOp(s, "stores", observeEmpty, map[string]any{"stores": []any{}},
-			func(_ context.Context, b agentNodeRequest) (string, error) { return b.NodeID, nil },
-			func(ctx context.Context, b agentNodeRequest) (any, error) {
+		handle(s, agentops.Stores, byNode,
+			func(ctx context.Context, b agentops.NodeRequest) (agentops.StoresAnswer, error) {
 				stores, err := s.Store.NodeStores(ctx, b.NodeID)
-				return map[string]any{"stores": stores}, err
+				return agentops.StoresAnswer{Stores: stores}, err
 			}),
-		newAgentOp(s, "store-observation", observeAllowed, nil,
-			func(ctx context.Context, b agentStoreObservationRequest) (string, error) {
+		handle(s, agentops.StoreObservation,
+			func(ctx context.Context, b agentops.StoreObservationRequest) (string, error) {
 				return s.Store.StoreNode(ctx, b.Observation.StoreID)
 			},
-			func(ctx context.Context, b agentStoreObservationRequest) (any, error) {
-				return okBody, s.Store.RecordStoreObservation(ctx, b.Observation)
+			func(ctx context.Context, b agentops.StoreObservationRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordStoreObservation(ctx, b.Observation))
 			}),
-		newAgentOp(s, "attempt-scratch", observeRefused, nil,
-			func(ctx context.Context, b agentAttemptScratchRequest) (string, error) {
+		handle(s, agentops.AttemptScratch,
+			func(ctx context.Context, b agentops.AttemptScratchRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.Scratch.AttemptID)
 			},
-			func(ctx context.Context, b agentAttemptScratchRequest) (any, error) {
-				return okBody, s.Store.RecordAttemptScratch(ctx, b.Scratch)
+			func(ctx context.Context, b agentops.AttemptScratchRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordAttemptScratch(ctx, b.Scratch))
 			}),
-		newAgentOp(s, "scratch-to-settle", observeEmpty, map[string]any{"scratch": []store.ScratchSettlement{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.ScratchToSettle, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.ScratchAnswer, error) {
 				scratch, err := s.Store.ScratchToSettle(ctx, b.ExecutorID)
-				return map[string]any{"scratch": scratch}, err
+				return agentops.ScratchAnswer{Scratch: scratch}, err
 			}),
-		newAgentOp(s, "settle-scratch", observeRefused, nil,
-			func(ctx context.Context, b agentSettleScratchRequest) (string, error) {
+		handle(s, agentops.SettleScratch,
+			func(ctx context.Context, b agentops.SettleScratchRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.Settled.AttemptID)
 			},
-			func(ctx context.Context, b agentSettleScratchRequest) (any, error) {
-				return okBody, s.Store.SettleScratch(ctx, b.Settled)
+			func(ctx context.Context, b agentops.SettleScratchRequest) (agentops.OK, error) {
+				return recorded(s.Store.SettleScratch(ctx, b.Settled))
 			}),
-		newAgentOp(s, "run-output", observeRefused, nil,
-			func(ctx context.Context, b agentRunOutputRequest) (string, error) {
+		handle(s, agentops.RunOutput,
+			func(ctx context.Context, b agentops.RunOutputRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.Output.AttemptID)
 			},
-			func(ctx context.Context, b agentRunOutputRequest) (any, error) {
-				return okBody, s.Store.RecordRunOutput(ctx, b.Output)
+			func(ctx context.Context, b agentops.RunOutputRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordRunOutput(ctx, b.Output))
 			}),
-		// An observe-only daemon orders no packs.
-		newAgentOp(s, "packs-to-make", observeEmpty, map[string]any{"packs": []store.PackOrder{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.PacksToMake, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.PacksAnswer, error) {
 				packs, err := s.Store.PacksToMake(ctx, b.ExecutorID)
-				return map[string]any{"packs": packs}, err
+				return agentops.PacksAnswer{Packs: packs}, err
 			}),
-		newAgentOp(s, "record-pack", observeRefused, nil,
-			func(ctx context.Context, b agentRecordPackRequest) (string, error) {
+		handle(s, agentops.RecordPack,
+			func(ctx context.Context, b agentops.RecordPackRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.Made.ExecutorID)
 			},
-			func(ctx context.Context, b agentRecordPackRequest) (any, error) {
-				return okBody, s.Store.RecordPack(ctx, b.Made)
+			func(ctx context.Context, b agentops.RecordPackRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordPack(ctx, b.Made))
 			}),
-		// An observe-only daemon orders no copies.
-		newAgentOp(s, "copies-to-make", observeEmpty, map[string]any{"copies": []store.CopyOrder{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.CopiesToMake, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.CopiesAnswer, error) {
 				copies, err := s.Store.CopiesToMake(ctx, b.ExecutorID)
-				return map[string]any{"copies": copies}, err
+				return agentops.CopiesAnswer{Copies: copies}, err
 			}),
-		newAgentOp(s, "record-described", observeRefused, nil,
-			func(ctx context.Context, b agentDescribedRequest) (string, error) {
+		handle(s, agentops.RecordDescribed, byObjectStore,
+			func(ctx context.Context, b agentops.ObjectStoreRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordDescribed(ctx, b.ExecutorID, b.ObjectID, b.StoreID))
+			}),
+		handle(s, agentops.AbandonPack,
+			func(ctx context.Context, b agentops.AbandonPackRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.ExecutorID)
 			},
-			func(ctx context.Context, b agentDescribedRequest) (any, error) {
-				return okBody, s.Store.RecordDescribed(ctx, b.ExecutorID, b.ObjectID, b.StoreID)
+			func(ctx context.Context, b agentops.AbandonPackRequest) (agentops.OK, error) {
+				return recorded(s.Store.AbandonPack(ctx, b.ExecutorID, b.ObjectID, b.Reason))
 			}),
-		newAgentOp(s, "abandon-pack", observeRefused, nil,
-			func(ctx context.Context, b agentAbandonPackRequest) (string, error) {
-				return s.Store.ExecutorNode(ctx, b.ExecutorID)
-			},
-			func(ctx context.Context, b agentAbandonPackRequest) (any, error) {
-				return okBody, s.Store.AbandonPack(ctx, b.ExecutorID, b.ObjectID, b.Reason)
-			}),
-		newAgentOp(s, "in-place-sources", observeEmpty, map[string]any{"sources": []store.InPlaceSource{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.InPlaceSources, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.InPlaceSourcesAnswer, error) {
 				sources, err := s.Store.InPlaceSources(ctx, b.ExecutorID)
 				if sources == nil {
 					sources = []store.InPlaceSource{}
 				}
-				return map[string]any{"sources": sources}, err
+				return agentops.InPlaceSourcesAnswer{Sources: sources}, err
 			}),
-		newAgentOp(s, "input-gone", observeRefused, nil,
-			func(ctx context.Context, b agentInputGoneRequest) (string, error) {
-				return s.Store.ExecutorNode(ctx, b.ExecutorID)
-			},
-			func(ctx context.Context, b agentInputGoneRequest) (any, error) {
-				return okBody, s.Store.InputGone(ctx, b.ExecutorID, b.ObjectID, b.Path)
+		handle(s, agentops.InputGone, byInput,
+			func(ctx context.Context, b agentops.InputPathRequest) (agentops.OK, error) {
+				return recorded(s.Store.InputGone(ctx, b.ExecutorID, b.ObjectID, b.Path))
 			}),
-		newAgentOp(s, "input-is-file", observeRefused, nil,
-			func(ctx context.Context, b agentInputGoneRequest) (string, error) {
-				return s.Store.ExecutorNode(ctx, b.ExecutorID)
-			},
-			func(ctx context.Context, b agentInputGoneRequest) (any, error) {
-				return okBody, s.Store.InputIsFile(ctx, b.ExecutorID, b.ObjectID, b.Path)
+		handle(s, agentops.InputIsFile, byInput,
+			func(ctx context.Context, b agentops.InputPathRequest) (agentops.OK, error) {
+				return recorded(s.Store.InputIsFile(ctx, b.ExecutorID, b.ObjectID, b.Path))
 			}),
-		newAgentOp(s, "claim-shed", observeRefused, nil,
-			func(ctx context.Context, b agentDescribedRequest) (string, error) {
-				return s.Store.ExecutorNode(ctx, b.ExecutorID)
-			},
-			func(ctx context.Context, b agentDescribedRequest) (any, error) {
-				return okBody, s.Store.ClaimShed(ctx, b.ExecutorID, b.ObjectID, b.StoreID)
+		handle(s, agentops.ClaimShed, byObjectStore,
+			func(ctx context.Context, b agentops.ObjectStoreRequest) (agentops.OK, error) {
+				return recorded(s.Store.ClaimShed(ctx, b.ExecutorID, b.ObjectID, b.StoreID))
 			}),
-		newAgentOp(s, "inventory-durable", observeRefused, nil,
-			func(ctx context.Context, b agentInventoryRequest) (string, error) {
+		handle(s, agentops.InventoryDurable,
+			func(ctx context.Context, b agentops.InventoryRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.Listing.ExecutorID)
 			},
-			func(ctx context.Context, b agentInventoryRequest) (any, error) {
+			func(ctx context.Context, b agentops.InventoryRequest) (store.DurableInventory, error) {
 				return s.Store.InventoryDurable(ctx, b.Listing)
 			}),
-		newAgentOp(s, "adopt-copies", observeRefused, nil,
-			func(ctx context.Context, b agentAdoptRequest) (string, error) {
+		handle(s, agentops.AdoptCopies,
+			func(ctx context.Context, b agentops.AdoptCopiesRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.ExecutorID)
 			},
-			func(ctx context.Context, b agentAdoptRequest) (any, error) {
+			func(ctx context.Context, b agentops.AdoptCopiesRequest) (agentops.AdoptedAnswer, error) {
 				n, err := s.Store.AdoptCopies(ctx, b.ExecutorID, b.StoreID, b.Root, b.Copies)
-				return map[string]int{"adopted": n}, err
+				return agentops.AdoptedAnswer{Adopted: n}, err
 			}),
-		newAgentOp(s, "record-copy", observeRefused, nil,
-			func(ctx context.Context, b agentRecordCopyRequest) (string, error) {
+		handle(s, agentops.RecordCopy,
+			func(ctx context.Context, b agentops.RecordCopyRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.Made.ExecutorID)
 			},
-			func(ctx context.Context, b agentRecordCopyRequest) (any, error) {
-				return okBody, s.Store.RecordCopy(ctx, b.Made)
+			func(ctx context.Context, b agentops.RecordCopyRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordCopy(ctx, b.Made))
 			}),
-		// An observe-only daemon orders nothing brought.
-		newAgentOp(s, "fetches-to-make", observeEmpty, map[string]any{"fetches": []store.FetchOrder{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.FetchesToMake, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.FetchesAnswer, error) {
 				fetches, err := s.Store.FetchesToMake(ctx, b.ExecutorID)
-				return map[string]any{"fetches": fetches}, err
+				return agentops.FetchesAnswer{Fetches: fetches}, err
 			}),
-		newAgentOp(s, "record-fetch", observeRefused, nil,
-			func(ctx context.Context, b agentRecordFetchRequest) (string, error) {
+		handle(s, agentops.RecordFetch,
+			func(ctx context.Context, b agentops.RecordFetchRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.Made.ExecutorID)
 			},
-			func(ctx context.Context, b agentRecordFetchRequest) (any, error) {
-				return okBody, s.Store.RecordFetch(ctx, b.Made)
+			func(ctx context.Context, b agentops.RecordFetchRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordFetch(ctx, b.Made))
 			}),
-		// An observe-only daemon orders no deletion and no read back.
-		newAgentOp(s, "deletions-to-make", observeEmpty, map[string]any{"deletions": []store.DeletionOrder{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.DeletionsToMake, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.DeletionsAnswer, error) {
 				deletions, err := s.Store.DeletionsToMake(ctx, b.ExecutorID)
-				return map[string]any{"deletions": deletions}, err
+				return agentops.DeletionsAnswer{Deletions: deletions}, err
 			}),
-		newAgentOp(s, "settle-deletion", observeRefused, nil,
-			func(ctx context.Context, b agentSettleDeletionRequest) (string, error) {
+		handle(s, agentops.SettleDeletion,
+			func(ctx context.Context, b agentops.SettleDeletionRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.Settled.ExecutorID)
 			},
-			func(ctx context.Context, b agentSettleDeletionRequest) (any, error) {
-				return okBody, s.Store.SettleDeletion(ctx, b.Settled)
+			func(ctx context.Context, b agentops.SettleDeletionRequest) (agentops.OK, error) {
+				return recorded(s.Store.SettleDeletion(ctx, b.Settled))
 			}),
-		// An observe-only daemon orders no eviction.
-		newAgentOp(s, "sources-in-use", observeAllowed, nil, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.SourcesInUse, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.SourceIDsAnswer, error) {
 				ids, err := s.Store.SourcesInUse(ctx, b.ExecutorID)
-				return map[string]any{"sources": ids}, err
+				return agentops.SourceIDsAnswer{Sources: ids}, err
 			}),
-		newAgentOp(s, "evictions-to-make", observeEmpty, map[string]any{"evictions": []store.EvictionOrder{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.EvictionsToMake, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.EvictionsAnswer, error) {
 				evictions, err := s.Store.EvictionsToMake(ctx, b.ExecutorID)
-				return map[string]any{"evictions": evictions}, err
+				return agentops.EvictionsAnswer{Evictions: evictions}, err
 			}),
-		newAgentOp(s, "settle-eviction", observeRefused, nil,
-			func(ctx context.Context, b agentSettleEvictionRequest) (string, error) {
+		handle(s, agentops.SettleEviction,
+			func(ctx context.Context, b agentops.SettleEvictionRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.Settled.ExecutorID)
 			},
-			func(ctx context.Context, b agentSettleEvictionRequest) (any, error) {
-				return okBody, s.Store.SettleEviction(ctx, b.Settled)
+			func(ctx context.Context, b agentops.SettleEvictionRequest) (agentops.OK, error) {
+				return recorded(s.Store.SettleEviction(ctx, b.Settled))
 			}),
-		newAgentOp(s, "scrubs-to-make", observeEmpty, map[string]any{"scrubs": []store.ScrubOrder{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.ScrubsToMake, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.ScrubsAnswer, error) {
 				scrubs, err := s.Store.ScrubsToMake(ctx, b.ExecutorID)
-				return map[string]any{"scrubs": scrubs}, err
+				return agentops.ScrubsAnswer{Scrubs: scrubs}, err
 			}),
-		newAgentOp(s, "record-scrub", observeRefused, nil,
-			func(ctx context.Context, b agentRecordScrubRequest) (string, error) {
+		handle(s, agentops.RecordScrub,
+			func(ctx context.Context, b agentops.RecordScrubRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.Result.ExecutorID)
 			},
-			func(ctx context.Context, b agentRecordScrubRequest) (any, error) {
-				return okBody, s.Store.RecordScrub(ctx, b.Result)
+			func(ctx context.Context, b agentops.RecordScrubRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordScrub(ctx, b.Result))
 			}),
-		// The agent of a pack's node asks before handing it over.
-		newAgentOp(s, "pack-read", observeRefused, nil,
-			func(_ context.Context, b agentPackReadRequest) (string, error) { return b.NodeID, nil },
-			func(ctx context.Context, b agentPackReadRequest) (any, error) {
+		handle(s, agentops.PackRead,
+			func(_ context.Context, b agentops.PackReadRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.PackReadRequest) (agentops.PackReadAnswer, error) {
 				read, err := s.Store.AuthorizePackRead(ctx, b.NodeID, b.ObjectID, b.Token)
-				return map[string]any{"read": read}, err
+				return agentops.PackReadAnswer{Read: read}, err
 			}),
-		newAgentOp(s, "unlaunched-leases", observeEmpty, map[string]any{"leases": []store.UnlaunchedLease{}},
-			func(ctx context.Context, b agentUnlaunchedRequest) (string, error) {
+		handle(s, agentops.UnlaunchedLeases,
+			func(ctx context.Context, b agentops.UnlaunchedRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.ExecutorID)
 			},
-			func(ctx context.Context, b agentUnlaunchedRequest) (any, error) {
+			func(ctx context.Context, b agentops.UnlaunchedRequest) (agentops.LeasesAnswer, error) {
 				leases, err := s.Store.ListUnlaunchedLeases(ctx, b.ExecutorID, time.Duration(b.OlderThanSeconds*float64(time.Second)))
-				return map[string]any{"leases": leases}, err
+				return agentops.LeasesAnswer{Leases: leases}, err
 			}),
-		newAgentOp(s, "validate-reservation", observeRefused, nil, byLease,
-			func(ctx context.Context, b agentLeaseRequest) (any, error) {
-				return okBody, s.Store.ValidateReservation(ctx, b.LeaseID, b.Epoch)
+		handle(s, agentops.ValidateReservation, byLease,
+			func(ctx context.Context, b agentops.LeaseRequest) (agentops.OK, error) {
+				return recorded(s.Store.ValidateReservation(ctx, b.LeaseID, b.Epoch))
 			}),
-		newAgentOp(s, "mark-lease-prepared", observeRefused, nil, byLease,
-			func(ctx context.Context, b agentLeaseRequest) (any, error) {
-				return okBody, s.Store.MarkLeasePrepared(ctx, b.LeaseID, b.Epoch)
+		handle(s, agentops.MarkLeasePrepared, byLease,
+			func(ctx context.Context, b agentops.LeaseRequest) (agentops.OK, error) {
+				return recorded(s.Store.MarkLeasePrepared(ctx, b.LeaseID, b.Epoch))
 			}),
-		newAgentOp(s, "release-reservation", observeRefused, nil, byLease,
-			func(ctx context.Context, b agentLeaseRequest) (any, error) {
-				return okBody, s.Store.ReleaseReservation(ctx, b.LeaseID, b.Epoch, b.Reason)
+		handle(s, agentops.ReleaseReservation, byLease,
+			func(ctx context.Context, b agentops.LeaseRequest) (agentops.OK, error) {
+				return recorded(s.Store.ReleaseReservation(ctx, b.LeaseID, b.Epoch, b.Reason))
 			}),
-		newAgentOp(s, "authorize-launch", observeRefused, nil,
-			func(ctx context.Context, b agentAuthorizeRequest) (string, error) {
+		handle(s, agentops.AuthorizeLaunch,
+			func(ctx context.Context, b agentops.AuthorizeRequest) (string, error) {
 				return s.Store.LeaseNode(ctx, b.Reservation.Lease.ID)
 			},
-			func(ctx context.Context, b agentAuthorizeRequest) (any, error) {
+			func(ctx context.Context, b agentops.AuthorizeRequest) (agentops.LaunchAnswer, error) {
 				launch, err := s.Store.AuthorizeLaunch(ctx, &b.Reservation)
-				return map[string]any{"launch": launch}, err
+				return agentops.LaunchAnswer{Launch: launch}, err
 			}),
-		newAgentOp(s, "activate-launch", observeRefused, nil,
-			func(ctx context.Context, b agentActivateRequest) (string, error) {
+		handle(s, agentops.ActivateLaunch,
+			func(ctx context.Context, b agentops.ActivateRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
-			func(ctx context.Context, b agentActivateRequest) (any, error) {
-				return okBody, s.Store.ActivateLaunch(ctx, b.AttemptID, b.LeaseID, b.Epoch, b.Token, b.PID, b.ProcessIdentity)
+			func(ctx context.Context, b agentops.ActivateRequest) (agentops.OK, error) {
+				return recorded(s.Store.ActivateLaunch(ctx, b.AttemptID, b.LeaseID, b.Epoch, b.Token, b.PID, b.ProcessIdentity))
 			}),
-		newAgentOp(s, "set-log-paths", observeAllowed, nil,
-			func(ctx context.Context, b agentLogPathsRequest) (string, error) {
+		handle(s, agentops.SetLogPaths,
+			func(ctx context.Context, b agentops.LogPathsRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
 			s.agentSetLogPaths),
-		newAgentOp(s, "log-problem", observeAllowed, nil,
-			func(ctx context.Context, b agentLogProblemRequest) (string, error) {
+		handle(s, agentops.LogProblem,
+			func(ctx context.Context, b agentops.LogProblemRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
-			func(ctx context.Context, b agentLogProblemRequest) (any, error) {
-				return okBody, s.Store.RecordAttemptLogProblem(ctx, b.AttemptID, b.Problem)
+			func(ctx context.Context, b agentops.LogProblemRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordAttemptLogProblem(ctx, b.AttemptID, b.Problem))
 			}),
-		newAgentOp(s, "mark-process-exited", observeAllowed, nil,
-			func(ctx context.Context, b agentProcessExitedRequest) (string, error) {
+		handle(s, agentops.MarkProcessExited,
+			func(ctx context.Context, b agentops.ProcessExitedRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
-			func(ctx context.Context, b agentProcessExitedRequest) (any, error) {
-				return okBody, s.Store.MarkAttemptProcessExited(ctx, b.AttemptID, b.Role, b.Rank, b.Identity)
+			func(ctx context.Context, b agentops.ProcessExitedRequest) (agentops.OK, error) {
+				return recorded(s.Store.MarkAttemptProcessExited(ctx, b.AttemptID, b.Role, b.Rank, b.Identity))
 			}),
-		newAgentOp(s, "record-terminal", observeAllowed, nil,
-			func(ctx context.Context, b agentTerminalRequest) (string, error) {
+		handle(s, agentops.RecordTerminal,
+			func(ctx context.Context, b agentops.TerminalRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
-			func(ctx context.Context, b agentTerminalRequest) (any, error) {
-				return okBody, s.Store.RecordTerminal(ctx, b.AttemptID, b.LeaseID, b.Epoch, b.ExitCode, b.ExitSignal)
+			func(ctx context.Context, b agentops.TerminalRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordTerminal(ctx, b.AttemptID, b.LeaseID, b.Epoch, b.ExitCode, b.ExitSignal))
 			}),
-		newAgentOp(s, "quiescence-candidates", observeEmpty, map[string]any{"candidates": []store.QuiescenceCandidate{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.QuiescenceCandidates, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.CandidatesAnswer, error) {
 				candidates, err := s.Store.ListQuiescenceCandidates(ctx, b.ExecutorID)
-				return map[string]any{"candidates": candidates}, err
+				return agentops.CandidatesAnswer{Candidates: candidates}, err
 			}),
-		newAgentOp(s, "finalize-quiescence", observeRefused, nil,
-			func(ctx context.Context, b agentAttemptLeaseRequest) (string, error) {
+		handle(s, agentops.FinalizeQuiescence,
+			func(ctx context.Context, b agentops.AttemptLeaseRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
-			func(ctx context.Context, b agentAttemptLeaseRequest) (any, error) {
-				return okBody, s.Store.FinalizeQuiescence(ctx, b.AttemptID, b.LeaseID, b.Epoch)
+			func(ctx context.Context, b agentops.AttemptLeaseRequest) (agentops.OK, error) {
+				return recorded(s.Store.FinalizeQuiescence(ctx, b.AttemptID, b.LeaseID, b.Epoch))
 			}),
-		newAgentOp(s, "quarantine-terminations", observeEmpty, map[string]any{"terminations": []store.QuarantineTermination{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.QuarantineTerms, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.TerminationsAnswer, error) {
 				terminations, err := s.Store.ListQuarantineTerminations(ctx, b.ExecutorID)
-				return map[string]any{"terminations": terminations}, err
+				return agentops.TerminationsAnswer{Terminations: terminations}, err
 			}),
-		newAgentOp(s, "quarantine-terminated", observeRefused, nil,
-			func(ctx context.Context, b agentAttemptRequest) (string, error) {
+		handle(s, agentops.QuarantineTerminated,
+			func(ctx context.Context, b agentops.AttemptRequest) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
-			func(ctx context.Context, b agentAttemptRequest) (any, error) {
-				return okBody, s.Store.MarkQuarantineTerminated(ctx, b.AttemptID)
+			func(ctx context.Context, b agentops.AttemptRequest) (agentops.OK, error) {
+				return recorded(s.Store.MarkQuarantineTerminated(ctx, b.AttemptID))
 			}),
-		newAgentOp(s, "force-stop-orders", observeEmpty, map[string]any{"orders": []store.ForceStopOrder{}}, byExecutor,
-			func(ctx context.Context, b agentExecutorRequest) (any, error) {
+		handle(s, agentops.ForceStopOrders, byExecutor,
+			func(ctx context.Context, b agentops.ExecutorRequest) (agentops.ForceStopOrdersAnswer, error) {
 				orders, err := s.Store.ForceStopOrders(ctx, b.ExecutorID)
-				return map[string]any{"orders": orders}, err
+				return agentops.ForceStopOrdersAnswer{Orders: orders}, err
 			}),
-		newAgentOp(s, "force-stop-ack", observeRefused, nil,
-			func(ctx context.Context, b agentForceStopAck) (string, error) {
+		handle(s, agentops.ForceStopAcked,
+			func(ctx context.Context, b agentops.ForceStopAck) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
-			func(ctx context.Context, b agentForceStopAck) (any, error) {
-				return okBody, s.Store.AckForceStop(ctx, b.AttemptID, b.Phase, b.Detail)
+			func(ctx context.Context, b agentops.ForceStopAck) (agentops.OK, error) {
+				return recorded(s.Store.AckForceStop(ctx, b.AttemptID, b.Phase, b.Detail))
 			}),
-		newAgentOp(s, "attempt-usage", observeAllowed, nil,
-			func(ctx context.Context, b agentAttemptUsage) (string, error) {
+		handle(s, agentops.AttemptUsed,
+			func(ctx context.Context, b agentops.AttemptUsage) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)
 			},
-			func(ctx context.Context, b agentAttemptUsage) (any, error) {
-				return okBody, s.Store.RecordAttemptUsage(ctx, b.AttemptID, b.RAMBytes, b.DiskWrittenBytes)
+			func(ctx context.Context, b agentops.AttemptUsage) (agentops.OK, error) {
+				return recorded(s.Store.RecordAttemptUsage(ctx, b.AttemptID, b.RAMBytes, b.DiskWrittenBytes))
 			}),
 	}
 }
 
-func (s *Server) agentRegister(ctx context.Context, b agentRegisterRequest) (any, error) {
+func (s *Server) agentRegister(ctx context.Context, b agentops.RegisterRequest) (agentops.RegisterAnswer, error) {
+	var none agentops.RegisterAnswer
 	if b.Node.ID == "" || b.Node.Name == "" {
-		return nil, errors.New("node.id and node.name are required")
+		return none, errors.New("node.id and node.name are required")
 	}
 	if b.UptimeSeconds != nil {
 		nanos := math.Ceil(*b.UptimeSeconds * float64(time.Second))
 		if !(nanos > 0 && nanos < float64(math.MaxInt64)) {
-			return nil, errors.New("uptime_seconds must be positive and fit in a duration")
+			return none, errors.New("uptime_seconds must be positive and fit in a duration")
 		}
 		// Use the daemon's clock, which also stamps attempt activation.
 		bootedAt := time.Now().UTC().Add(-time.Duration(nanos)).Format(time.RFC3339Nano)
@@ -600,25 +405,25 @@ func (s *Server) agentRegister(ctx context.Context, b agentRegisterRequest) (any
 	}
 	b.Node.Enabled = true
 	if err := s.Store.UpsertNode(ctx, b.Node); err != nil {
-		return nil, err
+		return none, err
 	}
 	for _, p := range b.Providers {
 		if p.ID == "" || p.Kind == "" {
-			return nil, errors.New("provider id and kind are required")
+			return none, errors.New("provider id and kind are required")
 		}
 		if err := s.Store.UpsertProvider(ctx, p.ID, b.Node.ID, p.Kind, nil); err != nil {
-			return nil, err
+			return none, err
 		}
 	}
 	stale := map[string]int{}
 	adopted := []string{}
 	for _, e := range b.Executors {
 		if e.ID == "" {
-			return nil, errors.New("executor id is required")
+			return none, errors.New("executor id is required")
 		}
 		e.NodeID = b.Node.ID
 		if err := s.Store.UpsertExecutor(ctx, e); err != nil {
-			return nil, err
+			return none, err
 		}
 		if e.Enabled {
 			// A (re)starting agent vouches only for the attempts it adopts;
@@ -626,36 +431,36 @@ func (s *Server) agentRegister(ctx context.Context, b agentRegisterRequest) (any
 			// until quiescence is proven.
 			n, kept, err := s.Store.ReregisterExecutor(ctx, e.ID, b.Adopt)
 			if err != nil {
-				return nil, err
+				return none, err
 			}
 			stale[e.ID] = n
 			adopted = append(adopted, kept...)
 		}
 	}
-	return map[string]any{"stale_leases": stale, "adopted": adopted}, nil
+	return agentops.RegisterAnswer{StaleLeases: stale, Adopted: adopted}, nil
 }
 
 // agentSetLogPaths records the daemon-side copies of an attempt's logs:
 // logs are shipped into the daemon's log directory under their own names,
 // which must be the attempt's.
-func (s *Server) agentSetLogPaths(ctx context.Context, b agentLogPathsRequest) (any, error) {
+func (s *Server) agentSetLogPaths(ctx context.Context, b agentops.LogPathsRequest) (agentops.OK, error) {
 	paths := make([]string, 0, 2)
 	for _, path := range []string{b.StdoutPath, b.StderrPath} {
 		// The agent may be on another OS: a Windows path uses backslashes.
 		name := path[strings.LastIndexAny(path, `/\`)+1:]
 		if attempt, _ := logAttempt(name); attempt != b.AttemptID {
-			return nil, fmt.Errorf("log %q is not named after attempt %s", name, b.AttemptID)
+			return agentops.OK{}, fmt.Errorf("log %q is not named after attempt %s", name, b.AttemptID)
 		}
 		local, err := s.agentLogPath(name)
 		if err != nil {
-			return nil, err
+			return agentops.OK{}, err
 		}
 		paths = append(paths, local)
 	}
 	if !strings.HasSuffix(paths[0], ".stdout.log") || !strings.HasSuffix(paths[1], ".stderr.log") {
-		return nil, errors.New("stdout_path and stderr_path must name the .stdout.log and .stderr.log files")
+		return agentops.OK{}, errors.New("stdout_path and stderr_path must name the .stdout.log and .stderr.log files")
 	}
-	return okBody, s.Store.SetAttemptLogPaths(ctx, b.AttemptID, b.Epoch, paths[0], paths[1])
+	return recorded(s.Store.SetAttemptLogPaths(ctx, b.AttemptID, b.Epoch, paths[0], paths[1]))
 }
 
 // logAttempt returns the attempt an attempt log file is named after.

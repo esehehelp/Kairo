@@ -20,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	"kairo/internal/agentops"
 	"kairo/internal/api"
 	"kairo/internal/machine"
 	"kairo/internal/store"
@@ -92,10 +93,22 @@ func (c *Client) call(ctx context.Context, op string, body, out any) error {
 	return json.Unmarshal(raw, out)
 }
 
-type Provider struct {
-	ID   string `json:"id"`
-	Kind string `json:"kind"`
+// do calls the agent operation op (internal/agentops) with req and returns
+// its answer.
+func do[Req, Resp any](ctx context.Context, c *Client, op agentops.Op[Req, Resp], req Req) (Resp, error) {
+	var out Resp
+	err := c.call(ctx, op.Name, req, &out)
+	return out, err
 }
+
+// done is do for an operation that only records.
+func done[Req any](ctx context.Context, c *Client, op agentops.Op[Req, agentops.OK], req Req) error {
+	_, err := do(ctx, c, op, req)
+	return err
+}
+
+// Provider is a provider this node registers.
+type Provider = agentops.Provider
 
 // Register upserts this node, its providers and executors, and marks the
 // executors' previous leases stale until quiescence is proven again.
@@ -109,272 +122,223 @@ func (c *Client) Register(ctx context.Context, node store.Node, executors []stor
 // it kept. An empty adopt is not sent (a daemon before adoption refuses the
 // field).
 func (c *Client) RegisterAdopting(ctx context.Context, node store.Node, executors []store.Executor, providers []Provider, adopt []store.AdoptedAttempt) (stale map[string]int, adopted []string, err error) {
-	var out struct {
-		StaleLeases map[string]int `json:"stale_leases"`
-		Adopted     []string       `json:"adopted"`
-	}
-	body := map[string]any{"node": node, "executors": executors, "providers": providers}
-	if len(adopt) > 0 {
-		body["adopt"] = adopt
-	}
+	req := agentops.RegisterRequest{Node: node, Executors: executors, Providers: providers, Adopt: adopt}
 	if seconds, ok := uptimeSeconds(); ok {
-		body["uptime_seconds"] = seconds
+		req.UptimeSeconds = &seconds
 	}
-	err = c.call(ctx, "register", body, &out)
+	out, err := do(ctx, c, agentops.Register, req)
 	return out.StaleLeases, out.Adopted, err
 }
 
 func (c *Client) ApplyObservationBatch(ctx context.Context, providerID string, resources []store.ResourceInstance, observations []store.Observation, claims []store.ExternalClaim) error {
-	return c.call(ctx, "observations", map[string]any{"provider_id": providerID, "resources": resources, "observations": observations, "claims": claims}, nil)
+	return done(ctx, c, agentops.Observations, agentops.ObservationRequest{ProviderID: providerID, Resources: resources, Observations: observations, Claims: claims})
 }
 
 func (c *Client) ReserveNext(ctx context.Context, executorID string) (*store.Reservation, error) {
-	var out struct {
-		Reservation *store.Reservation `json:"reservation"`
-	}
-	err := c.call(ctx, "reserve-next", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.ReserveNext, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Reservation, err
 }
 
 func (c *Client) EnsurePriorityPreemption(ctx context.Context, executorID string) ([]string, error) {
-	var out struct {
-		Commands []string `json:"commands"`
-	}
-	err := c.call(ctx, "ensure-preemption", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.EnsurePreemption, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Commands, err
 }
 
 // NodeStores asks for the stores declared on this node. A daemon older than
 // stores answers 404 (an unknown route).
 func (c *Client) NodeStores(ctx context.Context, nodeID string) ([]machine.Store, error) {
-	var out struct {
-		Stores []machine.Store `json:"stores"`
-	}
-	err := c.call(ctx, "stores", map[string]string{"node_id": nodeID}, &out)
+	out, err := do(ctx, c, agentops.Stores, agentops.NodeRequest{NodeID: nodeID})
 	return out.Stores, err
 }
 
 // RecordStoreObservation reports what this node sees of one of its stores.
 func (c *Client) RecordStoreObservation(ctx context.Context, obs store.StoreObservation) error {
-	return c.call(ctx, "store-observation", map[string]any{"observation": obs}, nil)
+	return done(ctx, c, agentops.StoreObservation, agentops.StoreObservationRequest{Observation: obs})
 }
 
 // RecordAttemptScratch records the scratch made for an attempt about to
 // launch.
 func (c *Client) RecordAttemptScratch(ctx context.Context, scratch store.AttemptScratch) error {
-	return c.call(ctx, "attempt-scratch", map[string]any{"scratch": scratch}, nil)
+	return done(ctx, c, agentops.AttemptScratch, agentops.AttemptScratchRequest{Scratch: scratch})
 }
 
 // RecordRunOutput records the output directory made (or found) for an
 // attempt about to launch.
 func (c *Client) RecordRunOutput(ctx context.Context, out store.RunOutput) error {
-	return c.call(ctx, "run-output", map[string]any{"output": out}, nil)
+	return done(ctx, c, agentops.RunOutput, agentops.RunOutputRequest{Output: out})
 }
 
 // PacksToMake asks for what this executor is to pack now.
 func (c *Client) PacksToMake(ctx context.Context, executorID string) ([]store.PackOrder, error) {
-	var out struct {
-		Packs []store.PackOrder `json:"packs"`
-	}
-	err := c.call(ctx, "packs-to-make", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.PacksToMake, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Packs, err
 }
 
 // RecordPack records a pack this executor made.
 func (c *Client) RecordPack(ctx context.Context, made store.PackMade) error {
-	return c.call(ctx, "record-pack", map[string]any{"made": made}, nil)
+	return done(ctx, c, agentops.RecordPack, agentops.RecordPackRequest{Made: made})
 }
 
 // CopiesToMake asks for what this executor is to copy to a durable store
 // now.
 func (c *Client) CopiesToMake(ctx context.Context, executorID string) ([]store.CopyOrder, error) {
-	var out struct {
-		Copies []store.CopyOrder `json:"copies"`
-	}
-	err := c.call(ctx, "copies-to-make", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.CopiesToMake, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Copies, err
 }
 
 // RecordDescribed records that the description of a verified copy is written
 // beside it.
 func (c *Client) RecordDescribed(ctx context.Context, executorID, objectID, storeID string) error {
-	return c.call(ctx, "record-described", map[string]string{"executor_id": executorID, "object_id": objectID, "store_id": storeID}, nil)
+	return done(ctx, c, agentops.RecordDescribed, agentops.ObjectStoreRequest{ExecutorID: executorID, ObjectID: objectID, StoreID: storeID})
 }
 
 // AbandonPack records that the source of an import this executor was to
 // pack is gone.
 func (c *Client) AbandonPack(ctx context.Context, executorID, objectID, reason string) error {
-	return c.call(ctx, "abandon-pack", map[string]string{"executor_id": executorID, "object_id": objectID, "reason": reason}, nil)
+	return done(ctx, c, agentops.AbandonPack, agentops.AbandonPackRequest{ExecutorID: executorID, ObjectID: objectID, Reason: reason})
 }
 
 // InventoryDurable reports what a durable store's directory holds.
 func (c *Client) InventoryDurable(ctx context.Context, l store.DurableListing) (store.DurableInventory, error) {
-	var out store.DurableInventory
-	err := c.call(ctx, "inventory-durable", map[string]any{"listing": l}, &out)
-	return out, err
+	return do(ctx, c, agentops.InventoryDurable, agentops.InventoryRequest{Listing: l})
 }
 
 // AdoptCopies records copies found on a durable store that the daemon lacks.
 func (c *Client) AdoptCopies(ctx context.Context, executorID, storeID, root string, copies []store.AdoptedCopy) (int, error) {
-	var out struct {
-		Adopted int `json:"adopted"`
-	}
-	err := c.call(ctx, "adopt-copies", map[string]any{"executor_id": executorID, "store_id": storeID, "root": root, "copies": copies}, &out)
+	out, err := do(ctx, c, agentops.AdoptCopies, agentops.AdoptCopiesRequest{ExecutorID: executorID, StoreID: storeID, Root: root, Copies: copies})
 	return out.Adopted, err
 }
 
 // ClaimShed claims the removal of a copy of a durable store below its
 // reserve; the files are removed only once it is claimed.
 func (c *Client) ClaimShed(ctx context.Context, executorID, objectID, storeID string) error {
-	return c.call(ctx, "claim-shed", map[string]string{"executor_id": executorID, "object_id": objectID, "store_id": storeID}, nil)
+	return done(ctx, c, agentops.ClaimShed, agentops.ObjectStoreRequest{ExecutorID: executorID, ObjectID: objectID, StoreID: storeID})
 }
 
 // InputGone reports an input whose path is not there at launch.
 func (c *Client) InputGone(ctx context.Context, executorID, objectID, path string) error {
-	return c.call(ctx, "input-gone", map[string]string{"executor_id": executorID, "object_id": objectID, "path": path}, nil)
+	return done(ctx, c, agentops.InputGone, agentops.InputPathRequest{ExecutorID: executorID, ObjectID: objectID, Path: path})
 }
 
 // InputIsFile reports an import read in place whose source is a file.
 func (c *Client) InputIsFile(ctx context.Context, executorID, objectID, path string) error {
-	return c.call(ctx, "input-is-file", map[string]string{"executor_id": executorID, "object_id": objectID, "path": path}, nil)
+	return done(ctx, c, agentops.InputIsFile, agentops.InputPathRequest{ExecutorID: executorID, ObjectID: objectID, Path: path})
 }
 
 // InPlaceSources are the paths of this node inputs are read in place at.
 func (c *Client) InPlaceSources(ctx context.Context, executorID string) ([]store.InPlaceSource, error) {
-	var out struct {
-		Sources []store.InPlaceSource `json:"sources"`
-	}
-	err := c.call(ctx, "in-place-sources", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.InPlaceSources, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Sources, err
 }
 
 // RecordCopy records a copy this executor wrote and read back.
 func (c *Client) RecordCopy(ctx context.Context, made store.CopyMade) error {
-	return c.call(ctx, "record-copy", map[string]any{"made": made}, nil)
+	return done(ctx, c, agentops.RecordCopy, agentops.RecordCopyRequest{Made: made})
 }
 
 // FetchesToMake asks for what this executor is to bring to its node now.
 func (c *Client) FetchesToMake(ctx context.Context, executorID string) ([]store.FetchOrder, error) {
-	var out struct {
-		Fetches []store.FetchOrder `json:"fetches"`
-	}
-	err := c.call(ctx, "fetches-to-make", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.FetchesToMake, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Fetches, err
 }
 
 // RecordFetch records an object this executor brought and unpacked.
 func (c *Client) RecordFetch(ctx context.Context, made store.FetchMade) error {
-	return c.call(ctx, "record-fetch", map[string]any{"made": made}, nil)
+	return done(ctx, c, agentops.RecordFetch, agentops.RecordFetchRequest{Made: made})
 }
 
 // AuthorizePackRead asks whether token lets this node hand over an
 // object's pack, and where it is.
 func (c *Client) AuthorizePackRead(ctx context.Context, nodeID, objectID, token string) (store.PackRead, error) {
-	var out struct {
-		Read store.PackRead `json:"read"`
-	}
-	err := c.call(ctx, "pack-read", map[string]string{"node_id": nodeID, "object_id": objectID, "token": token}, &out)
+	out, err := do(ctx, c, agentops.PackRead, agentops.PackReadRequest{NodeID: nodeID, ObjectID: objectID, Token: token})
 	return out.Read, err
 }
 
 // DeletionsToMake asks for the sources this executor is to delete now.
 func (c *Client) DeletionsToMake(ctx context.Context, executorID string) ([]store.DeletionOrder, error) {
-	var out struct {
-		Deletions []store.DeletionOrder `json:"deletions"`
-	}
-	err := c.call(ctx, "deletions-to-make", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.DeletionsToMake, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Deletions, err
 }
 
 // SettleDeletion records what this executor did with a source.
 func (c *Client) SettleDeletion(ctx context.Context, settled store.ObjectDeletion) error {
-	return c.call(ctx, "settle-deletion", map[string]any{"settled": settled}, nil)
+	return done(ctx, c, agentops.SettleDeletion, agentops.SettleDeletionRequest{Settled: settled})
 }
 
 // EvictionsToMake asks for what this executor is to evict now.
 func (c *Client) EvictionsToMake(ctx context.Context, executorID string) ([]store.EvictionOrder, error) {
-	var out struct {
-		Evictions []store.EvictionOrder `json:"evictions"`
-	}
-	err := c.call(ctx, "evictions-to-make", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.EvictionsToMake, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Evictions, err
 }
 
 // SettleEviction records what this executor did with an eviction.
 func (c *Client) SettleEviction(ctx context.Context, settled store.EvictionSettled) error {
-	return c.call(ctx, "settle-eviction", map[string]any{"settled": settled}, nil)
+	return done(ctx, c, agentops.SettleEviction, agentops.SettleEvictionRequest{Settled: settled})
 }
 
 // ScrubsToMake asks for the copies this executor is to read back now.
 func (c *Client) ScrubsToMake(ctx context.Context, executorID string) ([]store.ScrubOrder, error) {
-	var out struct {
-		Scrubs []store.ScrubOrder `json:"scrubs"`
-	}
-	err := c.call(ctx, "scrubs-to-make", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.ScrubsToMake, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Scrubs, err
 }
 
 // RecordScrub records what reading a copy back found.
 func (c *Client) RecordScrub(ctx context.Context, result store.ScrubResult) error {
-	return c.call(ctx, "record-scrub", map[string]any{"result": result}, nil)
+	return done(ctx, c, agentops.RecordScrub, agentops.RecordScrubRequest{Result: result})
 }
 
 // TrimsToMake asks for the containers this controller is to trim now.
 func (c *Client) TrimsToMake(ctx context.Context, nodeID string) ([]store.TrimOrder, error) {
-	var out struct {
-		Trims []store.TrimOrder `json:"trims"`
-	}
-	err := c.call(ctx, "trims-to-make", map[string]string{"node_id": nodeID}, &out)
+	out, err := do(ctx, c, agentops.TrimsToMake, agentops.NodeRequest{NodeID: nodeID})
 	return out.Trims, err
 }
 
 // RecordTrim records how a trim this controller made went.
-func (c *Client) RecordTrim(ctx context.Context, nodeID string, done store.TrimDone) error {
-	return c.call(ctx, "record-trim", map[string]any{"node_id": nodeID, "done": done}, nil)
+func (c *Client) RecordTrim(ctx context.Context, nodeID string, trimmed store.TrimDone) error {
+	return done(ctx, c, agentops.RecordTrim, agentops.RecordTrimRequest{NodeID: nodeID, Done: trimmed})
 }
 
 // ScratchToSettle asks for this executor's scratch to delete or keep now.
 func (c *Client) ScratchToSettle(ctx context.Context, executorID string) ([]store.ScratchSettlement, error) {
-	var out struct {
-		Scratch []store.ScratchSettlement `json:"scratch"`
-	}
-	err := c.call(ctx, "scratch-to-settle", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.ScratchToSettle, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Scratch, err
 }
 
 // SettleScratch records what this executor did with a scratch.
 func (c *Client) SettleScratch(ctx context.Context, settled store.ScratchSettled) error {
-	return c.call(ctx, "settle-scratch", map[string]any{"settled": settled}, nil)
+	return done(ctx, c, agentops.SettleScratch, agentops.SettleScratchRequest{Settled: settled})
+}
+
+// SourcesInUse are the code snapshots of executions not yet terminal
+// (executor.SourceKeeper), for this executor to keep unpacked.
+func (c *Client) SourcesInUse(ctx context.Context, executorID string) ([]string, error) {
+	out, err := do(ctx, c, agentops.SourcesInUse, agentops.ExecutorRequest{ExecutorID: executorID})
+	return out.Sources, err
 }
 
 // ListUnlaunchedLeases asks for this executor's leases that never reached a
 // running attempt (store.ListUnlaunchedLeases). A daemon older than this
 // operation answers 404, as an unknown route.
 func (c *Client) ListUnlaunchedLeases(ctx context.Context, executorID string, olderThan time.Duration) ([]store.UnlaunchedLease, error) {
-	var out struct {
-		Leases []store.UnlaunchedLease `json:"leases"`
-	}
-	err := c.call(ctx, "unlaunched-leases", map[string]any{"executor_id": executorID, "older_than_seconds": olderThan.Seconds()}, &out)
+	out, err := do(ctx, c, agentops.UnlaunchedLeases, agentops.UnlaunchedRequest{ExecutorID: executorID, OlderThanSeconds: olderThan.Seconds()})
 	return out.Leases, err
 }
 
 func (c *Client) ValidateReservation(ctx context.Context, leaseID string, epoch int64) error {
-	return c.call(ctx, "validate-reservation", map[string]any{"lease_id": leaseID, "epoch": epoch}, nil)
+	return done(ctx, c, agentops.ValidateReservation, agentops.LeaseRequest{LeaseID: leaseID, Epoch: epoch})
 }
 
 func (c *Client) MarkLeasePrepared(ctx context.Context, leaseID string, epoch int64) error {
-	return c.call(ctx, "mark-lease-prepared", map[string]any{"lease_id": leaseID, "epoch": epoch}, nil)
+	return done(ctx, c, agentops.MarkLeasePrepared, agentops.LeaseRequest{LeaseID: leaseID, Epoch: epoch})
 }
 
 func (c *Client) ReleaseReservation(ctx context.Context, leaseID string, epoch int64, reason string) error {
-	return c.call(ctx, "release-reservation", map[string]any{"lease_id": leaseID, "epoch": epoch, "reason": reason}, nil)
+	return done(ctx, c, agentops.ReleaseReservation, agentops.LeaseRequest{LeaseID: leaseID, Epoch: epoch, Reason: reason})
 }
 
 func (c *Client) AuthorizeLaunch(ctx context.Context, reservation *store.Reservation) (*store.Launch, error) {
-	var out struct {
-		Launch *store.Launch `json:"launch"`
-	}
-	if err := c.call(ctx, "authorize-launch", map[string]any{"reservation": reservation}, &out); err != nil {
+	out, err := do(ctx, c, agentops.AuthorizeLaunch, agentops.AuthorizeRequest{Reservation: *reservation})
+	if err != nil {
 		return nil, err
 	}
 	if out.Launch == nil {
@@ -384,88 +348,74 @@ func (c *Client) AuthorizeLaunch(ctx context.Context, reservation *store.Reserva
 }
 
 func (c *Client) ActivateLaunch(ctx context.Context, attemptID, leaseID string, epoch int64, token string, pid int, processIdentity string) error {
-	return c.call(ctx, "activate-launch", map[string]any{"attempt_id": attemptID, "lease_id": leaseID, "epoch": epoch, "token": token, "pid": pid, "process_identity": processIdentity}, nil)
+	return done(ctx, c, agentops.ActivateLaunch, agentops.ActivateRequest{AttemptID: attemptID, LeaseID: leaseID, Epoch: epoch, Token: token, PID: pid, ProcessIdentity: processIdentity})
 }
 
 func (c *Client) SetAttemptLogPaths(ctx context.Context, attemptID string, epoch int64, stdoutPath, stderrPath string) error {
-	return c.call(ctx, "set-log-paths", map[string]any{"attempt_id": attemptID, "epoch": epoch, "stdout_path": stdoutPath, "stderr_path": stderrPath}, nil)
+	return done(ctx, c, agentops.SetLogPaths, agentops.LogPathsRequest{AttemptID: attemptID, Epoch: epoch, StdoutPath: stdoutPath, StderrPath: stderrPath})
 }
 
 func (c *Client) RecordAttemptLogProblem(ctx context.Context, attemptID string, problem store.LogProblem) error {
-	return c.call(ctx, "log-problem", map[string]any{"attempt_id": attemptID, "problem": problem}, nil)
+	return done(ctx, c, agentops.LogProblem, agentops.LogProblemRequest{AttemptID: attemptID, Problem: problem})
 }
 
 func (c *Client) MarkAttemptProcessExited(ctx context.Context, attemptID, role string, rank int, identity string) error {
-	return c.call(ctx, "mark-process-exited", map[string]any{"attempt_id": attemptID, "role": role, "rank": rank, "identity": identity}, nil)
+	return done(ctx, c, agentops.MarkProcessExited, agentops.ProcessExitedRequest{AttemptID: attemptID, Role: role, Rank: rank, Identity: identity})
 }
 
 func (c *Client) RecordTerminal(ctx context.Context, attemptID, leaseID string, epoch int64, exitCode int, exitSignal string) error {
-	return c.call(ctx, "record-terminal", map[string]any{"attempt_id": attemptID, "lease_id": leaseID, "epoch": epoch, "exit_code": exitCode, "exit_signal": exitSignal}, nil)
+	return done(ctx, c, agentops.RecordTerminal, agentops.TerminalRequest{AttemptID: attemptID, LeaseID: leaseID, Epoch: epoch, ExitCode: exitCode, ExitSignal: exitSignal})
 }
 
 func (c *Client) ListQuiescenceCandidates(ctx context.Context, executorID string) ([]store.QuiescenceCandidate, error) {
-	var out struct {
-		Candidates []store.QuiescenceCandidate `json:"candidates"`
-	}
-	err := c.call(ctx, "quiescence-candidates", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.QuiescenceCandidates, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Candidates, err
 }
 
 func (c *Client) FinalizeQuiescence(ctx context.Context, attemptID, leaseID string, epoch int64) error {
-	return c.call(ctx, "finalize-quiescence", map[string]any{"attempt_id": attemptID, "lease_id": leaseID, "epoch": epoch}, nil)
+	return done(ctx, c, agentops.FinalizeQuiescence, agentops.AttemptLeaseRequest{AttemptID: attemptID, LeaseID: leaseID, Epoch: epoch})
 }
 
 func (c *Client) ListQuarantineTerminations(ctx context.Context, executorID string) ([]store.QuarantineTermination, error) {
-	var out struct {
-		Terminations []store.QuarantineTermination `json:"terminations"`
-	}
-	err := c.call(ctx, "quarantine-terminations", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.QuarantineTerms, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Terminations, err
 }
 
 func (c *Client) MarkQuarantineTerminated(ctx context.Context, attemptID string) error {
-	return c.call(ctx, "quarantine-terminated", map[string]string{"attempt_id": attemptID}, nil)
+	return done(ctx, c, agentops.QuarantineTerminated, agentops.AttemptRequest{AttemptID: attemptID})
 }
 
 func (c *Client) ForceStopOrders(ctx context.Context, executorID string) ([]store.ForceStopOrder, error) {
-	var out struct {
-		Orders []store.ForceStopOrder `json:"orders"`
-	}
-	err := c.call(ctx, "force-stop-orders", map[string]string{"executor_id": executorID}, &out)
+	out, err := do(ctx, c, agentops.ForceStopOrders, agentops.ExecutorRequest{ExecutorID: executorID})
 	return out.Orders, err
 }
 
 func (c *Client) AckForceStop(ctx context.Context, attemptID, phase string, detail json.RawMessage) error {
-	return c.call(ctx, "force-stop-ack", map[string]any{"attempt_id": attemptID, "phase": phase, "detail": detail}, nil)
+	return done(ctx, c, agentops.ForceStopAcked, agentops.ForceStopAck{AttemptID: attemptID, Phase: phase, Detail: detail})
 }
 
 func (c *Client) RecordAttemptUsage(ctx context.Context, attemptID string, ramBytes, diskWrittenBytes *int64) error {
-	return c.call(ctx, "attempt-usage", map[string]any{"attempt_id": attemptID, "ram_bytes": ramBytes, "disk_written_bytes": diskWrittenBytes}, nil)
+	return done(ctx, c, agentops.AttemptUsed, agentops.AttemptUsage{AttemptID: attemptID, RAMBytes: ramBytes, DiskWrittenBytes: diskWrittenBytes})
 }
 
 // RegisterController records that node's device controller started (kairo
 // controller); a node not known yet is created, a known one left as it is.
 func (c *Client) RegisterController(ctx context.Context, node store.Node, version string) error {
-	return c.call(ctx, "controller-register", map[string]any{"node": node, "version": version}, nil)
+	_, err := do(ctx, c, agentops.ControllerRegister, agentops.ControllerRegisterRequest{Node: node, Version: version})
+	return err
 }
 
 // DeviceSettings is a controller's poll: the devices its node controls and
 // the settings each is to have.
 func (c *Client) DeviceSettings(ctx context.Context, nodeID string) ([]store.ControlledDevice, error) {
-	var out struct {
-		Devices []store.ControlledDevice `json:"devices"`
-	}
-	err := c.call(ctx, "device-settings", map[string]string{"node_id": nodeID}, &out)
+	out, err := do(ctx, c, agentops.DeviceSettings, agentops.NodeRequest{NodeID: nodeID})
 	return out.Devices, err
 }
 
 // ReportDevices sends what is in place on the node's devices; it returns the
 // reports of devices the node does not control, which the daemon skipped.
 func (c *Client) ReportDevices(ctx context.Context, nodeID string, reports []store.DeviceReport) ([]string, error) {
-	var out struct {
-		Skipped []string `json:"skipped"`
-	}
-	err := c.call(ctx, "device-report", map[string]any{"node_id": nodeID, "reports": reports}, &out)
+	out, err := do(ctx, c, agentops.DeviceReport, agentops.DeviceReportRequest{NodeID: nodeID, Reports: reports})
 	return out.Skipped, err
 }
 
@@ -473,10 +423,7 @@ func (c *Client) ReportDevices(ctx context.Context, nodeID string, reports []sto
 // package power); it returns the samples the daemon skipped (no host names
 // node as its controller).
 func (c *Client) ReportSamples(ctx context.Context, nodeID string, samples []store.ControllerSample) ([]string, error) {
-	var out struct {
-		Skipped []string `json:"skipped"`
-	}
-	err := c.call(ctx, "device-samples", map[string]any{"node_id": nodeID, "samples": samples}, &out)
+	out, err := do(ctx, c, agentops.DeviceSamples, agentops.DeviceSamplesRequest{NodeID: nodeID, Samples: samples})
 	return out.Skipped, err
 }
 
@@ -732,16 +679,6 @@ func (s *LogShipper) shipFile(ctx context.Context, path, name string) error {
 		s.shipped[name] = offset
 	}
 	return nil
-}
-
-// SourcesInUse are the code snapshots of executions not yet terminal
-// (executor.SourceKeeper).
-func (c *Client) SourcesInUse(ctx context.Context, executorID string) ([]string, error) {
-	var out struct {
-		Sources []string `json:"sources"`
-	}
-	err := c.call(ctx, "sources-in-use", map[string]string{"executor_id": executorID}, &out)
-	return out.Sources, err
 }
 
 // FetchSource writes file ("pack" or "list") of code snapshot id, as the
