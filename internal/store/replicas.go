@@ -29,12 +29,11 @@ const replicaBatch = 50
 // the shedding margin and what it orders).
 func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets []machine.Store, room map[string]int64, t string) error {
 	var eligible []machine.Store
-	var servedIDs, eligibleIDs []string
+	var eligibleIDs []string
 	for _, s := range targets {
 		if !me.serves(s, executorID) {
 			continue
 		}
-		servedIDs = append(servedIDs, s.ID)
 		if room[s.ID] == unknownRoom || room[s.ID] >= shedMinShort {
 			eligible = append(eligible, s)
 			eligibleIDs = append(eligibleIDs, s.ID)
@@ -59,9 +58,8 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 			) blocked
 		) b
 		WHERE d.state='packed' AND d.lifecycle='durable' AND b.n<$2
-		AND EXISTS(SELECT 1 FROM object_copies v JOIN executors x ON x.id=v.executor_id WHERE v.object_id=d.id AND v.state='verified' AND v.check_problem IS NULL
-			AND (v.store_id=ANY($4::text[]) OR COALESCE(x.attributes_json::jsonb->>'pack_addr','')<>''))
-		ORDER BY d.pack_bytes,d.id LIMIT 2000`, []any{eligibleIDs, len(eligible), t, servedIDs}, func(rows *sql.Rows) error {
+		AND EXISTS(SELECT 1 FROM object_copies v WHERE v.object_id=d.id AND v.state='verified' AND v.check_problem IS NULL)
+		ORDER BY d.pack_bytes,d.id LIMIT 2000`, []any{eligibleIDs, len(eligible), t}, func(rows *sql.Rows) error {
 		var c candidate
 		var blocked string
 		if err := rows.Scan(&c.id, &c.created, &c.projectID, &c.bytes, &blocked); err != nil {
@@ -120,27 +118,38 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 }
 
 // remoteCopyTx is a verified copy of objectID on a durable store as declared
-// that executor me does not serve, made by an executor whose node's pack
-// server serves it (its pack_addr): where a replica is read when no copy is
-// on me's node.
+// that executor me does not serve, read through the pack server of whoever
+// serves that store now (storeServerTx): where a replica is read when no copy
+// is on me's node.
 func remoteCopyTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID, objectID string, byID map[string]machine.Store) (CopySource, string, bool, error) {
-	var src CopySource
-	var node string
-	found := false
-	err := eachRow(ctx, tx, `SELECT c.store_id,c.root,c.month,x.node_id,COALESCE(x.attributes_json::jsonb->>'pack_addr','') FROM object_copies c JOIN executors x ON x.id=c.executor_id
-		WHERE c.object_id=$1 AND c.state='verified' AND c.check_problem IS NULL ORDER BY c.store_id`, []any{objectID}, func(rows *sql.Rows) error {
-		var storeID, root, month, nodeID, addr string
-		if err := rows.Scan(&storeID, &root, &month, &nodeID, &addr); err != nil {
+	type copyRow struct{ storeID, root, month string }
+	var rows []copyRow
+	err := eachRow(ctx, tx, `SELECT c.store_id,c.root,c.month FROM object_copies c
+		WHERE c.object_id=$1 AND c.state='verified' AND c.check_problem IS NULL ORDER BY c.store_id`, []any{objectID}, func(r *sql.Rows) error {
+		var c copyRow
+		if err := r.Scan(&c.storeID, &c.root, &c.month); err != nil {
 			return err
 		}
-		d, ok := byID[storeID]
-		if found || addr == "" || !ok || d.Class != machine.StoreDurable || d.Root != root || d.MovedFrom != "" || d.Node != nodeID || me.serves(d, executorID) {
-			return nil
-		}
-		src, node, found = CopySource{StoreID: storeID, Root: root, Month: month, Addr: addr}, nodeID, true
+		rows = append(rows, c)
 		return nil
 	})
-	return src, node, found, err
+	if err != nil {
+		return CopySource{}, "", false, err
+	}
+	for _, c := range rows {
+		d, ok := byID[c.storeID]
+		if !ok || d.Class != machine.StoreDurable || d.Root != c.root || d.MovedFrom != "" || me.serves(d, executorID) {
+			continue
+		}
+		server, found, err := storeServerTx(ctx, tx, d)
+		if err != nil {
+			return CopySource{}, "", false, err
+		}
+		if found {
+			return CopySource{StoreID: c.storeID, Root: c.root, Month: c.month, Addr: server.attrs["pack_addr"]}, server.nodeID, true, nil
+		}
+	}
+	return CopySource{}, "", false, nil
 }
 
 // localCopiesTx is, for each object executor me is copying, a verified copy

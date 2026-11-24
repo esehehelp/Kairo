@@ -500,7 +500,12 @@ func (s *Store) FetchesToMake(ctx context.Context, executorID string) ([]FetchOr
 				local = append(local, source{src: CopySource{Local: true, StoreID: c.storeID, Root: c.root, Month: c.month}})
 				continue
 			}
-			if info, err := executorInfoTx(ctx, tx, c.copier); err == nil {
+			// read through whoever serves the copy's store now
+			info, found, err := storeServerTx(ctx, tx, d)
+			if err != nil {
+				return nil, err
+			}
+			if found {
 				remote = append(remote, source{src: CopySource{StoreID: c.storeID, Root: c.root, Month: c.month, Addr: info.attrs["pack_addr"]}, node: info.nodeID})
 			}
 		}
@@ -508,7 +513,9 @@ func (s *Store) FetchesToMake(ctx context.Context, executorID string) ([]FetchOr
 		if d, ok := byID[x.packStore]; ok && d.Root == x.packRoot && (x.sourceState == "present" || x.sourceState == SourceDeleting) {
 			if me.serves(d, executorID) {
 				local = append(local, source{src: CopySource{Local: true, StoreID: x.packStore, Root: x.packRoot}})
-			} else if info, err := executorInfoTx(ctx, tx, x.packExecutor); err == nil {
+			} else if info, found, err := storeServerTx(ctx, tx, d); err != nil {
+				return nil, err
+			} else if found {
 				remote = append(remote, source{src: CopySource{StoreID: x.packStore, Root: x.packRoot, Addr: info.attrs["pack_addr"]}, node: info.nodeID})
 			}
 		}
