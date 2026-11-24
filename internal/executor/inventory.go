@@ -71,7 +71,7 @@ func (e *Local) inventoryDue(ctx context.Context) {
 // store.InputIsFile, so it is brought as a directory holding it. A WSL
 // executor's paths are the distro's: not looked at from here.
 func (e *Local) checkInPlaceSources(ctx context.Context) {
-	if e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2" {
+	if !e.backend().readsNodePaths() {
 		return
 	}
 	sources, err := e.Store.InPlaceSources(ctx, e.ID)

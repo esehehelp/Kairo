@@ -43,16 +43,8 @@ func (j usageJob) close() {
 // round (sampleWSL); otherwise the attempt's job object, or, without one, the
 // descendants of its launcher (windowsTreeUsage).
 func (e *Local) sampleTrees(ctx context.Context, targets []usageTarget) map[string]usageSample {
-	if e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2" {
-		ids := make([]string, len(targets))
-		for i, t := range targets {
-			ids[i] = t.attemptID
-		}
-		samples, err := sampleWSL(ctx, e.Attributes["distro"], ids)
-		if err != nil {
-			e.Logger.Warn("attempt usage unknown", "error", err)
-		}
-		return samples
+	if s, ok := e.backend().(usageSampler); ok {
+		return s.sampleUsage(ctx, targets)
 	}
 	out := map[string]usageSample{}
 	for _, t := range targets {

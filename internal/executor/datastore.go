@@ -38,17 +38,12 @@ type servedStore struct {
 	movedFrom string
 }
 
-func (e *Local) isWSL() bool { return e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2" }
-
 // fsForStores is how this executor reaches its stores' roots.
 func (e *Local) fsForStores() storeFS {
 	if e.storeFSOverride != nil {
 		return e.storeFSOverride
 	}
-	if e.isWSL() {
-		return wslStoreFS{distro: e.Attributes["distro"]}
-	}
-	return localStoreFS{}
+	return e.backend().storeFS()
 }
 
 // serves reports whether a store of this executor's node is in its
@@ -57,7 +52,7 @@ func (e *Local) serves(s machine.Store) bool {
 	if s.Executor != "" {
 		return s.Executor == e.ID
 	}
-	return !e.isWSL()
+	return e.backend().servesNodeStores()
 }
 
 // refreshStores asks for the node's stores (at most every

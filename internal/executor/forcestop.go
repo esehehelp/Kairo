@@ -150,7 +150,8 @@ func (e *Local) ackForceStop(ctx context.Context, attemptID, phase string, detai
 // or else through the recorded pid when its creation identity still matches
 // (an executor restarted since the launch).
 func (e *Local) attemptTree(o store.ForceStopOrder) processTree {
-	t := processTree{attemptID: o.AttemptID, identity: deref(o.ProcessIdentity), wsl: e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2", distro: e.Attributes["distro"]}
+	t := e.backend().tree(o.AttemptID)
+	t.identity = deref(o.ProcessIdentity)
 	e.mu.Lock()
 	if pid := e.running[o.AttemptID]; pid != 0 {
 		t.pid = pid

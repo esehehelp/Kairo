@@ -49,9 +49,8 @@ func (e *Local) leftBehind(ctx context.Context, attempt store.Attempt) (bool, er
 
 // exitedTree is what this executor can reach of an exited attempt's tree.
 func (e *Local) exitedTree(attempt store.Attempt) processTree {
-	wsl := e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2"
-	t := processTree{attemptID: attempt.ID, wsl: wsl, distro: e.Attributes["distro"]}
-	if !wsl {
+	t := e.backend().tree(attempt.ID)
+	if !t.wsl {
 		// For WSL the work is the Linux processes, found by their
 		// KAIRO_ATTEMPT_ID; the Windows side of wsl.exe is not counted (its
 		// helpers may outlive it without running anything of the attempt).

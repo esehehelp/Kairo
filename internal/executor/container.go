@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 
-	"kairo/internal/config"
 	"kairo/internal/store"
 )
 
@@ -102,9 +101,6 @@ type containerMount struct {
 	ReadOnly bool   `json:"read_only,omitempty"`
 }
 
-// runsContainers reports whether this executor runs attempts in containers.
-func (e *Local) runsContainers() bool { return e.Kind == config.KindIncus }
-
 // containerInstance is the Incus instance name of an attempt (letters,
 // digits and dashes).
 func containerInstance(attemptID string) string {
@@ -121,9 +117,6 @@ func (e *Local) containerDir(attemptID string) string {
 // runner, under the shim): it checks the attempt can run here, writes its
 // spec and returns the runner's command.
 func (e *Local) containerCommand(launch *store.Launch) (*exec.Cmd, error) {
-	if !e.runsContainers() {
-		return nil, fmt.Errorf("image %s: executor %s (kind %s) does not run containers", launch.Image, e.ID, e.Kind)
-	}
 	if launch.Image == "" {
 		return nil, fmt.Errorf("executor %s runs attempts in containers: the execution names no image", e.ID)
 	}

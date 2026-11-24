@@ -220,9 +220,9 @@ const unactivatedKillWait = 10 * time.Second
 // unactivatedKillWait, the tree is kept (its handle open) for the launch's
 // cleanup, which releases nothing before it is empty (leftovers).
 func (e *Local) killUnactivated(launch *store.Launch, cmd *exec.Cmd, tree *treeHandle, identity string) {
-	wsl := e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2"
-	t := processTree{attemptID: launch.Attempt.ID, pid: cmd.Process.Pid, identity: identity, handle: tree, wsl: wsl, distro: e.Attributes["distro"]}
-	if !wsl {
+	t := e.backend().tree(launch.Attempt.ID)
+	t.pid, t.identity, t.handle = cmd.Process.Pid, identity, tree
+	if !t.wsl {
 		t.group = cmd.Process.Pid
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)

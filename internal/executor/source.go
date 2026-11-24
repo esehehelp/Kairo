@@ -221,9 +221,6 @@ type SourceFetcher interface {
 // place only once every file was checked; an unpack another process renamed
 // there first is taken).
 func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (string, error) {
-	if e.isWSL() {
-		return "", errors.New("code snapshots are not run inside WSL yet")
-	}
 	fetch, ok := e.Store.(SourceFetcher)
 	if !ok {
 		return "", errors.New("this executor cannot fetch code snapshots")

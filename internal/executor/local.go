@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -261,8 +260,8 @@ func (e *Local) tick(ctx context.Context) error {
 	e.makeScrubs()
 	e.makeInventories()
 	e.makeSourceCleanups()
-	if e.runsContainers() {
-		e.startRound(&e.containerSweeps, containerSweepInterval, containerSweepTimeout, e.sweepContainers)
+	if s, ok := e.backend().(instanceSweeper); ok {
+		e.startRound(&e.containerSweeps, containerSweepInterval, containerSweepTimeout, s.sweep)
 	}
 	e.endStep()
 	for {
@@ -600,9 +599,12 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 	for _, candidate := range candidates {
 		allAbsent := true
 		for _, process := range candidate.Processes {
-			liveness, livenessErr := processidentity.HostProcessLiveness(process.PID, process.ProcessIdentity)
-			if process.Namespace == "executor" && (e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2") {
-				liveness, livenessErr = processidentity.WSLProcessLiveness(ctx, e.Attributes["distro"], process.PID, process.ProcessIdentity)
+			var liveness processidentity.Liveness
+			var livenessErr error
+			if process.Namespace == "executor" {
+				liveness, livenessErr = e.backend().liveness(ctx, process.PID, process.ProcessIdentity)
+			} else {
+				liveness, livenessErr = processidentity.HostProcessLiveness(process.PID, process.ProcessIdentity)
 			}
 			if livenessErr != nil || liveness == processidentity.LivenessUnknown {
 				allAbsent = false
@@ -778,14 +780,15 @@ func (e *Local) launchEnv(launch *store.Launch) []string {
 // checkInputs refuses a launch one of whose inputs cannot be had here (the
 // daemon says why) or is not a directory there now (store/inputs.go): the
 // attempt does not start, and its execution ends launch_aborted saying so.
-// A WSL executor's paths are the distro's: they are not looked at from here.
+// The paths of an executor whose backend does not read the node's (WSL: the
+// distro's) are not looked at from here.
 func (e *Local) checkInputs(launch *store.Launch) error {
-	wsl := e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2"
+	nodePaths := e.backend().readsNodePaths()
 	for _, in := range launch.Inputs {
 		if in.Problem != "" {
 			return fmt.Errorf("input %s: %s", in.Name, in.Problem)
 		}
-		if wsl {
+		if !nodePaths {
 			continue
 		}
 		r, err := openDirPath(in.Path, false)
@@ -840,60 +843,6 @@ func hasEnv(env []string, name string) bool {
 		}
 	}
 	return false
-}
-
-// command builds the attempt's launcher. Its environment is the parent's,
-// then the execution's declared env, then Kairo's launch variables; a later
-// layer replaces a name of an earlier one, so declared env overrides PATH and
-// the like but never what Kairo sets. The parent's own KAIRO_* variables (an
-// operator's KAIRO_TOKEN, say) never reach the attempt. A WSL attempt gets its
-// variables through WSLENV rather than on the wsl.exe command line, which
-// other tools can read and log, and runs its argv with --exec: without it
-// wsl.exe joins the arguments into a line for the default shell, which expands
-// $VAR and re-splits quoted words.
-func (e *Local) command(launch *store.Launch) *exec.Cmd {
-	own := e.attemptEnv(launch)
-	given := map[string]bool{}
-	for _, kv := range own {
-		given[envKey(envName(kv))] = true
-	}
-	parent := make([]string, 0, len(os.Environ()))
-	wslenv := ""
-	for _, kv := range os.Environ() {
-		name, value, _ := strings.Cut(kv, "=")
-		switch {
-		case strings.EqualFold(name, "WSLENV"):
-			wslenv = value
-		case envspec.Reserved(name), given[envKey(name)]:
-		default:
-			parent = append(parent, kv)
-		}
-	}
-	if e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2" {
-		args := []string{}
-		if distro := e.Attributes["distro"]; distro != "" {
-			args = append(args, "-d", distro)
-		}
-		args = append(args, "--cd", launch.CWD, "--exec")
-		args = append(args, launch.Argv...)
-		cmd := exec.Command("wsl.exe", args...)
-		shared := []string{}
-		if wslenv != "" {
-			shared = append(shared, wslenv)
-		}
-		for _, kv := range own {
-			shared = append(shared, envName(kv)+"/u")
-		}
-		cmd.Env = append(append(parent, own...), "WSLENV="+strings.Join(shared, ":"))
-		return cmd
-	}
-	cmd := exec.Command(launch.Argv[0], launch.Argv[1:]...)
-	cmd.Dir = launch.CWD
-	if wslenv != "" {
-		parent = append(parent, "WSLENV="+wslenv)
-	}
-	cmd.Env = append(parent, own...)
-	return cmd
 }
 
 // attemptEnv is what the attempt is given on top of the environment it
@@ -957,48 +906,13 @@ func (e *Local) start(launch *store.Launch) error {
 			e.mu.Unlock()
 		}
 	}()
-	var cmd *exec.Cmd
-	var conf *confinement
-	if launch.Image != "" || e.runsContainers() {
-		// in a container of its image, which is its confinement
-		// (container.go)
-		c, err := e.containerCommand(launch)
-		if err != nil {
-			return err
-		}
-		cmd = c
-		e.forgetScratch(launch.Attempt.ID)
-		prepareProcessTree(cmd)
-	} else {
-		cmd = e.command(launch)
-		if cmd.Err != nil {
-			return cmd.Err
-		}
-		if launch.Source != nil {
-			// run in its code snapshot, cwd relative to it (source.go)
-			dir, err := e.ensureSource(context.Background(), launch.Source)
-			if err != nil {
-				return fmt.Errorf("code snapshot %s: %w", launch.Source.ID, err)
-			}
-			cmd.Dir = filepath.Join(dir, filepath.FromSlash(launch.CWD))
-			cmd.Env = append(cmd.Env, "KAIRO_SOURCE_DIR="+dir, "KAIRO_SOURCE_ID="+launch.Source.ID)
-			// Python would write its bytecode beside the modules, into the
-			// snapshot (which is then unpacked again at the next launch): not
-			// written, unless the attempt's environment says where.
-			if !hasEnv(cmd.Env, "PYTHONDONTWRITEBYTECODE") && !hasEnv(cmd.Env, "PYTHONPYCACHEPREFIX") {
-				cmd.Env = append(cmd.Env, "PYTHONDONTWRITEBYTECODE=1")
-			}
-		}
-		e.forgetScratch(launch.Attempt.ID)
-		prepareProcessTree(cmd)
-		if launch.Confine {
-			c, err := e.confine(cmd)
-			if err != nil {
-				return err
-			}
-			conf = c
-		}
+	// the launcher as this executor's backend builds it (backend.go)
+	cmd, conf, err := e.backend().launcher(launch)
+	e.forgetScratch(launch.Attempt.ID)
+	if err != nil {
+		return err
 	}
+	prepareProcessTree(cmd)
 	id := launch.Attempt.ID
 	job := ""
 	if runtime.GOOS == "windows" {
@@ -1132,13 +1046,8 @@ func (e *Local) finishAttempt(r AttemptRecord, exit int, closeLogs func()) {
 		time.Sleep(delay)
 	}
 	forgetRecord(e.LogDir, r.AttemptID)
+	e.backend().ended(r.AttemptID)
 	e.mu.Lock()
-	if e.runsContainers() {
-		// what its container was made from (its spec holds its token); its
-		// instance, left by a runner that was killed, at the next sweep
-		_ = os.RemoveAll(e.containerDir(r.AttemptID))
-		e.containerSweeps.at = time.Time{}
-	}
 	delete(e.running, r.AttemptID)
 	delete(e.outputRuns, r.AttemptID)
 	e.mu.Unlock()
