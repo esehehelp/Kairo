@@ -676,7 +676,10 @@ labels may take what is placed there.
   node an attempt runs on: a run's output directory still on its volatile
   store, an imported directory still where it was imported from (not
   deleted, or kept without `--delete-source`), or its data object brought to
-  that node (Data stores: brought inputs). An execution with inputs (a task
+  that node (Data stores: brought inputs). An input is always a directory:
+  an import of one file is never read where it was, but brought, a
+  directory holding the file, on its own node as on any other (so
+  `${KAIRO_INPUT_X}/<name>` reads the same everywhere). An execution with inputs (a task
   or a direct one) is planned onto a node, unless its executor selector
   names a `node` itself or it is a gang (whose rank 0 alone is handed its
   inputs): the first every input is on, else the one the first input is on,
@@ -1740,7 +1743,13 @@ the CLI sees it (`/srv/x` becomes `C:/Program Files/Git/srv/x`): the CLI
 refuses one that looks so; run it with `MSYS_NO_PATHCONV=1`.
 A PATH may also be a regular file (a published checkpoint: Checkpoints of
 running work): it is packed alone, under its name, opened through its
-directory. An import whose path is gone while its volume is there (a disk
+directory, and recorded as a file (`source_file`; the pack says so), which
+is never read in place as an input (Admission, Inputs). One packed before
+packs said so is recorded as a file by the executor that finds its source
+is one: when it checks the paths read in place on its node (`in-place-sources`,
+agent operation `input-is-file`, event `input_is_file`), or at a launch
+that would read it, which then ends `launch_aborted` saying to rerun. An
+import whose path is gone while its volume is there (a disk
 that is not mounted is not a deleted source) is `abandoned` (event
 `import_abandoned`): nothing packs it any more and its source is settled
 `kept` with why, so the path can be imported again. `kairo data cancel

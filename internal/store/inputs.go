@@ -159,9 +159,9 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 		src.temporal = lifecycle == LifecycleTemporal
 		src.packed = state == "packed" && !src.temporal
 		var kind, sourceID, executorID, storeID, root, path, sourceState string
-		var deleteSource bool
-		if err = q.QueryRowContext(ctx, `SELECT kind,source_id,executor_id,store_id,root,source_path,source_state,delete_source FROM data_objects WHERE id=$1`, src.objectID).
-			Scan(&kind, &sourceID, &executorID, &storeID, &root, &path, &sourceState, &deleteSource); err != nil {
+		var deleteSource, sourceFile bool
+		if err = q.QueryRowContext(ctx, `SELECT kind,source_id,executor_id,store_id,root,source_path,source_state,delete_source,source_file FROM data_objects WHERE id=$1`, src.objectID).
+			Scan(&kind, &sourceID, &executorID, &storeID, &root, &path, &sourceState, &deleteSource, &sourceFile); err != nil {
 			return src, err
 		}
 		switch kind {
@@ -171,8 +171,10 @@ func inputSourceTx(ctx context.Context, q queryer, declared []machine.Store, pro
 			}
 		case ObjectImport:
 			// in place while it is where it was imported from (not deleted,
-			// nor kept for having changed since it was packed)
-			if sourceState == "present" || sourceState == SourceKept && !deleteSource {
+			// nor kept for having changed since it was packed); but an input
+			// is a directory: an import of one file is brought, a directory
+			// holding it, on its own node as on any other (issue #27)
+			if (sourceState == "present" || sourceState == SourceKept && !deleteSource) && (!sourceFile || src.temporal) {
 				info, err := executorInfoTx(ctx, q, executorID)
 				if err != nil {
 					return src, err

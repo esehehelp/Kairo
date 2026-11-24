@@ -85,6 +85,8 @@ type packResult struct {
 	packSHA256, manifestHash string
 	// listBody: the file list as written (an identity's, recorded with it)
 	listBody string
+	// file: what was packed is an imported regular file, alone
+	file bool
 }
 
 // kindOf is the directory kind of an object kind.
@@ -190,7 +192,9 @@ func packDir(ctx context.Context, root, dir, objectID string, identity bool) (pa
 		if !regular {
 			return res, err
 		}
-		return packInto(ctx, r, root, parent, filepath.Dir(dir), nil, packOpts{only: name, live: true}, objectID, identity)
+		res, err = packInto(ctx, r, root, parent, filepath.Dir(dir), nil, packOpts{only: name, live: true}, objectID, identity)
+		res.file = true
+		return res, err
 	}
 	defer sr.Close()
 	mounts, err := mountsUnderFn(dir)
@@ -834,6 +838,7 @@ func packMade(executorID string, o store.PackOrder, res packResult) store.PackMa
 		made.Identity, made.Manifest = true, res.listBody
 	}
 	made.Transfer = o.Transfer
+	made.File = res.file
 	return made
 }
 

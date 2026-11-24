@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"kairo/internal/datainput"
 	"kairo/internal/machine"
 )
 
@@ -338,6 +339,83 @@ func TestAnImportedSourceFoundGoneIsNoLongerReadInPlace(t *testing.T) {
 		t.Fatalf("a source found gone is %s", got)
 	}
 	if err = store.InputGone(ctx, "win-exec", objectID, "D:/data/gone"); err != nil {
+		t.Fatalf("reported again: %v", err)
+	}
+}
+
+// An import of one file is not read in place as an input (an input is a
+// directory, issue #27): one packed so (PackMade.File) is marked a file at
+// once; one packed before is marked when an executor finds its source is a
+// file (InputIsFile, its path only, on its node). Either way it is no longer
+// a place inputs are read at, nor a source to check there.
+func TestAnImportOfOneFileIsNotReadInPlace(t *testing.T) {
+	store := importFixture(t)
+	ctx := context.Background()
+	imported, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"D:/ckpt/step_10.pt", "D:/ckpt/step_20.pt"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	packed, older := imported[0].ObjectID, imported[1].ObjectID
+	sha := strings.Repeat("ab", 32)
+	for _, o := range []struct {
+		id   string
+		file bool
+	}{{packed, true}, {older, false}} {
+		if err := store.RecordPack(ctx, PackMade{ObjectID: o.id, ExecutorID: "win-exec", PackPath: "D:/kairo/packs/" + o.id + ".tar.zst",
+			ManifestPath: "D:/kairo/packs/" + o.id + ".tar.zst.files.tsv", PackBytes: 100, ContentBytes: 900, Files: 1, PackSHA256: sha, ManifestSHA256: sha, File: o.file}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	readInPlace := func(objectID string) bool {
+		t.Helper()
+		tx, err := store.db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		declared, err := declaredStores(ctx, tx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var project string
+		if err := tx.QueryRowContext(ctx, `SELECT project_scope_id FROM data_objects WHERE id=$1`, objectID).Scan(&project); err != nil {
+			t.Fatal(err)
+		}
+		src, err := inputSourceTx(ctx, tx, declared, project, datainput.Input{Name: "init", Object: objectID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return src.on("node")
+	}
+	checked := func(objectID string) bool {
+		t.Helper()
+		sources, err := store.InPlaceSources(ctx, "win-exec")
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range sources {
+			if s.ObjectID == objectID {
+				return true
+			}
+		}
+		return false
+	}
+	if readInPlace(packed) || checked(packed) {
+		t.Fatal("an import packed as one file is read in place")
+	}
+	if !readInPlace(older) || !checked(older) {
+		t.Fatal("an import not known to be a file is not read in place")
+	}
+	if err := store.InputIsFile(ctx, "win-exec", older, "D:/ckpt/other.pt"); err != nil || !readInPlace(older) {
+		t.Fatalf("another path marked it: %v", err)
+	}
+	if err := store.InputIsFile(ctx, "win-exec", older, `D:\ckpt\step_20.pt`); err != nil {
+		t.Fatal(err)
+	}
+	if readInPlace(older) || checked(older) {
+		t.Fatal("an import found to be a file is still read in place")
+	}
+	if err := store.InputIsFile(ctx, "win-exec", older, "D:/ckpt/step_20.pt"); err != nil {
 		t.Fatalf("reported again: %v", err)
 	}
 }
