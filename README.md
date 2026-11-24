@@ -1,124 +1,136 @@
 # Kairo
 
-> **Kairo owns generic Project/Task orchestration semantics, but never
-> interprets project-specific state.**
+> **Kairo は汎用的な Project / Task オーケストレーションの意味論を担いますが、プロジェクト固有の状態は一切解釈しません。**
 
-Kairo safely orchestrates cooperative ML work on a few machines: one daemon
-(optionally with its own executors) and node agents on other hosts. A
-control-only daemon, with no `[[executors]]` or `[[providers]]` (only its
-`[node]` identity), is valid: it serves the API and runs the reconcilers while
-every host that runs jobs runs `kairo agent`. It has two layers. A small declarative orchestration layer stores
-a ProjectSpec, reconciles a static Task DAG, and applies an explicitly
-selected generic task policy. The coordination layer receives immutable
-Execution requests and owns Attempt, Lease, Command, provider, and executor
-mechanics.
+Kairo は、数台のマシン上で協調的な ML ワークロードを安全にオーケストレーションするためのシステムです。1 台のデーモン（`kairo serve`、自身の Executor を持つ構成も可能）と、他のホスト上で動作するノードエージェント（`kairo agent`）で構成されます。`[[executors]]` や `[[providers]]` を持たず、`[node]` の識別情報のみを備えた制御専用（control-only）デーモンも有効な構成です。この場合、デーモンが API の提供と各種リコンサイラの実行を担い、ジョブを実行するすべてのホストで `kairo agent` を稼働させます。
 
-Task is a durable logical object and can have a sequence of immutable
-Executions. Execution, Attempt, and Lease remain distinct physical lifecycle
-objects. At the coordination boundary, project, queue, and task names are
-opaque coordination scopes; the orchestration layer deliberately maps its
-logical Tasks onto those scopes.
+Kairo は次の 2 つのレイヤーに分かれています。
 
-The orchestration layer understands only generic facts: dependencies are
-satisfied, an execution exited, a continuation is permitted by the selected
-policy, or a task succeeded, failed, or became blocked. It does not
-interpret metrics, model quality, artifact contents, datasets, or other
-domain-specific state. DAG topology is static: there is no dynamic fan-out,
-runtime DAG mutation, artifact-derived topology, metric gate, cron scheduling,
-or cleanup language.
+- **宣言的オーケストレーション層**: 小さな宣言的レイヤーであり、ProjectSpec を保存し、静的な Task DAG をリコンサイル（reconcile）し、明示的に選択された汎用タスクポリシーを適用します。
+- **コーディネーション層**: イミュータブルな Execution リクエストを受け取り、Attempt、Lease、Command、Provider、および Executor の仕組みを担います。
 
-## Architecture
+Task は永続的な論理オブジェクトであり、一連のイミュータブルな Execution を持つことができます。一方、Execution、Attempt、Lease はそれぞれ別個の物理ライフサイクルオブジェクトとして維持されます。コーディネーション境界においては、プロジェクト・キュー・Task の名前は不透明（opaque）なコーディネーションスコープとして扱われ、オーケストレーション層が自身の論理的な Task を意図的にそれらのスコープへマッピングします。
 
-A map of the whole; each part is described in full in the section named.
+オーケストレーション層が理解するのは、「依存関係が満たされた」「Execution が終了した」「選択されたポリシーにより継続（continuation）が許可された」「Task が成功・失敗・ブロック状態になった」といった汎用的な事実のみです。メトリクス、モデル品質、アーティファクトの内容、データセットなどのドメイン固有の状態は一切解釈しません。また、DAG トポロジは静的であり、動的ファンアウト、実行時の DAG 変更、アーティファクト由来のトポロジ生成、メトリクスゲート、cron スケジューリング、クリーンアップ用言語といった機能はありません。
 
-Processes:
+## 目次
 
-- `kairo serve`, the daemon: the API, planning and every reconciliation,
-  with its state in PostgreSQL (Database). It may run executors of its own;
-  a control-only daemon runs none.
-- `kairo agent`, on every host that runs work: its executors (each a way of
-  running attempts on its node), its providers (GPUs, CPU and RAM,
-  filesystems) and its pack server (Data stores).
-- `kairo controller`, one per physical host: the device settings and
-  container trims (Hardware settings).
-- The CLI, and the worker SDKs (Python, Rust) in the attempts' processes
-  (Worker SDK).
+- [アーキテクチャ](#アーキテクチャ)
+  - [プロセス構成](#プロセス構成)
+  - [レイヤー構成](#レイヤー構成)
+  - [Execution のライフサイクル](#execution-のライフサイクル)
+  - [エージェントプロトコル](#エージェントプロトコル)
+  - [常に維持される不変条件](#常に維持される不変条件)
+- [クイックスタートと基本操作](#クイックスタートと基本操作)
+  - [一時停止と再開](#一時停止と再開)
+  - [ProjectSpec・タスクポリシー・デフォルト値・環境変数](#projectspecタスクポリシーデフォルト値環境変数)
+  - [Task のキャンセル・チェックポイント・再実行・整理](#task-のキャンセルチェックポイント再実行整理)
+  - [観測専用モードとリソース・ハードウェア履歴](#観測専用モードとリソースハードウェア履歴)
+- [CLI からの Task 監視とログ確認](#cli-からの-task-監視とログ確認)
+- [認証と TLS](#認証と-tls)
+  - [TLS](#tls)
+- [HTTP API](#http-api)
+  - [エンドポイント一覧](#エンドポイント一覧)
+  - [プロジェクトと Task の操作](#プロジェクトと-task-の操作)
+  - [Attempt ログの取得](#attempt-ログの取得)
+  - [ページネーション](#ページネーション)
+  - [クライアント契約とエラーコード](#クライアント契約とエラーコード)
+- [コーディネーションモデル](#コーディネーションモデル)
+  - [エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ)
+  - [アドミッション制御とプランニング](#アドミッション制御とプランニング)
+  - [実行時間の推定](#実行時間の推定)
+  - [Executor のティック処理](#executor-のティック処理)
+  - [Attempt ログ](#attempt-ログ)
+  - [電力と消費電力量](#電力と消費電力量)
+  - [マシン宣言](#マシン宣言)
+  - [コードスナップショット](#コードスナップショット)
+  - [コンテナ実行](#コンテナ実行)
+  - [データストア](#データストア)
+  - [ハードウェア設定](#ハードウェア設定)
+  - [ノード隔離](#ノード隔離)
+  - [ノードフェンス](#ノードフェンス)
+  - [強制停止](#強制停止)
+  - [Gang 実行](#gang-実行)
+- [Worker SDK](#worker-sdk)
+  - [管理対象 Attempt に渡される環境変数と Gang 連携](#管理対象-attempt-に渡される環境変数と-gang-連携)
+  - [セーフポイントの挙動と Python・Rust SDK](#セーフポイントの挙動と-pythonrust-sdk)
+  - [プロジェクト管理の低レベルコントローラポリシー](#プロジェクト管理の低レベルコントローラポリシー)
+- [パイロット受け入れ契約](#パイロット受け入れ契約)
+- [ハードウェアベンチマーク](#ハードウェアベンチマーク)
+  - [ベンチマーク実行](#ベンチマーク実行)
+  - [プリミティブ](#プリミティブ)
+  - [記録とプロファイル](#記録とプロファイル)
+  - [安全設計](#安全設計)
+  - [GPU ベンチマーク](#gpu-ベンチマーク)
+- [データベース](#データベース)
+- [稼働中環境のアップグレード](#稼働中環境のアップグレード)
+  - [運用スクリプト](#運用スクリプト)
+  - [自己バックアップ](#自己バックアップ)
+  - [Durable Store からの環境再構築](#durable-store-からの環境再構築)
+- [検証とテスト](#検証とテスト)
+  - [GitHub 上の CI](#github-上の-ci)
+  - [Kairo 上の CI](#kairo-上の-ci)
 
-Layers:
+## アーキテクチャ
 
-| layer | what it holds | packages | sections |
+システム全体の見取り図です。各要素の詳細は、記載されたセクションで解説しています。
+
+### プロセス構成
+
+- `kairo serve`（デーモン）: API、プランニング、およびすべてのリコンサイル（reconcile）を担当し、状態は PostgreSQL に保持します（[データベース](#データベース)）。自身の Executor を動かすこともできますが、制御専用デーモンの場合は Executor を持ちません。
+- `kairo agent`（ジョブを実行するすべてのホスト上で稼働）: 自身の Executor（そのノード上で Attempt を実行する各手段）、Provider（GPU、CPU・RAM、ファイルシステム）、および pack サーバを動かします（[データストア](#データストア)）。
+- `kairo controller`（物理ホストごとに 1 つ）: デバイス設定とコンテナのトリム（container trims）を担当します（[ハードウェア設定](#ハードウェア設定)）。
+- CLI および各 Attempt のプロセス内で利用する Worker SDK（Python、Rust）（[Worker SDK](#worker-sdk)）。
+
+### レイヤー構成
+
+| レイヤー | 担当内容 | パッケージ | 関連セクション |
 |---|---|---|---|
-| orchestration | ProjectSpec, Tasks (immutable), the policy's decisions, reruns | `orchestration`, `store` (orchestration, task_control, task_views) | Start, Following tasks from the CLI |
-| coordination | Executions (one-shot), Attempts, Leases, Commands, scope gates, gangs, quarantines, force stops | `store` (execution, scheduler, worker, scopes, gang, quarantine, forcestop), `execution` | Coordination model, Gang executions |
-| planning | one pass over the installation: placement, backfill, preemption, run-time estimates, admission accounting | `store` (planner, preemption, estimate) | Admission, Run-time estimates |
-| execution | launch through the executor's backend (on its host or in an Incus container: `executor/backend.go`), shim and adoption, confinement, force stop, quiescence, usage, observation | `executor`, `processidentity`, `provider`, `agentclient` | Agent restarts, Containers, Force stop |
-| data | stores; scratch, output and cache directories; data objects, packs, copies, replicas; imports, run snapshots, checkpoints, temporal data; fetches, eviction, read-back, inventory | `store` (packs, copies, replicas, deletions, imports, inputs, placements, evictions, temporal, regenerate, transfer, runsnapshots, checkpoints, inventory_durable, scrub, shed, control_snapshot), `executor` (its store worker, storeworker.go: datastore, pack, transfer, fetch, retire, evict, inventory, storefs), `machine`, `datainput` | Data stores, Kairo keeps itself |
-| provenance | code snapshots, container images by digest | `sourcesnap`, `imageref`, `store/provenance` | Code snapshots, Containers |
-| hardware | machine declaration, device settings, operating-point policy, benches, power and energy | `machine`, `devicecontrol`, `hwpolicy`, `hwbench`, `bench`, `cpupower`, `store` (device, device_policy, device_samples, hardware_bench, hardware_history, hosts) | Machine declaration, Hardware settings, Hardware benchmarks, Power and energy |
-| access | the HTTP API and the agent operations, tokens, TLS, private files | `api`, `agentops`, `tlsutil`, `secfile`, `store` (tokens) | Authentication and TLS, API |
-| support | the store's transactions under the decision lock and its event log; configuration, env rules, ids, times, external commands, build stamp, tests | `store/dbtx`, `config`, `envspec`, `id`, `instant`, `extcmd`, `buildinfo`, `conformance`, `pgtest`, `sqliteimport` | Database, Verification |
+| `orchestration` | ProjectSpec、Task（イミュータブル）、ポリシーによる判断、再実行（rerun） | `orchestration`, `store`（`orchestration`, `task_control`, `task_views`） | [クイックスタートと基本操作](#クイックスタートと基本操作), [CLI からの Task 監視とログ確認](#cli-からの-task-監視とログ確認) |
+| `coordination` | Execution（ワンショット）、Attempt、Lease、Command、スコープゲート（Scope gate）、Gang、隔離（quarantine）、強制停止 | `store`（`execution`, `scheduler`, `worker`, `scopes`, `gang`, `quarantine`, `forcestop`）, `execution` | [コーディネーションモデル](#コーディネーションモデル), [Gang 実行](#gang-実行) |
+| `planning` | 環境全体に対する 1 回のパスでの処理: 配置、バックフィル、プリエンプション、実行時間の推定、アドミッション計上 | `store`（`planner`, `preemption`, `estimate`） | [アドミッション制御とプランニング](#アドミッション制御とプランニング), [実行時間の推定](#実行時間の推定) |
+| `execution` | Executor のバックエンドを通じた起動（ホスト上または Incus コンテナ内: `executor/backend.go`）、shim と引き継ぎ（adoption）、コンファインメント（Confinement）、強制停止、静止（quiescence）、使用量計測、観測 | `executor`, `processidentity`, `provider`, `agentclient` | [エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ), [コンテナ実行](#コンテナ実行), [強制停止](#強制停止) |
+| `data` | ストア（store）、`scratch`・`output`・`cache` ディレクトリ、データオブジェクト・pack・コピー・レプリカ、インポート・Run スナップショット・チェックポイント・時系列データ、フェッチ・エビクション・リードバック（read-back）・インベントリ | `store`（`packs`, `copies`, `replicas`, `deletions`, `imports`, `inputs`, `placements`, `evictions`, `temporal`, `regenerate`, `transfer`, `runsnapshots`, `checkpoints`, `inventory_durable`, `scrub`, `shed`, `control_snapshot`）, `executor`（ストアワーカー `storeworker.go`: `datastore`, `pack`, `transfer`, `fetch`, `retire`, `evict`, `inventory`, `storefs`）, `machine`, `datainput` | [データストア](#データストア), [自己バックアップ](#自己バックアップ) |
+| `provenance` | コードスナップショット、ダイジェスト指定のコンテナイメージ | `sourcesnap`, `imageref`, `store/provenance` | [コードスナップショット](#コードスナップショット), [コンテナ実行](#コンテナ実行) |
+| `hardware` | マシン宣言、デバイス設定、動作点ポリシー、ベンチマーク、電力と消費電力量 | `machine`, `devicecontrol`, `hwpolicy`, `hwbench`, `bench`, `cpupower`, `store`（`device`, `device_policy`, `device_samples`, `hardware_bench`, `hardware_history`, `hosts`） | [マシン宣言](#マシン宣言), [ハードウェア設定](#ハードウェア設定), [ハードウェアベンチマーク](#ハードウェアベンチマーク), [電力と消費電力量](#電力と消費電力量) |
+| `access` | HTTP API とエージェント操作、トークン、TLS、プライベートファイル | `api`, `agentops`, `tlsutil`, `secfile`, `store`（`tokens`） | [認証と TLS](#認証と-tls), [HTTP API](#http-api) |
+| `support` | 決定ロック（decision lock）配下のストアトランザクションとイベントログ、設定、環境変数ルール、ID、時刻、外部コマンド、ビルドスタンプ、テスト | `store/dbtx`, `config`, `envspec`, `id`, `instant`, `extcmd`, `buildinfo`, `conformance`, `pgtest`, `sqliteimport` | [データベース](#データベース), [検証とテスト](#検証とテスト) |
 
-The life of an execution:
+### Execution のライフサイクル
 
-1. `kairo project apply` stores the declaration and binds each new Task to
-   its code snapshot and image.
-2. The orchestration policy submits the Task's Execution once its
-   dependencies have succeeded.
-3. A planning pass places it and reserves a Lease on a node (or says why it
-   waits).
-4. That node's executor prepares the lease, is authorized to launch an
-   Attempt, starts its shim and activates it; the shim then starts the
-   command (confined when the execution is, or the data policy confines
-   every launch).
-5. The executor records the exit, and the lease is released once every
-   process of the attempt is absent.
-6. The policy decides what follows: success, a continuation after a
-   checkpoint, or a blocked Task.
-7. Throughout, what the run writes is packed, copied to the durable stores
-   and kept.
+1. `kairo project apply` が宣言を保存し、各新規 Task をそのコードスナップショットおよびイメージに紐づけます。
+2. オーケストレーションポリシーが、依存先 Task がすべて成功した時点でその Task の Execution を投入します。
+3. プランニングパスが配置先を決定し、ノード上に Lease を予約します（配置できない場合は待機理由を記録します）。
+4. 該当ノードの Executor が Lease を準備し、Attempt 起動の認可を得て shim（`__kairo-shim`）を起動・有効化します。その後、shim がコマンドを起動します（Execution で指定されている場合、またはデータポリシーがすべての起動にコンファインメントを適用している場合は、コンファインメントされた状態で起動します）。
+5. Executor が終了（exit）を記録し、その Attempt のすべてのプロセスが存在しなくなった時点で Lease が解放されます。
+6. ポリシーが次の遷移先を判断します（成功、チェックポイント後の継続（continuation）、またはブロック状態の Task）。
+7. 実行中を通じて、ジョブが書き込んだデータは pack され、durable store へコピーされて保持されます。
 
-The agent protocol:
+### エージェントプロトコル
 
-- Agents dial the daemon; the daemon never dials them.
-- An agent registers its node, executors and providers, naming the
-  attempts it adopts.
-- Each executor then ticks every 250 ms. In each tick it reports
-  observations, carries out what it is ordered (quiescence checks,
-  terminations, force stops, packs, copies, fetches, deletions, evictions,
-  read-backs, scratch settlement) and reserves its next execution.
-- Every operation is `POST /api/agent/<operation>`, checked against the node
-  owning what it names. Each is declared once, with its request, answer and
-  observe-only rule, in `internal/agentops`, which the daemon serves and the
-  agents' client calls.
-- An order can be carried out twice with the same result, and lease epochs
-  fence what a stale caller does.
+- エージェントがデーモンへ接続します。デーモンからエージェントへ接続することはありません。
+- エージェントは自身のノード、Executor、Provider を登録し、引き継ぐ（adopt する）Attempt を申告します。
+- その後、各 Executor は 250 ms ごとにティックを実行します。各ティックでは観測結果を報告し、指示された操作（静止（quiescence）チェック、終了処理、強制停止、pack、コピー、フェッチ、削除、エビクション、リードバック（read-back）、`scratch` の精算）を実行したうえで、次の Execution を予約します。
+- すべての操作は `POST /api/agent/<operation>` であり、指定された対象を所有するノードと照合して検証されます。各操作はリクエスト・レスポンス・`observe_only` 時のルールとあわせて `internal/agentops` に 1 箇所だけ宣言されており、デーモンがこれを提供し、エージェントのクライアントがこれを呼び出します。
+- 指示は 2 回実行しても同じ結果になるように設計されており、Lease のエポック（lease epoch）によって `stale` な呼び出し元からの操作をフェンス（fence）します。
 
-Invariants every change keeps:
+### 常に維持される不変条件
 
-- The daemon decides and agents carry out and report facts. Kairo never
-  interprets a project's state: exit 0 is not the work's success.
-- A declared Task is immutable, and an Execution starts at most once.
-- A lease is released only once every process of its attempt is absent and
-  observations since show its resources unclaimed. Time alone never frees
-  one.
-- Kairo touches only its own under a store's root. On a durable store it
-  removes only its own writes it never recorded, and, to stay above a
-  store's reserve, copies kept verified on two other durable stores.
-- Every attempt writes only where Kairo hands it (Confinement). What it
-  writes is Kairo's to keep from the moment it is written.
+- デーモンが意思決定を行い、エージェントは指示の実行と事実の報告のみを担います。Kairo はプロジェクトの状態を一切解釈しません（終了コード 0 は、プロジェクト固有の意味での作業成功を意味するものではありません）。
+- 宣言された Task はイミュータブルであり、1 つの Execution が開始されるのは最大 1 回です。
+- Lease が解放されるのは、その Attempt に属するすべてのプロセスが存在しなくなり、かつそれ以降の観測で対象リソースが未占有であることが確認された場合のみです。時間の経過だけで Lease が解放されることはありません。
+- Kairo がストアのルート配下で操作するのは自身が管理する領域だけです。durable store 上で削除するのは、自身が書き込んだものの未記録のファイルと、ストアの予約空き容量（reserve）を下回らないように維持するために削除する「他の 2 つの durable store 上に検証済み（`verified`）のコピーが存在するコピー」のみです。
+- すべての Attempt は Kairo が割り当てた領域にのみ書き込みます（コンファインメント / Confinement）。Attempt が書き込んだデータは、書き込まれた瞬間から Kairo が保持する対象となります。
 
-## Start
+## クイックスタートと基本操作
 
-The daemon keeps its state in a PostgreSQL database (see Database below);
-create it once, empty, then point `database_url` (or `KAIRO_DATABASE_URL`) at
-it.
+デーモンは状態を PostgreSQL データベースに保存します（[データベース](#データベース)を参照）。最初に空のデータベースを 1 つ作成し、`database_url`（または環境変数 `KAIRO_DATABASE_URL`）でその接続先を指定してください。
 
 ```powershell
-# TLS material: a private CA and a server certificate for every address
-# clients use to reach the daemon (kairo tls issue re-issues it later).
+# TLS 用マテリアル: プライベート CA と、クライアントがデーモンへの接続に使うすべてのアドレス向けのサーバ証明書（後から kairo tls issue で再発行可能）
 go run ./cmd/kairo tls init --dir local/tls --host 127.0.0.1 --host localhost --host 192.168.1.12
-go run ./cmd/kairo serve --config examples/kairo.toml     # creates the schema
-# In another terminal: an operator token, saved where the CLI looks for it.
+go run ./cmd/kairo serve --config examples/kairo.toml     # スキーマを作成
+# 別ターミナルにて: オペレータ用トークンを作成し、CLI の参照先に保存
 go run ./cmd/kairo token create --config examples/kairo.toml --name operator --role admin --save
 go run ./cmd/kairo doctor
 go run ./cmd/kairo project validate examples/project-spec.toml
@@ -137,238 +149,176 @@ go run ./cmd/kairo machine show
 go run ./cmd/kairo hardware show
 ```
 
-The example configuration listens on loopback over plain HTTP (with
-`observe_only = true`), so its CLI needs `--api http://127.0.0.1:7474` or
-`KAIRO_API`; a daemon reachable from other hosts needs the TLS settings below.
-The CLI sends a token over plain HTTP only to a loopback address. Flags go
-before positional arguments.
+サンプル設定ファイル（`examples/kairo.toml`）は `observe_only = true` でループバック上の平文 HTTP を待ち受けるため、CLI からは `--api http://127.0.0.1:7474` または環境変数 `KAIRO_API` の指定が必要です。他のホストから到達可能なデーモンでは、後述の [TLS](#tls) 設定が必要になります。なお、CLI が平文 HTTP 経由でトークンを送信するのはループバックアドレス宛ての場合に限られます。また、CLI のフラグは位置引数よりも前に指定してください。
 
-Pause closes the selected coordination scope, fences concurrent launches, and
-waits by default until all captured executions are quiesced and their leases
-are released. `--no-wait` returns after the durable pause operation is stored.
-Resume only reopens admission; it never recalls a suspend command or decides
-which execution should run next.
+### 一時停止と再開
 
-`project apply` stores the declaration once; the daemon performs subsequent
-reconciliation. Applying the same normalized declaration is idempotent. A
-declared Task is immutable; a later complete ProjectSpec may add Tasks but
-cannot mutate an existing Task, and omission does not cancel it. A Task's
-`depends_on` (and so a `task = "T"` input) may name a Task the file does not
-declare but the project already has, declared by another file (a judge
-comparing a new experiment's run with an earlier one's, say): the daemon
-resolves it when applying and refuses the apply if the project has no such
-Task; it is then depended on as one of the file's own. `kairo project
-validate` lists such names (`external_dependencies` with `--json`). They
-cannot close a cycle, since a Task declared before depends only on Tasks
-declared before it.
+`pause` を実行すると、選択したコーディネーションスコープが閉じられ、並行する新規起動がフェンスされます。デフォルトでは、捕捉されたすべての Execution が `quiesced`（静止）状態となり、それらの Lease が解放されるまで待機します。`--no-wait` を指定した場合は、永続的な一時停止操作が保存された時点で即座に返ります。
 
-The initial `RunToCompletion@v1` policy waits for every dependency to succeed,
-submits the Task's initial Execution, and marks the Task successful only after
-a zero exit, Attempt quiescence, and Lease release. A checkpointed cooperative
-suspend with an opaque continuation creates the next immutable Execution.
-Lost Attempt identity blocks the Task (unless it is declared
-`continue_after_loss`, below), and an unsuccessful dependency blocks its
-dependants. See `examples/project-spec.toml` for the declaration format.
-Besides `labels`, `[tasks.execution.executor]` may name a `node` (only that
-node's executors take the task), and an `[[tasks.execution.exclusive]]`
-request a `device` (one GPU by its UUID, `count = 1`), as the tasks of
-`kairo hardware bench` do.
-A top-level `[defaults]` table (`queue`, `policy`, `execution`) is merged into
-every Task by the CLI before validation: the Task's own value wins, tables
-merge key by key, arrays and scalars are replaced, and an omitted `depends_on`
-becomes `[]`. Digests are those of the fully written Task, so `[defaults]`
-never changes what the daemon stores.
+`resume` はアドミッションを再開するだけです。中断（suspend）コマンドを取り消したり、次にどの Execution を実行すべきかを判断したりすることはありません。
 
-`[tasks.execution.env]` (and `[env]` in an execution TOML) sets environment
-variables of the attempt, instead of `powershell -Command '$env:...'` or
-`env A=B` wrappers. `[defaults.execution.env]` merges key by key, and `env` on
-a `[[tasks.execution.gang.ranks]]` entry merges over the task's for that rank.
-The attempt inherits the executor's environment, then the declared variables
-(which may replace `PATH` and the like; on Windows names compare without
-case), then what Kairo sets (`KAIRO_*`, gang variables, `CUDA_VISIBLE_DEVICES`
-for bound GPUs, `TMPDIR`/`TMP`/`TEMP` with `scratch_tmpdir`), which a
-declaration cannot override. Names starting with
-`KAIRO_` are rejected, and so is `CUDA_VISIBLE_DEVICES` on an
-execution with an exclusive GPU request (a CPU task may set it to `-1`).
-`argv[0]` is still looked up on the executor's own `PATH`, and
-argv reaches the program word for word on every executor: no shell sits in
-between, so `$VAR` in an argument
-is expanded only by a shell the argv itself starts.
-Env is part of the task's digest and is stored and shown in plain text to any
-reader of the API: it is not a place for secrets.
+### ProjectSpec・タスクポリシー・デフォルト値・環境変数
 
-`kairo task cancel [--dry-run] PROJECT [QUEUE] TASK` ends a Task that is not
-running: one still waiting for its dependencies, a pending or blocked one, or
-a paused one. It withdraws every execution of the Task that has not started
-(every gang rank included) and marks the Task `cancelled`; dependants are
-blocked as for a failed Task. It refuses while an execution is started and
-not terminal (pause the Task first, or `task pause --force`) and leaves
-checkpoints and other outputs alone. An execution withdrawn with `execution
-withdraw` before it started also leaves its Task `cancelled`.
+#### ProjectSpec の適用と外部依存
 
-`kairo task checkpoint [--wait] [--timeout 30m] PROJECT [QUEUE] TASK` asks
-every running attempt of a Task (every gang rank) to publish a checkpoint at
-its next safe point and carry on: a `checkpoint` command (origin
-`operator_checkpoint`), acknowledged like a suspend (`accepted`,
-`checkpointing`, then `checkpointed` with the path as `continuation_ref`), but
-the attempt stays `running`, its lease `active`, and the checkpoint is not the
-attempt's continuation (event `checkpoint_saved`, not `checkpoint_published`).
-An attempt has at most one checkpoint in flight; asking again returns it. It
-refuses a Task with no running attempt or whose execution is not
-checkpointable. `--wait` prints each published path (or the refusal) once
-acknowledged; `GET /api/commands/{id}` returns a command's state and payload.
-Workers whose SDK predates the command skip it, so it stays pending.
-The daemon asks for checkpoints the same way on its own (origin
-`data_protection`) and keeps what is published (Checkpoints of running
-work).
+`project apply` は宣言を一度保存する操作であり、その後のリコンサイル（reconcile）はデーモンが行います。正規化後に同一となる宣言を再適用する操作はべき等です。
 
-`kairo task rerun PROJECT [QUEUE] TASK` runs the same declaration of a
-`failed`, `stopped`, `cancelled` or `blocked` Task again, as its next
-Execution (reason `rerun`), once all of its executions have ended. Dependants
-that were blocked only because a dependency did not succeed return to
-`pending` and run if their dependencies now succeed. A changed declaration
-still needs a new Task name. `--from-checkpoint latest|COMMAND_ID` (a
-checkpointable Task that is not a gang) runs it from a checkpoint it
-published instead of from the start: the latest, or the one of that command
-(a suspend or checkpoint command acknowledged `checkpointed`; `GET
-/api/commands/{id}`). The new Execution is a continuation of that
-checkpoint's reference (`KAIRO_CONTINUATION_REF`), as after a checkpointed
-suspend, planned onto the node of the attempt that published it, since the
-reference is a path there; the CLI prints the checkpoint. A Task that
-published none, or a command that is not one of its checkpoints, is refused.
-`--source current|SNAPSHOT` (a Task that runs in a source) runs it in
-another snapshot of its source than the one it was declared with: `current`,
-the snapshot the project's latest `project apply` sent for that source
-(applying the same file again with fixed code leaves the Task as declared,
-so this is how the fix reaches it), or a snapshot of that source by id. The
-new Execution records the snapshot it runs in, the Task stays bound to its
-own, and dependants and inputs keep naming the same Task. A snapshot the
-daemon does not keep, or one of another source, is refused. The two options
-go together: fixed code going on from a checkpoint. `kairo project prune [--write]
-FILE` reports (or, with `--write`, rewrites FILE to) the Tasks that can still
-run and the dependencies they need, keeping each kept Task's digest.
+宣言済みの Task はイミュータブルです。後から完全な ProjectSpec を適用して新しい Task を追加することはできますが、既存の Task を変更することはできません。また、宣言から既存 Task を省略してもキャンセルはされません。
 
-`observe_only = true` inventories resources and external claims but never
-reserves, launches, suspends, or releases work. It is the recommended first
-deployment mode on a host with unmanaged training processes.
+Task の `depends_on`（およびそれに伴う `task = "T"` 入力）には、そのファイル内では宣言していないものの、別ファイルによって同じプロジェクト内に既に宣言されている Task を指定できます（たとえば、新しい実験の実行結果と以前の実行結果を比較する評価用 Task など）。デーモンは適用時にこの依存先を解決し、プロジェクトに該当する Task が存在しなければ適用を拒否します。解決された依存先は、そのファイル自身の Task と同様に依存対象として扱われます。`kairo project validate` はこうした外部依存の Task 名を一覧表示します（`--json` 指定時は `external_dependencies` フィールドに出力）。以前に宣言された Task はそれより前に宣言された Task にしか依存できないため、外部依存によって循環（サイクル）が生じることはありません。
 
-`kairo resource status` prints one row per resource, by node (GPUs, then
-cpu, ram and disk): its state (with a quarantine's reason), total and free as
-last observed (a GPU's memory and utilization; a cpu's cores), what live
-leases reserve of a cpu, ram or disk, the latest power sample (POWER: a GPU's
-draw and the power limit in force, `289/320 W`, a cpu's CPU package draw;
-CLOCKS: a GPU's SM clock, P-state and active clock event reasons, `1905 MHz
-P2 sw-power`; see Power and energy) and the tasks holding it (with the lease
-state unless `active`); then the external claims with their evidence, and the
-GPUs reported but not declared for their node. A claim's `since` is when the
-current episode was first observed; it starts over if the claim clears and
-returns. `--json` prints the response of `GET /api/resources` instead, whose
-resources also carry `total_bytes`, `free_bytes`, `utilization`, `reserved`,
-`holders` and `device` (the latest sample). `kairo doctor` ends with the same
-table.
+#### タスクポリシーと実行先指定・`[defaults]`
 
-Resource observations describe the present: only each resource's latest one
-is used, and the daemon prunes the others once they are an hour old. Device
-samples are kept for 72 hours (each device's latest always), and so is the
-hardware history: at most one observation per resource every 30 seconds,
-with what its live leases reserved of it then, and one device sample per
-device as often. `kairo db compact --config kairo.toml` prunes them all at
-once and vacuums their tables; it may run alongside the daemon (PostgreSQL's
-autovacuum does the same in time).
+初期ポリシーである `RunToCompletion@v1` は、すべての依存先 Task が成功するのを待って Task の初回 Execution を投入し、「終了コード 0」「Attempt の静止（quiescence）」「Lease の解放」のすべてが揃った時点で初めて Task を成功とみなします。チェックポイント付きの協調的中断（cooperative suspend）で不透明な継続（continuation）が返された場合は、次のイミュータブルな Execution を作成します。Attempt の識別情報が失われた場合は Task がブロック状態となります（後述の `continue_after_loss` が宣言されている場合を除く）。また、依存先 Task が成功しなかった場合、後続 Task はすべてブロック状態となります。
 
-The history is for dashboards, through two read routes. Both take `since`
-and `until` (RFC 3339; by default the last 24 hours, and `since` no earlier
-than 72 hours ago) and `key` (repeatable) to keep only some series:
+宣言フォーマットの詳細は `examples/project-spec.toml` を参照してください。`[tasks.execution.executor]` には `labels` のほか `node` を指定でき、指定するとそのノード上の Executor のみが Task を引き受けます。また、`[[tasks.execution.exclusive]]` には `device`（UUID による単一 GPU 指定、`count = 1`）を指定できます（`kairo hardware bench` の Task と同様の仕組みです）。
 
-- `GET /api/hardware/samples` (also `step`, a duration such as `60s` or a
-  number of seconds; never less than 30 s or than a 2000th of the window)
-  averages the history into buckets of `step` aligned on `since` and answers
-  `{"since", "until", "step_seconds", "series"}`. Each series is `{"key",
-  "kind", "nodes", "resources", "t", "metrics"}`: `t` holds the start of each
-  bucket that has a sample, in Unix milliseconds, and each metric one value
-  per bucket (`null` where none of its samples had it). A GPU is one series
-  by its UUID, listing every node it is declared on (`kind` `gpu`: `util`
-  and `mem_util` in percent, `mem_used`, `mem_total` in bytes, `power_w`,
-  `power_limit_w`, `sm_clock_mhz` from its device samples). A node's `cpu`
-  has `total`, `reserved` (millicores) and `power_w` (its CPU package, as
-  the node reads it); `ram` and `disk` have `used`, `total` and `reserved`
-  (bytes); a host's CPU package as its controller reads it is the series
-  `host/<host>/cpu` (`kind` `host_cpu`, `power_w`; its nodes are the
-  host's), which is the only package power of a container node.
-- `GET /api/hardware/leases` answers `{"since", "until", "leases"}`: every
-  lease that held a resource within the window, by resource and start, each
-  `{"key", "resource_id", "kind", "node", "lease_id", "state",
-  "execution_id", "project", "queue", "task", "quantity", "start", "end"}`.
-  `start` is when the lease was made (admission counts it from its
-  reservation) and `end` when it was released, `null` while it holds the
-  resource (a stale lease too); both RFC 3339.
+トップレベルの `[defaults]` テーブル（`queue`、`policy`、`execution`）は、バリデーション前に CLI によってすべての Task へマージされます。
 
-CPU, RAM, and disk reservations are admission accounting rather than hard OS
-limits (see Admission for how they are counted). GPU exclusion is a coordination guarantee among Kairo participants;
-external processes are observed and excluded but cannot be physically fenced.
-A compute process on a GPU that no attempt started is an `external_claim`;
-more than 1 GiB of GPU memory with no compute process to account for it is
-`unattributed_activity` (on Linux that is what another container's work
-looks like). On Windows, memory on a GPU that shows graphics processes (`G`
-or `C+G` in `nvidia-smi pmon`: the compositor, a browser, the desktop of a
-display GPU) is theirs and not unattributed, since WDDM reports no
-per-process memory to tell them apart.
+- Task 自身の値が優先されます。
+- テーブルはキー単位でマージされます。
+- 配列とスカラー値は上書き（置換）されます。
+- `depends_on` が省略されている場合は `[]` になります。
+- ダイジェストは展開後の完全な Task に対して計算されるため、`[defaults]` の有無によってデーモンが保存する内容が変わることはありません。
 
-## Following tasks from the CLI
+#### 環境変数（`env`）と `argv` の扱い
 
-Every command group answers `help`, `--help` and `-h` (`kairo task --help`,
-`kairo task wait --help`); a mistyped subcommand gets a suggestion. QUEUE may
-be left out of task commands for Tasks declared by a ProjectSpec.
+`[tasks.execution.env]`（および Execution TOML の `[env]`）を使うと、`powershell -Command '$env:...'` や `env A=B` のようなラッパーを使わずに Attempt の環境変数を設定できます。`[defaults.execution.env]` はキー単位でマージされ、`[[tasks.execution.gang.ranks]]` エントリの `env` は該当 rank に対して Task の `env` へ上書きマージされます。
 
-| Command | What it prints |
+環境変数の適用優先順位は次のとおりです（後から適用されるものが優先）。
+
+1. Executor 自身の環境変数を継承します。
+2. 宣言された環境変数を適用します（`PATH` などの上書きも可能です。Windows では変数名を大文字・小文字を区別せずに比較します）。
+3. Kairo が設定する環境変数（`KAIRO_*`、Gang 関連変数、割り当て GPU 向けの `CUDA_VISIBLE_DEVICES`、`scratch_tmpdir` 有効時の `TMPDIR` / `TMP` / `TEMP`）を適用します。これらは宣言側で上書きできません。
+
+また、次の制約があります。
+
+- `KAIRO_` で始まる変数名は拒否されます。
+- 排他的 GPU リクエストを持つ Execution では `CUDA_VISIBLE_DEVICES` の指定も拒否されます（CPU Task であれば `-1` を指定可能です）。
+- `argv[0]` の探索には、引き続き Executor 自身の `PATH` が使われます。
+- すべての Executor において、`argv` はシェルを介さずそのまま 1 語ずつプログラムへ渡されます。そのため、引数内の `$VAR` が展開されるのは `argv` 自体が起動したシェルによって処理される場合だけです。
+- `env` は Task のダイジェストに含まれ、API の読み取り権限を持つすべてのクライアントに平文で保存・表示されます。シークレットの格納場所としては使用しないでください。
+
+### Task のキャンセル・チェックポイント・再実行・整理
+
+#### キャンセル（`kairo task cancel`）
+
+`kairo task cancel [--dry-run] PROJECT [QUEUE] TASK` は、実行中でない Task（依存先待ち、`pending`、`blocked`、または一時停止中の Task）を終了させます。未開始の Execution（すべての Gang rank を含む）をすべて取り下げ、Task を `cancelled` 状態にします。後続 Task は失敗した Task に依存する場合と同様にブロックされます。
+
+既に開始され終了状態に達していない Execution がある間はキャンセルが拒否されるため、先に Task を一時停止するか、`task pause --force` を実行してください。既存のチェックポイントやその他の出力ファイルはそのまま残されます。なお、開始前の Execution を `execution withdraw` で取り下げた場合も、その Task は `cancelled` 状態になります。
+
+#### 実行中 Task のチェックポイント作成（`kairo task checkpoint`）
+
+`kairo task checkpoint [--wait] [--timeout 30m] PROJECT [QUEUE] TASK` は、Task の実行中のすべての Attempt（すべての Gang rank）に対し、次の安全なタイミングでチェックポイントを公開したうえで実行を続行するよう要求します。
+
+- `checkpoint` コマンド（origin は `operator_checkpoint`）が発行され、suspend と同様に `accepted`、`checkpointing`、そしてパスを `continuation_ref` として含む `checkpointed` で応答されます。
+- ただし、Attempt は `running`、Lease は `active` のまま維持され、作成されたチェックポイントは Attempt の継続（continuation）にはなりません（イベントも `checkpoint_published` ではなく `checkpoint_saved` となります）。
+- 1 つの Attempt で同時に進行できるチェックポイント要求は最大 1 件です。進行中に再度要求すると、既存の要求がそのまま返されます。
+- 実行中の Attempt が存在しない Task、またはチェックポイント非対応（not checkpointable）の Execution を持つ Task に対する要求は拒否されます。
+- `--wait` を指定すると、応答完了時に公開された各パス（または拒否理由）が出力されます。コマンドの状態とペイロードは `GET /api/commands/{id}` でも取得できます。
+- このコマンドより古い Worker SDK を使用しているワーカーはコマンドをスキップするため、保留（pending）のままになります。
+
+デーモン自身も同じ仕組み（origin は `data_protection`）でチェックポイントを要求し、公開されたチェックポイントを保護・保持します（[実行中ジョブのチェックポイント保護](#実行中ジョブのチェックポイント保護)を参照）。
+
+#### 再実行（`kairo task rerun`）と宣言の整理（`kairo project prune`）
+
+`kairo task rerun PROJECT [QUEUE] TASK` は、`failed`、`stopped`、`cancelled`、または `blocked` 状態の Task について、すべての Execution が終了した後に同一の宣言で次の Execution（理由は `rerun`）を実行します。依存先が成功しなかったことだけを理由にブロックされていた後続 Task は `pending` へ戻り、依存先が成功すれば実行されます。なお、宣言内容を変更したい場合は、引き続き新しい Task 名が必要です。
+
+`kairo task rerun` には次のオプションを指定できます（両方を併用して、修正したコードでチェックポイントから再開することも可能です）。
+
+- `--from-checkpoint latest|COMMAND_ID`（Gang ではないチェックポイント対応 Task が対象）: 最初からではなく、その Task が公開したチェックポイント（`latest`、または `checkpointed` 応答済みの suspend / checkpoint コマンドの `COMMAND_ID`、`GET /api/commands/{id}` で確認可能）から再開します。新しい Execution は、チェックポイント付き中断の再開時と同様に、そのチェックポイント参照（`KAIRO_CONTINUATION_REF`）の継続（continuation）として作成されます。参照先がそのノード上のパスであるため、チェックポイントを公開した Attempt のノードへ配置が計画され、CLI には使用されるチェックポイントが出力されます。チェックポイントを一度も公開していない Task や、該当 Task のチェックポイントではないコマンドを指定した場合は拒否されます。
+- `--source current|SNAPSHOT`（ソース上で実行する Task が対象）: 宣言時に紐づけられたスナップショットとは別の、同じソースのスナップショット上で実行します。`current` を指定すると、そのソースに対して最新の `project apply` が送信したスナップショットを使用します（コードを修正して同じファイルを再適用しても既存 Task の宣言自体は変わらないため、このオプションで修正を反映させます）。あるいはスナップショット ID を直接指定することもできます。新しい Execution には実行に使用したスナップショットが記録される一方、Task 自体は元のスナップショットに紐づいたまま維持されるため、後続 Task や入力参照は引き続き同じ Task 名を指定できます。デーモンが保持していないスナップショットや別ソースのスナップショットは拒否されます。
+
+`kairo project prune [--write] FILE` は、まだ実行可能な Task とそれらが必要とする依存先 Task を報告します（`--write` を指定すると、残す各 Task のダイジェストを維持したまま `FILE` を書き換えます）。
+
+### 観測専用モードとリソース・ハードウェア履歴
+
+#### 観測専用モード（`observe_only = true`）
+
+`observe_only = true` を設定すると、リソースおよび外部占有（`external_claim`）のインベントリ収集のみを行い、ジョブの予約・起動・中断・解放は一切行いません。Kairo の管理外で学習プロセスが動いているホストへ最初に導入する際の推奨モードです。
+
+#### リソース状態の表示（`kairo resource status`）
+
+`kairo resource status` は、ノードごとにリソース 1 件につき 1 行の表を出力します（GPU、続いて `cpu`、`ram`、`disk` の順）。各行には次の情報が表示されます。
+
+- リソースの状態（隔離（quarantine）されている場合はその理由を含む）
+- 最終観測時点の総量と空き容量（GPU はメモリと使用率、`cpu` はコア数）
+- 稼働中の Lease が予約している量（`cpu`、`ram`、`disk`）
+- 最新の電力・クロックサンプル:
+  - `POWER`: GPU の消費電力と有効な電力上限（例: `289/320 W`）、`cpu` の場合は CPU パッケージの消費電力
+  - `CLOCKS`: GPU の SM クロック、P-state、有効なクロックイベント理由（例: `1905 MHz P2 sw-power`。詳細は[電力と消費電力量](#電力と消費電力量)を参照）
+- そのリソースを保持している Task（Lease の状態が `active` 以外の場合はその状態も併記）
+
+表に続けて、根拠（evidence）付きの外部占有（`external_claim`）と、報告されているもののノードに宣言されていない GPU が表示されます。外部占有の `since` は現在の占有エピソードが最初に観測された時刻であり、一度解消されてから再び発生した場合は新しい時刻からカウントし直されます。
+
+`--json` を指定すると、代わりに `GET /api/resources` のレスポンスがそのまま出力されます。JSON 内の各リソースには `total_bytes`、`free_bytes`、`utilization`、`reserved`、`holders`、および `device`（最新サンプル）も含まれます。なお、`kairo doctor` の末尾にも同じ表が出力されます。
+
+#### 観測データとハードウェア履歴の保持・圧縮
+
+リソース観測データは「現在の状態」を表すためのものであり、各リソースの最新 1 件のみが利用されます。それ以外の古い観測データは 1 時間経過後にデーモンが自動で削除します。
+
+デバイスサンプルは 72 時間保持されます（各デバイスの最新 1 件は常に保持）。ハードウェア履歴も同様に 72 時間保持され、リソースごとに最大 30 秒に 1 件の観測データ（その時点で稼働中の Lease が予約していた量を含む）と、デバイスごとに同頻度のデバイスサンプルが記録されます。
+
+`kairo db compact --config kairo.toml` を実行すると、期限切れデータをまとめて削除し対象テーブルに VACUUM を実行します。デーモンの稼働中に並行実行しても問題ありません（PostgreSQL の autovacuum も時間をかけて同等の処理を行います）。
+
+#### ダッシュボード向けハードウェア履歴 API
+
+ハードウェア履歴はダッシュボード向けに 2 つの読み取りエンドポイントから取得できます。いずれもクエリパラメータとして `since` と `until`（RFC 3339 形式。デフォルトは直近 24 時間で、`since` は 72 時間前より過去にはできません）および `key`（複数回指定可。特定の系列のみに絞り込み）を受け付けます。
+
+- `GET /api/hardware/samples`:
+  - 追加パラメータとして `step`（`60s` のような期間指定または秒数。30 秒未満、および指定ウィンドウ幅の 1/2000 未満にはなりません）を受け付け、`since` に揃えた `step` 幅のバケットごとに履歴を平均化して `{"since", "until", "step_seconds", "series"}` を返します。
+  - 各系列は `{"key", "kind", "nodes", "resources", "t", "metrics"}` の形式です。`t` にはサンプルが存在する各バケットの開始時刻（Unix ミリ秒）が入り、各メトリクスにはバケットごとに 1 つの値が入ります（バケット内のいずれのサンプルにも値がない場合は `null`）。
+  - **GPU**: UUID ごとに 1 つの系列となり、その GPU が宣言されているすべてのノードが `nodes` に列挙されます（`kind` は `gpu`。メトリクスは `util`・`mem_util`（%）、`mem_used`・`mem_total`（バイト）、およびデバイスサンプル由来の `power_w`・`power_limit_w`・`sm_clock_mhz`）。
+  - **ノードの `cpu`**: `total`、`reserved`（ミリコア）、およびノード自身が読み取った CPU パッケージ電力 `power_w` を持ちます。
+  - **`ram` と `disk`**: `used`、`total`、`reserved`（バイト）を持ちます。
+  - **ホストの CPU パッケージ**: コントローラ（`kairo controller`）が読み取ったホスト単位の CPU パッケージ電力は `host/<host>/cpu` という系列（`kind` は `host_cpu`、メトリクスは `power_w`、`nodes` はそのホストに属するノード一覧）として提供されます。コンテナノードにおける CPU パッケージ電力は、この系列からのみ取得できます。
+- `GET /api/hardware/leases`:
+  - `{"since", "until", "leases"}` を返します。指定ウィンドウ内にリソースを保持していたすべての Lease が、リソースおよび開始時刻順で返されます。
+  - 各要素は `{"key", "resource_id", "kind", "node", "lease_id", "state", "execution_id", "project", "queue", "task", "quantity", "start", "end"}` の形式です。
+  - `start` は Lease が作成された時刻（アドミッションは予約時点から計上するため）、`end` は解放された時刻で、リソースを保持している間（`stale` な Lease を含む）は `null` になります。いずれも RFC 3339 形式です。
+
+#### リソース予約の意味論と GPU 外部占有の検出
+
+CPU、RAM、およびディスクの予約は OS レベルのハード制限ではなく、アドミッション計上のための仕組みです（計上方法の詳細は[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）。GPU の排他制御は Kairo に参加する主体間でのコーディネーション保証であり、外部プロセスについては観測してスケジュール対象から除外することはできますが、物理的にフェンスすることはできません。
+
+GPU 上の外部利用は次の基準で分類されます。
+
+- **`external_claim`**: いずれの Attempt からも起動されていない計算（compute）プロセスが GPU 上に存在する場合。
+- **`unattributed_activity`**: 説明のつく計算プロセスが存在しないにもかかわらず、1 GiB を超える GPU メモリが使用されている場合（Linux では別コンテナ上のワークロードがこの状態として観測されます）。
+- **Windows の例外**: Windows 上でグラフィックスプロセス（`nvidia-smi pmon` で `G` または `C+G` として現れるコンポジタ、ブラウザ、ディスプレイ接続 GPU のデスクトップなど）が表示されている GPU のメモリ使用量は、WDDM がプロセスごとのメモリ使用量を報告せず切り分けができないため、それらのプロセスによるものとして扱い `unattributed_activity` には計上しません。
+
+## CLI からの Task 監視とログ確認
+
+すべてのコマンドグループは `help`、`--help`、`-h` に対応しています（例: `kairo task --help`、`kairo task wait --help`）。サブコマンドを打ち間違えた場合は候補が提示されます。なお、ProjectSpec で宣言された Task に対する `task` 系コマンドでは `QUEUE` を省略できます。
+
+| コマンド | 出力内容 |
 |---|---|
-| `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | a table (name, queue, state, execution, start, elapsed, exit or reason or progress or pause) of live Tasks and those updated in the last 24 h (`--all`: every Task), then the project's counts by state |
-| `kairo task show PROJECT [QUEUE] TASK [--json]` | one Task: declaration, env, dependencies and dependants, scope gates (a closed one with who closed it and when), every execution with its attempts, nodes, exit, output objects (ID, state, lifecycle and verified copy locations; `outputs` in JSON), log paths and sizes, log issues, the energy its GPUs used (`energy: GPU 1.23 kWh (partial)`), the most RAM its processes were seen to use beside what it reserved (`ram: peak 9.0 GiB seen (sampled every 15 s)`), gang ranks, and why a waiting execution waits |
-| `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | the last N lines (default 50, `0` all) of the latest attempt's logs, also for attempts on agent nodes; `-f` follows until the attempt has exited and its logs stopped growing |
-| `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | one line per state change (`10:01:33 hello running -> succeeded`), `DOWN`/`UP` while the daemon is unreachable, `STALL` when a running Task's logs stop growing for D; exits 0 when all succeeded (or started), 1 when one ended otherwise, 2 on timeout, 3 on a usage or lookup error |
-| `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | state changes, progress (once a minute per Task) and a summary every 10 min; with `--exit-when-idle` it exits when nothing is pending or running (1 if a watched Task did not succeed) |
-| `kairo execution logs EXECUTION_ID`, `kairo logs ATTEMPT_ID` | the same logs by execution or attempt |
-| `kairo version` | the CLI's and the daemon's build; `doctor` warns when they differ |
+| `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | 稼働中（live）の Task と直近 24 時間以内に更新された Task（`--all` で全 Task）を表形式（name、queue、state、execution、start、elapsed、および exit / reason / progress / pause）で出力し、続けてプロジェクトの状態別件数を表示 |
+| `kairo task show PROJECT [QUEUE] TASK [--json]` | 単一 Task の詳細を表示: 宣言内容、`env`、依存先 Task と後続 Task、スコープゲート（閉じている場合は閉じた操作者と日時）、各 Execution とその Attempt・ノード・終了結果、出力オブジェクト（ID・状態・ライフサイクル・検証済みコピーの保存先、JSON では `outputs`）、ログのパスとサイズ、ログに関する問題、GPU の消費電力量（`energy: GPU 1.23 kWh (partial)`）、予約量と並べて表示されるプロセスの最大 RAM 使用観測値（`ram: peak 9.0 GiB seen (sampled every 15 s)`）、Gang の各 rank、待機中 Execution の待機理由 |
+| `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | 最新 Attempt のログの末尾 N 行（デフォルト 50 行、`0` で全行）を出力（エージェントノード上の Attempt にも対応）。`-f` を指定すると、Attempt が終了してログの追記が止まるまで追従 |
+| `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | 状態変化ごとに 1 行出力（`10:01:33 hello running -> succeeded`）。デーモンに到達できない間は `DOWN` / `UP`、実行中 Task のログが期間 `D` の間増えなければ `STALL` を出力。すべて成功（または開始）なら終了コード `0`、それ以外の結果で終わったものがあれば `1`、タイムアウトなら `2`、引数や参照エラーなら `3` で終了 |
+| `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | 状態変化、進捗（Task ごとに 1 分に 1 回）、10 分ごとのサマリを出力。`--exit-when-idle` を指定すると `pending` や `running` の Task がなくなった時点で終了（監視対象に成功しなかった Task があれば終了コード `1`） |
+| `kairo execution logs EXECUTION_ID`, `kairo logs ATTEMPT_ID` | Execution ID または Attempt ID を指定して同様にログを表示 |
+| `kairo version` | CLI とデーモンそれぞれのビルド情報を表示（一致しない場合は `doctor` が警告を出力） |
 
-If an ended attempt has no log for the requested streams, `task logs` prints
-one line for that attempt with the reason and the scratch path if known.
-This is not an error, and `-f` stops once there is no stream left to follow.
-If just one stream is missing, the CLI reports it and still reads the other.
-Log lookup and read failures still exit nonzero.
+終了済みの Attempt に要求されたストリームのログが存在しない場合、`task logs` はその Attempt について理由と（判明していれば）`scratch` パスを 1 行で出力します。これはエラーとしては扱われず、`-f` は追従すべきストリームが残っていない時点で終了します。一方のストリームだけが欠落している場合、CLI はその旨を報告しつつ残りのストリームを引き続き読み取ります。ただし、ログの検索失敗や読み取りエラーが発生した場合は非ゼロの終了コードで終了します。
 
-A pending or running Task held back by a closed gate of its project, queue or
-task keeps its state; its note says `paused: task gate closed by alice` once
-nothing of it runs (its continuation waits behind the gate), or `pausing`
-while its execution is still being suspended. A pause is a view of the gates,
-not a stored Task state, so `--state` does not select it.
+プロジェクト・キュー・Task いずれかの閉じたスコープゲートによって足止めされている `pending` または `running` の Task は、自身の状態を維持したままになります。その Task の実行中処理がすべて止まった時点（継続（continuation）がゲートの背後で待機している状態）では注記に `paused: task gate closed by alice` のように表示され、Execution の中断が進行中の間は `pausing` と表示されます。一時停止は保存された Task 状態ではなくゲートの状態から得られるビューであるため、`--state` による選択対象にはなりません。
 
-The line-oriented `wait` and `watch` suit a background monitor: each line is
-one event and is flushed at once. `project status PROJECT` still prints JSON
-and takes `--task NAME` (repeatable), `--match`, `--state`, `--live` and
-`--since`. `project apply` prints the Tasks it declared (`--json` for the
-response) and, on a conflict, names every Task declared before with different
-content; `project validate` prints one line (`--json` for the expanded Tasks).
-A command the daemon does not know (a CLI newer than the daemon) says so.
+行指向の `wait` と `watch` はバックグラウンド監視に適しており、1 行が 1 イベントとして即座にフラッシュされます。`project status PROJECT` は引き続き JSON を出力し、`--task NAME`（複数回指定可）、`--match`、`--state`、`--live`、`--since` を受け付けます。`project apply` は宣言された Task を出力し（レスポンス全体を得るには `--json`）、競合時には異なる内容で既に宣言されていたすべての Task 名を示します。`project validate` は 1 行のサマリを出力します（展開後の Task を得るには `--json`）。なお、CLI がデーモンより新しく、デーモンが認識できないコマンドを実行した場合は、その旨が通知されます。
 
-## Authentication and TLS
+## 認証と TLS
 
-Every request needs `Authorization: Bearer <token>`, from loopback too; only
-`GET /health` is open. A missing, unknown or revoked token gets 401, a token
-whose role does not allow the route 403. Tokens are random 256-bit values
-stored only as SHA-256 hashes; revocation takes effect immediately.
+すべてのリクエストには `Authorization: Bearer <token>` が必要です。ループバックからの接続も例外ではなく、認証なしで呼び出せるのは `GET /health` のみです。トークンが未指定・不明・失効済みの場合は `401`、トークンのロールがそのルートを許可していない場合は `403` を返します。トークンはランダムな 256 ビットの値で、SHA-256 ハッシュのみが保存されます。失効（revoke）は即座に反映されます。
 
-| Role | May call | Used by |
+| ロール | 呼び出し可能な範囲 | 利用元 |
 |---|---|---|
-| `read` | every operator `GET` | dashboards |
-| `admin` | every operator route | the CLI, kairo-monitor, project controllers |
-| `node` | `/api/agent/*`, for one node | a node agent, a host's controller |
-| worker | `/api/worker/*`, for one attempt | the processes of an attempt |
+| `read` | すべてのオペレータ向け `GET` | ダッシュボード |
+| `admin` | すべてのオペレータ向けルート | CLI、`kairo-monitor`、プロジェクトコントローラ |
+| `node` | `/api/agent/*`（単一ノード分） | ノードエージェント、ホストのコントローラ |
+| worker | `/api/worker/*`（単一 Attempt 分） | Attempt のプロセス |
 
-Operator and node tokens are managed by opening the daemon's database
-directly (database access is the root of trust; the daemon may be running).
-`--config` reads the database from the daemon's configuration; `--database-url
-URL` names it instead. Neither creates a schema: a token in a database the
-daemon does not use would never authenticate.
+オペレータ用トークンとノード用トークンは、デーモンのデータベースを直接開いて管理します（データベースへのアクセス権が信頼の起点となります。デーモンが稼働中でも実行可能です）。`--config` を指定するとデーモンの設定ファイルからデータベース接続先を読み取り、代わりに `--database-url URL` で直接指定することもできます。どちらの指定方法でもスキーマは作成されません。デーモンが使用していないデータベースにトークンを作成しても認証には使えないためです。
 
 ```powershell
 kairo token create --config kairo.toml --name operator --role admin --save
@@ -378,824 +328,549 @@ kairo token list --config kairo.toml
 kairo token revoke --config kairo.toml pve0-neo-train
 ```
 
-The plaintext is shown once. `--save` writes it to the user's config
-directory (`%APPDATA%\kairo\token`, `~/.config/kairo/token`).
+平文のトークンは作成時に 1 度だけ表示されます。`--save` を指定すると、ユーザーの設定ディレクトリ（`%APPDATA%\kairo\token`、`~/.config/kairo/token`）に書き込まれます。
 
-The CLI and the SDK's `KairoControllerClient` find the daemon, token and CA the
-same way:
+CLI と SDK の `KairoControllerClient` は、以下の共通の優先順位でデーモン・トークン・CA 証明書を解決します。
 
-- URL: `--api`, else `KAIRO_API`, else `https://127.0.0.1:7474`;
-- token: `KAIRO_TOKEN`, else the file named by `KAIRO_TOKEN_FILE`, else
-  `<config dir>/kairo/token`;
-- CA: `KAIRO_CA_FILE`, else `<config dir>/kairo/ca.pem` if present, else the
-  system roots.
+- **URL**: `--api`、なければ `KAIRO_API`、なければ `https://127.0.0.1:7474`
+- **トークン**: `KAIRO_TOKEN`、なければ `KAIRO_TOKEN_FILE` で指定されたファイル、なければ `<config dir>/kairo/token`
+- **CA**: `KAIRO_CA_FILE`、なければ `<config dir>/kairo/ca.pem`（存在する場合）、なければシステムのルート証明書
 
-Control traffic never goes through `HTTP(S)_PROXY` and never follows a
-redirect.
+制御トラフィックは `HTTP(S)_PROXY` を経由せず、リダイレクトにも一切追従しません。
 
-A node token is bound to its node: the agent may register only that node, and
-every operation is checked against the node owning the executor, lease,
-attempt, provider or log it names. An executor, provider or resource never
-moves to another node. Against an observe-only daemon an agent's polls find
-nothing to do and its actuating operations are refused (423).
+ノードトークンは対象のノードに紐づけられます。エージェントはそのノードのみを登録でき、すべての操作は対象として指定された Executor・Lease・Attempt・Provider・ログを所有するノードと照合されます。Executor・Provider・リソースが別のノードへ移動することはありません。`observe_only`（観測専用モード）のデーモンに対しては、エージェントのポーリングに実行すべき作業は返されず、状態を変更する操作は `423` で拒否されます。
 
-Each attempt gets its own worker token at launch authorization, in
-`KAIRO_ATTEMPT_TOKEN`. It identifies the attempt (and the lease and epoch it
-was issued under) to the worker API, and stops working once the attempt has
-quiesced or was fenced (for instance marked lost by a daemon restart). A
-worker that calls in the few hundred milliseconds between its start and its
-executor recording it running (the attempt authorized, its lease prepared) is
-answered as running, with no command, its heartbeat and processes recorded,
-not fenced: a server that polls at once, or a rank that registers at once,
-would otherwise be stopped by its own launch. The executor never passes its
-own process's `KAIRO_*` variables to an attempt.
+各 Attempt には、起動認可時に専用のワーカートークンが発行され、環境変数 `KAIRO_ATTEMPT_TOKEN` として渡されます。このトークンはワーカー API に対して Attempt（および発行元の Lease とエポック）を識別するものであり、Attempt が `quiesced`（静止）になるか、デーモン再起動によって lost とマークされるなどしてフェンス（fence）されると無効になります。
+
+ただし、ワーカーが起動してから Executor がその Attempt を `running` として記録するまでの数百ミリ秒の間（Attempt は認可済み、Lease は準備済みの状態）に API を呼び出した場合、デーモンはフェンスせず、`running` かつ Command なしとして応答し、ハートビートとプロセス情報を記録します。この扱いがなければ、起動直後にポーリングするサーバや即座に登録を行う rank が、自身の起動タイミングで停止させられてしまうためです。なお、Executor は自身のプロセスが持つ `KAIRO_*` 環境変数を Attempt に引き継ぎません。
 
 ### TLS
 
-`kairo tls init --dir DIR --host H...` writes `ca.pem`, `ca-key.pem`,
-`server.pem` and `server-key.pem` (ECDSA P-256; the server certificate covers
-every `--host`, IP or DNS name). `kairo tls issue --dir DIR --host H...`
-re-issues the server certificate from the same CA, for a new address. Kairo
-never reads `ca-key.pem` while it runs: keep it on one admin machine, out of
-the daemon's directory and of every host that runs work. Private keys and token files written by
-`kairo` are restricted to the current user, and the daemon restricts its
-`database_password_file` the same way at start: anyone who can write the
-database can mint tokens, so its credentials are kept like a private key. On Windows, where file modes are ignored, this replaces the
-inherited ACL with one granting only the user and SYSTEM.
+#### 証明書の発行と秘密鍵の保護
 
-The daemon refuses to start when its certificate does not chain to
-`tls_ca_file` or does not cover the `advertise_url` host. During a CA rotation
-`tls_ca_file` (and an agent's `ca_file`) may hold the old and the new CA;
-attempts receive every certificate in it.
+`kairo tls init --dir DIR --host H...` を実行すると、`ca.pem`、`ca-key.pem`、`server.pem`、`server-key.pem` が生成されます（ECDSA P-256。サーバ証明書は指定されたすべての `--host` の IP アドレスまたは DNS 名をカバーします）。新しいアドレス向けに同じ CA からサーバ証明書を再発行するには、`kairo tls issue --dir DIR --host H...` を使用します。
 
-The CA `kairo tls init` makes has path length 0, so it cannot cross-sign its
-successor. A CA is rotated through such a bundle, without stopping work:
+Kairo は実行中に `ca-key.pem` を一切読み込みません。`ca-key.pem` は 1 台の管理マシン上に保管し、デーモンのディレクトリやジョブを実行するホストには配置しないでください。
 
-1. Make the new CA (`kairo tls init` in a new directory). Put the old and the
-   new CA together in every CA file: the daemon's `tls_ca_file`, each agent's
-   and each controller's `ca_file`, and the CLI's. Restart them (agents adopt
-   their attempts).
-2. Wait until no attempt launched before step 1 runs. An attempt keeps the CA
-   it was given at launch (`KAIRO_API_CA`), so one that has only the old CA
-   would fail its next call once the daemon presents the new certificate.
-3. Give the daemon, and each agent's `[packs]`, a certificate of the new CA
-   (`kairo tls issue --dir NEW --host H...`). Leave the new CA alone in every
-   CA file and restart again.
-4. Delete the old CA's key, and the old server and pack keys.
+`kairo` が書き出す秘密鍵やトークンファイルは現在のユーザーのみにアクセスが制限されます。デーモンも起動時に自身の `database_password_file` に対して同じ制限を適用します。データベースに書き込める者は誰でもトークンを発行できるため、その認証情報は秘密鍵と同等に保護されます。POSIX のファイルモードが無視される Windows では、継承された ACL を置き換え、現在のユーザーと `SYSTEM` のみにアクセス権を付与します。
 
-Daemon configuration:
+#### 証明書の検証と CA ローテーション
+
+デーモンは、自身の証明書が `tls_ca_file` にチェーンしない場合、または `advertise_url` のホストをカバーしていない場合、起動を拒否します。CA ローテーション中は、`tls_ca_file`（およびエージェントの `ca_file`）に旧 CA と新 CA の両方を含めることができます。Attempt にはそのファイル内のすべての証明書が渡されます。
+
+`kairo tls init` が作成する CA はパス長が 0 のため、後継の CA にクロス署名できません。そのため、稼働中のジョブを止めずに CA をローテーションする場合は、以下のようにバンドルを介して切り替えます。
+
+1. 新しいディレクトリで `kairo tls init` を実行し、新 CA を作成します。旧 CA と新 CA の両方をすべての CA ファイル（デーモンの `tls_ca_file`、各エージェントおよび各コントローラの `ca_file`、CLI の CA ファイル）に格納し、それぞれを再起動します（エージェントは稼働中の Attempt を引き継ぎます）。
+2. 手順 1 より前に起動された Attempt がすべて終了するまで待機します。Attempt は起動時に受け取った CA（`KAIRO_API_CA`）を保持し続けるため、旧 CA のみを持つ Attempt が残った状態でデーモンが新証明書を提示すると、次の呼び出しで失敗します。
+3. デーモンと各エージェントの `[packs]` に対し、新 CA で発行した証明書（`kairo tls issue --dir NEW --host H...`）を配置します。すべての CA ファイルを新 CA のみにして、再度再起動します。
+4. 旧 CA の秘密鍵、および旧サーバ鍵・旧 pack 鍵を削除します。
+
+#### デーモンとクライアントの TLS 設定
+
+デーモン側の設定例は以下のとおりです。
 
 ```toml
 listen = "0.0.0.0:7474"
-advertise_url = "https://192.168.1.12:7474"  # what attempts are told
+advertise_url = "https://192.168.1.12:7474"  # Attempt に通知される接続先 URL
 tls_cert_file = "local/tls/server.pem"
 tls_key_file = "local/tls/server-key.pem"
-tls_ca_file = "local/tls/ca.pem"             # handed to attempts
+tls_ca_file = "local/tls/ca.pem"             # Attempt に渡される CA 証明書
 ```
 
-The daemon serves TLS 1.3 only. It refuses to listen on an address other hosts
-can reach without TLS unless `insecure_http = true`, and with TLS
-`advertise_url` must be https. Clients trust the daemon through `ca.pem`:
-copy it to `<config dir>/kairo/ca.pem` (or point `KAIRO_CA_FILE` at it) for the
-CLI and controllers, set `ca_file` for a node agent, and start Node-based
-tools with `NODE_EXTRA_CA_CERTS=ca.pem`. Attempts receive the CA itself in
-`KAIRO_API_CA` (base64 DER), so local and remote attempts need no path.
-The certificates carry no revocation endpoint, so Windows `curl.exe`
-(Schannel) needs `--ssl-no-revoke` with `--cacert ca.pem`.
+デーモンは TLS 1.3 のみを提供します。`insecure_http = true` を明示しない限り、TLS なしで他ホストから到達可能なアドレスでのリッスンは拒否されます。また、TLS を有効にする場合、`advertise_url` は `https` でなければなりません。
 
-A node agent runs `kairo agent --config agent.toml`. Its configuration:
+クライアントは `ca.pem` を通じてデーモンを信頼します。
+
+- **CLI・コントローラ**: `<config dir>/kairo/ca.pem` にコピーするか、`KAIRO_CA_FILE` でパスを指定する
+- **ノードエージェント**: 設定ファイルの `ca_file` を設定する
+- **Node.js ベースのツール**: `NODE_EXTRA_CA_CERTS=ca.pem` を設定して起動する
+- **Attempt**: CA 証明書自体が `KAIRO_API_CA`（Base64 エンコードされた DER 形式）で渡されるため、ローカル・リモートを問わずファイルパスは不要
+
+これらの証明書には失効確認エンドポイントが含まれていないため、Windows の `curl.exe`（Schannel）では `--cacert ca.pem` と併せて `--ssl-no-revoke` を指定する必要があります。
+
+#### ノードエージェントの設定
+
+ノードエージェントは `kairo agent --config agent.toml` で起動します。基本設定は以下のとおりです。
 
 ```toml
 server_url = "https://192.168.1.12:7474"
 token = "kairo_node_..."
 ca_file = "/etc/kairo/ca.pem"
-# attempt_api_url = "https://192.168.1.12:7474"  # KAIRO_API_URL of this node's attempts
+# attempt_api_url = "https://192.168.1.12:7474"  # このノード上の Attempt に渡す KAIRO_API_URL
 ```
 
-The rest (`log_directory`, `log_min_free_mib`, `observe_only`,
-`observation_interval_seconds`, `[node]`, `[bench]`, `[[executors]]`,
-`[[providers]]`) has the same form as in the daemon configuration
-(`examples/kairo.toml`). An executor runs its attempts on its host, or, of
-kind `incus`, in containers (Containers); the executor that ran attempts
-inside WSL is retired, and a configuration declaring one (kind `wsl2`, or
-the label `environment = "wsl2"`) is refused: Linux work runs on a Linux
-node or in a container. When an agent registers, an executor of its node it
-no longer declares is disabled (event `executor_undeclared`): its leases go
-stale as at a restart that adopts nothing, nothing is placed on it, and it
-serves no store, until an agent declares it again. A relative `log_directory` (or `source_directory`)
-is taken against the working directory the daemon or agent starts in, once:
-attempts get absolute paths into it. An
-agent refuses an `http://` URL unless `insecure_http = true`. A host's device
-controller (`kairo controller`, see Hardware settings) connects the same way.
+残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`、`[bench]`、`[[executors]]`、`[[providers]]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。
 
-An agent whose node makes packs that another node's agent copies to a
-durable store (Data stores) serves them with `[packs]`, all four or none:
+- **Executor の実行形態**: Executor はホスト上で直接 Attempt を実行するか、種別（kind）が `incus` の場合はコンテナ内で実行します（[コンテナ実行](#コンテナ実行)を参照）。WSL 内で Attempt を実行していた Executor は廃止されており、それを宣言する設定（種別 `wsl2` またはラベル `environment = "wsl2"`）は拒否されます。Linux 向けのジョブは Linux ノード上またはコンテナ内で実行してください。
+- **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。
+- **相対パスの基準**: `log_directory`（および `source_directory`）に相対パスを指定した場合、デーモンまたはエージェントの起動時の作業ディレクトリを基準に 1 度だけ解決され、Attempt には絶対パスが渡されます。
+- **接続要件**: エージェントは `insecure_http = true` を指定しない限り `http://` の URL を拒否します。ホストのデバイスコントローラ（`kairo controller`。[ハードウェア設定](#ハードウェア設定)を参照）も同じ方法で接続します。
+
+#### pack サーバの設定
+
+あるノードのエージェントが作成した pack を別ノードのエージェントが durable store へコピーする場合（[データストア](#データストア)を参照）、配信元のエージェントは `[packs]` セクションで pack を提供します。以下の 4 項目はすべて指定するか、すべて省略するかのどちらかです。
 
 ```toml
 [packs]
-listen = ":7475"                 # where it listens
-addr = "192.168.1.14:7475"       # where other agents reach it (pack_addr)
-cert_file = "/etc/kairo/pack.pem" # server.pem of kairo tls issue --host 192.168.1.14
+listen = ":7475"                 # リッスンするアドレス
+addr = "192.168.1.14:7475"       # 他エージェントからの到達先アドレス（pack_addr）
+cert_file = "/etc/kairo/pack.pem" # kairo tls issue --host 192.168.1.14 で発行した server.pem
 key_file = "/etc/kairo/pack-key.pem"
 ```
 
-The certificate is one the daemon's CA issued for that address: `kairo tls
-issue --dir DIR --host 192.168.1.14` in a directory holding copies of the
-CA's `ca.pem` and `ca-key.pem` (not the daemon's own directory, whose
-`server.pem` it would replace) writes `server.pem` and `server-key.pem`
-there.
+証明書には、デーモンの CA がそのアドレス向けに発行したものを使用します。CA の `ca.pem` と `ca-key.pem` のコピーを置いた別ディレクトリ（デーモン自身の `server.pem` を上書きしてしまうため、デーモンのディレクトリは使わないこと）で `kairo tls issue --dir DIR --host 192.168.1.14` を実行すると、そのディレクトリに `server.pem` と `server-key.pem` が生成されます。
 
-The certificate comes from the daemon's CA, which the fetching agent already
-trusts (`ca_file`). Every executor of the agent then advertises `pack_addr`
-among its attributes.
+この証明書はデーモンの CA から発行されているため、取得側のエージェントは自身の `ca_file` によってすでに信頼しています。設定を有効にすると、そのエージェント配下のすべての Executor が属性の 1 つとして `pack_addr` を公開します。
 
-## API
+## HTTP API
 
-A request that takes 2 s or longer is logged by the daemon at WARN (`slow
-request`, with its route pattern, never its path or headers, so no id or
-token; its status, seconds and remote address): the SDK gives up on a
-request after 10 s, so this is where a daemon too slow for its attempts
-shows.
+処理に 2 秒以上かかったリクエストは、デーモンが WARN レベルでログ出力します（`slow request`。ログにはルートパターン・HTTP ステータス・所要秒数・リモートアドレスが記録されます。実際のリクエストパスやヘッダは一切記録されないため、ID やトークンは含まれません）。SDK は 10 秒でリクエストを打ち切るため、デーモンが Attempt に対して遅くなりすぎている兆候をここで把握できます。
 
-| Method | Path | Role |
+### エンドポイント一覧
+
+| メソッド | パス | ロール |
 |---|---|---|
-| GET | `/health` | none |
-| GET | `/api/whoami` | any token |
-| POST | `/api/projects` (apply a ProjectSpec) | admin |
-| GET | `/api/projects/{project}` | read |
-| GET | `/api/projects/{project}/tasks/{task}` | read |
-| POST | `/api/projects/{project}/tasks/{task}/cancel`, `/rerun`, `/checkpoint` | admin |
-| GET | `/api/commands/{id}` | read |
-| POST, GET | `/api/executions` | admin, read |
-| GET | `/api/executions/{id}` | read |
-| POST | `/api/executions/{id}/withdraw` | admin |
-| GET | `/api/attempts`, `/api/events`, `/api/pause-operations/{id}` | read |
-| GET | `/api/attempts/{id}/log` | read |
-| GET | `/api/scopes`, `/api/scopes/{id}` | read |
-| POST | `/api/scopes/{id}/pause`, `/api/scopes/{id}/resume` | admin |
-| GET | `/api/nodes/quarantines` | read |
-| POST, DELETE | `/api/nodes/{id}/quarantine` | admin |
-| POST | `/api/nodes/{id}/fence` | admin |
-| GET | `/api/resources` | read |
-| POST | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | admin |
-| GET, POST | `/api/machines` (the machine declaration) | read, admin |
-| GET | `/api/stores`, `/api/data/objects` (`?project=&kind=&limit=`) | read |
-| POST, GET | `/api/sources` (code snapshots), `/api/sources/{id}` | admin, read |
-| GET | `/api/agent/sources/{id}/pack`, `/list` | node |
-| POST | `/api/data/imports`, `/api/data/fetches` | admin |
-| GET | `/api/hardware` (`?host=`) | read |
-| GET | `/api/hardware/samples`, `/api/hardware/leases` (`?since=&until=&step=&key=`) | read |
-| POST, DELETE | `/api/hardware/{host}/{device}/settings` | admin |
-| POST | `/api/hardware/{host}/{device}/bench` | admin |
-| GET | `/api/hardware/{host}/profile` (`?device=`) | read |
-| POST | `/api/agent/{operation}`, `/api/agent/logs` | node |
-| POST | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
-| GET | `/api/worker/commands` | worker |
-| POST | `/api/worker/commands/{command}/acks` | worker |
-| GET | `/api/worker/bench`, `/api/worker/bench/cpu-energy` | worker (a bench's attempt) |
-| POST | `/api/worker/bench/settings`, `/start`, `/points`, `/kinds`, `/finish` | worker (a bench's attempt) |
+| `GET` | `/health` | なし |
+| `GET` | `/api/whoami` | 任意のトークン |
+| `POST` | `/api/projects`（ProjectSpec の適用） | `admin` |
+| `GET` | `/api/projects/{project}` | `read` |
+| `GET` | `/api/projects/{project}/tasks/{task}` | `read` |
+| `POST` | `/api/projects/{project}/tasks/{task}/cancel`, `/rerun`, `/checkpoint` | `admin` |
+| `GET` | `/api/commands/{id}` | `read` |
+| `POST`, `GET` | `/api/executions` | `admin`, `read` |
+| `GET` | `/api/executions/{id}` | `read` |
+| `POST` | `/api/executions/{id}/withdraw` | `admin` |
+| `GET` | `/api/attempts`, `/api/events`, `/api/pause-operations/{id}` | `read` |
+| `GET` | `/api/attempts/{id}/log` | `read` |
+| `GET` | `/api/scopes`, `/api/scopes/{id}` | `read` |
+| `POST` | `/api/scopes/{id}/pause`, `/api/scopes/{id}/resume` | `admin` |
+| `GET` | `/api/nodes/quarantines` | `read` |
+| `POST`, `DELETE` | `/api/nodes/{id}/quarantine` | `admin` |
+| `POST` | `/api/nodes/{id}/fence` | `admin` |
+| `GET` | `/api/resources` | `read` |
+| `POST` | `/api/resources/{id}/enable`, `/quarantine`, `/reconcile` | `admin` |
+| `GET`, `POST` | `/api/machines`（マシン宣言） | `read`, `admin` |
+| `GET` | `/api/stores`, `/api/data/objects`（`?project=&kind=&limit=`） | `read` |
+| `POST`, `GET` | `/api/sources`（コードスナップショット）、`/api/sources/{id}` | `admin`, `read` |
+| `GET` | `/api/agent/sources/{id}/pack`, `/list` | `node` |
+| `POST` | `/api/data/imports`, `/api/data/fetches` | `admin` |
+| `GET` | `/api/hardware`（`?host=`） | `read` |
+| `GET` | `/api/hardware/samples`, `/api/hardware/leases`（`?since=&until=&step=&key=`） | `read` |
+| `POST`, `DELETE` | `/api/hardware/{host}/{device}/settings` | `admin` |
+| `POST` | `/api/hardware/{host}/{device}/bench` | `admin` |
+| `GET` | `/api/hardware/{host}/profile`（`?device=`） | `read` |
+| `POST` | `/api/agent/{operation}`, `/api/agent/logs` | `node` |
+| `POST` | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
+| `GET` | `/api/worker/commands` | worker |
+| `POST` | `/api/worker/commands/{command}/acks` | worker |
+| `GET` | `/api/worker/bench`, `/api/worker/bench/cpu-energy` | worker（ベンチマークの Attempt） |
+| `POST` | `/api/worker/bench/settings`, `/start`, `/points`, `/kinds`, `/finish` | worker（ベンチマークの Attempt） |
 
-Errors are `{"error": ..., "code": ...}`. An empty `actor` in a pause, resume,
-quarantine, cancel or rerun request is recorded as the token's name.
-`/health` and `/api/whoami` include the build `version`.
+エラーレスポンスの形式は `{"error": ..., "code": ...}` です。pause・resume・quarantine・cancel・rerun の各リクエストで `actor` が空の場合、呼び出しに使用したトークンの名前が記録されます。また、`/health` と `/api/whoami` のレスポンスにはビルドの `version` が含まれます。
 
-`GET /api/projects/{project}` takes the filters `task` (repeatable),
-`match` (name prefix), `state` (comma list), `live=1` (pending or running) and
-`since` (RFC 3339, by `updated_at`); `state_counts` counts every Task whatever
-the filter. Each Task has `created_at` and `updated_at`, and each execution its
-attempt, executor, timestamps and latest progress without `detail`.
-`GET /api/projects/{project}/tasks/{task}` adds the declaration (`spec`),
-dependencies, dependants, scope gates (a closed one with `closed_by` and
-`closed_at`, from the pause operation that closed it), and per execution its
-attempts (with log paths and sizes, `log_problems` and `energy`), gang ranks and
-`waiting` reasons. A live Task held back by a closed gate has `paused`, the
-innermost such gate. Apply answers
-`{"project", "spec_digest", "idempotent", "created", "unchanged"}`. Cancel
-takes `{"actor", "dry_run"}` and answers `{"task", "state", "withdrawn",
-"dry_run"}`; rerun takes `{"actor", "request_id"}` (a repeated `request_id`
-returns the first answer) and answers `{"task", "state", "ordinal",
-"unblocked"}`; a Task in the wrong state is `409 task_conflict`.
+### プロジェクトと Task の操作
 
-`GET /api/attempts/{id}/log?stream=stdout|stderr&offset=N&limit=M` returns an
-attempt's log as the daemon holds it (written by its own executor or shipped
-by an agent), as raw bytes: `stream` defaults to `stderr`, `limit` to 1 MiB
-(at most 8 MiB); `tail=N` instead returns the last N bytes. `Kairo-Log-Size`
-is the current size and `Kairo-Log-Next-Offset` where to continue (the body
-started at that offset minus its length). An offset past the end, a stream
-not yet recorded for a live execution, or a recorded log not yet shipped
-returns an empty body. If the execution is terminal and the stream has no
-recorded path, the response is `409 no_log`; its JSON `error` gives the
-terminal cause and the scratch path if recorded and still present in the
-store as active or kept. An unknown attempt still returns `404 not_found`.
-Only files inside the daemon's `log_directory` are served. `kairo logs
-[--stream stdout|stderr] [--tail N] [--follow] ATTEMPT_ID` prints it (`--tail`
-the last N bytes, `--follow` polls every 2 s until Ctrl-C), and the Python
-SDK's `KairoClient.attempt_log` reads one slice.
+**`GET /api/projects/{project}`** は以下のクエリフィルタを受け付けます。
 
-`GET /api/executions` (`?project=&queue=&task=&scope_id=&state=`, oldest
-first by submission) and `GET /api/attempts` (`?project=&execution_id=&state=`,
-newest first by authorization) return `limit` rows (default 100, at most
-1000). A page with more after it says where they start, `next` (an opaque
-cursor); the same request with `after=` that cursor reads them, and the last
-page has no `next`. The Python SDK's `KairoClient.all_executions` and
-`all_attempts` follow it.
+- `task`: Task 名（複数指定可能）
+- `match`: Task 名の前方一致
+- `state`: カンマ区切りの状態リスト
+- `live=1`: pending または running の Task に限定
+- `since`: RFC 3339 形式（`updated_at` 基準）
 
-Clients follow the contract in `sdk/conformance` (how to find the daemon, when
-a token may be sent, how to classify each error); every SDK's tests replay it.
-Codes: `unauthorized` 401, `forbidden` 403, `not_found` 404, `stale_epoch` and
-other conflicts 409, `gate_closed`/`observe_only` 423, `bad_request` 400 (fix
-the request), and `internal` 500/503 (a daemon-side failure; 503 when the
-database is unreachable, overloaded or gave up on a lock: transient, retry). `GET /health` returns `{"ok": true, "api": 1}`;
-`api` is the contract version and changes only on a breaking change.
+フィルタ条件にかかわらず、`state_counts` にはすべての Task が集計されます。各 Task には `created_at` と `updated_at` が含まれ、各 Execution には Attempt、Executor、タイムスタンプ、および `detail` を除いた最新の進捗（progress）が含まれます。
 
-## Coordination model
+**`GET /api/projects/{project}/tasks/{task}`** では上記に加え、宣言内容（`spec`）、依存先 Task、後続 Task、スコープゲート（閉鎖中のゲートには、そのゲートを閉じた pause 操作由来の `closed_by` と `closed_at` を含む）、さらに Execution ごとの Attempt 一覧（ログのパスとサイズ、`log_problems`、`energy` を含む）・Gang rank・`waiting` の理由が返されます。閉鎖中のゲートによって保留されている稼働中（live）の Task には、最も内側の閉鎖ゲートを示す `paused` が含まれます。
 
-- Execution request: immutable and one-shot (`waiting`, `authorized`,
-  `started`, `terminal`). A request can start at most once.
-- Attempt: process lifecycle facts (`authorized`, `running`, `quiescing`,
-  `exited`, `quiesced`, `lost`).
-- Lease: ownership coordination (`reserved`, `prepared`, `active`,
-  `releasing`, `released`, `stale`, `revocation_requested`).
-- Command: at-least-once cooperative `suspend` delivery (`pending`,
-  `accepted`, `checkpointing`, `checkpointed`, `rejected`).
-- Scope gate: admission is `open` or `closed`, with a generation fence checked
-  at reservation, authorization, and activation.
+その他のプロジェクト・Task 操作の入出力は以下のとおりです。
 
-Checkpoint publication does not prove process exit, and process exit does not
-prove distributed quiescence. Kairo releases a lease only after every
-registered process is absent and provider observations taken after that
-absence show resources unclaimed. A lease its executor cannot vouch for
-becomes stale: when the executor's agent registers again without adopting
-its attempt, or when an operator fences the node of an agent that is gone
-(`kairo node fence`, Node fence below). Time alone never makes a lease stale
-or free: a stale lease holds its resources until reconciled. If the daemon
-cannot prove that the attempt's processes are gone, an operator must use
-`kairo resource reconcile RESOURCE_ID --confirm-process-absent`. Reconcile
-needs an observation of each resource taken after the lease went stale, in
-which no process of its attempt is seen (one carrying its
-`KAIRO_ATTEMPT_ID`, or one of its registered processes). A claim that is not
-the attempt's (another program's process, unattributed activity, a game)
-does not hold the lease: the claim keeps the device from being placed on by
-itself, and is not something the operator has to wait out. Nothing can still
-run under the stale lease of an attempt that never started its command (lost
-before its activation: its shim starts the command only on the go-ahead its
-agent sends after the activation, and an agent gone takes that go-ahead with
-it), nor under one of no attempt or one whose node rebooted after it started.
-At registration, Linux and Windows agents report uptime that counts sleep
-and hibernation, so resuming is not mistaken for rebooting. The daemon uses
-its own clock to estimate the boot time and stamp the attempt's start. It
-requires the boot time to be more than two minutes later than the start to
-allow for timing uncertainty. The daemon releases these leases itself once
-each resource has a fresh observation taken since the lease went stale and
-no process of the attempt is seen (event `stale_lease_reconciled`,
-`by: daemon`). Manual reconcile needs no confirmation for them either.
+- **適用（`POST /api/projects`）**: `{"project", "spec_digest", "idempotent", "created", "unchanged"}` を返す
+- **キャンセル（`/cancel`）**: `{"actor", "dry_run"}` を受け取り、`{"task", "state", "withdrawn", "dry_run"}` を返す
+- **再実行（`/rerun`）**: `{"actor", "request_id"}` を受け取り、`{"task", "state", "ordinal", "unblocked"}` を返す（同じ `request_id` を再送すると初回のレスポンスを返す）
 
-What an exited attempt left running (its launcher exited and its exit is
-recorded, yet a process of its tree runs: one it started without
-registering, a server a wrapper left behind) is not its work any more, since
-no one reads what it does, and it holds the lease. Its executor ends it: once
-it has been seen for 10 s it is asked to stop (SIGTERM; on
-Windows CTRL_BREAK no longer reaches it once its launcher is gone), and 30 s
-later it is killed (the job object, the launcher's process group, the
-processes carrying the attempt's `KAIRO_ATTEMPT_ID`, each identified as
-force stop does; never anything else). An attempt lost with an agent restart
-is not an exited one and is left alone.
+対象 Task が操作に適さない状態にある場合は、`409 task_conflict` を返します。
 
-A compute process a provider sees on a GPU (`nvidia-smi pmon`) is an
-`external_process` claim unless it is the work of the attempt holding that GPU
-(on any node's row of it): one of the attempt's registered processes, a
-descendant of one (by its parent chain, each parent alive and started no later
-than its child), or, on Linux, a process carrying the attempt's
-`KAIRO_ATTEMPT_ID` (read from `/proc/PID/environ`, as force stop finds the
-attempt's processes; Windows reads only the parent chain). That holds only
-while the attempt is `running` or `quiescing` with a registered process alive:
-a descendant that outlives them is a claim again, and the lease is not
-released while it runs. A process that cannot be tied to the lease holder (one
-of another attempt, one whose parent has exited or whose environment cannot be
-read) stays a claim, and a GPU with a claim is not given to a preempting
-execution.
+### Attempt ログの取得
 
-### Agent restarts
+`GET /api/attempts/{id}/log?stream=stdout|stderr&offset=N&limit=M` は、デーモンが保持している Attempt のログ（デーモン自身の Executor が書き込んだもの、またはエージェントから転送されたもの）を生バイト列で返します。
 
-An attempt's launcher is a shim: the kairo binary of its executor run as
-`__kairo-shim`, whose pid, process group (Linux) or console process group
-and job object (Windows) and creation time are the attempt's. The executor
-starts the shim, puts it in the attempt's job object (Windows; named
-`kairo-attempt-<attempt id>`, and the shim is handed a handle to it, so the
-name lasts while the shim runs), activates the attempt and records it in
-`running/<attempt id>.json` under its log directory; only then does the shim
-start the attempt's command, with its environment, directory and logs, and
-confined when the execution is (Data stores). A launch whose activation is
-refused thus runs nothing. The shim lets SIGTERM and CTRL_BREAK go by (the
-command, in its group, is sent the same), waits for the command and writes
-its exit code to `running/<attempt id>.exit` before it exits with it; the
-attempt's exit is recorded from that file (the shim's own end, when it wrote
-none: killed).
+- **パラメータ**: `stream` のデフォルトは `stderr`、`limit` のデフォルトは `1 MiB`（最大 `8 MiB`）です。代わりに `tail=N` を指定すると、末尾 N バイトを返します。
+- **レスポンスヘッダ**: `Kairo-Log-Size` に現在のサイズ、`Kairo-Log-Next-Offset` に次回の読み取り開始位置が返されます（今回のボディの開始位置は `Kairo-Log-Next-Offset` からボディ長を引いた値です）。
+- **空ボディとエラーの挙動**:
+  - オフセットが末尾を超えている場合、稼働中（live）の Execution でまだ記録されていないストリームを指定した場合、または記録済みのログがまだ転送されていない場合は、空のボディを返します。
+  - Execution が終了状態（terminal）で、かつそのストリームに記録されたパスがない場合は `409 no_log` を返します。そのレスポンス JSON の `error` には終了原因が記載され、`scratch` パスが記録されていてストア上に `active` または `kept` として残っている場合はそのパスも含まれます。
+  - 存在しない Attempt を指定した場合は変わらず `404 not_found` を返します。
+- **配信範囲**: デーモンの `log_directory` 配下にあるファイルのみが配信されます。
+- **CLI と SDK**: `kairo logs [--stream stdout|stderr] [--tail N] [--follow] ATTEMPT_ID` で出力でき（`--tail` は末尾 N バイト、`--follow` は Ctrl-C で終了するまで 2 秒ごとにポーリング）、Python SDK の `KairoClient.attempt_log` では 1 スライス分を読み取れます。
 
-The agent is thus not the parent of the work, and an agent stopped and
-started again (only its own process: a Linux unit's `KillMode=process`; on
-Windows the agent alone, not the shims, which run the same image) keeps its
-attempts. At start it adopts each recorded attempt of its executors whose
-shim still runs, or is gone having written the exit: it names them (attempt,
-executor, the shim's pid and creation identity) when it registers, and the
-daemon keeps each one running or quiescing on that executor with that pid
-and identity as it was (event `attempt_adopted`); every other attempt the
-executor held is lost as before (`attempt_lost`), and its record removed. An
-adopted attempt is watched (every second) until its shim exits, and its exit
-is then recorded; meanwhile its logs are shipped on from where the daemon's
-copy ends, its usage is sampled, a force stop reaches it through its job
-object (found again by name) or its process group, and its scratch and
-output directory count as in use. A shim gone without its exit (killed, or
-the node restarted) is not adopted: that attempt is lost. An attempt
-launched before shims (by an agent from before them) is lost by a restart as
-before. A daemon with executors of its own adopts the same way.
+### ページネーション
 
-### Admission
+`GET /api/executions`（`?project=&queue=&task=&scope_id=&state=`、投入日時の古い順）と `GET /api/attempts`（`?project=&execution_id=&state=`、認可日時の新しい順）は、最大 `limit` 件（デフォルト 100、上限 1000）を返します。
 
-Which waiting execution runs where is decided by one planning pass over the
-whole installation: every waiting execution whose scope gates are open, every
-node with an executor that has polled in the last minute (or not yet), every
-lease and claim. Each executor's reserve and preemption call runs the same
-pass, and the pass, not the executor that polls first, chooses; an execution
-placed on another node waits for that node's executor (`awaiting_executor`).
-When no execution waits and no wait reason is left to clear, a poll runs no
-pass (a read without the lock tells), except one every 10 s, which keeps the
-disk watermark alerts current.
-Executors of one node share its resources, so any of them that matches the
-labels may take what is placed there.
+後続ページが存在する場合、レスポンスに次の開始位置を示す不透明カーソル `next` が含まれます。同じリクエストに `after=` でそのカーソルを付与すると続きを取得でき、最終ページには `next` が含まれません。Python SDK の `KairoClient.all_executions` と `all_attempts` はこのページネーションを自動でたどります。
 
-- Order: higher `priority` first. Within a priority, an execution with a
-  `start_by` or `finish_by` goes first, the one that must start soonest first
-  (its `start_by`, or its `finish_by` less its estimated run time, whichever
-  is earlier); then the project holding the smallest share of the
-  installation's GPUs, CPU or RAM (whichever share is largest), then the
-  earlier submission.
-- Start times: `not_before`, `start_by` and `finish_by` in
-  `[tasks.execution]` (or an execution manifest) are times with an offset, a
-  TOML date-time (`not_before = 2026-11-08T06:50:00+09:00`) or the same as a
-  string; a time without an offset is refused, since the daemon and the CLI
-  may be in different zones. Before its `not_before` an execution is not
-  admitted and reserves nothing (wait reason `not_before`). From two hours
-  before it, it holds what it needs, as backfill does, on a node it will fit
-  on by then (once the leases expected to end by then have), from its
-  `not_before` (or later, when what runs there is expected to end later):
-  until then only work expected to end by that time may use it, so it starts
-  on time unless work of higher priority comes first or something without
-  an estimate was already running there. Nothing is suspended to make room
-  that only such a hold takes. `start_by` and `finish_by` are when it should have started
-  and ended. Besides the order, they only show: a wait that is past one, or
-  expected to miss one (by estimated run times), says so; one more than 12
-  hours past (a rerun days later) is ignored. Nothing is suspended or
-  stopped for either; that stays with `priority`. A
-  continuation keeps the `not_before` and `finish_by` of its task, not its
-  `start_by` (it started already). `task show` prints the three under
-  `times:`.
-- Inputs: `[[tasks.execution.inputs]]` (`[[inputs]]` in an execution
-  manifest) name what an execution reads, each handed to its attempts by
-  path as `KAIRO_INPUT_<NAME>` (the name in upper case: a letter, then
-  letters, digits and `_`, 64 at most, each once; at most 32), with exactly
-  one source: `task = "T"`, the output directory of the latest run of task T
-  of the same project (tasks only, and T must be in `depends_on`, so that run
-  has succeeded first); `data = "NAME"`, the newest data object of the
-  project with that name (an import's, say: Data stores); `object = "obj_..."`,
-  a data object of the project by id. An input is read where it is on the
-  node an attempt runs on: a run's output directory still on its volatile
-  store, an imported directory still where it was imported from (not
-  deleted, or kept without `--delete-source`), or its data object brought to
-  that node (Data stores: brought inputs). An input is always a directory:
-  an import of one file is never read where it was, but brought, a
-  directory holding the file, on its own node as on any other (so
-  `${KAIRO_INPUT_X}/<name>` reads the same everywhere). An execution with inputs (a task
-  or a direct one) is planned onto a node, unless its executor selector
-  names a `node` itself or it is a gang (whose rank 0 alone is handed its
-  inputs): the first every input is on, else the one the first input is on,
-  else the one its object was made on. It waits (`inputs_not_ready`, saying
-  which and why) until every input is on that node, those missing being
-  brought there meanwhile once they are packed (temporal data from the node
-  it is on, or made again there when it is on none: Data stores: temporal
-  data); one that cannot be
-  had at all (a task with no run, a name the project has no object of,
-  temporal data made again differing from what it was) says so.
-  Each is checked again when its attempt launches: on that node, in its
-  executor's reach (a store it serves, or an imported directory of its
-  node), there as a directory; one that is not
-  aborts the launch, the execution ending `launch_aborted: input NAME: why`.
-  While a task that is pending
-  or running, or an execution not yet ended, names it as an input, a source
-  is not deleted once copied (it is packed and copied as usual): a run's
-  output directory, by its task while it is that task's latest run, by its
-  object's name or id; an imported directory with `--delete-source`, by its
-  name or id. Inputs are in the execution's digest only when there are some.
-- Source: `source = "NAME"` in a task's `[tasks.execution]` runs its
-  attempts in the code snapshot of the project's `[sources.NAME]` made when
-  the task was declared (Code snapshots, below), `cwd` relative to it
-  (default `.`; an absolute cwd, or one leaving the snapshot, is refused).
-  Not for a gang yet. In the task's digest only when set; the snapshot is
-  not.
-- Image: `image = "NAME"` in a task's `[tasks.execution]` runs its attempts
-  in a container of the project's `[images.NAME]`, by the digest its
-  reference named when the task was declared (Containers, below), on an
-  executor that runs containers; such an executor runs nothing else. Not
-  for a gang yet. In the task's digest only when set; the digest is not.
-- Regenerable: `regenerable = true` in a task's `[tasks.execution]` says
-  that what a run of it writes to its output directory can be made again by
-  running the task again (a dataset built from sources kept elsewhere, say):
-  that output is temporal data (Data stores: temporal data), not copied to a
-  durable store, and the task may be rerun by Kairo to make it again where
-  it is read. Not for a gang. In the execution's digest only when set.
-- Continue after loss: `continue_after_loss = true` in a checkpointable
-  task's `[tasks.execution]` (not a gang) makes a lost attempt (its node
-  lost power, its agent went away: `executor_identity_lost`) go on instead
-  of blocking the task. The task stays `running` until nothing of the lost
-  attempt can still run, that is until its stale lease is released (by the
-  daemon, for an attempt that never started its command or whose node
-  rebooted since, or by `kairo resource reconcile`), then goes on from the
-  latest checkpoint it published (a suspend's, an operator's or a
-  `data_protection` checkpoint command's) as a continuation (reason
-  `loss_continuation`) on the node that published it, as `kairo task rerun
-  --from-checkpoint latest` would. With no checkpoint published it is
-  blocked as without the setting. In the task's digest only when set.
-- Store: `store = "ID"` in `[tasks.execution]` (or an execution manifest)
-  names the volatile store (Machine declaration) its attempts' scratch, run
-  output and cache directories go on, instead of the first their executor
-  serves (Data stores): one with room for a large output, say. The
-  execution is planned onto that store's node (unless its executor selector
-  names a node itself); a launch on an executor that does not serve it,
-  usable, as a volatile store is refused (`launch_aborted: store ID is not a
-  usable volatile store executor E serves`). Not for a gang. In the
-  execution's digest only when set.
-- Confinement: `confine = true` in `[tasks.execution]` (or an execution
-  manifest) makes its attempts write only where Kairo hands them: their
-  scratch (`KAIRO_SCRATCH`), their run's output directory
-  (`KAIRO_OUTPUT_DIR`) and their project's cache directory
-  (`KAIRO_CACHE_DIR`; Data stores). Everything else they read as before but
-  cannot change; `TMPDIR`, `TMP` and `TEMP` name the scratch. The daemon's
-  `[data] confine_from` (a time with an offset, `"2026-11-14T00:00:00+09:00"`)
-  confines every attempt launched from then on, whether its execution asks
-  or not. A confined launch on an executor without a usable volatile store
-  (so without a scratch and an output directory) is refused
-  (`launch_aborted: cannot confine the attempt here: ...`). On Linux the launcher is the agent's binary run in a mount
-  namespace of its own (Go makes its mounts private, so nothing reaches the
-  node): it binds each of those directories, `/dev/shm` and `/proc` onto
-  itself, then a `tmp` directory of the scratch over `/tmp`, makes every
-  mount read-only (`mount_setattr`, recursively from `/`), makes those
-  writable again and execs the attempt's argv (looked up on its `PATH`) in
-  its place, so the pid, process group and creation time are the
-  attempt's; the agent must be able to make mounts (root, as in the
-  containers it runs in), devices stay usable, and it exits 126 (127 for an
-  argv not found) saying why on stderr if it cannot. On Windows the launcher
-  runs with a copy of the agent's token at Low integrity, and those three
-  directories are labelled Low (inherited by what is made in them): a Low
-  integrity process reads what it could before but writes only what is
-  labelled Low, and its children inherit the token. CUDA, Python and native
-  programs run so; programs that make named objects at the session's level
-  do not start (MSYS and Git Bash tools among them). Confinement is in the
-  execution's digest only when asked for.
-- Placement: among the nodes an execution fits on, the one left with the
-  fewest free GPUs (CPU work stays off GPU nodes, GPU work packs onto as few
-  as it can), then the most free CPU. A gang's ranks go on distinct nodes, all
-  or none.
-- Backfill: an execution that fits nowhere holds, on the node it would run on
-  once the leases in its way end, what it can already use there, from when
-  it is expected to start: when enough of those leases are expected to have
-  ended (Run-time estimates). Executions after it run on everything nobody
-  holds, and on what it holds if they are expected to end before it starts;
-  an execution without an estimate, or held for by one whose start no
-  estimate tells (a lease in its way has none), does not. Its wait reason
-  says when it is expected to start. It holds nothing when what stops it
-  does not end by itself: a process Kairo did not start on a GPU, activity no
-  process explains, a stale observation, a node too small for it, the disk
-  watermark.
-- Preemption: an execution that fits nowhere (any priority, a gang too) may
-  suspend executions of lower priority that are `checkpointable` and
-  `preemptible` and whose GPUs or RAM are what stops it, the fewest needed
-  (already suspending ones first, then the lowest priority, single executions
-  before gangs, the most recently started). Too little CPU or disk is waited
-  for, never a reason to suspend anything. One that suspending all of them
-  would still not make room for (their GPU would come free, but not the RAM
-  others hold) suspends none, and waits with what would still be short
-  rather than with what they hold (`insufficient_ram: pve0: 28.0 GiB ram
-  needed, 24.0 GiB free even were glm/maya-r3 (priority -100) suspended, so
-  none is suspended for it; and pve0: 1 GPU(s) needed, 0 usable; leased by
-  glm/maya-r3 (priority -100)`).
-- Accounting: CPU is the node's total minus the reservations on it. RAM is
-  the lesser of total minus reservations and observed free memory minus the
-  part of each reservation its attempt does not use yet (what an attempt
-  uses, sampled by its executor, counts for two minutes; without a sample the
-  whole reservation counts). A reservation counts only up to what runs like
-  it were seen to take, when three of them succeeded with their use sampled:
-  the most their attempts used, of the latest five runs sharing its most
-  specific run-time estimate key (program, subcommand and config; program and
-  subcommand; or its Task name with digits masked; never a whole queue or
-  project), half again plus 512 MiB, and never less than its attempt uses
-  now. A lease holding a GPU counts in full: the host memory CUDA pins is not
-  in the samples (PSS on Linux, the private working set on Windows; neither
-  counts pinned memory, and the Windows one leaves out mapped files such as
-  a model's weights), and a host without swap hangs when it runs out. A declaration written large (8 GiB for work that took 300 MiB) thus
-  stops holding memory it never uses, while one its like really used (16 GiB
-  for work that took 10.7 GiB) still counts in full; samples are 15 s apart,
-  which the headroom is for. Disk is observed free space minus every
-  reservation on it: bytes written overstate what stays on disk (a rewritten
-  checkpoint counts twice), so they never shrink a reservation. A disk
-  request keeps its `min_free_after_bytes` and the watermark free.
-- Elastic CPU: `cpu_millis_min` (at most `cpu_millis`) under `[capacity]`
-  (`[tasks.execution.capacity]`) is the least an execution keeps. The rest of
-  its CPU reservation is lent to executions of the same or higher priority,
-  which then run beside it and slow it down instead of stopping it: a server
-  declared with `cpu_millis = 16000` and `cpu_millis_min = 4000` lets 12 CPUs
-  of evaluations of its priority or above run next to it. It lends nothing
-  to executions of lower priority.
-- Disk watermark: a node with a registered filesystem under
-  `[scheduler] disk_min_free_bytes` of the daemon configuration (default
-  5 GiB, at most 5% of the filesystem; `0` turns it off) admits nothing until
-  space is freed. Each such filesystem is kept in `node_alerts` and announced
-  by the events `disk_low_watermark` and `disk_watermark_cleared`. (`[data]`
-  of the same configuration sets how durable copies are read back: Data
-  stores.)
+### クライアント契約とエラーコード
 
-Every waiting execution's latest reason is kept: `task show` prints it under
-`waiting:` (for example `gpu_leased: pve0: 1 GPU(s) of >= 11.0 GiB needed, 0
-usable; leased by glm/maya-r3 (priority -100)`), and `task list` adds its
-code to the NOTE (`execution waiting: insufficient_ram`). The codes are
-`no_executor`, `not_before`, `inputs_not_ready`, `store_moving`, `awaiting_executor`, `gpu_leased`, `held_for_higher_priority`,
-`gpu_memory_low`, `insufficient_gpu`, `insufficient_cpu`, `insufficient_ram`,
-`insufficient_disk`, `external_claim`, `unattributed_activity`,
-`stale_observation`, `disk_low_watermark` and `preempting`.
+クライアントは `sdk/conformance` に定義された契約（デーモンの探索方法、トークンを送信してよい条件、各エラーの分類方法）に従い、すべての SDK のテストがこの契約をリプレイします。
 
-### Run-time estimates
+| エラーコード | HTTP ステータス | 内容 |
+|---|---|---|
+| `unauthorized` | `401` | 認証失敗（トークン未指定・不明・失効） |
+| `forbidden` | `403` | 権限不足（ロールがルートを許可しない） |
+| `not_found` | `404` | リソース未検出 |
+| `stale_epoch` およびその他の競合 | `409` | 状態・エポックの競合 |
+| `gate_closed` / `observe_only` | `423` | スコープゲート閉鎖中または観測専用モード |
+| `bad_request` | `400` | リクエスト不正（リクエストを修正する） |
+| `internal` | `500` / `503` | デーモン側の障害（`503` はデータベースが到達不能・過負荷・ロック取得を断念した場合。一時的なためリトライ可能） |
 
-Backfill needs to know roughly when running work ends and how long waiting
-work will take. Nothing is declared for it: a run (a Task's executions
-together, or a direct execution) is expected to take what the runs like it
-took that succeeded before, the median of the latest five that share its
-most specific key:
+`GET /health` は `{"ok": true, "api": 1}` を返します（ビルドの `version` も含みます）。`api` は契約バージョンであり、破壊的変更がある場合にのみ更新されます。
 
-1. project, queue, program, subcommand or script, and config file, with
-   digits masked (`neo_ime.cli train --config shunran-v0.9-30m.toml` is like
-   `... shunran-v0.10-4m.toml`)
-2. project, queue, program, and subcommand or script
-3. project, queue, and Task name, with digits and hashes masked
-4. project and queue
-5. project
+## コーディネーションモデル
 
-The program is the first word of the command line that is not a runner (`uv
-run`, `python -m`, `pwsh -Command`...), without its
-directory, extension and hashes. A run that succeeded is one whose last
-execution exited 0 without a signal; what it took is the time its attempts
-ran, summed. What a run is still expected to take is its estimate minus what
-its attempts have run so far; a run already past its estimate is expected to
-take as long again as it has run (at least a minute). A lease with a live
-suspend command is expected to end within two minutes; one whose attempt has
-exited (and still holds what it left running), or whose run has no
-estimate, is not expected to end, so what waits behind it holds as without
-estimates. The history is read again after any attempt exits, and at least
-every 10 minutes.
+Kairo は、以下の 5 つのプリミティブによって実行状態とリソース所有権を厳密に調整します。
 
-Replayed on this installation's history (4,200 runs), half the estimates
-fall within twice the actual run time, and long runs are mostly
-underestimated, since the runs like them were often short trials. Backfill
-tolerates that: it only asks whether short work ends before the execution it
-would delay could start, and an estimate corrected as a run overruns costs
-that execution little. In a simulation of the same history, backfill on
-these estimates gave the same completion times as backfill on the actual run
-times, and much shorter ones than holding with no estimates.
+| プリミティブ | 役割・特性 | 状態・ライフサイクル |
+|---|---|---|
+| Execution request | イミュータブルかつ 1 回限り（one-shot）。1 つのリクエストが開始できるのは最大 1 回。 | `waiting` / `authorized` / `started` / `terminal` |
+| Attempt | プロセスライフサイクルの事実（facts）を表す。 | `authorized` / `running` / `quiescing` / `exited` / `quiesced` / `lost` |
+| Lease | リソース所有権の調整（ownership coordination）を表す。 | `reserved` / `prepared` / `active` / `releasing` / `released` / `stale` / `revocation_requested` |
+| Command | 協調的な `suspend` 要求を少なくとも 1 回（at-least-once）配信する。 | `pending` / `accepted` / `checkpointing` / `checkpointed` / `rejected` |
+| スコープゲート（Scope gate） | アドミッション可否を制御。予約（reservation）・認可（authorization）・有効化（activation）の各時点で世代フェンス（generation fence）を検査する。 | `open` / `closed` |
 
-### Executor ticks
+**Lease の解放と `stale` な Lease のリコンサイル**
 
-An executor's tick is bounded in time. Every external call on it has a
-deadline: each `nvidia-smi` run 20 s (a `pmon` that does not return fails that
-GPU observation), each `taskkill` 30 s, and
-each provider call (observe, prepare, release) 45 s. A call that cannot be
-cancelled is abandoned at its deadline, and no further call on that provider
-starts until it returns. A step of the tick that runs for 30 s is logged at
-WARN as `executor step stalled` (with `executor_id`, `step` and
-`age_seconds`), and its end at INFO as `executor step resumed`. External
-commands that take longer than 2 s are logged at INFO with their duration; a
-timeout is logged at WARN with the command.
+チェックポイントの公開はプロセスの終了を証明せず、プロセスの終了も分散環境における静止（quiescence）を証明しません。Kairo が Lease を解放するのは、登録済みの全プロセスが存在しないことを確認し、かつその不在確認後に取得された Provider の観測結果でリソースが未占有（unclaimed）であると示された後だけです。
 
-Every 15 s an executor samples what each attempt it launched takes up, for
-admission to count that part of the attempt's RAM reservation once
-(`attempt-usage` on the agent API; bytes written are recorded but do not
-change disk admission, see Admission). The sample runs beside the tick, one at a
-time, bounded to 15 s, so it never holds the tick. RAM is the memory the
-attempt's processes hold, bytes written what they have written, never less
-than an earlier sample showed:
+Executor が保証できなくなった Lease は `stale` になります。これは、その Executor のエージェントが当該 Attempt を引き継がず（adopt せず）に再登録したとき、または消失したエージェントのノードをオペレータがフェンスしたとき（`kairo node fence`。後述の[ノードフェンス](#ノードフェンス)参照）に発生します。時間経過だけで Lease が `stale` になったり解放されたりすることは決してなく、`stale` な Lease はリコンサイル（reconcile）されるまでリソースを保持し続けます。
 
-- Linux: the processes carrying the attempt's `KAIRO_ATTEMPT_ID` and the
-  descendants of its launcher; the sum of their PSS (`smaps_rollup`) and of
-  their `write_bytes` less `cancelled_write_bytes` (`/proc/PID/io`).
-- Windows: the processes of the attempt's job object, their private working
-  sets and the bytes the job has written; without a job object, the launcher
-  and its descendants by parent pid and what they have written while alive.
+デーモンが Attempt のプロセス消滅を証明できない場合、オペレータは次のコマンドでリコンサイルを実行する必要があります。
 
-A process that cannot be read (another user's, a kernel without
-`smaps_rollup`) makes that figure unknown, and admission then counts the
-whole reservation. An attempt adopted after an agent restart is sampled as
-one launched by the agent; one lost is not.
+```sh
+kairo resource reconcile RESOURCE_ID --confirm-process-absent
+```
 
-### Attempt logs
+リコンサイルには、Lease が `stale` になった後に取得された各リソースの観測結果において、その Attempt のプロセス（自身の `KAIRO_ATTEMPT_ID` を持つプロセス、または登録済みプロセスのいずれか）が 1 つも見つからないことが必要です。なお、その Attempt 以外のプロセスによる占有（他プログラムのプロセス、帰属不明なアクティビティ、ゲームなど）は Lease を引き留めません。その占有自体がデバイスへの新規配置を妨げるため、オペレータが終了を待つ必要はありません。
 
-An attempt's stdout and stderr are files in its executor's `log_directory`
-(`<attempt>.stdout.log`, `<attempt>.stderr.log`), written by the attempt's
-processes themselves. A node agent ships them into the daemon's
-`log_directory`, which `task show`, `task logs` and `GET
-/api/attempts/{id}/log` read.
+一方で、以下のいずれかに該当する `stale` な Lease 配下では、プロセスがなお動作している可能性は存在しません。
 
-- An executor does not launch while the filesystem holding its
-  `log_directory` has less than `log_min_free_mib` free (default 1024, in the
-  daemon and the agent configuration): the execution ends `launch_aborted:
-  launch failed before activation: the filesystem of the attempt log
-  directory ... has 12.0 MiB free, below the minimum of 1.0 GiB`, which `task
-  show` and `task list` print. So does a free space measurement that fails,
-  and a log file that cannot be created.
-- While its attempts run, the executor checks that space every 15 s and
-  records on each attempt when it falls below the minimum (`log_space_low`)
-  or runs out (`log_space_exhausted`: output is being lost), and checks once
-  more as an attempt exits. A write the attempt's own process makes cannot be
-  seen to fail, so the space is what is watched.
-- An agent ships every log, an empty one too, and retries one the daemon
-  does not take (the daemon unreachable, or its own disk full, answered as an
-  `internal` failure) at every sweep from where the daemon's copy ends, so
-  nothing the node-side file holds is lost. One that has not reached the
-  daemon for 30 s is recorded on its attempt (`log_forward_failed`, per
-  stream), and so is its catching up. As an attempt exits, its logs are
-  shipped before its exit is recorded.
+- **コマンドを一度も起動していない Attempt**: 有効化（activation）前にロストしたもの。shim は有効化後にエージェントから送られる開始許可（go-ahead）を受け取って初めてコマンドを起動するため、エージェントが消失すればその開始許可も失われます。
+- **Attempt が紐づいていない Lease**
+- **開始後にノードが再起動された Attempt**: 登録時、Linux および Windows のエージェントはスリープや休止状態（hibernation）の時間も含む稼働時間（uptime）を報告するため、復帰が再起動と誤認されることはありません。デーモンは自身の時計でブート時刻を推定し、Attempt の開始時刻を記録します。時刻の不確実性を考慮し、推定ブート時刻が Attempt の開始時刻より 2 分超あとであることを条件とします。
 
-Each problem is a coordination event (`attempt_log_problem`,
-`attempt_log_problem_resolved`) and a `log issue:` line of the attempt in
-`task show` (`log_problems` in the API), such as `log issue: stderr not
-shipped to the daemon: ... (10-27 10:01 to 10-27 10:04, caught up)`.
+これらに該当する Lease については、Lease が `stale` になって以降の新しい観測結果が各リソースについて揃い、かつ Attempt のプロセスが見られない時点で、デーモン自身が自動的に解放します（イベント `stale_lease_reconciled`、`by: daemon`）。手動リコンサイルを行う場合も、`--confirm-process-absent` による確認は不要です。
 
-### Power and energy
+**終了済み Attempt の残留プロセス処理**
 
-Providers record what a device draws and how it runs, with the time they read
-it; Kairo keeps these facts and judges none of them against a specification.
-Providers only read: settings are changed by a host's controller alone (see
-Hardware settings).
+終了済みの Attempt が残したプロセス（ランチャーが終了してその終了が記録されているにもかかわらず、そのプロセスツリー上のプロセスがまだ動いている状態。未登録のまま起動した子プロセスや、ラッパーが残したサーバなど）は、もはや誰もその結果を読まないため本来の作業ではなく、しかも Lease を保持し続けてしまいます。
 
-- GPU: each `nvidia-smi` poll also reads the board power
-  (`power.draw.average`, else `power.draw`), the power limit in force
-  (`enforced.power.limit`), the SM and memory clocks, the P-state, the active
-  clock event reasons (a bitmask: `0x1` idle, `0x4` software power cap, `0x40`
-  hardware thermal slowdown, ...), the PCIe generation and width, memory
-  utilization and fan speed, and, kept once per GPU, its default, least and
-  greatest power limit, its greatest clocks and its greatest PCIe link. A
-  field a GPU does not report (`[N/A]`, `[Not Supported]`) is left out, never
-  an error. A driver that rejects these fields is asked by their older names
-  (`clocks_throttle_reasons.active`, `pcie.link.gen.current`), then for the
-  inventory alone.
-- CPU package: a node's host provider reads the power of its CPU packages,
-  averaged since its previous poll: on Windows the `\Energy Meter(*)\Power`
-  performance counter (instances `rapl_package*_pkg`; no elevation needed),
-  on Linux the RAPL counters `/sys/class/powercap/*-rapl:N/energy_uj`
-  (wraps handled with `max_energy_range_uj`). Where they cannot be read (an
-  unprivileged container, a CPU without them) the node reports none,
-  silently. The reader is `internal/cpupower`.
+Executor はこのような残留プロセスを自動的に終了させます。
 
-Samples are kept per physical device (a GPU by its UUID), so the providers of
-a shared GPU add to one series. As each GPU sample arrives, the energy since
-the device's previous sample, the trapezoid of their power, is added to the
-attempts whose lease holds that GPU (on any node's row of it), cut at the
-attempt's start and at its exit, its lease's release or its lease going
-stale; a GPU is counted once whichever provider reports it. An interval the
-samples do not vouch for is not integrated and makes the attempt's total
-`partial`: a gap longer than the earlier sample's validity
-(`observation_ttl_seconds`, default 15 s), a sample without power, a run that
-began before the GPU's first sample or went on after its lease went stale.
-`task show` prints `energy: GPU 1.23 kWh (partial)` per attempt (`energy`
-with `gpu_joules`, `gpu_seconds_covered`, device-seconds, and `partial` in the
-API). A CPU package is shared by whatever runs on its node, so its power is
-kept for the node only. A host's controller also reads its CPU packages (the
-same `internal/cpupower`) at every poll and reports them as the host's series
-`host/<host>/cpu`: on a Proxmox host only the host itself can read RAPL, its
-containers cannot. While the operating-point policy's setting is in place on
-an attempt's GPU, `task show` adds what it saved: `energy: GPU 1.23 kWh;
-policy 3.0 h, saved ~120.0 Wh (estimate)` (`policy_seconds`,
-`policy_saved_joules`, `policy_unestimated_seconds`), see Operating-point
-policy.
+1. 検知されてから 10 秒経過すると停止を要求します（`SIGTERM` を送信。なお Windows ではランチャーがすでに終了しているため、`CTRL_BREAK` は届きません）。
+2. さらに 30 秒経過すると強制終了（kill）します。対象となるのは、ジョブオブジェクト、ランチャーのプロセスグループ、および当該 Attempt の `KAIRO_ATTEMPT_ID` を持つプロセスであり、それぞれ[強制停止](#強制停止)（force stop）と同じ方法で特定されます。これら以外のプロセスが対象になることは決してありません。
 
-The samples are the tables `device_samples` and `device_properties`, the
-totals `attempt_energy`. Samples are kept for 72 hours (about 5 MB a day per
-GPU and provider reporting it at the default 5 s poll); the totals are kept
-with their attempts.
+なお、エージェント再起動に伴ってロストした Attempt は終了済み（`exited`）ではないため、この自動終了の対象にはならずそのまま残されます。
 
-### Machine declaration
+**GPU 上の外部プロセス占有（`external_process`）**
 
-Which node holds which GPU is declared, not discovered. `kairo machine apply
-FILE` replaces the whole declaration: `[[nodes]]` tables with an `id` (a node
-known to the daemon) and `gpus`, NVIDIA UUIDs as `nvidia-smi -L` prints them
-(see `examples/machines.toml`). Providers only observe. A GPU a provider
-reports that is not declared for its node, whether declared for another node
-or for none, is not registered and not scheduled; the rest of that poll still
-applies, and the GPU is listed as undeclared by `kairo machine show` and
-`kairo resource status` (`undeclared_gpus` with `--json`; a registered GPU in
-that situation has `derived_state` `undeclared`).
+Provider が GPU 上で観測したコンピュートプロセス（`nvidia-smi pmon`）は、その GPU（いずれのノード行で管理されているかを問わない）を保持している Attempt の作業に該当しない限り、`external_process` の占有（claim）として扱われます。Attempt の作業とみなされるのは、以下のいずれかです。
 
-To move a GPU between nodes, declare it for its new node. It stays registered
-on the old node, unschedulable, until the new node's provider reports it,
-which takes it over (event `gpu_ownership_transferred`); the old node's open
-claims on it are cleared when the declaration changes (event
-`gpu_declaration_changed`). Apply refuses to move or drop a GPU that a live
-lease holds, and to declare an unknown node. `--dry-run` prints the changes
-(`+` declared, `~` moved, `-` dropped) without applying them. `machine show`
-lists each declared GPU as `observed`, `stale`, `pending` (not yet reported by
-its node) or `unseen`.
+- その Attempt の登録済みプロセス
+- 登録済みプロセスの子孫プロセス（親プロセス連鎖（parent chain）でたどれ、各親プロセスが生存しており、かつ子プロセスより後に起動していないこと）
+- Linux の場合、その Attempt の `KAIRO_ATTEMPT_ID` を環境変数に持つプロセス（[強制停止](#強制停止)で Attempt のプロセスを特定するのと同様に `/proc/PID/environ` から読み取る。Windows では親プロセス連鎖のみを参照）
 
-A GPU listed under several nodes is SHARED: nodes on one host (containers
-that all see the card, each with its agent) may each schedule it. Each node
-registers a row of its own (the first under the provider's id, the others as
-`<id>@<node>`), and a lease on any row of the device excludes the others:
-scheduling, admission checks, lease release and `resource status` count the
-leases and claims of every row of it. A provider cannot see another
-container's processes, so while one node's row is leased, the other nodes'
-claims of activity without a process (`unattributed_activity`) on it are the
-lease holder's work and are not recorded; the lease holder's own provider
-still reports what it cannot attribute, and a process another node does see
-there stays an `external_process` claim unless it is the lease holder's own
-work (see Coordination model). Priority preemption reaches a
-lower-priority victim holding the device through another node's row. Apply
-refuses to drop a node from a GPU whose row on that node a live lease holds;
-`from` / `to` of a shared GPU's change list its nodes, comma-separated.
-Containers share the host's RAM and CPUs as well, which Kairo accounts per
-node: keep their memory limits within the host's.
+この判定が成り立つのは、Attempt が `running` または `quiescing` 状態であり、かつ登録済みプロセスが生存している間だけです。登録済みプロセスより長く生き残った子孫プロセスは再び占有（claim）とみなされ、それが稼働している間は Lease も解放されません。
 
-Optional `[[hosts]]` tables declare the physical machines, and only what
-observation cannot tell: policy and authority. A host has an `id`, the `nodes`
-on it (containers, or the machine itself; a node is on at most one host), a
-`controller` (the node of the `kairo controller` that may change its devices'
-settings; none: its devices are only observed) and `max_slowdown`, the share
-of maximum performance its devices may give up for efficiency, in [0, 0.5)
-(omitted: 0, the hardware stays at its defaults). Its devices are every GPU
-declared for one of its nodes and `cpu` (its CPU packages); a GPU whose nodes
-are on two hosts is an error. `[[hosts.devices]]` overrides `max_slowdown` or
-sets `control = false` (never changed, never benched) for one device, a GPU
-UUID or `cpu`, listed once. `containers` maps those of its nodes that are
-Proxmox containers to their vmid (`containers = { pve0-neo-train = 101 }`):
-after Kairo deletes something on one, the host's controller trims it (Data
-stores), so it needs a controller, and a vmid is one node's. Host nodes and controllers must be known nodes
-(a controller registers its node when it starts), and a controller controls
-one host. What a device is, how fast it clocks and how much power it draws is
-observed by providers and measured by benches, never declared. A host is
-replaced as a whole on apply; `--dry-run` prints `+ host`, `~ host` (each
-changed field, `from -> to`) and `- host`, and the device settings the apply
-removes (`- setting`: the device is no longer on a host, is `control = false`,
-or its host lost its controller). `machine show` adds the hosts and the
-effective policy of each device (its own value, else its host's; event
-`host_declaration_changed`).
+Lease 保持者に紐づけられないプロセス（別 Attempt のプロセス、親プロセスがすでに終了しているプロセス、環境変数を読み取れないプロセスなど）は占有（claim）のまま残ります。占有が存在する GPU は、プリエンプションを行う Execution にも割り当てられません。
 
-Optional `[[stores]]` tables declare the places Kairo keeps data in (see Data
-stores): an `id`, a `class` (`durable`: kept for good, Kairo never deletes
-what it keeps there, only its own copies that did not complete; `volatile`:
-scratch space), the `node`, a `root` directory (absolute:
-`E:/kairo`, `/srv/kairo`; the root belongs to Kairo), the `filesystem` it is
-on (exactly the identity of a disk resource registered on the node, the one
-its admission accounting uses), `backend` (`local-fs`, the only one so far;
-omitted: `local-fs`), `reserve_free_bytes` (for a durable store the free space
-it keeps: no copy is made there that would take it below; for a volatile one
-the free space below which it evicts, see Evicting, a tenth of its total when
-unset; for either, the free space a pack or a fetch onto it must leave on its
-filesystem, 1 GiB when unset, so what else is there, a running attempt's
-checkpoints or the system, never finds it full) and optionally `executor`, the one
-executor of the node that serves it (without it every executor of the node
-does). Ids are unique,
-and no two stores of one node are at one place or one inside the other,
-whatever executors they name: roots are compared as one spelling of each
-place (separators, `.` and trailing separators dropped, a drive path without
-case), so `E:/data`, `e:\Data\` and `E:/./data` are one place, and a root
-declared with and without an executor is refused.
-A root has no `..` and no control character; a POSIX root no whitespace or
-backslash; a drive path no name Windows reads as another (ending in a dot or
-a space, with `~` as in a short 8.3 name, a `:` or a character names cannot
-hold). The agent also compares where the roots really are (Data stores). A
-store is replaced as a whole
-on apply (`+ store`, `~ store`, `- store`; event `store_declaration_changed`);
-dropping one deletes nothing, and a store declared at another root leaves
-what it has at the old one there, untouched and no longer used. To take it
-along, declare the new root with `moved_from` naming the root it is at
-(Data stores: moving a store). `machine show` adds the stores.
+### エージェント再起動と引き継ぎ
 
-`POST /api/machines` takes `{"nodes": [{"id", "gpus"}], "hosts": [{"id",
-"nodes", "controller", "max_slowdown", "devices": [{"id", "max_slowdown",
-"control"}]}], "stores": [{"id", "class", "node", "executor", "root",
-"filesystem", "backend", "reserve_free_bytes", "moved_from"}], "dry_run"}` and answers
-`{"changes": [{"uuid", "from", "to"}], "unchanged", "host_changes": [{"host",
-"from", "to"}], "unchanged_hosts", "store_changes": [{"store", "from", "to"}],
-"unchanged_stores", "cleared_settings", "dry_run"}`; a leased GPU is `409
-machine_conflict`. `GET /api/machines` answers `{"gpus", "undeclared",
-"hosts", "devices", "stores"}`, the devices with `host_id`, `device_id`,
-`kind`, `max_slowdown`, `control` and `controller`. A daemon older than stores
-refuses a declaration that has any (`stores` is an unknown field).
+Attempt のランチャーは shim です。これは Executor の `kairo` バイナリを `__kairo-shim` として実行するもので、その PID、プロセスグループ（Linux）またはコンソールプロセスグループおよびジョブオブジェクト（Windows）、ならびに作成時刻（creation time）が、そのまま Attempt の識別情報となります。
 
-### Code snapshots
+起動は次の手順で行われます。
 
-A task runs in the code it was declared with, kept by Kairo rather than
-named by a git commit (which a rewritten history loses): `kairo project
-apply` snapshots each source a task of the file names and the daemon keeps
-it, whatever later happens to the working tree or its git history.
+1. Executor が shim を起動し、Windows の場合は Attempt 用のジョブオブジェクト（名前は `kairo-attempt-<attempt id>`。shim にそのハンドルを渡すため、shim が稼働している間は名前が維持されます）に格納します。
+2. Executor が Attempt を有効化（activate）し、ログディレクトリ配下の `running/<attempt id>.json` に記録します。
+3. そこまで完了して初めて、shim が所定の環境変数・作業ディレクトリ・ログ設定のもとで Attempt のコマンドを起動します（Execution にコンファインメント指定がある場合はコンファインメント下で実行します。[データストア](#データストア)参照）。
+
+このため、有効化（activation）が拒否された起動ではコマンドが一切実行されません。shim は `SIGTERM` および `CTRL_BREAK` を自身で止めずに通過させ（同じグループに属するコマンドにも同じシグナルが送られます）、コマンドの終了を待機したうえで、その終了コードを `running/<attempt id>.exit` に書き出してから同じ終了コードで終了します。Attempt の終了はこのファイルから記録されます（ファイルが書き出されずに shim 自体が終了していた場合は kill されたものとして記録されます）。
+
+このようにエージェントは作業プロセスの直接の親ではないため、エージェント自身のプロセスのみを停止・再起動した場合でも Attempt は維持されます（Linux では systemd ユニットの `KillMode=process` を使用し、Windows では同じ実行イメージで動いている shim は終了させずエージェントのみを再起動します）。
+
+エージェントは起動時に、配下の Executor に記録されている各 Attempt のうち、shim が依然として稼働中のもの、または終了ファイルを書き出して終了済みのものを引き継ぎ（adopt）ます。
+
+- エージェントが登録時にそれら（Attempt、Executor、shim の PID、および作成アイデンティティ（creation identity））を申告すると、デーモンはそれぞれを従前の PID とアイデンティティのまま、その Executor 上で `running` または `quiescing` として維持します（イベント `attempt_adopted`）。
+- それ以外の、その Executor が保持していた Attempt は従来どおりロスト扱い（`attempt_lost`）となり、記録も削除されます。
+- 引き継がれた Attempt は shim が終了するまで 1 秒ごとに監視され、終了時に終了結果が記録されます。その間も、ログはデーモン側コピーの末尾から続けて転送され、リソース使用量がサンプリングされ、強制停止は名前で再取得したジョブオブジェクト（Windows）またはプロセスグループ（Linux）経由で到達し、`scratch` と `output` ディレクトリは使用中としてカウントされます。
+- 終了ファイルを残さずに消滅した shim（強制終了された場合やノード再起動時）は引き継がれず、その Attempt はロストとなります。shim 導入前の旧エージェントで起動された Attempt も、従来どおり再起動でロストします。
+- 自身で Executor を持つデーモンも、同じ仕組みで引き継ぎを行います。
+
+### アドミッション制御とプランニング
+
+待機中のどの Execution をどこで実行するかは、環境全体を対象とした単一のプランニングパスによって決定されます。このパスでは、スコープゲートが `open` なすべての待機中 Execution、直近 1 分以内にポーリングした（またはまだポーリングしていない）Executor を持つすべてのノード、およびすべての Lease と占有（claim）を考慮します。
+
+各 Executor からの予約（reserve）およびプリエンプションの呼び出しはすべて同じプランニングパスを実行します。選択を行うのは最初にポーリングした Executor ではなくこのプランニングパスであり、別ノードに配置決定された Execution はそのノードの Executor を待ちます（待機理由 `awaiting_executor`）。待機中の Execution がなく、かつクリアすべき待機理由も残っていない場合、ポーリングはプランニングパスを実行しません（ロックなしの読み取りで判定します）。ただし、ディスクウォーターマークのアラートを最新に保つため、10 秒に 1 回だけはパスを実行します。
+
+同一ノード上の複数 Executor はそのノードのリソースを共有するため、ラベル条件に一致する Executor であればどれでも、そのノードに配置された Execution を引き受けることができます。
+
+#### 優先順位と時刻制約
+
+- **優先順位（Order）**: `priority` が高いものを優先します。同じ `priority` 内では以下の順に優先されます。
+  1. `start_by` または `finish_by` を持つ Execution が先となり、最も早く開始する必要があるものを優先する（`start_by` と、「`finish_by` から推定実行時間を引いた時刻」のうち早い方）。
+  2. 環境全体の GPU・CPU・RAM それぞれに対するプロジェクトの占有率のうち、最大となっている割合が最も小さいプロジェクト。
+  3. 投入時刻（submission）が早いもの。
+- **開始・完了時刻制約（`not_before` / `start_by` / `finish_by`）**: `[tasks.execution]`（または Execution マニフェスト）で指定する `not_before`、`start_by`、`finish_by` は、タイムゾーンオフセット付きの時刻です。TOML の date-time（例: `not_before = 2026-11-08T06:50:00+09:00`）または同じ形式の文字列で指定します。デーモンと CLI が異なるタイムゾーンにある可能性があるため、オフセットのない時刻は拒否されます。
+  - `not_before` に達する前はアドミッションされず、リソースも予約しません（待機理由 `not_before`）。
+  - `not_before` の 2 時間前からは、バックフィルと同様に、その時点までに収まるノード（それまでに終了予定の Lease が解放された後に収まるノード）上で、`not_before`（またはそのノードで実行中のジョブの終了予定がそれより遅い場合はその時刻）以降の必要リソースを確保（hold）します。その時刻までは、それまでに終了する見込みのジョブだけがそのリソースを使用できます。したがって、より高い優先度のジョブが先に来たり、実行時間推定のないジョブがすでにそこで動いていたりしない限り、予定どおりに開始されます。この事前確保（hold）のためだけに他のジョブがサスペンドされることはありません。
+  - `start_by` と `finish_by` は、それぞれ開始すべき時刻と完了すべき時刻を表します。優先順位付け以外では表示のみに使われ、待機がこれらを過ぎている場合や（推定実行時間から）間に合わない見込みの場合はその旨が表示されます。12 時間以上過去になったもの（数日後の再実行など）は無視されます。いずれのためにも他ジョブがサスペンド・停止されることはなく、プリエンプションの判断はあくまで `priority` に委ねられます。
+  - 継続（continuation）は Task の `not_before` と `finish_by` を引き継ぎますが、`start_by` は引き継ぎません（すでに開始済みであるため）。`task show` ではこれら 3 つが `times:` の下に表示されます。
+
+#### 入力データ（`inputs`）
+
+`[[tasks.execution.inputs]]`（Execution マニフェストでは `[[inputs]]`）では、Execution が読み込む入力を指定します。各入力はそのパスが環境変数 `KAIRO_INPUT_<NAME>` として Attempt に渡されます。`<NAME>` は大文字に変換され、先頭が英字、以降が英字・数字・`_` から成る最大 64 文字の識別子である必要があり、重複不可・合計最大 32 件まで指定できます。各入力には、以下のソースをちょうど 1 つ指定します。
+
+- `task = "T"`: 同一プロジェクト内の Task `T` の最新 Run の `output` ディレクトリ（Task でのみ指定可能。`T` は `depends_on` に含まれている必要があり、その Run が先に成功していることが前提）。
+- `data = "NAME"`: その名前を持つプロジェクトの最新データオブジェクト（インポートしたものなど。[データストア](#データストア)参照）。
+- `object = "obj_..."`: ID で指定するプロジェクトのデータオブジェクト。
+
+入力の読み込み・配置・保護ルールは以下のとおりです。
+
+- **読み込み場所とディレクトリ保証**: 入力は、Attempt が実行されるノード上の既存の場所から読み込まれます。具体的には、volatile store 上にまだ残っている Run の `output` ディレクトリ、インポート元にまだ残っているディレクトリ（未削除、または `--delete-source` なしで保持されているもの）、あるいはそのノードへ持ち込まれたデータオブジェクト（[データストア](#データストア)の持ち込み入力（brought inputs）参照）です。入力は常にディレクトリとして提供されます。単一ファイルをインポートした場合は、元の場所から直接読まれることはなく、元のノード上であっても他ノードと同様に「そのファイルを格納したディレクトリ」として持ち込まれます（これにより、どのノードでも `${KAIRO_INPUT_X}/<name>` で同じように読み込めます）。
+- **配置先ノードの決定**: 入力を持つ Execution（Task または直接 Execution）は、Executor セレクタで `node` 自体を明示指定している場合や Gang（入力は rank 0 のみに渡されます）である場合を除き、次の優先順でノードにプランニングされます。
+  1. すべての入力が揃っている最初のノード
+  2. 最初の入力が存在するノード
+  3. そのオブジェクトが作成されたノード
+- **待機と持ち込み**: すべての入力がそのノードに揃うまで、Execution は `inputs_not_ready`（どの入力がなぜ未準備かも表示）で待機します。その間、不足している入力は pack 完了後にそのノードへ持ち込まれます（一時データ（temporal data）は存在するノードから持ち込まれるか、どのノードにも存在しない場合はそのノードで再生成されます。[データストア](#データストア)の一時データ参照）。そもそも取得できない入力（実行履歴のない Task、プロジェクトに該当オブジェクトが存在しない名前、再生成した一時データが元の内容と異なっていた場合など）についても、その旨が待機理由に示されます。
+- **起動時の再検証**: Attempt の起動時にも各入力が再検証されます。そのノード上にあり、Executor の到達範囲内（担当するストア、またはそのノードのインポート元ディレクトリ）にディレクトリとして存在しなければ起動は中止され、Execution は `launch_aborted: input NAME: why` で終了します。
+- **参照中のソース削除抑止**: pending または running の Task、あるいは未終了の Execution が入力として参照している間は、コピー完了後もソースは削除されません（pack とコピー自体は通常どおり行われます）。対象となるのは、Run の `output` ディレクトリ（その Task の最新 Run である間の Task 指定、またはオブジェクト名・ID 指定による参照）と、`--delete-source` 付きでインポートされたディレクトリ（名前または ID 指定による参照）です。
+- **ダイジェストへの影響**: 入力設定は、1 件以上指定されている場合にのみ Execution のダイジェストに含まれます。
+
+#### 実行環境・ライフサイクル設定
+
+- **ソース（`source`）**: Task の `[tasks.execution]` に `source = "NAME"` を指定すると、Task 宣言時点で作成されたプロジェクトの `[sources.NAME]` のコードスナップショット内で Attempt を実行します（後述の[コードスナップショット](#コードスナップショット)参照）。`cwd` はスナップショットに対する相対パスとなります（デフォルトは `.`。絶対パスやスナップショット外に出る `cwd` は拒否されます）。現時点では Gang には未対応です。設定されている場合のみ Task のダイジェストに含まれますが、スナップショット自体はダイジェストに含まれません。
+- **コンテナイメージ（`image`）**: Task の `[tasks.execution]` に `image = "NAME"` を指定すると、Task 宣言時点でプロジェクトの `[images.NAME]` の参照が指していたダイジェストのコンテナ内で Attempt を実行します（後述の[コンテナ実行](#コンテナ実行)参照）。実行はコンテナを実行する Executor 上で行われ、その種の Executor はコンテナ以外のジョブを実行しません。現時点では Gang には未対応です。設定されている場合のみ Task のダイジェストに含まれますが、イメージのダイジェスト自体は含まれません。
+- **再生成可能出力（`regenerable`）**: Task の `[tasks.execution]` に `regenerable = true` を指定すると、その Run が `output` ディレクトリに書き出す内容は Task の再実行によって再生成できることを宣言します（別所に保管されたソースから構築するデータセットなど）。その出力は一時データ（temporal data。[データストア](#データストア)参照）として扱われて durable store へはコピーされず、参照先のノードで必要になった際に Kairo が Task を再実行して再生成することがあります。Gang には非対応です。設定されている場合のみ Execution のダイジェストに含まれます。
+- **ロスト後の自動継続（`continue_after_loss`）**: チェックポイント可能な Task（Gang 以外）の `[tasks.execution]` に `continue_after_loss = true` を指定すると、Attempt がロストした場合（ノードの電源断やエージェント消失など、理由 `executor_identity_lost`）に Task をブロックせず続行させます。Task は、ロストした Attempt のプロセスが何も動作し得ない状態になるまで（つまり、コマンド未起動またはノード再起動済みでデーモンが自動解放するか、`kairo resource reconcile` によって `stale` な Lease が解放されるまで）`running` を維持します。その後、公開済みの最新チェックポイント（サスペンド時、オペレータによる実行、または `data_protection` チェックポイントコマンドによるもの）から、それを公開したノード上で継続（continuation、理由 `loss_continuation`）として再開します（`kairo task rerun --from-checkpoint latest` と同等の挙動）。チェックポイントが 1 つも公開されていない場合は、この設定がない場合と同様にブロックされます。設定されている場合のみ Task のダイジェストに含まれます。
+- **ストア指定（`store`）**: `[tasks.execution]`（または Execution マニフェスト）に `store = "ID"` を指定すると、Attempt の `scratch`、Run の `output`、`cache` ディレクトリの配置先となる volatile store（[マシン宣言](#マシン宣言)参照）を明示できます。指定しない場合は Executor が担当する最初のストアが使われます（[データストア](#データストア)参照）が、大容量の出力に余裕のあるストアを選びたい場合などに使用します。この Execution は（Executor セレクタで `node` を直接指定していない限り）指定ストアを持つノードにプランニングされます。そのストアを利用可能な volatile store として担当していない Executor 上での起動は拒否されます（`launch_aborted: store ID is not a usable volatile store executor E serves`）。Gang には非対応です。設定されている場合のみ Execution のダイジェストに含まれます。
+
+#### コンファインメント（`confine`）
+
+`[tasks.execution]`（または Execution マニフェスト）に `confine = true` を指定すると、Attempt の書き込み先が Kairo から渡された次の 3 ディレクトリのみに制限されます（[データストア](#データストア)参照）。
+
+- `scratch` ディレクトリ（`KAIRO_SCRATCH`）
+- Run の `output` ディレクトリ（`KAIRO_OUTPUT_DIR`）
+- プロジェクトの `cache` ディレクトリ（`KAIRO_CACHE_DIR`）
+
+それ以外の場所は従来どおり読み取れますが変更できなくなり、`TMPDIR`、`TMP`、`TEMP` には `scratch` ディレクトリが設定されます。また、デーモン設定の `[data] confine_from`（オフセット付き時刻、例: `"2026-11-14T00:00:00+09:00"`）を指定すると、その時刻以降に起動されるすべての Attempt が、Execution 側での指定の有無にかかわらずコンファインメント下で実行されます。
+
+利用可能な volatile store を持たない（したがって `scratch` や `output` ディレクトリを持たない）Executor 上でのコンファインメント起動は拒否されます（`launch_aborted: cannot confine the attempt here: ...`）。コンファインメント設定は、Execution 側で明示的に要求された場合にのみ Execution のダイジェストに含まれます。
+
+OS ごとの実装と制約は次のとおりです。
+
+- **Linux**: ランチャーはエージェント自身のバイナリであり、独自のマウント名前空間（mount namespace）内で実行されます（Go がマウントを private にするため、ノード本体へは影響しません）。上記の 3 ディレクトリ、`/dev/shm`、および `/proc` をそれぞれ自身にバインドマウントし、さらに `scratch` 配下の `tmp` ディレクトリを `/tmp` の上にバインドマウントします。そのうえで `/` から再帰的にすべてのマウントを読み取り専用にし（`mount_setattr`）、上記のマウント先だけを再び書き込み可能に戻してから、`PATH` 上で検索した Attempt の `argv` をそのまま `exec` します。これにより PID、プロセスグループ、作成時刻は Attempt 自身のものとなります。エージェントにはマウント操作権限が必要です（稼働中のコンテナ内と同様の `root` 権限）。デバイスはそのまま利用可能です。コンファインメントを実行できない場合は、理由を stderr に出力して終了コード `126`（`argv` が見つからない場合は `127`）で終了します。
+- **Windows**: ランチャーはエージェントのトークンを Low 整合性レベル（Low integrity）に複製したもので実行され、上記の 3 ディレクトリに Low ラベルが付与されます（配下に作成されるものへも継承されます）。Low 整合性プロセスは従来読み取れた場所を読み取れますが、書き込みは Low ラベルの付いた対象のみに制限され、子プロセスもこのトークンを継承します。CUDA、Python、ネイティブプログラムはこの環境で動作しますが、セッションレベルで名前付きオブジェクトを作成するプログラム（MSYS や Git Bash のツール群など）は起動できません。
+
+#### 配置・バックフィル・プリエンプション
+
+- **配置（Placement）**: Execution が収まるノードのうち、配置後に残る空き GPU 数が最も少ないノードを選びます（これにより CPU ジョブは GPU ノードを避け、GPU ジョブは可能な限り少数のノードへ集約されます）。同数の場合は空き CPU が最も多いノードを選びます。Gang の各 rank は互いに異なるノードに配置され、全 rank を配置できるか 1 つも配置しないか（all or none）のいずれかとなります。
+- **バックフィル（Backfill）**: 現時点でどのノードにも収まらない Execution は、障害となっている Lease 群が終了した際に実行される見込みのノード上で、すでに利用可能なリソースを「開始予定時刻」（必要な数の Lease が終了すると見込まれる時刻。[実行時間の推定](#実行時間の推定)参照）以降について確保（hold）します。
+  - 後続の Execution は、誰も確保していないリソースではそのまま実行でき、誰かが確保しているリソースであっても、その開始予定時刻より前に終了する見込みであれば実行できます。
+  - 自身に実行時間の推定値がない Execution や、開始予定時刻を推定できない先行 Execution（妨げとなっている Lease に推定値がない場合）によって確保されているリソースについては、バックフィル実行されません。
+  - 待機理由には開始予定時刻が表示されます。
+  - 自然終了しない要因で阻まれている場合は確保（hold）を行いません。該当するのは、Kairo 以外が起動した GPU 上のプロセス、プロセスで説明できないアクティビティ、古い観測結果（`stale_observation`）、ノード容量の絶対的不足、ディスクウォーターマーク超過です。
+- **プリエンプション（Preemption）**: どのノードにも収まらない Execution（優先度は問わず、Gang も対象）は、自身より低い優先度を持ち、`checkpointable` かつ `preemptible` であり、かつ自身の配置を妨げている GPU または RAM を保持している Execution を、必要最小限の数だけサスペンドできます。対象の選定順は次のとおりです。
+  1. すでにサスペンド処理中のもの
+  2. 優先度が最も低いもの
+  3. Gang より単体 Execution
+  4. 開始時刻が最も新しいもの
+
+  CPU やディスクの不足は待機対象であり、他ジョブをサスペンドする理由にはなりません。また、候補すべてをサスペンドしてもなお空きが足りない場合（GPU は空くが他ジョブが保持する RAM が足りない場合など）は 1 つもサスペンドせず待機し、候補が保持しているリソースではなくサスペンドしてもなお不足するリソースを待機理由として示します（例: `insufficient_ram: pve0: 28.0 GiB ram needed, 24.0 GiB free even were glm/maya-r3 (priority -100) suspended, so none is suspended for it; and pve0: 1 GPU(s) needed, 0 usable; leased by glm/maya-r3 (priority -100)`）。
+
+#### リソース計算・弾性 CPU・ディスクウォーターマーク
+
+- **リソース計算（Accounting）**:
+  - **CPU**: ノードの総 CPU から、そのノード上の予約（reservation）の合計を差し引いた値です。
+  - **RAM**: 「総メモリ − 予約合計」と、「観測された空きメモリ − 各予約のうち Attempt がまだ使っていない分」のうち小さい方を用います。Executor がサンプリングした Attempt の実使用量は 2 分間有効として計上され、サンプルがない場合は予約全額が計上されます。
+    - 同種の過去実行のうち使用量がサンプリングされた成功 Run が 3 件以上ある場合、予約の計上額には実績ベースの上限が適用されます。上限は、最も具体的な実行時間推定キー（プログラム・サブコマンド・設定ファイル、プログラム・サブコマンド、または数字をマスクした Task 名のいずれか。キュー全体やプロジェクト全体は対象外）を共有する直近 5 件の Run における Attempt 最大実使用量の 1.5 倍 + 512 MiB とし、かつその Attempt の現在の実使用量を下回ることはありません。
+    - ただし、GPU を保持している Lease は常に予約全額が計上されます。CUDA がピン留め（pin）するホストメモリはサンプリング値に含まれないためです（Linux では PSS、Windows では private working set を計測しており、どちらも pinned memory を含まず、さらに Windows ではモデル重みなどのメモリマップドファイルも含まれません）。スワップのないホストでメモリが枯渇するとハングするため、この保護を行っています。
+    - これにより、過大に宣言されたメモリ（実際には 300 MiB しか使わないジョブに 8 GiB を宣言した場合など）で使われない分を抱え込み続けるのを防ぎつつ、実際に大きく使うジョブ（10.7 GiB 使った実績に対して 16 GiB を宣言した場合など）は引き続き全額計上されます。サンプリング間隔は 15 秒であり、1.5 倍 + 512 MiB の余裕（headroom）はこの間隔での増加に備えるためのものです。
+  - **Disk**: 観測された空き容量から、その上の全予約を差し引いた値です。書き込みバイト数はディスク上に実際に残る容量を過大評価するため（書き換えられたチェックポイントが二重計上されるなど）、書き込み量によって予約額が減らされることはありません。ディスク要求は、自身の `min_free_after_bytes` とディスクウォーターマークの双方の空き容量を確保します。
+- **弾性 CPU（Elastic CPU）**: `[capacity]`（Task では `[tasks.execution.capacity]`）配下の `cpu_millis_min`（上限は `cpu_millis`）は、Execution が最低限維持する CPU 量です。予約 CPU の残余分は同等以上の優先度を持つ Execution に貸し出され、元のジョブを停止させずに横に並走させて処理速度を落とすだけで共存できます（例: `cpu_millis = 16000`、`cpu_millis_min = 4000` で宣言されたサーバは、同等以上の優先度の評価ジョブに対して 12 CPU 分を貸し出して並走を許容します）。より低い優先度の Execution には一切貸し出しません。
+- **ディスクウォーターマーク（Disk watermark）**: デーモン設定の `[scheduler] disk_min_free_bytes`（デフォルトは 5 GiB、かつファイルシステム容量の最大 5%。`0` で無効化）を下回る登録済みファイルシステムを持つノードは、空き容量が確保されるまで新規アドミッションを一切受け付けません。該当するファイルシステムはそれぞれ `node_alerts` に記録され、イベント `disk_low_watermark` および `disk_watermark_cleared` で通知されます（同じ設定ファイルの `[data]` では durable コピーのリードバック方式を設定します。[データストア](#データストア)参照）。
+
+#### 待機理由とコード一覧
+
+待機中のすべての Execution について最新の待機理由が保持されます。`task show` では `waiting:` の下に詳細が表示され（例: `gpu_leased: pve0: 1 GPU(s) of >= 11.0 GiB needed, 0 usable; leased by glm/maya-r3 (priority -100)`）、`task list` ではそのコードが NOTE に付加されます（例: `execution waiting: insufficient_ram`）。
+
+待機理由コードは以下のとおりです。
+
+`no_executor` / `not_before` / `inputs_not_ready` / `store_moving` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
+
+### 実行時間の推定
+
+バックフィルを行うには、実行中のジョブがおおよそいつ終わるか、また待機中のジョブがどのくらいかかるかを把握する必要があります。このための明示的な宣言は不要であり、1 つの Run（1 つの Task に属する Execution 群をまとめたもの、または直接 Execution）の所要時間は、過去に成功した同種の Run の実績から推定されます。具体的には、最も具体的なキーを共有する直近 5 件の中央値（median）を使用します。
+
+キーは次の優先順（具体性の高い順）で一致を探します。
+
+1. プロジェクト、キュー、プログラム、サブコマンドまたはスクリプト、および数字をマスクした設定ファイル（例: `neo_ime.cli train --config shunran-v0.9-30m.toml` は `... shunran-v0.10-4m.toml` と同種とみなされる）
+2. プロジェクト、キュー、プログラム、およびサブコマンドまたはスクリプト
+3. プロジェクト、キュー、および数字とハッシュをマスクした Task 名
+4. プロジェクト、およびキュー
+5. プロジェクト
+
+推定の算出ルールと更新タイミングは次のとおりです。
+
+- **プログラムの抽出**: コマンドライン上でランナー（`uv run`、`python -m`、`pwsh -Command` など）ではない最初の語から、ディレクトリ・拡張子・ハッシュを取り除いたものを用います。
+- **成功 Run と実績時間**: 最後の Execution がシグナルなしで終了コード `0` で終了した Run を成功とみなし、その配下の各 Attempt が実行された時間の合計を所要時間とします。
+- **残り実行時間の見積もり**: 「推定実行時間 − これまでに各 Attempt が実行した合計時間」を用います。すでに推定実行時間を超過している Run は、「これまで実行した時間と同じだけさらにかかる（ただし最低 1 分）」と見積もられます。
+- **特殊な Lease の扱い**: 有効な `suspend` Command が進行中の Lease は 2 分以内に終了すると見込まれます。一方、Attempt が終了済みなのに（残留プロセスにより）なお保持されている Lease や、推定実行時間を持たない Run の Lease は終了見込みなしと扱われるため、その後ろで待機する Execution は推定値がない場合と同様に確保（hold）を行います。
+- **履歴の再読み込み**: いずれかの Attempt が終了するたびに再読み込みされ、それ以外でも少なくとも 10 分ごとに再読み込みされます。
+
+実運用環境の履歴（4,200 件の Run）でリプレイ検証したところ、推定値の半数が実際の実行時間の 2 倍以内に収まりました。また、長時間の Run は過小評価される傾向があります（同種の過去 Run が短時間の試行であることが多いためです）。それでもバックフィルはこの誤差を許容できます。バックフィルが判断するのは「短いジョブが、それを遅延させ得る Execution の開始可能時刻より前に終わるかどうか」だけであり、実行時間超過に伴って推定値が補正されても、待機側 Execution へのコストはわずかだからです。同じ履歴でのシミュレーションにおいて、この推定値に基づくバックフィルは実際の実行時間を使ったバックフィルと同等の完了時間を達成し、推定値なしでリソース確保のみを行う場合と比べて大幅に短い完了時間となりました。
+
+### Executor のティック処理
+
+Executor の 1 回のティック（tick）は実行時間に上限が設けられています。
+
+#### 外部呼び出しのタイムアウトと停滞検知
+
+ティック内で行われるすべての外部呼び出しにはデッドラインが設定されています。
+
+- **`nvidia-smi` の各実行**: 20 秒（`pmon` が返らない場合、その GPU 観測は失敗となります）
+- **`taskkill` の各実行**: 30 秒
+- **各 Provider 呼び出し（`observe`、`prepare`、`release`）**: 45 秒
+
+キャンセルできない呼び出しはデッドライン到達時点で打ち切られ（abandoned）、その呼び出しが返るまで同じ Provider に対する後続の呼び出しは開始されません。
+
+ティック内のステップが 30 秒間続くと、WARN レベルで `executor step stalled`（`executor_id`、`step`、`age_seconds` 付き）がログ出力され、そのステップが終了すると INFO レベルで `executor step resumed` が記録されます。また、実行に 2 秒を超えた外部コマンドは所要時間とともに INFO レベルでログ出力され、タイムアウトした場合は対象コマンドとともに WARN レベルで記録されます。
+
+#### Attempt のリソース使用量サンプリング
+
+Executor は 15 秒ごとに、自身が起動した各 Attempt のリソース使用量をサンプリングします。これは、アドミッション制御が Attempt の RAM 予約量のうち実使用分を重複計上せず 1 回だけ計上できるようにするためです（エージェント API の `attempt-usage`。書き込みバイト数も記録されますが、ディスクのアドミッション計算には影響しません。[アドミッション制御とプランニング](#アドミッション制御とプランニング) を参照）。
+
+サンプリングはティックと並行して 1 回ずつ実行され、1 回の上限は 15 秒に制限されているため、ティック処理をブロックすることはありません。RAM は Attempt のプロセス群が保持しているメモリ量、書き込みバイト数はプロセス群が書き込んだ量を表し、以前のサンプル値を下回ることはありません。
+
+- **Linux**: Attempt の `KAIRO_ATTEMPT_ID` を持つプロセスおよびランチャーの子孫プロセスを対象とし、PSS（`smaps_rollup`）の合計と、`/proc/PID/io` の `write_bytes` から `cancelled_write_bytes` を引いた値の合計を集計します。
+- **Windows**: Attempt のジョブオブジェクトに属するプロセスを対象とし、そのプライベートワーキングセットの合計およびジョブ全体の書き込みバイト数を集計します。ジョブオブジェクトがない場合は、親 PID をたどって特定したランチャーとその子孫プロセスを対象とし、生存中に書き込んだバイト数を集計します。
+
+読み取れないプロセスがある場合（他ユーザーのプロセスや `smaps_rollup` を持たないカーネルなど）、その数値は不明扱いとなり、アドミッション制御は予約量全体を計上します。エージェント再起動後に引き継がれた（adopted）Attempt はエージェント自身が起動したものと同様にサンプリングされますが、見失われた（lost）Attempt はサンプリングされません。
+
+### Attempt ログ
+
+Attempt の標準出力（stdout）と標準エラー出力（stderr）は、Executor の `log_directory` 内のファイル（`<attempt>.stdout.log`、`<attempt>.stderr.log`）として、Attempt 自身のプロセスによって書き込まれます。ノードエージェントがこれらのファイルをデーモンの `log_directory` に転送し、`task show`、`task logs`、`GET /api/attempts/{id}/log` がデーモン側のコピーを読み取ります。
+
+- **起動前の空き容量チェック**: Executor は、`log_directory` を保持するファイルシステムの空き容量が `log_min_free_mib`（デフォルト `1024`、デーモン設定およびエージェント設定の両方で設定可能）を下回っている間は Attempt を起動しません。この場合、Execution は `launch_aborted: launch failed before activation: the filesystem of the attempt log directory ... has 12.0 MiB free, below the minimum of 1.0 GiB` として終了し、`task show` および `task list` に表示されます。空き容量の計測に失敗した場合や、ログファイルを作成できない場合も同様に起動中止となります。
+- **実行中・終了時の空き容量監視**: Attempt の実行中、Executor は 15 秒ごとにこの空き容量を確認し、最小値を下回った場合（`log_space_low`）や枯渇した場合（`log_space_exhausted`: 出力が失われている状態）を各 Attempt に記録します。さらに Attempt の終了時にもう 1 度確認します。Attempt 自身のプロセスが行う書き込みの失敗は外部から直接検知できないため、ファイルシステムの空き容量を監視対象としています。
+- **ログ転送とリトライ**: エージェントは空のファイルも含めてすべてのログを転送します。デーモンが受け取れなかったログ（デーモンへ到達できない場合や、デーモン側のディスク満杯により `internal` エラーが返された場合）は、スイープのたびにデーモン側のコピーの末尾から再送されるため、ノード側のファイルに記録された内容は失われません。30 秒間デーモンに到達していないログはストリームごとに Attempt に記録され（`log_forward_failed`）、その後追いついた際も記録されます。Attempt が終了する際は、終了が記録される前にログが転送されます。
+
+発生した各問題はコーディネーションイベント（`attempt_log_problem`、`attempt_log_problem_resolved`）として記録され、`task show` では Attempt の `log issue:` 行として（API では `log_problems` として）表示されます（例: `log issue: stderr not shipped to the daemon: ... (10-27 10:01 to 10-27 10:04, caught up)`）。
+
+### 電力と消費電力量
+
+Provider はデバイスの消費電力と動作状態を読み取り時刻とともに記録します。Kairo はこれらの事実をそのまま保持するだけで、仕様値に対する良否判定は行いません。Provider は読み取り専用であり、設定を変更できるのはホストのコントローラのみです（[ハードウェア設定](#ハードウェア設定) を参照）。
+
+#### デバイス別の計測項目
+
+- **GPU**: 各 `nvidia-smi` ポーリング時に、ボード消費電力（`power.draw.average`、取得できない場合は `power.draw`）、適用中の電力制限（`enforced.power.limit`）、SM クロックとメモリクロック、P-state、アクティブなクロックイベント理由（ビットマスク: `0x1` idle、`0x4` software power cap、`0x40` hardware thermal slowdown 等）、PCIe 世代とレーン幅、メモリ使用率、ファン速度を読み取ります。さらに GPU ごとに 1 回、デフォルト・最小・最大の電力制限、最大クロック、最大 PCIe リンクを保持します。GPU が返さないフィールド（`[N/A]`、`[Not Supported]`）は省略され、エラーにはなりません。これらのフィールド名をドライバが拒否した場合は旧名称（`clocks_throttle_reasons.active`、`pcie.link.gen.current`）で問い合わせ、それでも受け付けられない場合はインベントリ情報のみを取得します。
+- **CPU パッケージ**: ノードのホスト Provider が、前回のポーリングからの平均 CPU パッケージ消費電力を読み取ります。Windows では `\Energy Meter(*)\Power` パフォーマンスカウンタ（インスタンス `rapl_package*_pkg`、管理者権限不要）、Linux では RAPL カウンタ `/sys/class/powercap/*-rapl:N/energy_uj`（カウンタの折り返しは `max_energy_range_uj` で処理）を使用します。読み取れない環境（非特権コンテナや非対応 CPU など）では、エラーを出さずサイレントに報告なしとします。読み取り処理は `internal/cpupower` に実装されています。
+
+#### 電力量の積算と保存
+
+サンプルは物理デバイス単位（GPU は UUID 単位）で保持されるため、共有 GPU の複数 Provider からの報告は 1 つの時系列にまとめられます。GPU サンプルが到着するたびに、そのデバイスの前回サンプル以降の消費電力量（2 サンプル間の消費電力の台形積分）が、その GPU を保持している Lease（どのノードの行であっても）に属する Attempt へ加算されます。積分区間は Attempt の開始時刻から、Attempt の終了・Lease 解放・Lease の `stale` 化のいずれかまでで切り出され、どの Provider が報告した場合でも 1 台の GPU は 1 回だけ計上されます。
+
+サンプルによって裏付けられない区間は積分されず、その Attempt の合計値は `partial` となります。該当するのは、前のサンプルの有効期間（`observation_ttl_seconds`、デフォルト 15 秒）を超える空白がある場合、電力値を含まないサンプルがある場合、その GPU の最初のサンプル前に実行が開始されていた場合、または Lease が `stale` になった後も実行が継続した場合です。
+
+- **表示と API**: `task show` は Attempt ごとに `energy: GPU 1.23 kWh (partial)` のように出力します。API では `energy` として `gpu_joules`、`gpu_seconds_covered`（デバイス秒、device-seconds）、`partial` を返します。
+- **動作点ポリシーによる節約量**: Attempt の GPU に動作点ポリシーの設定が適用されている間、`task show` は推定節約量も併記します（例: `energy: GPU 1.23 kWh; policy 3.0 h, saved ~120.0 Wh (estimate)`。API フィールドは `policy_seconds`、`policy_saved_joules`、`policy_unestimated_seconds`。[動作点ポリシー](#動作点ポリシー) を参照）。
+- **CPU パッケージの扱い**: CPU パッケージはノード上で動くすべての処理で共有されるため、電力データはノード単位でのみ保持されます。ホストのコントローラも毎ポーリングで同じ `internal/cpupower` を使って CPU パッケージを読み取り、ホストの時系列 `host/<host>/cpu` として報告します（Proxmox ホストではホスト自身のみが RAPL を読み取れ、コンテナからは読み取れないためです）。
+- **データベースと保持期間**: サンプルは `device_samples` テーブルおよび `device_properties` テーブル、Attempt ごとの合計は `attempt_energy` テーブルに保存されます。サンプルは 72 時間保持され（デフォルトの 5 秒ポーリング時、GPU 1 台・報告 Provider 1 つあたり 1 日約 5 MB）、合計値は各 Attempt とともに保持されます。
+
+### マシン宣言
+
+どのノードがどの GPU を保持するかは自動検出ではなく宣言によって管理します。
+
+#### ノードと GPU の宣言・移動
+
+`kairo machine apply FILE` は宣言全体を置き換えます。`[[nodes]]` テーブルに `id`（デーモンに既知のノード）と `gpus`（`nvidia-smi -L` が出力する形式の NVIDIA UUID 配列）を指定します（`examples/machines.toml` を参照）。
+
+Provider は観測のみを行います。Provider が報告した GPU がそのノードに宣言されていない場合（他ノードに宣言されている場合も、どのノードにも宣言されていない場合も）、登録もスケジューリングもされません。そのポーリング内の他の観測結果は通常通り適用され、未宣言 GPU は `kairo machine show` および `kairo resource status` に未宣言として表示されます（`--json` 指定時は `undeclared_gpus`。登録済み GPU がこの状態になった場合の `derived_state` は `undeclared` です）。
+
+GPU を別ノードへ移動するには、新しいノードにその GPU を宣言します。
+
+- 新しいノードの Provider がその GPU を報告するまで、GPU は旧ノードに登録されたままスケジューリング不可の状態を保ち、新ノードから報告された時点で所有権が移譲されます（イベント `gpu_ownership_transferred`）。
+- 宣言が変更された時点で、旧ノード側のその GPU に対するオープンな claim はクリアされます（イベント `gpu_declaration_changed`）。
+- アクティブな（live）Lease が保持している GPU の移動・削除や、未知のノードの宣言は `apply` によって拒否されます。
+- `--dry-run` を付けると適用を行わず変更内容（`+` 宣言追加、`~` 移動、`-` 削除）のみを表示します。
+- `machine show` は宣言済みの各 GPU を `observed`、`stale`、`pending`（対象ノードからまだ未報告）、または `unseen` として一覧表示します。
+
+#### 共有 GPU（SHARED）
+
+複数のノードに列挙された GPU は共有（SHARED）扱いとなり、同一ホスト上の複数ノード（同じカードが見えており、それぞれエージェントが動いているコンテナ群）がそれぞれその GPU をスケジュールできます。
+
+- 各ノードは自身専用の行（row）を登録します（最初のノードは Provider の ID、それ以外のノードは `<id>@<node>`）。
+- そのデバイスのいずれかの行に対する Lease は他の行を排他します。スケジューリング、アドミッションチェック、Lease 解放、`resource status` は、そのデバイスのすべての行の Lease および claim を合算して扱います。
+- Provider は他コンテナ内のプロセスを見ることができないため、あるノードの行が Lease されている間、他ノードが報告するプロセス不明のアクティビティ（`unattributed_activity`）の claim は Lease 保有者の処理とみなされ記録されません。一方、Lease 保有者自身の Provider は帰属不能なアクティビティを引き続き報告し、他ノード側で実際に観測できたプロセスについては Lease 保有者自身の処理でない限り `external_process` claim として維持されます（[コーディネーションモデル](#コーディネーションモデル) を参照）。
+- 優先度プリエンプションは、他ノードの行を通じてそのデバイスを保持している低優先度の victim にも適用されます。
+- あるノードの行にアクティブな Lease がある場合、`apply` はその GPU からそのノードを外す変更を拒否します。共有 GPU の変更における `from` / `to` には対象ノードがカンマ区切りで列挙されます。
+- コンテナはホストの RAM と CPU も共有しますが、Kairo はこれらをノード単位で管理するため、各コンテナのメモリ上限はホストの実メモリ内に収めてください。
+
+#### 物理ホスト宣言（`[[hosts]]`）
+
+任意の `[[hosts]]` テーブルでは物理マシンを宣言します。ここに記述するのは観測からは分からない「ポリシーと権限」のみであり、デバイスの種別・クロック・消費電力といったハードウェア特性は Provider による観測とベンチマークによる実測で取得するため宣言しません。
+
+- `id`: ホスト ID。
+- `nodes`: そのホスト上のノード一覧（コンテナ群、または物理マシン自身。1 つのノードは最大 1 つのホストに属します）。
+- `controller`: デバイス設定の変更権限を持つ `kairo controller` のノード（省略時は設定変更せず観測のみ）。
+- `max_slowdown`: 電力効率のためにデバイスが最大性能から許容できる性能低下割合。範囲は `[0, 0.5)`（省略時は `0` で、ハードウェアはデフォルト設定を維持します）。
+- `[[hosts.devices]]`: 個別デバイス（GPU UUID または `cpu`。1 デバイスにつき 1 回のみ指定可能）に対して `max_slowdown` を上書きするか、`control = false`（設定変更もベンチマークも行わない）を設定します。
+- `containers`: ホスト上のノードのうち Proxmox コンテナであるものを vmid にマッピングします（例: `containers = { pve0-neo-train = 101 }`）。Kairo がコンテナ上でデータを削除した後にホストのコントローラがトリムを実行するため（[データストア](#データストア) を参照）、`controller` が必須であり、1 つの vmid は 1 つのノードにのみ割り当てられます。
+
+ホストの対象デバイスは、そのホストに属するいずれかのノードに宣言されたすべての GPU と `cpu`（CPU パッケージ）です。ある GPU に紐づくノードが 2 つのホストにまたがる構成はエラーとなります。ホストの `nodes` と `controller` は既知のノードでなければならず（コントローラは起動時に自身のノードを登録します）、1 つのコントローラが制御できるのは 1 ホストのみです。
+
+ホスト定義は `apply` 時に全体が置き換えられます（イベント `host_declaration_changed`）。`--dry-run` では `+ host`、`~ host`（変更フィールドごとの `from -> to`）、`- host` に加え、適用により削除されるデバイス設定（`- setting`: デバイスがホストから外れた、`control = false` になった、またはホストからコントローラが外れた場合）が出力されます。`machine show` にはホスト一覧と各デバイスの有効ポリシー（デバイス個別の値、未設定ならホストの値）も表示されます。
+
+#### データストア宣言（`[[stores]]`）
+
+任意の `[[stores]]` テーブルでは、Kairo がデータを保存するストアを宣言します（[データストア](#データストア) を参照）。
+
+- `id`: 一意なストア ID。
+- `class`: `durable`（永続保持用。Kairo は保存済みデータを削除せず、未完了に終わった自身のコピーのみを削除します）または `volatile`（スクラッチ領域用）。
+- `node`: ストアが属するノード。
+- `root`: 絶対パスのルートディレクトリ（例: `E:/kairo`、`/srv/kairo`）。このルートは Kairo 専用です。
+- `filesystem`: ストアが置かれているファイルシステム（そのノードに登録されているディスクリソースの識別子と厳密に一致する値で、アドミッション計算で使われるものと同じです）。
+- `backend`: バックエンド種別（現時点では `local-fs` のみ。省略時は `local-fs`）。
+- `reserve_free_bytes`: 確保する空き容量。
+  - `durable` ストアでは維持すべき空き容量であり、これを下回るコピーは実行されません。
+  - `volatile` ストアではこれを下回るとエビクション（[データストア](#データストア) のエビクションを参照）が発動するしきい値であり、未設定時は総容量の 1/10 になります。
+  - いずれのクラスでも、pack や fetch でストアへ書き込む際にファイルシステム上に残さなければならない空き容量として機能します（未設定時は 1 GiB）。これにより、同じファイルシステム上の他のデータ（実行中 Attempt のチェックポイントやシステム領域など）がディスク満杯になるのを防ぎます。
+- `executor`（任意）: ノード上でこのストアを提供する単一の Executor（省略時はそのノードのすべての Executor が提供します）。
+
+ストアの `root` には以下の制約があります。
+
+- 同一ノード上の 2 つのストアが同じ場所を指したり、一方が他方の配下にネストしたりすることはできません（指定した `executor` の有無や組み合わせを問いません）。
+- パス比較は正規化された単一表記で行われるため（区切り文字の統一、`.` および末尾区切り文字の除去、ドライブパスでは大文字・小文字を区別しない）、`E:/data`、`e:\Data\`、`E:/./data` は同一の場所とみなされます。同じルートを `executor` あり・なしの両方で宣言することも拒否されます。
+- `root` に `..` や制御文字は含められません。POSIX ルートには空白文字やバックスラッシュを含められません。ドライブパスには Windows が別名として解釈する名前（末尾がドットまたは空白、8.3 短縮名のような `~`、`:`、その他ファイル名に使用できない文字を含むもの）を含められません。
+- エージェント側でも各ルートの実体の場所を比較します（[データストア](#データストア) を参照）。
+
+ストア定義は `apply` 時に全体が置き換えられます（`+ store`、`~ store`、`- store`。イベント `store_declaration_changed`）。ストアを宣言から外してもデータは削除されません。また、別の `root` で宣言し直した場合、旧ルートにあるデータは手付かずのまま残り、以降は使用されなくなります。データを新ルートへ引き継ぐには、新ルートの宣言に `moved_from` で現在のルートを指定してください（[データストア](#データストア) のストア移動を参照）。`machine show` にはストア一覧も表示されます。
+
+#### マシン宣言 API
+
+- **`POST /api/machines`**
+  - リクエスト: `{"nodes": [{"id", "gpus"}], "hosts": [{"id", "nodes", "controller", "max_slowdown", "devices": [{"id", "max_slowdown", "control"}]}], "stores": [{"id", "class", "node", "executor", "root", "filesystem", "backend", "reserve_free_bytes", "moved_from"}], "dry_run"}`
+  - レスポンス: `{"changes": [{"uuid", "from", "to"}], "unchanged", "host_changes": [{"host", "from", "to"}], "unchanged_hosts", "store_changes": [{"store", "from", "to"}], "unchanged_stores", "cleared_settings", "dry_run"}`
+  - Lease 中の GPU に対する競合操作は `409 machine_conflict` を返します。
+- **`GET /api/machines`**
+  - レスポンス: `{"gpus", "undeclared", "hosts", "devices", "stores"}`
+  - `devices` の各要素には `host_id`、`device_id`、`kind`、`max_slowdown`、`control`、`controller` が含まれます。
+- ストア機能より古いデーモンは `stores` を含む宣言を拒否します（`stores` が未知フィールドとなるため）。
+
+### コードスナップショット
+
+Task は宣言時点のコードで実行されます。書き換えによって失われうる git コミット名で参照するのではなく、Kairo 自身がコードを保持します。`kairo project apply` はファイル内の Task が指定する各ソースをスナップショット化してデーモンに保存するため、後から作業ツリーや git 履歴がどう変化しても影響を受けません。
 
 ```toml
 [sources.neo-ime]
-root = "."            # relative to this file's directory (default)
+root = "."            # このファイルのディレクトリからの相対パス（デフォルト）
 paths = ["src", "crates", "configs", "pyproject.toml", "uv.lock", "Cargo.toml", "Cargo.lock"]
 exclude = ["__pycache__", "*.pyc", "target", ".venv"]
 
@@ -1204,124 +879,86 @@ name = "train-x"
 # ...
 [tasks.execution]
 source = "neo-ime"
-cwd = "."             # in the snapshot
+cwd = "."             # スナップショット内の作業ディレクトリ
 argv = ["uv", "run", "python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
 ```
 
-A snapshot holds the regular files of `paths` (each a file or a directory,
-taken whole) under `root`, but those an `exclude` pattern names (one
-without a slash matches any path element, one with a slash the whole
-relative path); links and special files are not taken. It is packed as a
-data object is (a tar.zst and its file list: path, bytes, sha256 and mtime
-of each file) and named by the sha256 of its file list without the mtimes
-(`src_` and 32 hex digits): the same files make the same snapshot, made or
-sent again for nothing. The CLI sends the daemon each one it lacks (`POST
-/api/sources`, multipart: `meta`, the file list and what it was made from,
-then `pack`), which checks it (its id against its file list, the pack's
-size and sha256, each file in it against the list, nothing else in it),
-keeps it in its `source_directory` (daemon configuration, default `sources`
-beside `log_directory`) and records it (table `source_snapshots`, with the project and source name, the
-host and directory it was made from and that directory's git HEAD and
-whether it had changes: for reference only; event
-`source_snapshot_recorded`). The same snapshot sent twice at once (the same
-files with other mtimes: another pack) is kept once, the first recorded,
-and its files are never written over. The apply then binds each task it declares
-(not one declared before, whose content is immutable) to the snapshot of
-its source, for good (`orchestration_tasks.source_snapshot_id`): a later
-apply with other code binds only the tasks it declares, and a rerun runs
-the code the task was declared with. A task naming a source whose snapshot
-the apply did not send (an older kairo) is refused.
+#### スナップショットの作成・保存・バインド
 
-Each execution of the task runs in its snapshot
-(`execution_requests.source_snapshot_id`; an execution submitted through
-the API names one as `source_snapshot`). Its executor brings the snapshot to its node once
-(`GET /api/agent/sources/<id>/pack` and `/list`, checked against the size
-and sha256 recorded, each file against the list, as a brought input is),
-unpacks it under `<root>/sources/<id>` of the first volatile store it
-serves and starts the attempt there, `cwd` relative to it, with
-`KAIRO_SOURCE_DIR` and `KAIRO_SOURCE_ID` set. A file packed executable, or
-one that begins with `#!` (a snapshot made on Windows has no execute bits),
-is unpacked executable, so `./scripts/x.sh` runs on Linux. On Windows,
-entries with reserved device names that cannot be created through store
-handles are checked but skipped, with their paths logged.
+スナップショットには、`root` 配下の `paths`（各要素はファイルまたはディレクトリで、ディレクトリは丸ごと取得）に含まれる通常ファイルが格納されます。ただし `exclude` パターンに一致するものは除外されます（スラッシュを含まないパターンは任意のパス要素に一致し、スラッシュを含むパターンは相対パス全体に一致します）。リンクや特殊ファイルは取り込まれません。
 
-The unpacked snapshot is read-only: its files on every system, its
-directories too but on Windows (where that would not keep files from being
-made in them). That does not stop root on Linux, nor anything on Windows
-from adding files, so what it was made is recorded beside it
-(`<root>/sources/<id>.state`: each directory, and each file's size, mtime
-and mode), and before every launch in it the tree is checked against that
-record. One changed (a file added, removed or written) is set aside as
-`<id>.changed-<time>` (an attempt still running in it keeps it; the
-executor's log names the first paths that differ) and the snapshot is
-unpacked again, so every attempt starts in the files it was declared with.
-What is built or installed belongs outside it (a uv environment through
-`UV_PROJECT_ENVIRONMENT`, Rust through `CARGO_TARGET_DIR`, set in the
-task's env); an attempt in a snapshot gets `PYTHONDONTWRITEBYTECODE=1`
-unless its environment sets that or `PYTHONPYCACHEPREFIX`, so Python does
-not write its bytecode there. A confined attempt cannot write there at all.
+スナップショットはデータオブジェクトと同じ形式（`tar.zst` と、各ファイルのパス・バイト数・sha256・mtime を記したファイル一覧）でパックされ、mtime を除いたファイル一覧の sha256 から命名されます（`src_` に続けて 32 桁の 16 進数）。そのため、同じファイル構成であれば常に同一のスナップショット ID になり、無駄に作り直したり再送信したりすることはありません。
 
-What is unpacked does not stay for good. Every hour each executor asks the
-daemon which snapshots executions not yet terminal use (agent operation
-`sources-in-use`) and, never without that answer, removes from
-`<root>/sources` of the volatile stores it serves: an unpacked snapshot none
-of them uses that was last launched in three days ago or more (its `.state`
-first, so a tree left half removed is taken as changed), a tree set aside
-as changed an hour ago once its snapshot is not in use, a `.state` without
-its tree, and what an unpack left half done a day ago. Nothing else there is
-touched: `<root>/sources` is reached through plain directories only (a link
-on the way, or `sources` itself a link, is refused, for unpacking too), and
-a file in a removed tree is removed as it is, never made writable first (it
-may be a hard link to one elsewhere). The daemon keeps every snapshot it was
-sent: they are the record of what each task ran.
+CLI はデーモンに存在しないスナップショットだけを送信します（`POST /api/sources`、multipart 形式: ファイル一覧と作成元情報を含む `meta`、続けて `pack`）。デーモンは以下を検証します。
 
-`kairo source list [--project P]` lists snapshots (newest first: project,
-source, files, size, git state), `kairo source show ID [--files]` one with
-the tasks bound to it, and `kairo source diff A B` the files added (`+`),
-removed (`-`) and changed (`M`) from A to B (`GET /api/sources`,
-`/api/sources/<id>`).
+1. ファイル一覧とスナップショット ID の一致
+2. `pack` のサイズと sha256
+3. `pack` 内の各ファイルとファイル一覧の一致、および一覧外のファイルが含まれていないこと
 
-### Containers
+検証を通過したスナップショットは、デーモン設定の `source_directory`（デフォルトは `log_directory` と同じ階層の `sources`）に保存され、`source_snapshots` テーブルに記録されます（プロジェクト名、ソース名、作成元のホスト・ディレクトリ、そのディレクトリの git HEAD と未コミット変更の有無を記録しますが、これらは参照用情報のみです。イベント `source_snapshot_recorded`）。同一のスナップショットが同時に 2 回送信された場合（中身が同じで mtime だけ異なる別の pack の場合を含む）、先に記録された 1 つだけが保持され、既存ファイルが上書きされることはありません。
 
-A code snapshot fixes the code a task runs; what it runs on (Python and its
-packages, system libraries) is the host's, and changes under it. A task
-can instead run in a container of an image, fixed by its digest:
+その後 `apply` は、今回新たに宣言する各 Task をそのソースのスナップショットに恒久的にバインドします（`orchestration_tasks.source_snapshot_id`）。以前宣言済みの Task は内容が不変であるため対象外です。後から別コードで `apply` しても新しく宣言された Task のみに紐づき、再実行（rerun）ではその Task が宣言された当時のコードが実行されます。古い `kairo` CLI などで、`apply` 時にスナップショットが送信されなかったソースを指定した Task は拒否されます。
+
+#### ノードでの展開と改変検知
+
+Task の各 Execution はそのスナップショット内で実行されます（`execution_requests.source_snapshot_id`。API から投入する Execution では `source_snapshot` で指定します）。Executor はスナップショットを自ノードへ 1 回取得し（`GET /api/agent/sources/<id>/pack` および `/list`。取得した入力データと同様に、記録済みのサイズ・sha256 およびファイル一覧に対する各ファイルの一致を検証）、自身が提供する最初の `volatile` ストアの `<root>/sources/<id>` に展開します。Attempt はそこを基準とした相対パスを `cwd` とし、`KAIRO_SOURCE_DIR` と `KAIRO_SOURCE_ID` を設定した状態で起動されます。
+
+- 実行可能権限付きでパックされたファイル、および先頭が `#!` で始まるファイル（Windows 上で作られたスナップショットには実行ビットがないため）は実行可能ファイルとして展開されるため、Linux 上で `./scripts/x.sh` などがそのまま実行できます。
+- Windows では、ストアハンドル経由で作成できない予約済みデバイス名のエントリは検証のみ行ってスキップし、該当パスをログ出力します。
+
+展開されたスナップショットは読み取り専用に設定されます（すべての OS でファイルが読み取り専用となり、Windows 以外ではディレクトリも読み取り専用になります。Windows ではディレクトリを読み取り専用にしても中へのファイル作成を防げないためです）。ただしこれだけでは Linux の root や Windows 上でのファイル追加は防げないため、展開時の状態を隣接ファイル `<root>/sources/<id>.state`（各ディレクトリ、および各ファイルのサイズ・mtime・モード）に記録し、起動のたびに毎回ツリーと照合します。
+
+- 変更（ファイルの追加・削除・書き換え）が見つかったツリーは `<id>.changed-<time>` として退避され（その中で実行中の Attempt があっても、その Attempt は退避されたディレクトリをそのまま使い続けます。Executor のログには最初に検出された差分パスが出力されます）、スナップショットが再展開されます。これにより、すべての Attempt が必ず宣言時のファイル状態で開始されます。
+- ビルド成果物やインストール先はスナップショット外に配置してください（Task の環境変数で uv 環境は `UV_PROJECT_ENVIRONMENT`、Rust は `CARGO_TARGET_DIR` を指定します）。
+- スナップショット内で実行される Attempt には、環境変数に `PYTHONDONTWRITEBYTECODE` または `PYTHONPYCACHEPREFIX` が設定されていない限り `PYTHONDONTWRITEBYTECODE=1` が自動設定され、Python がスナップショット内にバイトコードを書き出さないようにします。
+- コンファインメントされた Attempt はスナップショット内へ一切書き込みできません。
+
+#### 展開済みスナップショットのクリーンアップと CLI
+
+展開済みスナップショットは永続的に残るわけではありません。各 Executor は 1 時間ごとにデーモンへ問い合わせ、まだ終了状態になっていない Execution が使用中のスナップショット一覧を取得します（エージェント操作 `sources-in-use`）。この応答が得られない限り削除は一切行いません。応答を得たうえで、自身が提供する `volatile` ストアの `<root>/sources` から以下を削除します。
+
+- どの非終了 Execution にも使われておらず、最後に起動されてから 3 日以上経過した展開済みスナップショット（途中まで削除されたツリーが「変更あり」と判定されるよう、まず `.state` ファイルを先に削除します）
+- 1 時間以上前に変更ありとして退避されたツリー（対象スナップショットが使用中でなくなった後）
+- 対応するツリーが存在しない `.state` ファイル
+- 1 日以上前に展開が途中で終わった残骸
+
+上記以外のものには一切触れません。`<root>/sources` へは通常のディレクトリのみを経由してアクセスし、途中の経路や `sources` 自体がリンクである場合は展開時も含め拒否されます。また、削除対象ツリー内のファイルは書き込み可能に変更せずそのまま削除します（他所へのハードリンクである可能性があるためです）。一方、デーモン自身は受信したすべてのスナップショットを各 Task の実行記録として保持し続けます。
+
+CLI および API（`GET /api/sources`、`/api/sources/<id>`）では以下を利用できます。
+
+- `kairo source list [--project P]`: スナップショット一覧を新しい順に表示（プロジェクト、ソース、ファイル数、サイズ、git 状態）
+- `kairo source show ID [--files]`: 指定スナップショットの詳細と、それにバインドされた Task 一覧を表示
+- `kairo source diff A B`: スナップショット A から B への追加（`+`）、削除（`-`）、変更（`M`）ファイルを表示
+
+### コンテナ実行
+
+コードスナップショットは Task が実行するコードを固定しますが、その土台となる実行環境（Python やパッケージ、システムライブラリ）はホスト側のものであり時間とともに変化します。代わりに Task は、ダイジェストで固定されたコンテナイメージ内で実行することもできます。
 
 ```toml
 [images.torch]
-ref = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"   # a tag, or name@sha256:...
+ref = "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime"   # タグ指定、または name@sha256:...
 
 [[tasks]]
 name = "train-x"
 # ...
 [tasks.execution]
 image = "torch"
-source = "neo-ime"     # mounted read-only at /kairo/src; cwd relative to it
+source = "neo-ime"     # /kairo/src に読み取り専用でマウントされ、cwd はそこからの相対パス
 cwd = "."
 argv = ["python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
 ```
 
-A reference is read as docker reads one (no registry: Docker Hub, where a
-one-word repository is under `library/`; no tag: `latest`). `kairo project
-apply` asks each image's registry what its reference names now (the
-registry API, anonymously, with the bearer token a registry asks for to
-pull a public image) and sends the digest with the declaration
-(`image_pins`, not part of its digest, as snapshots are not); the daemon
-binds each task it declares to that digest for good
-(`orchestration_tasks.image_ref`, `registry/repository@sha256:...`): a
-later apply, after the tag was pushed again, binds only the tasks it
-declares. Each execution records the image it runs in
-(`execution_requests.image_ref`; an execution submitted through the API
-names one as `image`, pinned) and `kairo task show` prints it (`image:`). A
-task without a source runs in the image's own files and needs an absolute
-`cwd` there.
+#### イメージの宣言とダイジェスト固定
 
-Only an executor that runs containers takes an execution in an image, and
-it takes nothing else: an executor of kind `incus` registers the attribute
-`runtime = "incus"` (a label `runtime` is refused: only the kind sets it),
-and the execution's selector carries `"container": true`, set from its
-image (never from the caller). An executor of kind `incus` runs on Linux,
-beside the node's other executors if it has some:
+イメージ参照は Docker と同じ規則で解釈されます（レジストリ省略時は Docker Hub とみなし、1 単語のリポジトリは `library/` 配下、タグ省略時は `latest`）。`kairo project apply` は各イメージのレジストリに対してその参照が現在指しているダイジェストを問い合わせ（レジストリ API を匿名で利用し、パブリックイメージの pull にレジストリが要求する bearer トークンを使用）、宣言とともに送信します（`image_pins`。スナップショットと同様に宣言自体のダイジェストには含まれません）。
+
+デーモンは今回宣言された各 Task をそのダイジェストへ恒久的にバインドします（`orchestration_tasks.image_ref`、形式は `registry/repository@sha256:...`）。後から同じタグに別イメージが push された後に再 `apply` しても、新しいダイジェストがバインドされるのは新たに宣言された Task のみです。各 Execution には実行イメージが記録され（`execution_requests.image_ref`。API 経由で Execution を投入する場合はダイジェスト固定済みのイメージを `image` として指定します）、`kairo task show` にも `image:` として出力されます。`source` を指定しない Task はイメージ自身のファイルシステム上で動作するため、絶対パスの `cwd` を指定する必要があります。
+
+#### Incus Executor の要件と設定
+
+イメージを指定した Execution を受け付けるのはコンテナ実行用 Executor のみであり、コンテナ実行用 Executor はそれ以外の Execution を受け付けません。`kind = "incus"` の Executor は属性 `runtime = "incus"` を登録し（`labels` に `runtime` を手動指定すると拒否され、`kind` のみが設定できます）、イメージを持つ Execution のセレクタにはイメージ指定に基づいて `"container": true` が自動設定されます（呼び出し元から直接設定することはできません）。
+
+`kind = "incus"` の Executor は Linux 上で動作し、ノード上の他の Executor と並存できます。
 
 ```toml
 [[executors]]
@@ -1330,908 +967,597 @@ kind = "incus"
 labels = { environment = "linux", site = "pve0" }
 ```
 
-It needs Incus 6.3 or later (OCI images; Debian 13's 6.0 LTS has none, the
-Zabbly packages do) with a storage pool and a network in its default
-profile, and, for GPUs, `nvidia-container-cli` (`libnvidia-container-tools`)
-and the driver's user-space files on the node. Inside a Proxmox LXC
-(unprivileged, `features: nesting=1,keyctl=1`) the container is privileged
-within it (`security.privileged`: the LXC has one uid map only), which keeps
-it unprivileged on the host.
+必要な環境要件は以下のとおりです。
 
-The attempt's launcher is still its shim, which runs the agent's binary as
-the runner (`__kairo-incus-run`): it makes the instance `kairo-<attempt
-id>` from the image (`incus init REMOTE:REPOSITORY@DIGEST`, adding an OCI
-remote for the registry the first time), starts it, waits for it to stop,
-reads the exit the container wrote, deletes the instance and exits with
-that exit (-1 when it wrote none). An agent restarted meanwhile adopts the
-attempt as any (Agent restarts). In the container the same binary, mounted
-read-only, runs under Incus's own init (`__kairo-container-init`): it
-confines the container as a confined host attempt is confined (everything
-read-only but what Kairo hands it, `/tmp` a directory of its scratch,
-`/proc` and `/dev/shm` writable; Admission, Confinement), starts the argv in
-a process group of its own with its directory, its output appended to the
-attempt's logs, reaps what ends in the container and writes the argv's exit
-(and, on the attempt's stderr, the signal that ended it, if one did); its
-own exit stops the container and ends whatever still runs there. A force
-stop, a quarantine or the end of what an exited attempt left running
-reaches the argv's processes directly, as it reaches a host attempt's (they
-carry `KAIRO_ATTEMPT_ID`), and nothing passes it on: neither init carries
-that id, so both stay to see the argv end (Incus's init would end the
-container before the exit is written), and so does the runner, which then
-deletes the instance; one killed with the attempt leaves it to the sweep
-below. What
-the attempt writes outside what Kairo hands it goes with the instance.
-What Kairo hands it is mounted under `/kairo`, at the same paths on every
-node, so a continuation finds its run's files where its checkpoint names
-them:
+- **Incus 6.3 以降**: OCI イメージ対応が必要です（Debian 13 の 6.0 LTS には対応がなく、Zabbly パッケージを利用する必要があります）。また、デフォルトプロファイルにストレージプールとネットワークが設定されている必要があります。
+- **GPU 利用時**: ノード上に `nvidia-container-cli`（`libnvidia-container-tools`）とドライバのユーザー空間ファイルが必要です。
+- **Proxmox LXC 内での実行**: 非特権 Proxmox LXC（`features: nesting=1,keyctl=1`）内で実行する場合、LXC 内部ではコンテナを特権扱い（`security.privileged`。LXC には UID マップが 1 つしかないため）にしますが、物理ホスト側からは引き続き非特権のまま保たれます。
 
-| path | what |
+#### コンテナの起動・終了ライフサイクルとマウント構成
+
+Attempt のランチャーはホスト実行時と同様に shim であり、エージェントのバイナリをランナー（`__kairo-incus-run`）として起動します。ランナーはイメージからインスタンス `kairo-<attempt id>` を作成し（`incus init REMOTE:REPOSITORY@DIGEST`。初回はそのレジストリ用の OCI リモートを追加）、起動して停止を待ち、コンテナが書き出した終了コードを読み取ってインスタンスを削除し、その終了コードで終了します（終了コードが書かれていなかった場合は `-1`）。実行中にエージェントが再起動しても、他の Attempt と同様に引き継がれます（[エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ) を参照）。
+
+コンテナ内では、読み取り専用でマウントされた同一のバイナリが Incus 自身の init の配下でコンテナ用 init（`__kairo-container-init`）として動作します。
+
+- コンファインメントされたホスト Attempt と同様にコンテナ内を制限します（Kairo が渡すディレクトリ以外はすべて読み取り専用、`/tmp` は scratch 配下のディレクトリ、`/proc` と `/dev/shm` は書き込み可能。[アドミッション制御とプランニング](#アドミッション制御とプランニング) のコンファインメントを参照）。
+- 指定されたディレクトリで `argv` を専用のプロセスグループとして起動し、その出力を Attempt のログへ追記します。
+- コンテナ内で終了したプロセスを回収（reap）し、`argv` の終了コードを書き出します（シグナルで終了した場合はそのシグナルも Attempt の stderr に書き出します）。
+- `__kairo-container-init` 自身が終了するとコンテナが停止し、内部に残っていたプロセスもすべて終了します。
+
+強制停止、ノード隔離、および終了済み Attempt の残留プロセス終了処理は、ホスト Attempt の場合と同様に `argv` のプロセス群へ直接届きます（`KAIRO_ATTEMPT_ID` を保持しているため）。中継・転送は行われません。Incus の init も `__kairo-container-init` も `KAIRO_ATTEMPT_ID` を持たないため、どちらも `argv` の終了を見届けるまで生存します（Incus の init が先に落とされると終了コードが書かれる前にコンテナが終了してしまいます）。ランナーも同様に生存し、終了後にインスタンスを削除します。ランナーが Attempt とともに強制終了された場合は、後述の定期スイープがインスタンスを削除します。
+
+Kairo が渡した領域以外に Attempt が書き込んだ内容はインスタンス削除とともに消えます。Kairo が渡す領域は全ノード共通で `/kairo` 配下の同一パスにマウントされるため、継続（continuation）実行時もチェックポイントに記録されたパスでそのまま前回のファイルを参照できます。
+
+| パス | 内容 |
 |---|---|
-| `/kairo/scratch` | `KAIRO_SCRATCH`, `TMPDIR`, `TMP`, `TEMP` (its `tmp/` is `/tmp`) |
+| `/kairo/scratch` | `KAIRO_SCRATCH`、`TMPDIR`、`TMP`、`TEMP`（その配下の `tmp/` が `/tmp`） |
 | `/kairo/output` | `KAIRO_OUTPUT_DIR` |
 | `/kairo/cache` | `KAIRO_CACHE_DIR` |
-| `/kairo/src` | `KAIRO_SOURCE_DIR`, the code snapshot, read-only |
-| `/kairo/inputs/<name>` | `KAIRO_INPUT_<NAME>`, read-only |
-| `/kairo/nvidia` | the node's NVIDIA driver files, with a GPU, read-only |
-| `/kairo/run`, `/kairo/log`, `/kairo/bin` | the init's spec and exit, the logs, the binary |
+| `/kairo/src` | `KAIRO_SOURCE_DIR`、コードスナップショット（読み取り専用） |
+| `/kairo/inputs/<name>` | `KAIRO_INPUT_<NAME>`（読み取り専用） |
+| `/kairo/nvidia` | ノードの NVIDIA ドライバファイル群（GPU 利用時、読み取り専用） |
+| `/kairo/run`, `/kairo/log`, `/kairo/bin` | init の spec と終了コード、ログ、バイナリ |
 
-The environment is the image's, then the declared env, then Kairo's (its
-paths those above, a path under one rewritten too: a continuation's
-`KAIRO_CONTINUATION_REF`); the agent's own does not reach the container.
-`/dev/shm` is a tmpfs of up to half the memory (PyTorch's data loader
-workers share batches through it; what is written there is memory). A
-leased GPU is handed as its device (`/dev/nvidia<minor>`, found by its
-UUID) with the control devices, and the driver's libraries and programs, as
-`nvidia-container-cli list` names them, put together once per driver
-version in `<log dir>/containers/nvidia/<version>` (linked, with their
-sonames) and mounted at `/kairo/nvidia` (`lib` first on `LD_LIBRARY_PATH`,
-`bin` last on `PATH`); `CUDA_VISIBLE_DEVICES` names it by UUID as on a
-host. Device access is not fenced in a nested container (no cgroup device
-program loads there): a GPU is the attempt's because Kairo leased it, as on
-a host. The container's processes carry `KAIRO_ATTEMPT_ID` like any
-attempt's, so its GPU processes are the attempt's, its memory is sampled
-as its, and a force stop and the end of what an exited attempt left running
-reach them. A checkpoint a container publishes names a path in it
-(`/kairo/output/...`): it is not imported (Checkpoints of running work) but
-kept by the run's snapshots, which its publication orders. Every 10
-minutes, and soon after an attempt there ends, the executor deletes the
-stopped instances of attempts no longer running there (a runner that was
-killed deleted none). Not for a gang, not
-on Windows, and no state of a running container is kept yet:
-work goes on from its own checkpoints, as on a host.
+#### 環境変数・GPU 受け渡し・制約事項
 
-### Data stores
+- **環境変数と `/dev/shm`**: コンテナの環境変数は「イメージの環境変数 → 宣言された env → Kairo の環境変数」の順に構築されます。Kairo が渡すパスはすべて上記のコンテナ内パスとなり、その配下を指すパスも書き換えられます（例: 継続時の `KAIRO_CONTINUATION_REF`）。エージェント自身の環境変数はコンテナには渡されません。`/dev/shm` はメモリの最大半分を上限とする tmpfs です（PyTorch のデータローダワーカーがバッチ共有に使用します。ここに書き込まれた分はメモリ使用量となります）。
+- **GPU の受け渡し**: Lease された GPU は UUID から特定されたデバイスノード（`/dev/nvidia<minor>`）および制御デバイスとしてコンテナに渡されます。ドライバのライブラリとプログラム群は `nvidia-container-cli list` が列挙するものをドライババージョンごとに 1 回 `<log dir>/containers/nvidia/<version>` にまとめて配置し（soname 付きでリンク）、`/kairo/nvidia` にマウントします（`lib` を `LD_LIBRARY_PATH` の先頭に、`bin` を `PATH` の末尾に追加）。`CUDA_VISIBLE_DEVICES` にはホスト実行時と同様に UUID が設定されます。なお、ネストされたコンテナ内では cgroup のデバイスプログラムを読み込めないためデバイスアクセス自体はフェンスされません。ホスト実行時と同様、その GPU が Attempt の所有物であるのは Kairo が Lease していることに基づきます。
+- **プロセス帰属・チェックポイント・後始末**: コンテナ内のプロセスも他の Attempt と同様に `KAIRO_ATTEMPT_ID` を持つため、GPU プロセスの帰属、メモリ使用量のサンプリング、強制停止、終了済み Attempt の残留プロセス終了処理がいずれも機能します。コンテナが公開するチェックポイントはコンテナ内パス（`/kairo/output/...`）を指すためインポートは行われず（[実行中ジョブのチェックポイント保護](#実行中ジョブのチェックポイント保護) を参照）、チェックポイント公開が指示する Run スナップショットによって保持されます。また、Executor は 10 分ごと、およびコンテナ上の Attempt 終了直後に、もはやそこで実行されていない Attempt の停止済みインスタンスを削除します（ランナーが強制終了された場合はランナーによる削除が行われないためです）。
+- **現時点の制約**: Gang 実行および Windows には未対応であり、実行中コンテナの状態そのものを保持する機能もまだありません。処理の継続はホスト実行時と同様に、ジョブ自身のチェックポイントから再開します。
 
-A store (`[[stores]]`, Machine declaration) is a place Kairo keeps data in:
-durable ones keep what is put there for good, volatile ones are scratch
-space. Kairo touches only what is its own there: what it made under the
-store's root (and, from P1b on, what it has verified copies of on a durable
-store). Anything else on the filesystem is counted, never moved, changed or
-deleted, and nothing outside the root is ever walked.
+### データストア
 
-Every enabled executor serves the stores of its node: those naming it as
-`executor`, and those naming none.
-It asks the daemon for its node's stores when it starts and every 5 minutes
-(agent operation `stores`), makes each volatile store's root that is missing
-(never a durable store's: one missing may be a disk not mounted, and what
-Kairo wrote there would be on another; it is unusable until it is there), and
-checks that
-no component of the root's path is a link (a symlink, a junction or any
-other reparse point; on Windows the path the opened root resolves to, with
-its drive, must be the declared root, so no substituted drive or short 8.3
-name either; on Linux the root must be its own real path) and that
-the root is on the declared filesystem (Windows: the root's drive, which must
-be NTFS or exFAT; Linux: the same device as the filesystem, which must be a
-mount point in `/proc/self/mountinfo` (a disk not mounted leaves a plain
-directory there)). The root is opened, and a missing one made, one
-directory at a time from its volume's root, each through its parent's handle
-and checked to be the plain directory looked at, so nothing is made or
-reached through a link, not even one put there meanwhile. On
-Linux a volatile store whose root is, on disk, where another store this
-executor serves has its root, or inside or around it (a bind mount, which
-the declared paths cannot show; compared by device and path within the
-filesystem, from `/proc/self/mountinfo`), is not used either.
-A store that fails is not used and is reported unusable with the reason.
-Every 5 minutes, in the background, the executor reports each store
-(`store-observation`, with the root as it last read the declaration; a report
-of a root the store is no longer declared at is refused, and two reports of
-one store are written one after the other): the filesystem's total and free
-bytes and each Kairo scratch directory under the root (one whose marker names
-it) with its size: an attempt still running there is measured at every
-report, any other once per agent process (a kept scratch when it is kept),
-never through a link or into a mount point, each directory read 1024 entries
-at a time. A report that read the whole `<root>/scratch` marks a recorded
-scratch at that root it did not find `missing` (bytes 0, listed by
-`kairo store status`, never taken as deleted: Kairo did not delete it) until
-it is found again; a directory there whose marker cannot be read now (its
-mode, say) is not taken as missing. The executor samples filesystem usage
-last, after scanning scratch and outputs.
+ストア（[マシン宣言](#マシン宣言) の `[[stores]]`）は、Kairo がデータを保存する領域です。durable store は格納されたデータを恒久的に保持し、volatile store は一時作業領域（scratch space）として機能します。
 
-`kairo store status [--json]` (`GET /api/stores`, `{"stores": [...]}`) shows
-each store: class, node (and executor), `state` (`unknown`: never reported,
-no agent serves it or one older than stores; `ready`; `unusable`, with the
-`problem`; `stale`: no report for 15 minutes; `moving`: being moved, see
-below; `undeclared`: no longer declared but still holding kept scratch), the
-filesystem's total and free,
-Kairo's bytes by class (`scratch_active_bytes`, `scratch_kept_bytes`,
-`output_bytes` with the number of `outputs`, the run output directories as
-the last report found them, shown as `OUTPUTS`, `pack_bytes` with the number
-of `packs` made there and not removed yet (with their source, or with a source
-kept), shown as `PACKS`, `copy_bytes`
-with the number of verified `copies` on a durable store, shown as `COPIES`,
-`pinned_bytes`, 0 for now, and `cache_bytes`, the inputs brought there) and
-`external_bytes`, what the filesystem uses that Kairo does not know (used
-minus Kairo's classes), then the kept scratch of each store and the
-`damaged` copies of each durable store. The latest
-report of a store is the table `store_observations`. An agent older than
-stores leaves its stores `unknown`; a daemon older than stores answers the
-agent's `stores` with 404, and the agent runs without stores (warned once).
+ストア内で Kairo が操作対象とするのは自身が管理するデータのみであり、具体的にはストアのルート配下に自身で作成したもの（および P1b 以降は、durable store 上に検証済みコピーが存在するもの）に限られます。同一ファイルシステム上にあるそれ以外のデータは使用量の集計対象にはなりますが、移動・変更・削除されることは一切なく、ルート外の領域が走査されることもありません。
 
-Moving a store: a store declared at another root with `moved_from` naming
-the root it is at (`root = "D:/_kairo-volatile"`, `moved_from =
-"D:/kairo-store"`; nothing else of it changed, one drive or filesystem) is
-being moved, by a rename: nothing is copied. Until it is over, every record
-of it (scratch, run outputs, objects and their packs, copies, objects
-brought there or fetched from it) stays at the old root, so nothing reads,
-writes or deletes there or at the new one; an execution naming the store
-waits (`store_moving`) and one admitted just before is not launched (its
-reservation is released and it waits); its root cannot change again; and
-the node is told what still uses it where it is: executions using it (naming
-it, or with their scratch there) that hold a lease, running, starting or
-lost and not reconciled (their processes may still write there), scratch
-being deleted, objects being packed, deleted, evicted or packed for
-transfer there, copies being made there, objects being brought there or
-evicted, or fetched from it. Once nothing does, the executor serving it
-writes the marker `.kairo-store-move` (the store, both roots) into the old
-root and renames it to the new one, which must not be there yet (the parent
-must; Windows refuses the rename while anything there is open, and it is
-tried again at the next refresh); a new root that is there already without
-that marker is not taken for the store. Meanwhile the store is unusable
-(`kairo store status`: `moving`, with what it waits for). Its next report
-says it moved, and the daemon rebases every record of it onto the new root
-(paths in their own separators) in one transaction (event `store_moved`);
-the executor then removes the marker. `moved_from` left in the declaration
-once moved says nothing more, so the same file applies again unchanged.
-An agent older than this does not move a store: deploy the agents first.
+#### ストアの認識・検証・監視
 
-Scratch: an attempt launched by an executor that serves a usable volatile
-store (the first by id when there are several) gets a scratch directory
-there, `<root>/scratch/<attempt id>`, holding the marker file
-`.kairo-scratch` (the attempt id), made before the process starts and named
-by `KAIRO_SCRATCH`. It is recorded at the daemon (`attempt-scratch`, table
-`attempt_scratch`: attempt, store, root, path, `active`/`deleting`/`kept`/
-`deleted`/`missing`, bytes, reason; events `scratch_created`, then
-`scratch_deleted` or `scratch_kept`) while the attempt is still authorized,
-and only on a volatile store of the attempt's node in its executor's
-namespace, at the store's root spelled as declared, at exactly
-`<root>/scratch/<attempt id>` (an absolute path) and inside no other store of
-the node (compared as Machine declaration spells roots); if it cannot be made
-or recorded, the attempt starts without it (one made but not recorded is
-removed if it holds only its marker). `TMPDIR`,
-`TMP` and `TEMP` are left alone unless the task sets `scratch_tmpdir = true` in
-`[tasks.execution]` (or the execution TOML): then they name the scratch,
-over a declared env. Off by default, since a temporary directory emptied
-with every attempt loses caches such as torch's compile cache. It needs no
-SDK: the executor makes and settles it.
+有効化された各 Executor は、自ノードに属するストアのうち、`executor` として自身を指定しているもの、および `executor` が未指定のものを担当します。Executor は起動時および 5 分ごとにデーモンへ自ノードのストア一覧を問い合わせます（エージェント操作 `stores`）。
 
-Cache directories: every attempt launched by an executor that serves a
-usable volatile store also gets its project's cache directory on the store
-its scratch is made on, `<root>/cache/<project scope id>` (marker
-`.kairo-cache` naming the project), named by `KAIRO_CACHE_DIR`: what
-attempts of a project keep for one another on that node (compiled kernels,
-package caches; point `XDG_CACHE_HOME`, `TORCHINDUCTOR_CACHE_DIR`,
-`TRITON_CACHE_DIR`, `UV_CACHE_DIR`, `HF_HOME` or `CUDA_CACHE_PATH` there).
-Kairo does not delete it, nor count it yet (it shows as external bytes).
-A confined attempt (Admission, Confinement) may write it.
+ルートディレクトリが存在しない volatile store については、Executor が自動的にルートを作成します。一方、durable store のルートは決して自動作成しません。ルートが存在しない場合はディスクが未マウントである可能性があり、そのまま作成して書き込むと別のディスク上にデータが書かれてしまうためです。durable store は、ルートが実際に存在するようになるまで利用不可（`unusable`）として扱われます。
 
-Output directories: what a run is to keep goes in its output directory,
-`<root>/outputs/<run id>` on the store its scratch is made on, holding the
-marker `.kairo-output` (the run id) and named by `KAIRO_OUTPUT_DIR`. A run is
-an execution with the continuations that follow it: a Task's execution that is
-not a continuation (its initial execution, a rerun, or a restart after a node
-quarantine or a gang's failed launch) and its continuations (the run id is
-that execution's id), or a direct execution; a gang rank other than 0 has
-`<leader's run>-rank<r>`. Every attempt of the run launched on that store gets
-the same directory: the first makes it, a continuation finds what the run
-wrote there before (its checkpoint), and a rerun or another Task writes
-somewhere else, so one run never trips over another's files. A continuation
-placed on another node gets a directory of its own there (bringing the
-earlier one comes with P1c). It is recorded at the daemon (`run-output`,
-table `run_outputs`: run, store, root, path, `active`/`missing`, the last
-attempt that got it, bytes; events `output_created`, then `output_reused` for
-each later attempt) under the scratch's rules: only for an attempt about to
-launch in that run, on a volatile store of its node in its executor's
-namespace, at exactly `<root>/outputs/<run id>`; if it cannot be made or
-recorded, the attempt starts without it (a directory made but not recorded is
-left as it is and counted; one refused for good, its run's directory packed
-already, is removed again if it holds only its marker). Reports measure each output directory (at every
-report while an attempt of its run runs on that executor, else once per agent
-process), and one a whole scan no longer finds is `missing` until found
-again. Once its run has ended it is packed, copied to a durable store and
-then deleted (below); from its packing on, the daemon records no more
-attempts on it (what they wrote would be deleted without a copy), and one
-deleted is not counted again. A daemon older than output directories gives no run,
-and the attempt gets none.
+Executor は各ストアについて、以下の条件を検証します。
 
-Packing: what Kairo keeps is packed where it was written, once nothing writes
-there any more. A run's output directory is due once the run has ended (its
-Task is no longer pending or running, or a rerun of it has started; a direct
-execution once terminal; a gang rank's with its leader's) and the last
-attempt that got it has quiesced; a failed attempt's kept scratch once the
-attempt has quiesced (a lost attempt's waits until it is reconciled, since
-its processes may still write). A run suspended with a checkpoint has not
-ended: its continuation is to come. Each becomes a data object (table
-`data_objects`, `packing` then `packed`; events `pack_ordered`, `packed`),
-packed once, only while the declaration still makes the path that directory
-(an object ordered before its store moved is not handed out again until the
-declaration makes it so once more), by the executor that made it (`packs-to-make` every minute, `record-pack`)
-into `<root>/packs/<object id>.tar.zst` (tar, PAX format, compressed with
-zstd) with its file list `<object id>.tar.zst.files.tsv`: a header line
-`path`, `bytes`, `sha256`, `mtime_ns`, then such a line per regular file
-(the fields separated by tabs),
-sorted by its path (relative, `/`-separated; a backslash, tab, CR or LF in it
-written `\\`, `\t`, `\r`, `\n`), the format neo-ime's own packs on the durable
-store use. Directories are packed with their mode and mtime; links, special
-files and mount points are skipped (counted, never followed or entered), and
-the marker is left out. Windows reserved device names such as `aux` are
-packed by their literal names through directory handles, without following
-reparse points. The directory is reached as the store's rules say: the
-executor derives it from the root, the object's kind and its id (never a path
-it is sent), opens it one directory at a time through handles and checks its
-marker names it; a file must be the one listed, keep its size and mtime
-while it is read and hold no more than its size, else the round fails and is
-tried again; a name that is not UTF-8 is refused (the list could not name
-it). The list is sorted by the raw path. Both files are written under a
-`.partial` name, synced and renamed (the list first), the renames synced (the
-directory on Linux, each file on Windows), and then both are read back from
-disk around the cache: only a pack that reads back as written is recorded,
-so a pack that is there is whole, and a round cut short starts the object
-again. A source an attempt this executor launched still runs in waits. An
-object that fails is tried again at the next round, then after twice as long
-each time (from a minute) up to an hour; this holds for copies, deletions
-and read-backs too. An object whose
-directory is bigger than the store's free space waits.
-`kairo store status` shows the packs made on each store as `PACKS`
-(`pack_bytes`, `packs`); until they are moved they are Kairo's bytes there.
+- **パス上にリンクを含まないこと**: ルートパスのどの構成要素もリンク（シンボリックリンク、ジャンクション、その他のリパースポイント）であってはなりません。
+  - **Windows**: 開いたルートが解決されるパス（ドライブ文字を含む）が宣言されたルートと一致する必要があり、代替ドライブ（`subst` ドライブ）や短い 8.3 形式の名前も許可されません。
+  - **Linux**: ルート自体がその実パス（real path）と一致する必要があります。
+- **宣言されたファイルシステム上にあること**:
+  - **Windows**: ルートのドライブが NTFS または exFAT である必要があります。
+  - **Linux**: 宣言されたファイルシステムと同一デバイス上にあり、かつそのファイルシステムが `/proc/self/mountinfo` 上のマウントポイントである必要があります（未マウントのディスクでは単なる通常ディレクトリが残るためです）。
+- **ハンドル経由の安全な逐次検証**: ルートを開く際（および存在しないルートを作成する際）は、ボリュームのルートから 1 ディレクトリずつ親のハンドル経由でたどり、対象の通常ディレクトリであることを都度確認します。これにより、途中でリンクが差し込まれた場合であっても、リンク経由でディレクトリが作成・到達されることはありません。
+- **Linux における volatile store の重複・包含禁止**: Linux では、この Executor が担当する他のストアのルートとディスク上で同一の位置にある、あるいはその内側・外側にある（包含関係にある）volatile store も使用されません。宣言上のパスだけでは判別できないバインドマウントを含め、`/proc/self/mountinfo` から得たデバイスとファイルシステム内パスで比較されます。
 
-Copies to a durable store: each packed object is copied to the first durable
-store by id on the node its pack is on, else the first by id elsewhere (read
-through the pack's agent), not being moved nor naming an executor that is
-gone or disabled, with room
-for it (its free bytes as last reported, less its `reserve_free_bytes` and
-the packs of the copies being made there or verified there since that
-report, plus the packs shed since it; one never reported is taken as having
-room), then to every other durable store as a replica, so losing one
-store (a disk deleted or failed), or a whole host, loses nothing Kairo
-keeps: once an object has a verified copy, each other durable store an
-executor serves that has none of it takes one as it has room, smallest
-objects first, up to 50 at a time, read from a durable copy on that
-executor's node (its pack may be gone), else from one on another node
-through the pack server of the agent that made that copy (its `pack_addr`;
-the token, for that copy, is good only on that copy's node:
-`object_copies.source_*`). An object nowhere
-durable yet always goes before any replica, and the executor asks again after
-each copy, so none waits behind a long one. Each copy is taken by one
-executor serving its store (`copies-to-make` every
-minute, `record-copy`; table `object_copies`, `copying` then `verified`;
-events `copy_ordered`, `copy_verified`). A copy taken for a store the
-declaration no longer makes durable at that root, or that its executor no
-longer serves, is given up at its executor's next round and taken again for
-the store declared now. It is written to
-`<root>/objects/<YYYYMM>/<object id>.tar.zst` with its file list beside it
-(the month the object was made), and its description,
-`<object id>.tar.zst.object.json` (`format` `kairo object 1`: the object,
-its kind and lifecycle, project, name, the task whose run made it, what was
-packed and where, on which node and store, its size and sha256s, when it was
-made and packed): what the copy is, readable without the daemon (`kairo
-store catalogue ROOT` lists a durable store's copies from their descriptions
-alone). A copy made before descriptions is described afterwards (the same
-round hands out up to 200 describe-only orders a time; `record-described`,
-`object_copies.described_at`).
-A durable store more than 1 GiB under its `reserve_free_bytes` (its free
-bytes as last reported, less the copies being made there or verified there
-since, plus the copies shed there since: the report is minutes old) sheds
-copies: its executor is ordered (`Shed` in `copies-to-make`) to remove
-copies there of objects that keep at least two verified, undamaged copies on
-other durable stores, the biggest first, up to 50 at a time and only as many
-as cover the shortfall; never a copy a replica or a fetch is reading. Each is
-claimed first by an executor serving the store (`claim-shed`: other copies
-and active readers are checked again before the record goes; event
-`copy_shed`), then its pack, file list and description are removed. Replicas
-leave at least 1 GiB free above the reserve and do not return to a store
-that shed the same object in the last 24 hours.
-The directory of a durable store is what it holds, whatever the records say:
-every hour each executor serving one on its own filesystems lists it (each
-`<root>/objects/<YYYYMM>/<object id>.tar.zst` with its file list beside it;
-partial files left out; a root not there is not listed, so an unmounted disk
-is no empty store) and reports the listing (`inventory-durable`). A copy the
-records lack there (a database restored from an older control snapshot, the
-copy made after it) is adopted from its description (`adopt-copies`, 200 a
-time, event `copy_adopted`): the object recorded as described, `packed`, its
-source settled `kept` ("adopted from durable store ..."), the copy
-`verified`; a description that is not Kairo's, of a temporal object, or of a
-copy differing from the object recorded is refused (the agent's log says
-why). A verified copy recorded there before the listing began and not in it
-is marked damaged (`check_problem`, event `copy_damaged`), as a failed
-read-back would mark it; a listing with nothing in it, or without most of the
-verified copies recorded there, is not believed and changes nothing.
-When the pack is on a store that executor
-serves (the same node, its namespace), it is read there through handles;
-otherwise it is fetched from the agent of the pack's node, at the address its
-executor advertises (`pack_addr`, Agent configuration), over HTTPS trusting
-the daemon's CA, with a token the daemon issued for that copy (`GET
-/packs/<object id>.tar.zst` and `.files.tsv`, `Authorization: Bearer`). That
-agent asks the daemon about each request (`pack-read`): only the copy's
-latest token, unexpired (12 hours, a round's longest), from the node whose
-executor made the pack, gets it; anything else is 403 or 404 and learns
-nothing. A fetch cut short is resumed with a range request, a `.partial`
-pack already as long as the pack is not fetched again, a body longer than the
-pack fails, and a fetch that receives nothing for 5 minutes is given up (the
-client bounds the connection, handshake and answer's head too; the server
-closes idle connections and warns of a refused request once a minute per
-object). Both files are written as `.partial` and synced, then read back from
-disk around the cache (Windows: `FILE_FLAG_NO_BUFFERING`, the file opened by
-its path checked to be the one in the directory opened; Linux: the file's
-cached pages dropped first, best effort: a filesystem with a cache of its own,
-ZFS's ARC, may still answer from memory), and only if the pack's size and
-sha256 and the list's sha256 match are they renamed (the list first), the
-renames synced, and the copy recorded `verified`, which the daemon checks
-again, once the files under their final names are the ones read back (where
-a rename gives a file another id, as exFAT does, they are read back again
-under their final names and must match). A copy
-that does not match has its files removed and is fetched again later: its
-`.partial` files, or, renamed but not recorded (an order is only for a copy
-not recorded), its final ones. These, Kairo's own writes never recorded, are
-the only thing it ever deletes on a durable store. One renamed but not
-recorded that matches is recorded as it is.
+検証に失敗したストアは使用されず、その理由とともに利用不可（`unusable`）として報告されます。
 
-Deleting what was copied: once an object's copy is verified, the executor
-that packed it deletes its source, the run's output directory or the kept
-scratch, and the pack and file list made of it (`deletions-to-make` every
-minute, `settle-deletion`; events `source_deleted`, `source_kept`), by the
-scratch's rules below (the directory derived from the root, its kind and its
-id, its marker naming it, nothing reached through a link), and only while the
-declaration still makes the directory Kairo's. Before anything goes, the
-source is checked against the pack's file list: each regular file there must
-be listed with the size and mtime it was packed with (stat'ed through its
-handle), and nothing else may be there but directories: a file written or
-added since, a link, a special file or a mount point (none of which the pack
-holds) keeps the source, with why, and its pack is removed all the same (the
-copy holds it). On Windows a reserved device name directly in the source
-also keeps it if the name cannot be removed through its directory handle
-without deleting the marker first. Files listed but gone are no matter (a
-deletion cut short removed them). A source an attempt this executor launched
-still runs in waits. A marker that cannot be read now (denied, in use, an I/O error) or a
-directory replaced while it was opened is a failure tried again, not a
-reason to keep. It first claims the deletion
-(`deleting`, taken only while there is a verified copy that no read-back has
-found damaged, on a store the declaration still makes durable at that root,
-and the declaration makes the source Kairo's); until it is settled `deleted`, or `kept` when the deletion is
-refused for safety (with why; it is not tried again), `kairo machine apply`
-refuses a declaration under which the directory would not be Kairo's. A
-deleted output directory or scratch is marked `deleted` and no longer counted.
+Executor は 5 分ごとにバックグラウンドで各ストアの状態を報告します（エージェント操作 `store-observation`）。報告には直近で読み取った宣言上のルートが付与され、すでにそのルートで宣言されていないストアの報告は拒否されます。また、同一ストアに対する 2 つの報告は直列に（1 つずつ順番に）書き込まれます。報告内容と走査ルールは以下のとおりです。
 
-Temporal data: what can be made again need not take room on a durable
-store, which keeps what cannot. A data object is `durable` (the default:
-packed, copied to a durable store, as below) or `temporal` (column
-`lifecycle`): the output of a run of a task declared `regenerable`
-(Admission), or a directory imported with `--regenerable-by TASK` (a task
-of the project declared regenerable; not with `--delete-source`), whose
-task is kept as the one that makes it (`producer_task_scope_id`). A temporal
-object is not packed and not copied: its executor makes only its identity,
-the file list a pack of it would have (`identity` in `packs-to-make`; every
-file read, nothing written but `<root>/packs/<object id>.tar.zst.files.tsv`),
-recorded with the list itself, which the store keeps (`manifest`; event
-`identified`). The directory stays where it is, on its volatile store, and
-is read in place by the executions that name it as an input; it is not
-deleted once copied (it is not copied), but it is evicted when its store
-runs short of room (Evicting, below). `kairo data list` shows each object's
-`LIFECYCLE`.
+- **報告項目**: ファイルシステムの総容量と空き容量（バイト数）、およびルート配下にある各 Kairo scratch ディレクトリ（自身のマーカーが自身を指しているもの）とそのサイズ。
+- **測定頻度と走査方式**: まだ実行中の Attempt が使用している scratch ディレクトリは毎回の報告で測定され、それ以外はエージェントプロセスごとに 1 回測定されます（保持された scratch は保持時に測定されます）。走査時にリンクをたどったりマウントポイントに入ったりすることはなく、各ディレクトリは 1024 エントリずつ読み込まれます。
+- **`missing` の判定**: `<root>/scratch` 全体の読み取りを完了した報告において、そのルートに記録されているのに見つからなかった scratch は、再び見つかるまで `missing`（バイト数 `0`、`kairo store status` に一覧表示）としてマークされます。Kairo 自身が削除したわけではないため、削除済みとはみなされません。なお、そこに存在するディレクトリのマーカーが現在読み取れない場合（パーミッション等によるもの）は、`missing` とはみなされません。
+- **サンプリング順序**: Executor は scratch と output のスキャンを完了した後、最後にファイルシステム使用量をサンプリングします。
 
-Brought between nodes: an execution waiting on a node for temporal data that
-is on another node (its directory still there) has it brought, not made
-again. The executor holding it packs it for the move (`transfer_state`
-`packing`, the pack order's `transfer`; event `transfer_ordered`): the pack's
-file list must be its identity's, or it is removed and not recorded (the
-directory changed since it was identified: it is not brought). Packed
-(`packed`, with the pack's path, size and sha256; event `transfer_packed`),
-it is brought as a durable object is (Brought inputs, below), from the agent
-of the node that packed it: it is not copied to a durable store. Once no
-execution waits for it on a node lacking it and none is being brought, the
-pack is removed (`dropping`, the order's `drop`; its identity's file list
-stays; event `transfer_dropped`). Meanwhile its directory is not evicted. The
-waiting execution says where it is in that (`being packed on N to be brought
-to M`, `being brought to M from N`).
+#### ストア状態の表示（`kairo store status`）
 
-Made again: an execution waiting on a node for an input that is temporal
-data on no node (evicted wherever it was) has it made again there
-by the task that makes it, once that task has succeeded: the task is rerun
-(rerun request `regenerate:<object id>`, actor `kairo`; event
-`regeneration_ordered`), its execution planned onto that node, and the
-object keeps the rerun's ordinal (`regeneration_ordinal`); it is ordered
-once per object. Only where the task can run: when no enabled executor of
-that node has the executor labels of the task's latest execution (a dataset
-built from files one machine alone holds, read on another), nothing is
-ordered and its readers wait saying so (temporal data is not brought between
-nodes: make such data a durable output, which is). A task pending or running is waited for; one failed,
-stopped, cancelled or blocked is the project's to rerun (the wait says so):
-nothing is retried. Each output a run of the task leaves is compared, once
-identified, with the objects of the task that are evicted or ordered made
-again: its file list against theirs (each file's path, size and sha256, not
-its mtime). One that holds the same files is the object made again
-(`regenerated_as`; it takes the object's name; event `regenerated`): every
-input naming the object, or its name, reads it in the object's place (and
-keeps it from eviction while it waits). The output of a run ordered to make
-an object again that differs leaves the object a problem
-(`regeneration_problem`; event `regeneration_differs`): its readers wait,
-saying how it differs, until a later run (rerun by hand) makes the same
-files, or they are changed to read the task's output instead (an input
-`task = "T"` reads the task's latest run whatever it holds). `kairo data list`
-shows an object made again (`made again as obj_...`) and the problem.
+`kairo store status [--json]`（`GET /api/stores`、レスポンス形式 `{"stores": [...]}`）は、各ストアの種別（class）、ノード（および Executor）、状態（`state`）、ファイルシステムの総容量と空き容量、Kairo による種別ごとの使用量、および外部使用量を表示し、続けて各ストアの保持中（kept）の scratch と、各 durable store の `damaged` コピーを表示します。各ストアの最新報告は `store_observations` テーブルに保存されます。
 
-Importing existing data: `kairo data import --project P --node N [--name
-NAME] [--delete-source | --regenerable-by TASK] PATH...` (`POST /api/data/imports`, `{"project",
-"node", "paths", "name", "delete_source", "regenerable_by"}`, answered `201 {"objects": [...]}`
-with each object's id, name, path, store and executor) brings directories
-Kairo did not make under it, data written before the stores were declared or
-outside them. Each PATH becomes a data object of kind `import` of the
-project (`source_id` the object itself; event `import_ordered`), named NAME
-(with several paths `NAME/<the directory's name>`; without NAME the
-directory's name). It is packed by an executor of the node onto a volatile
-store it serves: the one on the directory's filesystem
-(the store whose declared `filesystem` holds the path, the longest such:
-`F:` for `F:/models`, `/srv/models` for `/srv/models/qwen`), else the first
-by id; like an output directory, the directory opened one directory at a time from
-its volume's root through handles (no link on its path; links, special files
-and mount points inside are skipped, counted), once the store has the room
-for what it holds; then it is copied to a durable store and read back like
-every object. A path must be absolute, in the namespace of that store (a
-drive path on a Windows store, a POSIX one on a Linux store), one spelling of
-one place (as a root), not a filesystem's root, inside no store of the node
-and holding none (but for a durable store's intake: a path strictly inside
-`<root>/intake` of a durable store may be imported, and deleted once copied
-with `--delete-source`; what is put there to be kept is inside a durable
-store, which nothing else deletes, until Kairo has it as objects), and not
-inside, at or around a directory being imported on
-the node (still to be packed, or copied and not yet deleted or kept); a store
-later declared over it stops its packing and deletion, and a declaration
-under which a directory being deleted would no longer be outside every store
-is refused like one under a scratch being deleted. The directory is not
-Kairo's: it is only read. Without `--delete-source` it stays where it is:
-once copied only the pack goes, and the source is settled `kept` ("imported
-without delete_source"); the same directory imported again by the project
-with `--delete-source` before that (its import still `present`) turns that
-import into one that deletes it, nothing packed again (event
-`import_delete_source`), while one settled since is packed again. With it, once its copy is verified, the executor
-claims the deletion and checks the directory as a source is checked (each
-regular file listed in the pack with its size and mtime, nothing else there
-but directories) and to be on the filesystem of the store it was packed on
-(the same drive on Windows, where a drive path given to be deleted must be
-the store's drive; the same device elsewhere, so never a mount or another
-disk, and never a durable store), then removes it through its parent's
-handle (the directory itself a plain one; a link under it removed itself,
-never followed), then the pack, and the node is trimmed as after every
-deletion. A directory that changed since it was packed is kept, with why,
-and its pack goes all the same. A file written between that check and the
-removal is lost with it: import directories nothing writes in any more.
-From Git Bash a POSIX path is rewritten into Git's own directory before
-the CLI sees it (`/srv/x` becomes `C:/Program Files/Git/srv/x`): the CLI
-refuses one that looks so; run it with `MSYS_NO_PATHCONV=1`.
-A PATH may also be a regular file (a published checkpoint: Checkpoints of
-running work): it is packed alone, under its name, opened through its
-directory, and recorded as a file (`source_file`; the pack says so), which
-is never read in place as an input (Admission, Inputs). One packed before
-packs said so is recorded as a file by the executor that finds its source
-is one: when it checks the paths read in place on its node (`in-place-sources`,
-agent operation `input-is-file`, event `input_is_file`), or at a launch
-that would read it, which then ends `launch_aborted` saying to rerun. An
-import whose path is gone while its volume is there (a disk
-that is not mounted is not a deleted source) is `abandoned` (event
-`import_abandoned`): nothing packs it any more and its source is settled
-`kept` with why, so the path can be imported again. `kairo data cancel
-OBJECT...` (`POST /api/data/objects/{id}/cancel`) abandons imports not
-packed yet the same way; a pack already being made when it is cancelled is
-still recorded when it is done, and copied.
-An imported directory may still be written (a collector's): a file of it
-written within the last hour is packed from a copy made beside the pack,
-copied again (up to five times, a second apart) until a copy is read with
-nothing written to the file meanwhile, and otherwise taken as last read (a
-prefix of what an appended file becomes; counted as `changing` in the
-agent's log); a file gone between listing and reading is left out (counted
-skipped). An older file written while it is read fails that pack as an
-output's would; at the next round it is a recent one. A file packed as it
-changed no longer matches the pack's list, so `--delete-source` keeps the
-directory.
-`kairo data list [--project P] [--kind output|scratch|import] [--task NAME]
-[--execution ID] [--limit N] [--json]` (`GET /api/data/objects`, `{"objects": [...]}`,
-newest first, 200 by default) shows each object: kind, project, name, node,
-`packing`, `packed` or `abandoned`, files, content and pack bytes, verified
-copies (and the path of one), and what became of its source (`present`,
-`deleting`, `deleted`, `kept`, `evicting`, `evicted`, with why).
-`--task` (`task` in the query) selects outputs of all runs of the named task;
-use `--project` to narrow that name to one project. `--execution` (`execution`
-in the query) selects outputs of the run that execution belongs to, even
-for a continuation. A gang leader includes its ranks' outputs. These
-filters also apply with `--json`.
+**ストアの状態（`state`）**
 
-#### Run snapshots
+| 状態 | 説明 |
+|---|---|
+| `unknown` | 一度も報告がない、担当するエージェントがいない、またはストア機能より古いバージョンのエージェントが動作している |
+| `ready` | 正常に利用可能 |
+| `unusable` | 利用不可（原因を示す `problem` を併記） |
+| `stale` | 15 分間報告がない |
+| `moving` | ストアを移動中（後述） |
+| `undeclared` | 宣言から削除されたが、保持中の scratch がまだ残っている |
 
-Whatever a run Kairo launched writes is Kairo's to keep from the moment it is
-written, not only once the run has ended (with `[data] confine_from` every
-attempt writes only where Kairo hands it: Admission, Confinement). While a
-run has not ended, its output directory is packed again and again, each time
-only the files changed since the run's previous snapshot (the first, every
-file): a data object of kind `run-snapshot`, source `<run id>~<n>`
-(`data_objects.snapshot_since`), packed by its executor (files written
-within the last hour from copies, as an import's are), copied to the
-durable stores and replicated like any object. One is ordered every
-`[data] run_snapshot_interval` (daemon configuration, a Go duration;
-default `"30m"`, `"0"` never) while its latest attempt runs, and as soon as
-that attempt publishes a checkpoint (a checkpoint command or a suspend
-acknowledged `checkpointed`) after the previous snapshot; one at a time per
-run (event `pack_ordered` with `reason` `periodic` or `checkpoint`). The
-directory itself stays the run's: a snapshot never deletes it (once copied
-only its pack goes, the source settled `kept`), and the run's output object
-is packed whole when the run ends. A checkpoint published as a path inside a
-store (the run's output directory) is kept by these snapshots rather than
-imported. Restoring a run's output as of a snapshot is unpacking its
-snapshots in order (a file deleted meanwhile is still in the earlier ones).
+**使用量の内訳**
 
-#### Checkpoints of running work
+| フィールド / 表示項目 | 説明 |
+|---|---|
+| `scratch_active_bytes` | 実行中 Attempt の scratch 使用量 |
+| `scratch_kept_bytes` | 保持されている scratch の使用量 |
+| `output_bytes` / `outputs`（`OUTPUTS` 表示） | 最新報告で確認された Run output ディレクトリの合計バイト数と件数 |
+| `pack_bytes` / `packs`（`PACKS` 表示） | そのストア上で作成され未削除の pack（ソースが存在するもの、または保持されているソースに紐づくもの）の合計バイト数と件数 |
+| `copy_bytes` / `copies`（`COPIES` 表示） | durable store 上の検証済みコピーの合計バイト数と件数 |
+| `pinned_bytes` | 現時点では `0` |
+| `cache_bytes` | そのストアに持ち込まれた入力データのサイズ |
+| `external_bytes` | ファイルシステム全体の使用量から Kairo の上記各クラス合計を差し引いた値（Kairo の管理外データ） |
 
-A run's output directory is kept once the run has ended; the work of a run
-still going is kept through its checkpoints. When an attempt publishes a
-checkpoint (it acknowledges a suspend or a checkpoint command `checkpointed`
-with a `continuation_ref`) whose reference is an absolute path of its node
-(`D:\ckpt\run\step_200.pt`, `/srv/ckpt/run`; not a URI, not a UNC path), a
-file or a directory outside every store, the daemon imports it into the
-attempt's project as `checkpoints/<task>/<the path's last component>` (the
-task left out when the name would pass 200 characters), packed and copied to
-the durable stores like any import, the path only read and left where it is.
-A path is imported once (a repeated acknowledgement imports nothing again);
-one whose import was abandoned is imported anew. A checkpoint that cannot be
-imported (inside a store, overlapping an import) is logged and left; the acknowledgement stands whatever
-becomes of it.
+後方互換性として、ストア機能より古いバージョンのエージェントが動作している場合、そのストアは `unknown` のままになります。逆にデーモン側がストア機能より古い場合は、エージェントの `stores` 要求に HTTP `404` を返し、エージェントは（1 度だけ警告を出したうえで）ストアなしで動作します。
 
-So that long work has checkpoints to keep, the daemon asks for them: every
-minute, each running checkpointable attempt that started at least
-`[data] checkpoint_interval` ago (daemon configuration, a Go duration;
-default `"2h"`, `"0"` never) and has had no checkpoint command in that time,
-nor any command in flight (a suspend included), gets a checkpoint command
-(origin `data_protection`, event `checkpoint_requested` with actor `kairo`),
-as `kairo task checkpoint` would make one: the attempt answers it at its next
-safe point and carries on. Only attempts of a project that has published a
-checkpoint that is a path before (any of its commands acknowledged
-`checkpointed` with one) are asked: what a worker does for a checkpoint is
-its own, and one serving a model may stop its server and name that by a URI,
-which keeps nothing. An attempt that does not take checkpoint commands
-leaves it pending, and is asked nothing more meanwhile.
+#### ストアの移動（`moved_from`）
 
-An input read in place whose path is not there when its attempt is to start
-(deleted from outside Kairo: its volume is there, the path is not) aborts
-that launch, and the executor reports it (`input-gone`, event
-`input_gone`): an imported source is settled `deleted` ("gone from its
-path"), a run's output directory `missing`, a brought copy forgotten. The
-record no longer offers that place, so a rerun waits for the object to be
-brought from a durable copy (below). Every executor also checks, at each
-inventory round (at its start and hourly), every path of its node the records
-offer for reading in place (`in-place-sources`) and reports those gone the
-same way, so a path deleted meanwhile is mostly known before a launch needs
-it.
+ストアの宣言において、現在のルートを `moved_from` に指定したうえで新しいルートを宣言すると（例: `root = "D:/_kairo-volatile"`、`moved_from = "D:/kairo-store"`。他の属性は変更せず、同一ドライブまたは同一ファイルシステム内であること）、ストアはコピーではなくリネームによって移動されます。
 
-Brought inputs: an input not on the node an execution waits on is brought
-there once it is a packed object (a fetch, ordered as the daemon reconciles
-tasks, for each input an execution waiting on a node lacks there; or by
-`kairo data fetch --project P --node N [--data NAME]... [OBJECT...] [--wait [--timeout D]]`,
-`POST /api/data/fetches`, `{"project", "node", "data", "objects"}`). Without
-`--wait`, the command returns as soon as it has asked for the fetch. With
-`--wait`, it checks the placement on that node every 2 s
-(`GET /api/data/objects/{id}/placement?node=N`) and prints `OBJECT: PATH`
-once the object is unpacked. It exits non-zero if the fetch cannot finish
-(for example, no placement was ordered or the pack is gone). Executors
-retry recoverable errors. `--timeout` limits the wait (exit 2 on timeout;
-0 or omitted means no limit) without cancelling the fetch.
+移動が完了するまでの間、システムは以下のように動作します。
 
-The object is brought to the volatile store of the node, among those an
-executor of the node serves, with the most room for its pack and
-unpacked tree (its free bytes as last reported, less its `reserve_free_bytes`,
-at least 1 GiB, and the pack and tree sizes of pending fetches there; the
-first by id among equals),
-by that executor: the volatile stores of a node are one pool, none preferred
-for its id; a fetch not ready an hour after it was ordered, on a store without
-room for it, moves to the other such store with the most room, if one has
-room for it (event `fetch_moved`: an
-execution waiting on an input that never fits would wait for good) (table
-`object_placements`: `fetching`, then `ready` with its bytes; events
-`fetch_ordered`, `fetched`; agent operations `fetches-to-make` every minute,
-`record-fetch`): the object's pack is read from a verified durable copy (a
-copy found damaged is not), or, while its source is not yet settled, from
-the pack where it was made, on a store this executor serves (through
-handles) before another node's agent (its `[packs]` server, with a token the
-daemon issued for that fetch, valid 12 hours, that only the agent of the
-node holding that copy or pack may honour; a durable copy is served from
-`<root>/objects/<month>`), into `<root>/inputs/<object id>.tar.zst.partial`
-with its file list (resumed with a range request when cut short), checked
-against the pack's size and sha256 and the list's sha256, and unpacked into
-`<root>/inputs/<object id>.partial`: only directories and regular files at
-relative paths inside it (written through a handle on it, so nothing
-escapes), each file's size and sha256 checked against the list, every listed
-file there, and the mtime set as packed for files written. On Windows only,
-paths with reserved device names that cannot be created through store
-handles are checked but skipped, with their paths logged. Then it is renamed
-`<root>/inputs/<object id>`, the pack and list are removed and it is
-recorded ready. The executor checks room for the rest of the pack and the
-unpacked tree. An already unpacked tree needs no more room to be recorded.
-A fetch that fails is warned once and tried again later.
-What is brought stays, read in place by every later execution on that node
-that names it, and is counted as the store's `CACHE` bytes, until it is
-evicted.
+- **既存レコードの固定と I/O 停止**: ストアに紐づくすべてのレコード（scratch、Run output、データオブジェクトとその pack、コピー、そのストアに持ち込まれたオブジェクトやそこから取得されるオブジェクト）は旧ルートにとどまり、旧ルート・新ルートのいずれに対しても読み取り・書き込み・削除は行われません。
+- **実行の待機**: そのストアを指定している Execution は待機状態（`store_moving`）になります。直前にアドミッションされた Execution も起動されず、予約が解放されて待機に戻ります。また、移動完了までルートを再度変更することはできません。
+- **使用中リソースの通知**: ストアは移動中 `unusable` 扱いとなり、`kairo store status` には `moving` と待機対象が表示されます。ノード側には、旧ルートでまだストアを使用している以下の要素が通知されます。
+  - そのストアを使用している（ストアを指定している、またはそこに scratch を持つ）Execution のうち、Lease を保持しており、実行中・起動中・ロストして未リコンサイル状態にあるもの（プロセスがまだ書き込んでいる可能性があるため）
+  - 削除中の scratch
+  - そのストア上でパッキング中・削除中・エビクト中、または転送用パッキング中のオブジェクト
+  - そのストア上で作成中のコピー
+  - そのストアへ持ち込み中・エビクト中、またはそこから取得中のオブジェクト
 
-Evicting: a volatile store whose free space, as its executor last reported
-it, is below its floor (its declared `reserve_free_bytes`, else a tenth of
-its total) has things evicted until it would be back above it (agent
-operations `evictions-to-make` every minute, `settle-eviction`; events
-`eviction_ordered`, `evicted`, `eviction_kept`). Both claimed evictions and
-bytes evicted since that report count toward covering the shortfall. Only
-what can be had again is evicted: what was brought there first (it can be
-brought again from its durable copy), then temporal data on it of that
-executor (it can be made again by its task), each least recently used first
-(the later of when it was made, or brought there, and when an attempt was
-last handed it as an input, `data_objects.last_used_at`), and never one a
-pending or running task, or an execution not yet ended, names as an input.
-Each is claimed first
-(placement `evicting`, or source `evicting`: not read in place nor handed to
-an attempt from then on, and a declaration under which it would no longer be
-Kairo's is refused), then deleted by the executor: a brought object's
-`<root>/inputs/<object id>` through the inputs directory's handle; a
-temporal run output directory by the store's rules, as a copied source is
-deleted, unless an attempt this executor launched still runs in it; a
-temporal imported directory through its parent's handle, on the store's
-filesystem; a temporal directory only while it holds just what its identity
-lists (each regular file listed, with the size and mtime it was identified
-with, nothing else but directories), then its identity's file list. It is
-settled `evicted` (a placement forgotten, so the object may be brought
-again; a temporal run output directory marked `deleted`), and the node is
-trimmed as after a deletion; one refused for safety (changed since it was
-identified, in use, not Kairo's) is settled kept, present again with why,
-and not ordered evicted again for an hour; one that failed otherwise stays
-claimed and is tried again. A temporal object evicted is gone until its task
-is run again (Temporal data). An imported temporal directory is evicted like
-Kairo's own: import with `--regenerable-by` only what its task really makes
-again.
+使用中の要素がすべてなくなると、担当 Executor は旧ルート内にマーカー `.kairo-store-move`（ストア名および新旧両ルートを記録）を書き込み、旧ルートを新ルートへリネームします。リネーム先の新ルートは未存在である必要があります（親ディレクトリは存在している必要があります）。Windows ではディレクトリ内のファイルが開かれている間はリネームが拒否されるため、次回のリフレッシュ時に再試行されます。なお、このマーカーを持たずにすでに存在している新ルートは、そのストアとしては認識されません。
 
-Reading durable copies back: a durable store keeps for good and may lose bits
-without saying so (exFAT has no journal), so an executor serving it reads
-each verified copy back in full, around the cache (`scrubs-to-make` every 10
-minutes, `record-scrub`), once `[data] scrub_interval` (daemon configuration,
-a Go duration, default `168h`) has passed since it was last read or verified,
-oldest first, at most `scrub_bytes_per_day` bytes a store a day (default 200
-GiB; one copy bigger than that is read on its own once a day). One that is
-gone, cannot be read whole, or no longer matches its pack's size and sha256
-is marked damaged (event `copy_damaged`) and listed by `kairo store status`
-under "damaged copies"; nothing is deleted or copied over it. A store whose
-objects directory is not there at all (a drive away) is left for later.
+次の報告で Executor が移動完了を伝えると、デーモンは 1 つのトランザクション内でストアに関する全レコードを新ルートへリベースします（各パスはその固有の区切り文字のまま変換されます。イベント `store_moved`）。その後、Executor はマーカーを削除します。
 
-Trimming containers: what is deleted inside a Proxmox container goes back to
-the host's thin pool only once it is trimmed. A deletion on a node asks for
-it (table `node_trims`, with the bytes deleted since the last trim); the
-controller of a host whose `containers` lists that node trims it
-(`trims-to-make` every 5 minutes, `pct fstrim <vmid>` with an hour's
-timeout, one container at a time, in the background so device settings are
-kept meanwhile; `record-trim`; events `node_trimmed`, `node_trim_failed`), at
-most once an hour per container: a trim is ordered no sooner than an hour
-after the last order or failure, covers what was deleted before its order (a
-deletion after it asks again), and one that fails is ordered again an hour
-later. A node that is no listed container is not trimmed.
+移動完了後に宣言ファイルへ `moved_from` を残したままにしてもそれ以上の効果はないため、同じ宣言ファイルを変更せずに再適用できます。なお、ストア移動機能より古いバージョンのエージェントは移動を実行しないため、先にエージェントをデプロイする必要があります。
 
-Once the attempt has quiesced, or was lost, its executor settles the scratch
-(`scratch-to-settle` every 10 seconds, with an `action` for each:
-`delete`, `keep` or `leave`; `settle-scratch`): after a success (exit 0
-without a signal, or a suspend that published its checkpoint) it is
-deleted; after a failure (another exit, a signal, a launch that never ran)
-it is kept, empty or not; a lost attempt's (also once reconciled) is kept as
-it is, since its processes may still be writing. Only success deletes, and
-only while the declaration still makes the recorded path the scratch
-directory of that volatile store: once the store is dropped, moved (its root
-spelled otherwise included), made durable or another store of the node holds
-the path, the scratch is left untouched (`leave`: kept, not even measured).
-Before deleting, the executor claims the scratch (`settle-scratch` with state
-`deleting`, taken only while it is to be deleted); from then until it is
-settled `deleted` (taken only once claimed), or `kept` when the deletion is
-refused for safety, `kairo machine apply` refuses a declaration under which
-it would not be deleted (409 `machine_conflict`, naming the scratch and its
-executor), so the declaration cannot change under a deletion. A claimed
-scratch stays to be deleted, also after an agent restart; if its executor
-never comes back, the conflict stays until the row is settled by hand. An
-observe-only daemon gives agents no stores (`stores` answers an empty list)
-and no scratch to settle, so they make no root and no scratch and delete
-nothing.
-Kept scratch is listed by `kairo store status` with its task, size and
-reason until it is packed, copied to a durable store and deleted (above); a
-lost attempt's waits for its reconciliation. Deleting is done by the executor
-itself, never by `os.RemoveAll` or `rm -rf` on a path it was given: the path
-must be exactly the recorded `<root>/scratch/<attempt id>` of an absolute
-root (anything else is refused), the root's path may hold no link, neither
-`<root>/scratch` nor the scratch directory may be a link, `<root>/scratch`
-may not be a mount point and none may be at or under the scratch directory
-(Linux, from `/proc/self/mountinfo`, bind mounts included), and its marker
-must name the attempt. Nothing is reached through a path: the root is opened
-one directory at a time from its volume's root, every operation below it goes
-through `os.Root` handles (`openat`-style on Linux, handle-relative on
-Windows), each directory opened must be the same file as the one checked
-(both identified through handles), and `os.Root.RemoveAll` removes a
-symlink, junction or other reparse point itself, never what it points at,
-entry by entry, the marker last, so a deletion cut short is resumed. Files
-are deleted without changing their attributes (a hard link to a file outside
-is unlinked, the file left as it was): on Windows this needs NTFS, where Go
-deletes ignoring the read-only attribute (elsewhere it clears it first, on
-the file a hard link shares), or exFAT, which has no hard links (nor
-reparse points), so the attribute cleared can only be the deleted file's;
-hence the filesystem check. Only a directory a task
-made unwritable (the scratch directory itself or one under it) is made
-writable again, on Linux, through an `O_PATH|O_NOFOLLOW|O_DIRECTORY` handle
-that can only be that directory, so a file put in its place keeps its mode.
-The marker is created exclusively in the directory just made, never opened,
-and read without blocking (a FIFO in its place does not hang the agent), so
-nothing put there meanwhile is written through. A deletion refused for any of
-these reasons keeps the scratch with the reason; one that failed otherwise (a
-file in use) is tried again. A daemon older than stores never gets scratch
-from a newer agent (it answers `stores` with 404, and the agent then neither
-makes scratch nor asks for any to settle).
+#### `scratch` ディレクトリ
 
-#### The data lifecycle
+利用可能な volatile store を担当する Executor が Attempt を起動すると、そのストア（複数ある場合は ID が先頭のストア）上に scratch ディレクトリ `<root>/scratch/<attempt id>` が割り当てられます。このディレクトリはプロセスの起動前に作成され、Attempt ID を記したマーカーファイル `.kairo-scratch` が置かれ、環境変数 `KAIRO_SCRATCH` でプロセスに渡されます。
 
-The records above change state only as this table says
-(`internal/store/lifecycle.go`). The place that makes each change checks it
-there first, so a change the machine does not have fails, saying so. "-" is
-a record not there: made from it, or removed to it.
+scratch ディレクトリは、Attempt がまだ認可されている間、デーモンへ記録されます（エージェント操作 `attempt-scratch`、`attempt_scratch` テーブルに attempt・store・root・path・状態 `active`/`deleting`/`kept`/`deleted`/`missing`・bytes・reason を記録。イベントは `scratch_created`、続いて `scratch_deleted` または `scratch_kept`）。デーモンが記録を受け入れるのは、以下の条件をすべて満たす場合に限られます。
 
-| record | from | to |
+- その Attempt が属するノードの volatile store であり、かつ担当 Executor の名前空間内にあること
+- ストアのルートが宣言どおりの表記であること
+- パスが厳密に絶対パス `<root>/scratch/<attempt id>` であること
+- 同一ノード上の他のどのストアの内側にも含まれないこと（[マシン宣言](#マシン宣言) のルート表記ルールで比較）
+
+ディレクトリを作成または記録できない場合、Attempt は scratch ディレクトリなしで起動します（ディレクトリは作成されたものの記録できなかった場合、マーカーしか入っていなければ削除されます）。
+
+環境変数 `TMPDIR`、`TMP`、`TEMP` はデフォルトでは変更されません。`[tasks.execution]`（または Execution TOML）で `scratch_tmpdir = true` を設定した場合にのみ、宣言された環境変数設定より優先してこれらの変数が scratch ディレクトリを指すようになります。デフォルトで無効になっているのは、Attempt ごとに空になる一時ディレクトリを使うと、`torch` のコンパイルキャッシュなどのキャッシュが毎回失われてしまうためです。scratch ディレクトリの作成と後処理は Executor が自動的に行うため、Worker SDK は不要です。
+
+#### `cache` ディレクトリ
+
+利用可能な volatile store を担当する Executor が起動するすべての Attempt には、scratch が作成されるストアと同じストア上に、そのプロジェクト専用のキャッシュディレクトリ `<root>/cache/<project scope id>`（プロジェクト名を記したマーカー `.kairo-cache` を格納）も割り当てられ、環境変数 `KAIRO_CACHE_DIR` で渡されます。
+
+このディレクトリは、同一ノード上でプロジェクト内の Attempt 同士が共有して保持するデータ（コンパイル済みカーネルやパッケージキャッシュなど）のための場所であり、`XDG_CACHE_HOME`、`TORCHINDUCTOR_CACHE_DIR`、`TRITON_CACHE_DIR`、`UV_CACHE_DIR`、`HF_HOME`、`CUDA_CACHE_PATH` などの指定先として利用できます。
+
+Kairo はこのディレクトリを削除せず、現時点では専用クラスとしての集計も行いません（`external_bytes` として表示されます）。コンファインメントされた Attempt（[アドミッション制御とプランニング](#アドミッション制御とプランニング) のコンファインメント参照）もこのディレクトリへ書き込むことができます。
+
+#### `output` ディレクトリ
+
+Run が保持すべき出力データは、scratch が作成されるストアと同じストア上の output ディレクトリ `<root>/outputs/<run id>` に保存されます。このディレクトリには Run ID を記したマーカーファイル `.kairo-output` が置かれ、環境変数 `KAIRO_OUTPUT_DIR` で渡されます。
+
+ここで **Run** とは、ある Execution とそれに続く継続（continuation）のまとまりを指します。具体的には、継続ではない Task の Execution（初回実行、rerun、ノード隔離や Gang 起動失敗後の再スタート）とそれに連なる継続群（Run ID は起点となる Execution の ID）、あるいは直接実行（direct execution）が 1 つの Run になります。Gang の rank 0 以外の rank では、Run ID は `<leader's run>-rank<r>` となります。
+
+そのストア上で起動される同一 Run のすべての Attempt には同じディレクトリが割り当てられます。最初の Attempt がディレクトリを作成し、継続（continuation）は前の Attempt がそこに書き込んだ内容（チェックポイントなど）をそのまま見つけることができます。一方、再実行（rerun）や別 Task には別のディレクトリが割り当てられるため、ある Run のファイルが別の Run と衝突することはありません。別ノードに配置された継続には、そのノード側で独自のディレクトリが割り当てられます（以前のノードのディレクトリを持ち込む機能は P1c で対応されます）。
+
+output ディレクトリはデーモンへ記録されます（エージェント操作 `run-output`、`run_outputs` テーブルに run・store・root・path・状態 `active`/`missing`・最後に割り当てられた Attempt・bytes を記録。イベントは初回が `output_created`、以降の各 Attempt が `output_reused`）。記録時の検証ルールは scratch と同様で、その Run で起動しようとしている Attempt のためであること、自ノードの volatile store かつ担当 Executor の名前空間内であること、厳密に `<root>/outputs/<run id>` である必要があります。作成または記録できない場合、Attempt は output ディレクトリなしで起動します。ディレクトリは作成されたものの記録できなかった場合はそのまま残されて集計対象となり、すでにその Run のディレクトリがパッキング済みであるなどの理由で恒久的に拒否された場合は、マーカーしか入っていなければ再び削除されます。
+
+ストア報告では各 output ディレクトリも測定されます（その Run の Attempt がその Executor 上で実行中であれば毎回の報告で測定、それ以外はエージェントプロセスごとに 1 回測定）。全体スキャンで見つからなくなったものは、再び見つかるまで `missing` としてマークされます。
+
+Run が終了すると、output ディレクトリはパッキングされ、durable store へコピーされた後に削除されます（後述）。パッキング開始以降、デーモンはそのディレクトリに対する新規 Attempt の記録を行わなくなります（書き込まれた内容がコピーされないまま削除されてしまうためです）。また、削除されたディレクトリは以降の集計対象外になります。なお、output ディレクトリ機能より古いバージョンのデーモンは Run を割り当てないため、Attempt にも output ディレクトリは渡されません。
+
+#### パッキング（Packing）
+
+Kairo が保持するデータは、書き込みが完全に止まった後に、データが書かれたそのストア上でパッキングされます。パッキング対象となるタイミングは以下のとおりです。
+
+- **Run の output ディレクトリ**: Run が終了し（Task が `pending` でも `running` でもなくなったか、その Task の再実行が始まった時点。直接実行では終端状態に達した時点。Gang の各 rank は leader と同時）、かつ最後にそのディレクトリを受け取った Attempt が `quiesced`（静止）した時点。なお、チェックポイントで一時中断された Run には後続の継続があるため、まだ終了したとはみなされません。
+- **失敗した Attempt の保持中 scratch**: その Attempt が `quiesced` した時点（ロストした Attempt は、プロセスがまだ書き込んでいる可能性があるため、リコンサイルが完了するまで待機します）。
+
+パッキング対象はそれぞれ 1 つのデータオブジェクトとして管理されます（`data_objects` テーブルで `packing` から `packed` へ遷移。イベントは `pack_ordered`、`packed`）。パッキングは 1 度だけ実行され、現在のストア宣言が依然としてそのパスを該当ディレクトリとして指している間にのみ実施されます（ストア移動前に指示されたオブジェクトは、宣言が再びそのパスを指すようになるまで再配布されません）。実行はディレクトリを作成した Executor が担当し、1 分ごとに `packs-to-make` で対象を取得して完了後に `record-pack` で記録します。
+
+パッキングでは、以下の 2 つのファイルが `<root>/packs/` 配下に生成されます（これは `neo-ime` 自身が durable store 上で使用する pack と同一の形式です）。
+
+- **アーカイブ本体**: `<root>/packs/<object id>.tar.zst`（PAX 形式の tar を zstd で圧縮）
+- **ファイル一覧**: `<root>/packs/<object id>.tar.zst.files.tsv`
+  - 先頭行はタブ区切りのヘッダ `path`、`bytes`、`sha256`、`mtime_ns` とし、以降に通常ファイルごとに 1 行ずつタブ区切りで出力します。
+  - パスは `/` 区切りの相対パスで、パス内のバックスラッシュ・タブ・CR・LF はそれぞれ `\\`、`\t`、`\r`、`\n` にエスケープされます。
+  - 一覧は生のパス（raw path）順でソートされます。
+
+アーカイブに含めるエントリの扱いと、走査・検証のルールは以下のとおりです。
+
+- **エントリの扱い**: ディレクトリはモード（パーミッション）と mtime を保持してパックされます。リンク、特殊ファイル、マウントポイントはスキップされます（件数はカウントされますが、追跡・進入は行いません）。マーカーファイルはアーカイブから除外されます。Windows の予約デバイス名（`aux` など）は、リパースポイントをたどらずディレクトリハンドル経由で文字どおりの名前（literal name）のままパックされます。
+- **安全な到達と整合性チェック**: 対象ディレクトリはストアのルールに従ってアクセスされます。Executor は送信されたパスをそのまま使わず、ストアのルート・オブジェクト種別・ID から対象ディレクトリを導出し、ハンドル経由で 1 ディレクトリずつ開いてマーカーが自身を指していることを確認します。各ファイルは一覧取得時のファイルと同一であり、読み取り中にサイズと mtime が変化せず、かつ宣言サイズを超えるデータを含んでいてはなりません。これに反する場合はそのラウンドが失敗となり再試行されます。また、UTF-8 ではないファイル名は一覧に記述できないため拒否されます。
+- **書き込み・同期・リードバック検証**: 2 つのファイルはいずれも `.partial` の仮名で書き出され、ディスク同期のうえリネームされます（ファイル一覧を先にリネーム）。リネーム自体もディスク同期（Linux ではディレクトリ、Windows では各ファイル）された後、両ファイルともキャッシュをバイパスしてディスクから直接リードバックされます。書き込んだ内容と一致するリードバックが確認された pack だけがデーモンへ記録されるため、記録済みの pack は完全であることが保証され、途中で中断されたラウンドは最初からやり直されます。
+- **待機条件とリトライ間隔**: この Executor が起動した Attempt がまだ実行中のソースディレクトリ、およびディレクトリサイズがストアの空き容量を上回るオブジェクトは待機します。失敗したオブジェクトは次回ラウンドで再試行され、その後は 1 分を起点に毎回 2 倍ずつ間隔を延ばし、最大 1 時間までバックオフして再試行されます（このバックオフ規則はコピー、削除、リードバックにも同様に適用されます）。
+
+`kairo store status` では各ストア上で作成された pack が `PACKS`（`pack_bytes`、`packs`）として表示され、それらが移動されるまではそのストア上で Kairo が使用するバイト数として計上されます。
+
+#### Durable Store へのコピーとレプリケーション
+
+##### 初回コピーとレプリカ配置
+
+pack 済みの各オブジェクトは、まず pack が存在するノード上の durable store のうち ID 順で最初のものへコピーされます。そのノード上に条件を満たす durable store がない場合は、他ノード上の ID 順で最初の durable store へコピーされます（この場合は pack 側ノードのエージェント経由で読み取ります）。
+
+コピー先として選ばれる durable store は、以下の条件をすべて満たしている必要があります。
+
+- 移動中ではないこと
+- 消滅済みまたは無効化された Executor を指定していないこと
+- オブジェクトを収める空き容量があること（最後に報告された空きバイト数から `reserve_free_bytes` と、その報告以降にそのストアで作成中または検証済みとなったコピーの pack サイズを差し引き、その報告以降にシェッドされた pack サイズを加えた値で判定。一度も報告されていないストアは空き容量ありとみなす）
+
+初回コピーの完了後は、他のすべての durable store へレプリカとしてコピーされます。これにより、1 つのストア（ディスクの削除や故障）あるいはホスト全体を失っても、Kairo が保持するデータは一切失われません。
+
+- **レプリカの取得ルール**: オブジェクトに検証済み（`verified`）コピーが 1 つできると、いずれかの Executor が担当している他の各 durable store のうち、まだそのオブジェクトを持たないものが、空き容量のある限りコピーを取得します。サイズの小さいオブジェクトから順に、1 回につき最大 50 件まで処理します。
+- **レプリカの読み取り元**: まずその Executor のノード上にある durable コピー（元の pack はすでに削除されている場合があります）から読み取り、なければ別ノード上の durable コピーから、そのコピーを作成したエージェントの pack サーバ（その `pack_addr`）経由で読み取ります。そのコピー用に発行されたトークンは、そのコピーが存在するノードでのみ有効です（`object_copies.source_*`）。
+- **優先順位と順次問い合わせ**: まだどの durable store にも存在しないオブジェクトは、常にどのレプリカよりも優先されます。また Executor はコピーを 1 件終えるたびに次のオーダーを再度問い合わせるため、優先度の高いコピーが長時間のコピーの後ろで待たされることはありません。
+- **実行主体と記録**: 各コピーは対象ストアを担当する 1 つの Executor が引き受けます（毎分の `copies-to-make`、`record-copy`、テーブル `object_copies`、状態は `copying` から `verified`、イベント `copy_ordered`・`copy_verified`）。マシン宣言の変更によりそのルートで durable store ではなくなったストア、またはその Executor が担当しなくなったストア向けに引き受けたコピーは、次回ラウンドで放棄され、現在の宣言におけるストア向けに再度引き受けられます。
+
+コピーは以下のファイル構成で書き込まれます（`<YYYYMM>` はオブジェクトの作成月です）。
+
+- pack 本体: `<root>/objects/<YYYYMM>/<object id>.tar.zst`
+- ファイル一覧: pack と同じディレクトリに配置
+- 説明ファイル（description）: `<object id>.tar.zst.object.json`（`format` は `kairo object 1`）。オブジェクト自体、種別（kind）、ライフサイクル（lifecycle）、プロジェクト、名前、生成元の Run に属する Task、何をどこで pack したか、どのノード・どのストア上か、サイズと sha256 群、作成時刻および pack 時刻を記録します。
+
+この説明ファイルにより、デーモンなしでもコピーの内容を読み取れます（`kairo store catalogue ROOT` は説明ファイルのみから durable store のコピー一覧を表示します）。説明ファイル導入以前に作成されたコピーには後から説明ファイルが付与されます（同じラウンドで 1 回につき最大 200 件の説明作成専用オーダーを配布し、`record-described` および `object_copies.described_at` で記録します）。
+
+##### 空き容量不足時のシェッド（Shed）
+
+durable store の実質的な空き容量（最後に報告された空きバイト数から、その報告以降にそこで作成中または検証済みとなったコピーのサイズを差し引き、その報告以降にそこでシェッドされたコピーのサイズを加えた値。報告には数分の遅延があるためこの補正を行います）が `reserve_free_bytes` を 1 GiB 超下回ると、コピーのシェッドが行われます。
+
+- 対象ストアの Executor に対し、`copies-to-make` の `Shed` でコピー削除が指示されます。
+- シェッド対象は、他の durable store 上に検証済みかつ破損していない（undamaged）コピーを少なくとも 2 つ保持しているオブジェクトのコピーに限られます。
+- サイズの大きいものから順に、1 回につき最大 50 件まで、不足分を補うのに必要な件数のみ削除します。レプリカ作成やフェッチで読み取り中のコピーは決してシェッドされません。
+- 各削除では、まずそのストアを担当する Executor がシェッドを claim します（`claim-shed`: レコードを削除する前に他コピーの存在とアクティブな読み取り処理を再度検証し、イベント `copy_shed` を記録）。その後、pack・ファイル一覧・説明ファイルを削除します。
+- レプリカ作成時は `reserve_free_bytes` の上に少なくとも 1 GiB の空きを残します。また、過去 24 時間以内に同じオブジェクトをシェッドしたストアにはレプリカを戻しません。
+
+##### Durable Store の定期インベントリと採用・破損検知
+
+レコードの記述にかかわらず、durable store のディレクトリ上の実体がそのストアの保持内容とみなされます。
+
+- **定期一覧化**: 毎時、自身のファイルシステム上で durable store を担当する各 Executor がディレクトリを一覧化し（`<root>/objects/<YYYYMM>/<object id>.tar.zst` とその隣のファイル一覧。`.partial` ファイルは除外。ルートが存在しない場合は一覧化しないため、アンマウントされたディスクを空のストアと誤認しません）、結果を報告します（`inventory-durable`）。
+- **未記録コピーの採用（Adopt）**: 古いコントロールスナップショットからデータベースを復元し、そのスナップショット以降に作られたコピーがレコードに欠けている場合など、レコード側に存在しないコピーは説明ファイルから採用されます（`adopt-copies`、1 回につき 200 件、イベント `copy_adopted`）。オブジェクトは説明通りに `packed`、ソースは `kept`（`"adopted from durable store ..."`）、コピーは `verified` として記録されます。Kairo のものではない説明ファイル、temporal オブジェクトの説明ファイル、あるいはすでに記録されているオブジェクトと食い違うコピーの説明ファイルは拒否されます（理由はエージェントログに出力されます）。
+- **欠損コピーの破損マークと安全策**: 一覧化の開始前からそこに存在すると記録されていた `verified` コピーが一覧に見当たらない場合、リードバック（read-back）失敗時と同様に破損（damaged）としてマークされます（`check_problem`、イベント `copy_damaged`）。ただし、一覧が空である場合や、そこに記録されている `verified` コピーの大部分が欠けている一覧は信用せず、何も変更しません。
+
+##### pack の転送とリードバック検証
+
+コピー元の pack がその Executor の担当するストア（同一ノード、同一名前空間）上にある場合は、ハンドル経由でローカルから直接読み取ります。それ以外の場合は、pack が存在するノードのエージェントから、その Executor が通知するアドレス（エージェント設定の `pack_addr`）へ HTTPS（デーモンの CA を信頼）で接続し、デーモンがそのコピー用に発行したトークンを使って取得します（`GET /packs/<object id>.tar.zst` および `.files.tsv`、`Authorization: Bearer`）。
+
+- **配信側の認可検証**: pack を配信するエージェントはリクエストごとにデーモンへ問い合わせます（`pack-read`）。その pack を作成した Executor のノードからの問い合わせであり、かつそのコピーの最新で有効期限内（12 時間、1 ラウンドの最大時間）のトークンである場合にのみ取得を許可します。それ以外は `403` または `404` を返し、情報を一切漏らしません。
+- **再開とタイムアウト制御**: 途中で途切れた取得は Range リクエストで再開されます。すでに pack と同じ長さに達している `.partial` pack は再取得しません。レスポンスボディが pack より長い場合は失敗となり、5 分間まったくデータを受信できない取得は打ち切られます（クライアント側は接続確立・ハンドシェイク・レスポンスヘッダの受信にも時間上限を設け、サーバ側はアイドル接続を閉じるとともに、拒否したリクエストをオブジェクトごとに 1 分に 1 回警告します）。
+- **キャッシュ迂回リードバックとリネーム**: pack とファイル一覧はいずれも `.partial` として書き込んで sync した後、キャッシュを迂回してディスクからリードバックします。
+  - **Windows**: `FILE_FLAG_NO_BUFFERING` を使用し、パスから開いたファイルが開いたディレクトリ内の同一ファイルであることを確認します。
+  - **Linux**: まずファイルのキャッシュ済みページを破棄します（ベストエフォートであり、ZFS の ARC のように独自のキャッシュを持つファイルシステムではメモリから応答される場合があります）。
+- **検証の確定**: pack のサイズ・sha256 およびファイル一覧の sha256 が一致した場合にのみリネームし（ファイル一覧を先にリネーム）、リネームを sync します。最終ファイル名の下にあるファイルが先ほどリードバックした同一ファイルであることを確認できたら（exFAT のようにリネームでファイル ID が変わる環境では、最終ファイル名の下で再度リードバックして一致を確認します）、コピーを `verified` として記録し、デーモン側でも再度検証します。
+- **不一致時の扱い**: 検証に一致しなかったコピーはファイルを削除し、後で再取得します。削除対象は `.partial` ファイル、あるいはリネーム済みだが未記録のコピーであれば最終ファイル名のファイルです（オーダーは未記録のコピーに対してのみ発行されます）。コピー処理において、Kairo 自身が書き込んだものの未記録であるこれらのファイルだけが、Kairo が durable store 上で削除する唯一のものです。なお、リネーム済みで未記録のファイルが検証に一致した場合は、そのままの状態で記録されます。
+
+#### コピー済みソースの削除
+
+オブジェクトのコピーが `verified` になると、そのオブジェクトを pack した Executor が、元のソース（Run の output ディレクトリまたは保持されていた scratch）と、それから作成した pack およびファイル一覧を削除します（毎分の `deletions-to-make`、`settle-deletion`、イベント `source_deleted`・`source_kept`）。削除は後述の scratch 削除ルール（ルート・種別・ID からディレクトリを導出し、マーカーで対象を識別し、リンク経由では一切到達しない）に従い、マシン宣言が引き続きそのディレクトリを Kairo の管理下としている間のみ実行されます。
+
+削除に着手する前に、ソースは pack のファイル一覧と照合されます。
+
+- ソース内のすべての通常ファイルが、pack 時と同じサイズ・mtime（ハンドル経由で stat して取得）で一覧に載っていなければならず、それ以外にはディレクトリしか存在してはなりません。
+- pack 後に書き込みや追加がされたファイル、リンク、特殊ファイル、マウントポイント（いずれも pack には含まれません）が 1 つでもあれば、理由付きでソースを保持（keep）します。ただしその場合も pack は削除されます（コピーが内容を保持しているためです）。
+- Windows では、ソース直下に予約済みデバイス名があり、マーカーを先に削除せずにディレクトリハンドル経由で削除できない場合もソースを保持します。
+- 一覧に載っているがすでに存在しないファイルは問題にしません（途中で中断された削除がすでに消したものであるためです）。
+- この Executor が起動した Attempt がまだ実行中のソースは待機します。
+- マーカーが現在読み取れない場合（アクセス拒否、使用中、I/O エラー）や、オープン中にディレクトリが差し替えられた場合は、保持（keep）する理由とはせず、再試行対象の失敗として扱います。
+
+削除時は、まず Executor が削除を claim します（状態 `deleting`）。claim が許可されるのは、リードバックで破損が見つかっていない `verified` コピーが存在し、そのコピー先ストアが宣言上依然としてそのルートで durable store であり、かつ宣言上そのソースが Kairo の管理下にある間のみです。その後、削除が `deleted` として確定するか、安全上の理由で拒否されて `kept`（理由付き、以後再試行しない）として確定するまで、`kairo machine apply` はそのディレクトリを Kairo の管理外とする宣言を拒否します。削除された output ディレクトリや scratch は `deleted` とマークされ、以後カウントされません。
+
+#### Temporal データ
+
+再生成できるデータは、再生成できないデータを保管する durable store の容量を消費する必要がありません。データオブジェクトのライフサイクル（`lifecycle` カラム）には、通常の `durable`（デフォルト: pack され、durable store へコピーされる）と `temporal` の 2 種類があります。
+
+以下のいずれかに該当するオブジェクトが `temporal` になり、生成元の Task が `producer_task_scope_id` として記録されます。
+
+- `regenerable` と宣言された Task（[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）の Run による output
+- `--regenerable-by TASK`（そのプロジェクトで `regenerable` と宣言された Task。`--delete-source` とは併用不可）を指定してインポートされたディレクトリ
+
+`temporal` オブジェクトは pack も durable store へのコピーも行われません。
+
+- 担当 Executor はそのアイデンティティ（identity）、すなわち pack した場合に得られるはずのファイル一覧のみを作成します（`packs-to-make` の `identity`: 全ファイルを読み取りますが、書き出すのは `<root>/packs/<object id>.tar.zst.files.tsv` のみです）。
+- オブジェクトはファイル一覧そのものと共に記録され、ストアがそれを保持します（`manifest`、イベント `identified`）。
+- ディレクトリは元の volatile store 上にそのまま留まり、それを入力として指定する Execution からその場（in place）で読み取られます。
+- コピーされないためコピー後の削除は行われませんが、ストアの空き容量が不足した際にエビクト（evict）されます（後述のエビクションを参照）。
+- `kairo data list` では各オブジェクトの `LIFECYCLE` を確認できます。
+
+#### Temporal データのノード間転送
+
+あるノード上で待機している Execution が必要とする temporal データが別ノード上にまだ残っている（ディレクトリが存在する）場合、再生成するのではなく転送して持ってきます。
+
+1. データを保持する Executor が移動用に一時 pack を作成します（`transfer_state` は `packing`、pack オーダーの `transfer`、イベント `transfer_ordered`）。作成した pack のファイル一覧はそのオブジェクトのアイデンティティと一致しなければならず、一致しない場合は pack を削除して記録しません（識別後にディレクトリが変更されたため転送しません）。
+2. pack が完了する（`packed`、pack のパス・サイズ・sha256 を記録、イベント `transfer_packed`）と、durable オブジェクトと同様に（後述の入力転送を参照）、pack したノードのエージェントから転送されます。ただし durable store にはコピーされません。
+3. そのデータを持たないノード上で待機している Execution がなくなり、かつ転送中の処理もなくなると、一時 pack は削除されます（`dropping`、オーダーの `drop`、アイデンティティのファイル一覧は残る、イベント `transfer_dropped`）。この一連の処理中、元のディレクトリはエビクトされません。
+
+待機中の Execution には、転送の進行状況が `being packed on N to be brought to M` や `being brought to M from N` のように表示されます。
+
+#### Temporal データの再生成
+
+あるノード上で待機している Execution が必要とする temporal データの入力が、どのノードにも存在しない（存在したすべての場所からエビクトされた）場合、そのデータを生成する Task が一度成功していれば、そのノード上でその Task により再生成されます。
+
+- **再生成の発注**: 対象の Task が再実行され（再実行リクエスト `regenerate:<object id>`、アクター `kairo`、イベント `regeneration_ordered`）、その Execution は待機中 Execution のノード上へ計画されます。オブジェクトはその再実行の ordinal を保持します（`regeneration_ordinal`）。発注はオブジェクトごとに 1 回のみです。
+- **実行可能なノードの制約**: そのノード上の有効な Executor のいずれも、対象 Task の最新 Execution の Executor ラベルを持たない場合（例: 特定マシン上にしかないファイルから構築されるデータセットを別ノードで読む場合）は、再生成は発注されず、読み取り側はその旨を表示して待機します（temporal データはノード間で転送されないため、そのようなデータは転送対象となる durable な output にしてください）。
+- **Task 状態による扱い**: 対象 Task が `pending` または `running` の場合は完了を待ちます。`failed`、`stopped`、`cancelled`、または `blocked` の場合はプロジェクト側で再実行する必要があり（待機理由にその旨が表示されます）、自動リトライは行われません。
+- **再生成結果の照合**: 対象 Task の Run が残した各 output は、識別（identified）されると、同じ Task のオブジェクトのうちエビクト済みまたは再生成発注済みのものとファイル一覧同士で照合されます（比較対象は各ファイルのパス・サイズ・sha256 であり、mtime は比較しません）。
+  - **一致した場合**: その output が元のオブジェクトの再生成物として紐付けられます（`regenerated_as`、元のオブジェクトの名前を引き継ぐ、イベント `regenerated`）。以後、元のオブジェクトまたはその名前を指定するすべての入力は、代わりにこの再生成物を読み取ります（待機中はエビクションからも保護されます）。
+  - **異なっていた場合**: 再生成のために発注された Run の output が元のオブジェクトと異なっていた場合、そのオブジェクトに問題が記録されます（`regeneration_problem`、イベント `regeneration_differs`）。読み取り側はどのように異なるかを表示しながら、後の手動再実行で同じファイル群が生成されるか、あるいは Task の最新 Run の output を直接読むよう入力を変更するまで待機します（`task = "T"` 形式の入力は中身にかかわらずその Task の最新 Run を読み取ります）。
+
+`kairo data list` では、再生成されたオブジェクト（`made again as obj_...`）および記録された問題を確認できます。
+
+#### 既存データのインポート
+
+ストア宣言前やストア外に書き込まれたディレクトリなど、Kairo が作成したのではないデータを Kairo の管理下に取り込むには `kairo data import` を使用します。
+
+- **CLI**: `kairo data import --project P --node N [--name NAME] [--delete-source | --regenerable-by TASK] PATH...`
+- **HTTP API**: `POST /api/data/imports`
+  - リクエスト: `{"project", "node", "paths", "name", "delete_source", "regenerable_by"}`
+  - レスポンス: `201 {"objects": [...]}`（各オブジェクトの `id`、`name`、`path`、`store`、`executor` を含む）
+
+各 `PATH` は指定プロジェクトの種別 `import` のデータオブジェクトになり（`source_id` はオブジェクト自身、イベント `import_ordered`）、名前は `--name NAME` 指定時が `NAME`（複数パス指定時は `NAME/<ディレクトリ名>`）、省略時が `<ディレクトリ名>` となります。
+
+##### ストア選定・pack・パス制約
+
+対象ノード上の Executor が、自身の担当する volatile store のうち対象ディレクトリのファイルシステム上のもの（宣言された `filesystem` がそのパスを含むもののうち最長一致: `F:/models` なら `F:`、`/srv/models/qwen` なら `/srv/models`）、該当がなければ ID 順で最初のストアへ pack します。output ディレクトリと同様に、ボリュームのルートからハンドル経由で 1 ディレクトリずつ開き（パス途中にリンクがないこと。内部のリンク・特殊ファイル・マウントポイントはスキップされカウントされます）、ストアにその内容を収める空き容量ができてから pack し、その後は他のオブジェクトと同様に durable store へコピーしてリードバック検証を行います。
+
+指定する `PATH` は以下の条件を満たしている必要があります。
+
+- 絶対パスであること
+- 対象ストアの名前空間に属すること（Windows ストアではドライブパス、Linux ストアでは POSIX パス）
+- ルート指定と同様に、1 つの場所を表す正規の単一表記であること
+- ファイルシステムのルートそのものではないこと
+- そのノード上のどのストアの内部にも含まれず、どのストアも包含しないこと
+  - **例外**: durable store の `<root>/intake` の真下（strictly inside）にあるパスはインポートでき、`--delete-source` 指定時はコピー完了後に削除できます（保持したいデータを他から削除されない durable store 内に置き、Kairo がオブジェクトとして取り込むまで保護するための仕組みです）。
+- そのノード上でインポート処理中（まだ pack されていない、またはコピー済みだが削除・保持が確定していない）のディレクトリの内部・同一パス・上位ではないこと
+
+後からそのパスを覆うストアが宣言された場合、pack および削除は停止されます。また、削除中のディレクトリが「すべてのストアの外」ではなくなるようなマシン宣言は、削除中の scratch の場合と同様に拒否されます。
+
+> [!NOTE]
+> Git Bash から実行すると、CLI が受け取る前に POSIX パスが Git のディレクトリ配下に書き換えられます（例: `/srv/x` が `C:/Program Files/Git/srv/x` になる）。CLI はそのようなパスを検出して拒否するため、`MSYS_NO_PATHCONV=1` を付けて実行してください。
+
+##### ソースの保持と `--delete-source`
+
+インポート元のディレクトリは Kairo の所有物ではないため、読み取りのみを行います。
+
+- **`--delete-source` なしの場合**: 元のディレクトリはそのまま残ります。コピー完了後は pack のみが削除され、ソースは `kept`（`"imported without delete_source"`）として確定します。確定する前（インポートのソースがまだ `present` の間）に、同じプロジェクトが同じディレクトリを `--delete-source` 付きで再度インポートすると、既存のインポートが削除ありへ切り替わり、再 pack は行われません（イベント `import_delete_source`）。すでに確定済みであれば改めて pack されます。
+- **`--delete-source` ありの場合**: コピーが `verified` になった後、Executor が削除を claim し、通常のソースと同様にディレクトリを検証します（すべての通常ファイルが pack と同じサイズ・mtime で一覧に載っており、他にはディレクトリしか存在しないこと）。さらに、pack 先のストアと同じファイルシステム上にあることを検証します（Windows では同じドライブであり、削除対象として渡すドライブパスはそのストアのドライブでなければなりません。それ以外の環境では同一デバイスであり、マウントや別ディスクではなく、決して durable store ではないこと）。そのうえで親ディレクトリのハンドル経由で対象を削除し（対象ディレクトリ自体は通常のディレクトリであること。配下のリンクはリンク自体を削除し、リンク先は決して辿りません）、続けて pack を削除し、通常の削除後と同様にノードを trim します。
+- pack 後に変更されていたディレクトリは理由付きで保持（kept）され、pack は通常通り削除されます。なお、検証から削除までの間に書き込まれたファイルは削除と共に失われるため、もう書き込みが行われないディレクトリをインポートしてください。
+
+##### 単一ファイル・書き込み継続中ディレクトリ・放棄とキャンセル
+
+- **通常ファイルのインポート**: `PATH` には通常ファイル単体も指定できます（公開済みチェックポイント: [実行中ジョブのチェックポイント保護](#実行中ジョブのチェックポイント保護)を参照）。親ディレクトリ経由で開き、自身のファイル名で単独 pack され、ファイルとして記録されます（`source_file`、pack 内にも記録）。ファイルオブジェクトは入力としてその場（in place）で読み取られることはありません（[アドミッション制御とプランニング](#アドミッション制御とプランニング)および入力仕様を参照）。pack にファイル種別が記載される以前に pack されたオブジェクトについては、ソースがファイルであることを検出した Executor が記録します。検出は、ノード上の in-place 読み取り対象パスを検査する際（`in-place-sources`、エージェント操作 `input-is-file`、イベント `input_is_file`）、またはそのオブジェクトを読み取ろうとした起動時に行われ、起動時の検出では再実行を促して `launch_aborted` で終了します。
+- **書き込み継続中ディレクトリの扱い**: インポート対象ディレクトリに書き込みが続いている場合（コレクタの出力先など）、過去 1 時間以内に更新されたファイルは pack の隣に作成したコピーから pack されます。読み取り中に元ファイルへの書き込みが起きなくなるまで（1 秒間隔で最大 5 回）コピーをやり直し、それでも書き込みが続く場合は最後に読み取った内容をそのまま採用します（追記型ファイルであれば先頭のプレフィックスとなり、エージェントログで `changing` としてカウントされます）。一覧取得から読み取りの間に消えたファイルは除外されます（skipped としてカウント）。1 時間より古いファイルが読み取り中に更新された場合は、output ディレクトリの場合と同様にその pack を失敗させ、次のラウンドでは直近更新ファイルとして扱います。変更中に pack されたファイルは pack のファイル一覧と一致しなくなるため、`--delete-source` 指定時でもディレクトリは保持されます。
+- **消失時の放棄とキャンセル**: ボリュームは存在するのにパスが消失しているインポート（マウントされていないディスクは削除済みソースとはみなしません）は `abandoned` となり（イベント `import_abandoned`）、以後は pack されず、ソースは理由付きで `kept` として確定するため、そのパスを再度インポートできます。`kairo data cancel OBJECT...`（`POST /api/data/objects/{id}/cancel`）も同様に、まだ pack されていないインポートを放棄します。キャンセル時点で作成中だった pack は、完了すればそのまま記録されてコピーされます。
+
+#### データオブジェクト一覧の確認（`kairo data list`）
+
+`kairo data list [--project P] [--kind output|scratch|import] [--task NAME] [--execution ID] [--limit N] [--json]`（`GET /api/data/objects`、レスポンス `{"objects": [...]}`、新しい順、デフォルト 200 件）でデータオブジェクトを確認できます。
+
+- **表示内容**: 種別（kind）、プロジェクト、名前、ノード、状態（`packing`、`packed`、`abandoned`）、ファイル数、コンテンツおよび pack のバイト数、検証済みコピー数（およびそのうち 1 つのパス）、ソースの状態（`present`、`deleting`、`deleted`、`kept`、`evicting`、`evicted` とその理由）。
+- **`--task`（クエリパラメータ `task`）**: 指定した Task 名の全 Run の output を選択します。特定プロジェクトに絞るには `--project` を併用します。
+- **`--execution`（クエリパラメータ `execution`）**: 指定した Execution が属する Run の output を選択します。継続（continuation）の Execution であってもその Run 全体が対象になり、Gang の leader を指定した場合は各 rank の output も含まれます。
+- これらのフィルタは `--json` 指定時にも適用されます。
+
+#### Run スナップショット
+
+Kairo が起動した Run によって書き出されたデータは、Run の終了後だけでなく、書き込まれた瞬間から Kairo の保全対象となります（`[data] confine_from` を設定すると、各 Attempt は Kairo から割り当てられた場所以外には書き込めなくなります。コンファインメントの詳細は [アドミッション制御とプランニング](#アドミッション制御とプランニング) を参照してください）。
+
+Run の実行が終了していない間、その output ディレクトリは繰り返し pack されます。
+
+- **差分スナップショットの生成**: 各回では、その Run の前回スナップショット以降に変更されたファイルのみを pack します（初回は全ファイル）。生成されるデータオブジェクトの種別は `run-snapshot`、ソースは `<run id>~<n>`（`data_objects.snapshot_since`）です。
+- **pack と複製**: 担当 Executor が pack を行い（インポート時と同様に、直近 1 時間以内に書き込まれたファイルはコピーを作成してから pack します）、他のデータオブジェクトと同じく durable store へコピー・複製されます。
+- **発行タイミングと並列制御**: Run の最新 Attempt が実行中である間、`[data] run_snapshot_interval`（デーモン設定、Go duration 形式、デフォルト `"30m"`、`"0"` で無効）ごとに 1 回、また前回スナップショット後にその Attempt がチェックポイントを発行（`checkpoint` コマンドまたは suspend に対して `checkpointed` を応答）した直後に指示されます。1 つの Run につき同時に実行されるのは 1 件のみです（イベント `pack_ordered`、`reason` は `periodic` または `checkpoint`）。
+- **ディレクトリの維持と完了時の処理**: output ディレクトリ自体は Run の所有物のまま維持され、スナップショット処理によって削除されることはありません。durable store へのコピー完了後は pack ファイルのみが削除され、ソースは `kept` として精算されます。Run が終了した時点で、Run 全体の output オブジェクトが丸ごと pack されます。
+- **ストア内チェックポイントの扱い**: ストア内部（Run の output ディレクトリ）のパスとして発行されたチェックポイントは、インポートではなくこの Run スナップショットによって保全されます。
+- **復元方法**: 特定のスナップショット時点の output を復元するには、その Run のスナップショットを先頭から順に展開します（途中で削除されたファイルも、それ以前のスナップショットに残っています）。
+
+#### 実行中ジョブのチェックポイント保護
+
+Run の output ディレクトリは Run の終了後に保全されますが、実行中の Run の作業内容はチェックポイントを通じて保全されます。
+
+##### 外部パスチェックポイントの自動インポート
+
+Attempt がチェックポイントを発行（suspend または `checkpoint` コマンドに対し、`continuation_ref` を添えて `checkpointed` を応答）した際、その `continuation_ref` が以下の条件を満たす場合、デーモンはそのパスを Attempt のプロジェクトへ自動インポートします。
+
+- ノード上の絶対パスであること（例: `D:\ckpt\run\step_200.pt`、`/srv/ckpt/run`。URI や UNC パスは対象外）
+- すべてのストアの外部に存在するファイルまたはディレクトリであること
+
+インポート時の挙動は次のとおりです。
+
+- インポート名は `checkpoints/<task>/<パスの末尾要素>` となります（名前が 200 文字を超える場合は `<task>` を省略します）。
+- 通常のインポートと同様に pack され、durable store へコピーされます。元のパスは読み取りのみで、元の場所にそのまま残されます。
+- 同一パスのインポートは 1 度のみ行われます（同じパスで繰り返し応答されても再インポートされません）。ただし、前回のインポートが `abandoned` になったパスは新たにインポートされます。
+- インポートできないチェックポイント（ストア内にあるパス、他のインポートと重複するパスなど）はログに記録されてそのまま残されます。インポートの成否にかかわらず、`checkpointed` の応答自体は有効なまま維持されます。
+
+##### 定期的なチェックポイント要求
+
+長時間実行されるジョブが保全可能なチェックポイントを持つよう、デーモンは毎分チェックポイントの取得を要求します。
+
+- **対象条件**: 実行中でチェックポイント対応（checkpointable）な Attempt のうち、開始から `[data] checkpoint_interval`（デーモン設定、Go duration 形式、デフォルト `"2h"`、`"0"` で無効）以上経過しており、その期間中に `checkpoint` コマンドを受けておらず、処理中（in flight）のコマンド（suspend を含む）も存在しないもの。
+- **プロジェクト単位の限定**: 過去にパス形式のチェックポイントを発行した実績があるプロジェクト（いずれかのコマンドがパスを伴って `checkpointed` 応答されたプロジェクト）の Attempt にのみ要求します。チェックポイント時に何を行うかはワーカー固有であり、たとえばモデルを配信しているワーカーはサーバを停止して URI を返す場合があり、それでは何も保全されないためです。
+- **要求の発行と応答**: 対象となった Attempt には、`kairo task checkpoint` で発行するものと同様の `checkpoint` コマンドが送信されます（origin は `data_protection`、イベント `checkpoint_requested`、actor は `kairo`）。Attempt は次の安全なタイミングでこれに応答し、そのまま実行を継続します。`checkpoint` コマンドを受け取らない Attempt はコマンドを保留（pending）にしたままとなり、その間は追加の要求は送られません。
+
+##### インプレース入力の消失検知
+
+インプレースで読み取る入力のパスが Attempt の起動時に存在しない場合（ボリュームは存在するのにパスが存在しない、すなわち Kairo の外部から削除された場合）、その起動は中止され、Executor が消失を報告します（エージェント操作 `input-gone`、イベント `input_gone`）。
+
+- インポート元ソース: `deleted`（理由: `"gone from its path"`）として精算
+- Run の output ディレクトリ: `missing` に更新
+- 取得済みコピー（brought copy）: 配置レコードを削除（forgotten）
+
+レコード上その場所は入力元として提示されなくなるため、再実行時は後述の仕組みによって durable コピーからオブジェクトが取得されるのを待つことになります。
+
+また各 Executor は、インベントリ巡回（起動時および 1 時間ごと）のたびに、レコード上でそのノードのインプレース読み取り候補となっている全パス（`in-place-sources`）を検証し、消失しているものを同様に報告します。これにより、途中で削除されたパスの大半は、起動時に必要となる前に検知されます。
+
+##### 入力データの取得（Brought inputs）
+
+Execution が待機しているノード上に存在しない入力データは、オブジェクトが `packed` になり次第、そのノードへ取得（fetch）されます。取得は以下のいずれかで指示されます。
+
+- **自動指示**: デーモンが Task をリコンサイルする際、ノード上で待機中の Execution に不足している各入力に対して自動で指示します。
+- **手動指示**: `kairo data fetch --project P --node N [--data NAME]... [OBJECT...] [--wait [--timeout D]]`、または `POST /api/data/fetches`（ボディ: `{"project", "node", "data", "objects"}`）で指示します。
+
+CLI オプションの挙動は次のとおりです。
+
+- `--wait` なしの場合、取得を指示すると即座に終了します。
+- `--wait` 指定時は、2 秒ごとにそのノード上の配置を確認し（`GET /api/data/objects/{id}/placement?node=N`）、展開が完了すると `OBJECT: PATH` を出力します。取得を完了できない場合（配置が指示されなかった、pack が消失した等）は非ゼロで終了します。回復可能なエラーは Executor がリトライします。
+- `--timeout` は待機時間の上限を指定します（タイムアウト時は終了コード 2。`0` または省略時は無制限）。タイムアウトしても取得自体はキャンセルされません。
+
+配置先の選定と転送・検証の流れは次のとおりです（テーブル `object_placements`: `fetching` → 完了後 `ready` とバイト数を記録。イベント `fetch_ordered`、`fetched`、`fetch_moved`。エージェント操作 `fetches-to-make`［毎分］、`record-fetch`）。
+
+1. **配置先 volatile store の選定**: ノード上の Executor が担当する volatile store のうち、pack と展開後ツリーを収める空き容量が最も多いストアが選ばれ、その担当 Executor が取得を行います。空き容量は「最終報告時の空きバイト数 − `reserve_free_bytes`（最低 1 GiB） − そのストアで保留中の fetch の pack サイズおよび展開後ツリーサイズの合計」で算出され、同率の場合は ID 順で先頭のストアとなります。ノード上の volatile store 群は 1 つのプールとして扱われ、ID による優先順位はありません。
+2. **容量不足時の移動**: 指示から 1 時間経過しても `ready` にならず、現在のストアに収まる空き容量がない場合、収まる空き容量を持つ別の volatile store のうち最も空きが大きいストアへ移動します（イベント `fetch_moved`）。収まらない入力を待つ Execution が永久に待機し続けるのを防ぐためです。
+3. **取得元の選択**: オブジェクトの pack は、`verified` な durable コピー（破損が見つかったコピーは対象外）、またはソースが未精算の間はその pack が作成された元の場所から読み出されます。この Executor 自身が担当するストア上にある場合は、他ノードのエージェントより優先してハンドル経由で直接読み取ります。他ノードから取得する場合は、そのノードのエージェントの `[packs]` サーバから取得します。この際、デーモンがその fetch 専用に発行したトークン（有効期限 12 時間、そのコピーまたは pack を保持するノードのエージェントのみが受理可能）を使用します。durable コピーは `<root>/objects/<month>` から配信されます。
+4. **ダウンロードと整合性検証**: pack とファイルリストを `<root>/inputs/<object id>.tar.zst.partial` に取得します（途中で切断された場合は Range リクエストで再開）。完了後、pack のサイズと SHA-256、およびファイルリストの SHA-256 を検証します。
+5. **展開と検証**: `<root>/inputs/<object id>.partial` へ展開します。展開されるのは内部の相対パスにおけるディレクトリと通常ファイルのみであり、展開先ディレクトリへのハンドル経由で書き込むため外部へのエスケープは発生しません。各ファイルのサイズと SHA-256 をファイルリストと照合し、リストに記載されたすべてのファイルが存在することを確認したうえで、書き込んだファイルの mtime を pack 時の値に設定します。Windows に限り、ストアのハンドル経由で作成できない予約デバイス名を含むパスは検証のみ行って作成をスキップし、そのパスをログに記録します。
+6. **確定とキャッシュ**: `<root>/inputs/<object id>` にリネームし、pack とファイルリストを削除して `ready` と記録します。Executor は事前に pack の残り部分と展開後ツリー分の空き容量を確認しますが、すでに展開済みのツリーであれば追加の空き容量なしに記録できます。失敗した fetch は 1 回警告を出し、後で再試行されます。
+
+取得されたオブジェクトはノード上に保持され、同じオブジェクトを入力に指定する後続の全 Execution からインプレースで読み取られます。エビクトされるまでの間、そのストアの `CACHE` バイト数として計上されます。
+
+##### エビクション（Evicting）
+
+Executor が最後に報告した volatile store の空き容量が下限（宣言された `reserve_free_bytes`、未宣言の場合は総容量の 1/10）を下回ると、下限を上回るまでデータがエビクト（evict）されます（エージェント操作 `evictions-to-make`［毎分］、`settle-eviction`。イベント `eviction_ordered`、`evicted`、`eviction_kept`）。不足分の解消計算には、すでに claim 済みのエビクションと、その最終報告以降にエビクトされたバイト数の両方が算入されます。
+
+- **対象と優先順位**: エビクトされるのは再取得または再生成が可能なデータのみです。まず取得済みオブジェクト（brought object: durable コピーから再取得可能）、次にその Executor の temporal データ（元の Task で再生成可能）の順に対象となります。それぞれの区分内では LRU（最も長く使われていないものから）順で選ばれます。最終使用時刻は「作成または取得された時刻」と「最後に Attempt へ入力として渡された時刻（`data_objects.last_used_at`）」のうち遅い方です。
+- **使用中データの保護**: 待機中（pending）または実行中（running）の Task、あるいは未終了の Execution が入力として指定しているオブジェクトは、決してエビクトされません。
+- **claim による排他制御**: 対象はまず claim されます（配置を `evicting`、またはソースを `evicting` に変更）。claim 以降はその場所からのインプレース読み取りや Attempt への受け渡しは行われず、その対象が Kairo の管理対象外となるようなマシン宣言変更も拒否されます。
+- **Executor による削除手順**:
+  - 取得済みオブジェクト: `inputs` ディレクトリのハンドル経由で `<root>/inputs/<object id>` を削除します。
+  - temporal な Run output ディレクトリ: その Executor が起動した Attempt がそのディレクトリ内でまだ実行中でない限り、コピー済みソースの削除と同様のストアルールに従って削除します。
+  - temporal なインポート済みディレクトリ: そのストアのファイルシステム上で、親ディレクトリのハンドル経由で削除します。
+  - temporal ディレクトリ共通の安全条件: identity のファイルリストと内容が完全に一致している間（リスト記載の各通常ファイルが識別時のサイズおよび mtime のままであり、他にはディレクトリしか存在しない状態）のみディレクトリを削除し、続けて identity のファイルリストを削除します。
+- **精算とエラー時の扱い**:
+  - 削除完了時は `evicted` として精算され（配置は削除されて再取得可能になり、temporal な Run output ディレクトリは `deleted` と記録されます）、通常の削除後と同様にノードのトリムが要求されます。
+  - 安全チェックで拒否された場合（識別後に変更された、使用中である、Kairo の管理対象外になった等）は、理由付きで保持（`kept`）として精算され再び利用可能な状態（ソースは `present`、配置は `ready`）に戻り、その後 1 時間は再度エビクション対象に選ばれません。
+  - それ以外のエラーで失敗した場合は claim 状態のまま維持され、再試行されます。
+
+エビクトされた temporal オブジェクトは、その生成 Task が再実行されるまで失われた状態になります（Temporal データの詳細は [データストア](#データストア) を参照してください）。インポートした temporal ディレクトリも Kairo 自身が生成したものと同様にエビクト（削除）されるため、`--regenerable-by` には該当 Task が確実に再生成できるデータのみを指定してください。
+
+##### Durable コピーのリードバック検査（Scrub）
+
+durable store はデータを永続保管しますが、無言でビット破損が発生する可能性があります（exFAT にはジャーナルがありません）。そのため、durable store を担当する Executor は、キャッシュをバイパスして各 `verified` コピーの全量をリードバック（read-back）検査します（エージェント操作 `scrubs-to-make`［10 分ごと］、`record-scrub`）。
+
+- **実行条件と帯域上限**: 前回のリードバックまたは検証から `[data] scrub_interval`（デーモン設定、Go duration 形式、デフォルト `168h`）以上経過したコピーが古い順に検査されます。上限は 1 ストアあたり 1 日最大 `scrub_bytes_per_day` バイト（デフォルト 200 GiB）です。この上限より大きい単一コピーは、1 日 1 回それ単体で読み出されます。
+- **破損検知時の挙動**: ファイルが存在しない、全量を読み取れない、または pack のサイズや SHA-256 と一致しないコピーは破損（damaged）とマークされ（イベント `copy_damaged`）、`kairo store status` の `"damaged copies"` に一覧表示されます。破損コピーに対して自動削除や上書きコピーが行われることはありません。
+- **オフラインストアの扱い**: `objects` ディレクトリ自体が存在しないストア（ドライブが取り外されている状態など）は、破損扱いとせず後回しにされます。
+
+##### コンテナのトリム（Trimming containers）
+
+Proxmox コンテナ内でファイルを削除しても、トリム（trim）を実行するまでホスト側のシン・プール（thin pool）へ領域は返還されません。
+
+- ノード上で削除が発生するとトリムが要求されます（テーブル `node_trims` に前回トリム以降の削除バイト数を記録）。
+- `containers` にそのノードを列挙しているホストのコントローラ（controller）がトリムを実行します（操作 `trims-to-make`［5 分ごと］、実行コマンド `pct fstrim <vmid>`、タイムアウト 1 時間、報告 `record-trim`、イベント `node_trimmed` / `node_trim_failed`）。デバイス設定の維持を妨げないよう、バックグラウンドで 1 コンテナずつ実行されます。
+- 実行頻度は 1 コンテナあたり最大 1 時間に 1 回です。前回の指示または失敗から 1 時間未満では新たに指示されません。1 回のトリムはその指示より前の削除分を対象とし、指示後に発生した削除は再度トリムを要求します。失敗したトリムは 1 時間後に再指示されます。
+- どのホストの `containers` にも列挙されていないノードはトリムされません。
+
+##### scratch ディレクトリの精算と安全な削除
+
+Attempt が静止（`quiesced`）または消失（lost）すると、担当 Executor がその scratch を精算します（エージェント操作 `scratch-to-settle`［10 秒ごと。各 scratch に `action` として `delete`・`keep`・`leave` を返す］、`settle-scratch`）。
+
+**精算の判定ルール**
+
+- **削除（`delete`）**: 成功時（シグナルなしの終了コード 0、またはチェックポイントを発行して終了した suspend）のみ削除されます。さらに、マシン宣言上その記録パスが引き続き該当 volatile store の scratch ディレクトリであることも条件となります。
+- **保持（`keep`）**: 失敗時（0 以外の終了コード、シグナル終了、実行に至らなかった起動）は、空であってもなくても保持されます。消失（lost）した Attempt（リコンサイル後も含む）も、プロセスがまだ書き込みを続けている可能性があるためそのまま保持されます。保持された scratch は、pack・durable store へのコピー・削除が完了するまで（[データストア](#データストア) を参照）、`kairo store status` に Task・サイズ・理由とともに一覧表示されます。消失した Attempt の scratch はリコンサイル完了を待ちます。
+- **手つかずで放置（`leave`）**: ストアが削除された、移動した（ルートパスの表記が変わった場合を含む）、durable store に変更された、あるいはノード上の別ストアがそのパスを管轄するようになった場合、scratch は手つかずのまま残されます（`leave`: 保持扱いとなり、サイズ計測すら行われません）。
+
+**削除前の claim と設定変更のブロック**
+
+削除に先立ち、Executor は scratch を claim します（`settle-scratch` で状態 `deleting` を取得。削除対象である間のみ受理されます）。claim されてから `deleted`（claim 済みの場合のみ受理）として精算されるか、安全チェックで拒否され `kept` として精算されるまでの間、`kairo machine apply` はその scratch が削除対象外になるような宣言変更を拒否します（HTTP 409 `machine_conflict`、対象の scratch と Executor 名を明示）。これにより、削除処理の途中で宣言が書き換わることを防ぎます。
+
+claim 済みの scratch はエージェント再起動後も削除対象として維持されます。該当 Executor が二度と復帰しない場合、手動でレコードを精算するまでコンフリクト状態が残ります。
+
+なお、`observe_only`（観測専用モード）のデーモンはエージェントにストアを返さず（`stores` は空リストを返す）、精算すべき scratch も返さないため、エージェントはルートディレクトリも scratch も作成せず、削除も一切行いません。
+
+**Executor による安全な削除の実装ルール**
+
+削除は Executor 自身が行い、与えられたパスに対して `os.RemoveAll` や `rm -rf` を直接呼び出すことは決してありません。
+
+- **パス・リンク・マウントの厳格検証**: 対象パスは絶対パスのルートに基づく記録済みの `<root>/scratch/<attempt id>` と厳密に一致しなければなりません（それ以外はすべて拒否）。ルートパスの途中にリンクが含まれていてはならず、`<root>/scratch` および scratch ディレクトリ自体もリンクであってはなりません。`<root>/scratch` はマウントポイントであってはならず、scratch ディレクトリ自身およびその配下にもマウントポイントが存在してはなりません（Linux では `/proc/self/mountinfo` から確認し、bind マウントも含みます）。また、マーカーファイルに該当 Attempt が記録されている必要があります。
+- **ハンドルベースの走査とエントリ単位の削除**: パス文字列を介した直接操作は一切行いません。ボリュームのルートから 1 ディレクトリずつ順に開き、ルート配下のすべての操作は `os.Root` ハンドル経由で行います（Linux では `openat` 相当、Windows ではハンドル相対操作）。開いた各ディレクトリは、事前に検証したディレクトリと同一ファイルであることをハンドル経由で確認します。削除には `os.Root.RemoveAll` を用い、シンボリックリンク・ジャンクション・その他のリパースポイントは参照先ではなくリンク自体を削除します。エントリごとに削除し、マーカーファイルを最後に消すことで、途中で中断された削除も再開できます。
+- **属性無変更とファイルシステム種別の確認**: ファイルは属性を変更せずに削除されます（外部ファイルへのハードリンクはリンクが解除されるだけで、元のファイルには手を付けません）。Windows でこれを実現するには、Go が読み取り専用属性を無視して削除できる NTFS（他のファイルシステムでは先に読み取り専用属性を解除するため、ハードリンク先の共有ファイルに影響してしまう）か、ハードリンクもリパースポイントも存在せず属性解除が削除対象ファイルのみにとどまる exFAT である必要があります。これがファイルシステムチェックを行う理由です。
+- **書き込み不可ディレクトリの復旧（Linux）**: Task によって書き込み不可にされたディレクトリ（scratch ディレクトリ自身またはその配下のディレクトリ）に限り、Linux 上で `O_PATH|O_NOFOLLOW|O_DIRECTORY` ハンドル経由で再度書き込み可能にします。このハンドルはそのディレクトリ以外を指せないため、ファイルにすり替えられていてもファイルのモードは変更されません。
+- **マーカーファイルの安全性**: マーカーファイルは新規作成したディレクトリ内に排他的に作成され（既存ファイルを開くことはありません）、読み取りもノンブロッキングで行います（マーカー位置に FIFO が置かれていてもエージェントはハングしません）。そのため、途中で差し替えられた対象へ誤って書き込むことはありません。
+- **拒否と再試行**: 以上の安全上の理由で拒否された削除は、その理由を記録して scratch を `kept` とします。それ以外のエラー（ファイルが使用中など）で失敗した場合は再試行されます。
+
+なお、ストア機能より古いデーモンに対して新しいエージェントが接続した場合、古いデーモンが scratch を受け取ることはありません（`stores` に 404 を返すため、エージェントは scratch の作成も精算の問い合わせも行いません）。
+
+#### データライフサイクル
+
+ここまで述べた各レコードは、以下の状態遷移表（`internal/store/lifecycle.go`）に定義された遷移のみを行います。状態変更を行う箇所は必ずこのステートマシンを事前にチェックするため、表に存在しない遷移はエラーメッセージとともに失敗します。表中の `-` はレコードが存在しない状態を表し、`-` からの遷移はレコードの作成、`-` への遷移はレコードの削除を意味します。
+
+| レコード | 遷移前（`from`） | 遷移後（`to`） |
 |---|---|---|
-| object (`data_objects.state`) | - | `packing` (ordered packed), `packed` (adopted from a durable store) |
-| | `packing` | `packed`, `abandoned` |
-| | `abandoned` | `packed` (a pack being made when its import was cancelled) |
-| source (`source_state`) | - | `present`, `kept` (adopted) |
-| | `present` | `deleting` (claimed), `kept`, `evicting` (claimed), `deleted` (found gone from its path) |
-| | `deleting` | `deleted`, `kept` |
-| | `evicting` | `evicted`, `present` (kept) |
-| | `kept` | `deleted` (a kept import found gone) |
-| | `deleted` | `kept` (an import abandoned once found gone) |
-| transfer (`transfer_state`) | - | `packing` |
+| object（`data_objects.state`） | `-` | `packing`（pack 指示時）、`packed`（durable store からの adopt 時） |
+| | `packing` | `packed`、`abandoned` |
+| | `abandoned` | `packed`（インポートがキャンセルされた時点で作成中だった pack が完了した場合） |
+| source（`source_state`） | `-` | `present`、`kept`（adopt 時） |
+| | `present` | `deleting`（claim 時）、`kept`、`evicting`（claim 時）、`deleted`（元のパスから消失しているのを発見した場合） |
+| | `deleting` | `deleted`、`kept` |
+| | `evicting` | `evicted`、`present`（保持された場合） |
+| | `kept` | `deleted`（保持していたインポート元が消失しているのを発見した場合） |
+| | `deleted` | `kept`（消失発見後にインポートが abandon された場合） |
+| transfer（`transfer_state`） | `-` | `packing` |
 | | `packing` | `packed` |
 | | `packed` | `dropping` |
-| | `dropping` | - |
-| copy (`object_copies`) | - | `copying` (ordered), `verified` (adopted) |
-| | `copying` | `verified`, - (given up: its store no longer durable there) |
-| | `verified` | - (shed) |
-| placement (`object_placements`) | - | `fetching` |
+| | `dropping` | `-` |
+| copy（`object_copies`） | `-` | `copying`（コピー指示時）、`verified`（adopt 時） |
+| | `copying` | `verified`、`-`（断念: 対象ストアがその場所でもはや durable ではなくなった場合） |
+| | `verified` | `-`（シェッド［shed］時） |
+| placement（`object_placements`） | `-` | `fetching` |
 | | `fetching` | `ready` |
-| | `ready` | `evicting` (claimed), - (found gone from its path) |
-| | `evicting` | `ready` (kept), - (evicted) |
-| scratch (`attempt_scratch`) | - | `active` |
-| | `active`, `missing` | `deleting` (claimed), `kept` |
-| | `active`, `kept` | `missing` (not found by a whole scan) |
-| | `missing` | `active`, `kept` (found again) |
-| | `deleting` | `deleted`, `kept` |
-| | `kept` | `deleted` (once copied to a durable store) |
-| run output (`run_outputs`) | - | `active` |
-| | `active` | `missing`, `deleted` |
-| | `missing` | `active` (found, or made again), `deleted` |
+| | `ready` | `evicting`（claim 時）、`-`（パスから消失しているのを発見した場合） |
+| | `evicting` | `ready`（保持された場合）、`-`（エビクト完了時） |
+| scratch（`attempt_scratch`） | `-` | `active` |
+| | `active`、`missing` | `deleting`（claim 時）、`kept` |
+| | `active`、`kept` | `missing`（全体スキャンで発見できなかった場合） |
+| | `missing` | `active`、`kept`（再発見された場合） |
+| | `deleting` | `deleted`、`kept` |
+| | `kept` | `deleted`（durable store へのコピー完了後） |
+| Run output（`run_outputs`） | `-` | `active` |
+| | `active` | `missing`、`deleted` |
+| | `missing` | `active`（再発見または再作成された場合）、`deleted` |
 
-`packed`, `evicted` and `deleted` are final.
+`packed`、`evicted`、`deleted` は終端状態です。
 
-### Hardware settings
+### ハードウェア設定
 
-A device of a host (a GPU by UUID, or `cpu`) can be given settings: a GPU's
-highest graphics clock (`graphics_clock_max_mhz`), a locked memory clock
-(`memory_clock_mhz`) and a power limit (`power_limit_w`); a CPU's highest
-frequency (`max_freq_mhz`, Windows and Linux cpufreq) or highest performance
-percentage (`max_perf_pct`, Linux intel_pstate). A setting left out is the
-hardware's default; no setting at all is the defaults. Kairo stores what is
-desired; the host's controller carries it out and reports what is in place.
-Nothing here holds back admission or a running job: a setting that fails is a
-recorded fact.
+ホスト上の各デバイス（UUID で指定する GPU、または `cpu`）には、以下のハードウェア設定を指定できます。
 
-- Owners: a setting is `manual` (an operator's), `bench` (a bench run's) or
-  `policy` (the operating-point policy's), one per owner kind and device. The
-  one in effect is manual, else bench, else policy, so a bench run overrides
-  the policy on a device it has leased. A bench setting, and a GPU's policy
-  setting, belongs to a lease: it needs a reserved, prepared or active lease
-  on a node of the host that, for a GPU, holds that GPU, and is refused (`409
-  device_setting_conflict`) while another lease's setting of that kind is
-  there. When a lease is released, by any path, its settings are removed in
-  the same transaction: no setting outlives its lease. A CPU is shared by
-  whatever runs on its host, so its policy setting belongs to the host (ref
-  `host`), not to a lease; it is removed when the declaration makes the CPU
-  uncontrollable, drops the host, or sets its `max_slowdown` to 0. A policy
-  setting is refused on a device whose `max_slowdown` is 0.
-- Capabilities: the controller reports what it can change on each device and
-  within which range (`nvidia-smi -q -d SUPPORTED_CLOCKS`, the power limit
-  range and default; the CPU's frequency range or intel_pstate's
-  `min_perf_pct`). A setting the device does not support, a value outside its
-  range, or one for a device whose controller has not reported yet is refused
-  with `400`. These capabilities are the only source of what can be set (the
-  bench grid and the policy's fallback come from them); the power limits and
-  greatest clocks a provider reads into `device_properties` are what was seen,
-  shown with the device's samples and used for nothing else.
-- Generation: every change of a device's setting in effect increments its
-  generation; the controller reports the generation it applied, so `hardware
-  show` tells `in sync` from `pending` and `failed` (with the error).
-- Events: `device_setting_requested`, `device_setting_cleared` (with why: an
-  operator, a released lease, the declaration), `device_setting_applied` and
-  `device_setting_failed` (once per distinct error).
+- **GPU**: 最大グラフィックスクロック（`graphics_clock_max_mhz`）、固定メモリクロック（`memory_clock_mhz`）、電力上限（`power_limit_w`）
+- **CPU**: 最大周波数（`max_freq_mhz`、Windows および Linux の `cpufreq`）、または最大パフォーマンス率（`max_perf_pct`、Linux の `intel_pstate`）
 
-| Command | What it does |
+省略された項目はハードウェアのデフォルト値となり、設定自体が存在しない場合はすべてデフォルトとなります。Kairo は望ましい設定状態（desired state）を保持し、ホスト上のコントローラがそれを適用して現在の適用状況を報告します。ハードウェア設定がアドミッションや実行中のジョブを妨げることはなく、設定に失敗した場合も単なる事実として記録されるだけです。
+
+- **所有権（Owners）**: 各設定には `manual`（オペレータによる手動設定）、`bench`（ベンチマーク実行による設定）、`policy`（動作点ポリシーによる設定）のいずれかの所有種別があり、デバイスごと・所有種別ごとに 1 つ保持されます。実際に有効となる優先順位は `manual` > `bench` > `policy` であり、ベンチマーク実行は自身が Lease を保持するデバイス上でポリシー設定を上書きします。
+  - `bench` 設定および GPU の `policy` 設定は Lease に紐づきます。設定するには対象ホスト上のノードに `reserved`、`prepared`、または `active` 状態の Lease が存在している必要があり（GPU の場合はその GPU を保持する Lease であること）、同じ所有種別で別 Lease の設定がすでに存在する場合は `409`（`device_setting_conflict`）で拒否されます。Lease がどの経路で解放された場合でも、紐づく設定は同一トランザクション内で削除されるため、設定が Lease より長く残ることはありません。
+  - CPU はホスト上で稼働するすべてのジョブで共有されるため、CPU の `policy` 設定は Lease ではなくホストに紐づきます（`ref` は `host`）。この設定は、マシン宣言によってその CPU が制御対象外になったとき、ホスト自体が削除されたとき、または `max_slowdown` が `0` に設定されたときに削除されます。また、`max_slowdown` が `0` のデバイスに対する `policy` 設定は拒否されます。
+- **ケイパビリティ（Capabilities）**: コントローラは、各デバイスで変更可能な項目と設定可能範囲を報告します（GPU は `nvidia-smi -q -d SUPPORTED_CLOCKS` や電力上限の範囲・デフォルト値、CPU は周波数範囲または `intel_pstate` の `min_perf_pct`）。デバイスがサポートしていない設定、範囲外の値、またはコントローラがまだ報告していないデバイスへの設定は `400` で拒否されます。設定可能な範囲の根拠となるのはこのケイパビリティ情報だけであり、ベンチマークの探索グリッドやポリシーのフォールバック値もここから算出されます。なお、Provider が `device_properties` に読み取る電力上限や最大クロックは、あくまで観測された値としてデバイスのサンプルとともに表示されるだけで、他の用途には使われません。
+- **世代（Generation）**: デバイスの有効な設定が変化するたびに `generation` がインクリメントされます。コントローラは適用した `generation` を報告するため、`kairo hardware show` で `in sync`、`pending`、`failed`（エラー内容付き）を判別できます。
+- **イベント**: `device_setting_requested`、`device_setting_cleared`（オペレータ操作、Lease 解放、マシン宣言の変更といった理由付き）、`device_setting_applied`、`device_setting_failed`（異なるエラー内容ごとに 1 回）が記録されます。
+
+| コマンド | 説明 |
 |---|---|
-| `kairo hardware show [HOST] [--json]` | per host: its nodes and controller (when last seen), then per device its policy, the setting in effect and its owner, what is applied, and `in sync`, `pending`, `failed`, `reset` (the controller returned it to defaults on its own), `not reported`, `observe only` or `not controlled`; then the errors, the settings overridden, what each device supports, the policy's latest decision and the latest bench |
-| `kairo hardware set HOST DEVICE [--graphics-clock-max MHz] [--memory-clock MHz] [--power-limit W] [--cpu-max-freq MHz \| --cpu-max-perf PCT]` | sets the device's manual setting (as a whole: what is left out is the default) |
-| `kairo hardware reset HOST DEVICE` | clears the manual setting: the device follows a bench or policy setting, else returns to its defaults |
-| `kairo hardware bench HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run]` | measures the device at each setting of a grid (see Bench runs) |
-| `kairo hardware profile HOST [DEVICE] [--json]` | the measured curves, the point for each device's `max_slowdown`, and drift from its previous bench |
+| `kairo hardware show [HOST] [--json]` | ホストごとにノード一覧とコントローラ（最終確認時刻）を表示し、続いてデバイスごとにポリシー、有効な設定とその所有者、適用済みの状態、ステータス（`in sync`、`pending`、`failed`、コントローラが自律的にデフォルトへ戻した `reset`、`not reported`、`observe only`、`not controlled`）を表示する。さらにエラー、上書きされている設定、各デバイスがサポートする設定、ポリシーの最新判断、最新のベンチマーク結果を表示する |
+| `kairo hardware set HOST DEVICE [--graphics-clock-max MHz] [--memory-clock MHz] [--power-limit W] [--cpu-max-freq MHz \| --cpu-max-perf PCT]` | デバイスの `manual` 設定を一括で設定する（省略した項目はデフォルト値になる） |
+| `kairo hardware reset HOST DEVICE` | `manual` 設定を解除する（`bench` または `policy` 設定があればそれに従い、なければデフォルトへ戻る） |
+| `kairo hardware bench HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run]` | グリッド上の各設定点でデバイスを計測する（[ベンチマーク実行](#ベンチマーク実行)を参照） |
+| `kairo hardware profile HOST [DEVICE] [--json]` | 計測されたカーブ、各デバイスの `max_slowdown` に対応する動作点、前回ベンチマークからのドリフトを表示する |
 
-`POST /api/hardware/{host}/{device}/settings` takes `{"settings", "owner":
-{"kind", "ref"}, "actor"}` (owner defaults to manual, whose ref is the actor;
-a bench or policy ref is its lease id, a CPU's policy ref `host`) and `DELETE` the same without
-settings; both answer `{"host_id", "device_id", "generation", "effective",
-"cleared"}`. `GET /api/hardware` answers `{"hosts"}` as `hardware show
---json` prints them. In-process components use the store's
-`SetDeviceSetting`, `ClearDeviceSetting` and `DevicePolicies`.
+HTTP API では、`POST /api/hardware/{host}/{device}/settings` が `{"settings", "owner": {"kind", "ref"}, "actor"}` を受け付けます（`owner` を省略した場合は `manual` となり、`ref` には `actor` が入ります。`bench` や `policy` の `ref` は Lease ID、CPU の `policy` の `ref` は `host` です）。`DELETE /api/hardware/{host}/{device}/settings` は `settings` を除いた同じリクエストを受け付けます。いずれのエンドポイントも `{"host_id", "device_id", "generation", "effective", "cleared"}` を返します。また、`GET /api/hardware` は `kairo hardware show --json` と同じ形式で `{"hosts"}` を返します。インプロセスコンポーネントからは、ストアの `SetDeviceSetting`、`ClearDeviceSetting`、`DevicePolicies` を使用します。
 
-#### The controller
+#### デバイスコントローラ
 
-`kairo controller --config kairo-controller.toml` (see
-`examples/kairo-controller.toml`) runs on the physical host, with `server_url`,
-`token`, `ca_file` and `insecure_http` as for an agent and a `[node]` of its
-own: give it a node token (`kairo token create --role node --node
-pve0-host`), start it once so its node is known, then name that node as the
-host's `controller`. Its node has no executors and is never scheduled; a node
-that already exists (one that also runs an agent) is left as it is. Every
-`poll_interval_seconds` (10) it fetches the settings of the devices it
-controls, which is every device with `control = true` of the host naming it
-and nothing else, changes what differs, reports what is in place, what failed
-and what each device supports, and counts as its heartbeat. It then reports
-the power of its host's CPU packages since its previous poll (see Power and
-energy); a reading the daemon does not take is dropped.
+`kairo controller --config kairo-controller.toml`（設定例は `examples/kairo-controller.toml` を参照）は物理ホスト上で稼働します。エージェントと同様に `server_url`、`token`、`ca_file`、`insecure_http` を指定し、さらに自身の `[node]` セクションを持ちます。セットアップ手順は以下のとおりです。
 
-- GPUs, by UUID with `nvidia-smi -i`: `-lgc LOWEST,MAX` / `-rgc`, `-lmc M,M` /
-  `-rmc`, `-pl W` / `-pl` `power.default_limit`. A reset the card does not
-  offer (exit code 3) is already the default.
-- Linux CPUs: intel_pstate's `max_perf_pct` when the driver has it (default
-  100), else cpufreq's `scaling_max_freq` of every CPU (default its
-  `cpuinfo_max_freq`).
-- Windows CPU: the AC value of `PROCFREQMAX` (and `PROCFREQMAX1` where Windows
-  has it) of the active power scheme, which is then re-activated. What the
-  user had there cannot be read back after a change, so the controller writes
-  it to its state file (`state_file`, default `<config name>.state.json` next
-  to the configuration) before its first change of a scheme, never with values
-  it set itself, and writes it back on reset. A state file it cannot read
-  stops it: fix or remove it by hand.
+1. ノードトークンを発行します（例: `kairo token create --role node --node pve0-host`）。
+2. コントローラを一度起動して、そのノードをデーモンに認識させます。
+3. そのノード名をホスト宣言の `controller` に指定します。
 
-It errs toward the hardware's defaults:
+コントローラ用のノードは Executor を持たず、ジョブがスケジュールされることはありません。すでに存在するノード（エージェントも併用しているノードなど）を指定した場合は、既存ノードの設定はそのまま維持されます。
 
-- On start every controlled device is brought to its desired setting, or
-  reset to its defaults when it has none (a crash may have left settings).
-- On SIGTERM or Ctrl-C it resets every device it may have changed, then
-  reports.
-- When the daemon has not answered for `reset_after_seconds` (120), it resets
-  every device, and applies the desired settings again once the daemon is
-  back. The state file also lists the controlled devices, so a controller
-  restarted while the daemon is down resets them too.
-- A change that fails is reported and retried after 5 s, doubling up to 5 min
-  (a new request is tried at once); it never stops the loop.
-- A device that leaves its control (dropped from the host, `control = false`,
-  another controller) is reset at once if it may have changed it (a failed
-  reset is retried, five times at most), then never touched again.
+コントローラは `poll_interval_seconds`（デフォルト `10`）秒ごとにポーリングを行い、次の処理を実行します。
 
-A setting in place is carried out again every 10 minutes, in case a driver
-reload or another controller's reset undid it. An observe-only daemon tells a
-controller it controls nothing: it changes no setting, and only returns the
-devices it may have changed (those its state file lists) to their defaults.
-Changing GPU clocks, power limits and processor settings needs
-privileges the daemon does not have:
+1. 自身が制御するデバイス（自身を `controller` に指定しているホストに属し、`control = true` になっているすべてのデバイスのみ）の設定を取得します。
+2. 現在の状態と異なる設定を変更します。
+3. 適用済みの設定、失敗した内容、および各デバイスがサポートする設定を報告します（この報告がハートビートを兼ねます）。
+4. 前回のポーリング以降におけるホストの CPU パッケージ消費電力を報告します（[電力と消費電力量](#電力と消費電力量)を参照）。デーモンに受け入れられなかった計測値は破棄されます。
 
-- Linux (a Proxmox host, as root; containers see the GPU but may not change
-  it): a systemd unit,
+各デバイス種別の制御方法は以下のとおりです。
+
+- **GPU**: UUID 指定で `nvidia-smi -i` を使用します。グラフィックスクロック上限は `-lgc LOWEST,MAX` / リセット `-rgc`、メモリクロック固定は `-lmc M,M` / リセット `-rmc`、電力上限は `-pl W` / リセット `-pl` に `power.default_limit` を指定します。カード側がリセット操作を提供していない場合（終了コード `3`）は、すでにデフォルト状態であるとみなします。
+- **Linux CPU**: ドライバが `intel_pstate` の `max_perf_pct` を提供している場合はそれを使用します（デフォルトは `100`）。それ以外の場合は、全 CPU コアの `cpufreq` の `scaling_max_freq` を設定します（デフォルトは各 CPU の `cpuinfo_max_freq`）。
+- **Windows CPU**: アクティブな電源プランの `PROCFREQMAX`（および Windows が備えている場合は `PROCFREQMAX1`）の AC 電源時の値を変更し、電源プランを再アクティブ化します。一度変更するとユーザーが元々設定していた値をリードバックできないため、コントローラはある電源プランを初めて変更する前に元の値をステートファイル（`state_file`、デフォルトは設定ファイルと同じディレクトリに置かれる `<config name>.state.json`）へ記録し（自身が設定した値で上書きすることはありません）、リセット時にその値を書き戻します。ステートファイルを読み込めない場合、コントローラは停止するため、手動で修復または削除してください。
+
+コントローラは安全側（ハードウェアのデフォルト値へ戻す方向）に倒れるよう設計されています。
+
+- **起動時**: すべての制御対象デバイスを望ましい設定に合わせるか、設定がなければデフォルトへリセットします（過去のクラッシュで設定が残っている可能性があるためです）。
+- **終了時（`SIGTERM` または `Ctrl-C`）**: 変更した可能性のあるすべてのデバイスをリセットしてから、結果を報告します。
+- **デーモン無応答時**: デーモンからの応答が `reset_after_seconds`（デフォルト `120`）秒間途絶えると、すべてのデバイスをリセットし、デーモンが復帰した時点で再度望ましい設定を適用します。ステートファイルには制御対象デバイスの一覧も保存されているため、デーモン停止中にコントローラが再起動された場合でもリセットが実行されます。
+- **変更失敗時**: エラーを報告したうえで 5 秒後にリトライし、以降リトライ間隔を最大 5 分まで倍増させます（新しい設定要求が来た場合は即座に試行します）。失敗によってメインループが停止することはありません。
+- **制御対象からの離脱時**: デバイスが制御対象から外れた場合（ホストからの削除、`control = false` への変更、別コントローラへの切り替え）、自身が変更した可能性があれば即座にリセットし（リセット失敗時は最大 5 回までリトライ）、以降は一切触れません。
+
+ドライバの再読み込みや別コントローラによるリセットで設定が元に戻ってしまうケースに備え、適用済みの設定は 10 分ごとに再適用されます。また、デーモンが `observe_only` モードのときは、コントローラには制御対象デバイスが存在しないものとして通知されます。このときコントローラは新たな設定変更を一切行わず、自身が変更した可能性のあるデバイス（ステートファイルに記載されているデバイス）のみをデフォルトへ戻します。
+
+GPU クロック、電力上限、プロセッサ設定の変更には、デーモン本体には付与されていない特権が必要です。OS ごとの常駐構成は以下のとおりです。
+
+- **Linux**（Proxmox ホストなどで `root` として実行。コンテナ内から GPU は見えても設定変更はできません）: 以下のような systemd ユニットを作成します。
 
   ```ini
   # /etc/systemd/system/kairo-controller.service
@@ -2251,11 +1577,9 @@ privileges the daemon does not have:
   WantedBy=multi-user.target
   ```
 
-  then `systemctl enable --now kairo-controller`. Keep the NVIDIA persistence
-  daemon running: without it the driver may drop clocks and limits when no
-  process holds the GPU.
-- Windows (elevated; the daemon itself runs unelevated): a scheduled task
-  with the highest run level, started at boot,
+  作成後、`systemctl enable --now kairo-controller` で有効化・起動します。NVIDIA の persistence デーモンは稼働させておいてください。これが動いていないと、GPU を使用しているプロセスが存在しない間にドライバがクロックや電力上限をリセットしてしまう場合があります。
+
+- **Windows**（管理者権限で実行。デーモン本体は非昇格権限で動作します）: 起動時に最高特権レベルで実行されるタスクスケジューラのタスクを登録します。
 
   ```powershell
   $action = New-ScheduledTaskAction -Execute "D:\Kairo\kairo.exe" -Argument "controller --config D:\Kairo\kairo-controller.toml" -WorkingDirectory "D:\Kairo"
@@ -2264,152 +1588,68 @@ privileges the daemon does not have:
   Register-ScheduledTask -TaskName "kairo-controller" -Action $action -Trigger (New-ScheduledTaskTrigger -AtStartup) -Principal $principal -Settings $settings
   ```
 
-  `Stop-ScheduledTask` and a shutdown end it without its graceful stop: the
-  GPUs return to their defaults with the driver at boot, and the processor
-  settings when the controller next starts (from its state file). Ctrl-C in
-  a console is a graceful stop.
+  `Stop-ScheduledTask` や OS のシャットダウン時はグレースフル停止を経ずに終了します。この場合、GPU は次回起動時にドライバによってデフォルトへ戻り、プロセッサ設定は次回コントローラ起動時にステートファイルから復元されます。コンソール上での `Ctrl-C` はグレースフル停止となります。
 
-The controller warns at start when it is not elevated (Windows) or not root
-(Linux); its changes then fail and are reported as such.
+なお、コントローラは起動時に管理者権限（Windows）または `root` 権限（Linux）で実行されていない場合、警告を出力します。その状態で設定変更を試みると失敗し、エラーとして報告されます。
 
-#### Operating-point policy
+#### 動作点ポリシー
 
-The daemon (not an observe-only one) evaluates every minute each device a
-controller may change whose `max_slowdown` s is above 0, and asks for the
-setting that keeps performance within s for the least energy as the device's
-`policy` setting. It never holds back admission or waits for anything: a
-setting the controller does not apply is only a fact, and the next
-evaluation goes on. A device's profile is, per kind, the curve of its latest
-ended bench run (finished, partial or invalid) with valid references of that
-kind: an invalid kind of a run leaves its other kinds' curves in use.
+デーモン（`observe_only` モードでないもの）は 1 分ごとに、コントローラが変更可能かつ `max_slowdown`（`s`）が `0` より大きいすべてのデバイスを評価し、性能低下を `s` 以内に抑えつつ消費電力量が最小となる設定をデバイスの `policy` 設定として要求します。この処理がアドミッションを遅延させたり何かを待機したりすることはありません。コントローラが設定を適用できなかった場合も単なる事実として扱われ、次の評価が通常どおり継続されます。
 
-- A GPU's policy setting belongs to the lease holding it (not a bench's
-  lease, which sets its own; not one whose attempt has not started). The
-  policy compares what the GPU was seen doing since the attempt started, over
-  the last 5 minutes (`utilization.gpu` of its observations, `utilization.memory`
-  of its samples, at least 5 of each varying by at most 15 points), with the
-  fingerprint each swept kind showed in its bench (the same utilizations at
-  the references): every kind within 15 points on both is a candidate. The
-  setting chosen must suit every candidate (the worst case).
-- A CPU's policy setting belongs to its host and must suit all three CPU
-  kinds. While a bench of the host's CPU holds a lease, the policy setting is
-  removed, so the bench measures the defaults.
-- Selection (`internal/hwbench`): for a kind and tolerance s, the valid points
-  whose performance is at least 1 - s - 0.01 of the reference (a measurement
-  is good to about 1%), and among them the one using the least energy per
-  unit of work; none is the defaults. For several kinds, a setting must be
-  such a point of every kind, and the one using the least energy relative to
-  each kind's reference, on average, is taken.
-- Without a valid profile, or without a confident classification (too few
-  samples, usage that varies, no kind alike), the fallback caps the highest
-  graphics clock at (1 - s) of the GPU's greatest supported graphics clock,
-  rounded up to a supported clock (a CPU at (1 - s) of its greatest frequency
-  or performance percentage). The default clocks never exceed the greatest,
-  and performance loses no more than clock does, so this loses at most s
-  whatever runs. A CPU without a reported frequency range (Windows) stays at
-  its defaults.
-- Hysteresis: a new choice is applied once it has been the choice for 3
-  evaluations in a row, and a device's setting changes at most once per 5
-  minutes. A new lease starts at the defaults.
-- Each change is recorded: event `device_policy_decision` with its inputs (the
-  candidate kinds, the observed fingerprint, the runs and expected relative
-  performance and power against the defaults per kind, or the fallback's
-  reason), kept as the device's latest decision (`policy` of `hardware show
-  --json`; `hardware show` prints `policy graphics_clock_max_mhz=1800MHz
-  (profile, for gemm perf 0.970, 250 W vs 300 W) for lease ...`).
-- Energy saved: every evaluation while the policy's setting is in place on a
-  GPU (its controller applied it), the attempt holding it is credited the
-  elapsed time and, from the profile, the power saved for the same work (the
-  least over the candidates of relative performance x default power - power).
-  A fallback setting has no profile to estimate from; its time is counted as
-  unestimated.
+デバイスのプロファイルは、ベンチマーク種別（kind）ごとに、その種別の有効なリファレンス計測値を持つ直近の終了済みベンチマーク実行（`finished`、`partial`、または `invalid`）のカーブで構成されます。あるベンチマーク実行で一部の種別が無効（`invalid`）になっても、同一実行内の他の種別のカーブはそのまま利用されます。
 
-### Node quarantine
+- **GPU のポリシー設定とワークロード分類**: GPU の `policy` 設定は、その GPU を保持している Lease に紐づきます（独自のハードウェア設定を行うベンチマーク用の Lease や、Attempt がまだ開始していない Lease は対象外です）。ポリシーは、Attempt 開始以降かつ直近 5 分間の GPU 挙動（observation の `utilization.gpu` とサンプルの `utilization.memory`。それぞれ 5 点以上あり、変動幅が 15 ポイント以内であること）を、ベンチマークで各スイープ種別が示したフィンガープリント（リファレンス計測時の同じ使用率）と比較します。両方の使用率が 15 ポイント以内に収まるすべての種別を候補とし、すべての候補に適合する設定（最悪ケース基準）を選択します。
+- **CPU のポリシー設定**: CPU の `policy` 設定はホストに紐づき、3 種類の CPU ベンチマーク種別すべてに適合する設定が選ばれます。そのホストの CPU に対するベンチマークが Lease を保持している間は、ベンチマークがデフォルト状態を計測できるよう `policy` 設定は削除されます。
+- **動作点の選定（`internal/hwbench`）**: 単一の種別と許容低下率 `s` に対して、リファレンス比の性能が `1 - s - 0.01` 以上（計測精度は約 1%）である有効な点の中から、単位作業量あたりの消費電力量が最小のものを選びます。条件を満たす点がなければデフォルトとします。候補が複数種別ある場合は、すべての種別でその条件を満たす設定の中から、各種別のリファレンスに対する相対消費電力量の平均が最小のものを選択します。
+- **フォールバック**: 有効なプロファイルがない場合、または確信ある分類ができない場合（サンプル数不足、使用率の変動が大きい、該当する種別がないなど）は、フォールバックとして GPU の最大グラフィックスクロックをサポート上限の `(1 - s)` 倍（サポートされているクロック値へ切り上げ）に制限します（CPU の場合は最大周波数または最大パフォーマンス率の `(1 - s)` 倍）。デフォルトクロックがサポート上限を超えることはなく、性能低下もクロック低下率を上回ることはないため、どのようなワークロードであっても性能低下は最大 `s` に収まります。なお、周波数範囲が報告されない CPU（Windows）はデフォルト設定のまま維持されます。
+- **ヒステリシス**: 新しい選択結果は 3 回連続の評価で同じ結果になったときに初めて適用され、デバイスの設定変更は 5 分間に最大 1 回までに制限されます。新しい Lease はデフォルト設定から開始します。
+- **判断結果の記録**: 変更のたびに `device_policy_decision` イベントが記録されます。ここには判断の入力（候補種別、観測されたフィンガープリント、参照したベンチマーク実行、種別ごとのデフォルト比での想定相対性能・消費電力、またはフォールバック理由）が含まれ、デバイスの最新判断として保持されます（`kairo hardware show --json` の `policy` フィールドに出力され、`kairo hardware show` では `policy graphics_clock_max_mhz=1800MHz (profile, for gemm perf 0.970, 250 W vs 300 W) for lease ...` のように表示されます）。
+- **削減電力量の集計**: GPU 上でポリシー設定が適用されている（コントローラにより反映済みである）各評価サイクルごとに、その GPU を保持する Attempt に対して経過時間と、プロファイルに基づく同一作業量あたりの削減電力（全候補種別における「相対性能 × デフォルト消費電力 - 動作点消費電力」の最小値）が計上されます。フォールバック設定には推定に使えるプロファイルがないため、適用時間は未推定（unestimated）としてカウントされます。
 
-`kairo node quarantine --reason ... <NODE_ID>` (or `--all`) stops all work on a
-node (or every node) until `kairo node release <NODE_ID>` (or `--all`):
+### ノード隔離
 
-- its executors reserve nothing and trigger no priority preemption;
-- a running checkpointable attempt gets a `suspend` command (origin
-  `node_quarantine`) and later continues from its checkpoint;
-- any other running attempt is terminated by its executor, launcher and
-  descendants (Windows `taskkill /T /F`; Linux SIGTERM then SIGKILL to the
-  attempt's process group), and its task runs again from the start
-  (orchestration reason `quarantine_restart`) instead of failing.
+`kairo node quarantine --reason ... <NODE_ID>`（または `--all`）を実行すると、`kairo node release <NODE_ID>`（または `--all`）で解除されるまで、対象ノード（または全ノード）上のすべてのジョブが停止されます。
 
-`kairo node quarantine-status` shows each quarantine with the attempts still
-alive on it; the quarantine has taken full effect once that count is zero.
-Every step is recorded as a coordination event.
+- 対象ノードの Executor は新たなリソース予約を行わず、優先度に基づくプリエンプションも発生させません。
+- 実行中のチェックポイント対応 Attempt には `suspend` Command（起点 `node_quarantine`）が送信され、後日チェックポイントから継続実行されます。
+- それ以外の実行中 Attempt は、ランチャーおよび子孫プロセスを含めて Executor によって強制終了され（Windows は `taskkill /T /F`、Linux は Attempt のプロセスグループへの `SIGTERM` の後に `SIGKILL`）、Task は失敗扱いではなく最初から再実行されます（オーケストレーション理由 `quarantine_restart`）。
 
-### Node fence
+`kairo node quarantine-status` は、各隔離対象とそこで依然として生存している Attempt 数を表示します。この数がゼロになると、隔離は完全に完了したことになります。一連のステップはすべてコーディネーションイベントとして記録されます。
 
-An agent that stops for good (its machine lost, its container destroyed)
-never registers again, so the leases of its attempts stay active and hold
-their GPUs and the rest. `kairo node fence NODE_ID --confirm-agent-gone
-[--reason R]` (`POST /api/nodes/{id}/fence`, admin) settles them as the
-agent's registration would have, adopting nothing: each attempt of the
-node's executors is lost, its execution terminal (`executor_identity_lost`),
-and every lease of theirs stale (event `node_fenced`, with the stale leases
-per executor). It is refused (409 `executor_live`) while an executor of the
-node has polled within the last minute: a live agent settles its own leases
-when it restarts. A stale lease holds its resources until reconciled. If the
-agent comes back after a reboot, the daemon can release the leases of
-attempts that predate the boot, as described above. A mere agent restart
-won't let it adopt attempts already marked lost by the fence: any surviving
-processes go on unwatched until they end or are stopped by hand, which is
-what `kairo resource reconcile RESOURCE_ID --confirm-process-absent` checks.
+### ノードフェンス
 
-Reconcile waits for fresh observations of every resource, which a node that
-no longer exists never sends. `kairo node retire NODE_ID
---confirm-node-gone [--reason R]` (`POST /api/nodes/{id}/retire`, admin) is
-for a node gone for good (its container deleted, its host decommissioned):
-it fences the node as above (refused the same while an executor of it
-polls), releases every stale lease of its executors without those
-observations (events `stale_lease_reconciled`, `node_retired`), quiesces its
-lost attempts and disables its executors and the node, all in one transaction.
-Its stores stay declared until the machine declaration drops them.
+マシンが失われた、コンテナが破棄されたなどの理由でエージェントが永久に停止した場合、そのエージェントが再登録することはないため、担当していた Attempt の Lease は `active` なまま残り、GPU などのリソースを占有し続けます。
 
-### Force stop
+`kairo node fence NODE_ID --confirm-agent-gone [--reason R]`（`POST /api/nodes/{id}/fence`、管理者権限）は、エージェントが再登録した際と同じようにこれらの Lease を清算しますが、既存プロセスの引き継ぎ（adopt）は一切行いません。具体的には、対象ノードの Executor に紐づくすべての Attempt をロスト扱いとし、各 Execution を終了状態（`executor_identity_lost`）にして、それらの Lease をすべて `stale` に遷移させます（Executor ごとの `stale` Lease 一覧を含む `node_fenced` イベントを記録します）。
 
-`kairo task pause --force|-f [--grace 30s] [--reason ...] PROJECT QUEUE TASK`
-(also `queue` / `project pause --force`) is a pause operation that ends what
-it captures instead of suspending it, checkpointable or not:
+対象ノードの Executor のいずれかが直近 1 分以内にポーリングしている間は、フェンス操作は `409`（`executor_live`）で拒否されます（稼働中のエージェントは再起動時に自身の Lease を清算するためです）。`stale` な Lease はリコンサイルされるまでリソースを保持し続けます。エージェントが OS 再起動後に復帰した場合は、前述のとおり（[エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ)を参照）、起動時刻より前の Attempt に紐づく Lease をデーモンが解放できます。一方、単なるエージェント再起動ではフェンスによってすでにロスト扱いとなった Attempt を引き継ぐことはできません。残存しているプロセスは終了するか手動停止されるまで監視外で動き続けるため、`kairo resource reconcile RESOURCE_ID --confirm-process-absent` でプロセス不在を確認する必要があります。
 
-- a started execution's attempt gets a force stop that its executor (in the
-  daemon or a node agent) carries out on the whole process tree: a graceful
-  stop first (Windows: CTRL_BREAK to the launcher's process group; Linux:
-  SIGTERM to the process group and to every process carrying the
-  attempt's `KAIRO_ATTEMPT_ID`), then, after the grace period, a kill of
-  everything left (Windows: the attempt's job object and `taskkill /T /F`;
-  Linux: SIGKILL). The execution ends with terminal cause
-  `force_stopped`; a suspend in progress is not waited for.
-- an execution that has not started is withdrawn (`withdrawn_before_start`),
-  a reserved lease revoked as for any pause.
-- leases are released only through the ordinary quiescence proof, and the
-  operation is `quiesced` once the executors also confirm the trees are gone.
-  An exiting process gives up its memory, and with it the environment
-  `/proc/PID/environ` reads (it reads empty, or is refused), before it closes
-  its files (a GPU's among them) and becomes a zombie: one found by its
-  `KAIRO_ATTEMPT_ID` is remembered with its starttime and counted while it
-  is still there with that starttime, not a zombie, with an environment that
-  is empty or cannot be read.
-- the task ends in state `stopped`: no continuation or restart is planned, and
-  its dependants are blocked as for a failed task. The task result records the
-  operation, actor and reason.
+リコンサイルではすべてのリソースについて最新の観測情報を待ちますが、もはや存在しないノードから観測情報が送られることはありません。コンテナを削除した、あるいは物理ホストを廃止したなど、ノード自体が永久に失われた場合は `kairo node retire NODE_ID --confirm-node-gone [--reason R]`（`POST /api/nodes/{id}/retire`、管理者権限）を使用します。この操作は次の処理を単一トランザクション内で実行します。
 
-Force stops are delivered like other executor work (`force-stop-orders` /
-`force-stop-ack` on the agent API, acknowledged `signalled` then
-`terminated`). One that no executor picks up within 30 s blocks its pause
-target with `force_stop_not_picked_up` (the executor polls but has not picked
-it up: check that node's agent log) or `executor_unreachable` (it has not been
-seen).
+1. 上記と同様にノードをフェンスします（Executor が直近でポーリングしている場合は同様に拒否されます）。
+2. 新たな観測情報を待たずに、対象 Executor のすべての `stale` な Lease を解放します（`stale_lease_reconciled` および `node_retired` イベントを記録します）。
+3. ロスト扱いとなった Attempt を静止（quiesce）させます。
+4. 対象ノードおよびその Executor を無効化します。
 
-### Gang executions (multi-node)
+なお、そのノードに紐づくストアは、マシン宣言から削除されるまで宣言されたまま残ります。
 
-`[tasks.execution.gang]` runs a task as `size` ranks on distinct nodes (DDP
-training across hosts, a pipeline-parallel server). Every rank asks for the
-task's resources on its own node; `[[tasks.execution.gang.ranks]]` overrides
-`argv`, `cwd`, `executor` labels, `exclusive` or `capacity` of single ranks:
+### 強制停止
+
+`kairo task pause --force|-f [--grace 30s] [--reason ...] PROJECT QUEUE TASK`（`queue pause --force` および `project pause --force` も同様）は、チェックポイント対応の有無にかかわらず、対象となった実行を一時停止ではなく終了させる pause 操作です。
+
+- **開始済み Execution**: その Attempt に対して強制停止が発行され、担当 Executor（デーモン内蔵またはノードエージェント）がプロセスツリー全体を停止します。まずグレースフル停止を試み（Windows はランチャーのプロセスグループへ `CTRL_BREAK` を送信、Linux はプロセスグループおよび該当 Attempt の `KAIRO_ATTEMPT_ID` を持つすべてのプロセスへ `SIGTERM` を送信）、グレース期間経過後も残っているプロセスを強制終了します（Windows は Attempt のジョブオブジェクト終了と `taskkill /T /F`、Linux は `SIGKILL`）。Execution は終了原因 `force_stopped` で終了し、進行中の `suspend` は待機されません。
+- **未開始 Execution**: 取り下げられ（`withdrawn_before_start`）、予約済みの Lease は通常の pause と同様に取消（revoke）されます。
+- **Lease 解放と静止判定**: Lease は通常の静止証明（quiescence proof）を経てのみ解放され、Executor がプロセスツリーの完全消滅も確認した時点で操作全体が `quiesced` となります。終了途中のプロセスは、ファイル（GPU のデバイスファイルを含む）を閉じてゾンビ状態になるよりも先に自身のメモリを解放するため、その段階で `/proc/PID/environ` から環境変数を読み取れなくなります（空になるかアクセスが拒否されます）。このため、`KAIRO_ATTEMPT_ID` によって特定されたプロセスは `starttime` とともに記憶され、同じ `starttime` で存在し続けており、ゾンビではなく、かつ環境変数が空または読み取り不可である間も生存中としてカウントされます。
+- **Task の最終状態**: Task は `stopped` 状態で終了し、継続実行や再起動は計画されません。また、後続 Task は失敗した Task の場合と同様にブロックされます。Task 結果には操作内容、実行者（actor）、および理由が記録されます。
+
+強制停止指示は他の Executor 作業と同様にエージェント API（`force-stop-orders` / `force-stop-ack`）で配信され、`signalled` に続いて `terminated` の順に確認応答されます。30 秒以内にどの Executor にもピックアップされない場合、対象の pause 操作は次のいずれかの理由でブロックされます。
+
+- `force_stop_not_picked_up`: Executor はポーリングしているにもかかわらず強制停止指示を取得していない状態（対象ノードのエージェントログを確認してください）。
+- `executor_unreachable`: Executor との通信が確認できていない状態。
+
+### Gang 実行
+
+`[tasks.execution.gang]` を設定すると、複数ホストにまたがる DDP 学習やパイプライン並列サーバのように、1 つの Task を別々のノード上で `size` 個の rank として実行できます。各 rank はそれぞれのノード上で Task に定義されたリソースを要求します。個別の rank については `[[tasks.execution.gang.ranks]]` で `argv`、`cwd`、`executor` ラベル、`exclusive`、`capacity` を上書きできます。
 
 ```toml
 [tasks.execution.gang]
@@ -2419,7 +1659,7 @@ rank = 1
 argv = ["/root/.local/bin/uv", "run", "train.py"]
 cwd = "/srv/project"
 executor = { labels = { environment = "linux" } }
-[[tasks.execution.gang.ranks.exclusive]]   # this rank's node has two GPUs
+[[tasks.execution.gang.ranks.exclusive]]   # この rank を実行するノードには GPU が 2 基ある
 kind = "gpu"
 count = 2
 same_node = true
@@ -2427,30 +1667,16 @@ same_node = true
 ram_bytes = 17179869184
 ```
 
-A rank's `exclusive` (`exclusive = []` for no GPU) or `capacity` replaces the
-task's for that rank as a whole; a rank without them asks for the task's. The
-task's `env` reaches every rank, so it may not set `CUDA_VISIBLE_DEVICES` when
-any rank leases a GPU.
+rank ごとの `exclusive`（GPU 不要の場合は `exclusive = []`）や `capacity` は、その rank について Task 側の定義全体を置き換えます。これらを指定しない rank は Task 側の定義をそのまま要求します。また、Task の `env` は全 rank に渡されるため、いずれかの rank が GPU を Lease する構成では `env` に `CUDA_VISIBLE_DEVICES` を設定することはできません。
 
-- Each rank is an ordinary execution; rank 0 (the leader) is the one
-  orchestration tracks, and the task's outcome is read over every rank.
-- Placement is all or nothing: every rank gets a lease on a distinct node in
-  one transaction. Rank 0's node needs an `interconnect_addr` label.
-- No rank launches before every rank is prepared. A placement not prepared
-  within two minutes, or losing a lease before launch, is aborted and the ranks
-  wait again. The abort reason (kept on the placement and logged) names each
-  rank's executor, whether that executor received the rank's lease, and the
-  executor's `last_seen_at`.
-- Every rank is launched with `RANK`, `WORLD_SIZE`, `MASTER_ADDR` (rank 0's
-  `interconnect_addr`), `MASTER_PORT` (29500-29999, free on that node) and
-  `KAIRO_GANG_*`; an executor labelled `interconnect_ifname` also sets
-  `NCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME`.
-- One fate: a rank that stops other than by exit 0 or a checkpoint gets the
-  others terminated; a `suspend` to one rank (pause, preemption, quarantine)
-  is sent to every rank. A rank that failed to launch after others started
-  restarts the gang (orchestration reason `gang_restart`).
-- A waiting gang preempts like a single execution (each rank on its node,
-  see Admission); its running ranks can be preempted.
+Gang 実行の動作ルールは以下のとおりです。
+
+- **実行単位と結果判定**: 各 rank は通常の Execution として扱われます。オーケストレーションが追跡するのは rank 0（leader）ですが、Task 全体の結果は全 rank を通して判定されます。
+- **一括配置（All-or-nothing placement）**: すべての rank に対し、それぞれ異なるノード上の Lease を単一トランザクションで一括確保します。rank 0 が配置されるノードには `interconnect_addr` ラベルが必要です。
+- **起動同期と中断**: すべての rank が `prepared` 状態になるまで、どの rank も起動されません。2 分以内に全 rank の準備が完了しない場合、または起動前にいずれかの Lease を失った場合、その配置（placement）は中断され、全 rank が再び待機状態に戻ります。中断理由（placement に保持され、ログにも出力されます）には、各 rank の Executor、その Executor が rank の Lease を受信したかどうか、および Executor の `last_seen_at` が記録されます。
+- **環境変数の注入**: 各 rank の起動時には、`RANK`、`WORLD_SIZE`、`MASTER_ADDR`（rank 0 の `interconnect_addr`）、`MASTER_PORT`（rank 0 のノード上で空いている `29500`〜`29999` のポート）、および `KAIRO_GANG_*` が設定されます。さらに、`interconnect_ifname` ラベルを持つ Executor では `NCCL_SOCKET_IFNAME` と `GLOO_SOCKET_IFNAME` も設定されます。
+- **運命共同体（One fate）**: いずれかの rank が終了コード `0` またはチェックポイント以外の理由で停止した場合、他のすべての rank も終了させられます。いずれか 1 つの rank に送られた `suspend`（pause、プリエンプション、隔離によるもの）は全 rank へ送信されます。また、他の rank が起動した後に一部の rank の起動が失敗した場合は、Gang 全体が再起動されます（オーケストレーション理由 `gang_restart`）。
+- **プリエンプション**: 待機中の Gang は単一の Execution と同様にプリエンプションを行います（各 rank が自身の配置先ノード上で実行。[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）。また、実行中の rank が他のジョブによってプリエンプションされることもあります。
 
 ## Worker SDK
 
@@ -2466,64 +1692,50 @@ with AttemptSession.from_environment() as kairo:
             break
 ```
 
-Managed attempts receive `KAIRO_API_URL`, `KAIRO_EXECUTION_ID`,
-`KAIRO_ATTEMPT_ID`, `KAIRO_ATTEMPT_TOKEN` and, when the daemon serves TLS,
-`KAIRO_API_CA`; also `KAIRO_NODE_ID`, `KAIRO_EXECUTOR_ID`,
-`KAIRO_RESOURCE_IDS`, `KAIRO_RESOURCE_BINDINGS` and `CUDA_VISIBLE_DEVICES` (a leased GPU by its UUID, never by index),
-`KAIRO_CONTINUATION_REF` when resuming, `KAIRO_SCRATCH` and
-`KAIRO_OUTPUT_DIR` when the executor serves a volatile store (Data stores),
-and the gang variables for a gang
-rank. Rank zero polls and acknowledges commands; the PyTorch adapter broadcasts the command,
-runs every rank's callback, and only publishes the continuation after the
-distributed barrier. Commands may be redelivered, so checkpoint publication
-must remain idempotent by command ID.
+### 管理対象 Attempt に渡される環境変数と Gang 連携
 
-A safe point acknowledges a `suspend` `accepted` and `checkpointing`, runs the
-checkpoint callback, and publishes its continuation with `checkpointed`; a
-`checkpoint` command (`kairo task checkpoint`) runs the same callback
-(`command.kind` tells them apart) and is acknowledged the same way, but the
-safe point returns false and the worker carries on. A
-callback that fails, or returns no continuation, is acknowledged `rejected`:
-for a suspend the error is raised, for a `checkpoint` command the worker
-carries on (it asked for a copy, not for the run to end). Unknown command
-kinds are skipped. A daemon or network briefly unavailable (a transient or
-retry-later failure of the poll, a heartbeat or an acknowledgement) is no
-command at that safe point: it carries on, keeps the error in
-`last_control_error`, and the command is delivered again. In a Kairo gang
-`DistributedAdapter` registers and heartbeats every rank in its own attempt;
-rank 0 polls and decides, and every other rank then acknowledges its own
-command the same way. After `install_stop_signals()` a SIGTERM /
-CTRL_BREAK (the graceful phase of a force stop) makes the next safe point run
-the callback once (reason `stop_signal`, no command id, nothing acknowledged)
-and return true, so the work can still be resumed by hand. A worker whose
-token is refused (the attempt quiesced: retired) or fenced stops reporting.
-Python also offers `ProgressReporter`, `GangContext`, `continuation_or`,
-`CommandJournal` (idempotent checkpoints by command id), `provenance.capture`
-and the operator `KairoClient`.
+Kairo が管理する Attempt には、以下の環境変数が渡されます。
 
-The Rust crate `sdk/rust/kairo-sdk` (blocking, ureq + rustls) implements the
-same worker side: `Attempt::from_env`, a `Session` with one heartbeat thread
-and `safe_point`, the process-wide `reporter(unit)` / `phase` progress
-handles, and `kairo_sdk::Progress` compatible with neo-ime's former
-`kairo-progress`. Depend on it by git:
+- **基本接続・認証**: `KAIRO_API_URL`、`KAIRO_EXECUTION_ID`、`KAIRO_ATTEMPT_ID`、`KAIRO_ATTEMPT_TOKEN`（デーモンが TLS を提供している場合は `KAIRO_API_CA` も付与）
+- **配置・リソース割り当て**: `KAIRO_NODE_ID`、`KAIRO_EXECUTOR_ID`、`KAIRO_RESOURCE_IDS`、`KAIRO_RESOURCE_BINDINGS`、および `CUDA_VISIBLE_DEVICES`（Lease された GPU の UUID が設定され、インデックス番号は決して使用されません）
+- **再開時**: `KAIRO_CONTINUATION_REF`
+- **volatile store**: Executor がvolatile store（[データストア](#データストア)を参照）を提供している場合は `KAIRO_SCRATCH` と `KAIRO_OUTPUT_DIR`
+- **Gang 実行**: Gang rank 向けの環境変数
+
+分散実行時は rank 0 が Command のポーリングと応答（acknowledge）を行います。PyTorch アダプタはその Command を全 rank へブロードキャストし、各 rank のコールバックを実行したうえで、分散バリア（distributed barrier）の完了後にのみ継続（continuation）を公開します。Command は再送される可能性があるため、チェックポイントの公開処理は Command ID ごとにべき等（idempotent）である必要があります。
+
+### セーフポイントの挙動と Python・Rust SDK
+
+`safe_point` およびワーカー制御の仕様は次のとおりです。
+
+- **`suspend` Command**: `accepted` と `checkpointing` を応答してチェックポイント用コールバックを実行し、得られた継続（continuation）を `checkpointed` として公開したうえで `True` を返します。
+- **`checkpoint` Command（`kairo task checkpoint`）**: `suspend` と同じコールバックを実行し（両者は `command.kind` で判別できます）、同じ手順で応答しますが、`safe_point` は `False` を返し、ワーカーはそのまま処理を継続します。
+- **コールバック失敗時**: コールバックが失敗した場合、または継続を返さなかった場合は `rejected` を応答します。このとき、`suspend` であればエラーが送出（raise）されますが、`checkpoint` Command であればワーカーは処理を継続します（実行の終了ではなくコピーの作成を求めているに過ぎないためです）。
+- **未知の Command**: 未知の Command 種別（command kind）はスキップされます。
+- **一時的な通信障害**: デーモンやネットワークが一時的に利用できない場合（ポーリング・ハートビート・応答における一時的エラーまたはリトライ対象エラー）は、そのセーフポイントでは Command が届いていないものとして扱われます。ワーカーは処理を継続し、エラーを `last_control_error` に保持したまま進み、Command は後から再送されます。
+- **Gang 実行**: Kairo Gang 内では、`DistributedAdapter` がすべての rank をそれぞれの Attempt として登録し、ハートビートを送信します。rank 0 がポーリングして判断を行い、他のすべての rank も同じ手順で自身の Command に応答します。
+- **停止シグナル**: `install_stop_signals()` を呼び出した後に `SIGTERM` / `CTRL_BREAK`（強制停止のグレースフルフェーズ）を受信すると、次のセーフポイントでコールバックが 1 回だけ実行され（reason は `stop_signal`、Command ID なし、応答送信なし）、`True` を返します。これにより、作業を手動で再開できる状態を保てます。
+- **退役・フェンス時**: トークンが拒否されたワーカー（Attempt が `quiesced` すなわち退役（retired）状態になった場合）や、フェンスされた（fenced）ワーカーは報告を停止します。
+
+Python SDK には、このほか `ProgressReporter`、`GangContext`、`continuation_or`、`CommandJournal`（Command ID ごとにべき等なチェックポイントを管理）、`provenance.capture`、およびオペレータ向けの `KairoClient` が用意されています。
+
+Rust クレート `sdk/rust/kairo-sdk`（ブロッキング実装、`ureq` + `rustls`）も同じワーカー側機能を実装しています。`Attempt::from_env`、1 つのハートビートスレッドと `safe_point` を備えた `Session`、プロセス全体で共有される `reporter(unit)` / `phase` 進捗ハンドル、および `neo-ime` の旧 `kairo-progress` と互換性のある `kairo_sdk::Progress` を提供します。依存関係は git 経由で指定します。
 
 ```toml
 kairo-sdk = { git = "https://github.com/esehehelp/Kairo", rev = "<commit>" }
 ```
 
-Every SDK replays `sdk/conformance/*.json` in its tests.
+すべての SDK は、テストスイート内で `sdk/conformance/*.json` をリプレイして適合性を検証します。
 
-### Low-level project-owned controller policy
+### プロジェクト管理の低レベルコントローラポリシー
 
-Projects submitting directly to the execution API can still opt into
-`ResumeAfterKairoPreemption`. The policy snapshot and canonical submission are
-written to the project's controller journal before the initial API call:
+Execution API へ直接投入するプロジェクトでも、`ResumeAfterKairoPreemption` をオプトインで利用できます。ポリシースナップショットと正規化された投入内容（canonical submission）は、最初の API 呼び出しの前にプロジェクト側のコントローラジャーナルへ書き込まれます。
 
 ```python
 from kairo_sdk import ControllerJournal, KairoControllerClient, ProjectController
 
 controller = ProjectController(
-    KairoControllerClient(),  # KAIRO_API / KAIRO_TOKEN / KAIRO_CA_FILE, or the config dir
+    KairoControllerClient(),  # KAIRO_API / KAIRO_TOKEN / KAIRO_CA_FILE、または設定ディレクトリを使用
     ControllerJournal("local/llm-controller.db"),
 )
 execution_id = controller.submit_with_resume_after_kairo_preemption(
@@ -2534,566 +1746,351 @@ execution_id = controller.submit_with_resume_after_kairo_preemption(
 controller.run_forever()
 ```
 
-Use one controller journal per project; activity IDs are local to that
-project-owned journal.
+コントローラジャーナルは 1 プロジェクトにつき 1 つ使用してください。activity ID はそのプロジェクト管理のジャーナル内でローカルに扱われます。
 
-Only a `priority_preemption` command with an acknowledged continuation for
-that exact command, a quiesced attempt, and a released lease can trigger the
-policy. The controller journals a deterministic decision before submitting
-the successor. API retries reuse the same client request ID, so controller
-crashes and complete event replay cannot create another successor. Event
-cursors are therefore only an optimization; the durable decision is the
-correctness boundary. Delegation validity comes from the immutable policy
-snapshot attached to the logical activity's current execution, not from a
-server-owned workflow state or semantic default.
+このポリシーを発動できるのは、以下の条件をすべて満たした場合に限られます。
 
-## Pilot acceptance contract
+- `priority_preemption` Command であること
+- まさにその Command に対して応答済みの継続（continuation）が存在すること
+- Attempt が `quiesced` になっていること
+- Lease が解放されていること
 
-1. Observe-only inspection of an existing LLM pretrain creates no lease.
-2. A one-GPU job passes `run -> suspend -> checkpointed -> process exit ->
-   quiesced -> lease release`; an explicitly selected task policy may then
-   submit a resumed immutable Execution.
-3. Daemon/process failure at every transition causes neither duplicate GPU
-   ownership nor loss of an acknowledged continuation.
-4. A project-selected short high-priority execution can trigger cooperative
-   preemption; a versioned Task policy decides whether to resume orchestrated
-   work, while direct execution API users retain the project-owned controller
-   option.
-5. Redelivery of one command cannot corrupt checkpoint publication.
-6. A static Task DAG submits a node only after all dependencies succeed, and
-   replay cannot create a duplicate Execution for one policy decision.
-7. A two-GPU DDP execution receives an all-or-nothing gang lease and all ranks
-   quiesce before release.
+コントローラは後続の Execution を投入する前に、決定論的な判定結果（deterministic decision）をジャーナルに記録します。API のリトライ時には同一のクライアントリクエスト ID（client request ID）を再利用するため、コントローラのクラッシュやイベントの完全リプレイが発生しても、別の後続 Execution が重複して作成されることはありません。
 
-Cloud provisioning, roles beyond the four above, service supervision,
-cron/fair-share scheduling, and hard CPU/RAM enforcement remain outside this
-pilot.
+したがって、イベントカーソルはあくまで最適化手段に過ぎず、永続化された判定記録（durable decision）こそが正当性の境界（correctness boundary）となります。委任の有効性（delegation validity）は、サーバ側が保持するワークフロー状態や暗黙のデフォルト仕様ではなく、論理アクティビティ（logical activity）の現在の Execution に紐づけられた不変のポリシースナップショットによって決まります。
 
-## Hardware benchmarks
+## パイロット受け入れ契約
 
-### Bench runs
+1. 既存の LLM 事前学習（pretrain）を `observe_only`（観測専用モード）で検査しても、Lease が作成されないこと。
+2. 1 GPU ジョブが `run -> suspend -> checkpointed -> process exit -> quiesced -> lease release` の遷移を完了でき、その後、明示的に選択された Task ポリシーによって再開用の不変 Execution を投入できること。
+3. どの状態遷移のタイミングでデーモンまたはプロセスに障害が発生しても、GPU の重複所有や、応答済み継続（acknowledged continuation）の喪失が起きないこと。
+4. プロジェクトが選択した短時間・高優先度の Execution によって協調的プリエンプション（cooperative preemption）を発動できること。オーケストレーション対象のジョブを再開するかどうかはバージョン管理された Task ポリシーが決定し、Execution API を直接利用するユーザーにはプロジェクト管理コントローラの選択肢が残されていること。
+5. 同一 Command が再送されても、チェックポイントの公開処理が破損しないこと。
+6. 静的な Task DAG では、すべての依存先が成功した後にのみ対象ノード（Task）が投入され、リプレイを行っても 1 つのポリシー判定に対して重複した Execution が作成されないこと。
+7. 2 GPU の DDP Execution は all-or-nothing の Gang Lease を取得し、Lease 解放前にすべての rank が静止（`quiesced`）すること。
 
-`kairo hardware bench HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run]`
-(admin) measures how a device performs, and what energy it uses, at each
-setting of a grid. DEVICE is a GPU UUID, `cpu`, `disk:FILESYSTEM` (a
-filesystem provider's path on one of the host's nodes) or `net:NODE` (the
-network from the host's node to NODE). The run is an ordinary Task of the
-Kairo-owned project `kairo`, queue `hardware-bench`, named after the run
-(`kairo task show kairo hardware-bench bnc_...`), declared as `project apply`
-declares one (`RunToCompletion@v1`, its first execution submitted at once),
-at priority -1000000, checkpointable and preemptible: it waits for every
-other execution, never preempts one, holds its device alone, and is
-suspended for work that needs its device (see Suspend and resume below):
+クラウドのプロビジョニング、上記 4 種類以外のロール、サービスの監視・常駐管理（service supervision）、cron / フェアシェアスケジューリング、および CPU / RAM の厳格な強制制限（hard enforcement）は、このパイロットの対象外です。
 
-| Device | Lease | Kinds (swept, else at the defaults) |
+## ハードウェアベンチマーク
+
+### ベンチマーク実行
+
+`kairo hardware bench HOST DEVICE [--kinds K,...] [--node NODE] [--dry-run]`（admin 権限）は、設定値のグリッド（grid）上の各設定において、デバイスがどの程度の性能を発揮し、どれだけの電力量（energy）を消費するかを計測します。`DEVICE` には、GPU の UUID、`cpu`、`disk:FILESYSTEM`（ホストに属するいずれかのノード上の filesystem Provider のパス）、または `net:NODE`（ホスト側のノードから `NODE` へのネットワーク）を指定します。
+
+ベンチマーク実行（bench run）は、Kairo 管理下のプロジェクト `kairo`、キュー `hardware-bench` に属する通常の Task として実行されます。Task 名は実行 ID にちなんだもの（`kairo task show kairo hardware-bench bnc_...`）となり、`project apply` で宣言した場合と同じ形式（`RunToCompletion@v1`、最初の Execution が即座に投入される）で宣言されます。優先度は `-1000000`、チェックポイント可能かつプリエンプション可能であるため、他のすべての Execution の完了を待ち、他の Execution をプリエンプトすることはありません。また、対象デバイスを単独で占有し、そのデバイスを必要とする別のジョブが到着すれば中断（suspend）されます（後述の「[中断と再開](#中断と再開)」を参照）。
+
+| デバイス | Lease | 種別（Kinds: 記載のあるものはスイープ対象、それ以外はデフォルト設定で計測） |
 |---|---|---|
-| GPU | that GPU (an exclusive request may name its `device`), 1 CPU, 2 GiB | `gemm` (bf16), `copy`, `gemv-b1`, `gemv-b8` swept; `pcie-h2d`, `pcie-d2h`, `pcie-h2d-latency`, `pcie-d2h-latency` |
-| `cpu` | the node's whole CPU (`cpu_millis_min` = all of it: nothing runs beside it), 4 GiB | `cpu-compute`, `cpu-single`, `cpu-stream` swept |
-| `disk:FS` | 9 GiB of FS (the test files) | `disk-seq-read`, `disk-seq-write` (qd 32), `disk-rand-read` (qd 32), `disk-rand-read-qd1`, `disk-rand-write`, `disk-fsync`, `disk-sustained` |
-| `net:NODE` | a 2-rank gang: rank 0 on the host's node (`--node`; it needs `interconnect_addr`, as for any gang) serves (`kairo bench serve` at `KAIRO_GANG_MASTER_ADDR:PORT`), rank 1 on NODE measures | `net-latency`, `net-bandwidth-send`, `net-bandwidth-recv` (4 streams) |
+| GPU | 対象 GPU（排他リクエストで対象 `device` を指定可能）、1 CPU、2 GiB | スイープ対象: `gemm`（bf16）、`copy`、`gemv-b1`、`gemv-b8`／デフォルト計測: `pcie-h2d`、`pcie-d2h`、`pcie-h2d-latency`、`pcie-d2h-latency` |
+| `cpu` | ノードの全 CPU（`cpu_millis_min` = 全量: 同じノードで他ジョブは並行実行されない）、4 GiB | スイープ対象: `cpu-compute`、`cpu-single`、`cpu-stream` |
+| `disk:FS` | `FS` 上の 9 GiB（テスト用ファイル） | `disk-seq-read`、`disk-seq-write`（qd 32）、`disk-rand-read`（qd 32）、`disk-rand-read-qd1`、`disk-rand-write`、`disk-fsync`、`disk-sustained` |
+| `net:NODE` | 2-rank Gang: ホスト側ノード（`--node`、通常の Gang と同様に `interconnect_addr` が必要）上の rank 0 が `KAIRO_GANG_MASTER_ADDR:PORT` でサーバ起動（`kairo bench serve`）、`NODE` 上の rank 1 が計測を実行 | `net-latency`、`net-bandwidth-send`、`net-bandwidth-recv`（4 ストリーム） |
 
-`--kinds` takes kinds or groups by prefix (`pcie`, `gemv`). A GPU or CPU bench
-sweeps settings, so it is refused for a device declared `control = false`, on
-a host without a controller, before the controller reported what the device
-supports, and while the device has a manual setting; a storage or network
-bench measures the defaults and needs no controller. One bench per device
-waits or runs at a time (`409 bench_conflict`), and a network bench is refused
-while another gang spans the two nodes. `--dry-run` prints the run, the lease
-and the argv without submitting.
+#### 実行条件・競合・バイナリ検出
 
-Where the programs are is reported by each node with its registration, from
-`[bench]` of the agent's (or daemon's, for its own node) configuration:
-`kairo_binary` (default: that kairo), `gpu_binary` (`kairo-bench-gpu`; a node
-without it takes no GPU bench), `cwd` (default the kairo binary's directory)
-and `executor_labels` (the executor that runs them natively). The execution's argv is `kairo hardware bench-run --run
-ID`, the driver, which reaches the daemon through the worker API with its
-attempt token (`KAIRO_API_URL`, `KAIRO_API_CA`, `KAIRO_ATTEMPT_TOKEN`): that
-token reaches only the run its attempt carries out (another run is `403`, an
-attempt that is no bench's `404`), and sets only its own lease's `bench`
-setting.
+- `--kinds` には個別の種別名、またはプレフィックスによるグループ指定（`pcie`、`gemv` 等）を渡せます。
+- GPU および CPU のベンチマークは設定をスイープするため、以下の場合は拒否されます。
+  - `control = false` と宣言されたデバイス
+  - コントローラのないホスト
+  - コントローラが対象デバイスのサポート機能をまだ報告していない段階
+  - 対象デバイスに手動設定（manual setting）が適用されている間
+- ストレージおよびネットワークのベンチマークはデフォルト設定で計測するため、コントローラは不要です。
+- 1 デバイスにつき待機中または実行中にできるベンチマークは 1 つまでです（競合時は `409 bench_conflict`）。ネットワークベンチマークは、その 2 ノード間にまたがる別の Gang が存在する間は拒否されます。
+- `--dry-run` を指定すると、実行を投入せずに run の内容、Lease、および argv を出力します。
 
-The driver, per kind, runs one primitive for the whole kind (stopped as soon
-as the kind is done; `--seconds` bounds it), and its clock is the primitive's
-own interval stream:
+各ベンチマーク用プログラムの配置場所は、各ノードが登録時にエージェント（デーモン自身のノードではデーモン）の設定ファイルの `[bench]` セクションから報告します。
 
-1. Records the device's facts from the start record (`device`, the workload
-   versions and builds, the GPU driver) and, before the first kind, the GPU's
-   observed temperature at rest.
-2. Clears its setting and waits until the controller reports the defaults
-   applied (no policy setting either), warms up until steady (temperature
-   changing by less than 0.5 °C/min over 60 s, or throughput by less than
-   0.5%/min without a temperature; at most 5 minutes, else `not steady`), and
-   measures the first reference: 20 s settle, 30 s measurement.
-3. Sweeps the grid, from the controller's capabilities: the GPU's graphics
-   clock cap from its greatest supported clock down to 50% of it in steps of
-   5% of it (snapped to the nearest supported clock), then each supported
-   memory clock below the greatest at the caps of 100% and 85%, then (gemm
-   only) power limits of 90, 80, 70 and 60% of the default within the range;
-   the CPU's `max_perf_pct` (intel_pstate) or `max_freq_mhz` (cpufreq) from
-   100% down to 50% in 5% steps (Windows reports no frequency range: no
-   sweep). Each point: ask for the setting, wait until the controller reports
-   that generation applied (60 s, else `not applied`), settle 20 s, measure 30
-   s. The second reference is taken after half the grid, the third at the end.
-4. Per point: work/s, performance relative to the mean of the three
-   references, mean power, energy per unit of work, the achieved clocks,
-   temperature, clock event reasons and utilization. GPU energy is the sum of
-   the intervals' NVML `energy_mj`; CPU energy comes from the daemon, from the
-   host's CPU package samples over the measurement window (of the series
-   covering most of it, the controller's or a node's; the same packages are
-   never added twice), each sample counting for the span since the one before
-   it (`cpu energy not covered` when they miss more than a tenth of it).
-5. A point is invalid when its setting was not applied (or no longer held at
-   its end), its clock fell short of its graphics clock cap by more than 2%
-   with a thermal event reason (`0x20`, `0x40`: the cap says nothing then; an
-   uncapped point measures what the device does with its heat), anything else
-   used the device (a process Kairo did not start on the GPU, another lease
-   on the host's nodes for a CPU, another lease reserving the filesystem, a
-   gang across the two nodes), a manual or policy setting was in effect, or
-   the primitive did no work or ended early. A kind whose three references
-   spread more than 1% ((max - min) / mean), or with an invalid reference, is
-   invalid as a whole: its curve is not used, the other kinds' are. A kind
-   measured once is its own reference. `disk-sustained` measures until its
-   write limit. Each kind's reference is recorded as soon as the kind is done
-   (`POST /api/worker/bench/kinds`).
-6. Clears its setting (the lease's release would anyway) and finishes the run:
-   `finished` when every kind is valid, `partial` when some are (the policy
-   and the profile use their curves; the reason names the other kinds and
-   why), `invalid` when none is. A run whose task ends without the driver
-   finishing it (force-stopped, crashed, cancelled) is `failed`, with `the
-   bench execution ended without its results (CAUSE)`: what it recorded is
-   kept but never used.
+- `kairo_binary`: `kairo` バイナリのパス（デフォルト: そのノードの `kairo` バイナリ自身）
+- `gpu_binary`: `kairo-bench-gpu` のパス（未設定のノードでは GPU ベンチマークは実行されない）
+- `cwd`: 作業ディレクトリ（デフォルト: `kairo` バイナリの配置ディレクトリ）
+- `executor_labels`: ベンチマークをネイティブ実行する Executor を指定するラベル
 
-Suspend and resume: the driver is a cooperative worker, as with the SDKs'
-`safe_point`. Before every kind and every point, every 15 s of a warm-up and
-while it waits for other work, it polls the attempt's commands (`GET
-/api/worker/commands`); a `suspend` (a preemption, a `pause`, a node
-quarantine) is acknowledged `accepted` and `checkpointing`, the primitive is
-stopped, the bench setting cleared (the lease's release returns the device
-to its defaults anyway), and `checkpointed` with the continuation
-`{"run":"bnc_...","done":["pcie-h2d",...]}` (the same for a command delivered
-again); the attempt exits 0. A suspend withdrawn meanwhile (404) is skipped,
-other kinds of command too. The task's continuation execution carries on the
-same run (event `hardware_bench_continued`): the run waits again (`hardware
-profile` shows it `suspended`, with the kinds done), the points of the kind
-that was interrupted are dropped, and the new attempt (`hardware_bench_resumed`
-when it starts) skips the kinds done and measures the others, the
-interrupted one from the start (its warm-up and references included), asking
-for its settings under its own lease. Suspended and resumed, a run ends like
-any other. The graceful phase of a force stop (SIGTERM, CTRL_BREAK, Ctrl-C)
-makes the driver leave within a second, the primitive stopped (it gets the
-signal too) and the setting cleared, publishing nothing: the task is
-`stopped` and the run `failed`. A second signal cancels what it is doing. A
-`task rerun` of a bench's task does not revive its failed run (the driver
-finds it ended and fails): ask for a new bench.
+Execution の argv はドライバである `kairo hardware bench-run --run ID` となります。ドライバは Attempt トークン（`KAIRO_API_URL`、`KAIRO_API_CA`、`KAIRO_ATTEMPT_TOKEN`）を使ってワーカー API 経由でデーモンと通信します。このトークンがアクセスできるのは自身の Attempt が担当する run のみであり（他の run へのアクセスは `403`、ベンチマーク以外の Attempt からのアクセスは `404`）、変更できる設定も自身の Lease に紐づく `bench` 設定のみです。
 
-The primitives' own safety limits apply as they are (free space, the 20 GiB
-written per primitive run, memory). Runs and points are kept indefinitely
-(`bench_runs`, `bench_points`); events `hardware_bench_requested`,
-`hardware_bench_started`, `hardware_bench_continued`,
-`hardware_bench_resumed`, `hardware_bench_finished` (with its `state` and
-`valid_kinds`) and `hardware_bench_invalid` (a run with no valid kind, and a
-failed run).
+#### ドライバの実行手順
 
-`kairo hardware profile HOST [DEVICE] [--json]` prints per device its latest
-runs (a partial one `valid for 7 of 8 kinds: gemm: references spread ...`, a
-suspended one `suspended since ..., 3 of 8 kinds done`) and, per kind, the
-curve of the latest ended run with valid references of it:
-each point's setting, relative performance, power, energy per unit of work,
-clock, temperature and validity, the point the policy would choose for the
-device's `max_slowdown` marked `*`, and the drift from the device's own
-previous run of that kind (`drift from bnc_... (10-20 09:00): work/s -0.8%,
-energy/work +1.2%`). Nothing is compared with a specification or with other
-devices. `GET /api/hardware/{host}/profile` answers `{"host", "runs"}` (runs
-with `references` and `points`); `POST .../bench` takes `{"kinds", "node",
-"dry_run", "actor"}` and answers `{"run", "execution", "dry_run"}`.
+ドライバは種別（kind）ごとに 1 つのプリミティブをその種別全体にわたって実行し（種別が完了次第すぐに停止、`--seconds` で上限時間を制限）、時間基準（クロック）にはプリミティブ自身のインターバルストリームを使用します。
 
-### Primitives
+1. **デバイス情報の記録**: `start` レコードからデバイスの基本情報（`device`、ワークロードのバージョンとビルド、GPU ドライバ）を記録します。最初の種別を開始する前に、GPU のアイドル時の観測温度（temperature at rest）も記録します。
+2. **ウォームアップと初回リファレンス計測**: 自身の設定をクリアし、コントローラがデフォルト設定の適用完了を報告するまで待機します（ポリシー設定も適用されていない状態）。その後、定常状態に達するまでウォームアップを行います（温度変化が 60 秒間で `0.5 °C/min` 未満、温度を取得できない場合はスループット変化が `0.5%/min` 未満になるまで。最大 5 分間。達しない場合は `not steady`）。続いて 1 回目のリファレンスを計測します（安定化待ち 20 秒、計測 30 秒）。
+3. **グリッドのスイープと第 2・第 3 リファレンス**: コントローラが報告した機能（capabilities）に基づき、以下のグリッドをスイープします。
+   - **GPU**: まずグラフィックスクロック上限（graphics clock cap）を最大サポートクロックからその 50% まで、最大サポートクロックの 5% 刻みで下げながらスイープします（各値は最も近いサポートクロックへ丸められます）。次に、最大値より低い各サポートメモリクロックについて、グラフィックスクロック上限 100% および 85% でスイープします。さらに（`gemm` のみ）、デフォルト電力上限の 90%、80%、70%、60% のうちサポート範囲内に収まる電力上限をスイープします。
+   - **CPU**: `max_perf_pct`（`intel_pstate`）または `max_freq_mhz`（`cpufreq`）を 100% から 50% まで 5% 刻みでスイープします（Windows は周波数範囲を報告しないためスイープは行われません）。
+   - 各計測点では、設定を要求し、コントローラがその generation の適用完了を報告するまで待機（60 秒、超過時は `not applied`）したうえで、安定化待ち 20 秒、計測 30 秒を行います。
+   - グリッドの半分を終えた時点で 2 回目のリファレンスを、すべてのグリッドを終えた最後で 3 回目のリファレンスを計測します。
+4. **計測点の算出指標とエネルギー計測**: 各計測点について、単位時間あたり処理量（work/s）、3 回のリファレンス平均に対する相対性能、平均電力、単位処理あたり消費電力量（energy per unit of work）、実測クロック、温度、クロックイベント理由（clock event reasons）、および稼働率を算出します。
+   - GPU の消費電力量は、各インターバルにおける NVML の `energy_mj` の合計です。
+   - CPU の消費電力量はデーモンから取得され、計測ウィンドウにわたるホストの CPU パッケージサンプルから算出されます（コントローラまたはノードの系列のうち計測ウィンドウの大部分をカバーする系列を使用し、同じパッケージが二重加算されることはありません）。各サンプルは直前サンプルからの経過区間を対象として計上され、サンプルの欠落が計測ウィンドウの 10 分の 1 を超えると `cpu energy not covered` となります。
+5. **有効性判定と種別ごとの記録**:
+   - **計測点が無効（invalid）になる条件**:
+     - 設定が適用されなかった、または計測終了時点で維持されていなかった
+     - サーマルイベント理由（`0x20`、`0x40`）を伴い、実測クロックがグラフィックスクロック上限を 2% 以上下回った（この状態ではクロック上限の意味をなさないため。一方、上限を設定しない（uncapped）計測点は発熱を含めたデバイスの実挙動を計測します）
+     - 他の何かがデバイスを使用していた（GPU 上の Kairo 以外が起動したプロセス、CPU ベンチマーク時の同一ホスト内ノード上の別 Lease、対象ファイルシステムを予約している別 Lease、対象 2 ノード間にまたがる Gang）
+     - 手動設定（manual setting）またはポリシー設定が有効だった
+     - プリミティブが一切処理を行わなかった、または途中で終了した
+   - **種別全体の判定と記録**:
+     - 3 回のリファレンスのばらつき `(max - min) / mean` が 1% を超える場合、またはリファレンス自体に無効なものが含まれる場合、その種別全体が無効となります。無効な種別のカーブは使用されませんが、他の有効な種別のカーブは使用されます。
+     - 1 回のみ計測する種別は、その計測結果自身がリファレンスとなります。`disk-sustained` は書き込み上限に達するまで計測を行います。
+     - 各種別のリファレンスは、その種別が完了した時点で直ちに記録されます（`POST /api/worker/bench/kinds`）。
+6. **設定解除と run の完了**: 自身の設定をクリアし（もっとも Lease の解放時にも自動的にクリアされます）、run を以下のいずれかの状態で終了します。
+   - `finished`: すべての種別が有効な場合
+   - `partial`: 一部の種別のみ有効な場合（ポリシーとプロファイルは有効な種別のカーブを使用します。理由欄には無効となった他の種別とその原因が記載されます）
+   - `invalid`: 有効な種別が 1 つもない場合
+   - `failed`: ドライバが完了させることなく Task が終了した場合（強制停止、クラッシュ、キャンセルなど）。理由として `the bench execution ended without its results (CAUSE)` が記録され、それまでに記録されたデータは保持されますが利用されることはありません。
 
-Measurement primitives for hardware efficiency: each runs one fixed,
-deterministic workload for a given time and streams what it did, so an
-orchestrator can window the intervals, compare them with a reference run and
-combine them with energy, at each device setting it sweeps (clock caps,
-power limits). They record measured facts, stamped with the date and the
-workload version, and never compare with vendor specifications. A bench is
-an ordinary execution: its argv is
+#### 中断と再開
+
+ドライバは SDK の `safe_point` と同様に協調的ワーカーとして動作します。すべての種別・すべての計測点の開始前、ウォームアップ中の 15 秒ごと、および他のジョブを待機している間に、Attempt の Command をポーリングします（`GET /api/worker/commands`）。
+
+- **`suspend` の処理**: プリエンプション、`pause`、ノード隔離などによる `suspend` を受け取ると、`accepted` と `checkpointing` を応答し、プリミティブを停止して bench 設定をクリアします（いずれにせよ Lease 解放時にデバイスはデフォルト設定へ戻ります）。その後、継続 `{"run":"bnc_...","done":["pcie-h2d",...]}` とともに `checkpointed` を応答し（同一 Command が再送された場合も同じ応答を返します）、Attempt は終了コード `0` で終了します。その間に取り下げられた `suspend`（`404`）や、他の種別の Command はスキップされます。
+- **継続 Execution による再開**: Task の継続 Execution（continuation execution）は同じ run を引き継ぎます（イベント `hardware_bench_continued`）。run は再び待機状態になり（`hardware profile` では完了済み種別とともに `suspended` と表示されます）、中断された種別の計測点は破棄されます。新しい Attempt は起動時に `hardware_bench_resumed` を発行し、完了済みの種別をスキップして残りの種別を計測します。中断された種別については最初から（ウォームアップとリファレンス計測も含めて）やり直し、自身の Lease の下で設定を要求します。中断と再開を経た run も、最終的には通常の run と同じように終了します。
+- **強制停止・`task rerun`**: 強制停止のグレースフルフェーズ（`SIGTERM`、`CTRL_BREAK`、Ctrl-C）を受信した場合、ドライバは 1 秒以内に終了します。その際、プリミティブを停止（プリミティブにもシグナルが届きます）して設定をクリアし、継続などの公開は一切行いません。結果として Task は `stopped`、run は `failed` になります。2 回目のシグナルを受信すると、実行中の停止処理自体がキャンセルされます。なお、ベンチマークの Task に対して `task rerun` を実行しても、`failed` になった run は復活しません（ドライバが run の終了済み状態を検知して失敗します）。やり直す場合は新しいベンチマークを実行してください。
+
+#### 安全制限・保存データ・プロファイルと API
+
+プリミティブ自身の安全制限（空き容量、1 プリミティブ実行あたり書き込み上限 20 GiB、メモリ上限）はそのまま適用されます。run と計測点のデータは無期限に保持されます（`bench_runs`、`bench_points`）。
+
+ベンチマーク実行では、以下のイベントが発行されます。
+
+- `hardware_bench_requested`
+- `hardware_bench_started`
+- `hardware_bench_continued`
+- `hardware_bench_resumed`
+- `hardware_bench_finished`（`state` と `valid_kinds` を含む）
+- `hardware_bench_invalid`（有効な種別が 1 つもない run、および `failed` になった run）
+
+`kairo hardware profile HOST [DEVICE] [--json]` は、デバイスごとに直近の run の状態（部分的に有効なものは `valid for 7 of 8 kinds: gemm: references spread ...`、中断中のものは `suspended since ..., 3 of 8 kinds done` など）を表示し、さらに種別ごとに、有効なリファレンスを持つ直近の終了済み run のカーブを表示します。出力には以下の情報が含まれます。
+
+- 各計測点の設定、相対性能、電力、単位処理あたり消費電力量、クロック、温度、有効性
+- そのデバイスの `max_slowdown` に対してポリシーが選択する計測点（`*` マーク付き）
+- 同一デバイスの前回同一種別 run からのドリフト（`drift from bnc_... (10-20 09:00): work/s -0.8%, energy/work +1.2%`）
+
+仕様値（スペック）や他のデバイスとの比較は一切行いません。HTTP API としては、`GET /api/hardware/{host}/profile` が `{"host", "runs"}`（各 run に `references` と `points` を含む）を返し、`POST .../bench` が `{"kinds", "node", "dry_run", "actor"}` を受け取って `{"run", "execution", "dry_run"}` を返します。
+
+### プリミティブ
+
+ハードウェア効率を計測するためのプリミティブ群です。各プリミティブは固定かつ決定論的なワークロードを指定時間実行し、実行結果をストリーム出力します。これにより、オーケストレータはインターバルを切り出し、リファレンス計測と比較し、スイープする各デバイス設定（クロック上限、電力上限）での消費電力量と組み合わせることができます。プリミティブが記録するのは日付とワークロードバージョンを付与した実測の事実のみであり、ベンダーの公称スペックとの比較は一切行いません。
+
+ベンチマーク本体は通常の Execution として実行でき、コマンドライン（argv）は次のとおりです。
 
 ```text
 kairo bench run WORKLOAD [--seconds S] [--interval S] [workload flags]
 kairo-bench-gpu WORKLOAD --device GPU-UUID [--seconds S] [--interval S] [flags]
-kairo bench serve --listen HOST:PORT        # the peer of net-latency / net-bandwidth
+kairo bench serve --listen HOST:PORT        # net-latency / net-bandwidth の対向サーバ
 ```
 
-`--seconds` (default 60; 0 runs until stopped) ends the run, as does SIGTERM,
-Ctrl-C or CTRL_BREAK: the run stops issuing work, waits for the requests in
-flight, writes its final interval and end record, cleans up and exits 0. A
-usage error (a bad or unsafe parameter) exits 2 and writes no record; a run
-refused by the machine (too little free space or memory, no such device) or
-failing writes an end record and exits 1. `kairo bench run WORKLOAD --help`
-lists a workload's flags.
+実行は `--seconds`（デフォルト `60`、`0` を指定すると停止されるまで無制限実行）の経過、または `SIGTERM`・Ctrl-C・`CTRL_BREAK` によって終了します。終了時は新規処理の発行を止め、実行中（in-flight）のリクエスト完了を待ってから、最終インターバルと終了レコードを書き出し、クリーンアップを行って終了コード `0` で終了します。
 
-| Workload | Work | Unit |
+使い方エラー（不正または危険なパラメータ指定）では終了コード `2` で終了し、レコードは一切書き出しません。マシン側の条件により拒否された場合（空き容量やメモリの不足、該当デバイスの不在など）や実行中に失敗した場合は、終了レコードを書き出して終了コード `1` で終了します。各ワークロード固有のフラグは `kairo bench run WORKLOAD --help` で一覧できます。
+
+| ワークロード | 処理内容 | 単位 |
 |---|---|---|
-| `cpu-compute` | per iteration 8 FP64 FMA chains + one xorshift64 step in registers (22 ops), `--threads` (default every logical CPU) | op |
-| `cpu-single` | the same on one thread pinned to `--cpu` (start says whether the pin held) | op |
-| `cpu-stream` | STREAM triad `a=b+3c` over three `--bytes` arrays (default 1 GiB each; 24 bytes per element: 2 reads + 1 write, write-allocate not counted) | byte |
-| `disk-seq` | 1 MiB sequential `--mode read\|write` at `--qd 1\|32` | byte |
-| `disk-rand` | 4 KiB random `--mode read\|write`; `--qd 1` for latency, 32 for IOPS (`ops`) | byte |
-| `disk-fsync` | 4 KiB write + fdatasync / FlushFileBuffers, one at a time | byte |
-| `disk-sustained` | 1 MiB sequential writes (default `--qd 32`) until `--max-write-bytes`: per-interval bandwidth shows SLC cache cliffs | byte |
-| `net-latency` | 64-byte TCP ping-pong (TCP_NODELAY), each echo checked | request |
-| `net-bandwidth` | 128 KiB writes (`--dir send`) or reads (`--dir recv`) on `--streams 1\|4` connections, application bytes | byte |
-| `gemm` (GPU) | cuBLAS bf16 tensor-core GEMM, fp32 accumulate, `--n` 8192: 2n³ per op | flop |
-| `copy` (GPU) | device-to-device copy, `--bytes` total footprint (default 2 GiB): read + write counted | byte |
-| `gemv` (GPU) | bf16 n×n matrix times `--batch 1\|8` vectors (memory-bound, like LLM decode) | byte, flop |
-| `pcie` (GPU) | pinned host memory `--dir h2d\|d2h`; `--mode bandwidth` 64 MiB transfers, `latency` 4 KiB transfers with percentiles | byte |
+| `cpu-compute` | 1 イテレーションあたりレジスタ上で FP64 FMA チェーン 8 本 + xorshift64 を 1 ステップ実行（22 ops）、`--threads`（デフォルト: 全論理 CPU） | `op` |
+| `cpu-single` | 上記と同じ処理を `--cpu` にピン留めした 1 スレッドで実行（`start` レコードにピン留めが維持されたかを記録） | `op` |
+| `cpu-stream` | 3 つの `--bytes` 配列（デフォルト各 1 GiB）に対する STREAM triad `a=b+3c`（1 要素あたり 24 バイト: 読み込み 2 + 書き込み 1、write-allocate は計上しない） | `byte` |
+| `disk-seq` | 1 MiB シーケンシャルアクセス（`--mode read\|write`、`--qd 1\|32`） | `byte` |
+| `disk-rand` | 4 KiB ランダムアクセス（`--mode read\|write`、レイテンシ計測は `--qd 1`、IOPS（`ops`）計測は `32`） | `byte` |
+| `disk-fsync` | 4 KiB 書き込み + `fdatasync` / `FlushFileBuffers` を 1 回ずつ逐次実行 | `byte` |
+| `disk-sustained` | `--max-write-bytes` に達するまで 1 MiB シーケンシャル書き込み（デフォルト `--qd 32`）を継続: インターバルごとの帯域で SLC キャッシュ切れによる速度低下（cliff）を観測可能 | `byte` |
+| `net-latency` | 64 バイトの TCP ピンポン通信（`TCP_NODELAY`）、各エコー内容を検証 | `request` |
+| `net-bandwidth` | `--streams 1\|4` 本のコネクションで 128 KiB の書き込み（`--dir send`）または読み込み（`--dir recv`）を実行、アプリケーション層バイト数を計測 | `byte` |
+| `gemm`（GPU） | cuBLAS bf16 Tensor Core GEMM（fp32 累算）、`--n` 8192: 1 op あたり `2n³` | `flop` |
+| `copy`（GPU） | デバイス間（device-to-device）コピー、合計フットプリント `--bytes`（デフォルト 2 GiB）: 読み込み + 書き込みを計上 | `byte` |
+| `gemv`（GPU） | bf16 の `n×n` 行列と `--batch 1\|8` 本のベクトルの積（LLM デコードのようなメモリ帯域律速処理） | `byte`, `flop` |
+| `pcie`（GPU） | ピン留めホストメモリによる `--dir h2d\|d2h` 転送、`--mode bandwidth` は 64 MiB 転送、`latency` はパーセンタイル付き 4 KiB 転送 | `byte` |
 
-### Records
+### 記録とプロファイル
 
-One JSON object per line. Every record has `schema` (`kairo.bench/v1`),
-`type` (`start`, `interval`, `end`), `run_id` (16 hex digits), `program`
-(`kairo` or `kairo-bench-gpu`), `workload`, `wall` (UTC, RFC 3339 with
-nanoseconds) and `mono_ns` (monotonic nanoseconds since the start record;
-QueryPerformanceCounter on Windows, whose Go clock follows the timer tick).
+出力は 1 行につき 1 つの JSON オブジェクトです。すべてのレコードに共通して、`schema`（`kairo.bench/v1`）、`type`（`start`、`interval`、`end`）、`run_id`（16 桁の 16 進数）、`program`（`kairo` または `kairo-bench-gpu`）、`workload`、`wall`（UTC、ナノ秒精度の RFC 3339）、および `mono_ns`（`start` レコードからの単調増加ナノ秒、Windows では Go の標準クロックがタイマーティックに従うため `QueryPerformanceCounter` を使用）が含まれます。
 
-- `start`, written once setup is done (files prefilled, memory allocated,
-  connections open, GPU warm), right before the timed work: `version` (the
-  workload definition; it changes when a unit of work changes), `build` (VCS
-  revision), `params` (every effective parameter), `units` (primary first),
-  `host` (`hostname`, `os`, `os_version` (kairo only), `arch`, `cpu_model`,
-  `logical_cpus`), `device`
-  (what identifies the device under test, below) and `setup` (facts of the
-  setup: `direct_io`, `prefill_ns`, `pinned`, the GPU batch size...).
-- `interval`, every `--interval` seconds (default 1) at fixed boundaries
-  `start + k·interval`: `index`, `begin_ns`, `end_ns` (each interval begins
-  where the previous ended; the last is partial: kairo credits it the
-  requests in flight at the stop, kairo-bench-gpu ends it at the deadline or
-  signal and drains its in-flight batches uncounted), `work` (`{unit: count}`
-  completed in the interval, credited when an operation completes), `ops`
-  (operations: requests, round trips, kernel chunks, GPU ops),
-  `device_busy_ns` (GPU-measured busy time, CUDA events; null for kairo) and
-  `latency` (`count`, `min_ns`, `mean_ns`, `p50_ns`, `p99_ns`, `p999_ns`,
-  `max_ns`, or null). GPU intervals add `nvml`: `samples`, `energy_mj` (the
-  energy counter's delta over the interval), `power_mw`, `sm_clock_mhz`,
-  `mem_clock_mhz`, `temperature_c`, `util_gpu_pct`, `util_mem_pct` (each
-  `{min, mean, max}` of the `--sample-ms` samples), `pstate` (`{min, max}`)
-  and `clocks_event_reasons` (the OR of the samples); a value NVML cannot
-  read is null.
-- `end`, always last: `reason` (`duration`, `signal` or `limit` — exit 0;
-  `error` or `refused` — exit 1), `limit` and `limit_detail` for a limit,
-  `error`, `elapsed_ns` (the measurement window: the last interval's end;
-  `mono_ns` is later, after cleanup), `intervals`, the `work`, `ops`, `device_busy_ns` and
-  `latency` of the whole run, `energy_mj` (GPU), and for storage
-  `bytes_written` (the probe and the prefill included) and `file_removed`. A
-  run refused or failing before its start record writes only an end record,
-  which then carries `params` and, when known, `device`.
+- **`start`**: セットアップ完了後（ファイルのプリフィル、メモリ確保、コネクション確立、GPU ウォームアップ完了後）、計測対象処理の開始直前に 1 度だけ出力されます。
+  - `version`（ワークロード定義のバージョン: 1 単位の処理内容が変更されたときに更新）
+  - `build`（VCS リビジョン）
+  - `params`（有効なすべてのパラメータ）
+  - `units`（主要単位が先頭）
+  - `host`（`hostname`、`os`、`os_version`（`kairo` のみ）、`arch`、`cpu_model`、`logical_cpus`）
+  - `device`（テスト対象デバイスを識別する情報、詳細は後述）
+  - `setup`（セットアップ時の事実情報: `direct_io`、`prefill_ns`、`pinned`、GPU のバッチサイズなど）
+- **`interval`**: `--interval` 秒ごと（デフォルト 1 秒）に固定境界 `start + k·interval` で出力されます。
+  - `index`、`begin_ns`、`end_ns`（各インターバルは直前の終了位置から開始。最後のインターバルは端数（partial）となり、`kairo` は停止時点で実行中だったリクエスト分をここに計上するが、`kairo-bench-gpu` は期限またはシグナル時点でインターバルを区切り、実行中のバッチは計上せずにドレインする）
+  - `work`（そのインターバル内に完了した `{unit: count}`、操作完了時に計上）
+  - `ops`（操作回数: リクエスト数、往復回数、カーネルチャンク数、GPU 操作数）
+  - `device_busy_ns`（GPU 側で計測されたビジー時間、CUDA イベントによる計測。`kairo` では `null`）
+  - `latency`（`count`、`min_ns`、`mean_ns`、`p50_ns`、`p99_ns`、`p999_ns`、`max_ns`、または `null`）
+  - GPU のインターバルにはさらに `nvml` が追加されます: `samples`、`energy_mj`（インターバル間のエネルギーカウンタ差分）、`power_mw`、`sm_clock_mhz`、`mem_clock_mhz`、`temperature_c`、`util_gpu_pct`、`util_mem_pct`（それぞれ `--sample-ms` 周期サンプルの `{min, mean, max}`）、`pstate`（`{min, max}`）、および `clocks_event_reasons`（全サンプルの論理和（OR））。NVML で読み取れない値は `null` になります。
+- **`end`**: 必ず最後に出力されます。
+  - `reason`（`duration`、`signal`、`limit` は終了コード `0`、`error`、`refused` は終了コード `1`）
+  - `limit`、`limit_detail`（上限到達による終了時）
+  - `error`
+  - `elapsed_ns`（計測ウィンドウ長: 最後のインターバルの終了時刻。`mono_ns` はクリーンアップ後のため、これより後になる）
+  - `intervals`
+  - 実行全体の `work`、`ops`、`device_busy_ns`、`latency`
+  - `energy_mj`（GPU のみ）
+  - ストレージ向け: `bytes_written`（プローブとプリフィルを含む）および `file_removed`
+  - `start` レコード出力前に拒否または失敗した実行では `end` レコードのみが出力され、その場合は `params` と（判明している場合）`device` が含まれます。
 
-Percentiles are nearest-rank over a log-linear histogram (exact below 128 ns,
-then 128 buckets per power of two: within 0.4%); both programs use the same
-buckets. `device` is `kind` `cpu` (`model`, `logical_cpus`, `gomaxprocs`,
-`fma`), `memory` (the same plus `total_bytes`, `available_bytes`), `storage`
-(`path`, `volume_path`, `filesystem`, `free_bytes`, `total_bytes`, sector
-sizes, `disk_model`, `disk_serial`, `disk_revision`, `disk_bus`, and on Windows
-`volume_serial`, on Linux `mount_source`, `block_device`, `rotational`),
-`network` (`local_addr`, `remote_addr`, the `interface` holding the local
-address — the one the route chose — its `mtu`, and the OS-reported
-`link_speed_tx_bps` / `link_speed_rx_bps`, a fact that a virtual NIC may
-report meaninglessly) or `gpu` (below).
+パーセンタイルは対数線形ヒストグラム（log-linear histogram）上の最近傍順位法（nearest-rank）で算出されます（128 ns 未満は厳密値、それ以上は 2 のべき乗あたり 128 バケット: 誤差 0.4% 以内）。両プログラムで同じバケット定義を使用します。
 
-### Safety
+`device` の内容は `kind` ごとに次のように構成されます。
 
-- Storage: the test file `kairo-bench-<id>.tmp` in `--path` (an existing
-  directory on the filesystem to test) is refused unless `--file-size` (1 GiB;
-  disk-fsync 64 MiB, disk-sustained 8 GiB) ≤ free space − `--keep-free`
-  (5 GiB) − 1 GiB. Every byte written counts against `--max-write-bytes`
-  (20 GiB, the prefill included; a prefill that alone would pass it is
-  refused), and the run ends with reason `limit` before the write that would
-  pass it; a write run also ends when free space falls below `--keep-free`.
-  The OS cache is bypassed (Windows `FILE_FLAG_NO_BUFFERING |
-  FILE_FLAG_WRITE_THROUGH`, Linux `O_DIRECT`, 4 KiB-aligned buffers or the
-  device's sector size); a filesystem that refuses it (tmpfs) runs buffered
-  with `setup.direct_io` false. The file is removed on every exit: Windows
-  opens it `FILE_FLAG_DELETE_ON_CLOSE` and Linux unlinks it as soon as it is
-  open, so even a killed run leaves nothing. Writes are incompressible and
-  every 4 KiB sector is distinct.
-- `cpu-stream` refuses arrays that, with a 2 GiB margin, exceed the available
-  memory.
-- `kairo bench serve` echoes, sinks or sources one test per connection (at
-  most 16 at a time, each closed after `--max-conn-duration`, default 1h),
-  writes one JSON line per connection, and exits after `--idle-timeout`
-  (default 5m) without connections. It serves anyone who connects: listen on
-  a trusted network.
+- `cpu`: `model`、`logical_cpus`、`gomaxprocs`、`fma`
+- `memory`: `cpu` の各フィールドに加え、`total_bytes`、`available_bytes`
+- `storage`: `path`、`volume_path`、`filesystem`、`free_bytes`、`total_bytes`、セクタサイズ、`disk_model`、`disk_serial`、`disk_revision`、`disk_bus`。さらに Windows では `volume_serial`、Linux では `mount_source`、`block_device`、`rotational`
+- `network`: `local_addr`、`remote_addr`、ローカルアドレスを保持する `interface`（ルーティングで選択されたインターフェース）、その `mtu`、および OS が報告する `link_speed_tx_bps` / `link_speed_rx_bps`（仮想 NIC では無意味な値が報告される場合があります）
+- `gpu`: 後述（「[GPU ベンチマーク](#gpu-ベンチマーク)」を参照）
 
-### GPU bench
+### 安全設計
 
-`bench/gpu/kairo-bench-gpu.cu` (CUDA C++, cuBLAS, NVML) is built separately
-for Ampere (sm_86, RTX 3080 / 3060) with a compute_86 PTX fallback:
+- **ストレージ**:
+  - **空き容量チェック**: テスト対象ファイルシステム上の既存ディレクトリ `--path` に作成するテストファイル `kairo-bench-<id>.tmp` は、`--file-size`（デフォルト 1 GiB、`disk-fsync` は 64 MiB、`disk-sustained` は 8 GiB）が「空き容量 − `--keep-free`（デフォルト 5 GiB） − 1 GiB」以下でない限り拒否されます。
+  - **書き込み上限と空き容量監視**: 書き込まれたすべてのバイト（プリフィルを含む）は `--max-write-bytes`（デフォルト 20 GiB）に対して計上され、プリフィルだけで上限を超える場合は開始前に拒否されます。実行中に上限を超える書き込みを行う直前で `reason` を `limit` として終了し、書き込み実行中に空き容量が `--keep-free` を下回った場合も終了します。
+  - **ダイレクト I/O**: OS キャッシュはバイパスされます（Windows は `FILE_FLAG_NO_BUFFERING | FILE_FLAG_WRITE_THROUGH`、Linux は `O_DIRECT`、4 KiB またはデバイスのセクタサイズ境界にアラインされたバッファを使用）。これを拒否するファイルシステム（`tmpfs` 等）ではバッファ付き I/O で実行され、`setup.direct_io` が `false` になります。
+  - **確実なファイル削除とデータ特性**: ファイルはどの終了経路でも必ず削除されます（Windows は `FILE_FLAG_DELETE_ON_CLOSE` でオープンし、Linux はオープン直後に `unlink` するため、強制終了されても残骸が残りません）。書き込みデータは非圧縮であり、4 KiB セクタごとに内容が異なります。
+- **`cpu-stream`**: 2 GiB のマージンを加えた配列サイズが使用可能メモリを超える場合は拒否されます。
+- **`kairo bench serve`**: 1 コネクションにつき 1 テスト分のエコー・シンク（受信）・ソース（送信）を実行します（同時接続数は最大 16、各接続は `--max-conn-duration`（デフォルト `1h`）でクローズ）。コネクションごとに 1 行の JSON を出力し、接続がない状態が `--idle-timeout`（デフォルト `5m`）続くと終了します。接続してきた任意のクライアントに応答するため、信頼できるネットワーク上で待ち受けてください。
+
+### GPU ベンチマーク
+
+`bench/gpu/kairo-bench-gpu.cu`（CUDA C++、cuBLAS、NVML）は、`compute_86` PTX フォールバック付きの Ampere アーキテクチャ（`sm_86`、RTX 3080 / 3060）向けに別途ビルドします。
 
 ```text
-cmd /c bench\gpu\build-windows.cmd     # CUDA 13.x + MSVC 2022 x64 (finds vcvars64 through vswhere)
-make -C bench/gpu                      # Linux, CUDA_HOME=/usr/local/cuda; CUBLAS_STATIC=1 links cuBLAS statically
+cmd /c bench\gpu\build-windows.cmd     # CUDA 13.x + MSVC 2022 x64（vswhere 経由で vcvars64 を検出）
+make -C bench/gpu                      # Linux、CUDA_HOME=/usr/local/cuda、CUBLAS_STATIC=1 で cuBLAS を静的リンク
 ```
 
-Both embed the revision (`BUILD_REV=...` overrides it). cudart is linked
-statically; NVML is loaded at run time (System32 `nvml.dll`,
-`libnvidia-ml.so.1`) and optional — without it every `nvml` value is null.
-On Windows cuBLAS is delay-loaded: `gemm` and `gemv` need `cublas64_13.dll`
-and `cublasLt64_13.dll` on PATH or beside the exe (a missing one is a clean
-`error` end), `copy` and `pcie` need no cuBLAS (their `cublas_version` is
-null). On Linux the shared cuBLAS is needed even for `--help` unless linked
-statically. The driver must support the toolkit it was built with.
+どちらのビルドでもリビジョンが埋め込まれます（`BUILD_REV=...` で上書き可能）。`cudart` は静的リンクされ、NVML は実行時に動的ロードされます（System32 の `nvml.dll`、`libnvidia-ml.so.1`）。NVML は任意であり、存在しない場合はすべての `nvml` 値が `null` になります。
 
-- `--device GPU-UUID` (required, as `nvidia-smi -L` prints it) is matched
-  against the visible devices' UUIDs (whatever `CUDA_VISIBLE_DEVICES` is);
-  no match is refused, listing the visible UUIDs.
-- Flags: `--seconds`, `--interval`, `--sample-ms` (NVML sampling period,
-  default 100), `--n` (gemm, gemv; multiple of 64, 256..32768), `--bytes`
-  (copy; binary suffixes, a multiple of 2 MiB), `--batch 1|8` (gemv), `--dir
-  h2d|d2h` and `--mode bandwidth|latency` (pcie), `--reserve-mib` (512: device
-  memory left free). A flag that does not apply to the workload is a usage
-  error. `--help`, `--version` (JSON: build, workload versions) and
-  `--validate-only` (the effective parameters as one `"type":"params"` line)
-  return before any CUDA, cuBLAS or NVML call.
-- Memory is checked, never tried: before creating a context NVML's free
-  memory must hold the buffers, the reserve and a 400 MiB context estimate;
-  after it `cudaMemGetInfo` must hold the buffers and the reserve, and the
-  free memory after allocating must still hold the reserve. Otherwise the run
-  is refused.
-- Inputs are filled on the device with a fixed pseudo-random pattern in
-  [-1, 1) (data values change power). Work is issued in batches calibrated to
-  about 20 ms, two in flight, bracketed by CUDA events: a batch counts in the
-  interval in which its end is seen, and `device_busy_ns` sums the event
-  times. pcie latency mode issues and synchronizes each 4 KiB transfer alone
-  (spin-wait, `setup.sync` `spin`; the others block) and reports host-measured
-  latencies, their sum as `device_busy_ns`.
-- `device` (`kind` `gpu`): `uuid`, `name`, `pci_bus_id`,
-  `compute_capability`, `sm_count`, `memory_total_bytes`,
-  `memory_free_bytes`, `driver_version`, `cuda_driver_version`,
-  `cuda_runtime_version`, `cublas_version`, `nvml_available`,
-  `power_limit_mw` (enforced), `applications_clock_mhz` and `max_clock_mhz`
-  (`sm`, `mem`, as the device reports them), `vbios_version`. The main thread
-  reads the energy counter at every interval boundary, so `energy_mj` covers
-  exactly the interval's work window.
-- SIGTERM, SIGINT, CTRL_C, CTRL_BREAK and CTRL_CLOSE stop it cleanly (exit
-  0); a very long op (gemm at n=32768 is ~2 s) delays the stop by up to two
-  ops.
+Windows では cuBLAS は遅延ロード（delay-load）されます。`gemm` と `gemv` には `PATH` 上または実行ファイルと同じディレクトリに `cublas64_13.dll` と `cublasLt64_13.dll` が必要です（見つからない場合はクリーンに `error` 終了します）。`copy` と `pcie` は cuBLAS を必要としません（`cublas_version` は `null` になります）。Linux では、静的リンクしない限り `--help` の実行にも共有ライブラリの cuBLAS が必要です。ドライバはビルドに使用した CUDA ツールキットをサポートしている必要があります。
 
-## Database
+- **デバイス指定**: `--device GPU-UUID`（必須、`nvidia-smi -L` が出力する形式）を、可視デバイスの UUID 一覧と照合します（`CUDA_VISIBLE_DEVICES` の値にかかわらず可視デバイスに対して照合）。一致するデバイスがない場合は、可視な UUID 一覧を出力して拒否されます。
+- **フラグ**:
+  - 共通: `--seconds`、`--interval`、`--sample-ms`（NVML サンプリング周期、デフォルト `100`）、`--reserve-mib`（デフォルト `512`: 空きとして残すデバイスメモリ容量）
+  - ワークロード固有: `--n`（`gemm`、`gemv` 用: 64 の倍数、`256..32768`）、`--bytes`（`copy` 用: 2 進接尾辞対応、2 MiB の倍数）、`--batch 1|8`（`gemv` 用）、`--dir h2d|d2h` および `--mode bandwidth|latency`（`pcie` 用）
+  - 対象ワークロードに適用されないフラグは使い方エラーになります。
+  - `--help`、`--version`（JSON: `build`、ワークロードのバージョン）、および `--validate-only`（有効なパラメータを 1 行の `"type":"params"` として出力）は、CUDA・cuBLAS・NVML の呼び出しを一切行う前に終了します。
+- **メモリ事前チェック**: メモリは確保を試すのではなく事前に検証します。コンテキスト作成前に、NVML の空きメモリが「バッファ容量 + reserve 容量 + コンテキスト推定分 400 MiB」を収容できる必要があります。コンテキスト作成後は、`cudaMemGetInfo` が「バッファ容量 + reserve 容量」を収容でき、さらにバッファ確保後の空きメモリにも依然として reserve 容量が残っている必要があります。いずれかを満たさない場合、実行は拒否されます。
+- **入力データとバッチ実行**: 入力データはデバイス上で `[-1, 1)` の範囲の固定疑似乱数パターンで初期化されます（データ値によって消費電力が変化するため）。処理は約 20 ms にキャリブレーションされたバッチ単位で、2 バッチを同時に in-flight にして発行し、CUDA イベントで挟んで計測します。バッチはその終了が観測されたインターバルに計上され、`device_busy_ns` は CUDA イベント時間の合計となります。`pcie` の `latency` モードでは、4 KiB 転送を 1 件ずつ発行して同期し（スピンウェイト、`setup.sync` は `spin`、他はブロッキング待機）、ホスト側で計測したレイテンシとその合計（`device_busy_ns`）を報告します。
+- **`device`（`kind`: `gpu`）**: `uuid`、`name`、`pci_bus_id`、`compute_capability`、`sm_count`、`memory_total_bytes`、`memory_free_bytes`、`driver_version`、`cuda_driver_version`、`cuda_runtime_version`、`cublas_version`、`nvml_available`、`power_limit_mw`（現在強制されている上限値（enforced））、`applications_clock_mhz`、`max_clock_mhz`（それぞれ `sm`、`mem`、デバイスが報告する値）、`vbios_version`。メインスレッドがすべてのインターバル境界でエネルギーカウンタを読み取るため、`energy_mj` はそのインターバルの処理ウィンドウと厳密に一致します。
+- **シグナルによる停止**: `SIGTERM`、`SIGINT`、`CTRL_C`、`CTRL_BREAK`、`CTRL_CLOSE` のいずれでもクリーンに停止します（終了コード `0`）。非常に時間のかかる 1 操作（例: `n=32768` の `gemm` は約 2 秒）では、停止まで最大 2 操作分の遅延が生じることがあります。
 
-The daemon's state is one PostgreSQL database (PostgreSQL 17; another host
-is fine, over a LAN). The daemon configuration names it:
+## データベース
+
+デーモンの状態は単一の PostgreSQL データベースに保存されます（PostgreSQL 17。LAN 上の別ホストでも構いません）。接続先はデーモン設定で指定します。
 
 ```toml
 database_url = "postgres://kairo@pve1:5432/kairo?sslmode=require"
-database_password_file = "local/kairo-db-password"   # optional: its first line
+database_password_file = "local/kairo-db-password"   # 任意: ファイルの 1 行目をパスワードとして使用
 ```
 
-`database_url` is a `postgres://` URL or a `key=value` connection string;
-`KAIRO_DATABASE_URL` may give it instead (not both), so the password need not
-be in the file. Without a password in either, `database_password_file`, then
-the usual `PGPASSWORD` and `.pgpass` are used. Logs show the URL with the
-password masked.
+`database_url` には `postgres://` 形式の URL または `key=value` 形式の接続文字列を指定します。代わりに環境変数 `KAIRO_DATABASE_URL` で指定することもできます（両方同時には指定できません）。これにより、設定ファイル内にパスワードを記述せずに済みます。どちらにもパスワードが含まれていない場合は、まず `database_password_file` が参照され、それでも得られない場合は通常の `PGPASSWORD` および `.pgpass` が使用されます。ログに出力される URL ではパスワード部分がマスクされます。
 
-The database must be UTF-8 with the `C` collation: times and identifiers are
-compared as text, byte by byte, and the daemon refuses another collation.
-Create it once, empty:
+データベースは UTF-8 エンコーディングかつ `C` 照合順序（collation）である必要があります。時刻や識別子をテキストとしてバイト単位で比較するためであり、デーモンはそれ以外の照合順序を拒否します。初回のみ、空のデータベースを次のように作成してください。
 
 ```sql
 CREATE ROLE kairo LOGIN PASSWORD '...';
 CREATE DATABASE kairo OWNER kairo TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C';
 ```
 
-The first `kairo serve` creates the schema; a later one applies the numbered
-migrations it lacks (`schema_version`), and refuses a database that has
-tables but no Kairo schema, or a schema newer than itself.
+初回の `kairo serve` 起動時にスキーマが作成されます。以降の起動では `schema_version` を参照して未適用の番号付きマイグレーションを適用します。Kairo のスキーマを持たない既存テーブルが存在するデータベースや、自身のバージョンより新しいスキーマを持つデータベースに対しては起動を拒否します。
 
-Writing transactions (a planning pass, a lease reservation, a launch, a
-pause, a heartbeat, an observation batch, issuing or revoking a token) take
-one transaction-scoped advisory lock, so Kairo's decisions run one at a time
-no matter how many connections or processes share the database. Reads
-(status, lists, logs) take no lock and run alongside. Store reports and the
-once-a-minute refresh of a token's last-used time write without the advisory
-lock. Authentication checks for revocation on every request. Connections
-are read-only unless a transaction explicitly makes them writable.
-Each statement is a round trip to the server: a planning pass costs a fixed
-20 or so whatever the number of waiting executions (it reads the names of
-the scopes its leases and candidates are in, not of every scope), a
-heartbeat 5. Executors poll four times a second each, so an idle
-installation skips the pass (see Admission).
+トランザクションの排他制御とアクセス特性は次のとおりです。
 
-Back up with `pg_dump` (the database holds the token hashes: keep the dump
-like the password). A database of the SQLite era (`kairo-v3.db`) is moved
-over once, with the daemon and agents stopped:
+- **書き込みトランザクションの直列化**: プランニングパス、Lease の予約、起動、一時停止、ハートビート、観測バッチの記録、およびトークンの発行・失効を行う書き込みトランザクションは、単一のトランザクションスコープのアドバイザリロックを取得します。これにより、データベースを共有する接続数やプロセス数にかかわらず、Kairo の意思決定は常に 1 つずつ実行されます。
+- **ロックを取らない読み取り・一部書き込み**: 読み取り処理（ステータス確認、一覧取得、ログ取得）はロックを取得せず並行実行されます。また、ストアレポートの記録や、トークンの最終使用時刻の 1 分ごとの更新もアドバイザリロックなしで書き込みます。
+- **認証と読み取り専用接続**: 認証処理ではリクエストごとにトークンの失効を確認します。データベース接続はデフォルトで読み取り専用であり、トランザクション側で明示的に書き込み可能に設定した場合のみ書き込みが行われます。
+- **ラウンドトリップとポーリング最適化**: 各 SQL 文はサーバとの 1 回のラウンドトリップになります。プランニングパスは待機中の Execution 数にかかわらず固定で約 20 回（全スコープではなく、対象の Lease と候補 Execution が属するスコープ名のみを読み取るため）、ハートビートは約 5 回のラウンドトリップです。各 Executor は 1 秒あたり 4 回ポーリングするため、アイドル状態の環境ではプランニングパスをスキップします（[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）。
+
+バックアップには `pg_dump` を使用してください（データベースにはトークンハッシュが保存されているため、ダンプファイルはパスワードと同等に厳重に管理してください）。SQLite 時代のデータベース（`kairo-v3.db`）は、デーモンおよびエージェントを停止した状態で 1 度だけ移行します。
 
 ```powershell
-kairo db import-sqlite --from local/kairo-v3.db --config kairo.toml   # or --to URL
+kairo db import-sqlite --from local/kairo-v3.db --config kairo.toml   # または --to URL
 ```
 
-It opens the file read-only (copy it with its `-wal` and `-shm` files first
-to import a snapshot of a running daemon's), needs an empty target, creates
-the schema of the last SQLite Kairo (migration 1) and copies every table in
-one transaction. Before committing it checks every table: the row count and
-a SHA-256 over the rows in key order (values normalized by column type:
-flags, integers, reals, text) computed the same way from both databases,
-then applies the later migrations. It prints one row per table and imports
-nothing when any table differs. The file must have been opened by the last
-SQLite Kairo, so its schema is complete.
+このコマンドは移行元ファイルを読み取り専用で開きます（稼働中デーモンのスナップショットをインポートしたい場合は、あらかじめ `-wal` ファイルおよび `-shm` ファイルと一緒にコピーしておいてください）。移行先は空のデータベースである必要があり、最後の SQLite 版 Kairo のスキーマ（マイグレーション 1）を作成した上で、1 つのトランザクション内で全テーブルをコピーします。コミット前に全テーブルについて行数と主キー順の全行に対する SHA-256 ハッシュ（フラグ、整数、実数、テキストの各列型で値を正規化）を両データベースで同一の方法により算出して照合し、その後にそれ以降のマイグレーションを適用します。各テーブルにつき 1 行の結果を出力し、1 つでも差異があるテーブルがあれば何もインポートしません。なお、スキーマが完全な状態である必要があるため、移行元ファイルは最後の SQLite 版 Kairo で一度開かれたものである必要があります。
 
-## Upgrading a running installation
+## 稼働中環境のアップグレード
 
-Replacing the daemon alone touches no attempt: back up the database
-(`pg_dump`), replace the binary and restart it. An agent that starts adopts
-the attempts its executors launched that still run, and marks the others lost
-(Agent restarts): replacing an agent whose attempts run under shims loses
-nothing. On Linux rename the new binary over the old one (the shims keep
-running the old file) and restart the unit; on Windows, where a running image
-cannot be overwritten but can be renamed, rename the agent's binary aside,
-copy the new one in its place and stop the agent process alone (not the
-shims, which run the renamed image). Replacing an agent that launched
-attempts without shims (from before them) loses those: drain first, pausing
-the projects until no attempt is authorized, running or quiescing on that
-node, then resume. Code that queued executions will load (scripts, the
-editable SDK) must not change while they wait.
+デーモン単体の入れ替えは稼働中の Attempt に一切影響しません。データベースを `pg_dump` でバックアップしたうえでバイナリを差し替え、デーモンを再起動します。
 
-Replace the daemon first, then the agents: an agent older than the daemon
-starts attempts without their declared `env`, and a daemon older than the
-agent refuses its log problem reports (the agent logs them), its
-observations, which carry power samples (its resources then go stale), and
-the registration of an agent that has attempts to adopt (which retries until
-the daemon is replaced). A
-daemon opening an older database applies the schema migrations it lacks
-(see Database); keep the backup, since an older binary refuses the newer
-schema.
+エージェントを起動すると、その Executor が起動した Attempt のうち現在も動作しているものを引き継ぎ（adopt）、それ以外はロスト扱いとします（[エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ)を参照）。そのため、shim 経由で Attempt を実行しているエージェントの入れ替えではジョブを失いません。OS ごとの手順は次のとおりです。
 
-A bench's driver is the kairo of the node that runs it (`[bench]
-kairo_binary`). One from before benches were tasks does not poll commands:
-it never acknowledges a suspend, so what would preempt it, or a pause of it,
-waits until it finishes as it did before (a force stop still ends it), and
-its run still finishes normally. A daemon from before submits benches as
-executions that are never suspended, which a newer driver runs as before.
+- **Linux**: 新しいバイナリを古いバイナリへ上書きリネームし（稼働中の shim は引き続き旧ファイルを実行し続けます）、systemd ユニットを再起動します。
+- **Windows**: 実行中のバイナリは上書きできないもののリネームは可能であるため、現在のエージェントバイナリを別名に退避し、新しいバイナリを元の位置へコピーしたうえで、エージェントプロセスのみを停止します（リネーム済みのイメージを実行している shim は停止しません）。
+- **shim 導入前のエージェントからの移行**: shim なしで Attempt を起動したエージェントを置き換えると、それらの Attempt は失われます。あらかじめ対象ノード上に `authorized`、`running`、または `quiescing` 状態の Attempt がなくなるまでプロジェクトを一時停止してドレインし、入れ替え完了後に再開してください。また、キュー内で待機している Execution が読み込むコード（スクリプトや editable インストールされた SDK）は、待機中に変更してはいけません。
 
-### Operating an installation (ops/)
+アップグレードは **必ずデーモンを先に、エージェントを後に** 行ってください。
 
-`ops/` holds what an operator runs; nothing an installation needs lives in
-the checkout. What is the operator machine's own is in the user's
-directories, as Go names them (`ops/site.sh`): the configuration directory
-(`%APPDATA%\kairo`, else `${XDG_CONFIG_HOME:-~/.config}/kairo`: the CLI's
-`token` and `ca.pem`, `site.env`, a Windows agent's `agent.toml`, the
-machine declaration) and the state directory (`%LOCALAPPDATA%\kairo`, else
-`${XDG_STATE_HOME:-~/.local/state}/kairo`: `builds/`, CI trees, `logs/`; a
-Windows agent's `attempts/`). `KAIRO_CONFIG_DIR` and `KAIRO_STATE_DIR`
-override them. `site.env` (shell variables) says how the site is reached:
-`KAIRO_PVE_HOST` (the Proxmox host of the daemon's and the database's
-containers), `KAIRO_DAEMON_VMID`, `KAIRO_DB_VMID`, `KAIRO_NODES` (`NODE=ssh:USER@HOST`
-or `NODE=pct:USER@HOST:VMID`, each Linux node whose agent ops/ replaces) and
-the `CI_*` settings of CI on Kairo.
+- **エージェントの方がデーモンより古い場合**: エージェントは宣言された `env` を渡さずに Attempt を起動してしまいます。
+- **デーモンの方がエージェントより古い場合**: デーモンはエージェントからのログ障害レポート（エージェント側でログに記録されます）、電力サンプルを含む観測データ（その結果、そのノードのリソースが `stale` になります）、および引き継ぎ対象の Attempt を持つエージェントの登録（デーモンが入れ替わるまでリトライし続けます）を拒否します。
+- **データベーススキーマ**: 古いデータベースを開いたデーモンは不足しているスキーママイグレーションを適用します（[データベース](#データベース)を参照）。古いバイナリは新しいスキーマを拒否するため、バックアップは必ず残しておいてください。
 
-- `bash ops/build.sh`: the clean checkout's HEAD built for Windows and Linux
-  into `builds/kairo-<sha>.exe` and `kairo-<sha>-linux`.
-- `bash ops/deploy-daemon.sh SHA NAME`: a `pg_dump` first, then the daemon's
-  binary (the old one kept as `kairo.before-NAME`), restarted, then the CLI on
-  PATH.
-- `[ADOPT=1] bash ops/replace-linux-agents.sh SHA NODE...`: each node's agent
-  (the old binary kept as `bin/kairo.before-SHA`); a node holding a lease is
-  refused unless `ADOPT=1`; each must report within 2 minutes.
-- Windows, elevated: `ops/windows/install-agent.ps1 -New BUILD` installs the
-  agent as `%LOCALAPPDATA%\Programs\kairo\kairo-agent.exe` with
-  `supervise-agent.ps1` beside it (logs in `<state>/logs`, its configuration
-  `%APPDATA%\kairo\agent.toml`) and the S4U task `kairo-agent` that starts it
-  at boot (refused while the node holds a lease: an agent started with
-  another log directory cannot adopt); `ops/windows/replace-agent.ps1 -New
-  BUILD [-Adopting]` replaces it. The agent runs as the user (its attempts
-  are the user's), so its files are the user's.
-- Windows, elevated: `ops/windows/install-controller.ps1 -New BUILD [-Config
-  TOML] [-State JSON] [-CA PEM]` installs the device controller, which runs
-  as SYSTEM: `%ProgramFiles%\Kairo\kairo-controller.exe`, its configuration,
-  state and CA in `%ProgramData%\Kairo` (readable by SYSTEM and Administrators
-  only: the configuration holds its token), and the task `kairo-controller`.
+ベンチマークのドライバは、実行ノード上の `kairo` バイナリ（`[bench]` の `kairo_binary`）です。ベンチマークが Task になる前の古いドライバは Command をポーリングしないため中断（suspend）に応答せず、それをプリエンプトする処理や一時停止操作は以前と同様に完了まで待機します（強制停止による終了は引き続き可能です）が、ベンチマーク自体はそのまま正常に完了します。逆に古いデーモンは中断されない Execution としてベンチマークを投入しますが、新しいドライバでも従来どおり実行できます。
 
-### Kairo keeps itself
+### 運用スクリプト
 
-The control plane is data like any other, so Kairo keeps it the same way.
-Every `control_snapshot_minutes` (daemon configuration; default 60, a
-negative value never) the daemon declares a task of project `kairo`, queue
-`control-snapshot`, named `snapshot-<UTC slot>` (`snapshot-20261116T0100Z`):
-`kairo control snapshot`, run with the `kairo_binary` (`[bench]`) of the node
-of the first durable store whose node reports one, on an executor of its
-`executor_labels`. Nothing runs while no durable store is declared or its
-node reports no kairo. Its priority is above everything and it reserves no
-CPU, RAM or GPU (the daemon dumps; the task only writes what it is sent), so
-nothing holds it back and it never suspends anything to fit. The task asks the daemon for the snapshot with its
-attempt token (`GET /api/worker/control-snapshot`, only for an attempt of
-that queue) and writes it to its run's output directory as
-`kairo-control-<time>.tar`, which is packed when the run ends and copied to
-every durable store like any output. The tar holds:
+`ops/` ディレクトリには運用者が実行するスクリプト群が収められており、稼働中の環境自体がチェックアウト内のファイルを必要とすることはありません。運用者マシン固有のファイルは、Go の規約に沿ったユーザーディレクトリ配下に配置されます（`ops/site.sh`）。
 
-| entry | what |
+- **設定ディレクトリ**（Windows では `%APPDATA%\kairo`、それ以外では `${XDG_CONFIG_HOME:-~/.config}/kairo`）: CLI 用の `token` および `ca.pem`、`site.env`、Windows エージェントの `agent.toml`、マシン宣言
+- **状態ディレクトリ**（Windows では `%LOCALAPPDATA%\kairo`、それ以外では `${XDG_STATE_HOME:-~/.local/state}/kairo`）: `builds/`、CI 用ソースツリー、`logs/`、Windows エージェントの `attempts/`
+
+これらのパスは環境変数 `KAIRO_CONFIG_DIR` および `KAIRO_STATE_DIR` で上書きできます。`site.env`（シェル変数形式）にはサイトへの接続情報を記述します。
+
+- `KAIRO_PVE_HOST`: デーモンおよびデータベースのコンテナが動作する Proxmox ホスト
+- `KAIRO_DAEMON_VMID` / `KAIRO_DB_VMID`: デーモンおよびデータベースの VMID
+- `KAIRO_NODES`: `ops/` でエージェントを入れ替える各 Linux ノード（`NODE=ssh:USER@HOST` または `NODE=pct:USER@HOST:VMID` 形式）
+- `CI_*`: [Kairo 上の CI](#kairo-上の-ci) で使用する各種設定
+
+主な運用スクリプトは次のとおりです。
+
+- `bash ops/build.sh`: クリーンなチェックアウトの `HEAD` を Windows 向け・Linux 向けにビルドし、`builds/kairo-<sha>.exe` および `kairo-<sha>-linux` を生成します。
+- `bash ops/deploy-daemon.sh SHA NAME`: まず `pg_dump` を実行し、続いてデーモンバイナリを置き換えて（旧バイナリは `kairo.before-NAME` として退避）再起動したのち、`PATH` 上の CLI を更新します。
+- `[ADOPT=1] bash ops/replace-linux-agents.sh SHA NODE...`: 各 Linux ノードのエージェントを入れ替えます（旧バイナリは `bin/kairo.before-SHA` として退避）。Lease を保持しているノードは `ADOPT=1` を指定しない限り拒否されます。各ノードは 2 分以内に報告を返す必要があります。
+- **Windows（管理者権限）エージェント導入・更新**: `ops/windows/install-agent.ps1 -New BUILD` は、エージェントを `%LOCALAPPDATA%\Programs\kairo\kairo-agent.exe` に、監視用スクリプト `supervise-agent.ps1` と並べてインストールし（ログは `<state>/logs`、設定は `%APPDATA%\kairo\agent.toml`）、起動時に実行される S4U タスク `kairo-agent` を登録します（ノードが Lease を保持している間は拒否されます。異なるログディレクトリで起動されたエージェントは既存の Attempt を引き継げないためです）。既存エージェントの差し替えには `ops/windows/replace-agent.ps1 -New BUILD [-Adopting]` を使用します。エージェントは対象ユーザー権限で動作するため（Attempt もそのユーザーとして実行されます）、関連ファイルもすべてユーザー所有になります。
+- **Windows（管理者権限）コントローラ導入**: `ops/windows/install-controller.ps1 -New BUILD [-Config TOML] [-State JSON] [-CA PEM]` は、`SYSTEM` 権限で動作するデバイスコントローラを `%ProgramFiles%\Kairo\kairo-controller.exe` にインストールします。設定・状態・CA 証明書は `%ProgramData%\Kairo` に配置され（設定ファイルにトークンが含まれるため、`SYSTEM` と `Administrators` のみ読み取り可能）、タスク `kairo-controller` が登録されます。
+
+### 自己バックアップ
+
+コントロールプレーンのデータも他のデータと本質的に変わらないため、Kairo 自身が同じ仕組みでこれを保全します。デーモン設定の `control_snapshot_minutes`（デフォルト `60`、負の値で無効）ごとに、デーモンはプロジェクト `kairo`、キュー `control-snapshot`、名前 `snapshot-<UTC slot>`（例: `snapshot-20261116T0100Z`）の Task を宣言します。
+
+この Task は `kairo control snapshot` を実行するもので、`[bench]` の `kairo_binary` を報告しているノードに属する最初の durable store を選び、そのノードの `kairo_binary` を用いて、当該 durable store の `executor_labels` に合致する Executor 上で実行されます。durable store が 1 つも宣言されていない間、または対象ノードが `kairo` バイナリを報告していない間は何も実行されません。優先度は他のあらゆるジョブより高く、CPU・RAM・GPU のいずれも予約しないため（ダンプ処理はデーモン側で行い、Task は受け取った内容を書き出すだけのため）、他ジョブに待たされることも、空きを作るために他ジョブを中断することもありません。
+
+Task は自身の Attempt トークンを用いてデーモンからスナップショットを取得し（`GET /api/worker/control-snapshot`。このキューの Attempt のみに許可）、Run の `output` ディレクトリに `kairo-control-<time>.tar` として書き出します。Run 終了時には通常の出力と同様に pack され、すべての durable store へコピーされます。tar アーカイブの中身は次のとおりです。
+
+| エントリ | 内容 |
 |---|---|
-| `SNAPSHOT.txt` | when, and the daemon's version |
-| `kairo.dump` | the database (`pg_dump -Fc`: the daemon runs `pg_dump`, or the configuration's `pg_dump`, with the password in `PGPASSWORD`) |
-| `sources/...` | the code snapshots (`source_directory`) |
-| `config/...` | the daemon's configuration file and its TLS certificate and CA, by base name |
+| `SNAPSHOT.txt` | 取得日時およびデーモンのバージョン |
+| `kairo.dump` | データベースのダンプ（`pg_dump -Fc`。デーモンが `pg_dump`、または設定の `pg_dump` で指定されたコマンドを `PGPASSWORD` にパスワードを渡して実行） |
+| `sources/...` | コードスナップショット（`source_directory`） |
+| `config/...` | デーモンの設定ファイル、TLS 証明書、および CA（ベース名で格納） |
 
-The command keeps the file only whole and holding a non-empty dump (else it
-fails and the task with it); inside an attempt without an output directory it
-refuses, since nothing would keep what it wrote. An operator takes one with
-an admin token (`kairo control snapshot --out DIR`, `GET
-/api/control/snapshot`). The snapshot holds no secret, since it is copied
-to every durable store: the server's TLS key (`tls_key_file`) and
-`database_password_file` are never in it, nor is the configuration file when
-its `database_url` holds a password (the daemon logs that it leaves it out;
-keep the password in `database_password_file`). Keep the key and the
-password apart, or make new ones when rebuilding.
+コマンドは、ファイル全体が完全に書き出され、かつ空でないダンプを含む場合にのみファイルを保持します（それ以外の場合は失敗し、Task も失敗します）。また、`output` ディレクトリを持たない Attempt 内で実行された場合は、書き出した内容を保全できないため実行を拒否します。運用者が手動で取得する場合は、管理者トークンを使用して `kairo control snapshot --out DIR`（`GET /api/control/snapshot`）を実行します。
 
-### Rebuilding an installation from its durable store
+スナップショットはすべての durable store にコピーされるため、機密情報は一切含まれません。サーバの TLS 秘密鍵（`tls_key_file`）と `database_password_file` は決して含まれず、`database_url` 内にパスワードが書かれている場合はデーモンの設定ファイル自体も除外されます（除外した旨がデーモンのログに出力されます。パスワードは `database_password_file` に分離してください）。秘密鍵とパスワードは別途保管するか、環境再構築時に新規作成してください。
 
-What Kairo holds survives in its durable store: every copy is
-`<root>/objects/<YYYYMM>/<object id>.tar.zst` (tar, zstd) with its file list
-beside it (`.files.tsv`) and its description (`.object.json`: whose it is,
-what it holds; `kairo store catalogue ROOT`), readable without Kairo. Its own
-control plane is among them (Kairo keeps itself): the newest
-`kairo-control-<time>.tar` of project `kairo`. (Before that was built in, the
-tasks of queue `control-backup` wrote `kairo-<time>.dump` and
-`daemon-srv-kairo-<time>.tar.gz`, and imports named `kairo-control-<time>`
-held the same with every node's `/srv/kairo`, the hosts' `/etc/kairo` and the
-Windows host's configuration directory.) With nothing else left (no database,
-no daemon, no nodes):
+### Durable Store からの環境再構築
 
-1. Find the newest snapshot: the file lists that name one
-   (`grep -l 'kairo-control-.*\.tar\|kairo-.*\.dump' <root>/objects/*/*.files.tsv`),
-   unpack that object (`zstd -dc OBJ.tar.zst | tar -x`) and the snapshot in it.
-2. Build kairo from this repository; make an empty PostgreSQL database
-   (Database) and `pg_restore -d kairo` the dump into it.
-3. Put the daemon's state back (`config/` and `sources/` as the
-   configuration names them), with the TLS key and the database password
-   from where they were kept apart (or a new key, its certificate issued
-   again, and a new password: `ALTER ROLE kairo PASSWORD ...`), and start
-   `kairo serve`; restore each node's agent configuration (or issue new
-   tokens) and start the agents.
-4. Declare the stores as before (the machine declaration is in the dump and
-   in the Windows configuration directory's `machines.toml`): the copies are
-   where the restored records say, so nothing is copied again.
+Kairo が保持するデータはすべて durable store 上に残ります。各コピーは `<root>/objects/<YYYYMM>/<object id>.tar.zst`（tar + zstd）として保存されており、同じ場所にファイル一覧（`.files.tsv`）とメタデータ記述（`.object.json`: 所有者や内容の説明。`kairo store catalogue ROOT` で確認可能）が置かれているため、Kairo なしでも読み取れます。
 
-What the daemon recorded after the dump restored (an import, a copy) is not
-in it, but its copy is on the durable stores all the same, with its file
-list and description: within the hour each agent's inventory of its durable
-stores adopts it (Data stores: the directory of a durable store is what it
-holds). A run, task or import that was under way is not adopted; declare it
-again.
+Kairo 自身のコントロールプレーンもこの中に含まれています（[自己バックアップ](#自己バックアップ)を参照）。対象となるのはプロジェクト `kairo` の最新の `kairo-control-<time>.tar` です。（この機能が組み込まれる前は、`control-backup` キューの Task が `kairo-<time>.dump` と `daemon-srv-kairo-<time>.tar.gz` を書き出しており、`kairo-control-<time>` という名前のインポートにはこれらに加えて各ノードの `/srv/kairo`、各ホストの `/etc/kairo`、および Windows ホストの設定ディレクトリが収められていました。）
 
-## Verification
+データベース、デーモン、ノードのすべてが失われた状態から再構築する手順は次のとおりです。
 
-The Go tests need a PostgreSQL 17 server where they may create databases:
-each test gets a database of its own (random name, collation C), dropped
-when it ends, so tests run in parallel and leave nothing behind (the
-databases of a run that could not clean up, `kairo_test_*`, are dropped by a
-run six hours later).
-`KAIRO_TEST_PG` names the server, by default the local test container below
-(`fsync` off: tests only). A test fails, it is not skipped, when the server
-cannot be reached.
+1. **最新スナップショットの特定と展開**: ファイル一覧から該当するオブジェクトを検索し（`grep -l 'kairo-control-.*\.tar\|kairo-.*\.dump' <root>/objects/*/*.files.tsv`）、オブジェクトを展開して（`zstd -dc OBJ.tar.zst | tar -x`）中のスナップショットを取り出します。
+2. **バイナリのビルドとデータベースの復元**: このリポジトリから `kairo` をビルドし、空の PostgreSQL データベースを作成したうえで（[データベース](#データベース)を参照）、`pg_restore -d kairo` でダンプを復元します。
+3. **デーモンとエージェントの起動**: 設定ファイルの指定どおりに `config/` と `sources/` を戻し、別途保管しておいた TLS 秘密鍵とデータベースパスワードを配置して（あるいは新しい鍵の作成・証明書の再発行および `ALTER ROLE kairo PASSWORD ...` による新パスワードの設定を行って）`kairo serve` を起動します。続いて各ノードのエージェント設定を復元し（または新しいトークンを発行して）、エージェントを起動します。
+4. **ストアの再宣言**: 以前と同じようにストアを宣言します（マシン宣言はダンプ内および Windows 設定ディレクトリの `machines.toml` にも保存されています）。復元されたレコードが示す場所に各コピーが既に存在するため、再コピーは発生しません。
+
+復元したダンプの作成以降にデーモンが記録したインポートやコピーはダンプには含まれませんが、そのコピー自体はファイル一覧や説明ファイルとともに durable store 上に存在します。1 時間以内に各エージェントによる durable store のインベントリ処理によって自動的に取り込まれます（[データストア](#データストア)を参照: durable store のディレクトリそのものが保持内容の正となります）。ただし、当時進行中だった Run・Task・インポートは自動取り込みされないため、再度宣言してください。
+
+## 検証とテスト
+
+Go のテストスイートを実行するには、テスト側でデータベースを作成できる PostgreSQL 17 サーバが必要です。各テストはランダムな名前の専用データベース（照合順序 `C`）を作成し、終了時に削除します。これによりテストを並列実行でき、実行後にゴミが残りません（何らかの理由でクリーンアップできなかった `kairo_test_*` データベースは、6 時間後の別テスト実行時に削除されます）。
+
+接続先サーバは環境変数 `KAIRO_TEST_PG` で指定します。デフォルトは下記のローカルテスト用コンテナです（`fsync` 無効化はテスト専用設定です）。サーバに到達できない場合、テストはスキップされず失敗します。
 
 ```powershell
 docker run -d --name kairo-pg-test -p 127.0.0.1:55432:5432 -e POSTGRES_USER=kairo -e POSTGRES_PASSWORD=kairo-test -e POSTGRES_DB=kairo postgres:17 -c fsync=off -c full_page_writes=off -c synchronous_commit=off
-$env:KAIRO_TEST_PG = "postgres://kairo:kairo-test@127.0.0.1:55432/kairo?sslmode=disable"   # the default
+$env:KAIRO_TEST_PG = "postgres://kairo:kairo-test@127.0.0.1:55432/kairo?sslmode=disable"   # デフォルト値
 go test ./...
 go test -race ./...
 go vet ./...
@@ -3101,67 +2098,43 @@ uv run --project sdk/python pytest -q
 git diff --check
 ```
 
-### CI on GitHub
+### GitHub 上の CI
 
-Every push to `main` and every pull request runs the checks that need
-nothing of this installation on GitHub's hosted runners
-(`.github/workflows/ci.yml`, each a `ci/check.sh` check): `linux`,
-`linux-race` and `linux-root` on Ubuntu with PostgreSQL 17 as a service
-(role `kairo`, a superuser), `windows` on Windows with the image's
-PostgreSQL, and `sdk-python` and `sdk-rust` on Ubuntu. There is no
-self-hosted runner and no secret, so nothing of the installation is reachable
-from there. The repository is private (2026-11-21), so the runs count against
-the account's Actions minutes: about 20 billed minutes a run, the Windows job
-counting twice. The checks that need
-the real environment (the LXC on pve1, the hardware) run on Kairo itself
-(below), before a deploy and before a large branch is merged. Deploying is
-not done from GitHub.
+`main` へのすべてのプッシュおよびすべてのプルリクエストでは、実稼働環境を必要としないチェック群が GitHub ホストランナー上で自動実行されます（`.github/workflows/ci.yml`。各ジョブは `ci/check.sh` のチェックを実行します）。
 
-### CI on Kairo
+- **Ubuntu（PostgreSQL 17 サービス付き、ロールはスーパーユーザーの `kairo`）**: `linux`、`linux-race`、`linux-root`
+- **Windows（ランナーイメージ付属の PostgreSQL を使用）**: `windows`
+- **Ubuntu**: `sdk-python`、`sdk-rust`
 
-Kairo's CI runs on Kairo: `bash ci/kairo-ci.sh [REV] [--wait]` declares the
-checks of one commit as Tasks of project `kairo-ci` (queue `ci`,
-`ci/tasks.toml.in` with the commit's short sha), so they run on this
-installation's own nodes, where the code runs, under the same admission as
-any work. The script copies the commit's tree (`git archive`) to each node the
-checks run on, as `site.env` says (Operating an installation), keeping the
-trees it sends in the state directory's `ci/`:
+セルフホストランナーもシークレットも設定していないため、GitHub 側から稼働環境へ到達することはできません。リポジトリはプライベート（2026-11-21 時点）であるため実行時間はアカウントの Actions 分数を消費し、1 回の実行あたり課金対象は約 20 分です（Windows ジョブは 2 倍でカウントされます）。実環境（`pve1` 上の LXC や実ハードウェア）を必要とするチェックは、デプロイ前や大規模ブランチのマージ前に Kairo 自体の上で実行します（[Kairo 上の CI](#kairo-上の-ci) を参照）。なお、GitHub からのデプロイは行いません。
+
+### Kairo 上の CI
+
+Kairo 自身の CI は Kairo 上で実行します。`bash ci/kairo-ci.sh [REV] [--wait]` を実行すると、指定コミットのチェック群をプロジェクト `kairo-ci`（キュー `ci`、`ci/tasks.toml.in` にコミットの短縮 SHA を埋め込んだ定義）の Task として宣言します。これにより、コードが実際に動作する稼働環境自身のノード上で、他の作業とまったく同じアドミッション制御の下でチェックが走ります。
+
+スクリプトは `site.env`（[運用スクリプト](#運用スクリプト)を参照）の指定に従って対象コミットのツリー（`git archive`）を各チェック実行ノードへコピーし、送信したツリーを状態ディレクトリ配下の `ci/` に保持します。
 
 ```sh
-CI_WINDOWS_ROOT=/c/Users/me/AppData/Local/kairo/ci-windows  # where windows-local's checks unpack
-CI_PVE1_HOST=root@192.168.1.252                             # the Proxmox host of pve1-work
-CI_PVE1_VMID=116                                            # pve1-work's container
+CI_WINDOWS_ROOT=/c/Users/me/AppData/Local/kairo/ci-windows  # windows-local 上のチェック展開先
+CI_PVE1_HOST=root@192.168.1.252                             # pve1-work の Proxmox ホスト
+CI_PVE1_VMID=116                                            # pve1-work のコンテナ
 ```
 
-Each Task unpacks that tree into its scratch (`KAIRO_SCRATCH`), runs
-`ci/check.sh CHECK` from it (the checks are those of the commit, and nothing a
-running check reads changes under it) with Go's, uv's and cargo's caches in
-the project's cache directory (`KAIRO_CACHE_DIR`), and removes the tree: its
-attempts are confined like any (Confinement), so those are the only places
-they may write. On windows-local they run at Low integrity, where Git Bash
-does not start, so the Windows checks run `ci/check.ps1 CHECK` in
-PowerShell instead of `ci/check.sh`. The checks: `<sha>-linux` (gofmt, `go vet`
-for Linux and Windows, `go test`), `<sha>-linux-race` and `<sha>-linux-root`
-(the executor, process and provider tests as root) on pve1-work, the first two
-as an unprivileged user (`ci`) so the tests of unreadable and undeletable
-files mean something; `<sha>-windows`,
-`<sha>-sdk-python` and `<sha>-sdk-rust` on windows-local. pve1-work has Go,
-gcc (for `-race`) and a test PostgreSQL 17 at `127.0.0.1:55432` (role
-`kairo`, a superuser as in the test container, since dropping a test database
-ends its other connections; listening on localhost only, `fsync` off),
-windows-local the test container above. The checks
-run at priority -500: they wait for everyone's work and preempt nothing. Each
-of pve1-work's reserves 3 GiB of its 4, so the planner runs them one at a
-time. `--wait` waits for all of them (`kairo task wait --match`) and exits 0
-only if every check succeeded; `kairo task logs kairo-ci ci <sha>-<check>`
-shows what failed, and `kairo task rerun` runs a check again (a declared Task
-is immutable, so a commit is declared once).
+各 Task はコピーされたツリーを自身の `scratch`（`KAIRO_SCRATCH`）に展開し、そこから `ci/check.sh CHECK` を実行します（チェック内容もそのコミット時点のものであり、実行中に読み込むファイルが外部から書き換わることはありません）。Go・`uv`・`cargo` のキャッシュはプロジェクトのキャッシュディレクトリ（`KAIRO_CACHE_DIR`）に配置し、完了時に展開したツリーを削除します。Attempt は他のジョブと同様にコンファインメントされるため（[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）、書き込みが許可されるのはこれらのみです。なお、`windows-local` 上では Low integrity で実行されるため Git Bash が起動せず、Windows 向けチェックは `ci/check.sh` ではなく PowerShell で `ci/check.ps1 CHECK` を実行します。
 
-Real NVIDIA, process-kill, and DDP runs are host-specific integration
-tests rather than ordinary unit tests, and so are the controller's changes of
-real clocks, power limits and processor settings (its tests use fake
-actuators). The bench tests run tiny workloads (TempDir files of a few MiB,
-loopback); `kairo-bench-gpu` is only built by them, and a GPU bench belongs on
-an idle GPU. The bench driver and the policy are tested with scripted JSON
-lines and fake daemons and controllers; only real idle hardware shows whether
-the curves, steady state and thermal limits behave as the fakes assume.
+実行されるチェックと対象ノードの構成は次のとおりです。
+
+- **`pve1-work` 上のチェック**:
+  - `<sha>-linux`（`gofmt`、Linux / Windows 向け `go vet`、`go test`）および `<sha>-linux-race`: 読み取り不可・削除不可ファイルのテストが本来の意味を持つよう、非特権ユーザー（`ci`）で実行します。
+  - `<sha>-linux-root`: Executor・プロセス・Provider のテストを `root` で実行します。
+  - **ノード環境**: Go、`gcc`（`-race` 用）、および `127.0.0.1:55432` のテスト用 PostgreSQL 17 を備えています（テストデータベースの削除時に他の接続を切断する必要があるため、テストコンテナと同様にロールはスーパーユーザーの `kairo`。localhost のみでリッスンし、`fsync` はオフ）。
+- **`windows-local` 上のチェック**:
+  - `<sha>-windows`、`<sha>-sdk-python`、`<sha>-sdk-rust`
+  - **ノード環境**: 前述のローカルテスト用コンテナを使用します。
+
+スケジューリングと運用上の操作は次のとおりです。
+
+- **優先度とメモリ予約**: すべてのチェックは優先度 `-500` で実行されるため、他のすべての作業の完了を待ち、何もプリエンプトしません。また、`pve1-work` 上の各チェックは搭載メモリ 4 GiB のうち 3 GiB を予約するため、プランナはこれらを 1 つずつ順番に実行します。
+- **待機・ログ確認・再実行**: `--wait` を付けると全チェックの完了を待機し（`kairo task wait --match`）、すべて成功した場合のみ終了コード `0` で終了します。失敗内容の確認には `kairo task logs kairo-ci ci <sha>-<check>` を、個別チェックの再実行には `kairo task rerun` を使用します（宣言済みの Task は不変であるため、1 つのコミットに対する宣言は 1 回のみです）。
+
+なお、実機の NVIDIA GPU、プロセス強制終了（process-kill）、および DDP 実行のテストは通常の単体テストではなくホスト固有の統合テストであり、コントローラによる実際のクロック・電力上限・プロセッサ設定の変更テストも同様です（コントローラの通常テストではフェイクのアクチュエータを使用します）。ベンチマークテストは極小のワークロード（`TempDir` 上の数 MiB のファイル、ループバック通信）のみを実行し、`kairo-bench-gpu` はビルド検証のみが行われます（GPU ベンチマークの実測はアイドル状態の GPU 上で実行する前提です）。ベンチマークドライバと動作点ポリシーはスクリプト化された JSON 行とフェイクのデーモン・コントローラを用いてテストされており、各種カーブ特性・定常状態・熱制限がフェイクの想定どおりに振る舞うかどうかは、実際のアイドル状態のハードウェア上でのみ確認できます。
