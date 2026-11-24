@@ -61,9 +61,10 @@ PY
   chmod 700 "$data"
   as_nobody() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
   as_nobody "$pg/bin/initdb" -D "$data" -U kairo --auth=trust -E UTF8 >/dev/null
+  # the portable build has no createdb: the database is made in single-user mode, before the server starts
+  echo "CREATE DATABASE kairo;" | as_nobody "$pg/bin/postgres" --single -D "$data" postgres >/dev/null
   as_nobody "$pg/bin/pg_ctl" -D "$data" -l "$data/server.log" -w start \
     -o "-p 55432 -k /tmp -c listen_addresses=127.0.0.1 -c max_connections=300 -c fsync=off -c synchronous_commit=off -c full_page_writes=off" >/dev/null
-  as_nobody "$pg/bin/createdb" -h 127.0.0.1 -p 55432 -U kairo kairo
 }
 need_pg() {
   if ! pg_reachable; then

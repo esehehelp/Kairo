@@ -70,7 +70,7 @@ name = "@SHA@-linux-root"
 image = "go"
 source = "kairo"
 cwd = "."
-argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; c=$KAIRO_CACHE_DIR; mkdir -p \"$d\"; cp -a /kairo/src/. \"$d\"; cd \"$d\"; GOCACHE=\"$c/root-build\" GOMODCACHE=\"$c/root-mod\" bash ci/check.sh linux-root"]
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; c=$KAIRO_CACHE_DIR; mkdir -p \"$d\"; cp -a /kairo/src/. \"$d\"; cd \"$d\"; bash ci/check.sh start-pg; GOCACHE=\"$c/root-build\" GOMODCACHE=\"$c/root-mod\" bash ci/check.sh linux-root"]
 [tasks.execution.executor]
 labels = { site = "@CI_LINUX_SITE@" }
 node = "@CI_LINUX_NODE@"
