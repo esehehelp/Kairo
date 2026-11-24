@@ -3,6 +3,9 @@
 -- (its size, sha256 and the sha256 of each chunk: every later read is checked against it); and the records a file
 -- (by sha256) holds under a framing ("<framing>|<field>"), which lets a loader start mid-way without reading it.
 ALTER TABLE execution_requests ADD COLUMN streams_json TEXT;
+-- the checkpoint (its command) a continuation goes on from: where its streams start is that command's accepted
+-- payload, nothing else
+ALTER TABLE execution_requests ADD COLUMN input_checkpoint_command_id TEXT;
 CREATE TABLE raw_identities(
  url TEXT PRIMARY KEY,
  size BIGINT NOT NULL,

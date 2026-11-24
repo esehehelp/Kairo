@@ -555,6 +555,24 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	if spec.Image, err = taskImageTx(ctx, tx, task.taskScopeID); err != nil {
 		return plannedOrchestrationDecision{}, err
 	}
+	// a continuation goes on from one published checkpoint: its command
+	if id, _ := trigger["command_id"].(string); continuation != nil && id != "" {
+		spec.InputCheckpointCommand = id
+	}
+	// and runs what its predecessor ran (a rerun in another snapshot goes on
+	// in that snapshot)
+	if pred, _ := trigger["predecessor_execution_id"].(string); pred != "" && (reason == "continuation" || reason == "loss_continuation") {
+		var snapshot, image sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT source_snapshot_id,image_ref FROM execution_requests WHERE id=$1`, pred).Scan(&snapshot, &image); err != nil {
+			return plannedOrchestrationDecision{}, err
+		}
+		if snapshot.Valid {
+			spec.SourceSnapshot = snapshot.String
+		}
+		if image.Valid {
+			spec.Image = image.String
+		}
+	}
 	// a rerun in another snapshot of the task's source (kairo task rerun
 	// --source) runs in it; the execution records which
 	if id, _ := trigger["source_snapshot_id"].(string); reason == "rerun" && id != "" {

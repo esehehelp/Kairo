@@ -257,13 +257,15 @@ class DistributedAdapter:
         )
         result = None
         local_error: str | None = None
+        local_positions: dict[str, list[dict[str, int]]] = {}
         try:
             result = normalize_suspend_result(checkpoint(context))
+            local_positions = stream_positions(tuple(streams))
         except BaseException as exc:
             local_error = f"rank {rank} checkpoint failed: {type(exc).__name__}: {exc}"
 
         # each rank's failure, and where each of its streams stands
-        local = (local_error, stream_positions(tuple(streams)))
+        local = (local_error, local_positions)
         gathered: list[Any] = [None] * (dist.get_world_size() if distributed else 1)
         if distributed:
             dist.all_gather_object(gathered, local)

@@ -1732,7 +1732,11 @@ Gang 実行の動作ルールは以下のとおりです。
 
 データセットは、できるだけネットワークとメモリの中だけで扱います（issue #43）。Corpus/Mix は作り置きせず、学習しながら raw データから作って流します（[データの手放し](#データの手放しdrop)）。Loader はそのための仕組みで、raw データを取り寄せて sha256 で確かめ、決まった順番のレコード列にして、学習プロセス（の各 rank）にソケットで渡します。どこまで渡したか（位置）を指定すれば、そのちょうど次のレコードから同じ順番で続きます。
 
-Task は宣言した stream を読みます（コンテナで動く Task のみ。gang は未対応）。agent の raw プロキシ（ノードのメモリでのキャッシュと LAN での共有）、ホストの Executor（Windows を含む）、状態表示は、これから組み込みます（#43）。
+Task は宣言した stream を読みます（コンテナで動く Task のみ。gang は未対応）。まだないもの（#43）:
+
+- agent の raw キャッシュ（ノードの volatile store とメモリへの保持、LAN での共有）。それまでは、Loader が各ファイルを上流から直接取り寄せます（コンテナから上流へ出られる必要があります）。また、最初に読まれるファイルは、その末尾で公開済みの sha256 と照合されるまで、照合前のバイトが学習側へ渡ります（このキャッシュで、照合を済ませてから渡すようにします）
+- Parquet などの形式、data object（`object = ...`）の source、非公開の Hugging Face ファイルの取得
+- 状態表示（`task show`）、ホストの Executor（Windows を含む）
 
 ### 宣言（`[raws]`・`[streams]`）
 
@@ -1741,7 +1745,7 @@ Task は宣言した stream を読みます（コンテナで動く Task のみ�
 urls = ["https://dumps.example.org/jawiki/20261101/jawiki-pages.xml.bz2"]   # 1 URL が 1 ファイル（名前は URL の最後の要素）
 
 [raws.web]
-hf = { repo = "owner/name", revision = "<40 桁のコミット>", files = ["data/*.parquet"], type = "dataset" }
+hf = { repo = "owner/name", revision = "<40 桁のコミット>", files = ["data/*.jsonl.zst"], type = "dataset" }
 
 [streams.mix]
 sources = [ { raw = "wiki", weight = 3, format = "text.bz2" }, { raw = "web", format = "jsonl", field = "text" } ]
@@ -1762,8 +1766,11 @@ streams = ["mix"]           # → KAIRO_STREAM_MIX
 ### 起動、識別、位置
 
 - **起動**: Attempt のコンテナの中で、本体より先に stream ごとに `kairo loader serve` が起動します。spec と位置は `/kairo/run/streams/<名前>/`、ソケットは同じ場所の `socket` です。ソケットができてから本体が `KAIRO_STREAM_<NAME>=unix:...` 付きで起動し、本体が終わると Loader（とその stage）も終わります。stage は Task の image とソースで、Task の `cwd` から動きます。Loader のログは Attempt の stderr に出ます。
-- **識別**: 最初に読まれたファイルは、読みながらチャンクごとの sha256 が作られ、最後まで読むと公開済みの sha256 とサイズ（Hugging Face の LFS ファイルなど）と照合されます。この識別情報と、分かったレコード数を、Loader が Attempt としてデーモンに送ります（`POST /api/worker/streams`、テーブル `raw_identities`・`raw_records`）。URL ごとに最初の識別情報が残り、別の識別情報が送られたら `raw data changed` です。以後の起動では、どのチャンクもこれと照合されます。
-- **位置と checkpoint**: SDK の `safe_point(..., streams=[train])`（torch の `DistributedAdapter.safe_point(..., streams=[train])` は全 rank の位置を集めます）は、checkpoint を公開するとき、各 stream の各 rank の位置を `checkpointed` の payload に `"streams": {NAME: [位置...]}` として入れます。その checkpoint から続く Attempt（continuation）の Loader は、その位置から始めます。
+- **識別**: 最初に読まれたファイルは、読みながらチャンクごとの sha256 が作られ、最後まで読むと公開済みの sha256 とサイズ（Hugging Face の LFS ファイルなど）と照合されます。この識別情報と、分かったレコード数を、Loader が Attempt（その Lease と epoch）としてデーモンに送ります（`POST /api/worker/streams`、テーブル `raw_identities`・`raw_records`）。受け付けるのは、その Attempt の stream が読むファイルのものだけです。URL ごとに最初の識別情報が残り、公開済みの値と違うもの、すでにあるものと少しでも違うもの（サイズ、sha256、チャンク）は `raw data changed` です。レコード数は、識別済みのファイルを、その Attempt の stream のどれかが読む形式・フィールドで数えたものだけを、区切り・実際の圧縮・フィールドごとに残します（違う数は `raw data changed`）。以後の起動では、どのチャンクもこれと照合され、長さが違えば（短くても長くても）変わったものとして扱います。
+- **位置と checkpoint**: SDK の `safe_point(..., streams=[train])`（torch の `DistributedAdapter.safe_point(..., streams=[train])` は全 rank の位置を集めます）は、checkpoint を公開するとき、各 stream の各 rank の位置を `checkpointed` の payload に `"streams": {NAME: [位置...]}` として入れます。stream を読む Execution の checkpoint は、読むすべての stream について rank 0〜W-1 の位置がちょうど 1 つずつ（負の値なし）なければ拒否されます（`safe_point` に stream を渡し忘れると、公開されません）。
+- **続き**: continuation（suspend 後、ロスト後、`rerun --from-checkpoint`）は、続けるもとの checkpoint を、その command で覚えています（`input_checkpoint_command_id`）。Loader は、その command の受理された payload が言う位置から始め、rank の数（W）はその位置の数に固定されます（別の数で接続した rank は拒否されます）。同じ参照で公開された別の checkpoint の位置が使われることはありません。また、continuation は前の Execution と同じコードスナップショットとイメージで動きます（`rerun --source` で別のスナップショットに替えた Run は、その続きもそのスナップショットです）。
+- **ストリームの終わりと失敗**: 終わり（`end`）と失敗（`error`）は、取り逃した rank が接続し直したときにも、もう一度渡されます。失敗した stream は、巻き戻しで作り直されることはありません。Loader のプロセスが終わったら、コンテナの init が起動し直し（5 回まで）、各 rank は自分の位置で接続し直します。
+- **メモリ**: 各 rank のために先に作っておく分は、件数（4096 件）とバイト数（`memory_bytes` の 4 分の 1 を rank で分けた分、最低 1 MiB。宣言がなければ rank ごとに 64 MiB）の両方で抑えます。
 
 ### 順番
 

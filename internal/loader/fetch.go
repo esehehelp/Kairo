@@ -145,9 +145,13 @@ func (c *checkedReader) fill() error {
 	failed := false
 	for {
 		data, err := c.readChunk()
+		if errors.Is(err, errLength) {
+			// shorter or longer than identified: as bytes not matching
+			data, err = nil, nil
+		}
 		if err == nil {
 			sum := sha256.Sum256(data)
-			if hex.EncodeToString(sum[:]) == c.f.Chunks[c.chunk] {
+			if data != nil && hex.EncodeToString(sum[:]) == c.f.Chunks[c.chunk] && (c.chunk+1 < len(c.f.Chunks) || c.atEnd()) {
 				if failed && c.x.Problem != nil {
 					c.x.Problem(c.f, nil)
 				}
@@ -156,7 +160,7 @@ func (c *checkedReader) fill() error {
 			}
 			c.closeBody()
 			if c.mismatch == c.chunk+1 {
-				return fmt.Errorf("%w: %s chunk %d from %s is not what was identified", ErrChanged, c.f.Name, c.chunk, c.x.Origin)
+				return fmt.Errorf("%w: %s chunk %d from %s is not what was identified (its bytes or the file's length)", ErrChanged, c.f.Name, c.chunk, c.x.Origin)
 			}
 			c.mismatch = c.chunk + 1
 			err = fmt.Errorf("%s chunk %d from %s does not match its sha256: reading it again", c.f.Name, c.chunk, c.x.Origin)
@@ -183,16 +187,32 @@ func (c *checkedReader) readChunk() ([]byte, error) {
 	if c.body == nil {
 		body, err := c.x.Origin.ReadFrom(c.ctx, c.f, int64(c.chunk)*c.f.ChunkBytes)
 		if err != nil {
-			return nil, err
+			return nil, err // errLength among them
 		}
 		c.body = body
 	}
 	data := make([]byte, c.f.chunkSize(c.chunk))
 	if _, err := io.ReadFull(c.body, data); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("%w: %s ends before its chunk %d", errLength, c.f.Name, c.chunk)
+		}
 		return nil, fmt.Errorf("%s chunk %d from %s: %w", c.f.Name, c.chunk, c.x.Origin, err)
 	}
 	return data, nil
 }
+
+// atEnd reports whether the body has nothing past the file's last chunk.
+func (c *checkedReader) atEnd() bool {
+	var one [1]byte
+	n, err := c.body.Read(one[:])
+	for n == 0 && err == nil {
+		n, err = c.body.Read(one[:])
+	}
+	return n == 0
+}
+
+// errLength: what was read is not as long as the file was identified.
+var errLength = errors.New("length not as identified")
 
 func (c *checkedReader) closeBody() {
 	if c.body != nil {
@@ -269,8 +289,20 @@ func (r *identifyingReader) Read(p []byte) (int, error) {
 		if err != nil {
 			r.body.Close()
 			r.body = nil
+			if r.x.Problem != nil {
+				r.x.Problem(r.f, err)
+			}
+			failed = true
 			if n > 0 {
 				return n, nil
+			}
+			select {
+			case <-r.ctx.Done():
+				return 0, r.ctx.Err()
+			case <-time.After(pause):
+			}
+			if pause *= 2; pause > maxPause {
+				pause = maxPause
 			}
 			continue
 		}
@@ -381,8 +413,21 @@ func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (io.Read
 	}
 	switch {
 	case resp.StatusCode == http.StatusPartialContent && offset > 0:
+		var start, end, total int64
+		if _, err := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes %d-%d/%d", &start, &end, &total); err != nil || start != offset {
+			resp.Body.Close()
+			return nil, fmt.Errorf("%s: asked from byte %d, answered %q", f.URL, offset, resp.Header.Get("Content-Range"))
+		}
+		if f.Identified() && total != f.Size {
+			resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s has %d bytes, identified as %d", errLength, f.URL, total, f.Size)
+		}
 		return resp.Body, nil
 	case resp.StatusCode == http.StatusOK:
+		if f.Identified() && resp.ContentLength >= 0 && resp.ContentLength != f.Size {
+			resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s has %d bytes, identified as %d", errLength, f.URL, resp.ContentLength, f.Size)
+		}
 		if _, err := io.CopyN(io.Discard, resp.Body, offset); err != nil { // no ranges there
 			resp.Body.Close()
 			return nil, err

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
@@ -43,6 +44,9 @@ func resolveRawListings(m *orchestration.Manifest) error {
 			continue
 		}
 		h := *raw.HF
+		if !hfCommit.MatchString(h.Revision) || len(h.Files) == 0 {
+			return fmt.Errorf("raw %s: hf needs a revision that is a 40-hex commit and file patterns", name)
+		}
 		kind := "datasets"
 		if h.Type == "model" {
 			kind = "models"
@@ -86,6 +90,9 @@ func resolveRawListings(m *orchestration.Manifest) error {
 			next = ""
 			if m := nextLink.FindStringSubmatch(resp.Header.Get("Link")); m != nil {
 				next = m[1]
+				if !sameOrigin(next, hfAPI) {
+					return fmt.Errorf("raw %s: the listing's next page is elsewhere (%s)", name, next)
+				}
 			}
 		}
 		sort.Slice(files, func(i, j int) bool { return files[i].Name < files[j].Name })
@@ -96,6 +103,15 @@ func resolveRawListings(m *orchestration.Manifest) error {
 		fmt.Fprintf(os.Stderr, "raw %s: %d files of %s at %s\n", name, len(files), h.Repo, h.Revision[:12])
 	}
 	return nil
+}
+
+var hfCommit = regexp.MustCompile(`^[0-9a-f]{40}$`)
+
+// sameOrigin reports whether a and b have one scheme and host.
+func sameOrigin(a, b string) bool {
+	x, err1 := url.Parse(a)
+	y, err2 := url.Parse(b)
+	return err1 == nil && err2 == nil && x.Scheme == y.Scheme && x.Host == y.Host
 }
 
 func matchesAny(patterns []string, p string) bool {

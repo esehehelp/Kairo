@@ -222,6 +222,12 @@ func (w *stageWorker) write(ctx context.Context, stdin io.WriteCloser, sent chan
 	defer close(sent)
 	bw := bufio.NewWriterSize(stdin, 1<<20)
 	put := func(g group) error {
+		// told first: the stage may answer a record while the next is written
+		select {
+		case sent <- g:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 		for _, rec := range g.recs {
 			var size [4]byte
 			binary.LittleEndian.PutUint32(size[:], uint32(len(rec)))
@@ -232,15 +238,7 @@ func (w *stageWorker) write(ctx context.Context, stdin io.WriteCloser, sent chan
 				return err
 			}
 		}
-		if err := bw.Flush(); err != nil {
-			return err
-		}
-		select {
-		case sent <- g:
-		case <-ctx.Done():
-			return ctx.Err()
-		}
-		return nil
+		return bw.Flush()
 	}
 	w.mu.Lock()
 	again := append([]group(nil), w.pending...)
@@ -279,9 +277,13 @@ func (w *stageWorker) write(ctx context.Context, stdin io.WriteCloser, sent chan
 	}
 }
 
+// maxOutputBytes bounds what one group's records give out.
+const maxOutputBytes = 1 << 30
+
 // readOutputs reads the outputs of n records.
 func readOutputs(r *bufio.Reader, n int) ([][]byte, error) {
 	var outs [][]byte
+	var total int64
 	for done := 0; done < n; {
 		var size [4]byte
 		if _, err := io.ReadFull(r, size[:]); err != nil {
@@ -297,6 +299,9 @@ func readOutputs(r *bufio.Reader, n int) ([][]byte, error) {
 		}
 		if v > maxRecordBytes {
 			return nil, fmt.Errorf("an output of %d bytes, more than %d", v, maxRecordBytes)
+		}
+		if total += int64(v); total > maxOutputBytes {
+			return nil, fmt.Errorf("outputs of more than %d bytes for %d records", maxOutputBytes, n)
 		}
 		rec := make([]byte, v)
 		if _, err := io.ReadFull(r, rec); err != nil {

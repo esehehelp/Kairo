@@ -206,8 +206,8 @@ def dataset(name: str, decode: Callable[[bytes], Any] | None = None, **kwargs: A
 
         def __iter__(self) -> Iterator[Any]:
             info = torch.utils.data.get_worker_info()
-            if info is not None and info.num_workers > 1:
-                raise StreamError(f"stream {name}: one process takes a rank's records: use num_workers=0")
+            if info is not None:
+                raise StreamError(f"stream {name}: the training process takes a rank's records itself (its position goes with its checkpoints): use num_workers=0")
             if self.stream is None:
                 self.stream = open(name, **kwargs)
             for item in self.stream:

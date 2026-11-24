@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"kairo/internal/loader"
 	"kairo/internal/orchestration"
@@ -22,6 +23,14 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 	setupSchedulerInventory(t, store)
 	ctx := context.Background()
 	if err := store.UpsertExecutor(ctx, Executor{ID: "ctr", NodeID: "node", Kind: "incus", Attributes: json.RawMessage(`{"environment":"wsl2","runtime":"incus"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertResourceInstance(ctx, ResourceInstance{ID: "ram", NodeID: "node", ProviderID: "gpu-provider", Kind: "ram", StableIdentity: "physical-memory", Binding: json.RawMessage(`{}`), AdminState: "enabled"}); err != nil {
+		t.Fatal(err)
+	}
+	total, free := int64(64<<30), int64(40<<30)
+	observed := time.Now().UTC()
+	if err := store.RecordObservation(ctx, Observation{ResourceID: "ram", ObservedAt: observed.Format(time.RFC3339Nano), ValidUntil: observed.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &free}); err != nil {
 		t.Fatal(err)
 	}
 	const url = "https://example.org/corpus/part-0.jsonl.zst"
@@ -73,21 +82,32 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.URL = url
-	report := StreamReport{Identities: []loader.File{f}, Records: []RecordsCount{{SHA256: f.SHA256, Format: "jsonl.zst", Field: "text", Records: 42}}}
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, report); err != nil {
+	report := StreamReport{Identities: []loader.File{f}, Records: []RecordsCount{{URL: url, SHA256: f.SHA256, Format: "jsonl.zst", Field: "text", Records: 42}}}
+	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, report); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, report); err != nil {
+	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, report); err != nil {
 		t.Fatalf("the same again: %v", err)
 	}
 	changed := f
 	changed.SHA256 = strings.Repeat("e", 64)
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, StreamReport{Identities: []loader.File{changed}}); !errors.Is(err, ErrRawChanged) {
+	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, StreamReport{Identities: []loader.File{changed}}); !errors.Is(err, ErrRawChanged) {
 		t.Fatalf("another identity of the URL: %v", err)
+	}
+	wrongCount := StreamReport{Records: []RecordsCount{{URL: url, SHA256: f.SHA256, Format: "jsonl.zst", Field: "text", Records: 41}}}
+	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, wrongCount); !errors.Is(err, ErrRawChanged) {
+		t.Fatalf("another record count: %v", err)
+	}
+	otherFormat := StreamReport{Records: []RecordsCount{{URL: url, SHA256: f.SHA256, Format: "text", Records: 7}}}
+	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, otherFormat); !errors.Is(err, ErrStreamReportRefused) {
+		t.Fatalf("a count as no source reads it: %v", err)
+	}
+	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch+1, report); !errors.Is(err, ErrStaleEpoch) {
+		t.Fatalf("another epoch: %v", err)
 	}
 	other := f
 	other.URL = "https://example.org/elsewhere"
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, StreamReport{Identities: []loader.File{other}}); !errors.Is(err, ErrStreamReportRefused) {
+	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, StreamReport{Identities: []loader.File{other}}); !errors.Is(err, ErrStreamReportRefused) {
 		t.Fatalf("a file of no stream of the attempt: %v", err)
 	}
 	streams, err := launchStreamsTx(ctx, store.db, launch.Execution.ID)
@@ -99,26 +119,53 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 		t.Fatalf("the next launch's source %+v", got)
 	}
 
-	// a checkpoint said where rank 0 stood
-	var task string
-	if err := store.db.QueryRowContext(ctx, `SELECT task_scope_id FROM execution_requests WHERE id=$1`, launch.Execution.ID).Scan(&task); err != nil {
+	// a checkpoint says where every rank of every stream stood, or it is
+	// refused; a continuation starts where its checkpoint (its command) says
+	decls, err := executionStreamsTx(ctx, store.db, launch.Execution.ID)
+	if err != nil || len(decls) != 1 {
+		t.Fatalf("decls %+v %v", decls, err)
+	}
+	for _, bad := range []string{
+		`{"continuation_ref":"ckpt-1"}`,
+		`{"continuation_ref":"ckpt-1","streams":{"other":[{"rank":0,"record":5}]}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":1,"record":5}]}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":0,"record":5},{"rank":0,"record":6}]}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":0,"record":-1}]}}`,
+	} {
+		if err := checkStreamPositionsTx(ctx, store.db, launch.Execution.ID, []byte(bad)); !errors.Is(err, ErrStreamPositions) {
+			t.Fatalf("%s: %v", bad, err)
+		}
+	}
+	good := `{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":1,"record":4,"sub":0},{"rank":0,"record":5,"sub":1}]}}`
+	if err := checkStreamPositionsTx(ctx, store.db, launch.Execution.ID, []byte(good)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.testExec(`INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at)
-		VALUES('cmd_1',$1,$2,$3,$4,'suspend','scope_pause','test','checkpointed','2026-11-25T00:00:00Z','2026-11-25T00:00:00Z')`,
-		launch.Execution.ID, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch); err != nil {
+	if _, err := store.testExec(`INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,payload_json,created_at,updated_at)
+		VALUES('cmd_1',$1,$2,$3,$4,'suspend','scope_pause','test','checkpointed',$5,'2026-11-25T00:00:00Z','2026-11-25T00:00:00Z')`,
+		launch.Execution.ID, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, good); err != nil {
 		t.Fatal(err)
 	}
+	// another publication of the same reference does not stand for it
 	if _, err := store.testExec(`INSERT INTO command_acks(command_id,attempt_id,coordination_epoch,phase,payload_json,created_at)
-		VALUES('cmd_1',$1,$2,'checkpointed',$3,'2026-11-25T00:00:00Z')`, launch.Attempt.ID, launch.Lease.CoordinationEpoch,
-		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":0,"record":5,"sub":1}]}}`); err != nil {
+		VALUES('cmd_1',$1,$2,'checkpointed',$3,'2026-11-25T00:00:01Z')`, launch.Attempt.ID, launch.Lease.CoordinationEpoch,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":0,"record":99},{"rank":1,"record":99}]}}`); err != nil {
 		t.Fatal(err)
 	}
-	positions, err := continuationPositionsTx(ctx, store.db, task, "ckpt-1")
-	if err != nil || len(positions["mix-1"]) != 1 || positions["mix-1"][0] != (loader.Position{Rank: 0, Record: 5, Sub: 1}) {
-		t.Fatalf("positions %+v %v", positions, err)
+	if _, err := store.testExec(`UPDATE execution_requests SET input_continuation_ref='ckpt-1' WHERE id=$1`, launch.Execution.ID); err != nil {
+		t.Fatal(err)
 	}
-	if positions, err = continuationPositionsTx(ctx, store.db, task, "ckpt-none"); err != nil || len(positions) != 0 {
-		t.Fatalf("no such checkpoint: %+v %v", positions, err)
+	if _, err := launchStreamsTx(ctx, store.db, launch.Execution.ID); !errors.Is(err, ErrStreamPositions) {
+		t.Fatalf("a continuation without its checkpoint's command: %v", err)
+	}
+	if _, err := store.testExec(`UPDATE execution_requests SET input_checkpoint_command_id='cmd_1' WHERE id=$1`, launch.Execution.ID); err != nil {
+		t.Fatal(err)
+	}
+	streams, err = launchStreamsTx(ctx, store.db, launch.Execution.ID)
+	if err != nil || len(streams[0].Positions) != 2 {
+		t.Fatalf("continuation streams %+v %v", streams, err)
+	}
+	got0 := streams[0].Positions
+	if !(got0[0] == (loader.Position{Rank: 1, Record: 4}) && got0[1] == (loader.Position{Rank: 0, Record: 5, Sub: 1})) {
+		t.Fatalf("positions %+v", got0)
 	}
 }

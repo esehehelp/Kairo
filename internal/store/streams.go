@@ -6,8 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"regexp"
-	"strings"
 
 	"kairo/internal/loader"
 	"kairo/internal/orchestration"
@@ -33,35 +31,87 @@ type LaunchStream struct {
 	Positions []loader.Position `json:"positions,omitempty"`
 }
 
-var notEnvChar = regexp.MustCompile(`[^A-Za-z0-9]`)
+// StreamEnv is the environment variable of stream name.
+func StreamEnv(name string) string { return orchestration.StreamEnv(name) }
 
-// StreamEnv is the environment variable of stream name: KAIRO_STREAM_ and
-// the name upper-cased, anything not a letter or digit an underscore.
-func StreamEnv(name string) string {
-	return "KAIRO_STREAM_" + strings.ToUpper(notEnvChar.ReplaceAllString(name, "_"))
-}
+// ErrStreamPositions: a checkpoint of an execution reading streams that does
+// not say exactly where each rank of each stream stood.
+var ErrStreamPositions = errors.New("stream positions")
 
-// framingKey is what a file's record count is kept under: the framing (the
-// format without its compression) and the field.
-func framingKey(format, field string) string {
-	framing, _, _ := strings.Cut(format, ".")
-	return framing + "|" + field
-}
-
-// launchStreamsTx is the streams the attempt of an execution reads.
-func launchStreamsTx(ctx context.Context, q queryer, executionID string) ([]LaunchStream, error) {
-	var body, continuation, task sql.NullString
-	err := q.QueryRowContext(ctx, `SELECT streams_json,input_continuation_ref,task_scope_id FROM execution_requests WHERE id=$1`, executionID).Scan(&body, &continuation, &task)
-	if err != nil || !body.Valid {
+// executionStreamsTx is the streams an execution reads (none: nil).
+func executionStreamsTx(ctx context.Context, q queryer, executionID string) ([]orchestration.StreamDecl, error) {
+	var body sql.NullString
+	if err := q.QueryRowContext(ctx, `SELECT streams_json FROM execution_requests WHERE id=$1`, executionID).Scan(&body); err != nil || !body.Valid {
 		return nil, err
 	}
 	var decls []orchestration.StreamDecl
 	if err := json.Unmarshal([]byte(body.String), &decls); err != nil {
 		return nil, fmt.Errorf("streams of execution %s: %w", executionID, err)
 	}
+	return decls, nil
+}
+
+// streamPositions reads where each rank of each stream of decls stood from a
+// checkpoint's payload ("streams": {NAME: [{rank, record, sub}...]}): every
+// stream there, each with ranks 0..W-1 once each, nothing negative.
+func streamPositions(decls []orchestration.StreamDecl, payload []byte) (map[string][]loader.Position, error) {
+	var body struct {
+		Streams map[string][]loader.Position `json:"streams"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrStreamPositions, err)
+	}
+	out := map[string][]loader.Position{}
+	for _, d := range decls {
+		ranks, ok := body.Streams[d.Name]
+		if !ok || len(ranks) == 0 {
+			return nil, fmt.Errorf("%w: the checkpoint says nothing of stream %s (pass it to safe_point)", ErrStreamPositions, d.Name)
+		}
+		seen := make([]bool, len(ranks))
+		for _, p := range ranks {
+			if p.Rank < 0 || p.Rank >= len(ranks) || seen[p.Rank] || p.Record < 0 || p.Sub < 0 {
+				return nil, fmt.Errorf("%w: stream %s: positions %v are not one each of ranks 0..%d", ErrStreamPositions, d.Name, ranks, len(ranks)-1)
+			}
+			seen[p.Rank] = true
+		}
+		out[d.Name] = ranks
+	}
+	return out, nil
+}
+
+// checkStreamPositionsTx refuses a checkpointed payload of an execution
+// reading streams that does not say where each rank of each stood.
+func checkStreamPositionsTx(ctx context.Context, q queryer, executionID string, payload []byte) error {
+	decls, err := executionStreamsTx(ctx, q, executionID)
+	if err != nil || len(decls) == 0 {
+		return err
+	}
+	_, err = streamPositions(decls, payload)
+	return err
+}
+
+// launchStreamsTx is the streams the attempt of an execution reads: from
+// the start, or, for a continuation, from where the checkpoint it goes on
+// from (its command's accepted payload) says each rank stood.
+func launchStreamsTx(ctx context.Context, q queryer, executionID string) ([]LaunchStream, error) {
+	decls, err := executionStreamsTx(ctx, q, executionID)
+	if err != nil || len(decls) == 0 {
+		return nil, err
+	}
+	var continuation, command sql.NullString
+	if err := q.QueryRowContext(ctx, `SELECT input_continuation_ref,input_checkpoint_command_id FROM execution_requests WHERE id=$1`, executionID).Scan(&continuation, &command); err != nil {
+		return nil, err
+	}
 	positions := map[string][]loader.Position{}
-	if continuation.Valid && task.Valid {
-		if positions, err = continuationPositionsTx(ctx, q, task.String, continuation.String); err != nil {
+	if continuation.Valid {
+		if !command.Valid {
+			return nil, fmt.Errorf("%w: execution %s goes on from %s, not from a checkpoint Kairo knows: where its streams start is not known", ErrStreamPositions, executionID, continuation.String)
+		}
+		var payload string
+		if err := q.QueryRowContext(ctx, `SELECT payload_json FROM commands WHERE id=$1 AND state='checkpointed'`, command.String).Scan(&payload); err != nil {
+			return nil, fmt.Errorf("checkpoint %s of execution %s: %w", command.String, executionID, err)
+		}
+		if positions, err = streamPositions(decls, []byte(payload)); err != nil {
 			return nil, err
 		}
 	}
@@ -76,32 +126,11 @@ func launchStreamsTx(ctx context.Context, q queryer, executionID string) ([]Laun
 	return out, nil
 }
 
-// continuationPositionsTx is where each rank of each stream stood when the
-// checkpoint ref of the task was published.
-func continuationPositionsTx(ctx context.Context, q queryer, taskScopeID, ref string) (map[string][]loader.Position, error) {
-	var payload string
-	err := q.QueryRowContext(ctx, `SELECT k.payload_json FROM command_acks k JOIN attempts a ON a.id=k.attempt_id JOIN execution_requests e ON e.id=a.execution_id
-		WHERE e.task_scope_id=$1 AND k.phase='checkpointed' AND k.payload_json::jsonb->>'continuation_ref'=$2 ORDER BY k.id DESC LIMIT 1`, taskScopeID, ref).Scan(&payload)
-	if errors.Is(err, sql.ErrNoRows) {
-		return map[string][]loader.Position{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var body struct {
-		Streams map[string][]loader.Position `json:"streams"`
-	}
-	if err := json.Unmarshal([]byte(payload), &body); err != nil || body.Streams == nil {
-		return map[string][]loader.Position{}, nil
-	}
-	return body.Streams, nil
-}
-
 // loaderSpecTx is the loader's spec of a stream as declared: each file with
 // the identity it was found to have (none yet: identified as it is read) and
 // its record count, when learned.
 func loaderSpecTx(ctx context.Context, q queryer, d orchestration.StreamDecl) (loader.Spec, error) {
-	spec := loader.Spec{Seed: d.Stream.Shuffle.Seed, Block: d.Stream.Shuffle.Block, ShuffleFiles: d.Stream.Shuffle.Files}
+	spec := loader.Spec{Seed: d.Stream.Shuffle.Seed, Block: d.Stream.Shuffle.Block, ShuffleFiles: d.Stream.Shuffle.Files, MemoryBytes: d.Stream.MemoryBytes}
 	if d.Stream.Epochs != nil {
 		spec.Epochs = *d.Stream.Epochs
 	}
@@ -122,8 +151,12 @@ func loaderSpecTx(ctx context.Context, q queryer, d orchestration.StreamDecl) (l
 				if err := json.Unmarshal([]byte(chunks), &file.Chunks); err != nil {
 					return spec, fmt.Errorf("identity of %s: %w", f.URL, err)
 				}
+				key, err := loader.CountKey(src.Format, src.Field, f.Name)
+				if err != nil {
+					return spec, err
+				}
 				var records int64
-				err = q.QueryRowContext(ctx, `SELECT records FROM raw_records WHERE sha256=$1 AND framing=$2`, file.SHA256, framingKey(src.Format, src.Field)).Scan(&records)
+				err = q.QueryRowContext(ctx, `SELECT records FROM raw_records WHERE sha256=$1 AND framing=$2`, file.SHA256, key).Scan(&records)
 				if err == nil {
 					s.Records[file.SHA256] = records
 				} else if !errors.Is(err, sql.ErrNoRows) {
@@ -152,46 +185,55 @@ type StreamReport struct {
 	Records    []RecordsCount `json:"records,omitempty"`
 }
 
-// RecordsCount is the records a file (by sha256) holds under a format and
-// field.
+// RecordsCount is the records a file (its URL, and its sha256) holds read
+// as a source of a stream reads it (its format and field).
 type RecordsCount struct {
+	URL     string `json:"url"`
 	SHA256  string `json:"sha256"`
 	Format  string `json:"format"`
 	Field   string `json:"field,omitempty"`
 	Records int64  `json:"records"`
 }
 
-// RecordStreamReport keeps what the loader of an attempt learned, of files
-// its execution's streams read: the first identity of a URL stands (the same
-// again is no error; another is ErrRawChanged), and so does a file's first
-// record count.
-func (s *Store) RecordStreamReport(ctx context.Context, attemptID string, report StreamReport) error {
+// RecordStreamReport keeps what the loader of an attempt (its lease, at
+// epoch) learned of the files its execution's streams read: the first
+// identity of a URL stands (the same again is no error; any other is
+// ErrRawChanged, as is one not the published sha256 or size); a record count
+// is kept only of a file identified so, read as a source of those streams
+// reads it, and the first stands (another is ErrRawChanged).
+func (s *Store) RecordStreamReport(ctx context.Context, attemptID, leaseID string, epoch int64, report StreamReport) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	var body sql.NullString
-	if err := tx.QueryRowContext(ctx, `SELECT e.streams_json FROM attempts a JOIN execution_requests e ON e.id=a.execution_id WHERE a.id=$1`, attemptID).Scan(&body); err != nil {
+	if err := validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
 		return err
 	}
-	var decls []orchestration.StreamDecl
-	if body.Valid {
-		if err := json.Unmarshal([]byte(body.String), &decls); err != nil {
-			return err
-		}
+	var executionID string
+	if err := tx.QueryRowContext(ctx, `SELECT execution_id FROM attempts WHERE id=$1`, attemptID).Scan(&executionID); err != nil {
+		return err
 	}
-	urls := map[string]bool{}
+	decls, err := executionStreamsTx(ctx, tx, executionID)
+	if err != nil {
+		return err
+	}
+	// each URL the streams read: as declared, and how each source reads it
+	type reading struct{ format, field string }
+	declared := map[string]orchestration.RawFile{}
+	readings := map[string][]reading{}
 	for _, d := range decls {
-		for _, files := range d.Files {
-			for _, f := range files {
-				urls[f.URL] = true
+		for _, src := range d.Stream.Sources {
+			for _, f := range d.Files[src.Raw] {
+				declared[f.URL] = f
+				readings[f.URL] = append(readings[f.URL], reading{src.Format, src.Field})
 			}
 		}
 	}
 	t := now()
 	for _, f := range report.Identities {
-		if !urls[f.URL] {
+		want, ok := declared[f.URL]
+		if !ok {
 			return fmt.Errorf("%w: %s is no file of a stream this attempt reads", ErrStreamReportRefused, f.URL)
 		}
 		if f.Size < 0 || f.ChunkBytes < 1 || !sha256Hex.MatchString(f.SHA256) || int64(len(f.Chunks)) != (f.Size+f.ChunkBytes-1)/f.ChunkBytes {
@@ -202,24 +244,51 @@ func (s *Store) RecordStreamReport(ctx context.Context, attemptID string, report
 				return fmt.Errorf("identity of %s: a chunk hash is not a sha256", f.URL)
 			}
 		}
+		if want.SHA256 != "" && want.SHA256 != f.SHA256 || want.Size > 0 && want.Size != f.Size {
+			return fmt.Errorf("%w: %s read as %s (%d bytes), published as %s (%d bytes)", ErrRawChanged, f.URL, f.SHA256, f.Size, want.SHA256, want.Size)
+		}
 		chunks, _ := json.Marshal(f.Chunks)
-		var kept string
+		var size, chunkBytes int64
+		var sha, keptChunks string
 		err := tx.QueryRowContext(ctx, `INSERT INTO raw_identities(url,size,sha256,chunk_bytes,chunks_json,identified_at,attempt_id) VALUES($1,$2,$3,$4,$5,$6,$7)
-			ON CONFLICT(url) DO UPDATE SET url=raw_identities.url RETURNING sha256`, f.URL, f.Size, f.SHA256, f.ChunkBytes, string(chunks), t, attemptID).Scan(&kept)
+			ON CONFLICT(url) DO UPDATE SET url=raw_identities.url RETURNING size,sha256,chunk_bytes,chunks_json`, f.URL, f.Size, f.SHA256, f.ChunkBytes, string(chunks), t, attemptID).Scan(&size, &sha, &chunkBytes, &keptChunks)
 		if err != nil {
 			return err
 		}
-		if kept != f.SHA256 {
-			return fmt.Errorf("%w: %s was %s the first time it was read, %s now", ErrRawChanged, f.URL, kept, f.SHA256)
+		if size != f.Size || sha != f.SHA256 || chunkBytes != f.ChunkBytes || keptChunks != string(chunks) {
+			return fmt.Errorf("%w: %s was %s (%d bytes) the first time it was read, %s (%d bytes) now", ErrRawChanged, f.URL, sha, size, f.SHA256, f.Size)
 		}
 	}
 	for _, r := range report.Records {
-		if !sha256Hex.MatchString(r.SHA256) || r.Records < 0 {
-			return fmt.Errorf("a record count of %q: a sha256 and a count", r.SHA256)
+		if r.Records < 0 {
+			return fmt.Errorf("a record count of %s: %d", r.URL, r.Records)
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO raw_records(sha256,framing,records,learned_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
-			r.SHA256, framingKey(r.Format, r.Field), r.Records, t); err != nil {
+		read := false
+		for _, x := range readings[r.URL] {
+			read = read || x.format == r.Format && x.field == r.Field
+		}
+		if !read {
+			return fmt.Errorf("%w: no stream this attempt reads reads %s as %s (field %q)", ErrStreamReportRefused, r.URL, r.Format, r.Field)
+		}
+		var sha string
+		err := tx.QueryRowContext(ctx, `SELECT sha256 FROM raw_identities WHERE url=$1`, r.URL).Scan(&sha)
+		if errors.Is(err, sql.ErrNoRows) || err == nil && sha != r.SHA256 {
+			return fmt.Errorf("%w: a record count of %s, not identified as %s", ErrStreamReportRefused, r.URL, r.SHA256)
+		}
+		if err != nil {
 			return err
+		}
+		key, err := loader.CountKey(r.Format, r.Field, declared[r.URL].Name)
+		if err != nil {
+			return err
+		}
+		var kept int64
+		if err := tx.QueryRowContext(ctx, `INSERT INTO raw_records(sha256,framing,records,learned_at) VALUES($1,$2,$3,$4)
+			ON CONFLICT(sha256,framing) DO UPDATE SET sha256=raw_records.sha256 RETURNING records`, sha, key, r.Records, t).Scan(&kept); err != nil {
+			return err
+		}
+		if kept != r.Records {
+			return fmt.Errorf("%w: %s held %d records read as %s, %d now", ErrRawChanged, r.URL, kept, key, r.Records)
 		}
 	}
 	return tx.Commit()

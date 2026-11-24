@@ -82,7 +82,7 @@ func (s *Server) workerStreams(w http.ResponseWriter, r *http.Request) {
 	var body store.StreamReport
 	err := decodeUpTo(r, &body, 64<<20)
 	if err == nil {
-		err = s.Store.RecordStreamReport(r.Context(), worker.AttemptID, body)
+		err = s.Store.RecordStreamReport(r.Context(), worker.AttemptID, worker.LeaseID, worker.Epoch, body)
 	}
 	if err != nil {
 		writeError(w, err)

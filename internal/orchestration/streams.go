@@ -87,6 +87,14 @@ var (
 	knownFormat = map[string]bool{"text": true, "jsonl": true, "lenbin": true, "file": true}
 )
 
+// StreamEnv is the environment variable of stream name: KAIRO_STREAM_ and
+// the name upper-cased, anything not a letter or digit an underscore.
+func StreamEnv(name string) string {
+	return "KAIRO_STREAM_" + strings.ToUpper(notEnvChar.ReplaceAllString(name, "_"))
+}
+
+var notEnvChar = regexp.MustCompile(`[^A-Za-z0-9]`)
+
 // HFFileURL is where a file of a Hugging Face repository is fetched from.
 func HFFileURL(h HFRaw, name string) string {
 	prefix := "https://huggingface.co/"
@@ -138,8 +146,11 @@ func normalizeStreams(m *Manifest) error {
 			seen := map[string]bool{}
 			for _, u := range raw.URLs {
 				parsed, err := url.Parse(u)
+				if err != nil {
+					return fmt.Errorf("raw %q: %q is not an http(s) URL of a file", name, u)
+				}
 				base := path.Base(parsed.Path)
-				if err != nil || parsed.Scheme != "https" && parsed.Scheme != "http" || parsed.Host == "" || base == "/" || base == "." {
+				if parsed.Scheme != "https" && parsed.Scheme != "http" || parsed.Host == "" || base == "/" || base == "." {
 					return fmt.Errorf("raw %q: %q is not an http(s) URL of a file", name, u)
 				}
 				if seen[base] {
@@ -201,7 +212,12 @@ func normalizeStreams(m *Manifest) error {
 		ex.StreamDecls = nil
 		names := append([]string(nil), ex.Streams...)
 		sort.Strings(names)
+		envs := map[string]string{}
 		for j, name := range names {
+			if other, taken := envs[StreamEnv(name)]; taken && other != name {
+				return fmt.Errorf("task %q reads streams %q and %q, both found at %s: rename one", m.Tasks[i].Name, other, name, StreamEnv(name))
+			}
+			envs[StreamEnv(name)] = name
 			s, ok := m.Streams[name]
 			if !ok {
 				return fmt.Errorf("task %q reads stream %q, which is no [streams.%s]", m.Tasks[i].Name, name, name)

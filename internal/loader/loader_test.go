@@ -588,3 +588,91 @@ func mustRead(t *testing.T, p string) []byte {
 	}
 	return b
 }
+
+// countingOrigin counts the files opened.
+type countingOrigin struct {
+	DirOrigin
+	mu     sync.Mutex
+	opened map[string]int
+}
+
+func (o *countingOrigin) ReadFrom(ctx context.Context, f File, offset int64) (io.ReadCloser, error) {
+	o.mu.Lock()
+	o.opened[f.Name]++
+	o.mu.Unlock()
+	return o.DirOrigin.ReadFrom(ctx, f, offset)
+}
+
+// A stream of one epoch ends at its last record, opening nothing of a next
+// epoch; a rank coming back after the end is told the end again.
+func TestAStreamEndsAtItsLastEpochAndSaysSoAgain(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Sources = spec.Sources[:1]
+	spec.Epochs = 1
+	origin := &countingOrigin{DirOrigin: DirOrigin{dir}, opened: map[string]int{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: origin}}, World: 1}).Serve(ctx, ln)
+	c, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for {
+		if _, err := c.Next(); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		n++
+	}
+	at := c.Position
+	c.Close()
+	if n != 38 {
+		t.Fatalf("%d records of one epoch, want 38", n)
+	}
+	origin.mu.Lock()
+	for name, times := range origin.opened {
+		if times != 1 {
+			t.Fatalf("%s opened %d times: %v", name, times, origin.opened)
+		}
+	}
+	origin.mu.Unlock()
+	again, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, &at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if _, err := again.Next(); err != io.EOF {
+		t.Fatalf("after the end, again: %v", err)
+	}
+}
+
+// An identified file whose length changed (longer or shorter) is changed;
+// a JSON null is not a string field.
+func TestALengthChangeIsAChangeAndNullIsNoString(t *testing.T) {
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte("abc"), 100)
+	p := filepath.Join(dir, "f")
+	os.WriteFile(p, data, 0o644)
+	f, _ := Identify(bytes.NewReader(data), "f", 128)
+	for _, changed := range [][]byte{append(append([]byte(nil), data...), 'x'), data[:250]} {
+		os.WriteFile(p, changed, 0o644)
+		r, err := (&Fetcher{Origin: DirOrigin{dir}, Retry: time.Millisecond}).Open(context.Background(), f, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = io.ReadAll(r)
+		r.Close()
+		if !errors.Is(err, ErrChanged) {
+			t.Fatalf("%d bytes for %d identified: %v", len(changed), len(data), err)
+		}
+	}
+	fm, _ := parseFormat("jsonl", "text")
+	rr, closeFn, _ := newRecordReader(bytes.NewReader([]byte(`{"text":null}`+"\n")), "x.jsonl", fm)
+	defer closeFn()
+	if _, err := rr.next(); err == nil {
+		t.Fatal("a null field taken as a string")
+	}
+}

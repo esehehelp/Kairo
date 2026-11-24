@@ -138,7 +138,8 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		SourceSnapshot       string                     `json:",omitempty"`
 		Image                string                     `json:",omitempty"`
 		Streams              []orchestration.StreamDecl `json:",omitempty"`
-	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy, spec.Inputs, spec.Confine, spec.Store, spec.Regenerable, spec.SourceSnapshot, spec.Image, spec.Streams}
+		InputCheckpoint      string                     `json:",omitempty"`
+	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy, spec.Inputs, spec.Confine, spec.Store, spec.Regenerable, spec.SourceSnapshot, spec.Image, spec.Streams, spec.InputCheckpointCommand}
 	normalized, err := json.Marshal(digestValue)
 	if err != nil {
 		return ExecutionSpec{}, nil, "", err
@@ -412,7 +413,7 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 			}
 		}
 		executionID, stamp := id.New("exe"), now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir,not_before,start_by,finish_by,inputs_json,confine,store_id,regenerable,source_snapshot_id,image_ref,streams_json) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir, nullable(spec.NotBefore), nullable(spec.StartBy), nullable(spec.FinishBy), inputs, spec.Confine, nullable(spec.Store), spec.Regenerable, nullable(spec.SourceSnapshot), nullable(spec.Image), streamsJSON); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_requests(id,project_scope_id,queue_scope_id,task_scope_id,client_request_id,spec_digest,state,argv_json,cwd,executor_selector_json,priority,checkpointable,preemptible,input_continuation_ref,submitted_at,env_json,scratch_tmpdir,not_before,start_by,finish_by,inputs_json,confine,store_id,regenerable,source_snapshot_id,image_ref,streams_json,input_checkpoint_command_id) VALUES($1,$2,$3,$4,$5,$6,'waiting',$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`, executionID, scopes.Project.ID, queueID, taskID, clientRequestID, digest, string(argv), spec.CWD, string(spec.ExecutorSelector), spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, stamp, env, spec.ScratchTmpdir, nullable(spec.NotBefore), nullable(spec.StartBy), nullable(spec.FinishBy), inputs, spec.Confine, nullable(spec.Store), spec.Regenerable, nullable(spec.SourceSnapshot), nullable(spec.Image), streamsJSON, nullable(spec.InputCheckpointCommand)); err != nil {
 			return "", err
 		}
 		if err = insertExecutionResourcesTx(ctx, tx, executionID, spec); err != nil {

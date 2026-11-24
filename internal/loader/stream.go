@@ -2,6 +2,7 @@ package loader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -17,6 +18,10 @@ type Spec struct {
 	ShuffleFiles bool         `json:"shuffle_files,omitempty"`
 	Epochs       int64        `json:"epochs"`
 	Stages       []Stage      `json:"stages,omitempty"`
+	// MemoryBytes is what the loader may hold (the stream's memory_bytes):
+	// a quarter of it, shared by the ranks, bounds what is made ahead for
+	// them (0: 64 MiB a rank).
+	MemoryBytes int64 `json:"memory_bytes,omitempty"`
 }
 
 // maxBlock bounds the records shuffled together (each kept in memory).
@@ -54,7 +59,7 @@ type inputs struct {
 	ended   bool
 }
 
-func newInputs(spec Spec, fetch *Fetcher, learned func(int, string, int64), identified func(int, File)) (*inputs, error) {
+func newInputs(spec Spec, fetch *Fetcher, learned func(int, File, int64), identified func(int, File)) (*inputs, error) {
 	weights := make([]int, len(spec.Sources))
 	in := &inputs{epochs: spec.Epochs}
 	for i, src := range spec.Sources {
@@ -75,6 +80,9 @@ func newInputs(spec Spec, fetch *Fetcher, learned func(int, string, int64), iden
 		return nil, err
 	}
 	in.mix = mix
+	if spec.Epochs > 0 {
+		in.sources[0].endEpoch = spec.Epochs
+	}
 	return in, nil
 }
 
@@ -101,13 +109,13 @@ func (in *inputs) next(ctx context.Context) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	s := in.mix.source(in.n)
-	rec, epoch, err := in.sources[s].next(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	if s == 0 && in.epochs > 0 && epoch >= in.epochs {
+	rec, _, err := in.sources[s].next(ctx)
+	if errors.Is(err, errSourceEnded) {
 		in.ended = true
 		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
 	}
 	in.n++
 	return rec, true, nil

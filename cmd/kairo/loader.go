@@ -47,6 +47,10 @@ func loaderServe(args []string) error {
 		if err := readJSONFile(*positionsPath, &positions); err != nil {
 			return err
 		}
+		// a run goes on with the ranks its positions are of
+		if *world == 0 {
+			*world = len(positions)
+		}
 	}
 	var o loader.Origin = loader.HTTPOrigin{Client: http.DefaultClient}
 	if dir, ok := strings.CutPrefix(*origin, "dir:"); ok {
@@ -81,9 +85,9 @@ func loaderServe(args []string) error {
 			return err
 		}
 		go r.run(ctx)
-		l.Learned = func(source int, sha string, records int64) {
+		l.Learned = func(source int, f loader.File, records int64) {
 			src := spec.Sources[source]
-			r.add(store.StreamReport{Records: []store.RecordsCount{{SHA256: sha, Format: src.Format, Field: src.Field, Records: records}}})
+			r.add(store.StreamReport{Records: []store.RecordsCount{{URL: f.URL, SHA256: f.SHA256, Format: src.Format, Field: src.Field, Records: records}}})
 		}
 		l.Identified = func(_ int, f loader.File) {
 			fmt.Fprintf(os.Stderr, "kairo loader: %s identified: %d bytes, sha256 %s\n", f.Name, f.Size, f.SHA256)
@@ -161,6 +165,7 @@ func newStreamReporter() (*streamReporter, error) {
 		return nil, errors.New("--report needs KAIRO_API_URL and KAIRO_ATTEMPT_TOKEN (an attempt's environment)")
 	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil // the daemon is reached directly, its token sent nowhere else
 	if ca := os.Getenv("KAIRO_API_CA"); ca != "" {
 		der, err := base64.StdEncoding.DecodeString(ca)
 		if err != nil {
@@ -176,7 +181,8 @@ func newStreamReporter() (*streamReporter, error) {
 		}
 		transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
 	}
-	return &streamReporter{client: &http.Client{Transport: transport, Timeout: time.Minute}, url: strings.TrimRight(api, "/") + "/api/worker/streams", token: token, queue: make(chan store.StreamReport, 1024)}, nil
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return &streamReporter{client: &http.Client{Transport: transport, Timeout: time.Minute, CheckRedirect: noRedirect}, url: strings.TrimRight(api, "/") + "/api/worker/streams", token: token, queue: make(chan store.StreamReport, 1024)}, nil
 }
 
 func (r *streamReporter) add(report store.StreamReport) {
