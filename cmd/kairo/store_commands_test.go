@@ -34,9 +34,9 @@ func TestStoreStatusPrintsStoresAndKeptScratch(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"STORE      CLASS     NODE            STATE     ROOT            FILESYSTEM  TOTAL    FREE     ACTIVE  KEPT   OUTPUTS    PACKS  COPIES     PINNED  CACHE  EXTERNAL",
-		"e-durable  durable   win             unusable  E:/kairo        E:          -        -        0 B     0 B    0 B        0 B    6 GiB (3)  0 B     0 B    -",
-		"pool       volatile  host-a            ready     /srv/kairo      /           300 GiB  100 GiB  2 GiB   1 GiB  3 GiB (2)  0 B    0 B        0 B     0 B    194 GiB",
+		"STORE      CLASS     NODE          STATE     ROOT            FILESYSTEM  TOTAL    FREE     ACTIVE  KEPT   OUTPUTS    PACKS  COPIES     PINNED  CACHE  EXTERNAL",
+		"e-durable  durable   win           unusable  E:/kairo        E:          -        -        0 B     0 B    0 B        0 B    6 GiB (3)  0 B     0 B    -",
+		"pool       volatile  host-a        ready     /srv/kairo      /           300 GiB  100 GiB  2 GiB   1 GiB  3 GiB (2)  0 B    0 B        0 B     0 B    194 GiB",
 		"wsl        volatile  win/wsl-exec  unknown   /var/tmp/kairo  D:          -        -        0 B     0 B    0 B        0 B    0 B        0 B     0 B    -",
 		"damaged copies on e-durable (read back unlike their pack; nothing was deleted):",
 		"obj_9   2026-11-03T04:05:06Z  E:/kairo/objects/202611/obj_9.tar.zst  read back as 9 bytes",

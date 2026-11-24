@@ -149,12 +149,12 @@ func TestFormatMachinesListsHostsAndDevicePolicies(t *testing.T) {
 		},
 	})
 	for _, line := range []string{
-		"HOST  NODES  CONTROLLER",
+		"HOST    NODES  CONTROLLER",
 		"host-a  a,b    host-a-host",
-		"win   w      -",
+		"win     w      -",
 		"host-a  GPU-a   0.1           yes",
 		"host-a  cpu     0.05          no",
-		"win   cpu     0             no (no controller)",
+		"win     cpu     0             no (no controller)",
 	} {
 		if !strings.Contains(out, line+"\n") {
 			t.Fatalf("missing %q in:\n%s", line, out)
