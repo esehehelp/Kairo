@@ -55,7 +55,7 @@ Layers:
 | data | stores; scratch, output and cache directories; data objects, packs, copies, replicas; imports, run snapshots, checkpoints, temporal data; fetches, eviction, read-back, inventory | `store` (packs, copies, replicas, deletions, imports, inputs, placements, evictions, temporal, regenerate, transfer, runsnapshots, checkpoints, inventory_durable, scrub, shed, control_snapshot), `executor` (its store worker, storeworker.go: datastore, pack, transfer, fetch, retire, evict, inventory, storefs), `machine`, `datainput` | Data stores, Kairo keeps itself |
 | provenance | code snapshots, container images by digest | `sourcesnap`, `imageref`, `store` (sources, images) | Code snapshots, Containers |
 | hardware | machine declaration, device settings, operating-point policy, benches, power and energy | `machine`, `devicecontrol`, `hwpolicy`, `hwbench`, `bench`, `cpupower`, `store` (device, device_policy, device_samples, hardware_bench, hardware_history, hosts) | Machine declaration, Hardware settings, Hardware benchmarks, Power and energy |
-| access | the HTTP API, tokens, TLS, private files | `api`, `tlsutil`, `secfile`, `store` (tokens) | Authentication and TLS, API |
+| access | the HTTP API and the agent operations, tokens, TLS, private files | `api`, `agentops`, `tlsutil`, `secfile`, `store` (tokens) | Authentication and TLS, API |
 | support | configuration, env rules, ids, times, external commands, build stamp, tests | `config`, `envspec`, `id`, `instant`, `extcmd`, `buildinfo`, `conformance`, `pgtest`, `sqliteimport` | Verification |
 
 The life of an execution:
@@ -87,7 +87,9 @@ The agent protocol:
   terminations, force stops, packs, copies, fetches, deletions, evictions,
   read-backs, scratch settlement) and reserves its next execution.
 - Every operation is `POST /api/agent/<operation>`, checked against the node
-  owning what it names.
+  owning what it names. Each is declared once, with its request, answer and
+  observe-only rule, in `internal/agentops`, which the daemon serves and the
+  agents' client calls.
 - An order can be carried out twice with the same result, and lease epochs
   fence what a stale caller does.
 

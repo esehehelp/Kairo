@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 
+	"kairo/internal/agentops"
 	"kairo/internal/buildinfo"
 	"kairo/internal/store"
 )
@@ -64,76 +65,49 @@ func (s *Server) clearDeviceSetting(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, result)
 }
 
-// Controller operations on the agent API, for the controller's own node.
-
-type controllerRegisterRequest struct {
-	Node    store.Node `json:"node"`
-	Version string     `json:"version"`
-}
-
-type controllerPollRequest struct {
-	NodeID string `json:"node_id"`
-}
-
-type controllerReportRequest struct {
-	NodeID  string               `json:"node_id"`
-	Reports []store.DeviceReport `json:"reports"`
-}
-
-type controllerTrimRequest struct {
-	NodeID string         `json:"node_id"`
-	Done   store.TrimDone `json:"done"`
-}
-
-type controllerSamplesRequest struct {
-	NodeID  string                   `json:"node_id"`
-	Samples []store.ControllerSample `json:"samples"`
-}
+// Controller operations on the agent API, for the controller's own node
+// (declared in internal/agentops).
 
 func (s *Server) controllerOps() []agentOp {
+	byNode := func(_ context.Context, b agentops.NodeRequest) (string, error) { return b.NodeID, nil }
 	return []agentOp{
-		newAgentOp(s, "controller-register", observeAllowed, nil,
-			func(_ context.Context, b controllerRegisterRequest) (string, error) { return b.Node.ID, nil },
-			func(ctx context.Context, b controllerRegisterRequest) (any, error) {
-				return map[string]any{"ok": true, "version": buildinfo.Version()}, s.Store.RegisterDeviceController(ctx, b.Node, b.Version)
+		handle(s, agentops.ControllerRegister,
+			func(_ context.Context, b agentops.ControllerRegisterRequest) (string, error) { return b.Node.ID, nil },
+			func(ctx context.Context, b agentops.ControllerRegisterRequest) (agentops.ControllerRegisterAnswer, error) {
+				return agentops.ControllerRegisterAnswer{OK: true, Version: buildinfo.Version()}, s.Store.RegisterDeviceController(ctx, b.Node, b.Version)
 			}),
 		// An observe-only daemon changes nothing: the controller is told it
 		// controls no device, so it only returns those it may have changed to
 		// their defaults.
-		newAgentOp(s, "device-settings", observeAllowed, nil,
-			func(_ context.Context, b controllerPollRequest) (string, error) { return b.NodeID, nil },
-			func(ctx context.Context, b controllerPollRequest) (any, error) {
+		handle(s, agentops.DeviceSettings, byNode,
+			func(ctx context.Context, b agentops.NodeRequest) (agentops.DevicesAnswer, error) {
 				devices, err := s.Store.PollDeviceSettings(ctx, b.NodeID)
 				if s.ObserveOnly {
 					devices = []store.ControlledDevice{}
 				}
-				return map[string]any{"devices": devices}, err
+				return agentops.DevicesAnswer{Devices: devices}, err
 			}),
-		newAgentOp(s, "device-report", observeAllowed, nil,
-			func(_ context.Context, b controllerReportRequest) (string, error) { return b.NodeID, nil },
-			func(ctx context.Context, b controllerReportRequest) (any, error) {
+		handle(s, agentops.DeviceReport,
+			func(_ context.Context, b agentops.DeviceReportRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.DeviceReportRequest) (agentops.SkippedAnswer, error) {
 				skipped, err := s.Store.ReportDevices(ctx, b.NodeID, b.Reports)
-				return map[string]any{"skipped": skipped}, err
+				return agentops.SkippedAnswer{Skipped: skipped}, err
 			}),
-		// An observe-only daemon deletes nothing, so asks for no trim.
-		newAgentOp(s, "trims-to-make", observeEmpty, map[string]any{"trims": []store.TrimOrder{}},
-			func(_ context.Context, b controllerPollRequest) (string, error) { return b.NodeID, nil },
-			func(ctx context.Context, b controllerPollRequest) (any, error) {
+		handle(s, agentops.TrimsToMake, byNode,
+			func(ctx context.Context, b agentops.NodeRequest) (agentops.TrimsAnswer, error) {
 				trims, err := s.Store.TrimsToMake(ctx, b.NodeID)
-				return map[string]any{"trims": trims}, err
+				return agentops.TrimsAnswer{Trims: trims}, err
 			}),
-		newAgentOp(s, "record-trim", observeRefused, nil,
-			func(_ context.Context, b controllerTrimRequest) (string, error) { return b.NodeID, nil },
-			func(ctx context.Context, b controllerTrimRequest) (any, error) {
-				return okBody, s.Store.RecordTrim(ctx, b.NodeID, b.Done)
+		handle(s, agentops.RecordTrim,
+			func(_ context.Context, b agentops.RecordTrimRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.RecordTrimRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordTrim(ctx, b.NodeID, b.Done))
 			}),
-		// What the controller reads of its host (the CPU package's power) is
-		// observation, recorded by an observe-only daemon too.
-		newAgentOp(s, "device-samples", observeAllowed, nil,
-			func(_ context.Context, b controllerSamplesRequest) (string, error) { return b.NodeID, nil },
-			func(ctx context.Context, b controllerSamplesRequest) (any, error) {
+		handle(s, agentops.DeviceSamples,
+			func(_ context.Context, b agentops.DeviceSamplesRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.DeviceSamplesRequest) (agentops.SkippedAnswer, error) {
 				skipped, err := s.Store.RecordControllerSamples(ctx, b.NodeID, b.Samples)
-				return map[string]any{"skipped": skipped}, err
+				return agentops.SkippedAnswer{Skipped: skipped}, err
 			}),
 	}
 }
