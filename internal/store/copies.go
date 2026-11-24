@@ -114,6 +114,30 @@ func (info executorInfo) serves(s machine.Store, executorID string) bool {
 	return info.enabled && s.Node == info.nodeID && (s.Executor == executorID || s.Executor == "")
 }
 
+// storeServerTx is the executor whose agent's pack server reads what is on
+// store s: the one s names, else the first by id of s's node, enabled and
+// with a pack server (pack_addr). It is whoever serves the store now, not the
+// executor that wrote there: a store that moved to another node (or whose
+// writer was retired) is read through its new server. found is false while
+// none serves it.
+func storeServerTx(ctx context.Context, q queryer, s machine.Store) (info executorInfo, found bool, err error) {
+	err = eachRow(ctx, q, `SELECT id FROM executors WHERE node_id=$1 AND enabled ORDER BY id`, []any{s.Node}, func(rows *sql.Rows) error {
+		var id string
+		if err := rows.Scan(&id); err != nil || found {
+			return err
+		}
+		x, err := executorInfoTx(ctx, q, id)
+		if err != nil {
+			return err
+		}
+		if x.serves(s, id) && x.attrs["pack_addr"] != "" {
+			info, found = x, true
+		}
+		return nil
+	})
+	return info, found, err
+}
+
 // copyTargetsTx are the durable stores objects are copied to, in the order
 // they are taken: the declared durable stores by id but those being moved
 // and those naming an executor that is gone or disabled.
@@ -348,11 +372,15 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 			}
 		}
 		o.Source = CopySource{StoreID: x.sourceStoreID, Root: x.sourceRoot}
-		source, err := executorInfoTx(ctx, tx, x.sourceExecutor)
-		if err != nil && !errors.Is(err, ErrNotFound) {
-			return nil, err
+		// the pack is read through whoever serves its store now
+		var source executorInfo
+		src, declared := byID[x.sourceStoreID]
+		if declared {
+			if source, _, err = storeServerTx(ctx, tx, src); err != nil {
+				return nil, err
+			}
 		}
-		if src, declared := byID[x.sourceStoreID]; err == nil && declared && src.Root == x.sourceRoot && me.serves(src, executorID) {
+		if declared && src.Root == x.sourceRoot && me.serves(src, executorID) {
 			o.Source.Local = true
 		} else {
 			o.Source.Addr = source.attrs["pack_addr"]
