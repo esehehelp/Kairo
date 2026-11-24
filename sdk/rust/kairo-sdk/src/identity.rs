@@ -6,7 +6,7 @@ use std::io;
 /// The Windows FILETIME of the Unix epoch (100 ns ticks since 1601).
 const UNIX_EPOCH_FILETIME: i128 = 116_444_736_000_000_000;
 
-/// The identity of process `pid`: `proc:PID:starttime:T` on Linux and WSL,
+/// The identity of process `pid`: `proc:PID:starttime:T` on Linux,
 /// `pid:PID:start:NS` on Windows.
 pub fn process_identity(pid: u32) -> io::Result<String> {
     os_identity(pid)

@@ -2,7 +2,6 @@
 # (README: Confinement), it runs at Low integrity, and MSYS and Git Bash do not start so. The tree this script is in
 # (an extracted commit) is checked; the first argument is the check:
 #   windows      go vet, go test                 (PostgreSQL at KAIRO_TEST_PG, default 127.0.0.1:55432)
-#   wsl          the tests that run against WSL  (KAIRO_TEST_WSL=1)
 #   sdk-python   the Python SDK's tests
 #   sdk-rust     the Rust SDK's tests
 # Everything written goes to the attempt's scratch (the tree, TEMP) or the project's cache (KAIRO_CACHE_DIR: Go's,
@@ -42,11 +41,6 @@ switch ($Check) {
     Need-PG
     Step 'go test'
     Run go test -count=1 ./...
-  }
-  'wsl' {
-    Step 'go test against WSL'
-    $env:KAIRO_TEST_WSL = '1'
-    Run go test -count=1 -run WSL ./internal/executor/ ./internal/processidentity/
   }
   'sdk-python' {
     Step 'pytest (Python SDK)'

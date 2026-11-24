@@ -12,17 +12,6 @@ import (
 	"time"
 )
 
-// statStart is the starttime (field 22) of pid's /proc/PID/stat.
-func statStart(t *testing.T, pid int) string {
-	t.Helper()
-	body, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
-		t.Fatal(err)
-	}
-	s := string(body)
-	return strings.Fields(s[strings.LastIndexByte(s, ')')+1:])[19]
-}
-
 func startWithAttemptID(t *testing.T, attemptID string) *exec.Cmd {
 	t.Helper()
 	cmd := exec.Command("sleep", "60")
@@ -40,46 +29,6 @@ func startWithAttemptID(t *testing.T, attemptID string) *exec.Cmd {
 			t.Fatal("the process never carried its attempt id")
 		}
 		time.Sleep(20 * time.Millisecond)
-	}
-}
-
-// The script WSL runs is plain sh: run here, it finds the attempt's process
-// by its environment with its starttime, leaves out remembered processes
-// that are gone, have another starttime or still have an environment (so are
-// not exiting), and signals what it found.
-func TestAttemptScriptFindsRemembersAndSignals(t *testing.T) {
-	const attemptID = "att_script_test"
-	cmd := startWithAttemptID(t, attemptID)
-	pid := cmd.Process.Pid
-	run := func(signal string, remembered ...string) ([]int, map[int]string) {
-		t.Helper()
-		args := append([]string{"-c", wslAttemptScript, "kairo-force-stop", attemptID, signal}, remembered...)
-		out, err := exec.Command("sh", args...).Output()
-		if err != nil {
-			t.Fatalf("script: %v", err)
-		}
-		pids, found, err := parseAttemptMembers(string(out))
-		if err != nil {
-			t.Fatal(err)
-		}
-		return pids, found
-	}
-	self := os.Getpid()
-	pids, found := run("0",
-		"999999999:1",                             // gone
-		strconv.Itoa(self)+":1",                   // another starttime
-		strconv.Itoa(self)+":"+statStart(t, self), // there, but with an environment
-	)
-	if !slices.Equal(pids, []int{pid}) || found[pid] != statStart(t, pid) {
-		t.Fatalf("found %v %v, want %d:%s", pids, found, pid, statStart(t, pid))
-	}
-	run("TERM", strconv.Itoa(pid)+":"+found[pid])
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
-	select {
-	case <-done:
-	case <-time.After(10 * time.Second):
-		t.Fatal("not signalled")
 	}
 }
 

@@ -10,9 +10,8 @@ import (
 	"kairo/internal/store"
 )
 
-// An executor serves the stores declared on its node in its namespace: a
-// store naming it as executor, else (for an executor that is not WSL) a
-// store naming none. It makes each root if missing and checks it is on the
+// An executor serves the stores declared on its node: a store naming it as
+// executor, and a store naming none. It makes each root if missing and checks it is on the
 // declared filesystem (a store that fails is not used, and is reported
 // unusable), and reports each one's filesystem total and free and the bytes
 // of the Kairo scratch directories under its root. A daemon without stores
@@ -39,20 +38,12 @@ type servedStore struct {
 }
 
 // fsForStores is how this executor reaches its stores' roots.
-func (e *storeWorker) fsForStores() storeFS {
-	if e.storeFSOverride != nil {
-		return e.storeFSOverride
-	}
-	return e.backend().storeFS()
-}
+func (e *storeWorker) fsForStores() storeFS { return localStoreFS{} }
 
-// serves reports whether a store of this executor's node is in its
-// namespace.
+// serves reports whether this executor serves a store of its node: one that
+// names it, or names no executor.
 func (e *storeWorker) serves(s machine.Store) bool {
-	if s.Executor != "" {
-		return s.Executor == e.ID
-	}
-	return e.backend().servesNodeStores()
+	return s.Executor == "" || s.Executor == e.ID
 }
 
 // refreshStores asks for the node's stores (at most every

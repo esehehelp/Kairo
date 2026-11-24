@@ -6,13 +6,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strconv"
-	"strings"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 
-	"kairo/internal/extcmd"
 	"kairo/internal/processidentity"
 )
 
@@ -38,14 +35,9 @@ func (j usageJob) close() {
 	}
 }
 
-// sampleTrees samples the attempts' trees: for a WSL executor the Linux
-// processes carrying each attempt's KAIRO_ATTEMPT_ID, in one wsl.exe run per
-// round (sampleWSL); otherwise the attempt's job object, or, without one, the
-// descendants of its launcher (windowsTreeUsage).
-func (e *Local) sampleTrees(ctx context.Context, targets []usageTarget) map[string]usageSample {
-	if s, ok := e.backend().(usageSampler); ok {
-		return s.sampleUsage(ctx, targets)
-	}
+// sampleTrees samples the attempts' trees: each attempt's job object, or,
+// without one, the descendants of its launcher (windowsTreeUsage).
+func (e *Local) sampleTrees(_ context.Context, targets []usageTarget) map[string]usageSample {
 	out := map[string]usageSample{}
 	for _, t := range targets {
 		out[t.attemptID] = windowsTreeUsage(hostProcesses{}, t)
@@ -271,61 +263,4 @@ func (hostProcesses) written(pid int) (int64, error) {
 		return 0, fmt.Errorf("I/O of process %d: %w", pid, err)
 	}
 	return int64(counters.WriteTransferCount), nil
-}
-
-// wslUsageScript prints, for each attempt id argument, "ID RAM WRITTEN" over
-// the Linux processes carrying KAIRO_ATTEMPT_ID=ID (as force stop finds them):
-// the sum of their PSS in bytes and of their write_bytes less
-// cancelled_write_bytes, "-" when a live one cannot be read. A process that
-// exits while being read is left out. It is plain sh, with no command run per
-// process.
-const wslUsageScript = `pss() { while read -r k v rest; do if [ "$k" = Pss: ]; then echo "$v"; return 0; fi; done < "$1/smaps_rollup"; return 1; }
-written() { w= c=0; while read -r k v; do case $k in write_bytes:) w=$v;; cancelled_write_bytes:) c=$v;; esac; done < "$1/io" || return 1; [ -n "$w" ] && echo $((w-c)); }
-for id in "$@"; do
-  ram=0 disk=0
-  for f in $(grep -lzxF -e "KAIRO_ATTEMPT_ID=$id" /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n'); do
-    d=${f%/environ}
-    p=$(pss "$d" 2>/dev/null) || p=
-    w=$(written "$d" 2>/dev/null) || w=
-    [ -d "$d" ] || continue
-    if [ -n "$p" ] && [ "$ram" != - ]; then ram=$((ram+p*1024)); else ram=-; fi
-    if [ -n "$w" ] && [ "$disk" != - ]; then disk=$((disk+w)); else disk=-; fi
-  done
-  echo "$id $ram $disk"
-done`
-
-// sampleWSL samples, in one wsl.exe run under ctx, the Linux processes of
-// each attempt (wslUsageScript).
-func sampleWSL(ctx context.Context, distro string, attemptIDs []string) (map[string]usageSample, error) {
-	args := []string{}
-	if distro != "" {
-		args = append(args, "-d", distro)
-	}
-	args = append(args, "--exec", "sh", "-c", wslUsageScript, "kairo-usage")
-	out, err := extcmd.Output(ctx, "wsl.exe", append(args, attemptIDs...)...)
-	if err != nil {
-		return map[string]usageSample{}, fmt.Errorf("sample attempt usage in WSL: %w", err)
-	}
-	return parseWSLUsage(string(out)), nil
-}
-
-// parseWSLUsage reads wslUsageScript's lines "ATTEMPT RAM WRITTEN", "-" for
-// a total that is not known.
-func parseWSLUsage(out string) map[string]usageSample {
-	samples := map[string]usageSample{}
-	for _, line := range strings.Split(out, "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 3 {
-			continue
-		}
-		var s usageSample
-		if n, err := strconv.ParseInt(fields[1], 10, 64); err == nil && n >= 0 {
-			s.ram = &n
-		}
-		if n, err := strconv.ParseInt(fields[2], 10, 64); err == nil && n >= 0 {
-			s.written = &n
-		}
-		samples[fields[0]] = s
-	}
-	return samples
 }

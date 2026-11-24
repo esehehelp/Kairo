@@ -41,7 +41,7 @@ func TestParseExecutionEnv(t *testing.T) {
 	if !strings.Contains(string(parsed.Normalized), `"env":{"PYTHONUTF8":"1","Path":"C:\\tools"}`) {
 		t.Fatalf("normalized: %s", parsed.Normalized)
 	}
-	for _, bad := range []string{"KAIRO_TOKEN = \"x\"\n", "WSLENV = \"x\"\n", "CUDA_VISIBLE_DEVICES = \"-1\"\n", "\"A=B\" = \"x\"\n"} {
+	for _, bad := range []string{"KAIRO_TOKEN = \"x\"\n", "CUDA_VISIBLE_DEVICES = \"-1\"\n", "\"A=B\" = \"x\"\n"} {
 		if _, err := Parse([]byte(envBase + "[env]\n" + bad)); err == nil {
 			t.Fatalf("accepted env %q", bad)
 		}

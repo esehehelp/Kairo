@@ -25,15 +25,13 @@ type storeWorker struct {
 	// The stores this executor serves (datastore.go), when they were last
 	// asked for, whether the daemon ever answered (storesKnown) and whether
 	// the last ask failed (warned once), when they were last reported and
-	// whether a report runs. storeFSOverride replaces how roots are reached,
-	// in tests.
-	stores          []servedStore
-	storesAt        time.Time
-	storesKnown     bool
-	storesWarned    bool
-	storeReportAt   time.Time
-	storeReporting  bool
-	storeFSOverride storeFS
+	// whether a report runs.
+	stores         []servedStore
+	storesAt       time.Time
+	storesKnown    bool
+	storesWarned   bool
+	storeReportAt  time.Time
+	storeReporting bool
 
 	// scratchSized is the size, measured once, of each scratch directory of
 	// an attempt not running here, by attempt; when scratch was last settled

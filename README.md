@@ -51,7 +51,7 @@ Layers:
 | orchestration | ProjectSpec, Tasks (immutable), the policy's decisions, reruns | `orchestration`, `store` (orchestration, task_control, task_views) | Start, Following tasks from the CLI |
 | coordination | Executions (one-shot), Attempts, Leases, Commands, scope gates, gangs, quarantines, force stops | `store` (execution, scheduler, worker, scopes, gang, quarantine, forcestop), `execution` | Coordination model, Gang executions |
 | planning | one pass over the installation: placement, backfill, preemption, run-time estimates, admission accounting | `store` (planner, preemption, estimate) | Admission, Run-time estimates |
-| execution | launch through the executor's backend (on its host, inside WSL, in an Incus container: `executor/backend.go`), shim and adoption, confinement, force stop, quiescence, usage, observation | `executor`, `processidentity`, `provider`, `agentclient` | Agent restarts, Containers, Force stop |
+| execution | launch through the executor's backend (on its host or in an Incus container: `executor/backend.go`), shim and adoption, confinement, force stop, quiescence, usage, observation | `executor`, `processidentity`, `provider`, `agentclient` | Agent restarts, Containers, Force stop |
 | data | stores; scratch, output and cache directories; data objects, packs, copies, replicas; imports, run snapshots, checkpoints, temporal data; fetches, eviction, read-back, inventory | `store` (packs, copies, replicas, deletions, imports, inputs, placements, evictions, temporal, regenerate, transfer, runsnapshots, checkpoints, inventory_durable, scrub, shed, control_snapshot), `executor` (its store worker, storeworker.go: datastore, pack, transfer, fetch, retire, evict, inventory, storefs), `machine`, `datainput` | Data stores, Kairo keeps itself |
 | provenance | code snapshots, container images by digest | `sourcesnap`, `imageref`, `store/provenance` | Code snapshots, Containers |
 | hardware | machine declaration, device settings, operating-point policy, benches, power and energy | `machine`, `devicecontrol`, `hwpolicy`, `hwbench`, `bench`, `cpupower`, `store` (device, device_policy, device_samples, hardware_bench, hardware_history, hosts) | Machine declaration, Hardware settings, Hardware benchmarks, Power and energy |
@@ -188,12 +188,11 @@ The attempt inherits the executor's environment, then the declared variables
 case), then what Kairo sets (`KAIRO_*`, gang variables, `CUDA_VISIBLE_DEVICES`
 for bound GPUs, `TMPDIR`/`TMP`/`TEMP` with `scratch_tmpdir`), which a
 declaration cannot override. Names starting with
-`KAIRO_` and `WSLENV` are rejected, and so is `CUDA_VISIBLE_DEVICES` on an
-execution with an exclusive GPU request (a CPU task may set it to `-1`). WSL
-executors pass the variables through `WSLENV` as written (`/u`, no path
-translation). `argv[0]` is still looked up on the executor's own `PATH`, and
+`KAIRO_` are rejected, and so is `CUDA_VISIBLE_DEVICES` on an
+execution with an exclusive GPU request (a CPU task may set it to `-1`).
+`argv[0]` is still looked up on the executor's own `PATH`, and
 argv reaches the program word for word on every executor: no shell sits in
-between (a WSL attempt runs through `wsl.exe --exec`), so `$VAR` in an argument
+between, so `$VAR` in an argument
 is expanded only by a shell the argv itself starts.
 Env is part of the task's digest and is stored and shown in plain text to any
 reader of the API: it is not a place for secrets.
@@ -460,7 +459,7 @@ can reach without TLS unless `insecure_http = true`, and with TLS
 copy it to `<config dir>/kairo/ca.pem` (or point `KAIRO_CA_FILE` at it) for the
 CLI and controllers, set `ca_file` for a node agent, and start Node-based
 tools with `NODE_EXTRA_CA_CERTS=ca.pem`. Attempts receive the CA itself in
-`KAIRO_API_CA` (base64 DER), so native, WSL and remote attempts need no path.
+`KAIRO_API_CA` (base64 DER), so local and remote attempts need no path.
 The certificates carry no revocation endpoint, so Windows `curl.exe`
 (Schannel) needs `--ssl-no-revoke` with `--cacert ca.pem`.
 
@@ -476,7 +475,14 @@ ca_file = "/etc/kairo/ca.pem"
 The rest (`log_directory`, `log_min_free_mib`, `observe_only`,
 `observation_interval_seconds`, `[node]`, `[bench]`, `[[executors]]`,
 `[[providers]]`) has the same form as in the daemon configuration
-(`examples/kairo.toml`). A relative `log_directory` (or `source_directory`)
+(`examples/kairo.toml`). An executor runs its attempts on its host, or, of
+kind `incus`, in containers (Containers); the executor that ran attempts
+inside WSL is retired, and a configuration declaring one (kind `wsl2`, or
+the label `environment = "wsl2"`) is refused: Linux work runs on a Linux
+node or in a container. When an agent registers, an executor of its node it
+no longer declares is disabled (event `executor_undeclared`): its leases go
+stale as at a restart that adopts nothing, nothing is placed on it, and it
+serves no store, until an agent declares it again. A relative `log_directory` (or `source_directory`)
 is taken against the working directory the daemon or agent starts in, once:
 attempts get absolute paths into it. An
 agent refuses an `http://` URL unless `insecure_http = true`. A host's device
@@ -500,8 +506,8 @@ CA's `ca.pem` and `ca-key.pem` (not the daemon's own directory, whose
 there.
 
 The certificate comes from the daemon's CA, which the fetching agent already
-trusts (`ca_file`). Every executor of the agent outside a WSL distro then
-advertises `pack_addr` among its attributes.
+trusts (`ca_file`). Every executor of the agent then advertises `pack_addr`
+among its attributes.
 
 ## API
 
@@ -648,7 +654,7 @@ What an exited attempt left running (its launcher exited and its exit is
 recorded, yet a process of its tree runs: one it started without
 registering, a server a wrapper left behind) is not its work any more, since
 no one reads what it does, and it holds the lease. Its executor ends it: once
-it has been seen for 10 s it is asked to stop (SIGTERM, inside WSL too; on
+it has been seen for 10 s it is asked to stop (SIGTERM; on
 Windows CTRL_BREAK no longer reaches it once its launcher is gone), and 30 s
 later it is killed (the job object, the launcher's process group, the
 processes carrying the attempt's `KAIRO_ATTEMPT_ID`, each identified as
@@ -771,8 +777,8 @@ labels may take what is placed there.
   had at all (a task with no run, a name the project has no object of,
   temporal data made again differing from what it was) says so.
   Each is checked again when its attempt launches: on that node, in its
-  executor's namespace (a store it serves; an imported directory of a
-  non-WSL executor for a non-WSL one), there as a directory; one that is not
+  executor's reach (a store it serves, or an imported directory of its
+  node), there as a directory; one that is not
   aborts the launch, the execution ending `launch_aborted: input NAME: why`.
   While a task that is pending
   or running, or an execution not yet ended, names it as an input, a source
@@ -827,9 +833,8 @@ labels may take what is placed there.
   `[data] confine_from` (a time with an offset, `"2026-11-14T00:00:00+09:00"`)
   confines every attempt launched from then on, whether its execution asks
   or not. A confined launch on an executor without a usable volatile store
-  (so without a scratch and an output directory) is refused, as is one
-  inside WSL for now (`launch_aborted: cannot confine the attempt here:
-  ...`). On Linux the launcher is the agent's binary run in a mount
+  (so without a scratch and an output directory) is refused
+  (`launch_aborted: cannot confine the attempt here: ...`). On Linux the launcher is the agent's binary run in a mount
   namespace of its own (Go makes its mounts private, so nothing reaches the
   node): it binds each of those directories, `/dev/shm` and `/proc` onto
   itself, then a `tmp` directory of the scratch over `/tmp`, makes every
@@ -934,7 +939,7 @@ most specific key:
 5. project
 
 The program is the first word of the command line that is not a runner (`uv
-run`, `python -m`, `pwsh -Command`, `wsl.exe --exec`...), without its
+run`, `python -m`, `pwsh -Command`...), without its
 directory, extension and hashes. A run that succeeded is one whose last
 execution exited 0 without a signal; what it took is the time its attempts
 ran, summed. What a run is still expected to take is its estimate minus what
@@ -959,7 +964,7 @@ times, and much shorter ones than holding with no estimates.
 
 An executor's tick is bounded in time. Every external call on it has a
 deadline: each `nvidia-smi` run 20 s (a `pmon` that does not return fails that
-GPU observation), each `wsl.exe` liveness run 15 s, each `taskkill` 30 s, and
+GPU observation), each `taskkill` 30 s, and
 each provider call (observe, prepare, release) 45 s. A call that cannot be
 cancelled is abandoned at its deadline, and no further call on that provider
 starts until it returns. A step of the tick that runs for 30 s is logged at
@@ -982,8 +987,6 @@ than an earlier sample showed:
 - Windows: the processes of the attempt's job object, their private working
   sets and the bytes the job has written; without a job object, the launcher
   and its descendants by parent pid and what they have written while alive.
-- WSL: the Linux processes carrying `KAIRO_ATTEMPT_ID`, as on Linux, read by
-  one `wsl.exe` run per sample.
 
 A process that cannot be read (another user's, a kernel without
 `smaps_rollup`) makes that figure unknown, and admission then counts the
@@ -1046,7 +1049,7 @@ Hardware settings).
   performance counter (instances `rapl_package*_pkg`; no elevation needed),
   on Linux the RAPL counters `/sys/class/powercap/*-rapl:N/energy_uj`
   (wraps handled with `max_energy_range_uj`). Where they cannot be read (an
-  unprivileged container, WSL, a CPU without them) the node reports none,
+  unprivileged container, a CPU without them) the node reports none,
   silently. The reader is `internal/cpupower`.
 
 Samples are kept per physical device (a GPU by its UUID), so the providers of
@@ -1153,14 +1156,13 @@ the free space below which it evicts, see Evicting, a tenth of its total when
 unset; for either, the free space a pack or a fetch onto it must leave on its
 filesystem, 1 GiB when unset, so what else is there, a running attempt's
 checkpoints or the system, never finds it full) and optionally `executor`, the one
-executor of the node whose namespace the root is in (a WSL executor's Linux
-paths; without it the root is in the node's own namespace). Ids are unique,
+executor of the node that serves it (without it every executor of the node
+does). Ids are unique,
 and no two stores of one node are at one place or one inside the other,
 whatever executors they name: roots are compared as one spelling of each
 place (separators, `.` and trailing separators dropped, a drive path without
-case, a WSL `/mnt/<drive>/...` path as that drive's path), so `E:/data`,
-`e:\Data\`, `E:/./data` and `/mnt/e/data` are one place, and a root
-declared with and without an executor (or in two WSL distros) is refused.
+case), so `E:/data`, `e:\Data\` and `E:/./data` are one place, and a root
+declared with and without an executor is refused.
 A root has no `..` and no control character; a POSIX root no whitespace or
 backslash; a drive path no name Windows reads as another (ending in a dot or
 a space, with `~` as in a short 8.3 name, a `:` or a character names cannot
@@ -1258,7 +1260,6 @@ What is built or installed belongs outside it (a uv environment through
 task's env); an attempt in a snapshot gets `PYTHONDONTWRITEBYTECODE=1`
 unless its environment sets that or `PYTHONPYCACHEPREFIX`, so Python does
 not write its bytecode there. A confined attempt cannot write there at all.
-Not inside WSL yet (refused at launch).
 
 What is unpacked does not stay for good. Every hour each executor asks the
 daemon which snapshots executions not yet terminal use (agent operation
@@ -1396,7 +1397,7 @@ kept by the run's snapshots, which its publication orders. Every 10
 minutes, and soon after an attempt there ends, the executor deletes the
 stopped instances of attempts no longer running there (a runner that was
 killed deleted none). Not for a gang, not
-on Windows or in WSL, and no state of a running container is kept yet:
+on Windows, and no state of a running container is kept yet:
 work goes on from its own checkpoints, as on a host.
 
 ### Data stores
@@ -1408,8 +1409,8 @@ store's root (and, from P1b on, what it has verified copies of on a durable
 store). Anything else on the filesystem is counted, never moved, changed or
 deleted, and nothing outside the root is ever walked.
 
-Every executor serves the stores of its node in its own namespace: those
-naming it as `executor`, and, unless it is a WSL executor, those naming none.
+Every enabled executor serves the stores of its node: those naming it as
+`executor`, and those naming none.
 It asks the daemon for its node's stores when it starts and every 5 minutes
 (agent operation `stores`), makes each volatile store's root that is missing
 (never a durable store's: one missing may be a disk not mounted, and what
@@ -1418,17 +1419,14 @@ checks that
 no component of the root's path is a link (a symlink, a junction or any
 other reparse point; on Windows the path the opened root resolves to, with
 its drive, must be the declared root, so no substituted drive or short 8.3
-name either; on Linux and in WSL the root must be its own real path) and that
+name either; on Linux the root must be its own real path) and that
 the root is on the declared filesystem (Windows: the root's drive, which must
 be NTFS or exFAT; Linux: the same device as the filesystem, which must be a
 mount point in `/proc/self/mountinfo` (a disk not mounted leaves a plain
-directory there); WSL: a root
-under `/mnt/<drive>` must be on that drive, a root on the distro's own disk is
-taken as declared). The root is opened, and a missing one made, one
+directory there)). The root is opened, and a missing one made, one
 directory at a time from its volume's root, each through its parent's handle
 and checked to be the plain directory looked at, so nothing is made or
-reached through a link, not even one put there meanwhile (WSL: the existing
-part of the path is checked with `realpath` before anything is made). On
+reached through a link, not even one put there meanwhile. On
 Linux a volatile store whose root is, on disk, where another store this
 executor serves has its root, or inside or around it (a bind mount, which
 the declared paths cannot show; compared by device and path within the
@@ -1511,8 +1509,7 @@ the node (compared as Machine declaration spells roots); if it cannot be made
 or recorded, the attempt starts without it (one made but not recorded is
 removed if it holds only its marker). `TMPDIR`,
 `TMP` and `TEMP` are left alone unless the task sets `scratch_tmpdir = true` in
-`[tasks.execution]` (or the execution TOML): then they name the scratch (a
-WSL attempt gets `TMPDIR` only, since its variables also reach `wsl.exe`),
+`[tasks.execution]` (or the execution TOML): then they name the scratch,
 over a declared env. Off by default, since a temporary directory emptied
 with every attempt loses caches such as torch's compile cache. It needs no
 SDK: the executor makes and settles it.
@@ -1593,15 +1590,14 @@ again. A source an attempt this executor launched still runs in waits. An
 object that fails is tried again at the next round, then after twice as long
 each time (from a minute) up to an hour; this holds for copies, deletions
 and read-backs too. An object whose
-directory is bigger than the store's free space waits. Directories of a store
-inside a WSL distro are not packed yet (the executor cannot read the distro's
-files through handles): such an object stays `packing`, warned once.
+directory is bigger than the store's free space waits.
 `kairo store status` shows the packs made on each store as `PACKS`
 (`pack_bytes`, `packs`); until they are moved they are Kairo's bytes there.
 
 Copies to a durable store: each packed object is copied to the first durable
 store by id on the node its pack is on, else the first by id elsewhere (read
-through the pack's agent), not inside a WSL distro nor being moved, with room
+through the pack's agent), not being moved nor naming an executor that is
+gone or disabled, with room
 for it (its free bytes as last reported, less its `reserve_free_bytes` and
 the packs of the copies being made there or verified there since that
 report, plus the packs shed since it; one never reported is taken as having
@@ -1616,7 +1612,7 @@ the token, for that copy, is good only on that copy's node:
 `object_copies.source_*`). An object nowhere
 durable yet always goes before any replica, and the executor asks again after
 each copy, so none waits behind a long one. Each copy is taken by one
-executor serving its store, never a WSL executor (`copies-to-make` every
+executor serving its store (`copies-to-make` every
 minute, `record-copy`; table `object_copies`, `copying` then `verified`;
 events `copy_ordered`, `copy_verified`). A copy taken for a store the
 declaration no longer makes durable at that root, or that its executor no
@@ -1781,8 +1777,8 @@ Kairo did not make under it, data written before the stores were declared or
 outside them. Each PATH becomes a data object of kind `import` of the
 project (`source_id` the object itself; event `import_ordered`), named NAME
 (with several paths `NAME/<the directory's name>`; without NAME the
-directory's name). It is packed by an executor of the node (never a WSL
-one) onto a volatile store it serves: the one on the directory's filesystem
+directory's name). It is packed by an executor of the node onto a volatile
+store it serves: the one on the directory's filesystem
 (the store whose declared `filesystem` holds the path, the longest such:
 `F:` for `F:/models`, `/srv/models` for `/srv/models/qwen`), else the first
 by id; like an output directory, the directory opened one directory at a time from
@@ -1894,8 +1890,7 @@ task left out when the name would pass 200 characters), packed and copied to
 the durable stores like any import, the path only read and left where it is.
 A path is imported once (a repeated acknowledgement imports nothing again);
 one whose import was abandoned is imported anew. A checkpoint that cannot be
-imported (inside a store, overlapping an import, a WSL attempt's POSIX path
-on a Windows node) is logged and left; the acknowledgement stands whatever
+imported (inside a store, overlapping an import) is logged and left; the acknowledgement stands whatever
 becomes of it.
 
 So that long work has checkpoints to keep, the daemon asks for them: every
@@ -1938,7 +1933,7 @@ retry recoverable errors. `--timeout` limits the wait (exit 2 on timeout;
 0 or omitted means no limit) without cancelling the fetch.
 
 The object is brought to the volatile store of the node, among those an
-executor of the node that is not a WSL one serves, with the most room for its pack and
+executor of the node serves, with the most room for its pack and
 unpacked tree (its free bytes as last reported, less its `reserve_free_bytes`,
 at least 1 GiB, and the pack and tree sizes of pending fetches there; the
 first by id among equals),
@@ -2080,11 +2075,7 @@ The marker is created exclusively in the directory just made, never opened,
 and read without blocking (a FIFO in its place does not hang the agent), so
 nothing put there meanwhile is written through. A deletion refused for any of
 these reasons keeps the scratch with the reason; one that failed otherwise (a
-file in use) is tried again. WSL stores are reached by one `sh` script run
-with `wsl.exe --exec` under the same rules as far as a shell can keep them
-(paths, not handles: `realpath` for the root, `/proc/self/mountinfo`, the
-marker created with `noclobber`, `rm -r --one-file-system` on what the
-scratch directory holds; the root is cleaned before it is compared). A daemon older than stores never gets scratch
+file in use) is tried again. A daemon older than stores never gets scratch
 from a newer agent (it answers `stores` with 404, and the agent then neither
 makes scratch nor asks for any to settle).
 
@@ -2386,11 +2377,11 @@ it captures instead of suspending it, checkpointable or not:
 
 - a started execution's attempt gets a force stop that its executor (in the
   daemon or a node agent) carries out on the whole process tree: a graceful
-  stop first (Windows: CTRL_BREAK to the launcher's process group; Linux and
-  WSL: SIGTERM to the process group and to every process carrying the
+  stop first (Windows: CTRL_BREAK to the launcher's process group; Linux:
+  SIGTERM to the process group and to every process carrying the
   attempt's `KAIRO_ATTEMPT_ID`), then, after the grace period, a kill of
   everything left (Windows: the attempt's job object and `taskkill /T /F`;
-  Linux/WSL: SIGKILL). The execution ends with terminal cause
+  Linux: SIGKILL). The execution ends with terminal cause
   `force_stopped`; a suspend in progress is not waited for.
 - an execution that has not started is withdrawn (`withdrawn_before_start`),
   a reserved lease revoked as for any pause.
@@ -2482,8 +2473,7 @@ Managed attempts receive `KAIRO_API_URL`, `KAIRO_EXECUTION_ID`,
 `KAIRO_CONTINUATION_REF` when resuming, `KAIRO_SCRATCH` and
 `KAIRO_OUTPUT_DIR` when the executor serves a volatile store (Data stores),
 and the gang variables for a gang
-rank. WSL attempts get them through `WSLENV`, never on the `wsl.exe` command
-line. Rank zero polls and acknowledges commands; the PyTorch adapter broadcasts the command,
+rank. Rank zero polls and acknowledges commands; the PyTorch adapter broadcasts the command,
 runs every rank's callback, and only publishes the continuation after the
 distributed barrier. Commands may be redelivered, so checkpoint publication
 must remain idempotent by command ID.
@@ -2615,8 +2605,7 @@ Where the programs are is reported by each node with its registration, from
 `[bench]` of the agent's (or daemon's, for its own node) configuration:
 `kairo_binary` (default: that kairo), `gpu_binary` (`kairo-bench-gpu`; a node
 without it takes no GPU bench), `cwd` (default the kairo binary's directory)
-and `executor_labels` (the executor that runs them natively, not a WSL one
-for Windows paths). The execution's argv is `kairo hardware bench-run --run
+and `executor_labels` (the executor that runs them natively). The execution's argv is `kairo hardware bench-run --run
 ID`, the driver, which reaches the daemon through the worker API with its
 attempt token (`KAIRO_API_URL`, `KAIRO_API_CA`, `KAIRO_ATTEMPT_TOKEN`): that
 token reaches only the run its attempt carries out (another run is `403`, an
@@ -3013,7 +3002,7 @@ the `CI_*` settings of CI on Kairo.
   at boot (refused while the node holds a lease: an agent started with
   another log directory cannot adopt); `ops/windows/replace-agent.ps1 -New
   BUILD [-Adopting]` replaces it. The agent runs as the user (its attempts
-  are the user's, WSL included), so its files are the user's.
+  are the user's), so its files are the user's.
 - Windows, elevated: `ops/windows/install-controller.ps1 -New BUILD [-Config
   TOML] [-State JSON] [-CA PEM]` installs the device controller, which runs
   as SYSTEM: `%ProgramFiles%\Kairo\kairo-controller.exe`, its configuration,
@@ -3124,7 +3113,7 @@ self-hosted runner and no secret, so nothing of the installation is reachable
 from there. The repository is private (2026-11-21), so the runs count against
 the account's Actions minutes: about 20 billed minutes a run, the Windows job
 counting twice. The checks that need
-the real environment (WSL, the LXC on pve1, the hardware) run on Kairo itself
+the real environment (the LXC on pve1, the hardware) run on Kairo itself
 (below), before a deploy and before a large branch is merged. Deploying is
 not done from GitHub.
 
@@ -3155,7 +3144,7 @@ PowerShell instead of `ci/check.sh`. The checks: `<sha>-linux` (gofmt, `go vet`
 for Linux and Windows, `go test`), `<sha>-linux-race` and `<sha>-linux-root`
 (the executor, process and provider tests as root) on pve1-work, the first two
 as an unprivileged user (`ci`) so the tests of unreadable and undeletable
-files mean something; `<sha>-windows`, `<sha>-wsl` (`KAIRO_TEST_WSL=1`),
+files mean something; `<sha>-windows`,
 `<sha>-sdk-python` and `<sha>-sdk-rust` on windows-local. pve1-work has Go,
 gcc (for `-race`) and a test PostgreSQL 17 at `127.0.0.1:55432` (role
 `kairo`, a superuser as in the test container, since dropping a test database
@@ -3168,7 +3157,7 @@ only if every check succeeded; `kairo task logs kairo-ci ci <sha>-<check>`
 shows what failed, and `kairo task rerun` runs a check again (a declared Task
 is immutable, so a commit is declared once).
 
-Real NVIDIA, WSL, process-kill, and DDP runs are host-specific integration
+Real NVIDIA, process-kill, and DDP runs are host-specific integration
 tests rather than ordinary unit tests, and so are the controller's changes of
 real clocks, power limits and processor settings (its tests use fake
 actuators). The bench tests run tiny workloads (TempDir files of a few MiB,

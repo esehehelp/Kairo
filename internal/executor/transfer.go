@@ -55,9 +55,6 @@ const (
 var stallTimeout = 5 * time.Minute
 
 var (
-	// errCopyNotHere: the durable store is one this executor does not write
-	// (inside a WSL distro).
-	errCopyNotHere = errors.New("copies to a store inside a WSL distro are not made yet")
 	// errCopyMismatch: a copy read back does not match the pack.
 	errCopyMismatch = errors.New("the copy read back does not match the pack")
 )
@@ -194,9 +191,6 @@ func describeCopy(s servedStore, o store.CopyOrder) error {
 	if o.Description == nil {
 		return errors.New("no description to write")
 	}
-	if _, ok := s.fs.(localStoreFS); !ok {
-		return errCopyNotHere
-	}
 	if !validScratchID(o.ObjectID) || !machine.ValidMonth(o.Month) {
 		return fmt.Errorf("%w: object %q, month %q", errOutsideRoot, o.ObjectID, o.Month)
 	}
@@ -233,9 +227,6 @@ func describeCopy(s servedStore, o store.CopyOrder) error {
 // back as it is.
 func (e *storeWorker) copyOne(ctx context.Context, s servedStore, o store.CopyOrder, served map[string]servedStore) (store.CopyMade, error) {
 	made := store.CopyMade{ObjectID: o.ObjectID, StoreID: o.StoreID, ExecutorID: e.ID}
-	if _, ok := s.fs.(localStoreFS); !ok {
-		return made, errCopyNotHere
-	}
 	if !validScratchID(o.ObjectID) || !machine.ValidMonth(o.Month) {
 		return made, fmt.Errorf("%w: object %q, month %q", errOutsideRoot, o.ObjectID, o.Month)
 	}
@@ -359,9 +350,6 @@ func (e *storeWorker) fetch(ctx context.Context, o store.CopyOrder, served map[s
 		src, ok := served[o.Source.StoreID]
 		if !ok || !src.usable || src.decl.Root != o.Source.Root {
 			return fmt.Errorf("the pack's store %s is not served here at %s", o.Source.StoreID, o.Source.Root)
-		}
-		if _, isLocal := src.fs.(localStoreFS); !isLocal {
-			return errPackNotHere
 		}
 		open = func(name string, offset int64) (io.ReadCloser, int64, error) {
 			if o.Source.Month != "" {

@@ -11,8 +11,8 @@ import (
 )
 
 // Validate checks env. Names must be non-empty, without '=' or NUL and
-// without surrounding spaces; values must not contain NUL. KAIRO_* and WSLENV
-// belong to Kairo, and so does CUDA_VISIBLE_DEVICES when the execution holds
+// without surrounding spaces; values must not contain NUL. KAIRO_* belongs
+// to Kairo, and so does CUDA_VISIBLE_DEVICES when the execution holds
 // GPUs (it is set from the lease); a CPU-only execution may set it, say to -1.
 func Validate(env map[string]string, exclusiveGPU bool) error {
 	for _, name := range Names(env) {
@@ -44,10 +44,9 @@ func Normalize(env map[string]string, exclusiveGPU bool) (map[string]string, err
 }
 
 // Reserved reports whether a variable belongs to Kairo whatever the execution
-// declares: KAIRO_* and WSLENV, in any case.
+// declares: KAIRO_*, in any case.
 func Reserved(name string) bool {
-	upper := strings.ToUpper(name)
-	return strings.HasPrefix(upper, "KAIRO_") || upper == "WSLENV"
+	return strings.HasPrefix(strings.ToUpper(name), "KAIRO_")
 }
 
 // Names returns the names of env in sorted order.

@@ -4,11 +4,7 @@ package executor
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
-	"strconv"
-	"strings"
 	"testing"
 
 	"kairo/internal/processidentity"
@@ -121,52 +117,6 @@ func TestWindowsTreeUsageOfARealChild(t *testing.T) {
 		s := windowsTreeUsage(hostProcesses{}, target)
 		if s.ram == nil || *s.ram <= 0 || s.written == nil || *s.written < 0 {
 			t.Errorf("%s: ram %s written %s", name, value(s.ram), value(s.written))
-		}
-	}
-}
-
-// The WSL script over a fake /proc, where a POSIX sh is at hand (Git for
-// Windows ships one).
-func TestWSLUsageScriptOverAFakeProc(t *testing.T) {
-	sh, err := exec.LookPath("sh")
-	if err != nil {
-		t.Skip("no sh")
-	}
-	root := filepath.ToSlash(t.TempDir())
-	write := func(pid int, name, body string) {
-		dir := filepath.Join(root, strconv.Itoa(pid))
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for pid, attempt := range map[int]string{10: "att_1", 11: "att_1", 12: "att_2", 13: "att_3"} {
-		write(pid, "environ", "PATH=/bin\x00KAIRO_ATTEMPT_ID="+attempt+"\x00")
-		write(pid, "smaps_rollup", fmt.Sprintf("Rss: %d kB\nPss: %d kB\n", 2*pid, pid))
-		if pid != 13 {
-			write(pid, "io", fmt.Sprintf("rchar: 1\nwrite_bytes: %d\ncancelled_write_bytes: 1\n", 100*pid))
-		}
-	}
-	script := strings.ReplaceAll(wslUsageScript, "/proc/", root+"/")
-	out, err := exec.Command(sh, "-c", script, "kairo-usage", "att_1", "att_2", "att_3", "att_4").Output()
-	if err != nil {
-		t.Fatalf("%v: %s", err, out)
-	}
-	got := parseWSLUsage(string(out))
-	for attempt, want := range map[string][2]string{"att_1": {fmt.Sprint(21 * 1024), "2098"}, "att_2": {fmt.Sprint(12 * 1024), "1199"}, "att_3": {fmt.Sprint(13 * 1024), "unknown"}, "att_4": {"0", "0"}} {
-		if s := got[attempt]; value(s.ram) != want[0] || value(s.written) != want[1] {
-			t.Errorf("%s: ram %s written %s, want %v (output %q)", attempt, value(s.ram), value(s.written), want, out)
-		}
-	}
-}
-
-func TestParseWSLUsage(t *testing.T) {
-	got := parseWSLUsage("att_1 1048576 4096\natt_2 - 10\natt_3 2048 -\nnoise\n")
-	for attempt, want := range map[string][2]string{"att_1": {"1048576", "4096"}, "att_2": {"unknown", "10"}, "att_3": {"2048", "unknown"}, "att_4": {"unknown", "unknown"}} {
-		if s := got[attempt]; value(s.ram) != want[0] || value(s.written) != want[1] {
-			t.Errorf("%s: ram %s written %s, want %v", attempt, value(s.ram), value(s.written), want)
 		}
 	}
 }

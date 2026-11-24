@@ -55,8 +55,8 @@ const StoreBackendLocalFS = "local-fs"
 // Store is a place Kairo keeps data in: a root directory, owned by Kairo, on
 // a filesystem of a node. Filesystem is the identity of the node's disk
 // resource the root is on (its admission accounting). Executor, when set,
-// names the one executor of the node whose namespace the root is in (a WSL
-// executor's Linux paths); a store without one is in the node's own namespace.
+// names the one executor of the node that serves the store; a store without
+// one is served by every executor of the node.
 // ReserveFreeBytes is the free space a durable store keeps (filling it stops
 // before), shown only for a volatile one.
 type Store struct {
@@ -102,8 +102,8 @@ func StoreRootIsAbsolute(root string) bool {
 // spelling of one place (checkStoreRoot), the node and filesystem given, the
 // reserve not negative, and no two stores of one node at one place or one
 // inside the other (StoreRootKey), whatever executors they name: a root
-// declared with and without an executor, or in two WSL distros, is refused
-// rather than taken as two places.
+// declared with and without an executor is refused rather than taken as two
+// places.
 func (s Spec) validateStores() error {
 	ids := map[string]bool{}
 	roots := map[string][]Store{}

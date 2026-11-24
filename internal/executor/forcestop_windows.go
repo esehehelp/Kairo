@@ -16,7 +16,6 @@ import (
 
 	"golang.org/x/sys/windows"
 
-	"kairo/internal/extcmd"
 	"kairo/internal/processidentity"
 )
 
@@ -100,23 +99,17 @@ func (h *treeHandle) activeProcesses() (int, error) {
 
 var errNoGracefulStop = errors.New("no graceful stop channel to this attempt (launched before force stop support, or by an earlier executor instance)")
 
-// stopTreeGracefully asks the attempt to stop: SIGTERM to every Linux process
-// of the attempt for a WSL executor, CTRL_BREAK to the launcher's console
-// process group otherwise.
+// stopTreeGracefully asks the attempt to stop: CTRL_BREAK to the launcher's
+// console process group.
 func (e *Local) stopTreeGracefully(ctx context.Context, t processTree) error {
-	if t.wsl {
-		_, err := wslAttemptProcesses(ctx, t.distro, t.attemptID, "TERM")
-		return err
-	}
 	if t.handle == nil || !t.handle.group || t.pid == 0 {
 		return errNoGracefulStop
 	}
 	return ctrlBreak(ctx, t.pid)
 }
 
-// killTree terminates everything of the attempt: the job object, the
-// launcher's process tree (taskkill /T /F) and, for WSL, every Linux process
-// carrying the attempt's KAIRO_ATTEMPT_ID.
+// killTree terminates everything of the attempt: the job object and the
+// launcher's process tree (taskkill /T /F).
 func (e *Local) killTree(ctx context.Context, t processTree) error {
 	var errs []error
 	if t.handle != nil && t.handle.job != 0 {
@@ -133,11 +126,6 @@ func (e *Local) killTree(ctx context.Context, t processTree) error {
 			}
 		}
 	}
-	if t.wsl {
-		if _, err := wslAttemptProcesses(ctx, t.distro, t.attemptID, "KILL"); err != nil {
-			errs = append(errs, err)
-		}
-	}
 	return errors.Join(errs...)
 }
 
@@ -152,42 +140,7 @@ func (e *Local) treeAlive(ctx context.Context, t processTree) (bool, error) {
 			return true, nil
 		}
 	}
-	alive, err := t.launcherAlive()
-	if err != nil || alive {
-		return alive, err
-	}
-	if t.wsl {
-		pids, err := wslAttemptProcesses(ctx, t.distro, t.attemptID, "0")
-		return len(pids) > 0, err
-	}
-	return false, nil
-}
-
-// wslAttemptProcesses finds (and signals, unless signal is "0") the Linux
-// processes of an attempt in WSL by wslAttemptScript, with those the last
-// scan of the attempt in that distro found (attemptMembers).
-func wslAttemptProcesses(ctx context.Context, distro, attemptID, signal string) ([]int, error) {
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	key := distro + "/" + attemptID // neither holds a /
-	args := []string{}
-	if distro != "" {
-		args = append(args, "-d", distro)
-	}
-	args = append(args, "--exec", "sh", "-c", wslAttemptScript, "kairo-force-stop", attemptID, signal)
-	for pid, start := range attemptMembers.known(key) {
-		args = append(args, strconv.Itoa(pid)+":"+start)
-	}
-	out, err := extcmd.Output(ctx, "wsl.exe", args...)
-	if err != nil {
-		return nil, fmt.Errorf("find attempt processes in WSL: %w", err)
-	}
-	pids, found, err := parseAttemptMembers(string(out))
-	if err != nil {
-		return nil, err
-	}
-	attemptMembers.set(key, found)
-	return pids, nil
+	return t.launcherAlive()
 }
 
 // ctrlBreakHelperArg runs this binary as a helper that sends CTRL_BREAK to a

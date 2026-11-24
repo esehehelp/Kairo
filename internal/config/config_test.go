@@ -138,6 +138,18 @@ func TestAgentStillRequiresAnExecutor(t *testing.T) {
 	}
 }
 
+// A WSL executor (its kind, or its environment label) is refused: that
+// kind is retired, and taken for a host executor it would run Linux command
+// lines on Windows.
+func TestAgentRefusesAWSLExecutor(t *testing.T) {
+	base := "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host\"\nname = \"host\"\n[[executors]]\nid = \"ubuntu-wsl\"\n"
+	for _, decl := range []string{"kind = \"wsl2\"\n", "kind = \"local\"\nlabels = { environment = \"wsl2\" }\n"} {
+		if _, err := LoadAgent(writeConfig(t, base+decl)); err == nil || !strings.Contains(err.Error(), "WSL executors are retired") {
+			t.Fatalf("%q: %v", decl, err)
+		}
+	}
+}
+
 func TestLogMinFreeDefaultsAndRefusesNegative(t *testing.T) {
 	agentBase := "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0\"\nname = \"pve0\"\n[[executors]]\nid = \"pve0-linux\"\nkind = \"linux\"\n"
 	c, err := Load(writeConfig(t, daemonBase))

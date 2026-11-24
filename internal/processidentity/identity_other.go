@@ -3,7 +3,6 @@
 package processidentity
 
 import (
-	"context"
 	"fmt"
 	"os"
 )
@@ -51,8 +50,4 @@ func HostProcessLiveness(pid int, expected string) (Liveness, error) {
 		return LivenessAlive, nil
 	}
 	return LivenessAbsent, nil
-}
-
-func WSLProcessLiveness(_ context.Context, _ string, pid int, expected string) (Liveness, error) {
-	return HostProcessLiveness(pid, expected)
 }

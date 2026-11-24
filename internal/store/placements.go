@@ -16,7 +16,7 @@ import (
 // (inputs.go): its data object is fetched from a verified copy on a durable
 // store (or, while it is still there, from the pack where it was made) and
 // unpacked under <root>/inputs/<object id> on a volatile store of the node
-// (of those an executor of the node that is not a WSL one serves, the one
+// (of those an executor of the node serves, the one
 // with the most room for the pack and unpacked tree, the first by id among
 // equals; a fetch still waiting for room moves to the one with the most room:
 // fetchRoomTx), by that executor, which checks the pack against its size and sha256 and each
@@ -105,7 +105,7 @@ const minFetchHeadroom = 1 << 30
 
 // placementStoreTx is the volatile store of a node objects are brought to,
 // and the executor that brings them: the first store by id that an executor
-// of the node that is not a WSL one serves.
+// of the node serves.
 func placementStoreTx(ctx context.Context, q queryer, declared []machine.Store, nodeID string) (machine.Store, string, bool, error) {
 	stores, err := placementStoresTx(ctx, q, declared, nodeID)
 	if err != nil || len(stores) == 0 {
@@ -147,8 +147,8 @@ type placementStore struct {
 }
 
 // placementStoresTx are the volatile stores of a node objects can be brought
-// to, by id, each with the executor that brings them: one of the node that
-// is not a WSL one serving it.
+// to, by id, each with the executor that brings them: one of the node
+// serving it.
 func placementStoresTx(ctx context.Context, q queryer, declared []machine.Store, nodeID string) ([]placementStore, error) {
 	var executorIDs []string
 	err := eachRow(ctx, q, `SELECT id FROM executors WHERE node_id=$1 ORDER BY id`, []any{nodeID}, func(rows *sql.Rows) error {
@@ -176,7 +176,7 @@ func placementStoresTx(ctx context.Context, q queryer, declared []machine.Store,
 			if err != nil {
 				return nil, err
 			}
-			if !info.wsl && info.serves(d, executorID) {
+			if info.serves(d, executorID) {
 				out = append(out, placementStore{d, executorID})
 				break
 			}

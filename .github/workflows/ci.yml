@@ -1,5 +1,5 @@
 # The checks of ci/check.sh that need nothing of this installation, on GitHub's hosted runners, for every push to
-# main and every pull request. The checks that need the real environment (WSL, the LXC on pve1, the hardware) run
+# main and every pull request. The checks that need the real environment (the LXC on pve1, the hardware) run
 # on Kairo itself (ci/kairo-ci.sh). No self-hosted runner and no secrets: nothing of the installation is reachable
 # from here. The repository is private (2026-11-21): runs count against the account's Actions minutes.
 name: ci

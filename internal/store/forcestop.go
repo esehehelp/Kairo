@@ -8,7 +8,7 @@ package store
 //     withdrawn_before_start) and recorded as force_stops state 'withdrawn';
 //   - a started execution gets a force stop that the executor of its attempt
 //     carries out on the attempt's whole process tree: a graceful stop
-//     (Windows CTRL_BREAK, Linux/WSL SIGTERM), then after the grace period a
+//     (Windows CTRL_BREAK, Linux SIGTERM), then after the grace period a
 //     kill of every process left. Its execution ends with terminal cause
 //     force_stopped. The lease is released only through the ordinary
 //     quiescence proof (registered processes absent, fresh provider

@@ -17,7 +17,7 @@ import (
 // Existing data comes under Kairo by being imported (kairo data import): a
 // directory on a node, outside every store of the node, becomes a data
 // object of kind import (source_id the object itself, source_path the
-// directory). It is packed by an executor of the node (never a WSL one) on
+// directory). It is packed by an executor of the node on
 // a volatile store it serves: the one on the directory's filesystem (the
 // store whose declared filesystem holds the path, the longest such), else
 // the first by id; into
@@ -214,14 +214,14 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 			if err != nil {
 				return nil, err
 			}
-			if !info.wsl && info.serves(d, executorID) {
+			if info.serves(d, executorID) {
 				packers = append(packers, packer{d, executorID})
 				break
 			}
 		}
 	}
 	if len(packers) == 0 {
-		return nil, fmt.Errorf("%w: node %q has no volatile store an executor packs on (none declared, or only WSL ones)", ErrImportRefused, req.Node)
+		return nil, fmt.Errorf("%w: node %q has no volatile store an executor packs on (none declared, or none an enabled executor serves)", ErrImportRefused, req.Node)
 	}
 	// packerOf is the store a directory is packed on: the one on its
 	// filesystem, else the first

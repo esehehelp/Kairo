@@ -634,6 +634,53 @@ func (s *Store) ReregisterExecutor(ctx context.Context, executorID string, adopt
 	return n, adopted, nil
 }
 
+// UndeclareExecutors disables the enabled executors of a node that its
+// agent, registering, no longer declares (declared: those it does): its agent
+// no longer runs them, so nothing is placed on them and they serve no store
+// (executorInfo.serves) until an agent declares them again. Their live
+// leases go stale as at a restart that adopts nothing (reregisterExecutorTx).
+// Each is recorded (event executor_undeclared); the ids disabled are
+// returned.
+func (s *Store) UndeclareExecutors(ctx context.Context, nodeID string, declared []string) ([]string, error) {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	keep := map[string]bool{}
+	for _, id := range declared {
+		keep[id] = true
+	}
+	var gone []string
+	err = eachRow(ctx, tx, `SELECT id FROM executors WHERE node_id=$1 AND enabled ORDER BY id`, []any{nodeID}, func(rows *sql.Rows) error {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		if !keep[id] {
+			gone = append(gone, id)
+		}
+		return nil
+	})
+	if err != nil || len(gone) == 0 {
+		return nil, err
+	}
+	t := now()
+	for _, id := range gone {
+		stale, _, err := reregisterExecutorTx(ctx, tx, id, nil)
+		if err != nil {
+			return nil, err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE executors SET enabled=FALSE,updated_at=$1 WHERE id=$2`, t, id); err != nil {
+			return nil, err
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "executor_undeclared", nil, "executor", id, nil, map[string]any{"node_id": nodeID, "stale_leases": stale}); err != nil {
+			return nil, err
+		}
+	}
+	return gone, tx.Commit()
+}
+
 // reregisterExecutorTx is ReregisterExecutor in tx: the leases made stale,
 // the attempts adopted.
 func reregisterExecutorTx(ctx context.Context, tx *sql.Tx, executorID string, adopt []AdoptedAttempt) (int, []string, error) {

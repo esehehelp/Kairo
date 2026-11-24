@@ -122,7 +122,7 @@ type ExecutionSpec struct {
 // GangSpec describes a multi-node execution. Every rank asks for the
 // execution's resources on its own node unless it gives its own; Ranks
 // overrides argv, cwd, the executor selector, exclusive or capacity of single
-// ranks (a Windows/WSL rank and a Linux rank need different paths, a two-GPU
+// ranks (a Windows rank and a Linux rank need different paths, a two-GPU
 // node and a one-GPU node different requests) and merges a rank's env over the
 // execution's.
 type GangSpec struct {

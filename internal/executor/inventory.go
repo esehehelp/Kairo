@@ -68,12 +68,8 @@ func (e *storeWorker) inventoryDue(ctx context.Context) {
 // at that is gone (its volume there): store.InputGone, so inputs are brought
 // from a durable copy instead (README: Data stores); and each that is a
 // regular file, an import of one file (an input is a directory):
-// store.InputIsFile, so it is brought as a directory holding it. A WSL
-// executor's paths are the distro's: not looked at from here.
+// store.InputIsFile, so it is brought as a directory holding it.
 func (e *storeWorker) checkInPlaceSources(ctx context.Context) {
-	if !e.backend().readsNodePaths() {
-		return
-	}
 	sources, err := e.Store.InPlaceSources(ctx, e.ID)
 	if err != nil {
 		e.roundProblem(&e.inventories, "", "in-place sources not read", err)

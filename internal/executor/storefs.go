@@ -83,8 +83,8 @@ var (
 	kindOutput = dirKind{dir: outputDirName, marker: outputMarkerName}
 )
 
-// storeFS is how an executor reaches a store's root: in its own namespace
-// (localStoreFS) or inside a WSL distro (wslStoreFS).
+// storeFS is how an executor reaches a store's root (localStoreFS: directly,
+// in the node's namespace).
 type storeFS interface {
 	// Ensure makes the root if it is missing (only with create: never a
 	// durable store's) and checks that it is a directory on the declared
@@ -149,15 +149,11 @@ func scanScratch(ctx context.Context, sfs storeFS, root string) (map[string]int6
 	return out, nil
 }
 
-// scratchPath is <root>/scratch/<id> as sfs spells paths (a Linux path for a
-// WSL distro's root).
+// scratchPath is <root>/scratch/<id>.
 func scratchPath(sfs storeFS, root, id string) string { return kindPath(sfs, root, kindScratch, id) }
 
-// kindPath is <root>/<kind's dir>/<id> as sfs spells paths.
-func kindPath(sfs storeFS, root string, kind dirKind, id string) string {
-	if _, ok := sfs.(wslStoreFS); ok {
-		return path.Join(wslRootPath(root), kind.dir, id)
-	}
+// kindPath is <root>/<kind's dir>/<id>.
+func kindPath(_ storeFS, root string, kind dirKind, id string) string {
 	return filepath.Join(root, kind.dir, id)
 }
 

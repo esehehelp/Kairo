@@ -13,7 +13,7 @@ const leftBehindReportInterval = time.Minute
 
 // What an exited attempt left running is not its work any more: its launcher
 // exited and its exit is recorded, so no one reads what the rest does. It is
-// asked to stop (SIGTERM; inside WSL too; on Windows CTRL_BREAK, which no
+// asked to stop (SIGTERM; on Windows CTRL_BREAK, which no
 // longer reaches it once its launcher is gone) once it has been seen for
 // leftoverGrace, and killed (the job object, the process group, the
 // processes carrying the attempt's KAIRO_ATTEMPT_ID) leftoverKillAfter after
@@ -34,7 +34,7 @@ type leftover struct {
 // although its registered processes are gone: the job object's processes
 // (Windows), the launcher's process group (Linux, also for a process that
 // dropped KAIRO_ATTEMPT_ID from its environment), or the processes carrying
-// its KAIRO_ATTEMPT_ID (inside WSL too). Its launcher has exited, so only
+// its KAIRO_ATTEMPT_ID. Its launcher has exited, so only
 // those count.
 func (e *Local) leftBehind(ctx context.Context, attempt store.Attempt) (bool, error) {
 	left, err := e.treeAlive(ctx, e.exitedTree(attempt))
@@ -49,20 +49,15 @@ func (e *Local) leftBehind(ctx context.Context, attempt store.Attempt) (bool, er
 
 // exitedTree is what this executor can reach of an exited attempt's tree.
 func (e *Local) exitedTree(attempt store.Attempt) processTree {
-	t := e.backend().tree(attempt.ID)
-	if !t.wsl {
-		// For WSL the work is the Linux processes, found by their
-		// KAIRO_ATTEMPT_ID; the Windows side of wsl.exe is not counted (its
-		// helpers may outlive it without running anything of the attempt).
-		e.mu.Lock()
-		t.handle = e.trees[attempt.ID]
-		e.mu.Unlock()
-		if attempt.PID != nil {
-			t.group = *attempt.PID
-		}
-		if attempt.ProcessIdentity != nil {
-			t.identity = *attempt.ProcessIdentity
-		}
+	t := processTree{attemptID: attempt.ID}
+	e.mu.Lock()
+	t.handle = e.trees[attempt.ID]
+	e.mu.Unlock()
+	if attempt.PID != nil {
+		t.group = *attempt.PID
+	}
+	if attempt.ProcessIdentity != nil {
+		t.identity = *attempt.ProcessIdentity
 	}
 	return t
 }

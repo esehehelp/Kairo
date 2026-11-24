@@ -1,4 +1,4 @@
-// Package extcmd runs the programs an executor depends on (nvidia-smi, wsl.exe,
+// Package extcmd runs the programs an executor depends on (nvidia-smi,
 // taskkill) under a deadline the caller sets, so that a hung one cannot hold a
 // tick, and logs the ones that are slow or time out.
 package extcmd

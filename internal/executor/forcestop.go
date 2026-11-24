@@ -13,21 +13,17 @@ import (
 // processTree is what this executor knows of an attempt's processes: the
 // launcher (pid 0 when it is gone or cannot be identified) and its creation
 // identity, the launcher's process group (Linux: its pid, which leads the
-// group it was started in; 0 when unknown or for WSL), the tree handle taken
-// at launch (nil for an attempt launched by an earlier executor instance),
-// and whether the work runs inside WSL.
+// group it was started in; 0 when unknown), and the tree handle taken at
+// launch (nil for an attempt launched by an earlier executor instance).
 type processTree struct {
 	attemptID string
 	pid       int
 	identity  string
 	group     int
 	handle    *treeHandle
-	wsl       bool
-	distro    string
 }
 
-// forceStopCheckInterval spaces out liveness checks of a signalled tree (a WSL
-// check runs wsl.exe).
+// forceStopCheckInterval spaces out liveness checks of a signalled tree.
 const forceStopCheckInterval = time.Second
 
 // carryOutForceStops carries out the force stops (pause --force) of this
@@ -150,7 +146,7 @@ func (e *Local) ackForceStop(ctx context.Context, attemptID, phase string, detai
 // or else through the recorded pid when its creation identity still matches
 // (an executor restarted since the launch).
 func (e *Local) attemptTree(o store.ForceStopOrder) processTree {
-	t := e.backend().tree(o.AttemptID)
+	t := processTree{attemptID: o.AttemptID}
 	t.identity = deref(o.ProcessIdentity)
 	e.mu.Lock()
 	if pid := e.running[o.AttemptID]; pid != 0 {
@@ -163,7 +159,7 @@ func (e *Local) attemptTree(o store.ForceStopOrder) processTree {
 			t.pid = *o.PID
 		}
 	}
-	if !t.wsl && o.PID != nil {
+	if o.PID != nil {
 		t.group = *o.PID // the launcher's process group, also once it is gone
 	}
 	return t

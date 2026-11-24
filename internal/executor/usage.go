@@ -25,7 +25,7 @@ import (
 const (
 	// usageInterval spaces out the rounds of usage samples.
 	usageInterval = 15 * time.Second
-	// usageTimeout bounds one round: its wsl.exe run and its reports.
+	// usageTimeout bounds one round: its samples and its reports.
 	usageTimeout = 15 * time.Second
 )
 

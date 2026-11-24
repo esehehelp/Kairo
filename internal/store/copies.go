@@ -89,34 +89,34 @@ type PackRead struct {
 var ErrCopyMismatch = errors.New("the copy does not match the pack")
 
 type executorInfo struct {
-	nodeID string
-	wsl    bool
-	attrs  map[string]string
+	nodeID  string
+	enabled bool
+	attrs   map[string]string
 }
 
 func executorInfoTx(ctx context.Context, q queryer, executorID string) (executorInfo, error) {
 	var info executorInfo
-	var kind, attrs string
-	if err := q.QueryRowContext(ctx, `SELECT node_id,kind,attributes_json FROM executors WHERE id=$1`, executorID).Scan(&info.nodeID, &kind, &attrs); err != nil {
+	var attrs string
+	if err := q.QueryRowContext(ctx, `SELECT node_id,enabled,attributes_json FROM executors WHERE id=$1`, executorID).Scan(&info.nodeID, &info.enabled, &attrs); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return info, ErrNotFound
 		}
 		return info, err
 	}
 	_ = json.Unmarshal([]byte(attrs), &info.attrs)
-	info.wsl = kind == "wsl2" || info.attrs["environment"] == "wsl2"
 	return info, nil
 }
 
-// serves reports whether an executor serves a store: one of its node, naming
-// it, or naming no executor while the executor is not a WSL one.
+// serves reports whether an executor serves a store: an enabled executor of
+// the store's node, which the store names or which names none (a disabled
+// one is no longer run by its node's agent: UndeclareExecutors).
 func (info executorInfo) serves(s machine.Store, executorID string) bool {
-	return s.Node == info.nodeID && (s.Executor == executorID || s.Executor == "" && !info.wsl)
+	return info.enabled && s.Node == info.nodeID && (s.Executor == executorID || s.Executor == "")
 }
 
 // copyTargetsTx are the durable stores objects are copied to, in the order
-// they are taken: the declared durable stores by id but those inside a WSL
-// distro (copies are not made there yet) and those being moved.
+// they are taken: the declared durable stores by id but those being moved
+// and those naming an executor that is gone or disabled.
 func copyTargetsTx(ctx context.Context, q queryer, declared []machine.Store) ([]machine.Store, error) {
 	var durable []machine.Store
 	for _, s := range declared {
@@ -132,7 +132,7 @@ func copyTargetsTx(ctx context.Context, q queryer, declared []machine.Store) ([]
 			if err != nil && !errors.Is(err, ErrNotFound) {
 				return nil, err
 			}
-			if err != nil || info.wsl {
+			if err != nil || !info.enabled {
 				continue
 			}
 		}

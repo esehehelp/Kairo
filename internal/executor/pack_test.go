@@ -339,7 +339,7 @@ func (f *fakePacks) RecordPack(_ context.Context, made store.PackMade) error {
 
 // A round packs what is ordered on a usable store this executor serves at
 // the ordered root, and records each pack; what is not served here as
-// ordered, or lies inside a WSL distro, waits.
+// ordered waits.
 func TestPackRoundPacksWhatIsOrdered(t *testing.T) {
 	ctx := context.Background()
 	root := filepath.Join(t.TempDir(), "volatile")
@@ -348,7 +348,6 @@ func TestPackRoundPacksWhatIsOrdered(t *testing.T) {
 	e := storesExecutor(t, fake, &logs)
 	e.storeWork().stores = []servedStore{
 		{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true},
-		{decl: machine.Store{ID: "w-scratch", Class: machine.StoreVolatile, Root: "/var/tmp/kairo"}, fs: wslStoreFS{}, usable: true},
 	}
 	if _, err := (localStoreFS{}).CreateKind(ctx, root, kindOutput, "exe_1"); err != nil {
 		t.Fatal(err)
@@ -364,7 +363,6 @@ func TestPackRoundPacksWhatIsOrdered(t *testing.T) {
 		{ObjectID: "obj_out", Kind: store.ObjectOutput, SourceID: "exe_1", StoreID: "c-scratch", Root: root},
 		{ObjectID: "obj_scr", Kind: store.ObjectScratch, SourceID: "att_1", StoreID: "c-scratch", Root: root},
 		{ObjectID: "obj_moved", Kind: store.ObjectOutput, SourceID: "exe_1", StoreID: "c-scratch", Root: root + "-elsewhere"},
-		{ObjectID: "obj_wsl", Kind: store.ObjectOutput, SourceID: "exe_2", StoreID: "w-scratch", Root: "/var/tmp/kairo"},
 	}
 	e.storeWork().packDue(ctx)
 	if len(fake.made) != 2 || fake.made[0].ObjectID != "obj_out" || fake.made[1].ObjectID != "obj_scr" {
@@ -377,14 +375,6 @@ func TestPackRoundPacksWhatIsOrdered(t *testing.T) {
 	}
 	if entries := unpack(t, scr.PackPath); len(entries) != 1 || entries["core"] != "dump" {
 		t.Fatalf("scratch packed: %v", entries)
-	}
-	if !strings.Contains(logs.String(), "directories of a store inside a WSL distro are not packed yet") {
-		t.Fatalf("WSL object not warned:\n%s", logs.String())
-	}
-	// warned once per object
-	e.storeWork().packDue(ctx)
-	if n := strings.Count(logs.String(), "not packed yet"); n != 1 {
-		t.Fatalf("warned %d times", n)
 	}
 }
 
