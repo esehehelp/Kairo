@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -50,6 +51,9 @@ func (f File) check() error {
 	return nil
 }
 
+// Identified reports whether f has its identity (each chunk's sha256).
+func (f File) Identified() bool { return f.ChunkBytes > 0 }
+
 // chunkSize is the size of chunk i of f.
 func (f File) chunkSize(i int) int64 {
 	if rest := f.Size - int64(i)*f.ChunkBytes; rest < f.ChunkBytes {
@@ -83,8 +87,16 @@ type Fetcher struct {
 	Problem func(f File, err error)
 }
 
-// Open reads f from chunk on.
+// Open reads f from chunk on. A file never read before (no chunk hashes:
+// Identified) is read from its start, its identity made as it is read; its
+// sha256 and size, when published, are checked at its end.
 func (x *Fetcher) Open(ctx context.Context, f File, chunk int) (io.ReadCloser, error) {
+	if !f.Identified() {
+		if f.Name == "" || chunk != 0 || f.SHA256 != "" && !hexSHA256.MatchString(f.SHA256) {
+			return nil, fmt.Errorf("file %q, not identified yet, is read from its start", f.Name)
+		}
+		return &identifyingReader{ctx: ctx, x: x, f: f, whole: sha256.New(), chunk: sha256.New()}, nil
+	}
 	if err := f.check(); err != nil {
 		return nil, err
 	}
@@ -191,6 +203,137 @@ func (c *checkedReader) closeBody() {
 
 func (c *checkedReader) Close() error {
 	c.closeBody()
+	return nil
+}
+
+// identifyingReader reads a file the first time, making its identity: the
+// sha256 of the whole and of each DefaultChunkBytes. Its bytes are not
+// checked as they are given (there is nothing yet to check them against),
+// only at the end against a published sha256 and size.
+type identifyingReader struct {
+	ctx      context.Context
+	x        *Fetcher
+	f        File
+	body     io.ReadCloser
+	offset   int64
+	whole    hash.Hash
+	chunk    hash.Hash
+	inChunk  int64
+	chunks   []string
+	identity *File
+}
+
+func (r *identifyingReader) Read(p []byte) (int, error) {
+	pause := r.x.Retry
+	if pause <= 0 {
+		pause = time.Second
+	}
+	maxPause := r.x.MaxRetry
+	if maxPause <= 0 {
+		maxPause = 5 * time.Minute
+	}
+	failed := false
+	for {
+		if r.identity != nil {
+			return 0, io.EOF
+		}
+		if r.body == nil {
+			body, err := r.x.Origin.ReadFrom(r.ctx, r.f, r.offset)
+			if err == nil {
+				r.body = body
+				if failed && r.x.Problem != nil {
+					r.x.Problem(r.f, nil)
+				}
+				failed = false
+				continue
+			}
+			failed = true
+			if r.x.Problem != nil {
+				r.x.Problem(r.f, err)
+			}
+			select {
+			case <-r.ctx.Done():
+				return 0, r.ctx.Err()
+			case <-time.After(pause):
+			}
+			if pause *= 2; pause > maxPause {
+				pause = maxPause
+			}
+			continue
+		}
+		n, err := r.body.Read(p)
+		r.take(p[:n])
+		if err == io.EOF {
+			return n, r.finish()
+		}
+		if err != nil {
+			r.body.Close()
+			r.body = nil
+			if n > 0 {
+				return n, nil
+			}
+			continue
+		}
+		return n, nil
+	}
+}
+
+// take hashes what was read.
+func (r *identifyingReader) take(b []byte) {
+	r.whole.Write(b)
+	r.offset += int64(len(b))
+	for len(b) > 0 {
+		room := DefaultChunkBytes - r.inChunk
+		part := b
+		if int64(len(part)) > room {
+			part = part[:room]
+		}
+		r.chunk.Write(part)
+		r.inChunk += int64(len(part))
+		b = b[len(part):]
+		if r.inChunk == DefaultChunkBytes {
+			r.chunks = append(r.chunks, hex.EncodeToString(r.chunk.Sum(nil)))
+			r.chunk.Reset()
+			r.inChunk = 0
+		}
+	}
+}
+
+// finish makes the identity once the file was read to its end, checked
+// against what was published of it.
+func (r *identifyingReader) finish() error {
+	if r.inChunk > 0 {
+		r.chunks = append(r.chunks, hex.EncodeToString(r.chunk.Sum(nil)))
+	}
+	f := r.f
+	sum := hex.EncodeToString(r.whole.Sum(nil))
+	switch {
+	case f.SHA256 != "" && f.SHA256 != sum:
+		return fmt.Errorf("%w: %s has sha256 %s, published as %s", ErrChanged, f.Name, sum, f.SHA256)
+	case f.Size > 0 && f.Size != r.offset:
+		return fmt.Errorf("%w: %s has %d bytes, published as %d", ErrChanged, f.Name, r.offset, f.Size)
+	}
+	f.Size, f.SHA256, f.ChunkBytes, f.Chunks = r.offset, sum, DefaultChunkBytes, r.chunks
+	if f.Chunks == nil {
+		f.Chunks = []string{}
+	}
+	r.identity = &f
+	return io.EOF
+}
+
+// Identity is the file's identity once it was read to its end.
+func (r *identifyingReader) Identity() (File, bool) {
+	if r.identity == nil {
+		return File{}, false
+	}
+	return *r.identity, true
+}
+
+func (r *identifyingReader) Close() error {
+	if r.body != nil {
+		r.body.Close()
+		r.body = nil
+	}
 	return nil
 }
 

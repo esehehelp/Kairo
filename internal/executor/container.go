@@ -99,6 +99,9 @@ type containerSpec struct {
 	Env      []string `json:"env"`
 	Writable []string `json:"writable"`
 	Tmp      string   `json:"tmp"`
+	// Streams the argv reads: a loader each, started before it in the
+	// container (startLoaders).
+	Streams []store.LaunchStream `json:"streams,omitempty"`
 }
 
 // containerMount is a node path mounted in the container.
@@ -209,6 +212,7 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		Writable: append(append([]string{containerRoot + "/run"}, writableLogs...), containerRoot+"/scratch", containerRoot+"/output"),
 		Tmp:      containerRoot + "/scratch/tmp",
 		Argv:     launch.Argv,
+		Streams:  launch.Streams,
 	}
 	paths := map[string]string{scratch: containerRoot + "/scratch", output: containerRoot + "/output"}
 	if cache != "" {

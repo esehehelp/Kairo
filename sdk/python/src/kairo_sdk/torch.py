@@ -15,6 +15,7 @@ from .runtime import (
     _stop_signal_context,
     normalize_suspend_result,
     stop_requested,
+    stream_positions,
     suspend_payload,
 )
 
@@ -196,7 +197,7 @@ class DistributedAdapter:
         self.session.last_control_error = None
         return "ok"
 
-    def safe_point(self, checkpoint, progress: dict[str, Any] | None = None) -> bool:
+    def safe_point(self, checkpoint, progress: dict[str, Any] | None = None, streams: Any = ()) -> bool:
         """Poll on rank 0 and suspend only after every rank checkpoints.
 
         Returns ``True`` only when the terminal acknowledgement reached Kairo,
@@ -261,12 +262,18 @@ class DistributedAdapter:
         except BaseException as exc:
             local_error = f"rank {rank} checkpoint failed: {type(exc).__name__}: {exc}"
 
-        errors_by_rank: list[Any] = [None] * (dist.get_world_size() if distributed else 1)
+        # each rank's failure, and where each of its streams stands
+        local = (local_error, stream_positions(tuple(streams)))
+        gathered: list[Any] = [None] * (dist.get_world_size() if distributed else 1)
         if distributed:
-            dist.all_gather_object(errors_by_rank, local_error)
+            dist.all_gather_object(gathered, local)
         else:
-            errors_by_rank[0] = local_error
-        failures = [error for error in errors_by_rank if error is not None]
+            gathered[0] = local
+        failures = [error for error, _ in gathered if error is not None]
+        positions: dict[str, list[dict[str, int]]] = {}
+        for _, by_name in gathered:
+            for name, ranks in by_name.items():
+                positions.setdefault(name, []).extend(ranks)
         if failures:
             reason = "; ".join(failures)
             if rank == 0:
@@ -289,7 +296,7 @@ class DistributedAdapter:
                 self._try_ack(context.command_id, "rejected", {"reason": "no continuation_ref"})
                 outcome["no_continuation"] = True
             else:
-                payload = suspend_payload(result)
+                payload = suspend_payload(result, positions)
                 status = self._try_ack(context.command_id, "checkpointed", payload)
                 outcome["ok"] = status == "ok"
                 outcome["continuation_ref"] = result.continuation_ref

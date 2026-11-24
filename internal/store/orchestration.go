@@ -618,6 +618,11 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 		Regenerable:          template.Regenerable,
 		NotBefore:            string(template.NotBefore),
 		FinishBy:             string(template.FinishBy),
+		Streams:              template.StreamDecls,
+	}
+	// what each stream's loader holds is the task's too
+	for _, s := range template.StreamDecls {
+		spec.Capacity.RAMBytes += s.Stream.MemoryBytes
 	}
 	// A continuation goes on from where its run was suspended: it started
 	// long ago, so a start_by says nothing of it.

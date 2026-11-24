@@ -31,8 +31,10 @@ type sourceStream struct {
 	fetch   *Fetcher
 	shuffle bool
 	seed    uint64
-	// learned hears a file's record count once it was read to its end.
-	learned func(source int, sha256 string, records int64)
+	// learned hears a file's record count once it was read to its end;
+	// identified a file's identity once it was read the first time.
+	learned    func(source int, sha256 string, records int64)
+	identified func(source int, f File)
 
 	epoch   int64
 	order   []int
@@ -44,7 +46,7 @@ type sourceStream struct {
 	read    int64 // records given since the source's first
 }
 
-func newSourceStream(spec SourceSpec, index int, fetch *Fetcher, shuffle bool, seed uint64, learned func(int, string, int64)) (*sourceStream, error) {
+func newSourceStream(spec SourceSpec, index int, fetch *Fetcher, shuffle bool, seed uint64, learned func(int, string, int64), identified func(int, File)) (*sourceStream, error) {
 	f, err := parseFormat(spec.Format, spec.Field)
 	if err != nil {
 		return nil, fmt.Errorf("source %s: %w", spec.Name, err)
@@ -53,11 +55,15 @@ func newSourceStream(spec SourceSpec, index int, fetch *Fetcher, shuffle bool, s
 		return nil, fmt.Errorf("source %s has no files", spec.Name)
 	}
 	for _, file := range spec.Files {
+		if !file.Identified() {
+			continue // identified the first time it is read
+		}
 		if err := file.check(); err != nil {
 			return nil, fmt.Errorf("source %s: %w", spec.Name, err)
 		}
 	}
-	return &sourceStream{spec: spec, index: index, format: f, fetch: fetch, shuffle: shuffle, seed: seed, learned: learned}, nil
+	spec.Files = append([]File(nil), spec.Files...)
+	return &sourceStream{spec: spec, index: index, format: f, fetch: fetch, shuffle: shuffle, seed: seed, learned: learned, identified: identified}, nil
 }
 
 // orderOf is the order of the files in epoch e.
@@ -162,6 +168,14 @@ func (s *sourceStream) seek(ctx context.Context, n int64) error {
 
 // endFile: the file being read gave its last record.
 func (s *sourceStream) endFile() {
+	if r, ok := s.body.(interface{ Identity() (File, bool) }); ok {
+		if f, done := r.Identity(); done {
+			s.spec.Files[s.order[s.file]] = f
+			if s.identified != nil {
+				s.identified(s.index, f)
+			}
+		}
+	}
 	f := s.spec.Files[s.order[s.file]]
 	if _, ok := s.count(s.order[s.file]); !ok && s.learned != nil {
 		s.learned(s.index, f.SHA256, s.inFile)

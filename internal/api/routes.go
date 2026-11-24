@@ -72,6 +72,7 @@ func (s *Server) routes() []route {
 
 		{"POST", "/api/worker/heartbeat", roleWorker, s.workerHeartbeat},
 		{"POST", "/api/worker/processes", roleWorker, s.workerProcess},
+		{"POST", "/api/worker/streams", roleWorker, s.workerStreams},
 		{"GET", "/api/worker/commands", roleWorker, s.workerPoll},
 		{"POST", "/api/worker/commands/{command}/acks", roleWorker, s.workerAck},
 		{"GET", "/api/worker/bench", roleWorker, s.workerBenchStatus},

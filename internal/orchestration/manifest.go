@@ -41,7 +41,17 @@ type Manifest struct {
 	// execution's image), pinned to a digest at apply. Absent from the JSON
 	// when none, so existing digests do not change.
 	Images map[string]Image `toml:"images" json:"images,omitempty"`
-	Tasks  []Task           `toml:"tasks" json:"tasks"`
+	// Raws and Streams are [raws.NAME] and [streams.NAME]: raw data and the
+	// streams of its records tasks read (streams.go, issue #43). Absent from
+	// the JSON when none.
+	Raws    map[string]Raw    `toml:"raws" json:"raws,omitempty"`
+	Streams map[string]Stream `toml:"streams" json:"streams,omitempty"`
+	Tasks   []Task            `toml:"tasks" json:"tasks"`
+	// RawFiles are the files of each Hugging Face raw as the apply that
+	// sends them listed them at its commit (kairo project apply lists them;
+	// not written in the file; in each task reading them, StreamDecls, and so
+	// in its digest: the same for good, a commit's files never change).
+	RawFiles map[string][]RawFile `toml:"-" json:"raw_files,omitempty"`
 	// Snapshots are the code snapshot each source was made into by the
 	// apply that sends them (kairo project apply makes them; not written in
 	// the file, not part of the digest).
@@ -145,6 +155,13 @@ type Execution struct {
 	// declared, on an executor that runs containers (executor/container.go).
 	// Absent from the JSON when empty.
 	Image string `toml:"image" json:"image,omitempty"`
+	// Streams names the project's [streams.NAME] the task reads: each
+	// attempt gets KAIRO_STREAM_<NAME>, where a loader in its container hands
+	// it its records (streams.go). StreamDecls are those streams as declared,
+	// with their raws' files (made by Normalize, part of the task's digest).
+	// Absent from the JSON when empty.
+	Streams     []string     `toml:"streams" json:"streams,omitempty"`
+	StreamDecls []StreamDecl `toml:"-" json:"stream_decls,omitempty"`
 	// ContinueAfterLoss: when an attempt of the task is lost (its node lost
 	// power, its agent went away) the task goes on from its latest published
 	// checkpoint, on the node that published it, once nothing of the lost
@@ -248,19 +265,30 @@ func (v Validated) ExternalDependencies() []string {
 // normalized spec, its digest and every Task digest are the same as for the
 // file written out in full; the daemon never sees [defaults].
 func Parse(source []byte) (Validated, error) {
-	expanded, err := expandDefaults(source)
+	manifest, err := Decode(source)
 	if err != nil {
 		return Validated{}, err
+	}
+	return Normalize(manifest)
+}
+
+// Decode reads a ProjectSpec TOML file ([defaults] expanded) without
+// validating it: what an apply adds to it (a Hugging Face raw's listing)
+// goes in before Normalize.
+func Decode(source []byte) (Manifest, error) {
+	expanded, err := expandDefaults(source)
+	if err != nil {
+		return Manifest{}, err
 	}
 	var manifest Manifest
 	metadata, err := toml.Decode(expanded, &manifest)
 	if err != nil {
-		return Validated{}, fmt.Errorf("parse TOML: %w", err)
+		return Manifest{}, fmt.Errorf("parse TOML: %w", err)
 	}
 	if undecoded := metadata.Undecoded(); len(undecoded) != 0 {
-		return Validated{}, fmt.Errorf("unknown project declaration field %q", undecoded[0].String())
+		return Manifest{}, fmt.Errorf("unknown project declaration field %q", undecoded[0].String())
 	}
-	return Normalize(manifest)
+	return manifest, nil
 }
 
 func Normalize(manifest Manifest) (Validated, error) {
@@ -409,6 +437,9 @@ func Normalize(manifest Manifest) (Validated, error) {
 	if err := validateAcyclic(manifest.Tasks); err != nil {
 		return Validated{}, err
 	}
+	if err := normalizeStreams(&manifest); err != nil {
+		return Validated{}, err
+	}
 	sort.Slice(manifest.Tasks, func(i, j int) bool { return manifest.Tasks[i].Name < manifest.Tasks[j].Name })
 
 	taskDigests := make(map[string]string, len(manifest.Tasks))
@@ -422,10 +453,10 @@ func Normalize(manifest Manifest) (Validated, error) {
 	// The snapshots and image pins an apply sends are not the declaration:
 	// the same file applied again with other code, or once a tag names
 	// another image, has the same digest.
-	snapshots, pins := manifest.Snapshots, manifest.ImagePins
-	manifest.Snapshots, manifest.ImagePins = nil, nil
+	snapshots, pins, rawFiles := manifest.Snapshots, manifest.ImagePins, manifest.RawFiles
+	manifest.Snapshots, manifest.ImagePins, manifest.RawFiles = nil, nil, nil
 	normalized, err := json.Marshal(manifest)
-	manifest.Snapshots, manifest.ImagePins = snapshots, pins
+	manifest.Snapshots, manifest.ImagePins, manifest.RawFiles = snapshots, pins, rawFiles
 	if err != nil {
 		return Validated{}, err
 	}

@@ -138,3 +138,15 @@ def test_open_takes_the_address_and_rank_from_the_environment(monkeypatch: pytes
             streams.open("mix-v9")
     finally:
         loader.close()
+
+
+def test_a_checkpoint_carries_where_each_stream_stands() -> None:
+    from kairo_sdk.runtime import SuspendResult, suspend_payload
+
+    class Taken:
+        name = "mix"
+        position = {"rank": 0, "record": 7, "sub": 1}
+
+    payload = suspend_payload(SuspendResult("ckpt", {"step": 3}), [Taken()])
+    assert payload == {"step": 3, "continuation_ref": "ckpt", "streams": {"mix": [{"rank": 0, "record": 7, "sub": 1}]}}
+    assert "streams" not in suspend_payload(SuspendResult("ckpt"))

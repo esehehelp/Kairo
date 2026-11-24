@@ -54,7 +54,7 @@ type inputs struct {
 	ended   bool
 }
 
-func newInputs(spec Spec, fetch *Fetcher, learned func(int, string, int64)) (*inputs, error) {
+func newInputs(spec Spec, fetch *Fetcher, learned func(int, string, int64), identified func(int, File)) (*inputs, error) {
 	weights := make([]int, len(spec.Sources))
 	in := &inputs{epochs: spec.Epochs}
 	for i, src := range spec.Sources {
@@ -62,7 +62,7 @@ func newInputs(spec Spec, fetch *Fetcher, learned func(int, string, int64)) (*in
 		if weights[i] == 0 && len(spec.Sources) == 1 {
 			weights[i] = 1
 		}
-		s, err := newSourceStream(src, i, fetch, spec.ShuffleFiles, spec.Seed, learned)
+		s, err := newSourceStream(src, i, fetch, spec.ShuffleFiles, spec.Seed, learned, identified)
 		if err != nil {
 			in.Close()
 			return nil, err

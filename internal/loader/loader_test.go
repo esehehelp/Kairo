@@ -513,3 +513,78 @@ var goldenPermutation = []int{8, 3, 6, 5, 4, 0, 9, 2, 1, 7}
 
 func bufioReader(r io.Reader) *bufio.Reader { return bufio.NewReaderSize(r, 1<<16) }
 func bufioWriter(w io.Writer) *bufio.Writer { return bufio.NewWriterSize(w, 1<<16) }
+
+// A file never read before is read from its start, its identity made as
+// it is read (the same as Identify makes) and heard once it was read to its
+// end; one whose published sha256 is not what was read fails at its end.
+func TestAFileIsIdentifiedTheFirstTimeItIsRead(t *testing.T) {
+	spec, dir := testData(t)
+	want := map[string]File{}
+	for s := range spec.Sources {
+		for i, f := range spec.Sources[s].Files {
+			id, _ := Identify(bytes.NewReader(mustRead(t, filepath.Join(dir, filepath.FromSlash(f.Name)))), f.Name, DefaultChunkBytes)
+			want[f.Name] = id
+			spec.Sources[s].Files[i] = File{Name: f.Name}
+		}
+	}
+	full := collect(t, spec, dir, 1, nil)
+	var mu sync.Mutex
+	got := map[string]File{}
+	l := &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}, Identified: func(_ int, f File) {
+		mu.Lock()
+		got[f.Name] = f
+		mu.Unlock()
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	go (&Server{Loader: l, World: 1}).Serve(ctx, ln)
+	c, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var items []string
+	for {
+		item, err := c.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, fmt.Sprintf("%d.%d:%s", c.Position.Record, c.Position.Sub, item))
+	}
+	c.Close()
+	if !reflect.DeepEqual(items, full[0]) {
+		t.Fatal("read unidentified, another order")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != len(want) {
+		t.Fatalf("identified %d of %d files", len(got), len(want))
+	}
+	for name, w := range want {
+		if g := got[name]; g.SHA256 != w.SHA256 || g.Size != w.Size || !reflect.DeepEqual(g.Chunks, w.Chunks) {
+			t.Fatalf("%s identified as %+v, want %+v", name, g, w)
+		}
+	}
+	// a published sha256 that is not what is there
+	x := &Fetcher{Origin: DirOrigin{dir}}
+	r, err := x.Open(context.Background(), File{Name: "b-0.txt", SHA256: strings.Repeat("0", 64)}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := io.ReadAll(r); !errors.Is(err, ErrChanged) {
+		t.Fatalf("a published sha256 not matching: %v", err)
+	}
+}
+
+func mustRead(t *testing.T, p string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}

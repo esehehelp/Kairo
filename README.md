@@ -462,7 +462,7 @@ key_file = "/etc/kairo/pack-key.pem"
 | `POST` | `/api/hardware/{host}/{device}/bench` | `admin` |
 | `GET` | `/api/hardware/{host}/profile`（`?device=`） | `read` |
 | `POST` | `/api/agent/{operation}`, `/api/agent/logs` | `node` |
-| `POST` | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
+| `POST` | `/api/worker/heartbeat`, `/api/worker/processes`, `/api/worker/streams` | worker |
 | `GET` | `/api/worker/commands` | worker |
 | `POST` | `/api/worker/commands/{command}/acks` | worker |
 | `GET` | `/api/worker/bench`, `/api/worker/bench/cpu-energy` | worker（ベンチマークの Attempt） |
@@ -1732,7 +1732,38 @@ Gang 実行の動作ルールは以下のとおりです。
 
 データセットは、できるだけネットワークとメモリの中だけで扱います（issue #43）。Corpus/Mix は作り置きせず、学習しながら raw データから作って流します（[データの手放し](#データの手放しdrop)）。Loader はそのための仕組みで、raw データを取り寄せて sha256 で確かめ、決まった順番のレコード列にして、学習プロセス（の各 rank）にソケットで渡します。どこまで渡したか（位置）を指定すれば、そのちょうど次のレコードから同じ順番で続きます。
 
-いまできるのは Loader 単体（`kairo loader`、パッケージ `internal/loader`、Python SDK の `kairo_sdk.streams`）です。`[raws]`・`[streams]` の宣言、agent の raw プロキシ（ノードのメモリでのキャッシュと LAN での共有）、checkpoint への位置の記録、状態表示は、これから Kairo に組み込みます（#43 の P1）。
+Task は宣言した stream を読みます（コンテナで動く Task のみ。gang は未対応）。agent の raw プロキシ（ノードのメモリでのキャッシュと LAN での共有）、ホストの Executor（Windows を含む）、状態表示は、これから組み込みます（#43）。
+
+### 宣言（`[raws]`・`[streams]`）
+
+```toml
+[raws.wiki]
+urls = ["https://dumps.example.org/jawiki/20261101/jawiki-pages.xml.bz2"]   # 1 URL が 1 ファイル（名前は URL の最後の要素）
+
+[raws.web]
+hf = { repo = "owner/name", revision = "<40 桁のコミット>", files = ["data/*.parquet"], type = "dataset" }
+
+[streams.mix]
+sources = [ { raw = "wiki", weight = 3, format = "text.bz2" }, { raw = "web", format = "jsonl", field = "text" } ]
+shuffle = { seed = 7, block = 65536, files = true }
+stages  = [ { argv = ["bin/normalize"], workers = 8 } ]
+epochs  = 1                 # 最初の source の周回数（既定 1、0 で終わりなし）
+memory_bytes = 4294967296   # Loader が持つ分。Task の RAM に足される
+
+[tasks.execution]
+image = "py"
+streams = ["mix"]           # → KAIRO_STREAM_MIX
+```
+
+- **Hugging Face**: `revision` はコミット（40 桁の 16 進）に限ります。同じファイルの組を、いつまでも同じに指すためです。`kairo project apply` が、そのコミットのファイル一覧（パスが `files` のどれかに一致するもの。各 LFS ファイルのサイズと sha256 も）を取り、宣言に添えて送ります（環境変数 `HF_TOKEN` があれば使います）。
+- **Task への固定**: Task には、読む stream の宣言と、その raw のファイル一覧（解決済み）が入り、Task の digest の一部になります。stream を変えるなら、Task も新しい名前で宣言し直します。
+- **検証**: 宣言にない raw・stream、コミットでない revision、未知の形式、`field` のついた jsonl 以外、image のない Task は拒否されます。
+
+### 起動、識別、位置
+
+- **起動**: Attempt のコンテナの中で、本体より先に stream ごとに `kairo loader serve` が起動します。spec と位置は `/kairo/run/streams/<名前>/`、ソケットは同じ場所の `socket` です。ソケットができてから本体が `KAIRO_STREAM_<NAME>=unix:...` 付きで起動し、本体が終わると Loader（とその stage）も終わります。stage は Task の image とソースで、Task の `cwd` から動きます。Loader のログは Attempt の stderr に出ます。
+- **識別**: 最初に読まれたファイルは、読みながらチャンクごとの sha256 が作られ、最後まで読むと公開済みの sha256 とサイズ（Hugging Face の LFS ファイルなど）と照合されます。この識別情報と、分かったレコード数を、Loader が Attempt としてデーモンに送ります（`POST /api/worker/streams`、テーブル `raw_identities`・`raw_records`）。URL ごとに最初の識別情報が残り、別の識別情報が送られたら `raw data changed` です。以後の起動では、どのチャンクもこれと照合されます。
+- **位置と checkpoint**: SDK の `safe_point(..., streams=[train])`（torch の `DistributedAdapter.safe_point(..., streams=[train])` は全 rank の位置を集めます）は、checkpoint を公開するとき、各 stream の各 rank の位置を `checkpointed` の payload に `"streams": {NAME: [位置...]}` として入れます。その checkpoint から続く Attempt（continuation）の Loader は、その位置から始めます。
 
 ### 順番
 

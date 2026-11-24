@@ -46,6 +46,9 @@ type Loader struct {
 	// Learned hears a file's record count once a source read it to its end
 	// (for Kairo to keep: a later start mid-way passes the file over).
 	Learned func(source int, sha256 string, records int64)
+	// Identified hears a file's identity once a source read it the first
+	// time (for Kairo to keep: later reads are checked against it).
+	Identified func(source int, f File)
 
 	mu        sync.Mutex
 	world     int
@@ -162,7 +165,7 @@ func (l *Loader) produce(ctx context.Context, gen *generation, positions []Posit
 			start = g
 		}
 	}
-	in, err := newInputs(l.Spec, l.Fetch, l.Learned)
+	in, err := newInputs(l.Spec, l.Fetch, l.Learned, l.Identified)
 	if err != nil {
 		return err
 	}
