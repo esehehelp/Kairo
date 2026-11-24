@@ -1,11 +1,17 @@
 # Kairo's CI as Kairo tasks: the checks of one commit (@SHA@, filled in by ci/kairo-ci.sh), each a Task of project
-# kairo-ci that unpacks the commit's tree (copied to each node by ci/kairo-ci.sh) into its scratch (KAIRO_SCRATCH), runs
-# the check from that tree with the build caches in the project's cache directory (KAIRO_CACHE_DIR), and removes the
-# tree. Attempts are confined (README: Confinement): those are the only places they may write, and on Windows they run
-# at Low integrity, where Git Bash does not start, so the Windows checks run ci/check.ps1 in PowerShell. Priority -500:
-# CI waits for everyone's work and preempts nothing (the lowest serving is -100). The Linux checks run on the Linux CI
-# node (@CI_LINUX_NODE@, of site @CI_LINUX_SITE@: site.env), which has the test PostgreSQL and /srv/kairo-ci, and
-# reserve 3 GiB each, so on a 4 GiB node the planner runs them one at a time; the Windows checks run beside each other.
+# kairo-ci that runs the check from the commit's tree with the build caches in the project's cache directory
+# (KAIRO_CACHE_DIR). Attempts are confined (README: Confinement): those are the only places they may write.
+#
+# The Linux checks run in a container of the golang image (pinned at apply) on the Linux CI node (@CI_LINUX_NODE@, of
+# site @CI_LINUX_SITE@: site.env; a Proxmox host's pct executor: one container per check, destroyed after it), from the
+# commit's tree as a code snapshot (source kairo, at /kairo/src) copied into the scratch. They start their own test
+# PostgreSQL 17 (ci/check.sh start-pg); the unprivileged checks run as nobody. Nothing of a check outlives it but its
+# logs and the caches.
+#
+# The Windows checks unpack the commit's tree (copied by ci/kairo-ci.sh) into their scratch; on Windows attempts run at
+# Low integrity, where Git Bash does not start, so they run ci/check.ps1 in PowerShell.
+#
+# Priority -500: CI waits for everyone's work and preempts nothing (the lowest serving is -100).
 schema_version = 1
 
 [project]
@@ -14,6 +20,13 @@ name = "kairo-ci"
 [defaults]
 queue = "ci"
 policy = "RunToCompletion@v1"
+
+[images.go]
+ref = "golang:1.26-bookworm"
+
+[sources.kairo]
+root = "@TREE@"
+paths = [@PATHS@]
 
 [defaults.execution]
 schema_version = 2
@@ -24,8 +37,10 @@ preemptible = false
 [[tasks]]
 name = "@SHA@-linux"
 [tasks.execution]
-argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; trap 'rm -rf \"$d\" \"$t\"' EXIT; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; chmod 755 \"$KAIRO_SCRATCH\" \"$c\"; chown -R ci:ci \"$d\" \"$t\"; chown ci:ci \"$c/ci-build\" \"$c/ci-mod\"; cd \"$d\"; setpriv --reuid=ci --regid=ci --init-groups env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux"]
-cwd = "/srv/kairo-ci"
+image = "go"
+source = "kairo"
+cwd = "."
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; cp -a /kairo/src/. \"$d\"; chown -R 65534:65534 \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; cd \"$d\"; bash ci/check.sh start-pg; setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux"]
 [tasks.execution.executor]
 labels = { site = "@CI_LINUX_SITE@" }
 node = "@CI_LINUX_NODE@"
@@ -37,8 +52,10 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-linux-race"
 [tasks.execution]
-argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; trap 'rm -rf \"$d\" \"$t\"' EXIT; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; chmod 755 \"$KAIRO_SCRATCH\" \"$c\"; chown -R ci:ci \"$d\" \"$t\"; chown ci:ci \"$c/ci-build\" \"$c/ci-mod\"; cd \"$d\"; setpriv --reuid=ci --regid=ci --init-groups env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux-race"]
-cwd = "/srv/kairo-ci"
+image = "go"
+source = "kairo"
+cwd = "."
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; cp -a /kairo/src/. \"$d\"; chown -R 65534:65534 \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; cd \"$d\"; bash ci/check.sh start-pg; setpriv --reuid=65534 --regid=65534 --clear-groups env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux-race"]
 [tasks.execution.executor]
 labels = { site = "@CI_LINUX_SITE@" }
 node = "@CI_LINUX_NODE@"
@@ -50,8 +67,10 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-linux-root"
 [tasks.execution]
-argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; c=$KAIRO_CACHE_DIR; trap 'rm -rf \"$d\"' EXIT; mkdir -p \"$d\"; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; GOCACHE=\"$c/root-build\" GOMODCACHE=\"$c/root-mod\" bash ci/check.sh linux-root"]
-cwd = "/srv/kairo-ci"
+image = "go"
+source = "kairo"
+cwd = "."
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; c=$KAIRO_CACHE_DIR; mkdir -p \"$d\"; cp -a /kairo/src/. \"$d\"; cd \"$d\"; GOCACHE=\"$c/root-build\" GOMODCACHE=\"$c/root-mod\" bash ci/check.sh linux-root"]
 [tasks.execution.executor]
 labels = { site = "@CI_LINUX_SITE@" }
 node = "@CI_LINUX_NODE@"

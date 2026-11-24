@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Run Kairo's CI for one commit as Kairo tasks (project kairo-ci, ci/tasks.toml.in) on this installation's own nodes:
 #   bash ci/kairo-ci.sh [REV] [--wait]
-# The commit's tree is copied as a tar to each node the checks run on (where, from site.env: ops/site.sh), the tasks are
+# The commit's tree goes to the Linux checks as a code snapshot (made from the commit, not the working copy) and to the
+# Windows checks as a tar copied to where they unpack it (from site.env: ops/site.sh); the tasks are
 # declared with kairo project apply, and with --wait the script waits for them and prints their states (exit 0 only
 # when every check succeeded). A commit already declared is not declared again (the tasks are immutable); kairo task
 # rerun kairo-ci ci <sha>-<check> runs one again.
@@ -18,7 +19,7 @@ for arg in "$@"; do
 done
 # The site's settings (site.env) and the script's files are this operator machine's, outside the checkout (ops/site.sh).
 # CI_WINDOWS_ROOT: where the Windows checks unpack (a POSIX path, /c/...); CI_LINUX_NODE and CI_LINUX_SITE: the Linux
-# CI node and its site label; CI_LINUX_HOST: the Proxmox host of that node (root@...); CI_LINUX_VMID: its container.
+# CI node (one with a container executor: the checks run in the golang image) and its site label.
 . ops/site.sh
 sha=$(git rev-parse --short=12 "$rev^{commit}")
 work=$kairo_state/ci
@@ -31,13 +32,17 @@ echo "kairo-ci $sha: $(git log -1 --format=%s "$sha")"
 # the Windows checks read it here
 mkdir -p "$CI_WINDOWS_ROOT/src" "$CI_WINDOWS_ROOT/run" "$CI_WINDOWS_ROOT/cache"
 cp "$tar" "$CI_WINDOWS_ROOT/src/$sha.tar"
-# the Linux CI node reads it at /srv/kairo-ci/src
-scp -q -o BatchMode=yes "$tar" "$CI_LINUX_HOST:/tmp/kairo-ci-$sha.tar"
-ssh -o BatchMode=yes "$CI_LINUX_HOST" "pct push $CI_LINUX_VMID /tmp/kairo-ci-$sha.tar /srv/kairo-ci/src/$sha.tar --perms 644 && rm /tmp/kairo-ci-$sha.tar"
+# the Linux checks' code snapshot: the commit's tree, unpacked here for kairo project apply to pack
+tree=$work/tree/$sha
+rm -rf "$tree"
+mkdir -p "$tree"
+tar -xf "$tar" -C "$tree"
+paths=$(git ls-tree --name-only "$sha" | sed 's/.*/"&"/' | paste -sd, -)
 
 manifest=$work/kairo-ci-$sha.toml
-sed -e "s/@SHA@/$sha/g" -e "s|@CI_LINUX_NODE@|$CI_LINUX_NODE|g" -e "s|@CI_LINUX_SITE@|$CI_LINUX_SITE|g" -e "s|@CI_WINDOWS_ROOT@|$CI_WINDOWS_ROOT|g" -e "s|@CI_WINDOWS_DIR@|$(cygpath -m "$CI_WINDOWS_ROOT")|g" ci/tasks.toml.in > "$manifest"
+sed -e "s/@SHA@/$sha/g" -e "s|@CI_LINUX_NODE@|$CI_LINUX_NODE|g" -e "s|@CI_LINUX_SITE@|$CI_LINUX_SITE|g" -e "s|@TREE@|tree/$sha|g" -e "s|@PATHS@|$paths|g" -e "s|@CI_WINDOWS_ROOT@|$CI_WINDOWS_ROOT|g" -e "s|@CI_WINDOWS_DIR@|$(cygpath -m "$CI_WINDOWS_ROOT")|g" ci/tasks.toml.in > "$manifest"
 kairo project apply "$manifest"
+rm -rf "$tree"
 if [ -z "$wait" ]; then
   echo "declared; follow with: kairo task list kairo-ci | grep $sha"
   exit 0
