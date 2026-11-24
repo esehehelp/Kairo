@@ -51,6 +51,7 @@ Task は永続的な論理オブジェクトであり、一連のイミュータ
   - [ノードフェンス](#ノードフェンス)
   - [強制停止](#強制停止)
   - [Gang 実行](#gang-実行)
+- [Loader（ストリーム）](#loaderストリーム)
 - [Worker SDK](#worker-sdk)
   - [管理対象 Attempt に渡される環境変数と Gang 連携](#管理対象-attempt-に渡される環境変数と-gang-連携)
   - [セーフポイントの挙動と Python・Rust SDK](#セーフポイントの挙動と-pythonrust-sdk)
@@ -91,6 +92,7 @@ Task は永続的な論理オブジェクトであり、一連のイミュータ
 | `planning` | 環境全体に対する 1 回のパスでの処理: 配置、バックフィル、プリエンプション、実行時間の推定、アドミッション計上 | `store`（`planner`, `preemption`, `estimate`） | [アドミッション制御とプランニング](#アドミッション制御とプランニング), [実行時間の推定](#実行時間の推定) |
 | `execution` | Executor のバックエンドを通じた起動（ホスト上または Incus コンテナ内: `executor/backend.go`）、shim と引き継ぎ（adoption）、コンファインメント（Confinement）、強制停止、静止（quiescence）、使用量計測、観測 | `executor`, `processidentity`, `provider`, `agentclient` | [エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ), [コンテナ実行](#コンテナ実行), [強制停止](#強制停止) |
 | `data` | ストア（store）、`scratch`・`output`・`cache` ディレクトリ、データオブジェクト・pack・コピー・レプリカ、インポート・Run スナップショット・チェックポイント・時系列データ、フェッチ・エビクション・リードバック（read-back）・インベントリ | `store`（`packs`, `copies`, `replicas`, `deletions`, `imports`, `inputs`, `placements`, `evictions`, `temporal`, `regenerate`, `transfer`, `runsnapshots`, `checkpoints`, `inventory_durable`, `scrub`, `shed`, `control_snapshot`）, `executor`（ストアワーカー `storeworker.go`: `datastore`, `pack`, `transfer`, `fetch`, `retire`, `evict`, `inventory`, `storefs`）, `machine`, `datainput` | [データストア](#データストア), [自己バックアップ](#自己バックアップ) |
+| `loader` | ストリーム: raw データの取得と照合、決まった順番（混合・シャッフル・rank への分割）、stage、ソケットでの受け渡し、位置 | `loader` | [Loader（ストリーム）](#loaderストリーム) |
 | `provenance` | コードスナップショット、ダイジェスト指定のコンテナイメージ | `sourcesnap`, `imageref`, `store/provenance` | [コードスナップショット](#コードスナップショット), [コンテナ実行](#コンテナ実行) |
 | `hardware` | マシン宣言、デバイス設定、動作点ポリシー、ベンチマーク、電力と消費電力量 | `machine`, `devicecontrol`, `hwpolicy`, `hwbench`, `bench`, `cpupower`, `store`（`device`, `device_policy`, `device_samples`, `hardware_bench`, `hardware_history`, `hosts`） | [マシン宣言](#マシン宣言), [ハードウェア設定](#ハードウェア設定), [ハードウェアベンチマーク](#ハードウェアベンチマーク), [電力と消費電力量](#電力と消費電力量) |
 | `access` | HTTP API とエージェント操作、トークン、TLS、プライベートファイル | `api`, `agentops`, `tlsutil`, `secfile`, `store`（`tokens`） | [認証と TLS](#認証と-tls), [HTTP API](#http-api) |
@@ -1725,6 +1727,48 @@ Gang 実行の動作ルールは以下のとおりです。
 - **環境変数の注入**: 各 rank の起動時には、`RANK`、`WORLD_SIZE`、`MASTER_ADDR`（rank 0 の `interconnect_addr`）、`MASTER_PORT`（rank 0 のノード上で空いている `29500`〜`29999` のポート）、および `KAIRO_GANG_*` が設定されます。さらに、`interconnect_ifname` ラベルを持つ Executor では `NCCL_SOCKET_IFNAME` と `GLOO_SOCKET_IFNAME` も設定されます。
 - **運命共同体（One fate）**: いずれかの rank が終了コード `0` またはチェックポイント以外の理由で停止した場合、他のすべての rank も終了させられます。いずれか 1 つの rank に送られた `suspend`（pause、プリエンプション、隔離によるもの）は全 rank へ送信されます。また、他の rank が起動した後に一部の rank の起動が失敗した場合は、Gang 全体が再起動されます（オーケストレーション理由 `gang_restart`）。
 - **プリエンプション**: 待機中の Gang は単一の Execution と同様にプリエンプションを行います（各 rank が自身の配置先ノード上で実行。[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）。また、実行中の rank が他のジョブによってプリエンプションされることもあります。
+
+## Loader（ストリーム）
+
+データセットは、できるだけネットワークとメモリの中だけで扱います（issue #43）。Corpus/Mix は作り置きせず、学習しながら raw データから作って流します（[データの手放し](#データの手放しdrop)）。Loader はそのための仕組みで、raw データを取り寄せて sha256 で確かめ、決まった順番のレコード列にして、学習プロセス（の各 rank）にソケットで渡します。どこまで渡したか（位置）を指定すれば、そのちょうど次のレコードから同じ順番で続きます。
+
+いまできるのは Loader 単体（`kairo loader`、パッケージ `internal/loader`、Python SDK の `kairo_sdk.streams`）です。`[raws]`・`[streams]` の宣言、agent の raw プロキシ（ノードのメモリでのキャッシュと LAN での共有）、checkpoint への位置の記録、状態表示は、これから Kairo に組み込みます（#43 の P1）。
+
+### 順番
+
+stream（`loader.Spec`、JSON）は、source（raw データとその重み・形式・ファイル）、seed、`block`、`shuffle_files`、`epochs`、`stages` から成ります。順番は次の手順で決まり、同じ宣言からはいつでも同じ列になります（並べ替えの乱数は `internal/loader` 自身の splitmix64 と Fisher–Yates で、Go の版に左右されません）。
+
+1. **ファイル**: source ごとに宣言順です。`shuffle_files` なら epoch ごとに (seed, source, epoch) で並べ替えます。
+2. **レコード**: 形式の区切りで切り出します。`text`（行。末尾の `\r` も除く）、`jsonl`（行。`field` を指定するとその文字列フィールド。ない行はエラー）、`lenbin`（4 バイトのリトルエンディアンの長さとバイト列）、`file`（ファイル全体で 1 件）です。圧縮は形式の接尾辞（`jsonl.zst`）か、ファイル名の拡張子（`.zst`・`.gz`・`.bz2`）で判断します。
+3. **混合**: source の列を重み（`weight`、合計 65536 まで）の滑らかな重み付きラウンドロビンで交互に並べます。乱数は使わず、重みの合計ごとに同じ並びを繰り返すため、どの位置でも各 source の何件目かが計算で分かります。source ごとに epoch を数え、尽きたら次の epoch に進みます。最初の source が `epochs` 回りきったところで stream は終わります（0 なら終わりません）。
+4. **ブロックシャッフル**: `block` 件ずつ (seed, ブロック番号) で並べ替えます。メモリはブロック 1 つ分で済み、どの位置からでも正確に再開できます。
+5. **rank への分割**: 並べた列の g 番目は rank `g mod W` の `g / W` 番目のレコードです。
+6. **stage**: プロジェクトのプロセスです。stdin で長さ付きのレコードを受け取り、レコードごとに 0 件以上の出力（長さ付き）と終わりの印 `ff ff ff ff` を stdout に書きます。`workers` 本を並列に動かし、出力は入力の順に戻します。同じ入力には同じ出力を返すことが条件で、落ちた stage は起動し直して、答えていなかったレコードから渡し直します（続けて 3 回落ちたら stream のエラー）。
+
+位置は rank ごとの `{rank, record, sub}`（その rank のレコードを `record` 件取り終え、次のレコードの出力を `sub` 件取った）です。再開では、W は変えられません。
+
+### 取得と照合
+
+各ファイルは、サイズ、sha256、チャンク（既定 4 MiB）ごとの sha256 で識別します（`kairo loader identify PATH|URL...` がこの一覧を JSON で出します）。どのチャンクも照合してから使います。取得元の失敗は 1 秒から 5 分まで間隔を延ばしながら取り直し、その間、受け取り側は待ちます。照合に合わないチャンクはもう一度取り、2 度合わなければ `raw data changed` で stream を止めます。ファイルを最後まで読むとレコード数が分かり、それがあれば途中から始めるときにそのファイルを読まずに飛ばせます。
+
+### 受け渡し
+
+`kairo loader serve --spec SPEC.json --listen unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--origin http|dir:DIR]` が stream を作ります。各 rank は 1 本の接続でつながります。フレームは「4 バイトのリトルエンディアンの長さ、種別 1 バイト、中身」です。
+
+- 受け取り側から: `hello`（`{"version":1,"rank":R,"world":W,"position":...}`。`position` は接続し直すときだけ）、`credit`（あと何件受け取るか）
+- Loader から: `ready`（その rank の開始位置）、`item`（レコード番号、出力番号、そのレコードの最後かどうか、中身）、`skip`（出力のなかったレコード）、`end`、`error`
+
+渡したのと違う位置で接続し直した rank があれば、各 rank を渡した位置から作り直します。Python では次のように受け取ります。
+
+```python
+from kairo_sdk import streams
+with streams.open("mix-v9") as train:   # KAIRO_STREAM_MIX_V9、RANK、WORLD_SIZE から
+    for item in train:                  # bytes
+        ...
+    where = train.position              # {"rank", "record", "sub"}
+```
+
+接続が切れたら、その位置で自動的に接続し直します。torch では `streams.dataset(name, decode)` が IterableDataset を返します（1 つの rank は 1 つのプロセスで受け取るため、`num_workers=0` で使います）。
 
 ## Worker SDK
 
