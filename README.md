@@ -2088,6 +2088,47 @@ scratch directory holds; the root is cleaned before it is compared). A daemon ol
 from a newer agent (it answers `stores` with 404, and the agent then neither
 makes scratch nor asks for any to settle).
 
+#### The data lifecycle
+
+The records above change state only as this table says
+(`internal/store/lifecycle.go`). The place that makes each change checks it
+there first, so a change the machine does not have fails, saying so. "-" is
+a record not there: made from it, or removed to it.
+
+| record | from | to |
+|---|---|---|
+| object (`data_objects.state`) | - | `packing` (ordered packed), `packed` (adopted from a durable store) |
+| | `packing` | `packed`, `abandoned` |
+| | `abandoned` | `packed` (a pack being made when its import was cancelled) |
+| source (`source_state`) | - | `present`, `kept` (adopted) |
+| | `present` | `deleting` (claimed), `kept`, `evicting` (claimed), `deleted` (found gone from its path) |
+| | `deleting` | `deleted`, `kept` |
+| | `evicting` | `evicted`, `present` (kept) |
+| | `kept` | `deleted` (a kept import found gone) |
+| | `deleted` | `kept` (an import abandoned once found gone) |
+| transfer (`transfer_state`) | - | `packing` |
+| | `packing` | `packed` |
+| | `packed` | `dropping` |
+| | `dropping` | - |
+| copy (`object_copies`) | - | `copying` (ordered), `verified` (adopted) |
+| | `copying` | `verified`, - (given up: its store no longer durable there) |
+| | `verified` | - (shed) |
+| placement (`object_placements`) | - | `fetching` |
+| | `fetching` | `ready` |
+| | `ready` | `evicting` (claimed), - (found gone from its path) |
+| | `evicting` | `ready` (kept), - (evicted) |
+| scratch (`attempt_scratch`) | - | `active` |
+| | `active`, `missing` | `deleting` (claimed), `kept` |
+| | `active`, `kept` | `missing` (not found by a whole scan) |
+| | `missing` | `active`, `kept` (found again) |
+| | `deleting` | `deleted`, `kept` |
+| | `kept` | `deleted` (once copied to a durable store) |
+| run output (`run_outputs`) | - | `active` |
+| | `active` | `missing`, `deleted` |
+| | `missing` | `active` (found, or made again), `deleted` |
+
+`packed`, `evicted` and `deleted` are final.
+
 ### Hardware settings
 
 A device of a host (a GPU by UUID, or `cpu`) can be given settings: a GPU's

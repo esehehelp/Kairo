@@ -144,8 +144,14 @@ func (s *Store) EvictionsToMake(ctx context.Context, executorID string) ([]Evict
 			}
 			var claim sql.Result
 			if o.Kind == EvictPlacement {
+				if err := checkTransition(recPlacement, "ready", "evicting"); err != nil {
+					return nil, err
+				}
 				claim, err = tx.ExecContext(ctx, `UPDATE object_placements SET state='evicting',updated_at=$1 WHERE object_id=$2 AND store_id=$3 AND state='ready'`, t, o.ObjectID, d.ID)
 			} else {
+				if err := checkTransition(recSource, SourcePresent, SourceEvicting); err != nil {
+					return nil, err
+				}
 				claim, err = tx.ExecContext(ctx, `UPDATE data_objects SET source_state='evicting',updated_at=$1 WHERE id=$2 AND source_state='present'`, t, o.ObjectID)
 			}
 			if err != nil {
@@ -269,6 +275,13 @@ func (s *Store) SettleEviction(ctx context.Context, settled EvictionSettled) err
 		if state != "evicting" {
 			return tx.Commit()
 		}
+		to := "ready"
+		if settled.Evicted {
+			to = noRecord
+		}
+		if err = checkTransition(recPlacement, state, to); err != nil {
+			return err
+		}
 		if settled.Evicted {
 			_, err = tx.ExecContext(ctx, `DELETE FROM object_placements WHERE object_id=$1 AND store_id=$2`, settled.ObjectID, settled.StoreID)
 		} else {
@@ -290,11 +303,21 @@ func (s *Store) SettleEviction(ctx context.Context, settled EvictionSettled) err
 		if state != "evicting" {
 			return tx.Commit()
 		}
+		to := SourcePresent
+		if settled.Evicted {
+			to = SourceEvicted
+		}
+		if err = checkTransition(recSource, state, to); err != nil {
+			return err
+		}
 		if settled.Evicted {
 			if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET source_state='evicted',source_reason=NULL,source_deleted_at=$1,updated_at=$2 WHERE id=$3`, t, t, settled.ObjectID); err != nil {
 				return err
 			}
 			if kind == ObjectOutput {
+				if err := checkRowsTransitionTx(ctx, tx, recRunOutput, "run_outputs", "run_id=$1 AND store_id=$2", "deleted", sourceID, storeID); err != nil {
+					return err
+				}
 				_, err = tx.ExecContext(ctx, `UPDATE run_outputs SET state='deleted',bytes=0,updated_at=$1 WHERE run_id=$2 AND store_id=$3`, t, sourceID, storeID)
 			}
 		} else {

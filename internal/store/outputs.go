@@ -164,12 +164,20 @@ func (s *Store) RecordRunOutput(ctx context.Context, out RunOutput) error {
 	t := now()
 	if found {
 		// Made again (or found) for this attempt: there again if it was missing.
+		if err := checkTransition(recRunOutput, state, "active"); err != nil {
+			return err
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE run_outputs SET last_attempt_id=$1,state='active',missing_at=NULL,updated_at=$2 WHERE run_id=$3 AND store_id=$4`, out.AttemptID, t, out.RunID, out.StoreID); err != nil {
 			return err
 		}
-	} else if _, err = tx.ExecContext(ctx, `INSERT INTO run_outputs(run_id,store_id,executor_id,root,path,state,last_attempt_id,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'active',$6,$7,$8)`,
-		out.RunID, out.StoreID, out.ExecutorID, out.Root, out.Path, out.AttemptID, t, t); err != nil {
-		return err
+	} else {
+		if err := checkMade(recRunOutput, "active"); err != nil {
+			return err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO run_outputs(run_id,store_id,executor_id,root,path,state,last_attempt_id,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'active',$6,$7,$8)`,
+			out.RunID, out.StoreID, out.ExecutorID, out.Root, out.Path, out.AttemptID, t, t); err != nil {
+			return err
+		}
 	}
 	projectID, err := executionProjectIDTx(ctx, tx, executionID)
 	if err != nil {

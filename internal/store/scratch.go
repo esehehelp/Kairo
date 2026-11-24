@@ -167,6 +167,9 @@ func (s *Store) RecordAttemptScratch(ctx context.Context, scratch AttemptScratch
 		return fmt.Errorf("scratch of attempt %s refused: %s", scratch.AttemptID, why)
 	}
 	t := now()
+	if err := checkMade(recScratch, "active"); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO attempt_scratch(attempt_id,store_id,executor_id,root,path,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'active',$6,$7)`,
 		scratch.AttemptID, scratch.StoreID, scratch.ExecutorID, scratch.Root, scratch.Path, t, t); err != nil {
 		return err
@@ -326,6 +329,9 @@ func (s *Store) SettleScratch(ctx context.Context, settled ScratchSettled) error
 	}
 	t := now()
 	if settled.State == ScratchDeleting {
+		if err := checkTransition(recScratch, current, ScratchDeleting); err != nil {
+			return err
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE attempt_scratch SET state=$1,updated_at=$2,missing_at=NULL WHERE attempt_id=$3`, ScratchDeleting, t, settled.AttemptID); err != nil {
 			return err
 		}
@@ -333,6 +339,9 @@ func (s *Store) SettleScratch(ctx context.Context, settled ScratchSettled) error
 	}
 	if settled.Reason != "" {
 		reason = settled.Reason
+	}
+	if err := checkTransition(recScratch, current, settled.State); err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE attempt_scratch SET state=$1,bytes=COALESCE($2,bytes),reason=$3,settled_at=$4,updated_at=$5,missing_at=NULL WHERE attempt_id=$6`,
 		settled.State, settled.Bytes, reason, t, t, settled.AttemptID); err != nil {

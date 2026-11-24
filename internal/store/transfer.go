@@ -47,6 +47,9 @@ func bringTemporalTx(ctx context.Context, tx *sql.Tx, declared []machine.Store, 
 	}
 	switch transfer.String {
 	case "":
+		if err := checkTransition(recTransfer, transfer.String, transferPacking); err != nil {
+			return false, err
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET transfer_state=$1,updated_at=$2 WHERE id=$3`, transferPacking, now(), objectID); err != nil {
 			return false, err
 		}
@@ -82,6 +85,9 @@ func dropTransfersTx(ctx context.Context, tx *sql.Tx, wanted map[string]bool) er
 		return err
 	}
 	for _, id := range packed {
+		if err := checkTransition(recTransfer, transferPacked, transferDropping); err != nil {
+			return err
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET transfer_state=$1,updated_at=$2 WHERE id=$3 AND transfer_state=$4`, transferDropping, now(), id, transferPacked); err != nil {
 			return err
 		}
@@ -111,6 +117,9 @@ func recordTransferTx(ctx context.Context, tx *sql.Tx, made PackMade, root strin
 		if transfer.String != transferDropping {
 			return tx.Commit() // removed already (or packed again since: not this removal's)
 		}
+		if err := checkTransition(recTransfer, transfer.String, noRecord); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE data_objects SET transfer_state=NULL,pack_path=NULL,pack_bytes=0,pack_sha256=NULL,updated_at=$1 WHERE id=$2`, t, made.ObjectID); err != nil {
 			return err
 		}
@@ -132,6 +141,9 @@ func recordTransferTx(ctx context.Context, tx *sql.Tx, made PackMade, root strin
 		return fmt.Errorf("pack of object %s: its sha256 is not 64 hex digits", made.ObjectID)
 	case made.PackBytes <= 0:
 		return fmt.Errorf("pack of object %s: impossible size", made.ObjectID)
+	}
+	if err := checkTransition(recTransfer, transfer.String, transferPacked); err != nil {
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE data_objects SET transfer_state=$1,pack_path=$2,pack_bytes=$3,pack_sha256=$4,updated_at=$5 WHERE id=$6`,
 		transferPacked, made.PackPath, made.PackBytes, made.PackSHA256, t, made.ObjectID); err != nil {

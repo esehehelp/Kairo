@@ -275,6 +275,9 @@ func orderFetchTx(ctx context.Context, tx *sql.Tx, declared []machine.Store, obj
 		return false, err
 	}
 	t := now()
+	if err := checkMade(recPlacement, "fetching"); err != nil {
+		return false, err
+	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO object_placements(object_id,store_id,executor_id,root,path,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'fetching',$6,$7)
 		ON CONFLICT(object_id,store_id) DO NOTHING`, objectID, s.ID, executorID, s.Root, inputDirOf(s.Root, objectID), t, t)
 	if err != nil {
@@ -577,6 +580,9 @@ func (s *Store) RecordFetch(ctx context.Context, made FetchMade) error {
 		return tx.Commit() // ready, or being evicted
 	}
 	t := now()
+	if err := checkTransition(recPlacement, state, "ready"); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE object_placements SET state='ready',bytes=$1,token_hash=NULL,token_expires_at=NULL,ready_at=$2,updated_at=$3 WHERE object_id=$4 AND store_id=$5`,
 		made.Bytes, t, t, made.ObjectID, made.StoreID); err != nil {
 		return err

@@ -210,6 +210,9 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 			}
 		}
 		objectID := id.New("obj")
+		if err := checkMade(recObject, "packing"); err != nil {
+			return nil, err
+		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,lifecycle,producer_task_scope_id,created_at,updated_at)
 			VALUES($1,$2,$3,$4,$5,$6,$7,$8,'packing',$9,$10,$11,$12)`, objectID, d.kind, d.sourceID, d.storeID, executorID, d.root, d.path, d.projectID, lifecycle, producer, t, t); err != nil {
 			return nil, err
@@ -332,6 +335,9 @@ func (s *Store) RecordPack(ctx context.Context, made PackMade) error {
 		return fmt.Errorf("pack of object %s: impossible sizes", made.ObjectID)
 	}
 	t := now()
+	if err := checkTransition(recObject, state, "packed"); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET state='packed',pack_path=$1,manifest_path=$2,content_bytes=$3,files=$4,skipped=$5,pack_bytes=$6,pack_sha256=$7,manifest_sha256=$8,packed_at=$9,updated_at=$10 WHERE id=$11`,
 		made.PackPath, made.ManifestPath, made.ContentBytes, made.Files, made.Skipped, made.PackBytes, made.PackSHA256, made.ManifestSHA256, t, t, made.ObjectID); err != nil {
 		return err

@@ -217,6 +217,9 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 	if settled.State == SourceDeleted {
 		deletedAt = t
 	}
+	if err := checkTransition(recSource, state, settled.State); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET source_state=$1,source_reason=$2,source_deleted_at=$3,updated_at=$4 WHERE id=$5`,
 		settled.State, nullable(settled.Reason), deletedAt, t, settled.ObjectID); err != nil {
 		return err
@@ -224,8 +227,14 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 	if settled.State == SourceDeleted {
 		switch kind {
 		case ObjectOutput:
+			if err := checkRowsTransitionTx(ctx, tx, recRunOutput, "run_outputs", "run_id=$1 AND store_id=$2", "deleted", sourceID, storeID); err != nil {
+				return err
+			}
 			_, err = tx.ExecContext(ctx, `UPDATE run_outputs SET state='deleted',bytes=0,updated_at=$1 WHERE run_id=$2 AND store_id=$3`, t, sourceID, storeID)
 		case ObjectScratch:
+			if err := checkRowsTransitionTx(ctx, tx, recScratch, "attempt_scratch", "attempt_id=$1", "deleted", sourceID); err != nil {
+				return err
+			}
 			_, err = tx.ExecContext(ctx, `UPDATE attempt_scratch SET state='deleted',bytes=0,reason=COALESCE(reason,'')||'; deleted once copied to a durable store',updated_at=$1 WHERE attempt_id=$2`, t, sourceID)
 		}
 		if err != nil {

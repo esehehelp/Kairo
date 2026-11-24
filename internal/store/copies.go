@@ -245,6 +245,9 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 			month := d.created[0:4] + d.created[5:7]
 			// Another executor serving the store may take it at the same
 			// time: it is then that one's.
+			if err := checkMade(recCopy, "copying"); err != nil {
+				return nil, err
+			}
 			result, err := tx.ExecContext(ctx, `INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'copying',$6,$7)
 				ON CONFLICT(object_id,store_id) DO NOTHING`, d.id, target.ID, executorID, target.Root, month, t, t)
 			if err != nil {
@@ -302,6 +305,9 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 		// a copy taken for a store no longer so is given up (nothing of it was
 		// verified), so the object is copied where the declaration says now.
 		if d, ok := byID[x.order.StoreID]; !ok || d.Class != machine.StoreDurable || d.Root != x.order.Root || !me.serves(d, executorID) {
+			if err := checkTransition(recCopy, "copying", noRecord); err != nil {
+				return nil, err
+			}
 			result, err := tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_id=$1 AND store_id=$2 AND executor_id=$3 AND state='copying'`, x.order.ObjectID, x.order.StoreID, executorID)
 			if err != nil {
 				return nil, err
@@ -472,6 +478,9 @@ func (s *Store) RecordCopy(ctx context.Context, made CopyMade) error {
 			}
 		}
 		return tx.Commit()
+	}
+	if err := checkTransition(recCopy, state, "verified"); err != nil {
+		return err
 	}
 	if _, err = tx.ExecContext(ctx, `UPDATE object_copies SET state='verified',path=$1,manifest_path=$2,token_hash=NULL,token_expires_at=NULL,verified_at=$3,updated_at=$4,described_at=$5 WHERE object_id=$6 AND store_id=$7`,
 		made.Path, made.ManifestPath, t, t, described, made.ObjectID, made.StoreID); err != nil {

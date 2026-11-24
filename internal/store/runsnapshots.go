@@ -109,6 +109,9 @@ func (s *Store) orderRunSnapshotsTx(ctx context.Context, tx *sql.Tx, declared []
 		if r.last.Valid {
 			sinceAt = r.last.String
 		}
+		if err := checkMade(recObject, "packing"); err != nil {
+			return err
+		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,lifecycle,snapshot_since,name,created_at,updated_at)
 			VALUES($1,'run-snapshot',$2,$3,$4,$5,$6,$7,'packing','durable',$8,$9,$10,$11) ON CONFLICT DO NOTHING`,
 			objectID, sourceID, r.storeID, executorID, r.root, r.path, r.projectID, sinceAt, "run-snapshots/"+sourceID, t, t); err != nil {

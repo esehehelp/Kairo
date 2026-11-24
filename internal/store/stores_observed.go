@@ -110,6 +110,9 @@ func (s *Store) RecordStoreObservation(ctx context.Context, obs StoreObservation
 		return err
 	}
 	t := now()
+	if err := errors.Join(checkTransition(recScratch, "missing", "active"), checkTransition(recScratch, "missing", "kept")); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE attempt_scratch k SET bytes=CASE WHEN r.bytes>=0 THEN r.bytes ELSE k.bytes END,
 		state=CASE WHEN k.state<>'missing' THEN k.state WHEN k.settled_at IS NULL THEN 'active' ELSE 'kept' END,
 		missing_at=NULL,updated_at=$1
@@ -119,6 +122,9 @@ func (s *Store) RecordStoreObservation(ctx context.Context, obs StoreObservation
 	}
 	if obs.ScratchScanned {
 		since := time.Now().UTC().Add(-time.Duration(obs.ScanSeconds*float64(time.Second)) - scratchScanMargin).Format(time.RFC3339Nano)
+		if err := checkTransitions(recScratch, []string{"active", "kept"}, "missing"); err != nil {
+			return err
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE attempt_scratch k SET state='missing',bytes=0,missing_at=$1,updated_at=$2
 			WHERE k.store_id=$3 AND k.root=$4 AND k.state IN('active','kept') AND (k.created_at)::timestamptz<($5)::timestamptz
 			AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(($6)::jsonb) AS r(attempt_id text,bytes bigint) WHERE r.attempt_id=k.attempt_id)`,
@@ -177,6 +183,9 @@ func recordOutputsObservedTx(ctx context.Context, tx *sql.Tx, obs StoreObservati
 	if err != nil {
 		return 0, err
 	}
+	if err := checkTransitions(recRunOutput, []string{"active", "missing"}, "active"); err != nil {
+		return 0, err
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE run_outputs o SET bytes=CASE WHEN r.bytes>=0 THEN r.bytes ELSE o.bytes END,state='active',missing_at=NULL,updated_at=$1
 		FROM jsonb_to_recordset(($2)::jsonb) AS r(run_id text,bytes bigint)
 		WHERE o.run_id=r.run_id AND o.store_id=$3 AND o.root=$4 AND o.state IN('active','missing')`, t, string(seen), obs.StoreID, obs.Root); err != nil {
@@ -184,6 +193,9 @@ func recordOutputsObservedTx(ctx context.Context, tx *sql.Tx, obs StoreObservati
 	}
 	if obs.OutputsScanned {
 		since := time.Now().UTC().Add(-time.Duration(obs.ScanSeconds*float64(time.Second)) - scratchScanMargin).Format(time.RFC3339Nano)
+		if err := checkTransition(recRunOutput, "active", "missing"); err != nil {
+			return 0, err
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE run_outputs o SET state='missing',bytes=0,missing_at=$1,updated_at=$2
 			WHERE o.store_id=$3 AND o.root=$4 AND o.state='active' AND (o.updated_at)::timestamptz<($5)::timestamptz
 			AND NOT EXISTS(SELECT 1 FROM jsonb_to_recordset(($6)::jsonb) AS r(run_id text,bytes bigint) WHERE r.run_id=o.run_id)`,
