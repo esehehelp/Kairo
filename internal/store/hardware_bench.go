@@ -722,7 +722,10 @@ func benchSelector(nodeID string, bench NodeBench) orchestration.ExecutorSelecto
 	return orchestration.ExecutorSelector{Labels: labels, Node: nodeID}
 }
 
-// nodeBenchTx is the bench configuration a node reports (none: zero).
+// nodeBenchTx is the bench configuration a node reports (none: zero). A
+// node whose enabled executors all run containers (a Proxmox host's pct
+// executor) reports none: the bench driver and the control snapshot run the
+// node's kairo binary on the host, which none of them would take.
 func nodeBenchTx(ctx context.Context, q queryer, nodeID string) (NodeBench, error) {
 	var attributes string
 	err := q.QueryRowContext(ctx, `SELECT attributes_json FROM nodes WHERE id=$1`, nodeID).Scan(&attributes)
@@ -736,6 +739,14 @@ func nodeBenchTx(ctx context.Context, q queryer, nodeID string) (NodeBench, erro
 		Bench NodeBench `json:"bench"`
 	}
 	_ = json.Unmarshal([]byte(attributes), &values)
+	var host bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM executors WHERE node_id=$1 AND enabled
+		AND COALESCE((attributes_json::jsonb)->>'`+ContainerRuntimeAttribute+`','')='')`, nodeID).Scan(&host); err != nil {
+		return NodeBench{}, err
+	}
+	if !host {
+		return NodeBench{}, nil
+	}
 	return values.Bench, nil
 }
 

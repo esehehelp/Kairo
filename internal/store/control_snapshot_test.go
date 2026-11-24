@@ -86,3 +86,40 @@ func TestControlSnapshotTaskOnceASlotOnTheFirstDurableStoresNode(t *testing.T) {
 		t.Fatalf("an unknown attempt's queue: %v", err)
 	}
 }
+
+// A node whose executors all run containers (a Proxmox host's pct executor)
+// takes no control snapshot, which runs the node's kairo on the host: the
+// next durable store's node does.
+func TestControlSnapshotSkipsANodeThatRunsOnlyContainers(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	addTestDisk(t, store, "node", "D:")
+	ctx := context.Background()
+	bench, _ := json.Marshal(map[string]any{"bench": map[string]any{"kairo": "/srv/kairo/bin/kairo"}})
+	if err := store.UpsertNode(ctx, Node{ID: "ctr", Name: "ctr", OS: "linux", Architecture: "amd64", Attributes: bench, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertExecutor(ctx, Executor{ID: "ctr-pct", NodeID: "ctr", Kind: "pct", Attributes: json.RawMessage(`{"runtime":"pct"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	addTestDisk(t, store, "ctr", "/")
+	winBench, _ := json.Marshal(map[string]any{"bench": map[string]any{"kairo": "C:/kairo/kairo.exe"}})
+	if err := store.UpsertNode(ctx, Node{ID: "node", Name: "node", OS: "windows", Architecture: "amd64", Attributes: winBench, Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	declareTestStore(t, store,
+		machine.Store{ID: "a-durable", Class: machine.StoreDurable, Node: "ctr", Root: "/srv/durable", Filesystem: "/"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "D:/durable", Filesystem: "D:"},
+	)
+	if b, err := nodeBenchTx(ctx, store.db, "ctr"); err != nil || b.Kairo != "" {
+		t.Fatalf("a containers-only node reports a bench: %+v %v", b, err)
+	}
+	name, err := store.ControlSnapshotTask(ctx, time.Date(2026, 11, 24, 7, 0, 0, 0, time.UTC), time.Hour)
+	if err != nil || name == "" {
+		t.Fatalf("declared %q %v", name, err)
+	}
+	var node string
+	if err := store.db.QueryRowContext(ctx, `SELECT (execution_template_json::jsonb)->'executor'->>'node' FROM orchestration_tasks WHERE name=$1`, name).Scan(&node); err != nil || node != "node" {
+		t.Fatalf("on node %q %v", node, err)
+	}
+}
