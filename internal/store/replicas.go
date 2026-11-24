@@ -29,12 +29,11 @@ const replicaBatch = 50
 // the shedding margin and what it orders).
 func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets []machine.Store, room map[string]int64, t string) error {
 	var eligible []machine.Store
-	var servedIDs, eligibleIDs []string
+	var eligibleIDs []string
 	for _, s := range targets {
 		if !me.serves(s, executorID) {
 			continue
 		}
-		servedIDs = append(servedIDs, s.ID)
 		if room[s.ID] == unknownRoom || room[s.ID] >= shedMinShort {
 			eligible = append(eligible, s)
 			eligibleIDs = append(eligibleIDs, s.ID)
@@ -60,7 +59,7 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 		) b
 		WHERE d.state='packed' AND d.lifecycle='durable' AND b.n<$2
 		AND EXISTS(SELECT 1 FROM object_copies v WHERE v.object_id=d.id AND v.state='verified' AND v.check_problem IS NULL)
-		ORDER BY d.pack_bytes,d.id LIMIT 2000`, []any{eligibleIDs, len(eligible), t, servedIDs}, func(rows *sql.Rows) error {
+		ORDER BY d.pack_bytes,d.id LIMIT 2000`, []any{eligibleIDs, len(eligible), t}, func(rows *sql.Rows) error {
 		var c candidate
 		var blocked string
 		if err := rows.Scan(&c.id, &c.created, &c.projectID, &c.bytes, &blocked); err != nil {
