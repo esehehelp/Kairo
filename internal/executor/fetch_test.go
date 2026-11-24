@@ -79,7 +79,7 @@ func TestAnObjectIsBroughtFromItsDurableCopy(t *testing.T) {
 	fake := &fakeFetches{}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{
+	e.storeWork().stores = []servedStore{
 		{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true},
 		{decl: machine.Store{ID: "e-durable", Class: machine.StoreDurable, Root: durable}, fs: localStoreFS{}, usable: true},
 	}
@@ -95,7 +95,7 @@ func TestAnObjectIsBroughtFromItsDurableCopy(t *testing.T) {
 		}
 	}
 	fake.orders = []store.FetchOrder{order, bad}
-	e.fetchDue(ctx)
+	e.storeWork().fetchDue(ctx)
 	if len(fake.made) != 1 || fake.made[0].ObjectID != "obj_d" || fake.made[0].Bytes != res.contentBytes || fake.made[0].Path != filepath.Join(volatile, inputsDirName, "obj_d") {
 		t.Fatalf("made %+v\n%s", fake.made, logs.String())
 	}
@@ -119,10 +119,10 @@ func TestAnObjectIsBroughtFromItsDurableCopy(t *testing.T) {
 		t.Fatalf("the bad copy was not warned of:\n%s", logs.String())
 	}
 	// Asked again (not recorded, say): no room is needed for an unpacked tree.
-	e.stores[0].decl.ReserveFreeBytes = math.MaxInt64
+	e.storeWork().stores[0].decl.ReserveFreeBytes = math.MaxInt64
 	fake.orders, fake.made = []store.FetchOrder{order}, nil
-	e.fetches = round{}
-	e.fetchDue(ctx)
+	e.storeWork().fetches = round{}
+	e.storeWork().fetchDue(ctx)
 	if len(fake.made) != 1 || fake.made[0].Bytes != res.contentBytes {
 		t.Fatalf("again: %+v", fake.made)
 	}
@@ -192,18 +192,18 @@ func TestAnObjectIsBroughtFromAnotherNodesDurableCopy(t *testing.T) {
 	copies.token, copies.readFor = "kairo_fetch_secret", store.PackRead{StoreID: "e-durable", Root: durable, Month: "202611"}
 	var serverLogs, logs bytes.Buffer
 	holder := storesExecutor(t, copies, &serverLogs)
-	holder.stores = []servedStore{{decl: machine.Store{ID: "e-durable", Class: machine.StoreDurable, Root: durable}, fs: localStoreFS{}, usable: true}}
+	holder.storeWork().stores = []servedStore{{decl: machine.Store{ID: "e-durable", Class: machine.StoreDurable, Root: durable}, fs: localStoreFS{}, usable: true}}
 	server := httptest.NewTLSServer(&PackServer{Store: copies, NodeID: "node", Executors: []*Local{holder}, Logger: holder.Logger})
 	defer server.Close()
 
 	fake := &fakeFetches{}
 	e := storesExecutor(t, fake, &logs)
 	e.PackClient = server.Client()
-	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
 	fake.orders = []store.FetchOrder{{ObjectID: "obj_1", StoreID: "c-scratch", Root: volatile, PackBytes: res.packBytes, ContentBytes: res.contentBytes,
 		PackSHA256: res.packSHA256, ManifestSHA256: res.manifestHash,
 		Source: store.CopySource{StoreID: "e-durable", Root: durable, Month: "202611", Addr: strings.TrimPrefix(server.URL, "https://"), Token: "kairo_fetch_secret"}}}
-	e.fetchDue(ctx)
+	e.storeWork().fetchDue(ctx)
 	if len(fake.made) != 1 || fake.made[0].Bytes != res.contentBytes {
 		t.Fatalf("made %+v\n%s\n%s", fake.made, logs.String(), serverLogs.String())
 	}

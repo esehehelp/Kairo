@@ -220,7 +220,7 @@ type SourceFetcher interface {
 // in this process; a directory there is the snapshot (it is renamed into
 // place only once every file was checked; an unpack another process renamed
 // there first is taken).
-func (e *Local) ensureSource(ctx context.Context, src *store.LaunchSource) (string, error) {
+func (e *storeWorker) ensureSource(ctx context.Context, src *store.LaunchSource) (string, error) {
 	fetch, ok := e.Store.(SourceFetcher)
 	if !ok {
 		return "", errors.New("this executor cannot fetch code snapshots")
@@ -594,14 +594,14 @@ const (
 	sourcePartialKeep = 24 * time.Hour
 )
 
-func (e *Local) makeSourceCleanups() {
+func (e *storeWorker) makeSourceCleanups() {
 	e.startRound(&e.sourceCleanups, sourceCleanInterval, sourceCleanTimeout, e.cleanSources)
 }
 
 // cleanSources removes from <root>/sources of each usable local volatile
 // store this executor serves what is no longer used there (cleanSourcesIn),
 // never without the daemon's word on which snapshots are in use.
-func (e *Local) cleanSources(ctx context.Context) {
+func (e *storeWorker) cleanSources(ctx context.Context) {
 	keeper, ok := e.Store.(SourceKeeper)
 	if !ok {
 		return
@@ -632,7 +632,7 @@ func (e *Local) cleanSources(ctx context.Context) {
 // record; one set aside as changed sourceAsideKeep ago whose snapshot no
 // execution uses; a record without its tree; and what an unpack left half
 // done sourcePartialKeep ago.
-func (e *Local) cleanSourcesIn(root string, inUse map[string]bool, now time.Time) {
+func (e *storeWorker) cleanSourcesIn(root string, inUse map[string]bool, now time.Time) {
 	base := filepath.Join(root, sourcesDirName)
 	dir, err := openSourcesDir(root, false)
 	if errors.Is(err, fs.ErrNotExist) {

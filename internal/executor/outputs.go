@@ -28,7 +28,7 @@ func (e *Local) makeOutput(launch *store.Launch) {
 	if launch.RunID == "" {
 		return
 	}
-	s, ok := e.storeFor(launch)
+	s, ok := e.storeWork().storeFor(launch)
 	if !ok {
 		return
 	}
@@ -58,9 +58,9 @@ func (e *Local) makeOutput(launch *store.Launch) {
 	}
 	e.outputs[attemptID] = dir
 	e.outputRuns[attemptID] = launch.RunID
-	// written again: measured again
-	delete(e.outputSized, launch.RunID)
 	e.mu.Unlock()
+	// written again: measured again
+	e.storeWork().forgetOutputSize(launch.RunID)
 }
 
 // outputEnv is what an attempt is told of its output directory:
@@ -81,12 +81,9 @@ func (e *Local) outputEnv(launch *store.Launch) []string {
 // attempt of the run runs on this executor, once per executor instance
 // otherwise (nothing writes there then). ok is false when it could not be
 // measured now.
-func (e *Local) outputSize(ctx context.Context, s servedStore, runID string) (int64, bool) {
+func (e *storeWorker) outputSize(ctx context.Context, s servedStore, runID string) (int64, bool) {
+	running := e.runRunsHere(runID)
 	e.mu.Lock()
-	running := false
-	for _, run := range e.outputRuns {
-		running = running || run == runID
-	}
 	size, measured := e.outputSized[runID]
 	e.mu.Unlock()
 	if measured && !running {

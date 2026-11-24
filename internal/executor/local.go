@@ -62,6 +62,10 @@ type Local struct {
 	logProblems map[string]map[string]bool
 
 	mu sync.Mutex
+	// sw does the work on the node's stores (storeworker.go), made at its
+	// first use.
+	sw     *storeWorker
+	swOnce sync.Once
 	// running holds the attempts running here, launched or adopted: the pid
 	// of each one's shim.
 	running map[string]int
@@ -92,59 +96,21 @@ type Local struct {
 	leftReported    map[string]time.Time
 	exitedLeftovers map[string]leftover
 
-	// Stores (datastore.go): the ones this executor serves, when they were
-	// last asked for, whether the daemon ever answered (storesKnown) and
-	// whether the last ask failed (warned once), when they were last
-	// reported and whether a report runs. storeFSOverride replaces how
-	// roots are reached, in tests.
-	stores          []servedStore
-	storesAt        time.Time
-	storesKnown     bool
-	storesWarned    bool
-	storeReportAt   time.Time
-	storeReporting  bool
-	storeFSOverride storeFS
-
-	// Scratch (scratch.go): the scratch made for attempts being launched,
-	// by attempt; when scratch was last settled and whether a round runs;
-	// the problems already warned of, by attempt.
-	scratch map[string]string
-	// scratchSized is the size, measured once, of each scratch directory of
-	// an attempt not running here (datastore.go), by attempt.
-	scratchSized    map[string]int64
-	scratchSettleAt time.Time
-	scratchSettling bool
-	scratchProblems map[string]string
-
-	// Output directories (outputs.go): the one made for each attempt being
-	// launched, by attempt, until its environment is built; the run of each
-	// attempt launched with one, by attempt, while it runs here; and the
-	// size, measured once, of each run's directory none of whose attempts
-	// runs here, by run.
-	outputs     map[string]string
-	outputRuns  map[string]string
-	outputSized map[string]int64
+	// The stores, and the rounds that keep them, are the store worker's
+	// (sw, storeworker.go). What a launch makes on them is kept here until
+	// its environment is built: the scratch made for each attempt being
+	// launched (scratch.go), the output directory made for each (outputs.go)
+	// and the run of each attempt launched with one, while it runs here.
+	scratch    map[string]string
+	outputs    map[string]string
+	outputRuns map[string]string
 	// caches: each attempt being launched's cache directory (confine.go),
 	// until its environment is built.
 	caches map[string]string
 
-	// Packing (pack.go), copies to a durable store (transfer.go; PackClient
-	// fetches packs from other agents, their CA trusted), deleting copied
-	// sources and reading durable copies back (retire.go): each a round.
+	// PackClient fetches packs from other agents, their CA trusted (the
+	// store worker's copies and fetches, transfer.go).
 	PackClient *http.Client
-	packs      round
-	copies     round
-	fetches    round
-	deletions  round
-	evictions  round
-	scrubs     round
-	// inventories: listing durable stores, adopting copies (inventory.go).
-	inventories round
-	// sourceCleanups: unpacked code snapshots no longer used (source.go).
-	sourceCleanups round
-	// containerSweeps: instances of attempts no longer running here
-	// (container_linux.go).
-	containerSweeps round
 
 	// Force stop (forcestop.go): process tree handles of the attempts this
 	// instance launched, and the progress of force stops being carried out.
@@ -249,19 +215,19 @@ func (e *Local) tick(ctx context.Context) error {
 	e.sweepUnlaunched(ctx)
 	e.endStep()
 	e.beginStep("stores")
-	e.refreshStores(ctx)
-	e.reportStores()
-	e.settleScratch()
-	e.makePacks()
-	e.makeCopies()
-	e.makeFetches()
-	e.makeDeletions()
-	e.makeEvictions()
-	e.makeScrubs()
-	e.makeInventories()
-	e.makeSourceCleanups()
+	e.storeWork().refreshStores(ctx)
+	e.storeWork().reportStores()
+	e.storeWork().settleScratch()
+	e.storeWork().makePacks()
+	e.storeWork().makeCopies()
+	e.storeWork().makeFetches()
+	e.storeWork().makeDeletions()
+	e.storeWork().makeEvictions()
+	e.storeWork().makeScrubs()
+	e.storeWork().makeInventories()
+	e.storeWork().makeSourceCleanups()
 	if s, ok := e.backend().(instanceSweeper); ok {
-		e.startRound(&e.containerSweeps, containerSweepInterval, containerSweepTimeout, s.sweep)
+		e.storeWork().startRound(&e.storeWork().containerSweeps, containerSweepInterval, containerSweepTimeout, s.sweep)
 	}
 	e.endStep()
 	for {
@@ -891,7 +857,7 @@ func (e *Local) start(launch *store.Launch) error {
 	if err := e.checkInputs(launch); err != nil {
 		return err
 	}
-	if err := e.checkStore(launch); err != nil {
+	if err := e.storeWork().checkStore(launch); err != nil {
 		return err
 	}
 	e.makeScratch(launch)

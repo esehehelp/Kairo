@@ -42,7 +42,7 @@ func (e *Local) makeCache(launch *store.Launch) {
 	if project == "" || !validScratchID(project) {
 		return
 	}
-	s, ok := e.storeFor(launch)
+	s, ok := e.storeWork().storeFor(launch)
 	if !ok {
 		return
 	}

@@ -59,7 +59,7 @@ func TestACopiedSourceIsDeleted(t *testing.T) {
 	fake := &fakeRetire{fakeCopies: newFakeCopies()}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
 	// another run's output directory whose marker names something else
 	other, err := (localStoreFS{}).CreateKind(ctx, volatile, kindOutput, "exe_2")
 	if err != nil {
@@ -73,7 +73,7 @@ func TestACopiedSourceIsDeleted(t *testing.T) {
 		{ObjectID: "obj_2", Kind: store.ObjectOutput, SourceID: "exe_2", StoreID: "c-scratch", Root: volatile},
 		{ObjectID: "obj_3", Kind: store.ObjectOutput, SourceID: "exe_4", StoreID: "c-scratch", Root: volatile + "-moved"},
 	}
-	e.deleteDue(ctx)
+	e.storeWork().deleteDue(ctx)
 	var got []string
 	for _, s := range fake.settled {
 		got = append(got, s.ObjectID+":"+s.State)
@@ -108,20 +108,20 @@ func TestDurableCopiesAreReadBack(t *testing.T) {
 	fake := &fakeRetire{fakeCopies: newFakeCopies()}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{
+	e.storeWork().stores = []servedStore{
 		{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true},
 		{decl: machine.Store{ID: "e-durable", Class: machine.StoreDurable, Root: durable}, fs: localStoreFS{}, usable: true},
 	}
 	order := store.ScrubOrder{ObjectID: "obj_1", StoreID: "e-durable", Root: durable, Month: "202611", PackBytes: res.packBytes, PackSHA256: res.packSHA256, ManifestSHA256: res.manifestHash}
 	// nothing copied yet: the objects directory is not there
 	fake.scrubs = []store.ScrubOrder{order}
-	e.scrubDue(ctx)
+	e.storeWork().scrubDue(ctx)
 	if len(fake.scrubbed) != 0 {
 		t.Fatalf("read back with no objects directory: %+v", fake.scrubbed)
 	}
 	fake.copies = []store.CopyOrder{orderFor(res, durable, store.CopySource{Local: true, StoreID: "c-scratch", Root: volatile})}
-	e.copyDue(ctx)
-	e.scrubDue(ctx)
+	e.storeWork().copyDue(ctx)
+	e.storeWork().scrubDue(ctx)
 	if len(fake.scrubbed) != 1 || fake.scrubbed[0].Problem != "" || fake.scrubbed[0].SHA256 != res.packSHA256 || fake.scrubbed[0].Bytes != res.packBytes ||
 		fake.scrubbed[0].ManifestSHA256 != res.manifestHash || fake.scrubbed[0].ExecutorID != "exec" {
 		t.Fatalf("read back %+v", fake.scrubbed)
@@ -135,14 +135,14 @@ func TestDurableCopiesAreReadBack(t *testing.T) {
 	if err := os.WriteFile(copyPath, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	e.scrubDue(ctx)
+	e.storeWork().scrubDue(ctx)
 	if len(fake.scrubbed) != 2 || fake.scrubbed[1].SHA256 == res.packSHA256 || !strings.Contains(logs.String(), "copy damaged") {
 		t.Fatalf("a changed copy: %+v", fake.scrubbed)
 	}
 	if err := os.Remove(copyPath); err != nil {
 		t.Fatal(err)
 	}
-	e.scrubDue(ctx)
+	e.storeWork().scrubDue(ctx)
 	if len(fake.scrubbed) != 3 || !strings.Contains(fake.scrubbed[2].Problem, "its pack") {
 		t.Fatalf("a copy gone: %+v", fake.scrubbed)
 	}
@@ -163,12 +163,12 @@ func TestASourceThatChangedSinceItWasPackedIsKept(t *testing.T) {
 		fake := &fakeRetire{fakeCopies: newFakeCopies()}
 		var logs bytes.Buffer
 		e := storesExecutor(t, fake, &logs)
-		e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
+		e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
 		if inUse {
 			e.outputRuns = map[string]string{"att_9": "exe_1"}
 		}
 		fake.deletions = []store.DeletionOrder{{ObjectID: "obj_1", Kind: store.ObjectOutput, SourceID: "exe_1", StoreID: "c-scratch", Root: volatile}}
-		e.deleteDue(ctx)
+		e.storeWork().deleteDue(ctx)
 		return fake, dir, res
 	}
 	kept := func(t *testing.T, change func(t *testing.T, dir string), why string) {

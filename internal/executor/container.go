@@ -186,7 +186,7 @@ func (e *Local) containerCommand(launch *store.Launch) (*exec.Cmd, error) {
 	}
 	spec.CWD = launch.CWD
 	if launch.Source != nil {
-		src, err := e.ensureSource(context.Background(), launch.Source)
+		src, err := e.storeWork().ensureSource(context.Background(), launch.Source)
 		if err != nil {
 			return nil, fmt.Errorf("code snapshot %s: %w", launch.Source.ID, err)
 		}

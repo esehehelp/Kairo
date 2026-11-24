@@ -72,14 +72,14 @@ func TestStoresUnavailableAreWarnedOnce(t *testing.T) {
 	var logs bytes.Buffer
 	e := storesExecutor(t, &fakeStores{err: errors.New("agent API 404: 404 page not found")}, &logs)
 	for i := 0; i < 3; i++ {
-		e.storesAt = e.storesAt.AddDate(-1, 0, 0) // due again
-		e.refreshStores(context.Background())
+		e.storeWork().storesAt = e.storeWork().storesAt.AddDate(-1, 0, 0) // due again
+		e.storeWork().refreshStores(context.Background())
 	}
 	if n := strings.Count(logs.String(), "cannot read this node's stores"); n != 1 {
 		t.Fatalf("warned %d times:\n%s", n, logs.String())
 	}
-	if len(e.servedStores()) != 0 {
-		t.Fatalf("stores without a daemon that has them: %+v", e.servedStores())
+	if len(e.storeWork().servedStores()) != 0 {
+		t.Fatalf("stores without a daemon that has them: %+v", e.storeWork().servedStores())
 	}
 }
 
@@ -100,8 +100,8 @@ func TestStoresServedMadeAndChecked(t *testing.T) {
 	}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.refreshStores(context.Background())
-	served := e.servedStores()
+	e.storeWork().refreshStores(context.Background())
+	served := e.storeWork().servedStores()
 	if len(served) != 3 || served[0].decl.ID != "local" || !served[0].usable ||
 		served[1].decl.ID != "missing" || served[1].usable || !strings.Contains(served[1].problem, "is not there") ||
 		served[2].decl.ID != "wrong" || served[2].usable || !strings.Contains(served[2].problem, "is not on filesystem") {
@@ -113,19 +113,19 @@ func TestStoresServedMadeAndChecked(t *testing.T) {
 	if fi, err := os.Stat(filepath.Join(dir, "local-root")); err != nil || !fi.IsDir() {
 		t.Fatalf("root not made: %v", err)
 	}
-	obs := e.observeStore(context.Background(), served[0])
+	obs := e.storeWork().observeStore(context.Background(), served[0])
 	if !obs.Usable || obs.TotalBytes == nil || obs.FreeBytes == nil || *obs.TotalBytes <= 0 || obs.Problem != "" || len(obs.Scratch) != 0 {
 		t.Fatalf("observation: %+v", obs)
 	}
-	if obs = e.observeStore(context.Background(), served[1]); obs.Usable || obs.TotalBytes != nil || obs.Problem == "" {
+	if obs = e.storeWork().observeStore(context.Background(), served[1]); obs.Usable || obs.TotalBytes != nil || obs.Problem == "" {
 		t.Fatalf("unusable observation: %+v", obs)
 	}
 
 	// A WSL executor serves only the store naming it.
 	wsl := storesExecutor(t, fake, &logs)
 	wsl.ID, wsl.Kind = "ubuntu-wsl", "wsl2"
-	wsl.storeFSOverride = localStoreFS{}
-	if got := []bool{wsl.serves(fake.stores[0]), wsl.serves(fake.stores[3])}; got[0] || !got[1] {
+	wsl.storeWork().storeFSOverride = localStoreFS{}
+	if got := []bool{wsl.storeWork().serves(fake.stores[0]), wsl.storeWork().serves(fake.stores[3])}; got[0] || !got[1] {
 		t.Fatalf("WSL executor serves %v", got)
 	}
 }
@@ -158,18 +158,18 @@ func TestStoreUsageIsSampledAfterScanningScratchAndOutputs(t *testing.T) {
 	e := &Local{ID: "exec"}
 	fs := &observedStoreFS{}
 	s := servedStore{decl: machine.Store{ID: "data"}, fs: fs, usable: true}
-	obs := e.observeStore(context.Background(), s)
+	obs := e.storeWork().observeStore(context.Background(), s)
 	if obs.FreeBytes == nil || *obs.FreeBytes != 80 || !obs.ScratchScanned || !obs.OutputsScanned || obs.Problem != "" {
 		t.Fatalf("observation: %+v, sized %d", obs, fs.sized)
 	}
 
 	fs.listErr = errors.New("cannot list")
-	obs = e.observeStore(context.Background(), s)
+	obs = e.storeWork().observeStore(context.Background(), s)
 	if obs.FreeBytes == nil || obs.ScratchScanned || obs.Problem != "scratch: cannot list" {
 		t.Fatalf("observation with scratch error: %+v", obs)
 	}
 	fs.usageErr = errors.New("cannot stat")
-	obs = e.observeStore(context.Background(), s)
+	obs = e.storeWork().observeStore(context.Background(), s)
 	if obs.FreeBytes != nil || obs.Problem != "usage: cannot stat" {
 		t.Fatalf("observation with usage error: %+v", obs)
 	}

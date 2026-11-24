@@ -73,7 +73,7 @@ func TestEvictionsDeleteWhatCanBeHadAgain(t *testing.T) {
 	fake := &fakeEvictions{fakeCopies: newFakeCopies()}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
 	order := func(objectID, kind, objectKind, sourceID, path string) store.EvictionOrder {
 		return store.EvictionOrder{ObjectID: objectID, Kind: kind, ObjectKind: objectKind, SourceID: sourceID, StoreID: "c-scratch", Root: volatile, Path: path}
 	}
@@ -97,7 +97,7 @@ func TestEvictionsDeleteWhatCanBeHadAgain(t *testing.T) {
 		order("obj_1", store.EvictTemporal, store.ObjectOutput, "exe_1", ""),
 		order("obj_2", store.EvictTemporal, store.ObjectImport, "obj_2", imported),
 	}
-	e.evictDue(ctx)
+	e.storeWork().evictDue(ctx)
 	if got := settled(); got != "obj_1:kept,obj_2:kept" {
 		t.Fatalf("settled %s", got)
 	}
@@ -117,7 +117,7 @@ func TestEvictionsDeleteWhatCanBeHadAgain(t *testing.T) {
 		order("obj_3", store.EvictPlacement, "", "", ""),
 		store.EvictionOrder{ObjectID: "obj_4", Kind: store.EvictPlacement, StoreID: "c-scratch", Root: volatile + "-moved"},
 	)
-	e.evictDue(ctx)
+	e.storeWork().evictDue(ctx)
 	if got := settled(); got != "obj_1:evicted,obj_2:evicted,obj_3:evicted" {
 		t.Fatalf("settled %s", got)
 	}
@@ -130,7 +130,7 @@ func TestEvictionsDeleteWhatCanBeHadAgain(t *testing.T) {
 		t.Fatal("the imported directory's parent went")
 	}
 	// gone already: evicted all the same
-	e.evictDue(ctx)
+	e.storeWork().evictDue(ctx)
 	if got := settled(); got != "obj_1:evicted,obj_2:evicted,obj_3:evicted" {
 		t.Fatalf("again: %s", got)
 	}

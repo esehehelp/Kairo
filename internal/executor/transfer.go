@@ -64,7 +64,7 @@ var (
 
 // makeCopies copies, in the background, what the daemon says is to be copied
 // now (at most every copyInterval), once the daemon has answered for stores.
-func (e *Local) makeCopies() {
+func (e *storeWorker) makeCopies() {
 	e.startRound(&e.copies, copyInterval, copyRoundTimeout, e.copyDue)
 }
 
@@ -72,7 +72,7 @@ func (e *Local) makeCopies() {
 // this executor serves at the ordered root, one at a time, and records each.
 // A failure is warned once per object (again when it changes) and tried
 // again later (roundProblem).
-func (e *Local) copyDue(ctx context.Context) {
+func (e *storeWorker) copyDue(ctx context.Context) {
 	// Asked again after each copy: what came due meanwhile (an object
 	// nowhere durable yet, which goes before any replica) is not left
 	// behind a long copy. A copy or description tried once in this round is
@@ -152,7 +152,7 @@ const descriptionSuffix = ".object.json"
 // (store/shed.go): claimed first, so a copy the daemon no longer lets go is
 // left alone; its files then removed through the store's handles. Files a
 // failed removal leaves are adopted again by the next inventory.
-func (e *Local) shedCopy(ctx context.Context, s servedStore, o store.CopyOrder) {
+func (e *storeWorker) shedCopy(ctx context.Context, s servedStore, o store.CopyOrder) {
 	if _, isLocal := s.fs.(localStoreFS); !isLocal {
 		return
 	}
@@ -231,7 +231,7 @@ func describeCopy(s servedStore, o store.CopyOrder) error {
 // copyOne writes and reads back one copy (see above) and returns what to
 // record. A copy already renamed (recorded after all, or not yet) is read
 // back as it is.
-func (e *Local) copyOne(ctx context.Context, s servedStore, o store.CopyOrder, served map[string]servedStore) (store.CopyMade, error) {
+func (e *storeWorker) copyOne(ctx context.Context, s servedStore, o store.CopyOrder, served map[string]servedStore) (store.CopyMade, error) {
 	made := store.CopyMade{ObjectID: o.ObjectID, StoreID: o.StoreID, ExecutorID: e.ID}
 	if _, ok := s.fs.(localStoreFS); !ok {
 		return made, errCopyNotHere
@@ -353,7 +353,7 @@ func openMade(r *os.Root, names ...string) (*os.Root, error) {
 
 // fetch writes the list (whole, again) and the pack (resumed when part of it
 // is there) as .partial files in dir, synced.
-func (e *Local) fetch(ctx context.Context, o store.CopyOrder, served map[string]servedStore, dir *os.Root, packName, listName string) error {
+func (e *storeWorker) fetch(ctx context.Context, o store.CopyOrder, served map[string]servedStore, dir *os.Root, packName, listName string) error {
 	var open func(name string, offset int64) (io.ReadCloser, int64, error)
 	if o.Source.Local {
 		src, ok := served[o.Source.StoreID]
@@ -531,7 +531,7 @@ func openPackFile(root, name string) (*os.File, error) {
 // fetchRemote asks the pack's agent for name from offset (a range request
 // when offset > 0) and returns the body with where it starts. The request is
 // given up once nothing has arrived for stallTimeout.
-func (e *Local) fetchRemote(ctx context.Context, o store.CopyOrder, name string, offset int64) (io.ReadCloser, int64, error) {
+func (e *storeWorker) fetchRemote(ctx context.Context, o store.CopyOrder, name string, offset int64) (io.ReadCloser, int64, error) {
 	rctx, cancel := context.WithCancel(ctx)
 	stall := time.AfterFunc(stallTimeout, cancel)
 	giveUp := func() {
@@ -597,7 +597,7 @@ func (w *watchedBody) Close() error {
 }
 
 // copyProblem is roundProblem for copies.
-func (e *Local) copyProblem(objectID, message string, err error) {
+func (e *storeWorker) copyProblem(objectID, message string, err error) {
 	e.roundProblem(&e.copies, objectID, message, err)
 }
 
@@ -662,7 +662,7 @@ func (p *PackServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	var root string
 	for _, e := range p.Executors {
-		for _, s := range e.servedStores() {
+		for _, s := range e.storeWork().servedStores() {
 			if _, isLocal := s.fs.(localStoreFS); isLocal && s.usable && s.decl.ID == read.StoreID && s.decl.Root == read.Root {
 				root = s.decl.Root
 			}

@@ -83,9 +83,9 @@ func TestACodeSnapshotIsPackedAndBroughtWhereItRuns(t *testing.T) {
 	fake := &fakeSources{fakeStores: &fakeStores{}, files: map[string]string{sp.ID + "/pack": sp.PackPath, sp.ID + "/list": sp.ListPath}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
 	src := &store.LaunchSource{ID: sp.ID, PackBytes: sp.PackBytes, PackSHA256: sp.PackSHA256, ListSHA256: sp.ListSHA256}
-	dir, err := e.ensureSource(ctx, src)
+	dir, err := e.storeWork().ensureSource(ctx, src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,13 +98,13 @@ func TestACodeSnapshotIsPackedAndBroughtWhereItRuns(t *testing.T) {
 	if exists(filepath.Join(dir, "notes.txt")) || exists(filepath.Join(dir, "src", "pkg", "__pycache__")) {
 		t.Fatal("unpacked what was not declared")
 	}
-	if _, err = e.ensureSource(ctx, src); err != nil || fake.fetched != 2 {
+	if _, err = e.storeWork().ensureSource(ctx, src); err != nil || fake.fetched != 2 {
 		t.Fatalf("brought again: %d fetches, %v", fake.fetched, err)
 	}
 	// a launch naming another pack: not unpacked
 	bad := &store.LaunchSource{ID: "src_" + strings.Repeat("1", 32), PackBytes: sp.PackBytes, PackSHA256: strings.Repeat("ab", 32), ListSHA256: sp.ListSHA256}
 	fake.files[bad.ID+"/pack"], fake.files[bad.ID+"/list"] = sp.PackPath, sp.ListPath
-	if _, err = e.ensureSource(ctx, bad); err == nil || exists(filepath.Join(root, sourcesDirName, bad.ID)) {
+	if _, err = e.storeWork().ensureSource(ctx, bad); err == nil || exists(filepath.Join(root, sourcesDirName, bad.ID)) {
 		t.Fatalf("a pack that is not the snapshot's was unpacked: %v", err)
 	}
 	if entries, _ := os.ReadDir(filepath.Join(root, sourcesDirName)); len(entries) != 2 {
@@ -157,7 +157,7 @@ func snapshotFixture(t *testing.T, files map[string]string) (*store.LaunchSource
 	fake := &fakeSources{fakeStores: &fakeStores{}, files: map[string]string{sp.ID + "/pack": sp.PackPath, sp.ID + "/list": sp.ListPath}}
 	executor := func(logs *bytes.Buffer) *Local {
 		e := storesExecutor(t, fake, logs)
-		e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
+		e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
 		return e
 	}
 	return &store.LaunchSource{ID: sp.ID, PackBytes: sp.PackBytes, PackSHA256: sp.PackSHA256, ListSHA256: sp.ListSHA256}, fake, root, executor
@@ -171,7 +171,7 @@ func TestASnapshotIsUnpackedReadOnlyWithItsScriptsExecutable(t *testing.T) {
 		"src/a.py":     "print('a')\n",
 	})
 	var logs bytes.Buffer
-	dir, err := executor(&logs).ensureSource(context.Background(), src)
+	dir, err := executor(&logs).storeWork().ensureSource(context.Background(), src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -225,19 +225,19 @@ func TestASnapshotChangedInPlaceIsSetAsideAndUnpackedAgain(t *testing.T) {
 			return os.Remove(filepath.Join(dir, "src", "pkg", "a.py"))
 		}},
 	} {
-		dir, err := e.ensureSource(ctx, src)
+		dir, err := e.storeWork().ensureSource(ctx, src)
 		if err != nil {
 			t.Fatal(err)
 		}
 		fetched := fake.fetched
-		if _, err = e.ensureSource(ctx, src); err != nil || fake.fetched != fetched {
+		if _, err = e.storeWork().ensureSource(ctx, src); err != nil || fake.fetched != fetched {
 			t.Fatalf("%s: an untouched snapshot brought again (%d fetches) %v", change.name, fake.fetched-fetched, err)
 		}
 		makeTreeWritable(dir)
 		if err := change.apply(dir); err != nil {
 			t.Fatal(err)
 		}
-		again, err := e.ensureSource(ctx, src)
+		again, err := e.storeWork().ensureSource(ctx, src)
 		if err != nil || again != dir || fake.fetched != fetched+2 {
 			t.Fatalf("%s: %s %v, %d fetches", change.name, again, err, fake.fetched-fetched)
 		}
@@ -264,7 +264,7 @@ func TestASnapshotUnpackedAtOnceByTwoExecutorsIsBroughtOnce(t *testing.T) {
 	errs := make(chan error, len(executors))
 	for _, e := range executors {
 		go func() {
-			_, err := e.ensureSource(context.Background(), src)
+			_, err := e.storeWork().ensureSource(context.Background(), src)
 			errs <- err
 		}()
 	}
@@ -363,15 +363,15 @@ func TestUnpackedSnapshotsNoLongerUsedAreRemoved(t *testing.T) {
 	fake := &keepingSources{fakeSources: &fakeSources{fakeStores: &fakeStores{}}, inUse: []string{id("b")}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
 	before, _ := os.ReadDir(base)
 	fake.err = errors.New("daemon unreachable")
-	e.cleanSources(context.Background())
+	e.storeWork().cleanSources(context.Background())
 	if after, _ := os.ReadDir(base); len(after) != len(before) {
 		t.Fatalf("removed without the daemon's word: %d of %d left", len(after), len(before))
 	}
 	fake.err = nil
-	e.cleanSources(context.Background())
+	e.storeWork().cleanSources(context.Background())
 	var left []string
 	entries, _ := os.ReadDir(base)
 	for _, entry := range entries {
@@ -441,7 +441,7 @@ func TestASourcesDirectoryThatIsALinkIsNotUsed(t *testing.T) {
 	var logs bytes.Buffer
 	e := executor(&logs)
 	e.Store = &keepingSources{fakeSources: fake}
-	e.cleanSources(context.Background())
+	e.storeWork().cleanSources(context.Background())
 	for _, p := range []string{filepath.Join(victim, "pkg", "a.py"), victim + stateSuffix} {
 		if _, err := os.Stat(p); err != nil {
 			t.Fatalf("removed through the link: %v\n%s", err, logs.String())
@@ -450,7 +450,7 @@ func TestASourcesDirectoryThatIsALinkIsNotUsed(t *testing.T) {
 	if !strings.Contains(logs.String(), "code snapshots not cleaned up") {
 		t.Fatalf("the link not reported:\n%s", logs.String())
 	}
-	if dir, err := e.ensureSource(context.Background(), src); err == nil {
+	if dir, err := e.storeWork().ensureSource(context.Background(), src); err == nil {
 		t.Fatalf("unpacked through the link in %s", dir)
 	}
 	if entries, _ := os.ReadDir(elsewhere); len(entries) != 2 {

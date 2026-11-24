@@ -33,7 +33,7 @@ func storeMoveMarkerBody(decl machine.Store) string {
 // moveStore brings decl, a store being moved, to its declared root: moved
 // when it is there (moved now, or before), else why not (it is not usable
 // meanwhile).
-func (e *Local) moveStore(sfs storeFS, decl machine.Store) (moved bool, problem string) {
+func (e *storeWorker) moveStore(sfs storeFS, decl machine.Store) (moved bool, problem string) {
 	if _, ok := sfs.(localStoreFS); !ok {
 		return false, "a store is moved only by an executor on its node's own filesystem (not inside WSL)"
 	}

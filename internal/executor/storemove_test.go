@@ -36,9 +36,9 @@ func TestAStoreBeingMovedIsRenamedOnceNothingUsesIt(t *testing.T) {
 		fake.mu.Lock()
 		fake.stores = []machine.Store{d}
 		fake.mu.Unlock()
-		e.storesAt = time.Time{}
-		e.refreshStores(context.Background())
-		served := e.servedStores()
+		e.storeWork().storesAt = time.Time{}
+		e.storeWork().refreshStores(context.Background())
+		served := e.storeWork().servedStores()
 		if len(served) != 1 {
 			t.Fatalf("served %+v", served)
 		}
@@ -55,7 +55,7 @@ func TestAStoreBeingMovedIsRenamedOnceNothingUsesIt(t *testing.T) {
 	if _, err := os.Stat(to); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the new root was made while waiting: %v", err)
 	}
-	if obs := e.observeStore(context.Background(), s); obs.Usable || obs.MovedFrom != "" {
+	if obs := e.storeWork().observeStore(context.Background(), s); obs.Usable || obs.MovedFrom != "" {
 		t.Fatalf("waiting observation: %+v", obs)
 	}
 
@@ -70,7 +70,7 @@ func TestAStoreBeingMovedIsRenamedOnceNothingUsesIt(t *testing.T) {
 	if body, err := os.ReadFile(filepath.Join(to, "scratch", "att_1", "kept.txt")); err != nil || string(body) != "k" {
 		t.Fatalf("what was in the store: %q %v", body, err)
 	}
-	if obs := e.observeStore(context.Background(), s); !obs.Usable || obs.MovedFrom != from || obs.Root != to {
+	if obs := e.storeWork().observeStore(context.Background(), s); !obs.Usable || obs.MovedFrom != from || obs.Root != to {
 		t.Fatalf("moved observation: %+v", obs)
 	}
 	// Asked again before the daemon has recorded it: there, moved.

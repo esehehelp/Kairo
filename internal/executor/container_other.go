@@ -15,4 +15,4 @@ const (
 	containerSweepTimeout  = time.Minute
 )
 
-func (e *Local) sweepContainers(context.Context) {}
+func (e *storeWorker) sweepContainers(context.Context) {}
