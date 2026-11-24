@@ -39,6 +39,10 @@ const (
 	frameError  = 7
 )
 
+// rankReleaseWait is how long a hello waits for the connection its rank
+// had to be noticed gone (a handler notices within its take wait).
+const rankReleaseWait = 5 * time.Second
+
 // ProtocolVersion is the protocol's version a hello names.
 const ProtocolVersion = 1
 
@@ -216,8 +220,15 @@ func (s *Server) join(hello Hello) (int, error) {
 	if hello.Rank < 0 || hello.Rank >= world {
 		return 0, fmt.Errorf("no rank %d of %d", hello.Rank, world)
 	}
-	if s.taken[hello.Rank] {
-		return 0, fmt.Errorf("%w: rank %d is being taken by another process", ErrRankTaken, hello.Rank)
+	// a taker coming back right after its connection broke may find the old
+	// one not noticed gone yet: it is given a while to go
+	for deadline := time.Now().Add(rankReleaseWait); s.taken[hello.Rank]; {
+		if time.Now().After(deadline) {
+			return 0, fmt.Errorf("%w: rank %d is being taken by another process", ErrRankTaken, hello.Rank)
+		}
+		s.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+		s.mu.Lock()
 	}
 	s.taken[hello.Rank] = true
 	if hello.Position != nil {
