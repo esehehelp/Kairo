@@ -1,9 +1,11 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -83,7 +85,7 @@ func TestBackendsRefuseWhatTheyCannotRun(t *testing.T) {
 		t.Errorf("confined inside WSL: %v", err)
 	}
 	cmd, conf, err := executor("linux").backend().launcher(launch())
-	if err != nil || conf != nil || cmd.Dir != "/work" || !strings.HasSuffix(cmd.Args[0], "python") {
+	if err != nil && !errors.Is(err, exec.ErrNotFound) || cmd == nil || conf != nil || cmd.Dir != "/work" || cmd.Args[0] != "python" {
 		t.Errorf("host launcher %v %v %v", cmd, conf, err)
 	}
 }

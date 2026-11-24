@@ -25,7 +25,8 @@ import (
 type backend interface {
 	// launcher builds an attempt's launcher, which its shim runs (shim.go),
 	// and the confinement the shim applies to it (nil: none, or the backend
-	// confines the attempt itself).
+	// confines the attempt itself). On an error the launch is refused; the
+	// command may still be returned (argv[0] not found: as built).
 	launcher(launch *store.Launch) (*exec.Cmd, *confinement, error)
 	// liveness is that of a process an attempt registered in the executor's
 	// namespace.
@@ -129,7 +130,8 @@ func (b hostBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, er
 	}
 	cmd.Env = append(parent, own...)
 	if cmd.Err != nil {
-		return nil, nil, cmd.Err
+		// argv[0] not found: the command as built, with why
+		return cmd, nil, cmd.Err
 	}
 	if launch.Source != nil {
 		// run in its code snapshot, cwd relative to it (source.go)

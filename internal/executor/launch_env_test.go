@@ -2,6 +2,7 @@ package executor
 
 import (
 	"encoding/json"
+	"errors"
 	"os/exec"
 	"path/filepath"
 	"runtime"
@@ -32,10 +33,10 @@ func testLaunch() *store.Launch {
 func launcherOf(t *testing.T, e *Local, launch *store.Launch) *exec.Cmd {
 	t.Helper()
 	cmd, _, err := e.backend().launcher(launch)
-	if err != nil {
+	if err != nil && (cmd == nil || !errors.Is(err, exec.ErrNotFound)) {
 		t.Fatal(err)
 	}
-	return cmd
+	return cmd // as built, also when argv[0] is not on this machine
 }
 
 func envValue(env []string, name string) (string, bool) {
