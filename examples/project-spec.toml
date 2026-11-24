@@ -12,7 +12,7 @@ policy = "RunToCompletion@v1"
 [tasks.execution]
 schema_version = 2
 argv = ["uv", "run", "project", "train", "--config", "configs/train/model-v1.toml"]
-cwd = "D:/Dev/example-project"
+cwd = "D:/work/example-project"
 priority = 10
 checkpointable = true
 preemptible = true
@@ -44,7 +44,7 @@ policy = "RunToCompletion@v1"
 [tasks.execution]
 schema_version = 2
 argv = ["uv", "run", "project", "export", "--config", "configs/export/model-v1.toml"]
-cwd = "D:/Dev/example-project"
+cwd = "D:/work/example-project"
 priority = 10
 checkpointable = false
 preemptible = false

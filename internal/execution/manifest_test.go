@@ -8,7 +8,7 @@ import (
 func TestParseExecutionDefaults(t *testing.T) {
 	parsed, err := Parse([]byte(`schema_version=2
 client_request_id="train/one"
-project="llm-develop"
+project="example-train"
 queue="training"
 task="model"
 argv=["python", "train.py"]

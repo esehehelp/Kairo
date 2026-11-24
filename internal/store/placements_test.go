@@ -26,7 +26,7 @@ func TestAnInputIsBroughtToTheNodeItIsReadOn(t *testing.T) {
 	if err := store.UpsertExecutor(ctx, Executor{ID: "exec2", NodeID: "node2", Kind: "linux", Attributes: json.RawMessage(`{"environment":"linux"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpsertExecutor(ctx, Executor{ID: "win-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows","pack_addr":"192.168.1.12:7475"}`), Enabled: true}); err != nil {
+	if err := store.UpsertExecutor(ctx, Executor{ID: "win-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows","pack_addr":"192.0.2.12:7475"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	addTestDisk(t, store, "node2", "/")
@@ -96,7 +96,7 @@ func TestAnInputIsBroughtToTheNodeItIsReadOn(t *testing.T) {
 		t.Fatalf("fetches %+v %v", fetches, err)
 	}
 	f := fetches[0]
-	if f.ObjectID != objectID || f.StoreID != "n2-scratch" || f.Source.Local || f.Source.Addr != "192.168.1.12:7475" || f.Source.Month != c.Month || f.Source.StoreID != "e-durable" || f.Source.Token == "" {
+	if f.ObjectID != objectID || f.StoreID != "n2-scratch" || f.Source.Local || f.Source.Addr != "192.0.2.12:7475" || f.Source.Month != c.Month || f.Source.StoreID != "e-durable" || f.Source.Token == "" {
 		t.Fatalf("fetch order %+v", f)
 	}
 	read, err := store.AuthorizePackRead(ctx, "node", objectID, f.Source.Token)

@@ -2,8 +2,8 @@
 # one physical host. It changes the settings of the devices of the host whose
 # `controller` (examples/machines.toml) is this node, and nothing else. Run it
 # elevated on Windows and as root on Linux (see README, Hardware settings).
-server_url = "https://192.168.1.12:7474"
-# kairo token create --config kairo.toml --name pve0-host --role node --node pve0-host
+server_url = "https://192.0.2.12:7474"
+# kairo token create --config kairo.toml --name host-a-host --role node --node host-a-host
 token = "kairo_node_..."
 ca_file = "/etc/kairo/ca.pem"
 # poll_interval_seconds = 10   # how often the desired settings are fetched
@@ -11,4 +11,4 @@ ca_file = "/etc/kairo/ca.pem"
 # state_file = "/etc/kairo/kairo-controller.state.json"   # default: next to this file
 
 [node]
-id = "pve0-host"   # a node of its own: it has no executors and is never scheduled
+id = "host-a-host"   # a node of its own: it has no executors and is never scheduled

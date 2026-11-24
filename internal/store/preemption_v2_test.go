@@ -184,13 +184,13 @@ func TestPriorityPreemptionRejectsUnsafeGPUEvidence(t *testing.T) {
 func TestPriorityPreemptionCrossesExecutorsOnTheSamePhysicalNode(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)
-	if err := store.UpsertExecutor(context.Background(), Executor{ID: "ubuntu-wsl", NodeID: "node", Kind: "wsl2", Attributes: json.RawMessage(`{"environment":"wsl2"}`), Enabled: true}); err != nil {
+	if err := store.UpsertExecutor(context.Background(), Executor{ID: "wsl-exec", NodeID: "node", Kind: "wsl2", Attributes: json.RawMessage(`{"environment":"wsl2"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpsertExecutor(context.Background(), Executor{ID: "windows-local", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
+	if err := store.UpsertExecutor(context.Background(), Executor{ID: "win-local", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	_, launch := startPreemptionVictimWithUnattributedPolicy(t, store, "ubuntu-wsl", true, 10, "allow")
+	_, launch := startPreemptionVictimWithUnattributedPolicy(t, store, "wsl-exec", true, 10, "allow")
 	if err := store.ObserveClaim(context.Background(), ExternalClaim{ID: "wsl-gpu-activity", ResourceID: "gpu-0", ClaimKind: "unattributed_activity"}); err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +200,7 @@ func TestPriorityPreemptionCrossesExecutorsOnTheSamePhysicalNode(t *testing.T) {
 	if _, _, err := store.SubmitExecution(context.Background(), waitingSpec); err != nil {
 		t.Fatal(err)
 	}
-	commands, err := store.EnsurePriorityPreemption(context.Background(), "windows-local")
+	commands, err := store.EnsurePriorityPreemption(context.Background(), "win-local")
 	if err != nil || len(commands) != 1 {
 		t.Fatalf("cross-executor preemption commands=%v err=%v", commands, err)
 	}

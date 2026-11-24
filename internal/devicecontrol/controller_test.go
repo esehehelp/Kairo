@@ -397,7 +397,7 @@ func (d *trimDaemon) RecordTrim(_ context.Context, _ string, done store.TrimDone
 // A controller trims the containers the daemon says, at most every
 // trimPoll, and reports how each went.
 func TestTheControllerTrimsContainersAfterDeletions(t *testing.T) {
-	daemon := &trimDaemon{fakeDaemon: &fakeDaemon{}, orders: []store.TrimOrder{{NodeID: "pve0-neo-train", VMID: 101, RequestedBytes: 1 << 30}, {NodeID: "pve0-glm", VMID: 105}}}
+	daemon := &trimDaemon{fakeDaemon: &fakeDaemon{}, orders: []store.TrimOrder{{NodeID: "host-a-gpu", VMID: 101, RequestedBytes: 1 << 30}, {NodeID: "host-a-infer", VMID: 105}}}
 	c := &clock{t: time.Date(2026, 11, 6, 12, 0, 0, 0, time.UTC)}
 	ctl := newTestController(daemon.fakeDaemon, &fakeActuator{}, &fakeActuator{}, nil, c)
 	ctl.Daemon, ctl.trimSync = daemon, true
@@ -412,8 +412,8 @@ func TestTheControllerTrimsContainersAfterDeletions(t *testing.T) {
 	ctx := context.Background()
 	ctl.Step(ctx)
 	if len(trimmed) != 2 || trimmed[0] != 101 || trimmed[1] != 105 || len(daemon.done) != 2 ||
-		daemon.done[0] != (store.TrimDone{NodeID: "pve0-neo-train", Output: "/: 1 GiB (1073741824 bytes) trimmed"}) ||
-		daemon.done[1].NodeID != "pve0-glm" || daemon.done[1].Problem != "pct: not running" {
+		daemon.done[0] != (store.TrimDone{NodeID: "host-a-gpu", Output: "/: 1 GiB (1073741824 bytes) trimmed"}) ||
+		daemon.done[1].NodeID != "host-a-infer" || daemon.done[1].Problem != "pct: not running" {
 		t.Fatalf("trimmed %v, reported %+v", trimmed, daemon.done)
 	}
 	ctl.Step(ctx)

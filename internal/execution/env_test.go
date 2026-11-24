@@ -7,7 +7,7 @@ import (
 
 const envBase = `schema_version=2
 client_request_id="train/one"
-project="llm-develop"
+project="example-train"
 queue="training"
 task="model"
 argv=["python", "train.py"]
@@ -25,7 +25,7 @@ func TestExecutionWithoutEnvKeepsItsDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Digest != "aacd8a34bc39ba9a4a49ebb9c9acd588a17577246eee005a2b72d3044bcdacf0" {
+	if parsed.Digest != "bdfed225e8e43113d1587f071940166abf70999c1d6b5b717f79ecbb7f3d3254" {
 		t.Fatalf("digest changed: %s\n%s", parsed.Digest, parsed.Normalized)
 	}
 }

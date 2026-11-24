@@ -15,11 +15,11 @@ func TestStoreStatusPrintsStoresAndKeptScratch(t *testing.T) {
 	stores := []store.StoreStatus{
 		{Store: machine.Store{ID: "e-durable", Class: "durable", Node: "win", Root: "E:/kairo", Filesystem: "E:"}, State: "unusable", Problem: &problem, Kept: []store.KeptScratch{},
 			CopyBytes: 6 << 30, Copies: 3, Damaged: []store.DamagedCopy{{ObjectID: "obj_9", Path: "E:/kairo/objects/202611/obj_9.tar.zst", Problem: "read back as 9 bytes", CheckedAt: since}}},
-		{Store: machine.Store{ID: "pool", Class: "volatile", Node: "pve0", Root: "/srv/kairo", Filesystem: "/"}, State: "ready",
+		{Store: machine.Store{ID: "pool", Class: "volatile", Node: "host-a", Root: "/srv/kairo", Filesystem: "/"}, State: "ready",
 			TotalBytes: gib(300), FreeBytes: gib(100), ScratchActiveBytes: 2 << 30, ScratchKeptBytes: 1 << 30, OutputBytes: 3 << 30, Outputs: 2, ExternalBytes: gib(194),
 			Kept:    []store.KeptScratch{{AttemptID: "att_1", ExecutionID: "exe_1", Task: "neo/train/run", Path: "/srv/kairo/scratch/att_1", Bytes: gib(1), KeptAt: &kept, Reason: &reason}},
 			Missing: []store.KeptScratch{{AttemptID: "att_2", ExecutionID: "exe_2", Task: "neo/train/gone", Path: "/srv/kairo/scratch/att_2", MissingAt: &since}}},
-		{Store: machine.Store{ID: "wsl", Class: "volatile", Node: "win", Executor: "ubuntu-wsl", Root: "/var/tmp/kairo", Filesystem: "D:"}, State: "unknown", Kept: []store.KeptScratch{}},
+		{Store: machine.Store{ID: "wsl", Class: "volatile", Node: "win", Executor: "wsl-exec", Root: "/var/tmp/kairo", Filesystem: "D:"}, State: "unknown", Kept: []store.KeptScratch{}},
 	}
 	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/api/stores" {
@@ -34,10 +34,10 @@ func TestStoreStatusPrintsStoresAndKeptScratch(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"STORE      CLASS     NODE            STATE     ROOT            FILESYSTEM  TOTAL    FREE     ACTIVE  KEPT   OUTPUTS    PACKS  COPIES     PINNED  CACHE  EXTERNAL",
-		"e-durable  durable   win             unusable  E:/kairo        E:          -        -        0 B     0 B    0 B        0 B    6 GiB (3)  0 B     0 B    -",
-		"pool       volatile  pve0            ready     /srv/kairo      /           300 GiB  100 GiB  2 GiB   1 GiB  3 GiB (2)  0 B    0 B        0 B     0 B    194 GiB",
-		"wsl        volatile  win/ubuntu-wsl  unknown   /var/tmp/kairo  D:          -        -        0 B     0 B    0 B        0 B    0 B        0 B     0 B    -",
+		"STORE      CLASS     NODE          STATE     ROOT            FILESYSTEM  TOTAL    FREE     ACTIVE  KEPT   OUTPUTS    PACKS  COPIES     PINNED  CACHE  EXTERNAL",
+		"e-durable  durable   win           unusable  E:/kairo        E:          -        -        0 B     0 B    0 B        0 B    6 GiB (3)  0 B     0 B    -",
+		"pool       volatile  host-a        ready     /srv/kairo      /           300 GiB  100 GiB  2 GiB   1 GiB  3 GiB (2)  0 B    0 B        0 B     0 B    194 GiB",
+		"wsl        volatile  win/wsl-exec  unknown   /var/tmp/kairo  D:          -        -        0 B     0 B    0 B        0 B    0 B        0 B     0 B    -",
 		"damaged copies on e-durable (read back unlike their pack; nothing was deleted):",
 		"obj_9   2026-11-03T04:05:06Z  E:/kairo/objects/202611/obj_9.tar.zst  read back as 9 bytes",
 		"e-durable: root E:/kairo is not on filesystem E:",

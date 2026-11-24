@@ -51,7 +51,7 @@ func envValue(env []string, name string) (string, bool) {
 func TestNativeLaunchEnvironment(t *testing.T) {
 	t.Setenv("KAIRO_TOKEN", "kairo_admin_operator")
 	t.Setenv("KAIRO_ATTEMPT_TOKEN", "kairo_worker_stale")
-	e := &Local{ID: "windows-local", NodeID: "host", Kind: "windows", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
+	e := &Local{ID: "win-local", NodeID: "host", Kind: "windows", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
 	cmd := launcherOf(t, e, testLaunch())
 	if !slices.Equal(cmd.Args, []string{"python", "train.py", "--steps", "10"}) || cmd.Dir != "/work" {
 		t.Fatalf("command %q in %q", cmd.Args, cmd.Dir)
@@ -84,7 +84,7 @@ func TestGPUBindingIsTheUUID(t *testing.T) {
 		{ID: "gpu-b", Binding: json.RawMessage(`{"cuda_index":"1","uuid":"GPU-bbbb"}`)},
 		{ID: "gpu-a", Binding: json.RawMessage(`{"cuda_index":"0","uuid":"GPU-aaaa"}`)},
 	}
-	e := &Local{ID: "pve0", NodeID: "node", Kind: "linux", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
+	e := &Local{ID: "host-a", NodeID: "node", Kind: "linux", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
 	env := e.launchEnv(launch)
 	for name, want := range map[string]string{"CUDA_VISIBLE_DEVICES": "GPU-bbbb,GPU-aaaa", "KAIRO_RESOURCE_BINDINGS": "GPU-bbbb,GPU-aaaa", "KAIRO_RESOURCE_IDS": "gpu-b,gpu-a"} {
 		if got, ok := envValue(env, name); !ok || got != want {
@@ -99,7 +99,7 @@ func TestDeclaredEnvOverridesTheParentButNotKairo(t *testing.T) {
 	t.Setenv("PYTHONUTF8", "0")
 	launch := testLaunch()
 	launch.Env = map[string]string{"PYTHONUTF8": "1", "path": `C:\only`, "RANK": "7", "CUDA_VISIBLE_DEVICES": "9", "Zeta": "z", "Alpha": "a"}
-	e := &Local{ID: "windows-local", NodeID: "host", Kind: "windows", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
+	e := &Local{ID: "win-local", NodeID: "host", Kind: "windows", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
 	cmd := launcherOf(t, e, launch)
 	values := func(name string) []string {
 		var out []string
@@ -147,8 +147,8 @@ func TestInputsAreHandedByPathOrRefuseTheLaunch(t *testing.T) {
 	if err := e.checkInputs(launch); err == nil || !strings.Contains(err.Error(), "input gone") {
 		t.Fatalf("a missing input: %v", err)
 	}
-	launch.Inputs = []store.LaunchInput{{Name: "far", Problem: "it is on node pve0-neo-train, not on node"}}
-	if err := e.checkInputs(launch); err == nil || !strings.Contains(err.Error(), "input far: it is on node pve0-neo-train") {
+	launch.Inputs = []store.LaunchInput{{Name: "far", Problem: "it is on node host-a-gpu, not on node"}}
+	if err := e.checkInputs(launch); err == nil || !strings.Contains(err.Error(), "input far: it is on node host-a-gpu") {
 		t.Fatalf("an input elsewhere: %v", err)
 	}
 	if _, ok := envValue(e.launchEnv(launch), "KAIRO_INPUT_FAR"); ok {

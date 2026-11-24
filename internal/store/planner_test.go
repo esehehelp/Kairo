@@ -384,7 +384,7 @@ func TestPlannerRecordsThatNoExecutorMatches(t *testing.T) {
 func TestPlannerRunsSmallWorkBesideAnElasticExecution(t *testing.T) {
 	c := newPlanCluster(t)
 	c.node("a", 0, 16000, 64, 500)
-	serving := planSpec("serving", "glm", -100, 0, 16000, 20)
+	serving := planSpec("serving", "infer", -100, 0, 16000, 20)
 	serving.Capacity.CPUMillisMin = 4000
 	c.submit(serving)
 	c.start("exec-a")

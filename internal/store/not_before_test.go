@@ -13,7 +13,7 @@ func at(d time.Duration) string { return time.Now().Add(d).Format(time.RFC3339) 
 func TestPlannerAdmitsNothingAndHoldsNothingLongBeforeNotBefore(t *testing.T) {
 	c := newPlanCluster(t)
 	c.node("a", 1, 16000, 64, 500)
-	spec := planSpec("predict", "rhllem", 10, 1, 2000, 16)
+	spec := planSpec("predict", "example-llm", 10, 1, 2000, 16)
 	spec.NotBefore = at(3 * time.Hour)
 	predict := c.submit(spec)
 	if r := c.reserve("exec-a"); r != nil {
@@ -34,7 +34,7 @@ func TestPlannerHoldsForANearNotBefore(t *testing.T) {
 	c.node("a", 1, 16000, 64, 500)
 	c.ran(planSpec("eval-1", "p3", 0, 0, 1000, 1), 10*time.Minute)
 	c.ran(planSpec("long-1", "p3", 0, 0, 1000, 1), 5*time.Hour)
-	spec := planSpec("predict", "rhllem", 10, 1, 2000, 16)
+	spec := planSpec("predict", "example-llm", 10, 1, 2000, 16)
 	spec.NotBefore = at(time.Hour)
 	predict := c.submit(spec)
 	long := c.submit(planSpec("long-2", "p3", 0, 1, 1000, 1))
@@ -56,7 +56,7 @@ func TestPlannerHoldsForANearNotBefore(t *testing.T) {
 	// The time has come (declared an hour ago): an execution is admitted.
 	c2 := newPlanCluster(t)
 	c2.node("a", 1, 16000, 64, 500)
-	past := planSpec("predict", "rhllem", 10, 1, 2000, 16)
+	past := planSpec("predict", "example-llm", 10, 1, 2000, 16)
 	past.NotBefore = at(-time.Hour)
 	c2.expectReserved("exec-a", c2.submit(past))
 }
@@ -123,7 +123,7 @@ func TestPlannerHoldsForANotBeforeWhereItWillFit(t *testing.T) {
 		c.submit(planSpec(name, "p1", 0, 1, 1000, 1))
 		c.start("exec-a")
 	}
-	spec := planSpec("predict", "rhllem", 10, 1, 1000, 1)
+	spec := planSpec("predict", "example-llm", 10, 1, 1000, 1)
 	spec.NotBefore = at(time.Hour)
 	predict := c.submit(spec)
 	fresh := c.submit(planSpec("fresh", "p4", 0, 2, 1000, 1))
@@ -144,7 +144,7 @@ func TestPlannerSuspendsNothingForANotBeforeHold(t *testing.T) {
 	c.node("a", 2, 16000, 64, 500)
 	c.submit(planSpec("victim", "p1", 0, 1, 1000, 1))
 	c.start("exec-a")
-	spec := planSpec("predict", "rhllem", 10, 1, 1000, 1)
+	spec := planSpec("predict", "example-llm", 10, 1, 1000, 1)
 	spec.NotBefore = at(time.Hour)
 	c.submit(spec)
 	c.submit(planSpec("mid", "p2", 5, 1, 1000, 1))

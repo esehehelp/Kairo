@@ -1,4 +1,4 @@
-//! The public API of neo-ime's `kairo-progress` crate, on top of
+//! The public API of the earlier `kairo-progress` crate, on top of
 //! [`crate::report`]: a dependency renamed to `kairo_progress` keeps
 //! `kairo_progress::Progress` working unchanged.
 

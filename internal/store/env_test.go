@@ -21,7 +21,7 @@ func TestExecutionSpecWithoutEnvKeepsItsDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if plain != "72c97292b3c56092c5a009e4607501505d05f11f51b52b427dd046bfd3b92b67" || gang != "18952961c32447398e9d1245ad2ad50492649f36d2a2c0392bfb102ec58fc271" {
+	if plain != "5ba34f7519c722dff5f40c160567a9de6b3717cd942bf7419b93f4db664861f6" || gang != "ccb3e6ea80a44533e8a35314ffc7ddf3cd105264d8004f1bfb442074f9d3e659" {
 		t.Fatalf("digests changed: %s %s", plain, gang)
 	}
 	withEnv := testExecutionSpec("pin")

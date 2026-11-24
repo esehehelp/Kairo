@@ -3,9 +3,9 @@
 # the check from that tree with the build caches in the project's cache directory (KAIRO_CACHE_DIR), and removes the
 # tree. Attempts are confined (README: Confinement): those are the only places they may write, and on Windows they run
 # at Low integrity, where Git Bash does not start, so the Windows checks run ci/check.ps1 in PowerShell. Priority -500:
-# CI waits for everyone's work and preempts nothing (the lowest serving is -100). The checks on pve1-work reserve
-# 3 GiB of its 4 GiB each, so the planner runs them one at a time (on pve1-work itself, which has the test PostgreSQL
-# and /srv/kairo-ci, not on another node of site pve1); those on windows-local run beside each other.
+# CI waits for everyone's work and preempts nothing (the lowest serving is -100). The Linux checks run on the Linux CI
+# node (@CI_LINUX_NODE@, of site @CI_LINUX_SITE@: site.env), which has the test PostgreSQL and /srv/kairo-ci, and
+# reserve 3 GiB each, so on a 4 GiB node the planner runs them one at a time; the Windows checks run beside each other.
 schema_version = 1
 
 [project]
@@ -27,8 +27,8 @@ name = "@SHA@-linux"
 argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; trap 'rm -rf \"$d\" \"$t\"' EXIT; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; chmod 755 \"$KAIRO_SCRATCH\" \"$c\"; chown -R ci:ci \"$d\" \"$t\"; chown ci:ci \"$c/ci-build\" \"$c/ci-mod\"; cd \"$d\"; setpriv --reuid=ci --regid=ci --init-groups env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux"]
 cwd = "/srv/kairo-ci"
 [tasks.execution.executor]
-labels = { site = "pve1" }
-node = "pve1-work"
+labels = { site = "@CI_LINUX_SITE@" }
+node = "@CI_LINUX_NODE@"
 [tasks.execution.capacity]
 cpu_millis = 6000
 ram_bytes = 3221225472
@@ -40,8 +40,8 @@ name = "@SHA@-linux-race"
 argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; trap 'rm -rf \"$d\" \"$t\"' EXIT; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; chmod 755 \"$KAIRO_SCRATCH\" \"$c\"; chown -R ci:ci \"$d\" \"$t\"; chown ci:ci \"$c/ci-build\" \"$c/ci-mod\"; cd \"$d\"; setpriv --reuid=ci --regid=ci --init-groups env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux-race"]
 cwd = "/srv/kairo-ci"
 [tasks.execution.executor]
-labels = { site = "pve1" }
-node = "pve1-work"
+labels = { site = "@CI_LINUX_SITE@" }
+node = "@CI_LINUX_NODE@"
 [tasks.execution.capacity]
 cpu_millis = 6000
 ram_bytes = 3221225472
@@ -53,8 +53,8 @@ name = "@SHA@-linux-root"
 argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; c=$KAIRO_CACHE_DIR; trap 'rm -rf \"$d\"' EXIT; mkdir -p \"$d\"; tar -xf /srv/kairo-ci/src/@SHA@.tar -C \"$d\"; cd \"$d\"; GOCACHE=\"$c/root-build\" GOMODCACHE=\"$c/root-mod\" bash ci/check.sh linux-root"]
 cwd = "/srv/kairo-ci"
 [tasks.execution.executor]
-labels = { site = "pve1" }
-node = "pve1-work"
+labels = { site = "@CI_LINUX_SITE@" }
+node = "@CI_LINUX_NODE@"
 [tasks.execution.capacity]
 cpu_millis = 4000
 ram_bytes = 3221225472

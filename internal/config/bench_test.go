@@ -8,11 +8,11 @@ import (
 )
 
 func TestBenchProgramsAreReportedWithTheNode(t *testing.T) {
-	path := writeConfig(t, `server_url = "https://192.168.1.12:7474"
+	path := writeConfig(t, `server_url = "https://192.0.2.12:7474"
 token = "kairo_node_x"
 [node]
-id = "pve0-train"
-name = "pve0-train"
+id = "host-a-train"
+name = "host-a-train"
 labels = { interconnect_addr = "10.0.0.2" }
 [bench]
 gpu_binary = "/opt/kairo/kairo-bench-gpu"

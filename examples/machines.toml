@@ -6,15 +6,15 @@
 # of one host): a lease through any of them excludes the rest.
 
 [[nodes]]
-id = "windows-host-1"
+id = "win-node"
 gpus = ["GPU-00000000-0000-0000-0000-000000000000"]
 
 [[nodes]]
-id = "pve0-neo-train"
+id = "host-a-gpu"
 gpus = ["GPU-11111111-1111-1111-1111-111111111111"]
 
 [[nodes]]
-id = "pve0-glm"
+id = "host-a-infer"
 gpus = ["GPU-11111111-1111-1111-1111-111111111111"]
 
 # Hosts are optional. A host declares only policy and authority: its devices
@@ -23,9 +23,9 @@ gpus = ["GPU-11111111-1111-1111-1111-111111111111"]
 # and only its controller node (`kairo controller`) may change their settings
 # (no controller: observe only).
 [[hosts]]
-id = "pve0"
-nodes = ["pve0-neo-train", "pve0-glm"]
-controller = "pve0-host"
+id = "host-a"
+nodes = ["host-a-gpu", "host-a-infer"]
+controller = "host-a-host"
 max_slowdown = 0.05
 
 [[hosts.devices]]                 # a device's own policy
@@ -37,9 +37,9 @@ id = "cpu"
 control = false                   # never changed, never benched: observe only
 
 [[hosts]]
-id = "windows-host-1"
-nodes = ["windows-host-1"]
-controller = "windows-host-1-ctl"
+id = "win-node"
+nodes = ["win-node"]
+controller = "win-node-ctl"
 
 # Stores are optional: the places Kairo keeps data in (README, Data stores).
 # A durable store is kept for good (Kairo never deletes from it); a volatile
@@ -48,15 +48,15 @@ controller = "windows-host-1-ctl"
 # [[stores]]
 # id = "e-durable"
 # class = "durable"
-# node = "windows-host-1"
+# node = "win-node"
 # root = "E:/kairo"
 # filesystem = "E:"
 # backend = "local-fs"
 # reserve_free_bytes = 214748364800
 #
 # [[stores]]
-# id = "pve0-train-scratch"
+# id = "host-a-train-scratch"
 # class = "volatile"
-# node = "pve0-neo-train"
+# node = "host-a-gpu"
 # root = "/srv/kairo-data"
 # filesystem = "/"

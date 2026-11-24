@@ -19,14 +19,14 @@ reserve_free_bytes = 214748364800
 id = "win-scratch"
 class = "volatile"
 node = "win"
-executor = "windows-local"
+executor = "win-local"
 root = "F:/kairo/scratch-root"
 filesystem = "F:"
 
 [[stores]]
-id = "pve0-pool"
+id = "host-a-pool"
 class = "volatile"
-node = "pve0-train"
+node = "host-a-train"
 root = "/srv/kairo"
 filesystem = "/"
 `
@@ -43,11 +43,11 @@ func TestStoresParse(t *testing.T) {
 	if e.ID != "e-durable" || e.Class != StoreDurable || e.Node != "win" || e.Root != "E:/kairo" || e.Filesystem != "E:" || e.Backend != StoreBackendLocalFS || e.ReserveFreeBytes != 200<<30 {
 		t.Fatalf("e-durable: %+v", e)
 	}
-	if w := spec.Stores[1]; w.Executor != "windows-local" || w.Backend != "" || w.Normalized().Backend != StoreBackendLocalFS {
+	if w := spec.Stores[1]; w.Executor != "win-local" || w.Backend != "" || w.Normalized().Backend != StoreBackendLocalFS {
 		t.Fatalf("win-scratch: %+v", w)
 	}
 	ids := spec.NodeIDs()
-	if strings.Join(ids, ",") != "pve0-glm,pve0-train,win" {
+	if strings.Join(ids, ",") != "host-a-infer,host-a-train,win" {
 		t.Fatalf("node ids %v", ids)
 	}
 }
@@ -93,7 +93,7 @@ func TestStoreValidation(t *testing.T) {
 		})
 	}
 	// One root on two nodes is two places; two roots side by side are too.
-	other := store("id = \"t\"\nclass = \"durable\"\nnode = \"pve0-train\"\nfilesystem = \"/\"\nroot = \"/k\"\n")
+	other := store("id = \"t\"\nclass = \"durable\"\nnode = \"host-a-train\"\nfilesystem = \"/\"\nroot = \"/k\"\n")
 	if _, err := Parse(nodes + store(base+"root = \"/k\"\n") + other); err != nil {
 		t.Fatalf("one root on two nodes: %v", err)
 	}
@@ -136,13 +136,13 @@ func TestRebasePath(t *testing.T) {
 }
 
 // durable is a second store, t, durable on node win at root; named one
-// naming executor windows-local.
+// naming executor win-local.
 func durable(root string) string {
 	return "[[stores]]\nid = \"t\"\nclass = \"durable\"\nnode = \"win\"\nfilesystem = \"D:\"\nroot = \"" + root + "\"\n"
 }
 
 func named(root string) string {
-	return "[[stores]]\nid = \"w\"\nclass = \"volatile\"\nnode = \"win\"\nexecutor = \"windows-local\"\nfilesystem = \"D:\"\nroot = \"" + root + "\"\n"
+	return "[[stores]]\nid = \"w\"\nclass = \"volatile\"\nnode = \"win\"\nexecutor = \"win-local\"\nfilesystem = \"D:\"\nroot = \"" + root + "\"\n"
 }
 
 func TestStoreRootKey(t *testing.T) {

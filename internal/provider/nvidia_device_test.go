@@ -64,7 +64,7 @@ func TestNVIDIAReadsPowerClocksAndStatePerGPU(t *testing.T) {
 		}
 		asked = append(asked, args[0])
 		return queryAnswer(args,
-			inventory("GPU-e710f4db-fe00-ca74-7acc-e8ef0092d37c, 0, 10240, 9000, 97, 66",
+			inventory("GPU-aaaaaaaa-0000-0000-0000-000000000000, 0, 10240, 9000, 97, 66",
 				"power.draw.average=110.93", "power.draw=110.99", "enforced.power.limit=320.00", "power.default_limit=320.00", "power.min_limit=100.00", "power.max_limit=350.00",
 				"clocks.sm=1800", "clocks.mem=9251", "clocks.max.sm=2130", "clocks.max.mem=9501", "pstate=P2", "clocks_event_reasons.active=0x0000000000000004",
 				"pcie.link.gen.gpucurrent=4", "pcie.link.gen.max=4", "pcie.link.width.current=16", "pcie.link.width.max=16", "utilization.memory=31", "fan.speed=45"),

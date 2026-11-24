@@ -172,8 +172,8 @@ func TestWhoAmI(t *testing.T) {
 	if status != http.StatusOK || !bytes.Contains(payload, []byte(`"role":"admin"`)) || !bytes.Contains(payload, []byte(`"name":"operator"`)) {
 		t.Fatalf("whoami: %d %s", status, payload)
 	}
-	node := d.token(t, "agent", store.RoleNode, "pve0")
-	if _, payload = d.call(t, http.MethodGet, "/api/whoami", node, nil); !bytes.Contains(payload, []byte(`"node_id":"pve0"`)) {
+	node := d.token(t, "agent", store.RoleNode, "host-a")
+	if _, payload = d.call(t, http.MethodGet, "/api/whoami", node, nil); !bytes.Contains(payload, []byte(`"node_id":"host-a"`)) {
 		t.Fatalf("node whoami: %s", payload)
 	}
 }
@@ -194,7 +194,7 @@ func TestRevokedTokenIsRefusedImmediately(t *testing.T) {
 
 func submitBody(requestID string) map[string]any {
 	return map[string]any{
-		"client_request_id": requestID, "project": "llm-develop",
+		"client_request_id": requestID, "project": "example-train",
 		"queue": "training", "task": "model", "argv": []string{"python", "train.py"},
 		"cwd": "/work", "checkpointable": true, "preemptible": true,
 		"executor": map[string]any{"labels": map[string]string{"environment": "wsl2"}},
@@ -223,7 +223,7 @@ func TestExecutionSubmissionIsIdempotentAndCreatesScopes(t *testing.T) {
 	if status != http.StatusOK || json.Unmarshal(payload, &repeated) != nil || !repeated.Idempotent || repeated.Execution.ID != first.Execution.ID {
 		t.Fatalf("submission was not idempotent: %d %s", status, payload)
 	}
-	status, payload = d.call(t, http.MethodGet, "/api/scopes?project=llm-develop&queue=training&task=model", d.admin, nil)
+	status, payload = d.call(t, http.MethodGet, "/api/scopes?project=example-train&queue=training&task=model", d.admin, nil)
 	if status != http.StatusOK || !bytes.Contains(payload, []byte(`"kind":"task"`)) {
 		t.Fatalf("scope lookup returned %d: %s", status, payload)
 	}
@@ -380,7 +380,7 @@ func TestForcedScopePause(t *testing.T) {
 func projectBody(argv ...any) map[string]any {
 	return map[string]any{
 		"schema_version": 1,
-		"project":        map[string]any{"name": "neo-ime"},
+		"project":        map[string]any{"name": "example-app"},
 		"tasks": []any{map[string]any{
 			"name": "train", "queue": "training", "depends_on": []any{}, "policy": "RunToCompletion@v1",
 			"execution": map[string]any{
@@ -402,7 +402,7 @@ func TestProjectApplyIsIdempotentAndImmutable(t *testing.T) {
 	if err := json.Unmarshal(raw, &payload); err != nil || status != http.StatusOK || payload["idempotent"] != true {
 		t.Fatalf("idempotent apply status=%d payload=%s", status, raw)
 	}
-	status, raw = d.call(t, http.MethodGet, "/api/projects/neo-ime", d.admin, nil)
+	status, raw = d.call(t, http.MethodGet, "/api/projects/example-app", d.admin, nil)
 	if status != http.StatusOK || !bytes.Contains(raw, []byte(`"name":"train"`)) {
 		t.Fatalf("status=%d payload=%s", status, raw)
 	}

@@ -8,7 +8,7 @@
 //! [`Session`]: the process registered once, a background heartbeat thread
 //! and [`Session::safe_point`] for suspend commands. [`report`] is the
 //! soft-fail progress reporter for jobs that only want the monitor to show
-//! progress, and [`Progress`] keeps the API of neo-ime's `kairo-progress`.
+//! progress, and [`Progress`] keeps the API of the earlier `kairo-progress` crate.
 //!
 //! The token goes only to the attempt's URL: no proxy, no redirects, TLS 1.3
 //! only, and never over plain `http://` unless the URL names a loopback host.

@@ -1,5 +1,5 @@
 # The checks of ci/check.sh that need nothing of this installation, on GitHub's hosted runners, for every push to
-# main and every pull request. The checks that need the real environment (the LXC on pve1, the hardware) run
+# main and every pull request. The checks that need the real environment (the site's nodes and hardware) run
 # on Kairo itself (ci/kairo-ci.sh). No self-hosted runner and no secrets: nothing of the installation is reachable
 # from here. The repository is private (2026-11-21): runs count against the account's Actions minutes.
 name: ci
@@ -26,7 +26,7 @@ jobs:
       matrix:
         check: [linux, linux-race, linux-root]
     services:
-      # The store tests' PostgreSQL, as on pve1-work: role kairo (a superuser, as the image makes it).
+      # The store tests' PostgreSQL, as on the Linux CI node: role kairo (a superuser, as the image makes it).
       postgres:
         image: postgres:17
         env:

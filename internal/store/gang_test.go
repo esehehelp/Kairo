@@ -68,7 +68,7 @@ policy = "RunToCompletion@v1"
 [tasks.execution]
 schema_version = 2
 argv = ["wsl-train", "--config", "x.toml"]
-cwd = "/mnt/d/Dev/neo-ime"
+cwd = "/mnt/d/Dev/example-app"
 checkpointable = `+cp+`
 preemptible = `+cp+`
 [tasks.execution.executor]
@@ -81,7 +81,7 @@ size = 2
 [[tasks.execution.gang.ranks]]
 rank = 1
 argv = ["linux-train", "--config", "x.toml"]
-cwd = "/srv/neo-ime"
+cwd = "/srv/example-app"
 executor = { labels = { environment = "linux" } }
 `)
 	ctx := context.Background()
@@ -177,7 +177,7 @@ func TestGangPlacesRanksOnDistinctNodesAndLaunchesThemTogether(t *testing.T) {
 	if a.Gang.MasterAddr != "10.77.10.2" || a.Gang.MasterPort != gangPortFirst || b.Gang.MasterAddr != a.Gang.MasterAddr || a.Gang.Size != 2 {
 		t.Fatalf("rendezvous: %+v / %+v", a.Gang, b.Gang)
 	}
-	if a.Argv[0] != "wsl-train" || b.Argv[0] != "linux-train" || b.CWD != "/srv/neo-ime" {
+	if a.Argv[0] != "wsl-train" || b.Argv[0] != "linux-train" || b.CWD != "/srv/example-app" {
 		t.Fatalf("rank overrides: %v %s / %v %s", a.Argv, a.CWD, b.Argv, b.CWD)
 	}
 	if a.Resources[0].ID != "gpu-a" || b.Resources[0].ID != "gpu-b" {

@@ -17,8 +17,8 @@ for arg in "$@"; do
   esac
 done
 # The site's settings (site.env) and the script's files are this operator machine's, outside the checkout (ops/site.sh).
-# CI_WINDOWS_ROOT: where windows-local's checks unpack (a POSIX path, /c/...); CI_PVE1_HOST: the Proxmox host of
-# pve1-work (root@...); CI_PVE1_VMID: pve1-work's container.
+# CI_WINDOWS_ROOT: where the Windows checks unpack (a POSIX path, /c/...); CI_LINUX_NODE and CI_LINUX_SITE: the Linux
+# CI node and its site label; CI_LINUX_HOST: the Proxmox host of that node (root@...); CI_LINUX_VMID: its container.
 . ops/site.sh
 sha=$(git rev-parse --short=12 "$rev^{commit}")
 work=$kairo_state/ci
@@ -28,15 +28,15 @@ tar=$work/src/$sha.tar
 git -c core.autocrlf=false -c core.eol=lf archive --format=tar -o "$tar" "$sha"
 echo "kairo-ci $sha: $(git log -1 --format=%s "$sha")"
 
-# windows-local reads it here
+# the Windows checks read it here
 mkdir -p "$CI_WINDOWS_ROOT/src" "$CI_WINDOWS_ROOT/run" "$CI_WINDOWS_ROOT/cache"
 cp "$tar" "$CI_WINDOWS_ROOT/src/$sha.tar"
-# pve1-work reads it at /srv/kairo-ci/src
-scp -q -o BatchMode=yes "$tar" "$CI_PVE1_HOST:/tmp/kairo-ci-$sha.tar"
-ssh -o BatchMode=yes "$CI_PVE1_HOST" "pct push $CI_PVE1_VMID /tmp/kairo-ci-$sha.tar /srv/kairo-ci/src/$sha.tar --perms 644 && rm /tmp/kairo-ci-$sha.tar"
+# the Linux CI node reads it at /srv/kairo-ci/src
+scp -q -o BatchMode=yes "$tar" "$CI_LINUX_HOST:/tmp/kairo-ci-$sha.tar"
+ssh -o BatchMode=yes "$CI_LINUX_HOST" "pct push $CI_LINUX_VMID /tmp/kairo-ci-$sha.tar /srv/kairo-ci/src/$sha.tar --perms 644 && rm /tmp/kairo-ci-$sha.tar"
 
 manifest=$work/kairo-ci-$sha.toml
-sed -e "s/@SHA@/$sha/g" -e "s|@CI_WINDOWS_ROOT@|$CI_WINDOWS_ROOT|g" -e "s|@CI_WINDOWS_DIR@|$(cygpath -m "$CI_WINDOWS_ROOT")|g" ci/tasks.toml.in > "$manifest"
+sed -e "s/@SHA@/$sha/g" -e "s|@CI_LINUX_NODE@|$CI_LINUX_NODE|g" -e "s|@CI_LINUX_SITE@|$CI_LINUX_SITE|g" -e "s|@CI_WINDOWS_ROOT@|$CI_WINDOWS_ROOT|g" -e "s|@CI_WINDOWS_DIR@|$(cygpath -m "$CI_WINDOWS_ROOT")|g" ci/tasks.toml.in > "$manifest"
 kairo project apply "$manifest"
 if [ -z "$wait" ]; then
   echo "declared; follow with: kairo task list kairo-ci | grep $sha"

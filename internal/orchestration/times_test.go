@@ -9,7 +9,7 @@ import (
 func timesSpec(fields string) string {
 	return `schema_version = 1
 [project]
-name = "rhllem"
+name = "example-llm"
 
 [defaults]
 policy = "RunToCompletion@v1"

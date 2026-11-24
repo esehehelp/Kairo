@@ -107,7 +107,7 @@ class FakeAPI:
         self.fail_event_reads = False
 
     def list_events(self, project: str, after: int = 0) -> list[CoordinationEvent]:
-        assert project == "llm-develop"
+        assert project == "example-train"
         if self.fail_event_reads:
             raise TransientControllerError("events temporarily unavailable")
         return [item for item in self.events if item.sequence > after]
@@ -138,11 +138,11 @@ def template() -> dict[str, Any]:
     return {
         "schema_version": 2,
         "client_request_id": "original-request",
-        "project": "llm-develop",
+        "project": "example-train",
         "queue": "train",
         "task": "pretrain",
         "argv": ["python", "-m", "train"],
-        "cwd": "D:/Dev/LLM-Develop",
+        "cwd": "D:/work/Example-Train",
         "priority": 10,
         "checkpointable": True,
         "preemptible": True,
@@ -159,7 +159,7 @@ def delegated_controller(
     controller = ProjectController(api, journal)
     execution_id = controller.submit_with_resume_after_kairo_preemption(
         activity_id="jalm-300m-v3",
-        project="llm-develop",
+        project="example-train",
         submission=template(),
     )
     assert execution_id == "exe_old"
@@ -328,11 +328,11 @@ def test_policy_snapshot_is_immutable_and_inherited_by_successor(tmp_path: Path)
     with pytest.raises(ValueError, match="different enrollment"):
         controller.submit_with_resume_after_kairo_preemption(
             activity_id="jalm-300m-v3",
-            project="llm-develop",
+            project="example-train",
             submission=changed,
         )
 
-    assert journal.active_delegations("llm-develop") == {
+    assert journal.active_delegations("example-train") == {
         ("ResumeAfterKairoPreemption", 1): {"exe_successor"}
     }
 
@@ -346,7 +346,7 @@ def test_initial_controller_submission_journals_enrollment_before_post(tmp_path:
     with pytest.raises(TransientControllerError, match="after server accepted"):
         controller.submit_with_resume_after_kairo_preemption(
             activity_id="jalm-300m-v3",
-            project="llm-develop",
+            project="example-train",
             submission=template(),
         )
 
@@ -357,7 +357,7 @@ def test_initial_controller_submission_journals_enrollment_before_post(tmp_path:
     assert api.calls[0]["client_request_id"] == "original-request"
     assert api.calls[0] == api.calls[1]
     assert len(api.accepted) == 1
-    assert journal.active_delegations("llm-develop") == {
+    assert journal.active_delegations("example-train") == {
         ("ResumeAfterKairoPreemption", 1): {"exe_old"}
     }
 
@@ -504,7 +504,7 @@ def test_templates_without_schema_version_are_accepted(tmp_path: Path):
 
     assert (
         controller.submit_with_resume_after_kairo_preemption(
-            activity_id="jalm-300m-v3", project="llm-develop", submission=submission
+            activity_id="jalm-300m-v3", project="example-train", submission=submission
         )
         == "exe_old"
     )
@@ -516,7 +516,7 @@ def test_templates_with_another_schema_version_are_rejected(tmp_path: Path):
     submission = {**template(), "schema_version": 3}
     with pytest.raises(ValueError, match="schema_version must be 2"):
         controller.submit_with_resume_after_kairo_preemption(
-            activity_id="jalm-300m-v3", project="llm-develop", submission=submission
+            activity_id="jalm-300m-v3", project="example-train", submission=submission
         )
 
 
@@ -608,12 +608,12 @@ def test_client_pages_api_events_with_the_bearer_token(api_server):
     _APIHandler.pages = [[raw_event(sequence) for sequence in range(1, 1001)], [raw_event(1001)]]
     client = KairoControllerClient(api_server, token="tok_events")
 
-    events = client.list_events("llm-develop", after=0)
+    events = client.list_events("example-train", after=0)
 
     assert [item.sequence for item in events] == list(range(1, 1002))
     assert [path for _method, path, _headers, _body in _APIHandler.requests] == [
-        "/api/events?project=llm-develop&after=0&limit=1000",
-        "/api/events?project=llm-develop&after=1000&limit=1000",
+        "/api/events?project=example-train&after=0&limit=1000",
+        "/api/events?project=example-train&after=1000&limit=1000",
     ]
     assert {headers["Authorization"] for _m, _p, headers, _b in _APIHandler.requests} == {
         "Bearer tok_events"

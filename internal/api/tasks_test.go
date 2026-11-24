@@ -37,7 +37,7 @@ func TestProjectApplyAnswersCompactly(t *testing.T) {
 		Unchanged  *int     `json:"unchanged"`
 	}
 	status, raw := d.call(t, http.MethodPost, "/api/projects", d.admin, projectBody("uv", "run", "train"))
-	if status != http.StatusCreated || json.Unmarshal(raw, &applied) != nil || applied.Project != "neo-ime" || applied.SpecDigest == "" || applied.Idempotent || strings.Join(applied.Created, ",") != "train" || applied.Unchanged == nil || *applied.Unchanged != 0 {
+	if status != http.StatusCreated || json.Unmarshal(raw, &applied) != nil || applied.Project != "example-app" || applied.SpecDigest == "" || applied.Idempotent || strings.Join(applied.Created, ",") != "train" || applied.Unchanged == nil || *applied.Unchanged != 0 {
 		t.Fatalf("apply: %d %s", status, raw)
 	}
 	if bytes.Contains(raw, []byte(`"tasks"`)) {
@@ -56,7 +56,7 @@ func TestProjectApplyAnswersCompactly(t *testing.T) {
 		task.(map[string]any)["execution"].(map[string]any)["cwd"] = "/elsewhere"
 	}
 	status, raw = d.call(t, http.MethodPost, "/api/projects", d.admin, changed)
-	if e := expectError(t, "conflicting apply", status, raw, http.StatusConflict, "orchestration_conflict"); !strings.Contains(e.Error, "neo-ime/export, neo-ime/train") {
+	if e := expectError(t, "conflicting apply", status, raw, http.StatusConflict, "orchestration_conflict"); !strings.Contains(e.Error, "example-app/export, example-app/train") {
 		t.Fatalf("conflict does not name every task: %s", e.Error)
 	}
 }
@@ -72,7 +72,7 @@ func TestProjectStatusFiltersOverTheAPI(t *testing.T) {
 	read := d.token(t, "dashboard", store.RoleRead, "")
 	names := func(query string) string {
 		t.Helper()
-		status, raw := d.call(t, http.MethodGet, "/api/projects/neo-ime"+query, read, nil)
+		status, raw := d.call(t, http.MethodGet, "/api/projects/example-app"+query, read, nil)
 		var body struct {
 			Project store.ProjectStatus `json:"project"`
 		}
@@ -103,7 +103,7 @@ func TestProjectStatusFiltersOverTheAPI(t *testing.T) {
 		}
 	}
 	for _, query := range []string{"?since=yesterday", "?state=bogus", "?live=maybe"} {
-		status, raw := d.call(t, http.MethodGet, "/api/projects/neo-ime"+query, read, nil)
+		status, raw := d.call(t, http.MethodGet, "/api/projects/example-app"+query, read, nil)
 		expectError(t, query, status, raw, http.StatusBadRequest, "bad_request")
 	}
 	status, raw := d.call(t, http.MethodGet, "/api/projects/missing?live=1", read, nil)
@@ -127,7 +127,7 @@ func TestTaskDetailOverTheAPI(t *testing.T) {
 	if err := d.store.SetAttemptLogPaths(ctx, launch.Attempt.ID, launch.Lease.CoordinationEpoch, stdout, filepath.Join(d.logs, launch.Attempt.ID+".stderr.log")); err != nil {
 		t.Fatal(err)
 	}
-	status, raw := d.call(t, http.MethodGet, "/api/projects/neo-ime/tasks/train", d.token(t, "dashboard", store.RoleRead, ""), nil)
+	status, raw := d.call(t, http.MethodGet, "/api/projects/example-app/tasks/train", d.token(t, "dashboard", store.RoleRead, ""), nil)
 	var body struct {
 		Task struct {
 			Name       string          `json:"name"`
@@ -156,7 +156,7 @@ func TestTaskDetailOverTheAPI(t *testing.T) {
 	if attempt.StdoutBytes == nil || *attempt.StdoutBytes != 6 || attempt.StderrBytes != nil || attempt.NodeID == nil || *attempt.NodeID != "node" {
 		t.Fatalf("attempt: %s", raw)
 	}
-	status, raw = d.call(t, http.MethodGet, "/api/projects/neo-ime/tasks/missing", d.admin, nil)
+	status, raw = d.call(t, http.MethodGet, "/api/projects/example-app/tasks/missing", d.admin, nil)
 	expectError(t, "unknown task", status, raw, http.StatusNotFound, "not_found")
 }
 
@@ -197,41 +197,41 @@ func TestTaskCancelAndRerunOverTheAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	var cancelled store.CancelResult
-	status, raw := d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/cancel", d.admin, map[string]any{"dry_run": true})
+	status, raw := d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/cancel", d.admin, map[string]any{"dry_run": true})
 	if status != http.StatusOK || json.Unmarshal(raw, &cancelled) != nil || !cancelled.DryRun || len(cancelled.Withdrawn) != 1 {
 		t.Fatalf("dry run: %d %s", status, raw)
 	}
-	status, raw = d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/cancel", d.admin, nil)
+	status, raw = d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/cancel", d.admin, nil)
 	if status != http.StatusOK || json.Unmarshal(raw, &cancelled) != nil || cancelled.DryRun || cancelled.State != "cancelled" || cancelled.Task != "train" || len(cancelled.Withdrawn) != 1 {
 		t.Fatalf("cancel: %d %s", status, raw)
 	}
-	status, raw = d.call(t, http.MethodGet, "/api/projects/neo-ime/tasks/train", d.admin, nil)
+	status, raw = d.call(t, http.MethodGet, "/api/projects/example-app/tasks/train", d.admin, nil)
 	if status != http.StatusOK || !bytes.Contains(raw, []byte(`"actor":"operator"`)) {
 		t.Fatalf("cancel did not record the token as actor: %s", raw)
 	}
-	if status, raw = d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/cancel", d.admin, map[string]any{"actor": "again"}); status != http.StatusOK {
+	if status, raw = d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/cancel", d.admin, map[string]any{"actor": "again"}); status != http.StatusOK {
 		t.Fatalf("repeated cancel: %d %s", status, raw)
 	}
-	status, raw = d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/missing/cancel", d.admin, nil)
+	status, raw = d.call(t, http.MethodPost, "/api/projects/example-app/tasks/missing/cancel", d.admin, nil)
 	expectError(t, "cancel of an unknown task", status, raw, http.StatusNotFound, "not_found")
 
 	var rerun store.RerunResult
-	status, raw = d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/rerun", d.admin, map[string]any{"request_id": "r1"})
+	status, raw = d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/rerun", d.admin, map[string]any{"request_id": "r1"})
 	if status != http.StatusOK || json.Unmarshal(raw, &rerun) != nil || rerun.State != "pending" || rerun.Ordinal != 1 || rerun.Task != "train" {
 		t.Fatalf("rerun: %d %s", status, raw)
 	}
 	first := string(raw)
-	if status, raw = d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/rerun", d.admin, map[string]any{"request_id": "r1"}); status != http.StatusOK || string(raw) != first {
+	if status, raw = d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/rerun", d.admin, map[string]any{"request_id": "r1"}); status != http.StatusOK || string(raw) != first {
 		t.Fatalf("repeated rerun: %d %s, want %s", status, raw, first)
 	}
-	status, raw = d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/rerun", d.admin, map[string]any{"request_id": "r2"})
+	status, raw = d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/rerun", d.admin, map[string]any{"request_id": "r2"})
 	if e := expectError(t, "rerun of a pending task", status, raw, http.StatusConflict, "task_conflict"); e.Error != "task train is pending; only failed, stopped, cancelled or blocked tasks can be rerun" {
 		t.Fatalf("rerun conflict: %s", e.Error)
 	}
 	if err := d.store.ReconcileProjectTasks(ctx); err != nil {
 		t.Fatal(err)
 	}
-	status, raw = d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/cancel", d.admin, nil)
+	status, raw = d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/cancel", d.admin, nil)
 	if status != http.StatusOK {
 		t.Fatalf("cancel of the rerun: %d %s", status, raw)
 	}
@@ -279,9 +279,9 @@ func TestTaskCancelStartedExecutionConflicts(t *testing.T) {
 		t.Fatal(err)
 	}
 	launch := d.launchNext(t)
-	status, raw := d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/cancel", d.admin, nil)
+	status, raw := d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/cancel", d.admin, nil)
 	e := expectError(t, "cancel of a running task", status, raw, http.StatusConflict, "task_conflict")
-	if want := "execution " + launch.Execution.ID + " of neo-ime/training/train is running (started); pause the task first, or end it with task pause --force"; e.Error != want {
+	if want := "execution " + launch.Execution.ID + " of example-app/training/train is running (started); pause the task first, or end it with task pause --force"; e.Error != want {
 		t.Fatalf("error %q, want %q", e.Error, want)
 	}
 }
@@ -291,10 +291,10 @@ func TestObserveOnlyRefusesTaskCancelButNotItsDryRun(t *testing.T) {
 	if status, raw := d.call(t, http.MethodPost, "/api/projects", d.admin, projectBody("uv", "run", "train")); status != http.StatusCreated {
 		t.Fatalf("apply: %d %s", status, raw)
 	}
-	if status, raw := d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/cancel", d.admin, map[string]any{"dry_run": true}); status != http.StatusOK {
+	if status, raw := d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/cancel", d.admin, map[string]any{"dry_run": true}); status != http.StatusOK {
 		t.Fatalf("dry run: %d %s", status, raw)
 	}
-	if status, _ := d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/cancel", d.admin, nil); status != http.StatusLocked {
+	if status, _ := d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/cancel", d.admin, nil); status != http.StatusLocked {
 		t.Fatalf("observe-only cancel: %d", status)
 	}
 }
@@ -304,7 +304,7 @@ func TestObserveOnlyRefusesTaskRerun(t *testing.T) {
 	if status, raw := d.call(t, http.MethodPost, "/api/projects", d.admin, projectBody("uv", "run", "train")); status != http.StatusCreated {
 		t.Fatalf("apply: %d %s", status, raw)
 	}
-	status, raw := d.call(t, http.MethodPost, "/api/projects/neo-ime/tasks/train/rerun", d.admin, map[string]any{"request_id": "r1"})
+	status, raw := d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/rerun", d.admin, map[string]any{"request_id": "r1"})
 	expectError(t, "observe-only rerun", status, raw, http.StatusLocked, "observe_only")
 }
 

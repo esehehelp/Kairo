@@ -169,7 +169,7 @@ func TestTokenCreateValidation(t *testing.T) {
 	empty := pgtest.DSN(t) // a database without the Kairo schema
 	for _, args := range [][]string{
 		{"create", "--database-url", db, "--name", "agent", "--role", "node"},
-		{"create", "--database-url", db, "--name", "x", "--role", "admin", "--node", "pve0"},
+		{"create", "--database-url", db, "--name", "x", "--role", "admin", "--node", "host-a"},
 		{"create", "--database-url", db, "--name", "x", "--role", "root"},
 		{"create", "--database-url", db, "--role", "admin"},
 		{"create", "--name", "x", "--role", "admin"},
@@ -189,7 +189,7 @@ func TestTokenCreateValidation(t *testing.T) {
 		t.Fatalf("token create created a schema: %v", err)
 	}
 	out, err := captureStdout(t, func() error {
-		return run([]string{"token", "create", "--database-url", db, "--name", "agent", "--role", "node", "--node", "pve0"})
+		return run([]string{"token", "create", "--database-url", db, "--name", "agent", "--role", "node", "--node", "host-a"})
 	})
 	if err != nil || !strings.HasPrefix(strings.TrimSpace(out), "kairo_node_") {
 		t.Fatalf("node token: %v %q", err, out)
