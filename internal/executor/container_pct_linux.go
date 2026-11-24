@@ -60,6 +60,9 @@ var (
 	pctLock = "/run/lock/kairo-pct.lock"
 	// pctConfigDir holds the host's container configurations.
 	pctConfigDir = "/etc/pve/lxc"
+	// pctDestroyRetry spaces out the tries to destroy a container whose disk
+	// is still in use.
+	pctDestroyRetry = 3 * time.Second
 )
 
 // pctTool runs a Proxmox or image tool (pct, pvesh, pvesm, skopeo) and
@@ -155,7 +158,11 @@ func runPCT(ctx context.Context, spec containerSpec, logf func(string, ...any)) 
 		return vmid, shimNotStarted, err
 	}
 	if _, err := pctTool(ctx, "pct", "start", strconv.Itoa(vmid)); err != nil {
-		return vmid, shimNotStarted, err
+		// an attempt that ends at once stops the container before pct start
+		// has seen it run: it ran when its init wrote its exit
+		if _, ran := readExitFile(filepath.Join(spec.RunDir, "exit")); !ran {
+			return vmid, shimNotStarted, err
+		}
 	}
 	warned := false
 	for {
@@ -359,9 +366,23 @@ func destroyPCT(ctx context.Context, vmid int) error {
 	if exists, err := pctExists(ctx, vmid); err != nil || !exists {
 		return err
 	}
-	_, err := pctTool(ctx, "pct", "destroy", strconv.Itoa(vmid), "--force", "1", "--purge", "1")
-	if err != nil && strings.Contains(err.Error(), "does not exist") {
-		return nil
+	// a container that has just stopped may still hold its disk a moment
+	var err error
+	for try := 0; try < 10; try++ {
+		if try > 0 {
+			select {
+			case <-ctx.Done():
+				return errors.Join(err, ctx.Err())
+			case <-time.After(pctDestroyRetry):
+			}
+		}
+		_, err = pctTool(ctx, "pct", "destroy", strconv.Itoa(vmid), "--force", "1", "--purge", "1")
+		if err == nil || strings.Contains(err.Error(), "does not exist") {
+			return nil
+		}
+		if !strings.Contains(err.Error(), "in use") {
+			return err
+		}
 	}
 	return err
 }

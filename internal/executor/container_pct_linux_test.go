@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 // fakePCT records the Proxmox tools' calls and answers them from answer.
@@ -188,5 +189,28 @@ func TestPCTSweepDestroysOnlyKairosStoppedContainersOfEndedAttempts(t *testing.T
 	destroyed := f.called("pct", "destroy")
 	if len(destroyed) != 1 || destroyed[0][2] != "1000" {
 		t.Fatalf("destroyed %v\n%s", destroyed, logs.String())
+	}
+}
+
+// A container whose disk is still in use just after it stopped is destroyed
+// at a later try.
+func TestDestroyPCTRetriesWhileItsDiskIsInUse(t *testing.T) {
+	tries := 0
+	f := &fakePCT{answer: func(args []string) ([]byte, error) {
+		if args[0] == "pct" && args[1] == "destroy" {
+			tries++
+			if tries < 3 {
+				return nil, errors.New("lvremove 'pve/vm-1000-disk-0' error: Logical volume pve/vm-1000-disk-0 contains a filesystem in use.")
+			}
+		}
+		return nil, nil
+	}}
+	f.install(t)
+	old := pctDestroyRetry
+	pctDestroyRetry = time.Millisecond
+	t.Cleanup(func() { pctDestroyRetry = old })
+	writeCTConfig(t, 1000)
+	if err := destroyPCT(context.Background(), 1000); err != nil || tries != 3 {
+		t.Fatalf("destroy after %d tries: %v", tries, err)
 	}
 }
