@@ -114,7 +114,7 @@ func TestMsysRewrittenPaths(t *testing.T) {
 	for p, want := range map[string]bool{
 		"C:/Program Files/Git/srv/kairo-import-smoke": true,
 		`C:\Program Files\Git\root\data`:              true,
-		"D:/work/example-app/local/nvme-datasets":          false,
+		"D:/work/example-app/local/nvme-datasets":     false,
 		"F:/Strata-data":                              false,
 		"/srv/models":                                 false,
 	} {

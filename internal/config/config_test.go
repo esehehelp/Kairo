@@ -256,9 +256,9 @@ func TestHasPassword(t *testing.T) {
 	for dsn, want := range map[string]bool{
 		"postgres://kairo@192.0.2.248:5432/kairo?sslmode=require": false,
 		"postgres://kairo:secret@192.0.2.248:5432/kairo":          true,
-		"postgresql://kairo@host/kairo?password=secret":             true,
-		"host=127.0.0.1 user=kairo dbname=kairo":                    false,
-		"host=127.0.0.1 user=kairo password=secret dbname=kairo":    true,
+		"postgresql://kairo@host/kairo?password=secret":           true,
+		"host=127.0.0.1 user=kairo dbname=kairo":                  false,
+		"host=127.0.0.1 user=kairo password=secret dbname=kairo":  true,
 		"postgres://%zz": true,
 		"":               false,
 	} {
