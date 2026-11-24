@@ -112,7 +112,8 @@ func describeOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executor
 	}
 	var orders []CopyOrder
 	err = eachRow(ctx, tx, `SELECT c.object_id,c.store_id,c.root,c.month FROM object_copies c
-		WHERE c.store_id=ANY($1::text[]) AND c.state='verified' AND c.described_at IS NULL ORDER BY c.verified_at,c.object_id LIMIT $2`,
+		WHERE c.store_id=ANY($1::text[]) AND c.state='verified' AND c.described_at IS NULL
+		AND NOT EXISTS(SELECT 1 FROM data_objects d WHERE d.id=c.object_id AND d.dropped_at IS NOT NULL) ORDER BY c.verified_at,c.object_id LIMIT $2`,
 		[]any{served, describeBatch}, func(rows *sql.Rows) error {
 			var o CopyOrder
 			if err := rows.Scan(&o.ObjectID, &o.StoreID, &o.Root, &o.Month); err != nil {

@@ -23,6 +23,22 @@ func (s *Server) importData(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"objects": objects})
 }
 
+// dropData drops data Kairo is not to keep the bytes of (kairo data drop),
+// or says what it would drop.
+func (s *Server) dropData(w http.ResponseWriter, r *http.Request) {
+	var body store.DropRequest
+	if err := decode(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	objects, err := s.Store.DropData(r.Context(), body, actorOr(r, ""))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"objects": objects})
+}
+
 // cancelImport abandons an import not packed yet (kairo data cancel).
 func (s *Server) cancelImport(w http.ResponseWriter, r *http.Request) {
 	if err := s.Store.CancelImport(r.Context(), r.PathValue("id"), actorOr(r, "")); err != nil {

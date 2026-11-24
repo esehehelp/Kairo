@@ -102,6 +102,80 @@ func dataCancel(args []string) error {
 	return nil
 }
 
+// dataDrop: kairo data drop --project P [--match NAME_PREFIX] [--task-match
+// TASK_PREFIX] [--reason TEXT] [--confirm] [--json] [OBJECT|NAME...].
+func dataDrop(args []string) error {
+	fs := newFlags("data drop")
+	api := apiFlag(fs)
+	project := fs.String("project", "", "the project the data belongs to (required)")
+	match := fs.String("match", "", "the objects whose name starts with this")
+	taskMatch := fs.String("task-match", "", "the outputs of the tasks whose name starts with this")
+	reason := fs.String("reason", "", "why (recorded)")
+	confirm := fs.Bool("confirm", false, "drop them: without it, nothing changes")
+	asJSON := fs.Bool("json", false, "print the daemon's response")
+	objects, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if *project == "" || len(objects) == 0 && *match == "" && *taskMatch == "" {
+		return usageError("data drop needs --project and the objects (ids or names), --match or --task-match")
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	payload, err := client.call(http.MethodPost, "/api/data/drops", store.DropRequest{Project: *project, Objects: objects, NamePrefix: *match, TaskPrefix: *taskMatch, Reason: *reason, Confirm: *confirm})
+	if routeMissing(err) {
+		return fmt.Errorf("the daemon does not drop data: %s", olderDaemonHint())
+	}
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		_, err = os.Stdout.Write(payload)
+		return err
+	}
+	var body struct {
+		Objects []store.DroppedObject `json:"objects"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return fmt.Errorf("decode drops: %w", err)
+	}
+	var b strings.Builder
+	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "OBJECT\tKIND\tNAME OR TASK\tPACK\tCOPIES\tBROUGHT TO\tSTATE")
+	var bytes int64
+	dropping, refused := 0, 0
+	for _, o := range body.Objects {
+		what := o.Name
+		if what == "" {
+			what = o.Task
+		}
+		state := "to drop"
+		switch {
+		case o.Refused != "":
+			state, refused = "kept: "+o.Refused, refused+1
+		case o.Dropped && *confirm:
+			state = "dropped"
+		case o.Dropped:
+			state = "dropped already"
+		}
+		if o.Refused == "" {
+			dropping++
+			bytes += o.PackBytes
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%d\t%s\n", o.ObjectID, o.Kind, what, formatSize(o.PackBytes), o.Copies, o.Placements, state)
+	}
+	w.Flush()
+	fmt.Print(b.String())
+	if *confirm {
+		fmt.Printf("%d dropped (%s packed), %d kept: only their file lists stay; their copies and the places they were brought to are deleted as their agents get to them\n", dropping, formatSize(bytes), refused)
+	} else {
+		fmt.Printf("%d to drop (%s packed), %d kept; nothing changed: run again with --confirm to drop them\n", dropping, formatSize(bytes), refused)
+	}
+	return nil
+}
+
 // dataList lists data objects, optionally narrowed to a task or execution's outputs.
 func dataList(args []string) error {
 	fs := newFlags("data list")

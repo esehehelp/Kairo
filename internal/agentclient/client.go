@@ -215,6 +215,12 @@ func (c *Client) ClaimShed(ctx context.Context, executorID, objectID, storeID st
 	return done(ctx, c, agentops.ClaimShed, agentops.ObjectStoreRequest{ExecutorID: executorID, ObjectID: objectID, StoreID: storeID})
 }
 
+// KeepIdentity sends the file list beside a copy of a dropped object, for
+// the daemon to keep as its identity before the copy is removed.
+func (c *Client) KeepIdentity(ctx context.Context, executorID, objectID, storeID, list string) error {
+	return done(ctx, c, agentops.KeepIdentity, agentops.KeepIdentityRequest{ExecutorID: executorID, ObjectID: objectID, StoreID: storeID, List: list})
+}
+
 // InputGone reports an input whose path is not there at launch.
 func (c *Client) InputGone(ctx context.Context, executorID, objectID, path string) error {
 	return done(ctx, c, agentops.InputGone, agentops.InputPathRequest{ExecutorID: executorID, ObjectID: objectID, Path: path})

@@ -453,7 +453,7 @@ key_file = "/etc/kairo/pack-key.pem"
 | `GET` | `/api/stores`, `/api/data/objects`（`?project=&kind=&limit=`） | `read` |
 | `POST`, `GET` | `/api/sources`（コードスナップショット）、`/api/sources/{id}` | `admin`, `read` |
 | `GET` | `/api/agent/sources/{id}/pack`, `/list` | `node` |
-| `POST` | `/api/data/imports`, `/api/data/fetches` | `admin` |
+| `POST` | `/api/data/imports`, `/api/data/fetches`, `/api/data/drops` | `admin` |
 | `GET` | `/api/hardware`（`?host=`） | `read` |
 | `GET` | `/api/hardware/samples`, `/api/hardware/leases`（`?since=&until=&step=&key=`） | `read` |
 | `POST`, `DELETE` | `/api/hardware/{host}/{device}/settings` | `admin` |
@@ -1292,6 +1292,24 @@ durable store の実質的な空き容量（最後に報告された空きバイ
   - **異なっていた場合**: 再生成のために発注された Run の output が元のオブジェクトと異なっていた場合、そのオブジェクトに問題が記録されます（`regeneration_problem`、イベント `regeneration_differs`）。読み取り側はどのように異なるかを表示しながら、後の手動再実行で同じファイル群が生成されるか、あるいは Task の最新 Run の output を直接読むよう入力を変更するまで待機します（`task = "T"` 形式の入力は中身にかかわらずその Task の最新 Run を読み取ります）。
 
 `kairo data list` では、再生成されたオブジェクト（`made again as obj_...`）および記録された問題を確認できます。
+
+#### データの手放し（drop）
+
+durable store が保管するのは、作り直せないもの（学習の結果、チェックポイント、評価結果、Run スナップショット、退避したアーカイブなど）です。作り直せるもの・取り直せるものは durable に置きません。
+
+- **Corpus/Mix**（raw データからプロジェクトのツールで作った生成物）は、raw がある限り作り直せるので durable にしません。データを作る Task は `regenerable` と宣言し、その output を temporal にします。
+- **raw データ**（外から取ってきたもの）は、Kairo は中身を持たず、ファイル一覧（各ファイルの sha256）だけを持ちます。要るときはプロジェクトが取り直します。
+
+すでに durable になっているものは `kairo data drop` で手放します。
+
+- **CLI**: `kairo data drop --project P [--match NAME_PREFIX] [--task-match TASK_PREFIX] [--reason TEXT] [--confirm] [OBJECT|NAME...]`。ID か名前、名前の先頭（`--match`）、またはその名前で始まる Task の output（`--task-match`）で選びます。`--confirm` がなければ何も変えず、手放すもの・手放さないもの（とその理由）を表示するだけです。HTTP API は `POST /api/data/drops`（ボディ: `{"project", "objects", "name_prefix", "task_prefix", "reason", "confirm"}`）です。
+- **残るもの**: オブジェクトはファイル一覧（pack のファイル一覧: 各ファイルのパス・サイズ・sha256・mtime）だけを持つ temporal データになります（`lifecycle` は `temporal`、`dropped_at`、イベント `data_dropped`）。
+- **消えるもの**: durable store 上のすべてのコピーと、ノードへ取り寄せた（fetch した）すべての場所です。どちらも空き容量に関係なく消します。
+  - ファイル一覧は durable store のコピーの横（`<copy>.files.tsv`）にしかないため、コピーを持つストアの Executor が先に送り（`copies-to-make` の `send_list`、`keep-identity`）、daemon は記録済みの sha256 と一致したときだけ保持します（イベント `identity_kept`）。保持するまで、どのコピーも消しません（`claim-shed` が拒否）。
+  - コピーはシェッドと同じ手順で消します（`copies-to-make` の `shed` と `drop`、イベント `copy_shed`）。レプリカ作成やフェッチが読んでいるコピーは消しません。
+  - 取り寄せた場所はエビクションと同じ手順で消します。入力として指定されている間は残します。
+- **手放さないもの**: pack 済みの durable なインポートと Run の output だけを手放します。終わっていない Execution、または pending・running の Task が入力として指定しているもの、ノードへ取り寄せている途中のもの、ファイル一覧を取れる正常なコピーがないものは手放しません。
+- **手放した後の読み手**: それを入力に指定した Execution は、プロジェクトが作り直す（または取り直す）までハード問題として待ちます（`dropped data ...: make it again or fetch it again, and import it`）。
 
 #### 既存データのインポート
 

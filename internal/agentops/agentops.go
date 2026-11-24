@@ -37,7 +37,14 @@ type Op[Req, Resp any] struct {
 	Name    string
 	Observe Observe
 	Empty   Resp
+	// MaxBody: the largest request the daemon reads (0: its default, 1 MiB).
+	MaxBody int64
 }
+
+// MaxIdentityList is the largest file list an agent sends as a dropped
+// object's identity (KeepIdentity); the request may be twice that, the JSON
+// escaping its tabs and newlines.
+const MaxIdentityList = 64 << 20
 
 // Named is any operation, by its name.
 type Named interface{ OpName() string }
@@ -217,6 +224,14 @@ type (
 		ObjectID   string `json:"object_id"`
 		StoreID    string `json:"store_id"`
 	}
+	// KeepIdentityRequest is the file list beside an executor's copy of a
+	// dropped object (store.KeepIdentity).
+	KeepIdentityRequest struct {
+		ExecutorID string `json:"executor_id"`
+		ObjectID   string `json:"object_id"`
+		StoreID    string `json:"store_id"`
+		List       string `json:"list"`
+	}
 	AbandonPackRequest struct {
 		ExecutorID string `json:"executor_id"`
 		ObjectID   string `json:"object_id"`
@@ -337,6 +352,7 @@ var (
 	InputGone        = Op[InputPathRequest, OK]{Name: "input-gone", Observe: Refused}
 	InputIsFile      = Op[InputPathRequest, OK]{Name: "input-is-file", Observe: Refused}
 	ClaimShed        = Op[ObjectStoreRequest, OK]{Name: "claim-shed", Observe: Refused}
+	KeepIdentity     = Op[KeepIdentityRequest, OK]{Name: "keep-identity", Observe: Refused, MaxBody: MaxIdentityList * 2}
 	InventoryDurable = Op[InventoryRequest, store.DurableInventory]{Name: "inventory-durable", Observe: Refused}
 	AdoptCopies      = Op[AdoptCopiesRequest, AdoptedAnswer]{Name: "adopt-copies", Observe: Refused}
 	RecordCopy       = Op[RecordCopyRequest, OK]{Name: "record-copy", Observe: Refused}
@@ -390,7 +406,7 @@ var (
 var All = []Named{
 	Register, Observations, ReserveNext, EnsurePreemption, Stores, StoreObservation, AttemptScratch, ScratchToSettle,
 	SettleScratch, RunOutput, PacksToMake, RecordPack, CopiesToMake, RecordDescribed, AbandonPack, InPlaceSources,
-	InputGone, InputIsFile, ClaimShed, InventoryDurable, AdoptCopies, RecordCopy, FetchesToMake, RecordFetch,
+	InputGone, InputIsFile, ClaimShed, KeepIdentity, InventoryDurable, AdoptCopies, RecordCopy, FetchesToMake, RecordFetch,
 	DeletionsToMake, SettleDeletion, SourcesInUse, EvictionsToMake, SettleEviction, ScrubsToMake, RecordScrub,
 	PackRead, UnlaunchedLeases, ValidateReservation, MarkLeasePrepared, ReleaseReservation, AuthorizeLaunch,
 	ActivateLaunch, SetLogPaths, LogProblem, MarkProcessExited, RecordTerminal, QuiescenceCandidates,

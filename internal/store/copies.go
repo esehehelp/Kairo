@@ -58,8 +58,12 @@ type CopyOrder struct {
 	Description  *ObjectDescription `json:"description,omitempty"`
 	DescribeOnly bool               `json:"describe_only,omitempty"`
 	// Shed: the copy is to be removed, its store being below its reserve
-	// (shed.go): claimed first (ClaimShed), then its files removed.
-	Shed bool `json:"shed,omitempty"`
+	// (shed.go): claimed first (ClaimShed), then its files removed. Drop: it
+	// is removed for its object is dropped (data_drop.go), the file list
+	// beside it sent first when SendList (KeepIdentity).
+	Shed     bool `json:"shed,omitempty"`
+	Drop     bool `json:"drop,omitempty"`
+	SendList bool `json:"send_list,omitempty"`
 }
 
 // CopyMade is a copy an executor wrote and read back: where, its size and

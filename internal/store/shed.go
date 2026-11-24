@@ -39,6 +39,12 @@ func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID s
 		if !me.serves(s, executorID) {
 			continue
 		}
+		// copies of dropped objects go whatever room there is
+		dropped, err := dropShedOrdersTx(ctx, tx, s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, dropped...)
 		short := -room[s.ID]
 		if short <= shedMinShort {
 			continue
@@ -49,8 +55,8 @@ func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID s
 				others = append(others, d.ID)
 			}
 		}
-		err := eachRow(ctx, tx, `SELECT c.object_id,c.month,c.root,COALESCE(d.pack_bytes,0) FROM object_copies c JOIN data_objects d ON d.id=c.object_id
-			WHERE c.store_id=$1 AND c.state='verified'
+		err = eachRow(ctx, tx, `SELECT c.object_id,c.month,c.root,COALESCE(d.pack_bytes,0) FROM object_copies c JOIN data_objects d ON d.id=c.object_id
+			WHERE c.store_id=$1 AND c.state='verified' AND d.dropped_at IS NULL
 			AND (SELECT COUNT(*) FROM object_copies o WHERE o.object_id=c.object_id AND o.store_id=ANY($2::text[]) AND o.state='verified' AND o.check_problem IS NULL)>=$3
 			AND NOT EXISTS(SELECT 1 FROM object_copies r WHERE r.object_id=c.object_id AND r.state='copying' AND (r.source_store_id=c.store_id OR r.source_store_id IS NULL))
 			AND NOT EXISTS(SELECT 1 FROM object_placements p WHERE p.object_id=c.object_id AND p.state='fetching' AND p.source_store_id=c.store_id)
@@ -115,8 +121,9 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 	}
 	var state string
 	var projectID *string
-	err = tx.QueryRowContext(ctx, `SELECT c.state,d.project_scope_id FROM object_copies c JOIN data_objects d ON d.id=c.object_id WHERE c.object_id=$1 AND c.store_id=$2 FOR UPDATE OF c`,
-		objectID, storeID).Scan(&state, &projectID)
+	var dropped, identityKept bool
+	err = tx.QueryRowContext(ctx, `SELECT c.state,d.project_scope_id,d.dropped_at IS NOT NULL,d.manifest IS NOT NULL FROM object_copies c JOIN data_objects d ON d.id=c.object_id WHERE c.object_id=$1 AND c.store_id=$2 FOR UPDATE OF c`,
+		objectID, storeID).Scan(&state, &projectID, &dropped, &identityKept)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil // claimed before (a retried call)
 	}
@@ -135,7 +142,10 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 		objectID, others, storeID).Scan(&count, &reading); err != nil {
 		return err
 	}
-	if count < minOtherCopies {
+	switch {
+	case dropped && !identityKept:
+		return fmt.Errorf("%w: %s is dropped, but its file list is not kept yet (KeepIdentity)", ErrShedRefused, objectID)
+	case !dropped && count < minOtherCopies:
 		return fmt.Errorf("%w: %s has %d other good copies, not %d", ErrShedRefused, objectID, count, minOtherCopies)
 	}
 	if reading {
@@ -147,7 +157,7 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 	if _, err = tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_id=$1 AND store_id=$2`, objectID, storeID); err != nil {
 		return err
 	}
-	if err = appendCoordinationEventTx(ctx, tx, "copy_shed", projectID, "object", objectID, nil, map[string]any{"store_id": storeID, "executor_id": executorID, "other_copies": count}); err != nil {
+	if err = appendCoordinationEventTx(ctx, tx, "copy_shed", projectID, "object", objectID, nil, map[string]any{"store_id": storeID, "executor_id": executorID, "other_copies": count, "dropped": dropped}); err != nil {
 		return err
 	}
 	return tx.Commit()

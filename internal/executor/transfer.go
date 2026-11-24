@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"kairo/internal/agentops"
 	"kairo/internal/machine"
 	"kairo/internal/store"
 )
@@ -146,12 +147,24 @@ func (e *storeWorker) copyDue(ctx context.Context) {
 const descriptionSuffix = ".object.json"
 
 // shedCopy removes a copy of a durable store below its reserve
-// (store/shed.go): claimed first, so a copy the daemon no longer lets go is
-// left alone; its files then removed through the store's handles. Files a
-// failed removal leaves are adopted again by the next inventory.
+// (store/shed.go), or of a dropped object (store/data_drop.go: the file list
+// beside it sent first when the daemon has not kept it yet): claimed first,
+// so a copy the daemon no longer lets go is left alone; its files then
+// removed through the store's handles. Files a failed removal leaves are
+// adopted again by the next inventory.
 func (e *storeWorker) shedCopy(ctx context.Context, s servedStore, o store.CopyOrder) {
 	if _, isLocal := s.fs.(localStoreFS); !isLocal {
 		return
+	}
+	if o.SendList {
+		list, err := readCopyList(s.decl.Root, o.Month, o.ObjectID)
+		if err == nil {
+			err = e.Store.KeepIdentity(ctx, e.ID, o.ObjectID, o.StoreID, list)
+		}
+		if err != nil {
+			e.copyProblem(o.ObjectID, "file list of a dropped object not kept", err)
+			return
+		}
 	}
 	if err := e.Store.ClaimShed(ctx, e.ID, o.ObjectID, o.StoreID); err != nil {
 		e.copyProblem(o.ObjectID, "copy not shed", err)
@@ -162,7 +175,38 @@ func (e *storeWorker) shedCopy(ctx context.Context, s servedStore, o store.CopyO
 		return
 	}
 	e.copyProblem(o.ObjectID, "", nil)
+	if o.Drop {
+		e.Logger.Info("copy removed: its object is dropped (only its file list is kept)", "object_id", o.ObjectID, "store_id", o.StoreID, "pack_bytes", o.PackBytes)
+		return
+	}
 	e.Logger.Info("copy shed: its store is below its reserve", "object_id", o.ObjectID, "store_id", o.StoreID, "pack_bytes", o.PackBytes)
+}
+
+// readCopyList reads the file list beside the copy of id made in month on
+// the durable store at root (<id>.tar.zst.files.tsv), of at most
+// agentops.MaxIdentityList bytes.
+func readCopyList(root, month, id string) (string, error) {
+	if !machine.ValidMonth(month) || !machine.ScratchIDValid(id) {
+		return "", fmt.Errorf("%w: object %q, month %q", errOutsideRoot, id, month)
+	}
+	r, err := openDirPath(filepath.Join(root, "objects", month), false)
+	if err != nil {
+		return "", err
+	}
+	defer r.Close()
+	f, err := r.Open(id + packSuffix + manifestSuffix)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	body, err := io.ReadAll(io.LimitReader(f, agentops.MaxIdentityList+1))
+	if err != nil {
+		return "", err
+	}
+	if len(body) > agentops.MaxIdentityList {
+		return "", fmt.Errorf("the file list of %s is more than %d bytes", id, agentops.MaxIdentityList)
+	}
+	return string(body), nil
 }
 
 // removeObjectCopy removes the copy of id made in month on the durable store

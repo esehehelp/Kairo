@@ -48,8 +48,12 @@ type Coordinator interface {
 	RecordDescribed(ctx context.Context, executorID, objectID, storeID string) error
 	// AbandonPack: the source of an import to pack is gone.
 	AbandonPack(ctx context.Context, executorID, objectID, reason string) error
-	// ClaimShed: a copy of a store below its reserve is about to be removed.
+	// ClaimShed: a copy of a store below its reserve (or of a dropped
+	// object) is about to be removed.
 	ClaimShed(ctx context.Context, executorID, objectID, storeID string) error
+	// KeepIdentity: the file list beside a copy of a dropped object, kept
+	// before the copy is removed.
+	KeepIdentity(ctx context.Context, executorID, objectID, storeID, list string) error
 	// InputGone: an input's path is not there at launch.
 	InputGone(ctx context.Context, executorID, objectID, path string) error
 	// InputIsFile: an import read in place is a file, not a directory.
