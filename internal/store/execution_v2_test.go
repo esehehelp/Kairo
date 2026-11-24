@@ -50,7 +50,7 @@ func testExecutionSpec(requestID string) ExecutionSpec {
 	continuation := "checkpoint://opaque"
 	return ExecutionSpec{
 		ClientRequestID:      requestID,
-		Scope:                ScopePath{Project: "llm-develop", Queue: "training", Task: "pretrain"},
+		Scope:                ScopePath{Project: "example-train", Queue: "training", Task: "pretrain"},
 		Argv:                 []string{"python", "train.py"},
 		CWD:                  "/work",
 		ExecutorSelector:     json.RawMessage(`{"environment":"wsl2"}`),
@@ -100,7 +100,7 @@ func TestScopePauseClosesOnlyItsOwnGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	scopes, err := store.GetScopeByPath(ctx, ScopePath{Project: "llm-develop", Queue: "training", Task: "pretrain"})
+	scopes, err := store.GetScopeByPath(ctx, ScopePath{Project: "example-train", Queue: "training", Task: "pretrain"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +150,7 @@ func TestPauseDiscoversLiveExecutionOnce(t *testing.T) {
 	if _, err = store.testExec(`UPDATE execution_requests SET state='started',authorized_at='now',started_at='now' WHERE id=$1`, execution.ID); err != nil {
 		t.Fatal(err)
 	}
-	scopes, err := store.GetScopeByPath(ctx, ScopePath{Project: "llm-develop"})
+	scopes, err := store.GetScopeByPath(ctx, ScopePath{Project: "example-train"})
 	if err != nil {
 		t.Fatal(err)
 	}

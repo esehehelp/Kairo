@@ -26,7 +26,7 @@ func TestTemporalDataIsBroughtFromWhereItIs(t *testing.T) {
 	if err := store.UpsertExecutor(ctx, Executor{ID: "exec2", NodeID: "node2", Kind: "linux", Attributes: json.RawMessage(`{"environment":"linux"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.UpsertExecutor(ctx, Executor{ID: "win-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows","pack_addr":"192.168.1.12:7475"}`), Enabled: true}); err != nil {
+	if err := store.UpsertExecutor(ctx, Executor{ID: "win-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows","pack_addr":"192.0.2.12:7475"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	addTestDisk(t, store, "node2", "/")
@@ -141,7 +141,7 @@ labels = { environment = "windows" }
 		t.Fatalf("wait: %q", why)
 	}
 	fetches, err := store.FetchesToMake(ctx, "exec2")
-	if err != nil || len(fetches) != 1 || fetches[0].PackSHA256 != packSHA || fetches[0].Source.Addr != "192.168.1.12:7475" || fetches[0].Source.Token == "" || fetches[0].Source.Month != "" {
+	if err != nil || len(fetches) != 1 || fetches[0].PackSHA256 != packSHA || fetches[0].Source.Addr != "192.0.2.12:7475" || fetches[0].Source.Token == "" || fetches[0].Source.Month != "" {
 		t.Fatalf("fetches %+v %v", fetches, err)
 	}
 	if read, err := store.AuthorizePackRead(ctx, "node", object, fetches[0].Source.Token); err != nil || read.StoreID != "d-scratch" {

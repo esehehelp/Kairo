@@ -1,4 +1,4 @@
-# The Windows checks of ci/check.sh, for a Kairo task on windows-local (ci/tasks.toml.in): an attempt there is confined
+# The Windows checks of ci/check.sh, for a Kairo task on the Windows CI node (ci/tasks.toml.in): an attempt there is confined
 # (README: Confinement), it runs at Low integrity, and MSYS and Git Bash do not start so. The tree this script is in
 # (an extracted commit) is checked; the first argument is the check:
 #   windows      go vet, go test                 (PostgreSQL at KAIRO_TEST_PG, default 127.0.0.1:55432)

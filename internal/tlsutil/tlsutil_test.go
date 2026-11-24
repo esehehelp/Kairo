@@ -277,7 +277,7 @@ func TestVerifyServerChecksChainAndHost(t *testing.T) {
 	if err := InitCA(other); err != nil {
 		t.Fatal(err)
 	}
-	if err := IssueServer(dir, []string{"192.168.1.12", "localhost"}); err != nil {
+	if err := IssueServer(dir, []string{"192.0.2.12", "localhost"}); err != nil {
 		t.Fatal(err)
 	}
 	cert, err := tls.LoadX509KeyPair(filepath.Join(dir, ServerCertFile), filepath.Join(dir, ServerKeyFile))
@@ -286,13 +286,13 @@ func TestVerifyServerChecksChainAndHost(t *testing.T) {
 	}
 	ca, _ := os.ReadFile(filepath.Join(dir, CACertFile))
 	otherCA, _ := os.ReadFile(filepath.Join(other, CACertFile))
-	if err := VerifyServer(cert, ca, "192.168.1.12"); err != nil {
+	if err := VerifyServer(cert, ca, "192.0.2.12"); err != nil {
 		t.Fatalf("valid certificate: %v", err)
 	}
-	if err := VerifyServer(cert, ca, "192.168.1.13"); err == nil {
+	if err := VerifyServer(cert, ca, "192.0.2.13"); err == nil {
 		t.Fatal("certificate accepted for a host it does not cover")
 	}
-	if err := VerifyServer(cert, otherCA, "192.168.1.12"); err == nil {
+	if err := VerifyServer(cert, otherCA, "192.0.2.12"); err == nil {
 		t.Fatal("certificate accepted under another CA")
 	}
 }

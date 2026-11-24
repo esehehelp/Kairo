@@ -30,7 +30,7 @@ func TestTaskOutputAndPlacementOverTheAPI(t *testing.T) {
 		t.Fatal(err)
 	}
 	read := d.token(t, "dashboard", store.RoleRead, "")
-	code, raw := d.call(t, http.MethodGet, "/api/projects/neo-ime/tasks/train", read, nil)
+	code, raw := d.call(t, http.MethodGet, "/api/projects/example-app/tasks/train", read, nil)
 	var detail struct {
 		Task store.TaskDetail `json:"task"`
 	}
@@ -46,7 +46,7 @@ func TestTaskOutputAndPlacementOverTheAPI(t *testing.T) {
 	}{
 		{"task=train", 1}, {"task=export", 0}, {"execution=" + launch.Execution.ID, 1}, {"execution=exe_missing", 0},
 	} {
-		code, raw := d.call(t, http.MethodGet, "/api/data/objects?project=neo-ime&"+tc.query, read, nil)
+		code, raw := d.call(t, http.MethodGet, "/api/data/objects?project=example-app&"+tc.query, read, nil)
 		var body struct {
 			Objects []store.DataObject `json:"objects"`
 		}

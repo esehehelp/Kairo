@@ -22,7 +22,7 @@ import (
 // leases that held a resource within a window.
 //
 // The interval keeps a day's history small enough to average on each
-// request: on pve1's PostgreSQL (2 cores) a day of device_samples (a row per
+// request: on host-b's PostgreSQL (2 cores) a day of device_samples (a row per
 // provider poll, about 150,000) took 2.3 s; a day of both histories is about
 // 80,000 narrow rows.
 

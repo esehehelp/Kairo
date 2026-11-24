@@ -17,9 +17,9 @@ func benchPoint(seq int, phase string, settings store.DeviceSettings, rel, watts
 
 func TestRenderProfileMarksThePointForMaxSlowdownAndDrift(t *testing.T) {
 	controller := "ctl"
-	host := store.HardwareHost{ID: "pve0", Devices: []store.HardwareDevice{
-		{DevicePolicy: machine.DevicePolicy{HostID: "pve0", DeviceID: "GPU-a", Kind: "gpu", MaxSlowdown: 0.05, Control: true, Controller: &controller}},
-		{DevicePolicy: machine.DevicePolicy{HostID: "pve0", DeviceID: "cpu", Kind: "cpu", MaxSlowdown: 0.05, Control: true, Controller: &controller}},
+	host := store.HardwareHost{ID: "host-a", Devices: []store.HardwareDevice{
+		{DevicePolicy: machine.DevicePolicy{HostID: "host-a", DeviceID: "GPU-a", Kind: "gpu", MaxSlowdown: 0.05, Control: true, Controller: &controller}},
+		{DevicePolicy: machine.DevicePolicy{HostID: "host-a", DeviceID: "cpu", Kind: "cpu", MaxSlowdown: 0.05, Control: true, Controller: &controller}},
 	}}
 	ended, started, idle, valid := "2026-10-20T12:00:00Z", "2026-10-27T10:00:00Z", 34.0, true
 	jpwOld, jpwNew := 5e-12, 4.9e-12
@@ -44,7 +44,7 @@ func TestRenderProfileMarksThePointForMaxSlowdownAndDrift(t *testing.T) {
 	}
 	text := out.String()
 	for _, want := range []string{
-		"pve0/GPU-a  max_slowdown 0.05",
+		"host-a/GPU-a  max_slowdown 0.05",
 		"bnc_new finished 10-27",
 		"idle 34 °C",
 		"copy: references spread 2.0% (more than 1%)",
@@ -54,8 +54,8 @@ func TestRenderProfileMarksThePointForMaxSlowdownAndDrift(t *testing.T) {
 		"no: thermal",
 		"drift from bnc_old",
 		"work/s +1.0%, energy/work -2.0%",
-		"pve0/cpu  max_slowdown 0.05",
-		"not benched (kairo hardware bench pve0 cpu)",
+		"host-a/cpu  max_slowdown 0.05",
+		"not benched (kairo hardware bench host-a cpu)",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("profile lacks %q:\n%s", want, text)
@@ -71,7 +71,7 @@ func TestRenderProfileMarksThePointForMaxSlowdownAndDrift(t *testing.T) {
 
 func TestRenderBenchPlan(t *testing.T) {
 	plan := store.BenchPlan{
-		Run: store.BenchRun{ID: "bnc_1", HostID: "pve0", DeviceID: "GPU-a", Class: "gpu", Kinds: []string{"gemm", "copy"}, NodeID: "pve0-train", ExecutionID: "exe_1"},
+		Run: store.BenchRun{ID: "bnc_1", HostID: "host-a", DeviceID: "GPU-a", Class: "gpu", Kinds: []string{"gemm", "copy"}, NodeID: "host-a-train", ExecutionID: "exe_1"},
 		Execution: store.ExecutionSpec{Scope: store.ScopePath{Project: store.BenchProject, Queue: store.BenchQueue, Task: "bnc_1"}, Priority: store.BenchPriority, Checkpointable: true, Preemptible: true,
 			Argv: []string{"/opt/kairo", "hardware", "bench-run", "--run", "bnc_1"}, CWD: "/opt",
 			Exclusive: []store.ExclusiveRequest{{Kind: "gpu", Count: 1, Device: "GPU-a"}}, Capacity: store.CapacityRequest{CPUMillis: 1000, RAMBytes: 2 << 30}},
@@ -81,10 +81,10 @@ func TestRenderBenchPlan(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"bench bnc_1 of pve0/GPU-a (gpu: gemm, copy) on pve0-train: execution exe_1",
+		"bench bnc_1 of host-a/GPU-a (gpu: gemm, copy) on host-a-train: execution exe_1",
 		"holds GPU GPU-a, 1 CPU, 2 GiB RAM, at priority -1000000 in kairo/hardware-bench (waits for every other execution; preemptible: suspended at its next point",
 		"argv /opt/kairo hardware bench-run --run bnc_1 (cwd /opt)",
-		"kairo hardware profile pve0 GPU-a (its task: kairo task show kairo hardware-bench bnc_1)",
+		"kairo hardware profile host-a GPU-a (its task: kairo task show kairo hardware-bench bnc_1)",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Fatalf("plan lacks %q:\n%s", want, out.String())

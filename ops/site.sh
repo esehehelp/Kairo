@@ -8,7 +8,7 @@
 #   KAIRO_PVE_HOST=root@HOST          the Proxmox host of the daemon's and the database's containers
 #   KAIRO_DAEMON_VMID=N, KAIRO_DB_VMID=N
 #   KAIRO_NODES="NODE=ssh:root@HOST NODE=pct:root@HOST:VMID ..."   the Linux nodes whose agents ops/ replaces
-#   CI_WINDOWS_ROOT, CI_PVE1_HOST, CI_PVE1_VMID                      ci/kairo-ci.sh
+#   CI_WINDOWS_ROOT, CI_LINUX_NODE, CI_LINUX_SITE, CI_LINUX_HOST, CI_LINUX_VMID   ci/kairo-ci.sh
 upath() { if command -v cygpath >/dev/null 2>&1; then cygpath -u "$1"; else printf '%s\n' "$1"; fi; }
 if [ -n "${KAIRO_CONFIG_DIR:-}" ]; then
   kairo_config=$KAIRO_CONFIG_DIR

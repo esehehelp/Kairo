@@ -22,7 +22,7 @@ func TestResumedPauseCapturesNothingAdmittedAfterTheResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	operation := pauseProjectForTest(t, store, "pause-old")
-	scopes, err := store.GetScopeByPath(ctx, ScopePath{Project: "llm-develop"})
+	scopes, err := store.GetScopeByPath(ctx, ScopePath{Project: "example-train"})
 	if err != nil {
 		t.Fatal(err)
 	}

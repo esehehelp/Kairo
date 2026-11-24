@@ -246,9 +246,9 @@ def test_attempt_session_rejects_a_server_outside_the_launch_ca(monkeypatch):
 def test_controller_client_trusts_ca_file():
     with serve(tls=True) as url:
         client = KairoControllerClient(url, token="tok_controller", ca_file=DATA / "ca.pem")
-        assert client.list_events("llm-develop") == []
+        assert client.list_events("example-train") == []
     method, path, headers = _Handler.requests[0]
-    assert (method, path) == ("GET", "/api/events?project=llm-develop&after=0&limit=1000")
+    assert (method, path) == ("GET", "/api/events?project=example-train&after=0&limit=1000")
     assert headers["Authorization"] == "Bearer tok_controller"
 
 
@@ -256,7 +256,7 @@ def test_controller_client_treats_untrusted_server_as_misconfiguration():
     with serve(tls=True) as url:
         client = KairoControllerClient(url, token="tok", ca_file=DATA / "ca-other.pem")
         with pytest.raises(ControllerConfigurationError) as raised:
-            client.list_events("llm-develop")
+            client.list_events("example-train")
     assert url in str(raised.value)
     assert str(DATA / "ca-other.pem") in str(raised.value)
     assert isinstance(raised.value.__cause__, urllib.error.URLError)
@@ -268,7 +268,7 @@ def test_controller_client_treats_failed_handshake_as_misconfiguration():
     with serve(tls=True, maximum_version=ssl.TLSVersion.TLSv1_2) as url:
         client = KairoControllerClient(url, token="tok", ca_file=DATA / "ca.pem")
         with pytest.raises(ControllerConfigurationError, match="TLS to the Kairo API"):
-            client.list_events("llm-develop")
+            client.list_events("example-train")
     assert _Handler.requests == []
 
 
@@ -279,7 +279,7 @@ def test_controller_client_treats_direct_ssl_error_as_misconfiguration(monkeypat
     monkeypatch.setattr(_http, "request_json", fail)
     client = KairoControllerClient("https://kairo.example:7474", token="tok")
     with pytest.raises(ControllerConfigurationError, match="system CA roots") as raised:
-        client.list_events("llm-develop")
+        client.list_events("example-train")
     assert "https://kairo.example:7474" in str(raised.value)
 
 
@@ -291,9 +291,9 @@ LOOPBACK_URLS = [
     "http://LOCALHOST:7474",
     "http://[::ffff:127.0.0.1]:7474",
 ]
-TLS_URLS = ["https://192.168.1.12:7474", "https://127.0.0.1.nip.io:7474", "https://kairo.example"]
+TLS_URLS = ["https://192.0.2.12:7474", "https://127.0.0.1.nip.io:7474", "https://kairo.example"]
 REFUSED_URLS = [
-    "http://192.168.1.12:7474",
+    "http://192.0.2.12:7474",
     "http://127.0.0.1.nip.io:7474",
     "http://localhost.example:7474",
     "http://[fe80::1]:7474",
@@ -322,12 +322,12 @@ def test_token_never_travels_over_plain_http_off_loopback(url):
 
 
 def test_plain_http_refusal_names_the_host():
-    with pytest.raises(ValueError, match=r"plain http to 192\.168\.1\.12:7474: use https"):
-        KairoControllerClient("http://192.168.1.12:7474", token="tok")
+    with pytest.raises(ValueError, match=r"plain http to 192\.0\.2\.12:7474: use https"):
+        KairoControllerClient("http://192.0.2.12:7474", token="tok")
 
 
 def test_controller_client_refuses_plain_http_from_the_environment(monkeypatch):
-    monkeypatch.setenv("KAIRO_API", "http://192.168.1.12:7474")
+    monkeypatch.setenv("KAIRO_API", "http://192.0.2.12:7474")
     with pytest.raises(ValueError, match="plain http"):
         KairoControllerClient(token="tok")
 
@@ -350,7 +350,7 @@ def test_attempt_session_refuses_plain_http_from_the_environment(monkeypatch):
         ("127.0.0.1.nip.io", False),
         ("localhost.", False),
         ("::1%lo", False),
-        ("192.168.1.12", False),
+        ("192.0.2.12", False),
         ("", False),
         (None, False),
     ],

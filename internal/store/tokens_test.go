@@ -64,8 +64,8 @@ func TestAPITokenLifecycle(t *testing.T) {
 			t.Fatalf("accepted role %q node %q", bad.role, bad.node)
 		}
 	}
-	node, nodePlain, err := store.CreateAPIToken(ctx, "pve0", RoleNode, "pve0-node")
-	if err != nil || node.NodeID == nil || *node.NodeID != "pve0-node" || !strings.HasPrefix(nodePlain, "kairo_node_") {
+	node, nodePlain, err := store.CreateAPIToken(ctx, "host-a", RoleNode, "host-a-node")
+	if err != nil || node.NodeID == nil || *node.NodeID != "host-a-node" || !strings.HasPrefix(nodePlain, "kairo_node_") {
 		t.Fatalf("node token: %+v %v", node, err)
 	}
 	if _, err = store.AuthenticateAPIToken(ctx, plain+"x"); !errors.Is(err, ErrUnauthorized) {

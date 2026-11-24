@@ -128,7 +128,7 @@ Task は永続的な論理オブジェクトであり、一連のイミュータ
 
 ```powershell
 # TLS 用マテリアル: プライベート CA と、クライアントがデーモンへの接続に使うすべてのアドレス向けのサーバ証明書（後から kairo tls issue で再発行可能）
-go run ./cmd/kairo tls init --dir local/tls --host 127.0.0.1 --host localhost --host 192.168.1.12
+go run ./cmd/kairo tls init --dir local/tls --host 127.0.0.1 --host localhost --host 192.0.2.12
 go run ./cmd/kairo serve --config examples/kairo.toml     # スキーマを作成
 # 別ターミナルにて: オペレータ用トークンを作成し、CLI の参照先に保存
 go run ./cmd/kairo token create --config examples/kairo.toml --name operator --role admin --save
@@ -140,9 +140,9 @@ go run ./cmd/kairo task list example-project
 go run ./cmd/kairo task wait example-project train
 go run ./cmd/kairo task logs example-project train --follow
 go run ./cmd/kairo execution submit examples/execution.toml
-go run ./cmd/kairo execution list --project llm-develop
-go run ./cmd/kairo project pause llm-develop
-go run ./cmd/kairo project resume llm-develop
+go run ./cmd/kairo execution list --project example-train
+go run ./cmd/kairo project pause example-train
+go run ./cmd/kairo project resume example-train
 go run ./cmd/kairo resource status
 go run ./cmd/kairo machine apply examples/machines.toml
 go run ./cmd/kairo machine show
@@ -323,9 +323,9 @@ GPU 上の外部利用は次の基準で分類されます。
 ```powershell
 kairo token create --config kairo.toml --name operator --role admin --save
 kairo token create --config kairo.toml --name dashboard --role read --out dashboard.token
-kairo token create --config kairo.toml --name pve0-neo-train --role node --node pve0-neo-train
+kairo token create --config kairo.toml --name host-a-gpu --role node --node host-a-gpu
 kairo token list --config kairo.toml
-kairo token revoke --config kairo.toml pve0-neo-train
+kairo token revoke --config kairo.toml host-a-gpu
 ```
 
 平文のトークンは作成時に 1 度だけ表示されます。`--save` を指定すると、ユーザーの設定ディレクトリ（`%APPDATA%\kairo\token`、`~/.config/kairo/token`）に書き込まれます。
@@ -371,7 +371,7 @@ Kairo は実行中に `ca-key.pem` を一切読み込みません。`ca-key.pem`
 
 ```toml
 listen = "0.0.0.0:7474"
-advertise_url = "https://192.168.1.12:7474"  # Attempt に通知される接続先 URL
+advertise_url = "https://192.0.2.12:7474"  # Attempt に通知される接続先 URL
 tls_cert_file = "local/tls/server.pem"
 tls_key_file = "local/tls/server-key.pem"
 tls_ca_file = "local/tls/ca.pem"             # Attempt に渡される CA 証明書
@@ -393,10 +393,10 @@ tls_ca_file = "local/tls/ca.pem"             # Attempt に渡される CA 証明
 ノードエージェントは `kairo agent --config agent.toml` で起動します。基本設定は以下のとおりです。
 
 ```toml
-server_url = "https://192.168.1.12:7474"
+server_url = "https://192.0.2.12:7474"
 token = "kairo_node_..."
 ca_file = "/etc/kairo/ca.pem"
-# attempt_api_url = "https://192.168.1.12:7474"  # このノード上の Attempt に渡す KAIRO_API_URL
+# attempt_api_url = "https://192.0.2.12:7474"  # このノード上の Attempt に渡す KAIRO_API_URL
 ```
 
 残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`、`[bench]`、`[[executors]]`、`[[providers]]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。
@@ -413,12 +413,12 @@ ca_file = "/etc/kairo/ca.pem"
 ```toml
 [packs]
 listen = ":7475"                 # リッスンするアドレス
-addr = "192.168.1.14:7475"       # 他エージェントからの到達先アドレス（pack_addr）
-cert_file = "/etc/kairo/pack.pem" # kairo tls issue --host 192.168.1.14 で発行した server.pem
+addr = "192.0.2.14:7475"       # 他エージェントからの到達先アドレス（pack_addr）
+cert_file = "/etc/kairo/pack.pem" # kairo tls issue --host 192.0.2.14 で発行した server.pem
 key_file = "/etc/kairo/pack-key.pem"
 ```
 
-証明書には、デーモンの CA がそのアドレス向けに発行したものを使用します。CA の `ca.pem` と `ca-key.pem` のコピーを置いた別ディレクトリ（デーモン自身の `server.pem` を上書きしてしまうため、デーモンのディレクトリは使わないこと）で `kairo tls issue --dir DIR --host 192.168.1.14` を実行すると、そのディレクトリに `server.pem` と `server-key.pem` が生成されます。
+証明書には、デーモンの CA がそのアドレス向けに発行したものを使用します。CA の `ca.pem` と `ca-key.pem` のコピーを置いた別ディレクトリ（デーモン自身の `server.pem` を上書きしてしまうため、デーモンのディレクトリは使わないこと）で `kairo tls issue --dir DIR --host 192.0.2.14` を実行すると、そのディレクトリに `server.pem` と `server-key.pem` が生成されます。
 
 この証明書はデーモンの CA から発行されているため、取得側のエージェントは自身の `ca_file` によってすでに信頼しています。設定を有効にすると、そのエージェント配下のすべての Executor が属性の 1 つとして `pack_addr` を公開します。
 
@@ -683,7 +683,7 @@ OS ごとの実装と制約は次のとおりです。
   3. Gang より単体 Execution
   4. 開始時刻が最も新しいもの
 
-  CPU やディスクの不足は待機対象であり、他ジョブをサスペンドする理由にはなりません。また、候補すべてをサスペンドしてもなお空きが足りない場合（GPU は空くが他ジョブが保持する RAM が足りない場合など）は 1 つもサスペンドせず待機し、候補が保持しているリソースではなくサスペンドしてもなお不足するリソースを待機理由として示します（例: `insufficient_ram: pve0: 28.0 GiB ram needed, 24.0 GiB free even were glm/maya-r3 (priority -100) suspended, so none is suspended for it; and pve0: 1 GPU(s) needed, 0 usable; leased by glm/maya-r3 (priority -100)`）。
+  CPU やディスクの不足は待機対象であり、他ジョブをサスペンドする理由にはなりません。また、候補すべてをサスペンドしてもなお空きが足りない場合（GPU は空くが他ジョブが保持する RAM が足りない場合など）は 1 つもサスペンドせず待機し、候補が保持しているリソースではなくサスペンドしてもなお不足するリソースを待機理由として示します（例: `insufficient_ram: host-a: 28.0 GiB ram needed, 24.0 GiB free even were infer/serve-r3 (priority -100) suspended, so none is suspended for it; and host-a: 1 GPU(s) needed, 0 usable; leased by infer/serve-r3 (priority -100)`）。
 
 #### リソース計算・弾性 CPU・ディスクウォーターマーク
 
@@ -699,7 +699,7 @@ OS ごとの実装と制約は次のとおりです。
 
 #### 待機理由とコード一覧
 
-待機中のすべての Execution について最新の待機理由が保持されます。`task show` では `waiting:` の下に詳細が表示され（例: `gpu_leased: pve0: 1 GPU(s) of >= 11.0 GiB needed, 0 usable; leased by glm/maya-r3 (priority -100)`）、`task list` ではそのコードが NOTE に付加されます（例: `execution waiting: insufficient_ram`）。
+待機中のすべての Execution について最新の待機理由が保持されます。`task show` では `waiting:` の下に詳細が表示され（例: `gpu_leased: host-a: 1 GPU(s) of >= 11.0 GiB needed, 0 usable; leased by infer/serve-r3 (priority -100)`）、`task list` ではそのコードが NOTE に付加されます（例: `execution waiting: insufficient_ram`）。
 
 待機理由コードは以下のとおりです。
 
@@ -822,7 +822,7 @@ GPU を別ノードへ移動するには、新しいノードにその GPU を�
 - `controller`: デバイス設定の変更権限を持つ `kairo controller` のノード（省略時は設定変更せず観測のみ）。
 - `max_slowdown`: 電力効率のためにデバイスが最大性能から許容できる性能低下割合。範囲は `[0, 0.5)`（省略時は `0` で、ハードウェアはデフォルト設定を維持します）。
 - `[[hosts.devices]]`: 個別デバイス（GPU UUID または `cpu`。1 デバイスにつき 1 回のみ指定可能）に対して `max_slowdown` を上書きするか、`control = false`（設定変更もベンチマークも行わない）を設定します。
-- `containers`: ホスト上のノードのうち Proxmox コンテナであるものを vmid にマッピングします（例: `containers = { pve0-neo-train = 101 }`）。Kairo がコンテナ上でデータを削除した後にホストのコントローラがトリムを実行するため（[データストア](#データストア) を参照）、`controller` が必須であり、1 つの vmid は 1 つのノードにのみ割り当てられます。
+- `containers`: ホスト上のノードのうち Proxmox コンテナであるものを vmid にマッピングします（例: `containers = { host-a-gpu = 101 }`）。Kairo がコンテナ上でデータを削除した後にホストのコントローラがトリムを実行するため（[データストア](#データストア) を参照）、`controller` が必須であり、1 つの vmid は 1 つのノードにのみ割り当てられます。
 
 ホストの対象デバイスは、そのホストに属するいずれかのノードに宣言されたすべての GPU と `cpu`（CPU パッケージ）です。ある GPU に紐づくノードが 2 つのホストにまたがる構成はエラーとなります。ホストの `nodes` と `controller` は既知のノードでなければならず（コントローラは起動時に自身のノードを登録します）、1 つのコントローラが制御できるのは 1 ホストのみです。
 
@@ -869,7 +869,7 @@ GPU を別ノードへ移動するには、新しいノードにその GPU を�
 Task は宣言時点のコードで実行されます。書き換えによって失われうる git コミット名で参照するのではなく、Kairo 自身がコードを保持します。`kairo project apply` はファイル内の Task が指定する各ソースをスナップショット化してデーモンに保存するため、後から作業ツリーや git 履歴がどう変化しても影響を受けません。
 
 ```toml
-[sources.neo-ime]
+[sources.example-app]
 root = "."            # このファイルのディレクトリからの相対パス（デフォルト）
 paths = ["src", "crates", "configs", "pyproject.toml", "uv.lock", "Cargo.toml", "Cargo.lock"]
 exclude = ["__pycache__", "*.pyc", "target", ".venv"]
@@ -878,7 +878,7 @@ exclude = ["__pycache__", "*.pyc", "target", ".venv"]
 name = "train-x"
 # ...
 [tasks.execution]
-source = "neo-ime"
+source = "example-app"
 cwd = "."             # スナップショット内の作業ディレクトリ
 argv = ["uv", "run", "python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
 ```
@@ -943,7 +943,7 @@ name = "train-x"
 # ...
 [tasks.execution]
 image = "torch"
-source = "neo-ime"     # /kairo/src に読み取り専用でマウントされ、cwd はそこからの相対パス
+source = "example-app"     # /kairo/src に読み取り専用でマウントされ、cwd はそこからの相対パス
 cwd = "."
 argv = ["python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
 ```
@@ -962,9 +962,9 @@ argv = ["python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
 
 ```toml
 [[executors]]
-id = "pve0-ctr"
+id = "host-a-ctr"
 kind = "incus"
-labels = { environment = "linux", site = "pve0" }
+labels = { environment = "linux", site = "host-a" }
 ```
 
 必要な環境要件は以下のとおりです。
@@ -1134,7 +1134,7 @@ Kairo が保持するデータは、書き込みが完全に止まった後に�
 
 パッキング対象はそれぞれ 1 つのデータオブジェクトとして管理されます（`data_objects` テーブルで `packing` から `packed` へ遷移。イベントは `pack_ordered`、`packed`）。パッキングは 1 度だけ実行され、現在のストア宣言が依然としてそのパスを該当ディレクトリとして指している間にのみ実施されます（ストア移動前に指示されたオブジェクトは、宣言が再びそのパスを指すようになるまで再配布されません）。実行はディレクトリを作成した Executor が担当し、1 分ごとに `packs-to-make` で対象を取得して完了後に `record-pack` で記録します。
 
-パッキングでは、以下の 2 つのファイルが `<root>/packs/` 配下に生成されます（これは `neo-ime` 自身が durable store 上で使用する pack と同一の形式です）。
+パッキングでは、以下の 2 つのファイルが `<root>/packs/` 配下に生成されます（これは `example-app` 自身が durable store 上で使用する pack と同一の形式です）。
 
 - **アーカイブ本体**: `<root>/packs/<object id>.tar.zst`（PAX 形式の tar を zstd で圧縮）
 - **ファイル一覧**: `<root>/packs/<object id>.tar.zst.files.tsv`
@@ -1526,7 +1526,7 @@ HTTP API では、`POST /api/hardware/{host}/{device}/settings` が `{"settings"
 
 `kairo controller --config kairo-controller.toml`（設定例は `examples/kairo-controller.toml` を参照）は物理ホスト上で稼働します。エージェントと同様に `server_url`、`token`、`ca_file`、`insecure_http` を指定し、さらに自身の `[node]` セクションを持ちます。セットアップ手順は以下のとおりです。
 
-1. ノードトークンを発行します（例: `kairo token create --role node --node pve0-host`）。
+1. ノードトークンを発行します（例: `kairo token create --role node --node host-a-host`）。
 2. コントローラを一度起動して、そのノードをデーモンに認識させます。
 3. そのノード名をホスト宣言の `controller` に指定します。
 
@@ -1719,7 +1719,7 @@ Kairo が管理する Attempt には、以下の環境変数が渡されます�
 
 Python SDK には、このほか `ProgressReporter`、`GangContext`、`continuation_or`、`CommandJournal`（Command ID ごとにべき等なチェックポイントを管理）、`provenance.capture`、およびオペレータ向けの `KairoClient` が用意されています。
 
-Rust クレート `sdk/rust/kairo-sdk`（ブロッキング実装、`ureq` + `rustls`）も同じワーカー側機能を実装しています。`Attempt::from_env`、1 つのハートビートスレッドと `safe_point` を備えた `Session`、プロセス全体で共有される `reporter(unit)` / `phase` 進捗ハンドル、および `neo-ime` の旧 `kairo-progress` と互換性のある `kairo_sdk::Progress` を提供します。依存関係は git 経由で指定します。
+Rust クレート `sdk/rust/kairo-sdk`（ブロッキング実装、`ureq` + `rustls`）も同じワーカー側機能を実装しています。`Attempt::from_env`、1 つのハートビートスレッドと `safe_point` を備えた `Session`、プロセス全体で共有される `reporter(unit)` / `phase` 進捗ハンドル、および `example-app` の旧 `kairo-progress` と互換性のある `kairo_sdk::Progress` を提供します。依存関係は git 経由で指定します。
 
 ```toml
 kairo-sdk = { git = "https://github.com/esehehelp/Kairo", rev = "<commit>" }
@@ -1740,7 +1740,7 @@ controller = ProjectController(
 )
 execution_id = controller.submit_with_resume_after_kairo_preemption(
     activity_id="jalm-300m-v3",
-    project="llm-develop",
+    project="example-train",
     submission=execution_request,
 )
 controller.run_forever()
@@ -1978,7 +1978,7 @@ Windows では cuBLAS は遅延ロード（delay-load）されます。`gemm` �
 デーモンの状態は単一の PostgreSQL データベースに保存されます（PostgreSQL 17。LAN 上の別ホストでも構いません）。接続先はデーモン設定で指定します。
 
 ```toml
-database_url = "postgres://kairo@pve1:5432/kairo?sslmode=require"
+database_url = "postgres://kairo@host-b:5432/kairo?sslmode=require"
 database_password_file = "local/kairo-db-password"   # 任意: ファイルの 1 行目をパスワードとして使用
 ```
 
@@ -2106,7 +2106,7 @@ git diff --check
 - **Windows（ランナーイメージ付属の PostgreSQL を使用）**: `windows`
 - **Ubuntu**: `sdk-python`、`sdk-rust`
 
-セルフホストランナーもシークレットも設定していないため、GitHub 側から稼働環境へ到達することはできません。リポジトリはプライベート（2026-11-21 時点）であるため実行時間はアカウントの Actions 分数を消費し、1 回の実行あたり課金対象は約 20 分です（Windows ジョブは 2 倍でカウントされます）。実環境（`pve1` 上の LXC や実ハードウェア）を必要とするチェックは、デプロイ前や大規模ブランチのマージ前に Kairo 自体の上で実行します（[Kairo 上の CI](#kairo-上の-ci) を参照）。なお、GitHub からのデプロイは行いません。
+セルフホストランナーもシークレットも設定していないため、GitHub 側から稼働環境へ到達することはできません。リポジトリは公開されているため、GitHub ホストのランナーの実行時間は課金されません。実環境（`host-b` 上の LXC や実ハードウェア）を必要とするチェックは、デプロイ前や大規模ブランチのマージ前に Kairo 自体の上で実行します（[Kairo 上の CI](#kairo-上の-ci) を参照）。なお、GitHub からのデプロイは行いません。
 
 ### Kairo 上の CI
 
@@ -2115,26 +2115,28 @@ Kairo 自身の CI は Kairo 上で実行します。`bash ci/kairo-ci.sh [REV] 
 スクリプトは `site.env`（[運用スクリプト](#運用スクリプト)を参照）の指定に従って対象コミットのツリー（`git archive`）を各チェック実行ノードへコピーし、送信したツリーを状態ディレクトリ配下の `ci/` に保持します。
 
 ```sh
-CI_WINDOWS_ROOT=/c/Users/me/AppData/Local/kairo/ci-windows  # windows-local 上のチェック展開先
-CI_PVE1_HOST=root@192.168.1.252                             # pve1-work の Proxmox ホスト
-CI_PVE1_VMID=116                                            # pve1-work のコンテナ
+CI_WINDOWS_ROOT=/c/Users/me/AppData/Local/kairo/ci-windows  # Windows のチェックの展開先
+CI_LINUX_NODE=host-b-work                                   # Linux のチェックを走らせるノード
+CI_LINUX_SITE=host-b                                        # そのノードの site ラベル
+CI_LINUX_HOST=root@192.0.2.252                              # そのノードの Proxmox ホスト
+CI_LINUX_VMID=116                                           # そのノードのコンテナ
 ```
 
-各 Task はコピーされたツリーを自身の `scratch`（`KAIRO_SCRATCH`）に展開し、そこから `ci/check.sh CHECK` を実行します（チェック内容もそのコミット時点のものであり、実行中に読み込むファイルが外部から書き換わることはありません）。Go・`uv`・`cargo` のキャッシュはプロジェクトのキャッシュディレクトリ（`KAIRO_CACHE_DIR`）に配置し、完了時に展開したツリーを削除します。Attempt は他のジョブと同様にコンファインメントされるため（[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）、書き込みが許可されるのはこれらのみです。なお、`windows-local` 上では Low integrity で実行されるため Git Bash が起動せず、Windows 向けチェックは `ci/check.sh` ではなく PowerShell で `ci/check.ps1 CHECK` を実行します。
+各 Task はコピーされたツリーを自身の `scratch`（`KAIRO_SCRATCH`）に展開し、そこから `ci/check.sh CHECK` を実行します（チェック内容もそのコミット時点のものであり、実行中に読み込むファイルが外部から書き換わることはありません）。Go・`uv`・`cargo` のキャッシュはプロジェクトのキャッシュディレクトリ（`KAIRO_CACHE_DIR`）に配置し、完了時に展開したツリーを削除します。Attempt は他のジョブと同様にコンファインメントされるため（[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）、書き込みが許可されるのはこれらのみです。なお、`win-local` 上では Low integrity で実行されるため Git Bash が起動せず、Windows 向けチェックは `ci/check.sh` ではなく PowerShell で `ci/check.ps1 CHECK` を実行します。
 
 実行されるチェックと対象ノードの構成は次のとおりです。
 
-- **`pve1-work` 上のチェック**:
+- **`host-b-work` 上のチェック**:
   - `<sha>-linux`（`gofmt`、Linux / Windows 向け `go vet`、`go test`）および `<sha>-linux-race`: 読み取り不可・削除不可ファイルのテストが本来の意味を持つよう、非特権ユーザー（`ci`）で実行します。
   - `<sha>-linux-root`: Executor・プロセス・Provider のテストを `root` で実行します。
   - **ノード環境**: Go、`gcc`（`-race` 用）、および `127.0.0.1:55432` のテスト用 PostgreSQL 17 を備えています（テストデータベースの削除時に他の接続を切断する必要があるため、テストコンテナと同様にロールはスーパーユーザーの `kairo`。localhost のみでリッスンし、`fsync` はオフ）。
-- **`windows-local` 上のチェック**:
+- **`win-local` 上のチェック**:
   - `<sha>-windows`、`<sha>-sdk-python`、`<sha>-sdk-rust`
   - **ノード環境**: 前述のローカルテスト用コンテナを使用します。
 
 スケジューリングと運用上の操作は次のとおりです。
 
-- **優先度とメモリ予約**: すべてのチェックは優先度 `-500` で実行されるため、他のすべての作業の完了を待ち、何もプリエンプトしません。また、`pve1-work` 上の各チェックは搭載メモリ 4 GiB のうち 3 GiB を予約するため、プランナはこれらを 1 つずつ順番に実行します。
+- **優先度とメモリ予約**: すべてのチェックは優先度 `-500` で実行されるため、他のすべての作業の完了を待ち、何もプリエンプトしません。また、`host-b-work` 上の各チェックは搭載メモリ 4 GiB のうち 3 GiB を予約するため、プランナはこれらを 1 つずつ順番に実行します。
 - **待機・ログ確認・再実行**: `--wait` を付けると全チェックの完了を待機し（`kairo task wait --match`）、すべて成功した場合のみ終了コード `0` で終了します。失敗内容の確認には `kairo task logs kairo-ci ci <sha>-<check>` を、個別チェックの再実行には `kairo task rerun` を使用します（宣言済みの Task は不変であるため、1 つのコミットに対する宣言は 1 回のみです）。
 
 なお、実機の NVIDIA GPU、プロセス強制終了（process-kill）、および DDP 実行のテストは通常の単体テストではなくホスト固有の統合テストであり、コントローラによる実際のクロック・電力上限・プロセッサ設定の変更テストも同様です（コントローラの通常テストではフェイクのアクチュエータを使用します）。ベンチマークテストは極小のワークロード（`TempDir` 上の数 MiB のファイル、ループバック通信）のみを実行し、`kairo-bench-gpu` はビルド検証のみが行われます（GPU ベンチマークの実測はアイドル状態の GPU 上で実行する前提です）。ベンチマークドライバと動作点ポリシーはスクリプト化された JSON 行とフェイクのデーモン・コントローラを用いてテストされており、各種カーブ特性・定常状態・熱制限がフェイクの想定どおりに振る舞うかどうかは、実際のアイドル状態のハードウェア上でのみ確認できます。

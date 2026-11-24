@@ -26,7 +26,7 @@ func insertPauseTestRunning(t *testing.T, store *Store, execution ExecutionReque
 func pauseProjectForTest(t *testing.T, store *Store, requestID string) PauseOperation {
 	t.Helper()
 	ctx := context.Background()
-	scopes, err := store.GetScopeByPath(ctx, ScopePath{Project: "llm-develop"})
+	scopes, err := store.GetScopeByPath(ctx, ScopePath{Project: "example-train"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -97,7 +97,7 @@ func TestPauseReconcilerEnqueuesSuspendAndResumeDoesNotRecallIt(t *testing.T) {
 		t.Fatalf("targets=%+v err=%v", targets, err)
 	}
 	commandID := *targets[0].CommandID
-	scopes, _ := store.GetScopeByPath(ctx, ScopePath{Project: "llm-develop"})
+	scopes, _ := store.GetScopeByPath(ctx, ScopePath{Project: "example-train"})
 	if _, err = store.ResumeScope(ctx, scopes.Project.ID, "operator"); err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestResumedPauseDoesNotCaptureNewExecution(t *testing.T) {
 		t.Fatal(err)
 	}
 	operation := pauseProjectForTest(t, store, "pause-then-resume")
-	scopes, _ := store.GetScopeByPath(ctx, ScopePath{Project: "llm-develop"})
+	scopes, _ := store.GetScopeByPath(ctx, ScopePath{Project: "example-train"})
 	if _, err := store.ResumeScope(ctx, scopes.Project.ID, "operator"); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestPauseTargetNeverSwitchesToPostResumeLease(t *testing.T) {
 	if _, err = store.testExec(`UPDATE leases SET state='released',released_at='now' WHERE id='lease-before'`); err != nil {
 		t.Fatal(err)
 	}
-	scopes, _ := store.GetScopeByPath(ctx, ScopePath{Project: "llm-develop"})
+	scopes, _ := store.GetScopeByPath(ctx, ScopePath{Project: "example-train"})
 	if _, err = store.ResumeScope(ctx, scopes.Project.ID, "operator"); err != nil {
 		t.Fatal(err)
 	}

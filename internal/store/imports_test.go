@@ -297,7 +297,7 @@ func TestAnExecutionNamesTheStoreItsDirectoriesGoOn(t *testing.T) {
 func TestADurableStoresIntakeCanBeImported(t *testing.T) {
 	store := importFixture(t)
 	ctx := context.Background()
-	if _, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"E:/kairo/intake/neo-ime/results"}}); err != nil {
+	if _, err := store.ImportData(ctx, ImportRequest{Project: "imp", Node: "node", Paths: []string{"E:/kairo/intake/example-app/results"}}); err != nil {
 		t.Fatalf("intake refused: %v", err)
 	}
 	for _, p := range []string{"E:/kairo/intake", "E:/kairo/objects/202611", "E:/kairo/elsewhere", "D:/kairo/intake/x"} {

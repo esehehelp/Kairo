@@ -1,10 +1,10 @@
 schema_version = 2
 client_request_id = "example-001"
-project = "llm-develop"
+project = "example-train"
 queue = "training"
 task = "pretrain"
 argv = ["python", "train.py"]
-cwd = "D:/Dev/llm-develop"
+cwd = "D:/work/example-train"
 priority = 0
 checkpointable = true
 preemptible = true

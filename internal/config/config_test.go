@@ -38,9 +38,9 @@ func TestDaemonTransportRules(t *testing.T) {
 		{"lan http allowed explicitly", "listen = \"0.0.0.0:7474\"\ninsecure_http = true", ""},
 		{"https advertise without tls", "advertise_url = \"https://127.0.0.1:7474\"", "must be http"},
 		{"partial tls", "listen = \"0.0.0.0:7474\"\ntls_cert_file = \"server.pem\"", "go together"},
-		{"tls with http advertise", "listen = \"0.0.0.0:7474\"\nadvertise_url = \"http://192.168.1.12:7474\"\n" + tlsFiles, "must be https"},
-		{"tls and insecure", "listen = \"0.0.0.0:7474\"\ninsecure_http = true\nadvertise_url = \"https://192.168.1.12:7474\"\n" + tlsFiles, "contradicts"},
-		{"tls", "listen = \"0.0.0.0:7474\"\nadvertise_url = \"https://192.168.1.12:7474\"\n" + tlsFiles, ""},
+		{"tls with http advertise", "listen = \"0.0.0.0:7474\"\nadvertise_url = \"http://192.0.2.12:7474\"\n" + tlsFiles, "must be https"},
+		{"tls and insecure", "listen = \"0.0.0.0:7474\"\ninsecure_http = true\nadvertise_url = \"https://192.0.2.12:7474\"\n" + tlsFiles, "contradicts"},
+		{"tls", "listen = \"0.0.0.0:7474\"\nadvertise_url = \"https://192.0.2.12:7474\"\n" + tlsFiles, ""},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := Load(writeConfig(t, c.head+"\n"+daemonBase))
@@ -65,15 +65,15 @@ func TestTLSDefaultsAdvertiseToHTTPS(t *testing.T) {
 }
 
 func TestAgentRefusesPlainHTTPUnlessAsked(t *testing.T) {
-	base := "token = \"kairo_node_x\"\n[node]\nid = \"pve0\"\nname = \"pve0\"\n[[executors]]\nid = \"pve0-linux\"\nkind = \"linux\"\n"
+	base := "token = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n[[executors]]\nid = \"host-a-linux\"\nkind = \"linux\"\n"
 	for _, c := range []struct {
 		name, head, wantErr string
 	}{
-		{"https", `server_url = "https://192.168.1.12:7474"`, ""},
-		{"http refused", `server_url = "http://192.168.1.12:7474"`, "plain HTTP"},
-		{"http attempt url refused", "server_url = \"https://192.168.1.12:7474\"\nattempt_api_url = \"http://192.168.1.12:7474\"", "plain HTTP"},
+		{"https", `server_url = "https://192.0.2.12:7474"`, ""},
+		{"http refused", `server_url = "http://192.0.2.12:7474"`, "plain HTTP"},
+		{"http attempt url refused", "server_url = \"https://192.0.2.12:7474\"\nattempt_api_url = \"http://192.0.2.12:7474\"", "plain HTTP"},
 		{"http allowed explicitly", "server_url = \"http://127.0.0.1:7474\"\ninsecure_http = true", ""},
-		{"not a url", `server_url = "192.168.1.12:7474"`, "not an http(s) URL"},
+		{"not a url", `server_url = "192.0.2.12:7474"`, "not an http(s) URL"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			_, err := LoadAgent(writeConfig(t, c.head+"\n"+base))
@@ -107,16 +107,16 @@ func TestControlOnlyDaemonLoads(t *testing.T) {
 }
 
 func TestControllerConfig(t *testing.T) {
-	base := "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0-host\"\n"
+	base := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host-a-host\"\n"
 	path := writeConfig(t, base)
 	c, err := LoadController(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Node.Name != "pve0-host" || c.PollIntervalSeconds != 10 || c.ResetAfterSeconds != 120 || c.StateFile != strings.TrimSuffix(path, ".toml")+".state.json" {
+	if c.Node.Name != "host-a-host" || c.PollIntervalSeconds != 10 || c.ResetAfterSeconds != 120 || c.StateFile != strings.TrimSuffix(path, ".toml")+".state.json" {
 		t.Fatalf("defaults: %+v", c)
 	}
-	if c, err = LoadController("../../examples/kairo-controller.toml"); err != nil || c.Node.ID != "pve0-host" {
+	if c, err = LoadController("../../examples/kairo-controller.toml"); err != nil || c.Node.ID != "host-a-host" {
 		t.Fatalf("example: %+v %v", c, err)
 	}
 	for _, bad := range []struct{ body, want string }{
@@ -132,7 +132,7 @@ func TestControllerConfig(t *testing.T) {
 }
 
 func TestAgentStillRequiresAnExecutor(t *testing.T) {
-	_, err := LoadAgent(writeConfig(t, "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0\"\nname = \"pve0\"\n"))
+	_, err := LoadAgent(writeConfig(t, "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n"))
 	if err == nil || !strings.Contains(err.Error(), "at least one executor") {
 		t.Fatalf("agent without executors: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestAgentStillRequiresAnExecutor(t *testing.T) {
 // kind is retired, and taken for a host executor it would run Linux command
 // lines on Windows.
 func TestAgentRefusesAWSLExecutor(t *testing.T) {
-	base := "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host\"\nname = \"host\"\n[[executors]]\nid = \"ubuntu-wsl\"\n"
+	base := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host\"\nname = \"host\"\n[[executors]]\nid = \"wsl-exec\"\n"
 	for _, decl := range []string{"kind = \"wsl2\"\n", "kind = \"local\"\nlabels = { environment = \"wsl2\" }\n"} {
 		if _, err := LoadAgent(writeConfig(t, base+decl)); err == nil || !strings.Contains(err.Error(), "WSL executors are retired") {
 			t.Fatalf("%q: %v", decl, err)
@@ -151,7 +151,7 @@ func TestAgentRefusesAWSLExecutor(t *testing.T) {
 }
 
 func TestLogMinFreeDefaultsAndRefusesNegative(t *testing.T) {
-	agentBase := "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0\"\nname = \"pve0\"\n[[executors]]\nid = \"pve0-linux\"\nkind = \"linux\"\n"
+	agentBase := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n[[executors]]\nid = \"host-a-linux\"\nkind = \"linux\"\n"
 	c, err := Load(writeConfig(t, daemonBase))
 	if err != nil || c.LogMinFreeMiB != DefaultLogMinFreeMiB {
 		t.Fatalf("daemon default: %d %v", c.LogMinFreeMiB, err)
@@ -216,10 +216,10 @@ func TestDatabaseFromTheFileTheEnvironmentAndAPasswordFile(t *testing.T) {
 }
 
 func TestAgentPacksAreAllOrNothing(t *testing.T) {
-	agentBase := "server_url = \"https://192.168.1.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"pve0\"\nname = \"pve0\"\n[[executors]]\nid = \"pve0-linux\"\nkind = \"linux\"\n"
-	full := "[packs]\nlisten = \":7475\"\naddr = \"192.168.1.14:7475\"\ncert_file = \"pack.pem\"\nkey_file = \"pack-key.pem\"\n"
+	agentBase := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n[[executors]]\nid = \"host-a-linux\"\nkind = \"linux\"\n"
+	full := "[packs]\nlisten = \":7475\"\naddr = \"192.0.2.14:7475\"\ncert_file = \"pack.pem\"\nkey_file = \"pack-key.pem\"\n"
 	a, err := LoadAgent(writeConfig(t, agentBase+full))
-	if err != nil || a.Packs.Listen != ":7475" || a.Packs.Addr != "192.168.1.14:7475" {
+	if err != nil || a.Packs.Listen != ":7475" || a.Packs.Addr != "192.0.2.14:7475" {
 		t.Fatalf("packs: %+v %v", a.Packs, err)
 	}
 	if a, err = LoadAgent(writeConfig(t, agentBase)); err != nil || a.Packs != (Packs{}) {
@@ -228,7 +228,7 @@ func TestAgentPacksAreAllOrNothing(t *testing.T) {
 	if _, err = LoadAgent(writeConfig(t, agentBase+"[packs]\nlisten = \":7475\"\n")); err == nil || !strings.Contains(err.Error(), "together") {
 		t.Fatalf("packs half set: %v", err)
 	}
-	if _, err = LoadAgent(writeConfig(t, agentBase+strings.Replace(full, "192.168.1.14:7475", "192.168.1.14", 1))); err == nil || !strings.Contains(err.Error(), "host:port") {
+	if _, err = LoadAgent(writeConfig(t, agentBase+strings.Replace(full, "192.0.2.14:7475", "192.0.2.14", 1))); err == nil || !strings.Contains(err.Error(), "host:port") {
 		t.Fatalf("addr without a port: %v", err)
 	}
 }
@@ -254,8 +254,8 @@ func TestDataScrubSettings(t *testing.T) {
 // holds a password (issue #11): HasPassword tells.
 func TestHasPassword(t *testing.T) {
 	for dsn, want := range map[string]bool{
-		"postgres://kairo@192.168.1.248:5432/kairo?sslmode=require": false,
-		"postgres://kairo:secret@192.168.1.248:5432/kairo":          true,
+		"postgres://kairo@192.0.2.248:5432/kairo?sslmode=require": false,
+		"postgres://kairo:secret@192.0.2.248:5432/kairo":          true,
 		"postgresql://kairo@host/kairo?password=secret":             true,
 		"host=127.0.0.1 user=kairo dbname=kairo":                    false,
 		"host=127.0.0.1 user=kairo password=secret dbname=kairo":    true,

@@ -41,7 +41,7 @@ policy = "RunToCompletion@v1"
 [tasks.execution]
 schema_version = 2
 argv = ["wsl-train"]
-cwd = "/mnt/d/Dev/neo-ime"
+cwd = "/mnt/d/Dev/example-app"
 [tasks.execution.executor]
 labels = { environment = "windows" }
 [[tasks.execution.exclusive]]
@@ -53,7 +53,7 @@ size = 2
 [[tasks.execution.gang.ranks]]
 rank = 1
 argv = ["linux-train"]
-cwd = "/srv/neo-ime"
+cwd = "/srv/example-app"
 executor = { labels = { environment = "linux" } }
 `+rank1Extra)
 	ctx := context.Background()
@@ -124,7 +124,7 @@ policy = "RunToCompletion@v1"
 [tasks.execution]
 schema_version = 2
 argv = ["wsl-train"]
-cwd = "/mnt/d/Dev/neo-ime"
+cwd = "/mnt/d/Dev/example-app"
 [tasks.execution.executor]
 labels = { environment = "windows" }
 [[tasks.execution.exclusive]]

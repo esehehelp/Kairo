@@ -21,7 +21,7 @@ func TestACopyIsDescribedBesideItself(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "obj_a"+packSuffix), []byte("pack"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	name, project := "local/hand", "neo-ime-dict"
+	name, project := "local/hand", "example-app-dict"
 	s := servedStore{decl: machine.Store{ID: "e", Class: machine.StoreDurable, Root: root}, fs: localStoreFS{}, usable: true}
 	o := store.CopyOrder{ObjectID: "obj_a", StoreID: "e", Root: root, Month: "202611",
 		Description: &store.ObjectDescription{Format: store.DescriptionFormat, ObjectID: "obj_a", Kind: "import", Project: &project, Name: &name}}

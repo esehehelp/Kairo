@@ -37,9 +37,9 @@ func TestSpecWithoutEnvKeepsItsDigests(t *testing.T) {
 		source, spec string
 		tasks        map[string]string
 	}{
-		{validManifest(), "3f95aaffe4564078a89faf70f1fa935ee1b7b25c1aed89df4d2c03f04e2466b8", map[string]string{
-			"prepare": "0970cc079430f52b0ef3fcc6cf1a4afe980d3911c6d3248d6efb3f200fe6c0e1",
-			"train":   "50adcaa461eeefe47e1d2c99815093a1d6df61088a60bef1a39f1106c141e5bf",
+		{validManifest(), "8ea36af8d36273cd6767b0c7945a21e2a7d7b20229b7629ea8e54a271374060f", map[string]string{
+			"prepare": "f6e3762d094af3352ddcfc328ee1a3ed44b8aa40a26bdd3e7956f1cfc0d0758c",
+			"train":   "794c8579601a0394b28e12aaf6c723cd3052cb72bad4a73f875d12d2b672b12f",
 		}},
 		{gangDigestManifest, "744ec6b2855b6948ba8f0af2884c5fb6d09743824eea47aeb47f6f42ab9784f1", map[string]string{
 			"ddp": "39142e7adf75450e94bd2de8e5253bf4d28509a1fc07112c3ae496c370dbfd26",

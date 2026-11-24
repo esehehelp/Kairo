@@ -33,7 +33,7 @@ func TestParseNodeAndDevicePinsKeepOtherDigests(t *testing.T) {
 func validManifest() string {
 	return `schema_version = 1
 [project]
-name = "neo-ime"
+name = "example-app"
 
 [[tasks]]
 name = "prepare"
@@ -42,7 +42,7 @@ depends_on = []
 policy = "RunToCompletion@v1"
 [tasks.execution]
 schema_version = 2
-argv = ["uv", "run", "neo-ime", "prepare"]
+argv = ["uv", "run", "example-app", "prepare"]
 cwd = "/work"
 checkpointable = false
 preemptible = false
@@ -54,7 +54,7 @@ depends_on = ["prepare"]
 policy = "RunToCompletion@v1"
 [tasks.execution]
 schema_version = 2
-argv = ["uv", "run", "neo-ime", "train"]
+argv = ["uv", "run", "example-app", "train"]
 cwd = "/work"
 checkpointable = true
 preemptible = true
@@ -69,7 +69,7 @@ func TestParseProjectTaskDAG(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if parsed.Manifest.Project.Name != "neo-ime" || len(parsed.Manifest.Tasks) != 2 {
+	if parsed.Manifest.Project.Name != "example-app" || len(parsed.Manifest.Tasks) != 2 {
 		t.Fatalf("unexpected manifest: %+v", parsed.Manifest)
 	}
 	if parsed.Manifest.Tasks[1].Name != "train" || parsed.Manifest.Tasks[1].DependsOn[0] != "prepare" {
@@ -99,7 +99,7 @@ func TestParseRejectsTaskCycles(t *testing.T) {
 func defaultsManifest() string {
 	return `schema_version = 1
 [project]
-name = "neo-ime"
+name = "example-app"
 
 [defaults]
 policy = "RunToCompletion@v1"
@@ -113,14 +113,14 @@ preemptible = false
 name = "prepare"
 queue = "data"
 [tasks.execution]
-argv = ["uv", "run", "neo-ime", "prepare"]
+argv = ["uv", "run", "example-app", "prepare"]
 
 [[tasks]]
 name = "train"
 queue = "training"
 depends_on = ["prepare"]
 [tasks.execution]
-argv = ["uv", "run", "neo-ime", "train"]
+argv = ["uv", "run", "example-app", "train"]
 checkpointable = true
 preemptible = true
 [[tasks.execution.exclusive]]
@@ -170,7 +170,7 @@ name = "a"
 [tasks.execution]
 argv = ["run", "a"]
 [tasks.execution.executor]
-labels = { site = "pve0" }
+labels = { site = "host-a" }
 [tasks.execution.capacity]
 cpu_millis = 0
 `
@@ -189,7 +189,7 @@ cpu_millis = 0
 	if execution.Capacity.CPUMillis != 0 || execution.Capacity.RAMBytes != 4096 {
 		t.Fatalf("capacity: %+v", execution.Capacity)
 	}
-	if execution.Executor.Labels["environment"] != "windows" || execution.Executor.Labels["site"] != "pve0" {
+	if execution.Executor.Labels["environment"] != "windows" || execution.Executor.Labels["site"] != "host-a" {
 		t.Fatalf("labels: %+v", execution.Executor.Labels)
 	}
 }

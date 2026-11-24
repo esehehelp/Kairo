@@ -29,7 +29,7 @@ import (
 // compressed with zstd) with its file list <object id>.tar.zst.files.tsv: a
 // header line "path\tbytes\tsha256\tmtime_ns", then one line per regular
 // file, sorted by path (relative, "/"-separated; a backslash, tab, CR or LF
-// in it written \\, \t, \r, \n), the format neo-ime's own packs on the
+// in it written \\, \t, \r, \n), the format example-app's own packs on the
 // durable store use. Both are written under a ".partial" name and renamed
 // once complete and synced (the file list first), so a pack that is there is
 // whole; a round cut short starts the object again.

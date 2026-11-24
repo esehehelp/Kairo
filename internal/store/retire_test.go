@@ -228,14 +228,14 @@ func TestDeletionsAreTrimmedByTheHostsController(t *testing.T) {
 		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"},
 	)
-	if err := store.UpsertNode(ctx, Node{ID: "pve0-host", Name: "pve0-host", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+	if err := store.UpsertNode(ctx, Node{ID: "host-a-host", Name: "host-a-host", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	spec.Hosts = []machine.Host{{ID: "pve0", Nodes: []string{"node"}, Controller: "pve0-host", Containers: map[string]int{"node": 101}}}
+	spec.Hosts = []machine.Host{{ID: "host-a", Nodes: []string{"node"}, Controller: "host-a-host", Containers: map[string]int{"node": 101}}}
 	if _, err := store.ApplyMachines(ctx, spec, false); err != nil {
 		t.Fatal(err)
 	}
-	if trims, err := store.TrimsToMake(ctx, "pve0-host"); err != nil || len(trims) != 0 {
+	if trims, err := store.TrimsToMake(ctx, "host-a-host"); err != nil || len(trims) != 0 {
 		t.Fatalf("a trim with nothing deleted: %+v %v", trims, err)
 	}
 	for _, state := range []string{SourceDeleting, SourceDeleted} {
@@ -246,30 +246,30 @@ func TestDeletionsAreTrimmedByTheHostsController(t *testing.T) {
 	if trims, err := store.TrimsToMake(ctx, "another-host"); err != nil || len(trims) != 0 {
 		t.Fatalf("another controller asked to trim: %+v %v", trims, err)
 	}
-	trims, err := store.TrimsToMake(ctx, "pve0-host")
+	trims, err := store.TrimsToMake(ctx, "host-a-host")
 	if err != nil || len(trims) != 1 || trims[0] != (TrimOrder{NodeID: "node", VMID: 101, RequestedBytes: 1000}) {
 		t.Fatalf("trims %+v %v", trims, err)
 	}
 	if err := store.RecordTrim(ctx, "another-host", TrimDone{NodeID: "node"}); err == nil {
 		t.Fatal("a trim recorded by another host's controller")
 	}
-	if err := store.RecordTrim(ctx, "pve0-host", TrimDone{NodeID: "node", Output: "/: 9.3 GiB trimmed"}); err != nil {
+	if err := store.RecordTrim(ctx, "host-a-host", TrimDone{NodeID: "node", Output: "/: 9.3 GiB trimmed"}); err != nil {
 		t.Fatal(err)
 	}
-	if trims, err := store.TrimsToMake(ctx, "pve0-host"); err != nil || len(trims) != 0 {
+	if trims, err := store.TrimsToMake(ctx, "host-a-host"); err != nil || len(trims) != 0 {
 		t.Fatalf("trimmed again at once: %+v %v", trims, err)
 	}
 	// deleted again within the hour: trimmed once the hour has passed
 	if _, err := store.testExec(`UPDATE node_trims SET requested_at=$1`, time.Now().UTC().Add(time.Minute).Format(time.RFC3339Nano)); err != nil {
 		t.Fatal(err)
 	}
-	if trims, err := store.TrimsToMake(ctx, "pve0-host"); err != nil || len(trims) != 0 {
+	if trims, err := store.TrimsToMake(ctx, "host-a-host"); err != nil || len(trims) != 0 {
 		t.Fatalf("trimmed again within the hour: %+v %v", trims, err)
 	}
 	if _, err := store.testExec(`UPDATE node_trims SET trimmed_at='2026-01-01T00:00:00Z'`); err != nil {
 		t.Fatal(err)
 	}
-	if trims, err := store.TrimsToMake(ctx, "pve0-host"); err != nil || len(trims) != 1 {
+	if trims, err := store.TrimsToMake(ctx, "host-a-host"); err != nil || len(trims) != 1 {
 		t.Fatalf("not trimmed once the hour passed: %+v %v", trims, err)
 	}
 }

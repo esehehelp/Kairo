@@ -2,12 +2,12 @@
 # One CI check of the tree this script is in (an extracted commit), as a Kairo task of project kairo-ci runs it
 # (ci/kairo-ci.sh), or as a job of GitHub's CI (.github/workflows/ci.yml, the checks that need nothing of this
 # installation). The check is the first argument:
-#   linux       gofmt, go vet (Linux and Windows), go test   (pve1-work, as an unprivileged user)
-#   linux-race  go test -race                               (pve1-work, as an unprivileged user)
-#   linux-root  the executor and process tests as root      (pve1-work)
-#   windows     go vet, go test                             (windows-local)
-#   sdk-python  the Python SDK's tests                      (windows-local)
-#   sdk-rust    the Rust SDK's tests                        (windows-local)
+#   linux       gofmt, go vet (Linux and Windows), go test   (the Linux CI node, as an unprivileged user)
+#   linux-race  go test -race                               (the Linux CI node, as an unprivileged user)
+#   linux-root  the executor and process tests as root      (the Linux CI node)
+#   windows     go vet, go test                             (the Windows CI node)
+#   sdk-python  the Python SDK's tests                      (the Windows CI node)
+#   sdk-rust    the Rust SDK's tests                        (the Windows CI node)
 # Store tests need PostgreSQL at KAIRO_TEST_PG (default 127.0.0.1:55432, kairo/kairo-test).
 set -euo pipefail
 check=${1:?usage: ci/check.sh CHECK}

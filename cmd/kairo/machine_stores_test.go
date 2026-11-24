@@ -9,7 +9,7 @@ import (
 )
 
 func TestFormatApplyListsStoreChanges(t *testing.T) {
-	from := machine.Store{ID: "pool", Class: "volatile", Node: "pve0", Root: "/srv/kairo", Filesystem: "/", Backend: "local-fs"}
+	from := machine.Store{ID: "pool", Class: "volatile", Node: "host-a", Root: "/srv/kairo", Filesystem: "/", Backend: "local-fs"}
 	to := from
 	to.Root = "/srv/kairo2"
 	result := store.MachineApplyResult{
