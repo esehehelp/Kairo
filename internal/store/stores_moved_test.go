@@ -54,8 +54,8 @@ func TestAStoreIsMovedAndItsRecordsFollow(t *testing.T) {
 		VALUES('obj_1','e-durable','win-exec','E:/kairo','202611','verified','E:/kairo/objects/202611/obj_1.tar.zst','E:/kairo/objects/202611/obj_1.tar.zst.files.tsv','2026-11-06T01:02:03Z','2026-11-06T01:02:03Z','2026-11-06T01:02:03Z')`); err != nil {
 		t.Fatal(err)
 	}
-	scratch := machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:"}
-	durable := machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "E:/kairo", Filesystem: "D:"}
+	scratch := machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "win-exec", Root: "D:/kairo", Filesystem: "D:"}
+	durable := machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "win-exec", Root: "E:/kairo", Filesystem: "D:"}
 	moving := durable
 	moving.Root, moving.MovedFrom = "E:/_kairo-durable", "E:/kairo"
 
