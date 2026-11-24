@@ -4,15 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+
+	"kairo/internal/store/dbtx"
 )
 
 func appendCoordinationEventTx(ctx context.Context, tx *sql.Tx, eventType string, projectScopeID *string, aggregateType, aggregateID string, epoch *int64, payload any) error {
-	body, err := json.Marshal(payload)
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO coordination_events(event_type,project_scope_id,aggregate_type,aggregate_id,coordination_epoch,payload_json,created_at) VALUES($1,$2,$3,$4,$5,$6,$7)`, eventType, projectScopeID, aggregateType, aggregateID, epoch, string(body), now())
-	return err
+	return dbtx.AppendEvent(ctx, tx, eventType, projectScopeID, aggregateType, aggregateID, epoch, payload)
 }
 
 func (s *Store) ListEvents(ctx context.Context, filter EventFilter) ([]CoordinationEvent, error) {

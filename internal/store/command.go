@@ -1,5 +1,7 @@
 package store
 
+import "kairo/internal/store/dbtx"
+
 func ackState(phase string) (string, bool) {
 	switch phase {
 	case "accepted", "checkpointing", "checkpointed", "rejected":
@@ -26,9 +28,4 @@ func commandStateRank(state string) int {
 	}
 }
 
-func nullable(value string) any {
-	if value == "" {
-		return nil
-	}
-	return value
-}
+func nullable(value string) any { return dbtx.Nullable(value) }

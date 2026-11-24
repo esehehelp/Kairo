@@ -53,10 +53,10 @@ Layers:
 | planning | one pass over the installation: placement, backfill, preemption, run-time estimates, admission accounting | `store` (planner, preemption, estimate) | Admission, Run-time estimates |
 | execution | launch through the executor's backend (on its host, inside WSL, in an Incus container: `executor/backend.go`), shim and adoption, confinement, force stop, quiescence, usage, observation | `executor`, `processidentity`, `provider`, `agentclient` | Agent restarts, Containers, Force stop |
 | data | stores; scratch, output and cache directories; data objects, packs, copies, replicas; imports, run snapshots, checkpoints, temporal data; fetches, eviction, read-back, inventory | `store` (packs, copies, replicas, deletions, imports, inputs, placements, evictions, temporal, regenerate, transfer, runsnapshots, checkpoints, inventory_durable, scrub, shed, control_snapshot), `executor` (its store worker, storeworker.go: datastore, pack, transfer, fetch, retire, evict, inventory, storefs), `machine`, `datainput` | Data stores, Kairo keeps itself |
-| provenance | code snapshots, container images by digest | `sourcesnap`, `imageref`, `store` (sources, images) | Code snapshots, Containers |
+| provenance | code snapshots, container images by digest | `sourcesnap`, `imageref`, `store/provenance` | Code snapshots, Containers |
 | hardware | machine declaration, device settings, operating-point policy, benches, power and energy | `machine`, `devicecontrol`, `hwpolicy`, `hwbench`, `bench`, `cpupower`, `store` (device, device_policy, device_samples, hardware_bench, hardware_history, hosts) | Machine declaration, Hardware settings, Hardware benchmarks, Power and energy |
 | access | the HTTP API and the agent operations, tokens, TLS, private files | `api`, `agentops`, `tlsutil`, `secfile`, `store` (tokens) | Authentication and TLS, API |
-| support | configuration, env rules, ids, times, external commands, build stamp, tests | `config`, `envspec`, `id`, `instant`, `extcmd`, `buildinfo`, `conformance`, `pgtest`, `sqliteimport` | Verification |
+| support | the store's transactions under the decision lock and its event log; configuration, env rules, ids, times, external commands, build stamp, tests | `store/dbtx`, `config`, `envspec`, `id`, `instant`, `extcmd`, `buildinfo`, `conformance`, `pgtest`, `sqliteimport` | Database, Verification |
 
 The life of an execution:
 
