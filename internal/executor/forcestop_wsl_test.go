@@ -67,7 +67,7 @@ func TestWSLLaunchEnvironmentReachesTheAttempt(t *testing.T) {
 	launch.CWD = "/tmp"
 	launch.Argv = []string{"sh", "-c", `echo "$KAIRO_ATTEMPT_TOKEN|$CUDA_VISIBLE_DEVICES|$RANK|${KAIRO_TOKEN:-none}"; sleep 120 & sleep 120; wait`}
 	t.Setenv("KAIRO_TOKEN", "kairo_admin_operator")
-	cmd := (&Local{ID: "wsl", Kind: "wsl2", Attributes: map[string]string{}}).command(launch)
+	cmd := launcherOf(t, &Local{ID: "wsl", Kind: "wsl2", Attributes: map[string]string{}}, launch)
 	var out strings.Builder
 	cmd.Stdout = &out
 	if err := cmd.Start(); err != nil {
@@ -108,7 +108,7 @@ func TestWSLLaunchRunsArgvVerbatim(t *testing.T) {
 	launch.Gang = nil
 	launch.CWD = "/tmp"
 	launch.Argv = []string{"bash", "-c", `for bm in 64 128; do printf '%s|' "BM=$bm"; done; printf '%s' "$1"`, "x", "two words"}
-	out, err := e.command(launch).Output()
+	out, err := launcherOf(t, e, launch).Output()
 	if err != nil {
 		t.Fatal(err)
 	}

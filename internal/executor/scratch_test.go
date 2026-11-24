@@ -319,7 +319,7 @@ func TestLaunchGetsScratchOnAVolatileStore(t *testing.T) {
 	}
 	launch.ScratchTmpdir = true
 	t.Setenv("TMP", filepath.Join(root, "parent-tmp"))
-	cmd := e.command(launch)
+	cmd := launcherOf(t, e, launch)
 	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
 		var values []string
 		for _, kv := range cmd.Env {

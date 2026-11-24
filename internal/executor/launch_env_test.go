@@ -2,6 +2,8 @@ package executor
 
 import (
 	"encoding/json"
+	"errors"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -27,6 +29,16 @@ func testLaunch() *store.Launch {
 	}
 }
 
+// launcherOf is the launcher e's backend builds for launch (backend.go).
+func launcherOf(t *testing.T, e *Local, launch *store.Launch) *exec.Cmd {
+	t.Helper()
+	cmd, _, err := e.backend().launcher(launch)
+	if err != nil && (cmd == nil || !errors.Is(err, exec.ErrNotFound)) {
+		t.Fatal(err)
+	}
+	return cmd // as built, also when argv[0] is not on this machine
+}
+
 func envValue(env []string, name string) (string, bool) {
 	for _, kv := range env {
 		if k, v, _ := strings.Cut(kv, "="); k == name {
@@ -43,7 +55,7 @@ func TestWSLLaunchPassesTheEnvironmentThroughWSLENV(t *testing.T) {
 	t.Setenv("KAIRO_TOKEN", "kairo_admin_operator")
 	t.Setenv("WSLENV", "USERPROFILE/p")
 	e := &Local{ID: "ubuntu-wsl", NodeID: "host", Kind: "wsl2", APIURL: "https://192.168.1.12:7474", APICA: "Q0E=", Attributes: map[string]string{"distro": "Ubuntu", "interconnect_ifname": "eth1"}}
-	cmd := e.command(testLaunch())
+	cmd := launcherOf(t, e, testLaunch())
 	if want := []string{"-d", "Ubuntu", "--cd", "/work", "--exec", "python", "train.py", "--steps", "10"}; !slices.Equal(cmd.Args[1:], want) {
 		t.Fatalf("args = %q", cmd.Args)
 	}
@@ -80,7 +92,7 @@ func TestNativeLaunchEnvironment(t *testing.T) {
 	t.Setenv("KAIRO_TOKEN", "kairo_admin_operator")
 	t.Setenv("KAIRO_ATTEMPT_TOKEN", "kairo_worker_stale")
 	e := &Local{ID: "windows-local", NodeID: "host", Kind: "windows", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
-	cmd := e.command(testLaunch())
+	cmd := launcherOf(t, e, testLaunch())
 	if !slices.Equal(cmd.Args, []string{"python", "train.py", "--steps", "10"}) || cmd.Dir != "/work" {
 		t.Fatalf("command %q in %q", cmd.Args, cmd.Dir)
 	}
@@ -128,7 +140,7 @@ func TestDeclaredEnvOverridesTheParentButNotKairo(t *testing.T) {
 	launch := testLaunch()
 	launch.Env = map[string]string{"PYTHONUTF8": "1", "path": `C:\only`, "RANK": "7", "CUDA_VISIBLE_DEVICES": "9", "Zeta": "z", "Alpha": "a"}
 	e := &Local{ID: "windows-local", NodeID: "host", Kind: "windows", APIURL: "https://127.0.0.1:7474", Attributes: map[string]string{}}
-	cmd := e.command(launch)
+	cmd := launcherOf(t, e, launch)
 	values := func(name string) []string {
 		var out []string
 		for _, kv := range cmd.Env {
@@ -160,7 +172,7 @@ func TestWSLLaunchSharesDeclaredEnvThroughWSLENV(t *testing.T) {
 	launch := testLaunch()
 	launch.Env = map[string]string{"PYTHONUTF8": "1", "HF_HOME": "/srv/hf", "RANK": "7"}
 	e := &Local{ID: "ubuntu-wsl", NodeID: "host", Kind: "wsl2", APIURL: "https://192.168.1.12:7474", Attributes: map[string]string{"distro": "Ubuntu"}}
-	cmd := e.command(launch)
+	cmd := launcherOf(t, e, launch)
 	for name, want := range map[string]string{"PYTHONUTF8": "1", "HF_HOME": "/srv/hf", "RANK": "1"} {
 		if got, _ := envValue(cmd.Env, name); got != want {
 			t.Fatalf("%s = %q", name, got)

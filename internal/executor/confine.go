@@ -114,9 +114,6 @@ type confinement struct {
 // made ready as confineCommand makes them (which also tells, before
 // anything starts, that it can be confined here).
 func (e *Local) confine(cmd *exec.Cmd) (*confinement, error) {
-	if e.isWSL() {
-		return nil, fmt.Errorf("%w: confinement inside WSL is not done yet", errConfineHere)
-	}
 	scratch, output, cache := confinedDirs(cmd.Env)
 	if scratch == "" || output == "" {
 		return nil, fmt.Errorf("%w: no scratch and output directory here (no usable volatile store)", errConfineHere)

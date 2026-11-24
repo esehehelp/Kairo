@@ -136,9 +136,8 @@ func (e *Local) scratchEnv(launch *store.Launch) []string {
 	}
 	env := []string{"KAIRO_SCRATCH=" + dir}
 	if launch.ScratchTmpdir {
-		env = append(env, "TMPDIR="+dir)
-		if !e.isWSL() {
-			env = append(env, "TMP="+dir, "TEMP="+dir)
+		for _, name := range e.backend().tempNames() {
+			env = append(env, name+"="+dir)
 		}
 	}
 	return env
