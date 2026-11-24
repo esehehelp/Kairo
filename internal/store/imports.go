@@ -308,6 +308,9 @@ func (s *Store) ImportData(ctx context.Context, req ImportRequest) ([]ImportedOb
 			return nil, err
 		}
 		objectID := id.New("obj")
+		if err := checkMade(recObject, "packing"); err != nil {
+			return nil, err
+		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,name,delete_source,lifecycle,producer_task_scope_id,created_at,updated_at)
 			VALUES($1,'import',$1,$2,$3,$4,$5,$6,'packing',$7,$8,$9,$10,$11,$12)`, objectID, packStore.ID, packExecutor, packStore.Root, dir, projectID, name, req.DeleteSource, lifecycle, producer, t, t); err != nil {
 			return nil, err

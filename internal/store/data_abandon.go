@@ -35,9 +35,9 @@ func (s *Store) abandonImport(ctx context.Context, objectID, executorID, reason,
 		return err
 	}
 	defer tx.Rollback()
-	var kind, state, owner string
+	var kind, state, owner, sourceState string
 	var projectID *string
-	err = tx.QueryRowContext(ctx, `SELECT kind,state,executor_id,project_scope_id FROM data_objects WHERE id=$1 FOR UPDATE`, objectID).Scan(&kind, &state, &owner, &projectID)
+	err = tx.QueryRowContext(ctx, `SELECT kind,state,executor_id,project_scope_id,source_state FROM data_objects WHERE id=$1 FOR UPDATE`, objectID).Scan(&kind, &state, &owner, &projectID, &sourceState)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: object %s", ErrNotFound, objectID)
 	}
@@ -53,6 +53,9 @@ func (s *Store) abandonImport(ctx context.Context, objectID, executorID, reason,
 		return fmt.Errorf("%w: object %s is a %s object, %s", ErrNotAbandonable, objectID, kind, state)
 	}
 	t := now()
+	if err := errors.Join(checkTransition(recObject, state, "abandoned"), checkTransition(recSource, sourceState, SourceKept)); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET state='abandoned',source_state='kept',source_reason=$1,updated_at=$2 WHERE id=$3`, reason, t, objectID); err != nil {
 		return err
 	}

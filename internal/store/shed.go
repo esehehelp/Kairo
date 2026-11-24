@@ -141,6 +141,9 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 	if reading {
 		return fmt.Errorf("%w: a replica or fetch is reading the copy of %s on %s", ErrShedRefused, objectID, storeID)
 	}
+	if err := checkTransition(recCopy, state, noRecord); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_id=$1 AND store_id=$2`, objectID, storeID); err != nil {
 		return err
 	}

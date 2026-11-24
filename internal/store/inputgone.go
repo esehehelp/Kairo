@@ -31,7 +31,7 @@ func (s *Store) InputGone(ctx context.Context, executorID, objectID, path string
 	}
 	var kind, sourceID, sourcePath, sourceState, owner string
 	var projectID sql.NullString
-	err = tx.QueryRowContext(ctx, `SELECT kind,source_id,source_path,source_state,executor_id,project_scope_id FROM data_objects WHERE id=$1`, objectID).
+	err = tx.QueryRowContext(ctx, `SELECT kind,source_id,source_path,source_state,executor_id,project_scope_id FROM data_objects WHERE id=$1 FOR UPDATE`, objectID).
 		Scan(&kind, &sourceID, &sourcePath, &sourceState, &owner, &projectID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return fmt.Errorf("%w: object %s", ErrNotFound, objectID)
@@ -51,12 +51,18 @@ func (s *Store) InputGone(ctx context.Context, executorID, objectID, path string
 		if ownerInfo.nodeID != me.nodeID {
 			return fmt.Errorf("object %s's source is on node %s, not %s", objectID, ownerInfo.nodeID, me.nodeID)
 		}
+		if err := checkTransition(recSource, sourceState, SourceDeleted); err != nil {
+			return err
+		}
 		if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET source_state='deleted',source_reason=$1,source_deleted_at=$2,updated_at=$3 WHERE id=$4`,
 			"gone from its path (found missing when an attempt was to read it)", t, t, objectID); err != nil {
 			return err
 		}
 		what = "import source"
 	default:
+		if err := checkTransition(recRunOutput, "active", "missing"); err != nil {
+			return err
+		}
 		result, err := tx.ExecContext(ctx, `UPDATE run_outputs SET state='missing',missing_at=$1,updated_at=$2 WHERE run_id=$3 AND state='active' AND path=$4
 			AND executor_id IN (SELECT id FROM executors WHERE node_id=$5)`, t, t, sourceID, path, me.nodeID)
 		if err != nil {
@@ -65,6 +71,9 @@ func (s *Store) InputGone(ctx context.Context, executorID, objectID, path string
 		if n, _ := result.RowsAffected(); n > 0 {
 			what = "run output"
 			break
+		}
+		if err := checkTransition(recPlacement, "ready", noRecord); err != nil {
+			return err
 		}
 		result, err = tx.ExecContext(ctx, `DELETE FROM object_placements WHERE object_id=$1 AND path=$2 AND state='ready'
 			AND executor_id IN (SELECT id FROM executors WHERE node_id=$3)`, objectID, path, me.nodeID)

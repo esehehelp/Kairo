@@ -51,6 +51,9 @@ func recordIdentityTx(ctx context.Context, tx *sql.Tx, made PackMade, root, stat
 		return fmt.Errorf("object %s: impossible sizes", made.ObjectID)
 	}
 	t := now()
+	if err := checkTransition(recObject, state, "packed"); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE data_objects SET state='packed',manifest_path=$1,content_bytes=$2,files=$3,skipped=$4,pack_bytes=0,manifest_sha256=$5,manifest=$6,packed_at=$7,updated_at=$8 WHERE id=$9`,
 		made.ManifestPath, made.ContentBytes, made.Files, made.Skipped, made.ManifestSHA256, made.Manifest, t, t, made.ObjectID); err != nil {
 		return err

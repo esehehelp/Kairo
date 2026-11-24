@@ -217,6 +217,9 @@ func (s *Store) AdoptCopies(ctx context.Context, executorID, storeID, root strin
 			if d.PackedAt != nil {
 				packedAt = *d.PackedAt
 			}
+			if err := checkAdopted(); err != nil {
+				return 0, err
+			}
 			result, err := tx.ExecContext(ctx, `INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,content_bytes,files,skipped,pack_bytes,pack_sha256,manifest_sha256,
 				created_at,updated_at,packed_at,source_state,source_reason,name,lifecycle)
 				VALUES($1,$2,$3,$4,$5,$6,$7,$8,'packed',$9,$10,0,$11,$12,$13,$14,$15,$16,'kept',$17,$18,'durable') ON CONFLICT DO NOTHING`,
@@ -234,6 +237,9 @@ func (s *Store) AdoptCopies(ctx context.Context, executorID, storeID, root strin
 			return 0, fmt.Errorf("object %s: the copy on %s is not the object recorded (pack %s, %d bytes; recorded %s, %d bytes)", d.ObjectID, storeID, d.PackSHA256, d.PackBytes, packSHA.String, packBytes.Int64)
 		}
 		path := strings.TrimRight(root, `/\`) + "/objects/" + c.Month + "/" + d.ObjectID + ".tar.zst"
+		if err := checkMade(recCopy, "verified"); err != nil {
+			return 0, err
+		}
 		result, err := tx.ExecContext(ctx, `INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,path,manifest_path,created_at,updated_at,verified_at,described_at)
 			VALUES($1,$2,$3,$4,$5,'verified',$6,$7,$8,$9,$10,$11) ON CONFLICT(object_id,store_id) DO NOTHING`,
 			d.ObjectID, storeID, executorID, root, c.Month, path, path+".files.tsv", t, t, t, t)

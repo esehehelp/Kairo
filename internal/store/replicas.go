@@ -92,6 +92,9 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 				continue
 			}
 			month := c.created[0:4] + c.created[5:7]
+			if err := checkMade(recCopy, "copying"); err != nil {
+				return err
+			}
 			result, err := tx.ExecContext(ctx, `INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'copying',$6,$7)
 				ON CONFLICT(object_id,store_id) DO NOTHING`, c.id, target.ID, executorID, target.Root, month, t, t)
 			if err != nil {
