@@ -298,7 +298,7 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 				return nil, err
 			}
 		}
-		if err = orderReplicasTx(ctx, tx, me, executorID, targets, room, t); err != nil {
+		if err = orderReplicasTx(ctx, tx, me, executorID, targets, declared, room, t); err != nil {
 			return nil, err
 		}
 	}
