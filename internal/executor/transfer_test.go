@@ -93,7 +93,7 @@ func TestCopyToTheDurableStoreLocally(t *testing.T) {
 	fake := newFakeCopies()
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{
+	e.storeWork().stores = []servedStore{
 		{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true},
 		{decl: machine.Store{ID: "e-durable", Class: machine.StoreDurable, Root: durable}, fs: localStoreFS{}, usable: true},
 	}
@@ -104,7 +104,7 @@ func TestCopyToTheDurableStoreLocally(t *testing.T) {
 	bad := orderFor(res, durable, store.CopySource{Local: true, StoreID: "c-scratch", Root: volatile})
 	bad.PackSHA256 = strings.Repeat("0", 64)
 	fake.copies = []store.CopyOrder{bad}
-	e.copyDue(context.Background())
+	e.storeWork().copyDue(context.Background())
 	dir := filepath.Join(durable, objectsDirName, "202611")
 	if len(fake.copied) != 0 || !strings.Contains(logs.String(), "the copy read back does not match the pack") {
 		t.Fatalf("a mismatching copy was recorded: %+v\n%s", fake.copied, logs.String())
@@ -114,7 +114,7 @@ func TestCopyToTheDurableStoreLocally(t *testing.T) {
 	}
 
 	fake.copies = []store.CopyOrder{orderFor(res, durable, store.CopySource{Local: true, StoreID: "c-scratch", Root: volatile})}
-	e.copyDue(context.Background())
+	e.storeWork().copyDue(context.Background())
 	want := store.CopyMade{ObjectID: "obj_1", StoreID: "e-durable", ExecutorID: "exec", Path: filepath.Join(dir, "obj_1.tar.zst"),
 		ManifestPath: filepath.Join(dir, "obj_1.tar.zst.files.tsv"), Bytes: res.packBytes, SHA256: res.packSHA256, ManifestSHA256: res.manifestHash}
 	if len(fake.copied) != 1 || fake.copied[0] != want {
@@ -127,7 +127,7 @@ func TestCopyToTheDurableStoreLocally(t *testing.T) {
 		t.Fatalf("partial files left: %v", left)
 	}
 	// ordered again (recorded after all, or not): read back as it is
-	e.copyDue(context.Background())
+	e.storeWork().copyDue(context.Background())
 	if len(fake.copied) != 2 || fake.copied[1] != want {
 		t.Fatalf("copied again %+v", fake.copied)
 	}
@@ -147,18 +147,18 @@ func TestCopyFetchesFromThePacksAgent(t *testing.T) {
 	fake.token, fake.readFor = "kairo_pack_secret", store.PackRead{StoreID: "c-scratch", Root: volatile}
 	var serverLogs, logs bytes.Buffer
 	source := storesExecutor(t, fake, &serverLogs)
-	source.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
+	source.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
 	server := httptest.NewTLSServer(&PackServer{Store: fake, NodeID: "node", Executors: []*Local{source}, Logger: source.Logger})
 	defer server.Close()
 	addr := strings.TrimPrefix(server.URL, "https://")
 
 	e := storesExecutor(t, fake, &logs)
 	e.PackClient = server.Client()
-	e.stores = []servedStore{{decl: machine.Store{ID: "e-durable", Class: machine.StoreDurable, Root: durable}, fs: localStoreFS{}, usable: true}}
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "e-durable", Class: machine.StoreDurable, Root: durable}, fs: localStoreFS{}, usable: true}}
 	order := orderFor(res, durable, store.CopySource{StoreID: "c-scratch", Root: volatile, Addr: addr, Token: "kairo_pack_wrong"})
 
 	fake.copies = []store.CopyOrder{order}
-	e.copyDue(context.Background())
+	e.storeWork().copyDue(context.Background())
 	if len(fake.copied) != 0 || !strings.Contains(logs.String(), "403 Forbidden") {
 		t.Fatalf("copied with a wrong token: %+v\n%s", fake.copied, logs.String())
 	}
@@ -179,7 +179,7 @@ func TestCopyFetchesFromThePacksAgent(t *testing.T) {
 	})
 	order.Source.Token = "kairo_pack_secret"
 	fake.copies = []store.CopyOrder{order}
-	e.copyDue(context.Background())
+	e.storeWork().copyDue(context.Background())
 	if len(fake.copied) != 1 || fake.copied[0].SHA256 != res.packSHA256 || fake.copied[0].Bytes != res.packBytes {
 		t.Fatalf("not copied: %+v\n%s", fake.copied, logs.String())
 	}

@@ -41,7 +41,7 @@ func TestLaunchGetsItsRunsOutputDirectory(t *testing.T) {
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
 	volatile := filepath.Join(root, "volatile")
-	e.stores = []servedStore{
+	e.storeWork().stores = []servedStore{
 		{decl: machine.Store{ID: "a-durable", Class: machine.StoreDurable, Root: filepath.Join(root, "durable")}, fs: localStoreFS{}, usable: true},
 		{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true},
 	}
@@ -103,7 +103,7 @@ func TestLaunchGetsItsRunsOutputDirectory(t *testing.T) {
 	}
 
 	// reports measure them
-	obs := e.observeStore(ctx, e.stores[1])
+	obs := e.storeWork().observeStore(ctx, e.storeWork().stores[1])
 	if !obs.OutputsScanned || obs.Outputs["exe_1"] != int64(len("checkpoint")+len("exe_1\n")) || len(obs.Outputs) != 2 {
 		t.Fatalf("observed outputs: %+v scanned %v", obs.Outputs, obs.OutputsScanned)
 	}
@@ -124,7 +124,7 @@ func TestLaunchGetsItsRunsOutputDirectory(t *testing.T) {
 		t.Fatalf("an unrecorded output directory was named:\n%s", logs.String())
 	}
 	fake.outputErr = nil
-	e.stores = e.stores[:1]
+	e.storeWork().stores = e.storeWork().stores[:1]
 	durableOnly := testLaunch()
 	durableOnly.Attempt.ID, durableOnly.RunID = "att_6", "exe_6"
 	e.makeOutput(durableOnly)

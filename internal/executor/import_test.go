@@ -41,12 +41,12 @@ func TestAnImportedDirectoryIsPacked(t *testing.T) {
 	fake := &fakePacks{fakeOutputs: &fakeOutputs{fakeScratch: &fakeScratch{fakeStores: &fakeStores{}}}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
 	fake.orders = []store.PackOrder{
 		{ObjectID: "obj_a", Kind: store.ObjectImport, SourceID: "obj_a", StoreID: "c-scratch", Root: root, Path: data},
 		{ObjectID: "obj_gone", Kind: store.ObjectImport, SourceID: "obj_gone", StoreID: "c-scratch", Root: root, Path: filepath.Join(base, "data", "gone")},
 	}
-	e.packDue(ctx)
+	e.storeWork().packDue(ctx)
 	if len(fake.made) != 1 || fake.made[0].ObjectID != "obj_a" || fake.made[0].Files != 2 || fake.made[0].ContentBytes != 4096+11 {
 		t.Fatalf("made: %+v\n%s", fake.made, logs.String())
 	}
@@ -88,13 +88,13 @@ func TestAnImportedDirectoryIsDeletedOnlyWhenAskedFor(t *testing.T) {
 	fake := &fakeRetire{fakeCopies: newFakeCopies()}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}}
 	fake.deletions = []store.DeletionOrder{
 		{ObjectID: "obj_a", Kind: store.ObjectImport, SourceID: "obj_a", StoreID: "c-scratch", Root: root, Path: dirs["a"], DeleteSource: true},
 		{ObjectID: "obj_b", Kind: store.ObjectImport, SourceID: "obj_b", StoreID: "c-scratch", Root: root, Path: dirs["b"]},
 		{ObjectID: "obj_c", Kind: store.ObjectImport, SourceID: "obj_c", StoreID: "c-scratch", Root: root, Path: dirs["c"], DeleteSource: true},
 	}
-	e.deleteDue(ctx)
+	e.storeWork().deleteDue(ctx)
 	var got []string
 	for _, s := range fake.settled {
 		got = append(got, s.ObjectID+":"+s.State)

@@ -50,14 +50,14 @@ const (
 // errInputMismatch: an unpacked file, or the pack, not as its file list says.
 var errInputMismatch = errors.New("the object does not unpack as its file list says")
 
-func (e *Local) makeFetches() {
+func (e *storeWorker) makeFetches() {
 	e.startRound(&e.fetches, fetchInterval, fetchRoundTimeout, e.fetchDue)
 }
 
 // fetchDue brings every object the daemon says is due to a usable volatile
 // store this executor serves at the ordered root, one at a time, and
 // records each.
-func (e *Local) fetchDue(ctx context.Context) {
+func (e *storeWorker) fetchDue(ctx context.Context) {
 	orders, err := e.Store.FetchesToMake(ctx, e.ID)
 	if err != nil {
 		e.roundProblem(&e.fetches, "", "fetches to make not read", err)
@@ -90,7 +90,7 @@ func (e *Local) fetchDue(ctx context.Context) {
 
 // fetchOne brings one object (see above) and returns what to record. One
 // already unpacked (recorded after all, or not yet) is taken as it is.
-func (e *Local) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder, served map[string]servedStore) (store.FetchMade, error) {
+func (e *storeWorker) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder, served map[string]servedStore) (store.FetchMade, error) {
 	made := store.FetchMade{ObjectID: o.ObjectID, StoreID: o.StoreID, ExecutorID: e.ID}
 	if _, ok := s.fs.(localStoreFS); !ok {
 		return made, errPackNotHere

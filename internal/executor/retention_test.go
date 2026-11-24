@@ -26,7 +26,7 @@ func TestFailuresWaitLongerEachTime(t *testing.T) {
 	e := &Local{ID: "e", Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	r := &round{interval: time.Minute}
 	fail := func() time.Duration {
-		e.roundProblem(r, "obj", "not copied", errors.New("no"))
+		e.storeWork().roundProblem(r, "obj", "not copied", errors.New("no"))
 		at, ok := r.retryAt["obj"]
 		if !ok {
 			return 0
@@ -40,11 +40,11 @@ func TestFailuresWaitLongerEachTime(t *testing.T) {
 	if fmt.Sprint(waits) != "[0s 1m0s 2m0s 4m0s 8m0s 16m0s 32m0s 1h0m0s 1h0m0s]" {
 		t.Fatalf("waits %v", waits)
 	}
-	if e.due(r, "obj") || !e.due(r, "other") {
+	if e.storeWork().due(r, "obj") || !e.storeWork().due(r, "other") {
 		t.Fatal("due while waiting, or another object waits")
 	}
-	e.roundProblem(r, "obj", "", nil)
-	if !e.due(r, "obj") || r.failures["obj"] != 0 {
+	e.storeWork().roundProblem(r, "obj", "", nil)
+	if !e.storeWork().due(r, "obj") || r.failures["obj"] != 0 {
 		t.Fatal("still waiting once done")
 	}
 }
@@ -99,7 +99,7 @@ func TestAStalledFetchIsGivenUp(t *testing.T) {
 	defer server.Close()
 	e := &Local{ID: "e", PackClient: server.Client(), Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	order := store.CopyOrder{ObjectID: "obj_1", Source: store.CopySource{Addr: server.Listener.Addr().String(), Token: "t"}}
-	body, from, err := e.fetchRemote(context.Background(), order, "obj_1.tar.zst", 0)
+	body, from, err := e.storeWork().fetchRemote(context.Background(), order, "obj_1.tar.zst", 0)
 	if err != nil || from != 0 {
 		t.Fatalf("fetch: %v %d", err, from)
 	}
@@ -123,13 +123,13 @@ func TestAnUnrecordedCopyThatDoesNotMatchIsMadeAgain(t *testing.T) {
 	fake := newFakeCopies()
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{
+	e.storeWork().stores = []servedStore{
 		{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true},
 		{decl: machine.Store{ID: "e-durable", Class: machine.StoreDurable, Root: durable}, fs: localStoreFS{}, usable: true},
 	}
 	order := orderFor(res, durable, store.CopySource{Local: true, StoreID: "c-scratch", Root: volatile})
 	fake.copies = []store.CopyOrder{order}
-	e.copyDue(context.Background())
+	e.storeWork().copyDue(context.Background())
 	if len(fake.copied) != 1 {
 		t.Fatalf("not copied: %s", logs.String())
 	}
@@ -142,11 +142,11 @@ func TestAnUnrecordedCopyThatDoesNotMatchIsMadeAgain(t *testing.T) {
 	if err := os.WriteFile(final, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	e.copyDue(context.Background())
+	e.storeWork().copyDue(context.Background())
 	if len(fake.copied) != 1 || exists(final) || exists(final+manifestSuffix) || !strings.Contains(logs.String(), "does not match the pack") {
 		t.Fatalf("a copy that does not match was kept or recorded: %+v (there: %v)\n%s", fake.copied, exists(final), logs.String())
 	}
-	e.copyDue(context.Background())
+	e.storeWork().copyDue(context.Background())
 	if len(fake.copied) != 2 || sha256File(t, final) != res.packSHA256 {
 		t.Fatalf("not copied again: %+v\n%s", fake.copied, logs.String())
 	}
@@ -160,7 +160,7 @@ func TestARefusedOutputDirectoryIsRemovedAgain(t *testing.T) {
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
 	volatile := filepath.Join(root, "volatile")
-	e.stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
 	launch := testLaunch()
 	launch.RunID = "exe_1"
 	e.makeOutput(launch)

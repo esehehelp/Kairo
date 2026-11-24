@@ -29,11 +29,11 @@ const (
 	adoptBatch            = 200
 )
 
-func (e *Local) makeInventories() {
+func (e *storeWorker) makeInventories() {
 	e.startRound(&e.inventories, inventoryEvery, inventoryRoundTimeout, e.inventoryDue)
 }
 
-func (e *Local) inventoryDue(ctx context.Context) {
+func (e *storeWorker) inventoryDue(ctx context.Context) {
 	e.checkInPlaceSources(ctx)
 	for _, s := range e.servedStores() {
 		if !s.usable || s.decl.Class != machine.StoreDurable || s.decl.MovedFrom != "" {
@@ -70,7 +70,7 @@ func (e *Local) inventoryDue(ctx context.Context) {
 // regular file, an import of one file (an input is a directory):
 // store.InputIsFile, so it is brought as a directory holding it. A WSL
 // executor's paths are the distro's: not looked at from here.
-func (e *Local) checkInPlaceSources(ctx context.Context) {
+func (e *storeWorker) checkInPlaceSources(ctx context.Context) {
 	if !e.backend().readsNodePaths() {
 		return
 	}
@@ -110,7 +110,7 @@ func (e *Local) checkInPlaceSources(ctx context.Context) {
 // adoptCopies adopts the copies ids of store s from their descriptions,
 // batched; a batch refused is tried a copy at a time, so one bad description
 // keeps out only its own copy.
-func (e *Local) adoptCopies(ctx context.Context, s servedStore, months map[string]string, ids []string) (adopted, refused int) {
+func (e *storeWorker) adoptCopies(ctx context.Context, s servedStore, months map[string]string, ids []string) (adopted, refused int) {
 	var batch []store.AdoptedCopy
 	send := func(copies []store.AdoptedCopy) error {
 		n, err := e.Store.AdoptCopies(ctx, e.ID, s.decl.ID, s.decl.Root, copies)

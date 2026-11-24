@@ -36,13 +36,13 @@ const (
 // run output directory.
 var errEvictInUse = errors.New("an attempt still runs in it")
 
-func (e *Local) makeEvictions() {
+func (e *storeWorker) makeEvictions() {
 	e.startRound(&e.evictions, evictInterval, evictRoundTimeout, e.evictDue)
 }
 
 // evictDue evicts every object the daemon orders from a usable volatile
 // store this executor serves at the ordered root, and settles each.
-func (e *Local) evictDue(ctx context.Context) {
+func (e *storeWorker) evictDue(ctx context.Context) {
 	orders, err := e.Store.EvictionsToMake(ctx, e.ID)
 	if err != nil {
 		e.roundProblem(&e.evictions, "", "evictions to make not read", err)
@@ -92,7 +92,7 @@ func (e *Local) evictDue(ctx context.Context) {
 
 // evictTemporal deletes a temporal object's directory (see above), then its
 // identity's file list.
-func (e *Local) evictTemporal(ctx context.Context, s servedStore, o store.EvictionOrder) error {
+func (e *storeWorker) evictTemporal(ctx context.Context, s servedStore, o store.EvictionOrder) error {
 	root := s.decl.Root
 	if o.ObjectKind == store.ObjectImport {
 		err := checkPackedDir(ctx, root, o.Path, o.ObjectID)

@@ -39,7 +39,7 @@ const (
 // storeFor is the volatile store an attempt's scratch, output and cache
 // directories go on: the one its execution names, if this executor serves
 // it usable now, else the first (scratchStore).
-func (e *Local) storeFor(launch *store.Launch) (servedStore, bool) {
+func (e *storeWorker) storeFor(launch *store.Launch) (servedStore, bool) {
 	if launch.Store == "" {
 		return e.scratchStore()
 	}
@@ -54,7 +54,7 @@ func (e *Local) storeFor(launch *store.Launch) (servedStore, bool) {
 // checkStore refuses a launch whose execution names a store this executor
 // does not serve, usable, as a volatile one (it would have none of its
 // directories where it asked for them).
-func (e *Local) checkStore(launch *store.Launch) error {
+func (e *storeWorker) checkStore(launch *store.Launch) error {
 	if launch.Store == "" {
 		return nil
 	}
@@ -64,7 +64,7 @@ func (e *Local) checkStore(launch *store.Launch) error {
 	return nil
 }
 
-func (e *Local) scratchStore() (servedStore, bool) {
+func (e *storeWorker) scratchStore() (servedStore, bool) {
 	for _, s := range e.servedStores() {
 		if s.usable && s.decl.Class == machine.StoreVolatile {
 			return s, true
@@ -78,7 +78,7 @@ func (e *Local) scratchStore() (servedStore, bool) {
 // one (no volatile store, or making or recording it failed, which is
 // logged) the attempt starts all the same.
 func (e *Local) makeScratch(launch *store.Launch) {
-	s, ok := e.storeFor(launch)
+	s, ok := e.storeWork().storeFor(launch)
 	if !ok {
 		return
 	}
@@ -146,7 +146,7 @@ func (e *Local) scratchEnv(launch *store.Launch) []string {
 // settleScratch settles, in the background, this executor's scratch that
 // is due (at most every scratchSettleInterval), once the daemon has
 // answered for stores: one older than stores knows no scratch.
-func (e *Local) settleScratch() {
+func (e *storeWorker) settleScratch() {
 	e.mu.Lock()
 	due := e.storesKnown && !e.scratchSettling && time.Since(e.scratchSettleAt) >= scratchSettleInterval
 	if due {
@@ -172,7 +172,7 @@ func (e *Local) settleScratch() {
 // settleDueScratch settles every scratch the daemon says is due. A failure
 // is warned once per scratch (and again when it changes) and tried again
 // at the next round.
-func (e *Local) settleDueScratch(ctx context.Context) {
+func (e *storeWorker) settleDueScratch(ctx context.Context) {
 	due, err := e.Store.ScratchToSettle(ctx, e.ID)
 	if err != nil {
 		e.scratchProblem("", "scratch to settle not read", err)
@@ -246,7 +246,7 @@ func settleOnDisk(ctx context.Context, fs storeFS, k store.ScratchSettlement) (s
 
 // scratchProblem warns of a scratch problem once (again when it changes);
 // an empty message clears it. attemptID "" is the round itself.
-func (e *Local) scratchProblem(attemptID, message string, err error) {
+func (e *storeWorker) scratchProblem(attemptID, message string, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if message == "" {

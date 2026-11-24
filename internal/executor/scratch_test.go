@@ -291,7 +291,7 @@ func TestLaunchGetsScratchOnAVolatileStore(t *testing.T) {
 	fake := &fakeScratch{fakeStores: &fakeStores{}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.stores = []servedStore{
+	e.storeWork().stores = []servedStore{
 		{decl: machine.Store{ID: "a-durable", Class: machine.StoreDurable, Root: filepath.Join(root, "durable")}, fs: localStoreFS{}, usable: true},
 		{decl: machine.Store{ID: "b-unusable", Class: machine.StoreVolatile, Root: filepath.Join(root, "unusable")}, fs: localStoreFS{}},
 		{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: filepath.Join(root, "volatile")}, fs: localStoreFS{}, usable: true},
@@ -359,7 +359,7 @@ func TestLaunchGetsScratchOnAVolatileStore(t *testing.T) {
 	}
 
 	// Without a volatile store there is none.
-	e.stores = e.stores[:2]
+	e.storeWork().stores = e.storeWork().stores[:2]
 	launch.Attempt.ID = "att_3"
 	fake.recordErr = nil
 	e.makeScratch(launch)
@@ -399,7 +399,7 @@ func TestDueScratchIsSettled(t *testing.T) {
 	}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.settleDueScratch(ctx)
+	e.storeWork().settleDueScratch(ctx)
 
 	if exists(ok) {
 		t.Fatal("a successful scratch was not deleted")
@@ -450,8 +450,8 @@ func TestDueScratchIsSettled(t *testing.T) {
 	// a settlement the daemon does not take is tried again, warned once
 	fake.settled, fake.settleErr = nil, errors.New("daemon unreachable")
 	fake.due = []store.ScratchSettlement{settlement("att_failed", failed, store.ScratchKeep, "exit 1")}
-	e.settleDueScratch(ctx)
-	e.settleDueScratch(ctx)
+	e.storeWork().settleDueScratch(ctx)
+	e.storeWork().settleDueScratch(ctx)
 	if n := strings.Count(logs.String(), "scratch not settled"); n != 1 || !exists(filepath.Join(failed, "data")) {
 		t.Fatalf("warned %d times:\n%s", n, logs.String())
 	}
@@ -464,22 +464,22 @@ func TestScratchWaitsForADaemonThatKnowsStores(t *testing.T) {
 	fake := &fakeScratch{fakeStores: &fakeStores{err: errors.New("agent API 404: 404 page not found")}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
-	e.refreshStores(context.Background())
-	e.settleScratch()
+	e.storeWork().refreshStores(context.Background())
+	e.storeWork().settleScratch()
 	e.makeScratch(testLaunch())
 	fake.mu.Lock()
 	asked, recorded := fake.asked, len(fake.recorded)
 	fake.mu.Unlock()
-	if asked != 0 || recorded != 0 || e.storesKnown {
-		t.Fatalf("asked %d, recorded %d, stores known %v", asked, recorded, e.storesKnown)
+	if asked != 0 || recorded != 0 || e.storeWork().storesKnown {
+		t.Fatalf("asked %d, recorded %d, stores known %v", asked, recorded, e.storeWork().storesKnown)
 	}
 
 	fake.fakeStores.mu.Lock()
 	fake.fakeStores.err = nil
 	fake.fakeStores.mu.Unlock()
-	e.storesAt = e.storesAt.AddDate(-1, 0, 0)
-	e.refreshStores(context.Background())
-	e.settleScratch()
+	e.storeWork().storesAt = e.storeWork().storesAt.AddDate(-1, 0, 0)
+	e.storeWork().refreshStores(context.Background())
+	e.storeWork().settleScratch()
 	waitFor(t, "scratch to settle asked for", func() bool {
 		fake.mu.Lock()
 		defer fake.mu.Unlock()
@@ -535,7 +535,7 @@ func TestAttemptScratchEndToEnd(t *testing.T) {
 			if body, err := os.ReadFile(filepath.Join(dir, "out")); err != nil || string(body) != "scratch" {
 				t.Fatalf("the attempt's file: %q %v", body, err)
 			}
-			e.settleDueScratch(ctx)
+			e.storeWork().settleDueScratch(ctx)
 			status, err := st.ListStoreStatus(ctx)
 			if err != nil || len(status) != 1 {
 				t.Fatalf("status: %+v %v", status, err)

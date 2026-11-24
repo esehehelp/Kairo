@@ -505,7 +505,7 @@ const (
 	containerSweepTimeout  = 5 * time.Minute
 )
 
-func (e *Local) sweepContainers(ctx context.Context) {
+func (e *storeWorker) sweepContainers(ctx context.Context) {
 	out, err := incusCommand(ctx, nil, "list", "--format", "json")
 	if err != nil {
 		e.roundProblem(&e.containerSweeps, "", "containers not listed", err)
@@ -526,10 +526,7 @@ func (e *Local) sweepContainers(ctx context.Context) {
 			continue
 		}
 		attempt := "att_" + rest
-		e.mu.Lock()
-		_, running := e.running[attempt]
-		e.mu.Unlock()
-		if running {
+		if e.attemptRunsHere(attempt) {
 			continue
 		}
 		if _, err := incusCommand(ctx, nil, "delete", "--force", in.Name); err != nil && !incusNotFound(err) {

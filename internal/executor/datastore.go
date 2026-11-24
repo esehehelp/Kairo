@@ -39,7 +39,7 @@ type servedStore struct {
 }
 
 // fsForStores is how this executor reaches its stores' roots.
-func (e *Local) fsForStores() storeFS {
+func (e *storeWorker) fsForStores() storeFS {
 	if e.storeFSOverride != nil {
 		return e.storeFSOverride
 	}
@@ -48,7 +48,7 @@ func (e *Local) fsForStores() storeFS {
 
 // serves reports whether a store of this executor's node is in its
 // namespace.
-func (e *Local) serves(s machine.Store) bool {
+func (e *storeWorker) serves(s machine.Store) bool {
 	if s.Executor != "" {
 		return s.Executor == e.ID
 	}
@@ -57,7 +57,7 @@ func (e *Local) serves(s machine.Store) bool {
 
 // refreshStores asks for the node's stores (at most every
 // storeRefreshInterval) and makes ready the ones this executor serves.
-func (e *Local) refreshStores(ctx context.Context) {
+func (e *storeWorker) refreshStores(ctx context.Context) {
 	if !e.storesAt.IsZero() && time.Since(e.storesAt) < storeRefreshInterval {
 		return
 	}
@@ -132,7 +132,7 @@ func refuseSharedPlaces(ctx context.Context, served []servedStore) {
 }
 
 // servedStores is a copy of the stores this executor serves.
-func (e *Local) servedStores() []servedStore {
+func (e *storeWorker) servedStores() []servedStore {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]servedStore(nil), e.stores...)
@@ -141,7 +141,7 @@ func (e *Local) servedStores() []servedStore {
 // reportStores reports every served store (at most every
 // storeReportInterval), in the background: sizing scratch trees may take a
 // while and must not hold the tick.
-func (e *Local) reportStores() {
+func (e *storeWorker) reportStores() {
 	e.mu.Lock()
 	due := !e.storeReporting && time.Since(e.storeReportAt) >= storeReportInterval && len(e.stores) != 0
 	if due {
@@ -171,7 +171,7 @@ func (e *Local) reportStores() {
 }
 
 // observeStore is what a served store holds now.
-func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObservation {
+func (e *storeWorker) observeStore(ctx context.Context, s servedStore) store.StoreObservation {
 	obs := store.StoreObservation{StoreID: s.decl.ID, ExecutorID: e.ID, Root: s.decl.Root, Usable: s.usable, Problem: s.problem, MovedFrom: s.movedFrom}
 	if !s.usable {
 		return obs
@@ -187,7 +187,7 @@ func (e *Local) observeStore(ctx context.Context, s servedStore) store.StoreObse
 }
 
 // scanStore measures what Kairo holds in scratch and output directories.
-func (e *Local) scanStore(ctx context.Context, s servedStore, obs *store.StoreObservation) {
+func (e *storeWorker) scanStore(ctx context.Context, s servedStore, obs *store.StoreObservation) {
 	started := time.Now()
 	ids, unread, err := s.fs.List(ctx, s.decl.Root)
 	if err != nil {
@@ -234,9 +234,9 @@ func (e *Local) scanStore(ctx context.Context, s servedStore, obs *store.StoreOb
 // report, any other (kept, or not yet settled) once per executor instance,
 // nothing being written there any more. ok is false when it could not be
 // measured now.
-func (e *Local) scratchSize(ctx context.Context, s servedStore, id string) (int64, bool) {
+func (e *storeWorker) scratchSize(ctx context.Context, s servedStore, id string) (int64, bool) {
+	running := e.attemptRunsHere(id)
 	e.mu.Lock()
-	_, running := e.running[id]
 	size, measured := e.scratchSized[id]
 	e.mu.Unlock()
 	if measured && !running {

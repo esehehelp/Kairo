@@ -223,22 +223,22 @@ func TestALaunchNamingAStoreUsesItOrIsRefused(t *testing.T) {
 	base := t.TempDir()
 	first, named := filepath.Join(base, "first"), filepath.Join(base, "named")
 	e := &Local{ID: "exec", NodeID: "node"}
-	e.stores = []servedStore{
+	e.storeWork().stores = []servedStore{
 		{decl: machine.Store{ID: "a-first", Class: machine.StoreVolatile, Root: first}, fs: localStoreFS{}, usable: true},
 		{decl: machine.Store{ID: "b-named", Class: machine.StoreVolatile, Root: named}, fs: localStoreFS{}, usable: true},
 		{decl: machine.Store{ID: "c-durable", Class: machine.StoreDurable, Root: base}, fs: localStoreFS{}, usable: true},
 	}
 	launch := testLaunch()
-	if s, ok := e.storeFor(launch); !ok || s.decl.ID != "a-first" {
+	if s, ok := e.storeWork().storeFor(launch); !ok || s.decl.ID != "a-first" {
 		t.Fatalf("default store %+v %v", s.decl, ok)
 	}
 	launch.Store = "b-named"
-	if s, ok := e.storeFor(launch); !ok || s.decl.ID != "b-named" || e.checkStore(launch) != nil {
+	if s, ok := e.storeWork().storeFor(launch); !ok || s.decl.ID != "b-named" || e.storeWork().checkStore(launch) != nil {
 		t.Fatalf("named store %+v %v", s.decl, ok)
 	}
 	for _, id := range []string{"c-durable", "nowhere"} {
 		launch.Store = id
-		if err := e.checkStore(launch); err == nil || !strings.Contains(err.Error(), id) {
+		if err := e.storeWork().checkStore(launch); err == nil || !strings.Contains(err.Error(), id) {
 			t.Fatalf("%s: %v", id, err)
 		}
 	}

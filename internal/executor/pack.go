@@ -663,7 +663,7 @@ func writeNew(dir *os.Root, name string, body []byte) error {
 
 // makePacks packs, in the background, what the daemon says is to be packed
 // now (at most every packInterval), once the daemon has answered for stores.
-func (e *Local) makePacks() {
+func (e *storeWorker) makePacks() {
 	e.startRound(&e.packs, packInterval, packRoundTimeout, e.packDue)
 }
 
@@ -672,7 +672,7 @@ func (e *Local) makePacks() {
 // per object (again when it changes) and tried again later (roundProblem).
 // A source an attempt this executor launched still runs in is left for
 // later.
-func (e *Local) packDue(ctx context.Context) {
+func (e *storeWorker) packDue(ctx context.Context) {
 	orders, err := e.Store.PacksToMake(ctx, e.ID)
 	if err != nil {
 		e.packProblem("", "packs to make not read", err)
@@ -753,7 +753,7 @@ func headroom(s servedStore) int64 {
 	return minHeadroom
 }
 
-func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
+func (e *storeWorker) packImport(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
 	if !served || !s.usable || s.decl.Root != o.Root || !e.due(&e.packs, o.ObjectID) {
 		return
 	}
@@ -801,7 +801,7 @@ func (e *Local) packImport(ctx context.Context, o store.PackOrder, s servedStore
 // packRunSnapshot packs the files of a running run's output directory
 // changed since its previous snapshot (store/runsnapshots.go): while the run
 // writes there, files still being written are packed from copies.
-func (e *Local) packRunSnapshot(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
+func (e *storeWorker) packRunSnapshot(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
 	if !served || !s.usable || s.decl.Root != o.Root || !e.due(&e.packs, o.ObjectID) {
 		return
 	}
@@ -857,7 +857,7 @@ func checkTransferPack(s servedStore, o store.PackOrder, res packResult) error {
 // dropTransferPack removes the pack made to bring temporal data to another
 // node once nothing waits for it there (o.Drop); its file list, the
 // object's identity, stays.
-func (e *Local) dropTransferPack(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
+func (e *storeWorker) dropTransferPack(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
 	if !served || s.decl.Root != o.Root {
 		return
 	}
@@ -879,6 +879,6 @@ type nopWriteCloser struct{ io.Writer }
 func (nopWriteCloser) Close() error { return nil }
 
 // packProblem is roundProblem for packing.
-func (e *Local) packProblem(objectID, message string, err error) {
+func (e *storeWorker) packProblem(objectID, message string, err error) {
 	e.roundProblem(&e.packs, objectID, message, err)
 }

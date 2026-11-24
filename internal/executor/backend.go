@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"kairo/internal/config"
 	"kairo/internal/envspec"
@@ -135,7 +134,7 @@ func (b hostBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, er
 	}
 	if launch.Source != nil {
 		// run in its code snapshot, cwd relative to it (source.go)
-		dir, err := e.ensureSource(context.Background(), launch.Source)
+		dir, err := e.storeWork().ensureSource(context.Background(), launch.Source)
 		if err != nil {
 			return nil, nil, fmt.Errorf("code snapshot %s: %w", launch.Source.ID, err)
 		}
@@ -249,9 +248,7 @@ func (incusBackend) tempNames() []string               { return []string{"TMPDIR
 // at the next tick.
 func (b incusBackend) ended(attemptID string) {
 	_ = os.RemoveAll(b.e.containerDir(attemptID))
-	b.e.mu.Lock()
-	b.e.containerSweeps.at = time.Time{}
-	b.e.mu.Unlock()
+	b.e.storeWork().sweepSoon()
 }
 
-func (b incusBackend) sweep(ctx context.Context) { b.e.sweepContainers(ctx) }
+func (b incusBackend) sweep(ctx context.Context) { b.e.storeWork().sweepContainers(ctx) }

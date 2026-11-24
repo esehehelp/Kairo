@@ -62,7 +62,7 @@ const maxRetryDelay = time.Hour
 
 // startRound runs fn in the background, at most every interval, once the
 // daemon has answered for stores, one round at a time.
-func (e *Local) startRound(r *round, interval, timeout time.Duration, fn func(context.Context)) {
+func (e *storeWorker) startRound(r *round, interval, timeout time.Duration, fn func(context.Context)) {
 	e.mu.Lock()
 	due := e.storesKnown && !r.running && time.Since(r.at) >= interval
 	if due {
@@ -90,7 +90,7 @@ func (e *Local) startRound(r *round, interval, timeout time.Duration, fn func(co
 // further failure in a row, after twice as long as before (from the round's
 // interval), at most maxRetryDelay: one that cannot be done does not fetch or
 // read again every round.
-func (e *Local) roundProblem(r *round, objectID, message string, err error) {
+func (e *storeWorker) roundProblem(r *round, objectID, message string, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if message == "" {
@@ -125,24 +125,24 @@ func (e *Local) roundProblem(r *round, objectID, message string, err error) {
 
 // due reports whether objectID is to be tried in this round: it has not
 // failed, or its wait since is over.
-func (e *Local) due(r *round, objectID string) bool {
+func (e *storeWorker) due(r *round, objectID string) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	at, failed := r.retryAt[objectID]
 	return !failed || !time.Now().Before(at)
 }
 
-func (e *Local) makeDeletions() {
+func (e *storeWorker) makeDeletions() {
 	e.startRound(&e.deletions, deleteInterval, deleteRoundTimeout, e.deleteDue)
 }
 
-func (e *Local) makeScrubs() {
+func (e *storeWorker) makeScrubs() {
 	e.startRound(&e.scrubs, scrubEvery, scrubRoundTimeout, e.scrubDue)
 }
 
 // deleteDue deletes every source the daemon says is due on a usable store
 // this executor serves at the ordered root.
-func (e *Local) deleteDue(ctx context.Context) {
+func (e *storeWorker) deleteDue(ctx context.Context) {
 	orders, err := e.Store.DeletionsToMake(ctx, e.ID)
 	if err != nil {
 		e.roundProblem(&e.deletions, "", "deletions to make not read", err)
@@ -218,7 +218,7 @@ func (e *Local) deleteDue(ctx context.Context) {
 // the pack was made on, then removed through its parent's handle, then its
 // pack; a directory refused for safety is kept, with why, and its pack
 // removed all the same.
-func (e *Local) retireImport(ctx context.Context, o store.DeletionOrder, s servedStore) {
+func (e *storeWorker) retireImport(ctx context.Context, o store.DeletionOrder, s servedStore) {
 	if _, isLocal := s.fs.(localStoreFS); !isLocal {
 		return
 	}
@@ -360,19 +360,11 @@ func removeImportedDir(dir string) error {
 // inUse reports whether an attempt this executor launched still runs in the
 // source of kind and id: an attempt of the run (its output directory), the
 // attempt itself (its scratch).
-func (e *Local) inUse(kind dirKind, id string) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+func (e *storeWorker) inUse(kind dirKind, id string) bool {
 	if kind.dir == kindScratch.dir {
-		_, running := e.running[id]
-		return running
+		return e.attemptRunsHere(id)
 	}
-	for _, run := range e.outputRuns {
-		if run == id {
-			return true
-		}
-	}
-	return false
+	return e.runRunsHere(id)
 }
 
 // errSourceChanged: a source holds what its pack does not (written since it
@@ -591,7 +583,7 @@ func removePackFiles(sfs storeFS, root, objectID string, names ...string) error 
 
 // scrubDue reads back every copy the daemon says is due on a usable durable
 // store this executor serves at the ordered root, and reports each.
-func (e *Local) scrubDue(ctx context.Context) {
+func (e *storeWorker) scrubDue(ctx context.Context) {
 	orders, err := e.Store.ScrubsToMake(ctx, e.ID)
 	if err != nil {
 		e.roundProblem(&e.scrubs, "", "copies to read back not read", err)
