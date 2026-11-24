@@ -166,7 +166,12 @@ func transientDatabaseError(code string) bool {
 }
 
 func decode(r *http.Request, target any) error {
-	dec := json.NewDecoder(io.LimitReader(r.Body, 1<<20))
+	return decodeUpTo(r, target, 1<<20)
+}
+
+// decodeUpTo is decode of a request of up to limit bytes.
+func decodeUpTo(r *http.Request, target any, limit int64) error {
+	dec := json.NewDecoder(io.LimitReader(r.Body, limit))
 	dec.DisallowUnknownFields()
 	return dec.Decode(target)
 }

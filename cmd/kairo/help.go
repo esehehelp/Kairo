@@ -225,6 +225,7 @@ func init() {
 				{"list", "[--project P] [--kind K] [--task NAME] [--execution ID] [--limit N] [--json]", "data objects, newest first; --task and --execution select run outputs", dataList},
 				{"fetch", "--project P --node N [--data NAME]... [OBJECT...] [--wait [--timeout D]]", "bring data objects to a node; --wait prints their paths once unpacked (exit 2 on timeout)", dataFetch},
 				{"cancel", "OBJECT...", "abandon imports not packed yet (their paths are left as they are)", dataCancel},
+				{"drop", "--project P [--match NAME_PREFIX] [--task-match TASK_PREFIX] [--reason TEXT] [--confirm] [--json] [OBJECT|NAME...]", "data made again or fetched again (a corpus, a mix, raw data): keep only its file list, delete every copy; without --confirm, say what would go", dataDrop},
 			},
 			aliases: map[string]string{"ls": "list", "show": "list", "add": "import"},
 		}},

@@ -45,7 +45,11 @@ type agentOp struct {
 func handle[Req, Resp any](s *Server, op agentops.Op[Req, Resp], owner func(context.Context, Req) (string, error), run func(context.Context, Req) (Resp, error)) agentOp {
 	return agentOp{name: op.Name, handler: func(w http.ResponseWriter, r *http.Request) {
 		var body Req
-		if err := decode(r, &body); err != nil {
+		limit := op.MaxBody
+		if limit == 0 {
+			limit = 1 << 20
+		}
+		if err := decodeUpTo(r, &body, limit); err != nil {
 			writeError(w, err)
 			return
 		}
@@ -200,6 +204,13 @@ func (s *Server) agentOps() []agentOp {
 		handle(s, agentops.ClaimShed, byObjectStore,
 			func(ctx context.Context, b agentops.ObjectStoreRequest) (agentops.OK, error) {
 				return recorded(s.Store.ClaimShed(ctx, b.ExecutorID, b.ObjectID, b.StoreID))
+			}),
+		handle(s, agentops.KeepIdentity,
+			func(ctx context.Context, b agentops.KeepIdentityRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentops.KeepIdentityRequest) (agentops.OK, error) {
+				return recorded(s.Store.KeepIdentity(ctx, b.ExecutorID, b.ObjectID, b.StoreID, b.List))
 			}),
 		handle(s, agentops.InventoryDurable,
 			func(ctx context.Context, b agentops.InventoryRequest) (string, error) {

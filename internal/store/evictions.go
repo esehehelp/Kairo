@@ -96,6 +96,13 @@ func (s *Store) EvictionsToMake(ctx context.Context, executorID string) ([]Evict
 			return nil, err
 		}
 		out = append(out, claimed...)
+		// what was brought here of dropped objects goes whatever room there is
+		dropped, err := dropEvictionsTx(ctx, tx, d, executorID)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, dropped...)
+		claimed = append(claimed, dropped...)
 		var total, free sql.NullInt64
 		var observed string
 		err = tx.QueryRowContext(ctx, `SELECT total_bytes,free_bytes,observed_at FROM store_observations WHERE store_id=$1 AND usable`, d.ID).Scan(&total, &free, &observed)

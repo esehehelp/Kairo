@@ -331,14 +331,17 @@ func linkRegenerationsTx(ctx context.Context, tx *sql.Tx, objectID, runID, list 
 // be had there: a problem (hard) its reader cannot wait out, or what it
 // waits for.
 func regenerationWaitTx(ctx context.Context, q queryer, objectID, node string) (string, bool, error) {
-	var producer, problem sql.NullString
+	var producer, problem, dropped sql.NullString
 	var ordered sql.NullInt64
-	err := q.QueryRowContext(ctx, `SELECT producer_task_scope_id,regeneration_problem,regeneration_ordinal FROM data_objects WHERE id=$1`, objectID).Scan(&producer, &problem, &ordered)
+	err := q.QueryRowContext(ctx, `SELECT producer_task_scope_id,regeneration_problem,regeneration_ordinal,dropped_at FROM data_objects WHERE id=$1`, objectID).Scan(&producer, &problem, &ordered, &dropped)
 	if err != nil {
 		return "", false, err
 	}
 	if problem.Valid {
 		return problem.String, true, nil
+	}
+	if dropped.Valid && !producer.Valid {
+		return "dropped data (Kairo keeps only its file list, since " + dropped.String + "): make it again or fetch it again, and import it", true, nil
 	}
 	if !producer.Valid {
 		return "temporal data no task makes again", true, nil

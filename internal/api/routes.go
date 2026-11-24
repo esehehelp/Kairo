@@ -60,6 +60,7 @@ func (s *Server) routes() []route {
 		{"GET", "/api/data/objects/{id}/placement", roleRead, s.getDataPlacement},
 		{"POST", "/api/data/imports", roleAdmin, s.importData},
 		{"POST", "/api/data/objects/{id}/cancel", roleAdmin, s.cancelImport},
+		{"POST", "/api/data/drops", roleAdmin, s.dropData},
 		{"POST", "/api/data/fetches", roleAdmin, s.fetchData},
 		{"GET", "/api/hardware", roleRead, s.listHardware},
 		{"GET", "/api/hardware/samples", roleRead, s.hardwareSamples},

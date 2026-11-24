@@ -88,3 +88,26 @@ func TestAShedCopysFilesAreRemoved(t *testing.T) {
 		t.Fatal("a month outside the objects was taken")
 	}
 }
+
+// The file list beside a copy of a dropped object is read for the daemon to
+// keep; only beside a copy of the store, by its month and object id.
+func TestTheFileListBesideACopyIsRead(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "_kairo-durable")
+	month := filepath.Join(root, "objects", "202611")
+	if err := os.MkdirAll(month, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	list := "a.bin\t1\t" + strings.Repeat("ab", 32) + "\t2026-11-06T01:02:03Z\n"
+	if err := os.WriteFile(filepath.Join(month, "obj_a.tar.zst.files.tsv"), []byte(list), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := readCopyList(root, "202611", "obj_a"); err != nil || got != list {
+		t.Fatalf("list %q %v", got, err)
+	}
+	if _, err := readCopyList(root, "202611", "obj_b"); err == nil {
+		t.Fatal("a list not there was read")
+	}
+	if _, err := readCopyList(root, "../x", "obj_a"); err == nil {
+		t.Fatal("a month outside the objects was taken")
+	}
+}
