@@ -16,11 +16,11 @@ backend = "local-fs"
 reserve_free_bytes = 214748364800
 
 [[stores]]
-id = "wsl-scratch"
+id = "win-scratch"
 class = "volatile"
 node = "win"
-executor = "ubuntu-wsl"
-root = "/home/kairo/scratch-root"
+executor = "windows-local"
+root = "F:/kairo/scratch-root"
 filesystem = "F:"
 
 [[stores]]
@@ -43,8 +43,8 @@ func TestStoresParse(t *testing.T) {
 	if e.ID != "e-durable" || e.Class != StoreDurable || e.Node != "win" || e.Root != "E:/kairo" || e.Filesystem != "E:" || e.Backend != StoreBackendLocalFS || e.ReserveFreeBytes != 200<<30 {
 		t.Fatalf("e-durable: %+v", e)
 	}
-	if w := spec.Stores[1]; w.Executor != "ubuntu-wsl" || w.Backend != "" || w.Normalized().Backend != StoreBackendLocalFS {
-		t.Fatalf("wsl-scratch: %+v", w)
+	if w := spec.Stores[1]; w.Executor != "windows-local" || w.Backend != "" || w.Normalized().Backend != StoreBackendLocalFS {
+		t.Fatalf("win-scratch: %+v", w)
 	}
 	ids := spec.NodeIDs()
 	if strings.Join(ids, ",") != "pve0-glm,pve0-train,win" {
@@ -71,9 +71,7 @@ func TestStoreValidation(t *testing.T) {
 		// One place spelled twice is refused, whatever executor either names.
 		{"dot spelling", store(base+"root = \"D:/k\"\n") + durable("D:/./k//"), "nested roots"},
 		{"case", store(base+"root = \"D:/k\"\n") + durable("d:/K"), "nested roots"},
-		{"with and without executor", store(base+"root = \"/k\"\n") + wsl("/k/inner"), "nested roots"},
-		{"WSL path to the drive", store(base+"root = \"D:/k\"\n") + wsl("/mnt/d/K/inner"), "nested roots"},
-		{"drive holding a WSL path", wsl("/mnt/d/k/inner") + durable("D:/"), "nested roots"},
+		{"with and without executor", store(base+"root = \"D:/k\"\n") + named("D:/k/inner"), "nested roots"},
 		{"trailing dot", store(base + "root = \"D:/k.\"\n"), "ending in a dot or a space"},
 		{"trailing space", store(base + "root = \"D:/k /x\"\n"), "ending in a dot or a space"},
 		{"short name", store(base + "root = \"D:/PROGRA~1/k\"\n"), "reads as another"},
@@ -137,20 +135,20 @@ func TestRebasePath(t *testing.T) {
 	}
 }
 
-// durable is a second store, t, durable on node win at root; wsl one of
-// executor ubuntu-wsl.
+// durable is a second store, t, durable on node win at root; named one
+// naming executor windows-local.
 func durable(root string) string {
 	return "[[stores]]\nid = \"t\"\nclass = \"durable\"\nnode = \"win\"\nfilesystem = \"D:\"\nroot = \"" + root + "\"\n"
 }
 
-func wsl(root string) string {
-	return "[[stores]]\nid = \"w\"\nclass = \"volatile\"\nnode = \"win\"\nexecutor = \"ubuntu-wsl\"\nfilesystem = \"D:\"\nroot = \"" + root + "\"\n"
+func named(root string) string {
+	return "[[stores]]\nid = \"w\"\nclass = \"volatile\"\nnode = \"win\"\nexecutor = \"windows-local\"\nfilesystem = \"D:\"\nroot = \"" + root + "\"\n"
 }
 
 func TestStoreRootKey(t *testing.T) {
 	for root, want := range map[string]string{
 		"E:/data": "e:/data", `E:\Data\`: "e:/data", "e:/./data//x/": "e:/data/x", "E:/": "e:/", "E:": "e:/",
-		"/mnt/e/Data": "e:/data", "/mnt/e": "e:/", "/mnt/ee/x": "/mnt/ee/x", "/srv//Kairo/./x/": "/srv/Kairo/x", "/": "/",
+		"/mnt/e/Data": "/mnt/e/Data", "/srv//Kairo/./x/": "/srv/Kairo/x", "/": "/",
 	} {
 		if got := StoreRootKey(root); got != want {
 			t.Errorf("%q: %q, want %q", root, got, want)
@@ -160,7 +158,7 @@ func TestStoreRootKey(t *testing.T) {
 		p, root string
 		want    bool
 	}{
-		{"E:/k", "E:/k", true}, {`e:\K\scratch\x`, "E:/k", true}, {"E:/kept", "E:/k", false}, {"E:/k", "E:/", true}, {"/srv/x", "/", true}, {"/mnt/e/k/a", "E:/k", true},
+		{"E:/k", "E:/k", true}, {`e:\K\scratch\x`, "E:/k", true}, {"E:/kept", "E:/k", false}, {"E:/k", "E:/", true}, {"/srv/x", "/", true}, {"/mnt/e/k/a", "E:/k", false},
 	} {
 		if got := PathUnder(c.p, c.root); got != c.want {
 			t.Errorf("PathUnder(%q, %q) = %v", c.p, c.root, got)

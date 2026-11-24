@@ -34,9 +34,6 @@ func storeMoveMarkerBody(decl machine.Store) string {
 // when it is there (moved now, or before), else why not (it is not usable
 // meanwhile).
 func (e *storeWorker) moveStore(sfs storeFS, decl machine.Store) (moved bool, problem string) {
-	if _, ok := sfs.(localStoreFS); !ok {
-		return false, "a store is moved only by an executor on its node's own filesystem (not inside WSL)"
-	}
 	from, to := filepath.Clean(decl.MovedFrom), filepath.Clean(decl.Root)
 	switch r, err := openDirPath(to, false); {
 	case err == nil:

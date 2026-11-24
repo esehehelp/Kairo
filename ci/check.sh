@@ -6,7 +6,6 @@
 #   linux-race  go test -race                               (pve1-work, as an unprivileged user)
 #   linux-root  the executor and process tests as root      (pve1-work)
 #   windows     go vet, go test                             (windows-local)
-#   wsl         the tests that run against WSL              (windows-local, KAIRO_TEST_WSL=1)
 #   sdk-python  the Python SDK's tests                      (windows-local)
 #   sdk-rust    the Rust SDK's tests                        (windows-local)
 # Store tests need PostgreSQL at KAIRO_TEST_PG (default 127.0.0.1:55432, kairo/kairo-test).
@@ -67,10 +66,6 @@ windows)
   need_pg
   step "go test"
   go test -count=1 ./...
-  ;;
-wsl)
-  step "go test against WSL"
-  KAIRO_TEST_WSL=1 go test -count=1 -run 'WSL' ./internal/executor/ ./internal/processidentity/
   ;;
 sdk-python)
   step "pytest (Python SDK)"

@@ -25,7 +25,7 @@ import (
 // platform's (confine_linux.go: its own mount namespace, everything read-only
 // but those directories, /tmp a directory of its scratch, and /dev/shm;
 // confine_windows.go: a token at Low integrity, those directories labelled
-// Low). Not done inside WSL yet: a confined launch there is refused.
+// Low).
 
 // kindCache: a project's cache directory, <root>/cache/<project scope id>.
 var kindCache = dirKind{dir: "cache", marker: ".kairo-cache"}

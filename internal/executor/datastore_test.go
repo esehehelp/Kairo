@@ -83,8 +83,8 @@ func TestStoresUnavailableAreWarnedOnce(t *testing.T) {
 	}
 }
 
-// An executor serves its node's stores in its namespace: one naming it, and
-// (unless it is WSL) one naming no executor. It makes a missing volatile
+// An executor serves its node's stores: one naming it, and one naming no
+// executor (not one naming another executor). It makes a missing volatile
 // root, never a durable one (a disk not mounted), and checks the root's
 // filesystem; a store on another one is unusable.
 func TestStoresServedMadeAndChecked(t *testing.T) {
@@ -96,7 +96,7 @@ func TestStoresServedMadeAndChecked(t *testing.T) {
 		{ID: "local", Class: machine.StoreVolatile, Node: "node", Root: filepath.Join(dir, "local-root"), Filesystem: testFilesystem(dir)},
 		{ID: "missing", Class: machine.StoreDurable, Node: "node", Root: filepath.Join(dir, "durable-root"), Filesystem: testFilesystem(dir)},
 		{ID: "wrong", Class: machine.StoreDurable, Node: "node", Root: filepath.Join(dir, "wrong-root"), Filesystem: otherFilesystem()},
-		{ID: "wsl-only", Class: machine.StoreVolatile, Node: "node", Executor: "ubuntu-wsl", Root: "/var/tmp/kairo", Filesystem: "D:"},
+		{ID: "other-only", Class: machine.StoreVolatile, Node: "node", Executor: "other-executor", Root: "/var/tmp/kairo", Filesystem: "D:"},
 	}}
 	var logs bytes.Buffer
 	e := storesExecutor(t, fake, &logs)
@@ -119,14 +119,6 @@ func TestStoresServedMadeAndChecked(t *testing.T) {
 	}
 	if obs = e.storeWork().observeStore(context.Background(), served[1]); obs.Usable || obs.TotalBytes != nil || obs.Problem == "" {
 		t.Fatalf("unusable observation: %+v", obs)
-	}
-
-	// A WSL executor serves only the store naming it.
-	wsl := storesExecutor(t, fake, &logs)
-	wsl.ID, wsl.Kind = "ubuntu-wsl", "wsl2"
-	wsl.storeWork().storeFSOverride = localStoreFS{}
-	if got := []bool{wsl.storeWork().serves(fake.stores[0]), wsl.storeWork().serves(fake.stores[3])}; got[0] || !got[1] {
-		t.Fatalf("WSL executor serves %v", got)
 	}
 }
 

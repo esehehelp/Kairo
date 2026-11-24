@@ -417,6 +417,7 @@ func (s *Server) agentRegister(ctx context.Context, b agentops.RegisterRequest) 
 	}
 	stale := map[string]int{}
 	adopted := []string{}
+	declared := make([]string, 0, len(b.Executors))
 	for _, e := range b.Executors {
 		if e.ID == "" {
 			return none, errors.New("executor id is required")
@@ -425,6 +426,7 @@ func (s *Server) agentRegister(ctx context.Context, b agentops.RegisterRequest) 
 		if err := s.Store.UpsertExecutor(ctx, e); err != nil {
 			return none, err
 		}
+		declared = append(declared, e.ID)
 		if e.Enabled {
 			// A (re)starting agent vouches only for the attempts it adopts;
 			// every other lease its previous incarnation held goes stale
@@ -436,6 +438,10 @@ func (s *Server) agentRegister(ctx context.Context, b agentops.RegisterRequest) 
 			stale[e.ID] = n
 			adopted = append(adopted, kept...)
 		}
+	}
+	// An executor of the node the agent no longer declares is no longer run.
+	if _, err := s.Store.UndeclareExecutors(ctx, b.Node.ID, declared); err != nil {
+		return none, err
 	}
 	return agentops.RegisterAnswer{StaleLeases: stale, Adopted: adopted}, nil
 }

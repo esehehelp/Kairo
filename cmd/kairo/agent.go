@@ -93,9 +93,9 @@ func agentCommand(args []string) error {
 		if err != nil {
 			return err
 		}
-		// Executors outside a WSL distro advertise this agent's pack server:
-		// other agents fetch from it the packs they make.
-		if cfg.Packs.Addr != "" && e.Kind != "wsl2" && e.Labels["environment"] != "wsl2" {
+		// Executors advertise this agent's pack server: other agents fetch
+		// from it the packs they make.
+		if cfg.Packs.Addr != "" {
 			if _, ok := labels["pack_addr"]; !ok {
 				labels["pack_addr"] = cfg.Packs.Addr
 			}

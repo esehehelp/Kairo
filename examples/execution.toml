@@ -10,7 +10,7 @@ checkpointable = true
 preemptible = true
 
 [executor]
-labels = { environment = "wsl2" }
+labels = { environment = "windows" }
 
 [[exclusive]]
 kind = "gpu"

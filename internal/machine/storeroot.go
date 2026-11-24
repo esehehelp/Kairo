@@ -11,10 +11,8 @@ import (
 // StoreRootKey is a root (or a path under one) as roots are compared: one
 // spelling of one place. Separators are forward slashes; "." components and
 // repeated or trailing separators go; a drive path is case folded (Windows
-// compares names without case); and a WSL path to a Windows drive
-// (/mnt/e/...) is that drive's path, since it reaches the same files. Two
-// roots of one node are compared by their keys whatever namespace (executor)
-// they are declared in. The agent also compares the places the roots really
+// compares names without case). Two roots of one node are compared by their
+// keys whatever executor they name. The agent also compares the places the roots really
 // are (links, mounts, short names), which a declaration cannot see.
 func StoreRootKey(root string) string {
 	p := strings.ReplaceAll(root, `\`, "/")
@@ -22,8 +20,6 @@ func StoreRootKey(root string) string {
 	switch {
 	case len(p) >= 2 && p[1] == ':' && isDriveLetter(p[0]):
 		drive, p = p[:1], p[2:]
-	case len(p) >= 6 && strings.HasPrefix(p, "/mnt/") && isDriveLetter(p[5]) && (len(p) == 6 || p[6] == '/'):
-		drive, p = p[5:6], p[6:]
 	}
 	p = path.Clean("/" + p)
 	if drive != "" {

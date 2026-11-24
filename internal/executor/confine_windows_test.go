@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-
-	"kairo/internal/store"
 )
 
 // A confined attempt writes its scratch, output and cache directories (and
@@ -88,11 +86,5 @@ func TestAConfinedLaunchNeedsAStore(t *testing.T) {
 	cmd := exec.Command("cmd", "/c", "echo")
 	if _, err := e.confine(cmd); err == nil {
 		t.Fatal("confined without a store")
-	}
-	// inside WSL a confined launch is refused (its backend, backend.go)
-	wsl := &Local{ID: "wsl", Kind: "wsl2"}
-	launch := &store.Launch{Attempt: store.Attempt{ID: "att_1"}, Argv: []string{"sh"}, CWD: "/tmp", Confine: true}
-	if _, _, err := wsl.backend().launcher(launch); err == nil || !strings.Contains(err.Error(), "WSL") {
-		t.Fatalf("confined inside WSL: %v", err)
 	}
 }

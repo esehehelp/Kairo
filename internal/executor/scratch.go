@@ -126,9 +126,7 @@ func (e *Local) forgetScratch(attemptID string) {
 }
 
 // scratchEnv is what an attempt is told of its scratch: KAIRO_SCRATCH, and
-// with scratch_tmpdir its temporary directory too (TMPDIR, plus TMP and
-// TEMP except for a WSL attempt, whose variables are also set on wsl.exe,
-// a Windows program that must not get a Linux path as its TMP).
+// with scratch_tmpdir its temporary directory too (TMPDIR, TMP and TEMP).
 func (e *Local) scratchEnv(launch *store.Launch) []string {
 	dir := e.scratchDir(launch.Attempt.ID)
 	if dir == "" {
@@ -136,7 +134,7 @@ func (e *Local) scratchEnv(launch *store.Launch) []string {
 	}
 	env := []string{"KAIRO_SCRATCH=" + dir}
 	if launch.ScratchTmpdir {
-		for _, name := range e.backend().tempNames() {
+		for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
 			env = append(env, name+"="+dir)
 		}
 	}

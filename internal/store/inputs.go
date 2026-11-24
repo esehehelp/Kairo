@@ -287,7 +287,7 @@ func resolveInputsTx(ctx context.Context, q *sql.Tx, executionID, projectScopeID
 			return nil, err
 		}
 		for _, p := range src.places {
-			if p.node == me.nodeID && sameNamespace(ctx, q, declared, p, me, executorID) {
+			if p.node == me.nodeID && sameNamespace(declared, p, me, executorID) {
 				li.Path, li.Object = p.path, p.object
 				if li.Object == "" {
 					li.Object = src.objectID
@@ -303,7 +303,7 @@ func resolveInputsTx(ctx context.Context, q *sql.Tx, executionID, projectScopeID
 			case src.problem != "":
 				li.Problem = src.problem
 			case src.on(me.nodeID):
-				li.Problem = "it is on node " + me.nodeID + " in another executor's namespace"
+				li.Problem = "it is on node " + me.nodeID + " on a store this executor does not serve"
 			default:
 				li.Problem = "it is not on node " + me.nodeID + " (yet)"
 			}
@@ -314,9 +314,9 @@ func resolveInputsTx(ctx context.Context, q *sql.Tx, executionID, projectScopeID
 }
 
 // sameNamespace reports whether executor (me) reaches the path of an input
-// as written: on a store it serves, or an imported directory of its own or,
-// for an executor not of WSL, of another such of its node.
-func sameNamespace(ctx context.Context, q queryer, declared []machine.Store, p inputPlace, me executorInfo, executorID string) bool {
+// of its node as written: on a store it serves, or an imported directory
+// (every executor of a node reaches the node's paths).
+func sameNamespace(declared []machine.Store, p inputPlace, me executorInfo, executorID string) bool {
 	if p.storeID != "" {
 		for _, s := range declared {
 			if s.ID == p.storeID {
@@ -325,11 +325,7 @@ func sameNamespace(ctx context.Context, q queryer, declared []machine.Store, p i
 		}
 		return false
 	}
-	if p.executor == executorID {
-		return true
-	}
-	other, err := executorInfoTx(ctx, q, p.executor)
-	return err == nil && !other.wsl && !me.wsl
+	return true
 }
 
 // inputsNodesTx are the nodes an execution with inputs is best planned

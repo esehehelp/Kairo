@@ -45,9 +45,6 @@ import (
 // a name that is not UTF-8 is refused (the file list could not name it).
 // Once renamed, the directory is synced and both are read back from disk
 // around the cache: only a pack that reads back as written is recorded.
-// Packing is not done for a store inside a
-// WSL distro yet (its files are Linux files the executor cannot read through
-// handles): such an object stays to be packed.
 
 const (
 	packsDirName   = "packs"
@@ -63,9 +60,6 @@ const (
 )
 
 var (
-	// errPackNotHere: the store is one this executor does not pack (inside
-	// a WSL distro).
-	errPackNotHere = errors.New("directories of a store inside a WSL distro are not packed yet")
 	// errPackChanged: a file changed while it was packed.
 	errPackChanged = errors.New("a file changed while it was packed")
 	// errPackName: a name the file list cannot hold.
@@ -298,26 +292,6 @@ func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src str
 		return res, err
 	}
 	return res, nil
-}
-
-func (wslStoreFS) Pack(context.Context, string, dirKind, string, string) (packResult, error) {
-	return packResult{}, errPackNotHere
-}
-
-func (wslStoreFS) PackDir(context.Context, string, string, string) (packResult, error) {
-	return packResult{}, errPackNotHere
-}
-
-func (wslStoreFS) PackSince(context.Context, string, dirKind, string, string, time.Time) (packResult, error) {
-	return packResult{}, errPackNotHere
-}
-
-func (wslStoreFS) Identify(context.Context, string, dirKind, string, string) (packResult, error) {
-	return packResult{}, errPackNotHere
-}
-
-func (wslStoreFS) IdentifyDir(context.Context, string, string, string) (packResult, error) {
-	return packResult{}, errPackNotHere
 }
 
 // countWriter counts the bytes written through it.

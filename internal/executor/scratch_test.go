@@ -331,16 +331,6 @@ func TestLaunchGetsScratchOnAVolatileStore(t *testing.T) {
 			t.Fatalf("%s = %q with scratch_tmpdir", name, values)
 		}
 	}
-	// A WSL attempt's TMP and TEMP would reach wsl.exe as well: only TMPDIR.
-	e.Kind = "wsl2"
-	env = e.launchEnv(launch)
-	if got, _ := envValue(env, "TMPDIR"); got != want {
-		t.Fatalf("WSL TMPDIR = %q", got)
-	}
-	if _, ok := envValue(env, "TMP"); ok {
-		t.Fatal("WSL attempt given TMP")
-	}
-	e.Kind = "windows"
 	e.forgetScratch("att_1")
 	if _, ok := envValue(e.launchEnv(launch), "KAIRO_SCRATCH"); ok {
 		t.Fatal("scratch named after it was forgotten")

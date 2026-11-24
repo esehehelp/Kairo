@@ -5,7 +5,7 @@ import "testing"
 func TestValidate(t *testing.T) {
 	for _, env := range []map[string]string{
 		{"": "x"}, {" A": "x"}, {"A ": "x"}, {"A=B": "x"}, {"A\x00": "x"}, {"A": "x\x00y"},
-		{"KAIRO_TOKEN": "x"}, {"Kairo_Api_Url": "x"}, {"WSLENV": "x"}, {"wslenv": "x"},
+		{"KAIRO_TOKEN": "x"}, {"Kairo_Api_Url": "x"},
 	} {
 		if err := Validate(env, false); err == nil {
 			t.Fatalf("accepted %q", env)

@@ -638,7 +638,7 @@ const terminationGrace = 10 * time.Second
 // checkpoint, and of the running ranks of a gang one of whose ranks stopped.
 // The whole tree is reached as for a force stop (processTree): the job
 // object, the launcher's process group, and the processes carrying the
-// attempt's KAIRO_ATTEMPT_ID, inside WSL too. A graceful stop goes first, a
+// attempt's KAIRO_ATTEMPT_ID. A graceful stop goes first, a
 // kill after terminationGrace, and the termination is recorded only once no
 // process of the tree is left. Quiescence is proven afterwards by
 // reconcileQuiescence as for any exit.
@@ -746,16 +746,10 @@ func (e *Local) launchEnv(launch *store.Launch) []string {
 // checkInputs refuses a launch one of whose inputs cannot be had here (the
 // daemon says why) or is not a directory there now (store/inputs.go): the
 // attempt does not start, and its execution ends launch_aborted saying so.
-// The paths of an executor whose backend does not read the node's (WSL: the
-// distro's) are not looked at from here.
 func (e *Local) checkInputs(launch *store.Launch) error {
-	nodePaths := e.backend().readsNodePaths()
 	for _, in := range launch.Inputs {
 		if in.Problem != "" {
 			return fmt.Errorf("input %s: %s", in.Name, in.Problem)
-		}
-		if !nodePaths {
-			continue
 		}
 		r, err := openDirPath(in.Path, false)
 		if err != nil {

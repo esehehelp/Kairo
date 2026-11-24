@@ -99,7 +99,7 @@ type Execution struct {
 	// Env is [tasks.execution.env], added to the attempt's environment (see
 	// envspec.Validate for what is allowed). Absent from the JSON when empty.
 	Env map[string]string `toml:"env" json:"env,omitempty"`
-	// ScratchTmpdir points TMPDIR, TMP and TEMP (a WSL attempt: TMPDIR) of the
+	// ScratchTmpdir points TMPDIR, TMP and TEMP of the
 	// attempt at its scratch directory (KAIRO_SCRATCH) when it has one. Off
 	// by default: a temporary directory emptied with every attempt loses
 	// caches such as torch's compile cache. Absent from the JSON when false.

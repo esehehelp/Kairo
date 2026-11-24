@@ -66,7 +66,7 @@ type Bench struct {
 	// CWD is the benches' working directory (default: KairoBinary's).
 	CWD string `toml:"cwd"`
 	// ExecutorLabels pick the executor of the node that runs benches (one
-	// that runs the binaries above natively, not a WSL one for Windows paths).
+	// that runs the binaries above natively).
 	ExecutorLabels map[string]string `toml:"executor_labels"`
 }
 
@@ -321,8 +321,11 @@ func (e Executor) Attributes() (map[string]string, error) {
 	return out, nil
 }
 
-// checkExecutors refuses executors whose attributes cannot be made, or
-// that run containers on a system without Incus.
+// checkExecutors refuses executors whose attributes cannot be made, that
+// run containers on a system without Incus, or that would run inside WSL:
+// that executor kind is retired (Linux work runs on a Linux node or in a
+// container), and an agent taking one for a host executor would run Linux
+// command lines on Windows.
 func checkExecutors(executors []Executor) error {
 	for _, e := range executors {
 		if _, err := e.Attributes(); err != nil {
@@ -330,6 +333,9 @@ func checkExecutors(executors []Executor) error {
 		}
 		if e.Kind == KindIncus && runtime.GOOS != "linux" {
 			return fmt.Errorf("executor %s: kind incus runs on Linux only", e.ID)
+		}
+		if e.Kind == "wsl2" || e.Labels["environment"] == "wsl2" {
+			return fmt.Errorf("executor %s: WSL executors are retired; remove it from the configuration", e.ID)
 		}
 	}
 	return nil

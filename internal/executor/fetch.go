@@ -92,9 +92,6 @@ func (e *storeWorker) fetchDue(ctx context.Context) {
 // already unpacked (recorded after all, or not yet) is taken as it is.
 func (e *storeWorker) fetchOne(ctx context.Context, s servedStore, o store.FetchOrder, served map[string]servedStore) (store.FetchMade, error) {
 	made := store.FetchMade{ObjectID: o.ObjectID, StoreID: o.StoreID, ExecutorID: e.ID}
-	if _, ok := s.fs.(localStoreFS); !ok {
-		return made, errPackNotHere
-	}
 	if !validScratchID(o.ObjectID) || o.Source.Month != "" && !machine.ValidMonth(o.Source.Month) {
 		return made, fmt.Errorf("%w: object %q, month %q", errOutsideRoot, o.ObjectID, o.Source.Month)
 	}

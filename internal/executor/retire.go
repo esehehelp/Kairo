@@ -554,9 +554,6 @@ func removePackOnly(sfs storeFS, root, objectID string) error {
 }
 
 func removePackFiles(sfs storeFS, root, objectID string, names ...string) error {
-	if _, ok := sfs.(localStoreFS); !ok {
-		return errPackNotHere
-	}
 	if !validScratchID(objectID) {
 		return fmt.Errorf("%w: object %q", errOutsideRoot, objectID)
 	}

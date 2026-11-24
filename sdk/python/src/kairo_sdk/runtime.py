@@ -890,7 +890,7 @@ _UNIX_EPOCH_FILETIME = 116_444_736_000_000_000
 
 
 def process_identity_from_proc_stat(pid: int, stat_text: str) -> str | None:
-    """Linux/WSL identity ``proc:PID:starttime:T`` from ``/proc/PID/stat`` text.
+    """Linux identity ``proc:PID:starttime:T`` from ``/proc/PID/stat`` text.
 
     ``None`` when the text carries no positive start time.
     """

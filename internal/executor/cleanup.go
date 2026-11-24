@@ -214,17 +214,14 @@ const unactivatedKillWait = 10 * time.Second
 
 // killUnactivated ends a launcher whose activation failed together with
 // everything it started: its job object or process group, and the
-// processes carrying its KAIRO_ATTEMPT_ID (inside WSL too), not the launcher
+// processes carrying its KAIRO_ATTEMPT_ID, not the launcher
 // alone, whose children would otherwise run on unmanaged. A signal sent is
 // not a process gone: the tree must be seen empty. If it is not within
 // unactivatedKillWait, the tree is kept (its handle open) for the launch's
 // cleanup, which releases nothing before it is empty (leftovers).
 func (e *Local) killUnactivated(launch *store.Launch, cmd *exec.Cmd, tree *treeHandle, identity string) {
-	t := e.backend().tree(launch.Attempt.ID)
-	t.pid, t.identity, t.handle = cmd.Process.Pid, identity, tree
-	if !t.wsl {
-		t.group = cmd.Process.Pid
-	}
+	t := processTree{attemptID: launch.Attempt.ID}
+	t.pid, t.identity, t.handle, t.group = cmd.Process.Pid, identity, tree, cmd.Process.Pid
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	if err := e.killTree(ctx, t); err != nil {
