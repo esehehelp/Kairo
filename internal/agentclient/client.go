@@ -234,6 +234,11 @@ func (c *Client) InputGone(ctx context.Context, executorID, objectID, path strin
 	return c.call(ctx, "input-gone", map[string]string{"executor_id": executorID, "object_id": objectID, "path": path}, nil)
 }
 
+// InputIsFile reports an import read in place whose source is a file.
+func (c *Client) InputIsFile(ctx context.Context, executorID, objectID, path string) error {
+	return c.call(ctx, "input-is-file", map[string]string{"executor_id": executorID, "object_id": objectID, "path": path}, nil)
+}
+
 // InPlaceSources are the paths of this node inputs are read in place at.
 func (c *Client) InPlaceSources(ctx context.Context, executorID string) ([]store.InPlaceSource, error) {
 	var out struct {

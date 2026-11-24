@@ -84,6 +84,9 @@ type PackMade struct {
 	// pack removed (PackOrder.Drop).
 	Transfer bool `json:"transfer,omitempty"`
 	Dropped  bool `json:"dropped,omitempty"`
+	// File: what was packed is an imported regular file, alone; it is not
+	// read in place as an input then (inputs.go: an input is a directory).
+	File bool `json:"file,omitempty"`
 }
 
 // maxManifestBytes bounds a temporal object's file list kept in the store.
@@ -298,6 +301,13 @@ func (s *Store) RecordPack(ctx context.Context, made PackMade) error {
 	}
 	if made.Transfer || made.Dropped {
 		return recordTransferTx(ctx, tx, made, root, projectID)
+	}
+	// an import of one regular file is not read in place as an input
+	// (inputs.go): it is brought, a directory holding the file
+	if made.File && kind == ObjectImport {
+		if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET source_file=true WHERE id=$1`, made.ObjectID); err != nil {
+			return err
+		}
 	}
 	if made.Identity != (lifecycle == LifecycleTemporal) {
 		return fmt.Errorf("object %s is %s: an identity is recorded for a temporal object, a pack for a durable one", made.ObjectID, lifecycle)

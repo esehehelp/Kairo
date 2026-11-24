@@ -66,8 +66,10 @@ func (e *Local) inventoryDue(ctx context.Context) {
 
 // checkInPlaceSources reports each path of this node inputs are read in place
 // at that is gone (its volume there): store.InputGone, so inputs are brought
-// from a durable copy instead (README: Data stores). A WSL executor's paths
-// are the distro's: not looked at from here.
+// from a durable copy instead (README: Data stores); and each that is a
+// regular file, an import of one file (an input is a directory):
+// store.InputIsFile, so it is brought as a directory holding it. A WSL
+// executor's paths are the distro's: not looked at from here.
 func (e *Local) checkInPlaceSources(ctx context.Context) {
 	if e.Kind == "wsl2" || e.Attributes["environment"] == "wsl2" {
 		return
@@ -77,9 +79,18 @@ func (e *Local) checkInPlaceSources(ctx context.Context) {
 		e.roundProblem(&e.inventories, "", "in-place sources not read", err)
 		return
 	}
-	gone := 0
+	gone, files := 0, 0
 	for _, src := range sources {
-		if _, err := os.Lstat(src.Path); err == nil || !errors.Is(sourceGone(src.Path, err), errSourceGone) {
+		info, err := os.Lstat(src.Path)
+		if err == nil && info.Mode().IsRegular() {
+			if err := e.Store.InputIsFile(ctx, e.ID, src.ObjectID, src.Path); err != nil {
+				e.roundProblem(&e.inventories, src.ObjectID, "file source not recorded", err)
+				continue
+			}
+			files++
+			continue
+		}
+		if err == nil || !errors.Is(sourceGone(src.Path, err), errSourceGone) {
 			continue
 		}
 		if err := e.Store.InputGone(ctx, e.ID, src.ObjectID, src.Path); err != nil {
@@ -90,6 +101,9 @@ func (e *Local) checkInPlaceSources(ctx context.Context) {
 	}
 	if gone > 0 {
 		e.Logger.Warn("sources read in place are gone: recorded, brought from durable copies instead", "count", gone)
+	}
+	if files > 0 {
+		e.Logger.Info("imports of one file read in place: recorded, brought as a directory holding the file instead", "count", files)
 	}
 }
 

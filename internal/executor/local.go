@@ -800,6 +800,16 @@ func (e *Local) checkInputs(launch *store.Launch) error {
 				cancel()
 				return fmt.Errorf("input %s (%s) is gone from there; rerun to have it brought from a durable copy: %w", in.Name, in.Path, err)
 			}
+			if info, ferr := os.Lstat(in.Path); ferr == nil && info.Mode().IsRegular() && in.Object != "" {
+				// an import of one file, read in place (issue #27): recorded,
+				// so the next plan brings it as a directory holding the file
+				ctx, cancel := context.WithTimeout(context.Background(), scratchCallTimeout)
+				if ferr := e.Store.InputIsFile(ctx, e.ID, in.Object, in.Path); ferr != nil {
+					e.Logger.Warn("input is a file, not recorded", "object_id", in.Object, "path", in.Path, "error", ferr)
+				}
+				cancel()
+				return fmt.Errorf("input %s (%s) is a file, not a directory; rerun to have it brought as a directory holding it", in.Name, in.Path)
+			}
 			return fmt.Errorf("input %s (%s): %w", in.Name, in.Path, err)
 		}
 		r.Close()

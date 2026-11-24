@@ -379,6 +379,13 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentInputGoneRequest) (any, error) {
 				return okBody, s.Store.InputGone(ctx, b.ExecutorID, b.ObjectID, b.Path)
 			}),
+		newAgentOp(s, "input-is-file", observeRefused, nil,
+			func(ctx context.Context, b agentInputGoneRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentInputGoneRequest) (any, error) {
+				return okBody, s.Store.InputIsFile(ctx, b.ExecutorID, b.ObjectID, b.Path)
+			}),
 		newAgentOp(s, "claim-shed", observeRefused, nil,
 			func(ctx context.Context, b agentDescribedRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.ExecutorID)
