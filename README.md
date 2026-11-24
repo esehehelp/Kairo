@@ -2082,7 +2082,7 @@ kairo db import-sqlite --from local/kairo-v3.db --config kairo.toml   # また�
 
 コントロールプレーンのデータも他のデータと本質的に変わらないため、Kairo 自身が同じ仕組みでこれを保全します。デーモン設定の `control_snapshot_minutes`（デフォルト `60`、負の値で無効）ごとに、デーモンはプロジェクト `kairo`、キュー `control-snapshot`、名前 `snapshot-<UTC slot>`（例: `snapshot-20261116T0100Z`）の Task を宣言します。
 
-この Task は `kairo control snapshot` を実行するもので、`[bench]` の `kairo_binary` を報告しているノードに属する最初の durable store を選び、そのノードの `kairo_binary` を用いて、当該 durable store の `executor_labels` に合致する Executor 上で実行されます。durable store が 1 つも宣言されていない間、または対象ノードが `kairo` バイナリを報告していない間は何も実行されません。優先度は他のあらゆるジョブより高く、CPU・RAM・GPU のいずれも予約しないため（ダンプ処理はデーモン側で行い、Task は受け取った内容を書き出すだけのため）、他ジョブに待たされることも、空きを作るために他ジョブを中断することもありません。
+この Task は `kairo control snapshot` を実行するもので、`[bench]` の `kairo_binary` を報告しているノードに属する最初の durable store を選び、そのノードの `kairo_binary` を用いて、当該 durable store の `executor_labels` に合致する Executor 上で実行されます。durable store が 1 つも宣言されていない間、または対象ノードが `kairo` バイナリを報告していない間は何も実行されません。有効な Executor がすべてコンテナ実行用（`kind = "incus"` / `"pct"`）のノードは、ベンチマークのドライバも control snapshot も（ホスト上で `kairo` を動かすため）受け付けられないので、`kairo` バイナリを報告していないものとして扱われ、次の durable store のノードが選ばれます。優先度は他のあらゆるジョブより高く、CPU・RAM・GPU のいずれも予約しないため（ダンプ処理はデーモン側で行い、Task は受け取った内容を書き出すだけのため）、他ジョブに待たされることも、空きを作るために他ジョブを中断することもありません。
 
 Task は自身の Attempt トークンを用いてデーモンからスナップショットを取得し（`GET /api/worker/control-snapshot`。このキューの Attempt のみに許可）、Run の `output` ディレクトリに `kairo-control-<time>.tar` として書き出します。Run 終了時には通常の出力と同様に pack され、すべての durable store へコピーされます。tar アーカイブの中身は次のとおりです。
 
