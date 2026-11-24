@@ -120,22 +120,29 @@ func (info executorInfo) serves(s machine.Store, executorID string) bool {
 // executor that wrote there: a store that moved to another node (or whose
 // writer was retired) is read through its new server. found is false while
 // none serves it.
-func storeServerTx(ctx context.Context, q queryer, s machine.Store) (info executorInfo, found bool, err error) {
-	err = eachRow(ctx, q, `SELECT id FROM executors WHERE node_id=$1 AND enabled ORDER BY id`, []any{s.Node}, func(rows *sql.Rows) error {
+func storeServerTx(ctx context.Context, q queryer, s machine.Store) (executorInfo, bool, error) {
+	var ids []string
+	err := eachRow(ctx, q, `SELECT id FROM executors WHERE node_id=$1 AND enabled ORDER BY id`, []any{s.Node}, func(rows *sql.Rows) error {
 		var id string
-		if err := rows.Scan(&id); err != nil || found {
+		if err := rows.Scan(&id); err != nil {
 			return err
 		}
-		x, err := executorInfoTx(ctx, q, id)
-		if err != nil {
-			return err
-		}
-		if x.serves(s, id) && x.attrs["pack_addr"] != "" {
-			info, found = x, true
-		}
+		ids = append(ids, id)
 		return nil
 	})
-	return info, found, err
+	if err != nil {
+		return executorInfo{}, false, err
+	}
+	for _, id := range ids {
+		x, err := executorInfoTx(ctx, q, id)
+		if err != nil {
+			return executorInfo{}, false, err
+		}
+		if x.serves(s, id) && x.attrs["pack_addr"] != "" {
+			return x, true, nil
+		}
+	}
+	return executorInfo{}, false, nil
 }
 
 // copyTargetsTx are the durable stores objects are copied to, in the order
