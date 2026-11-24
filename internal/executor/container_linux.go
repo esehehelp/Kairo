@@ -35,6 +35,8 @@ func runContainerHelpers(args []string) {
 		os.Exit(containerRun(args[2]))
 	case containerInitArg:
 		os.Exit(containerInit(args[2]))
+	case pctRunArg:
+		os.Exit(pctRun(args[2]))
 	}
 }
 
@@ -388,32 +390,6 @@ func devName(soname string) string {
 		return soname[:i+3]
 	}
 	return ""
-}
-
-// linkOrCopy hard-links src to dst, or copies it when they are on
-// different filesystems.
-func linkOrCopy(src, dst string) error {
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	fi, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fi.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	if _, err = io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
 }
 
 // containerInit runs under Incus's init, the container's first process: it

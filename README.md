@@ -401,7 +401,7 @@ ca_file = "/etc/kairo/ca.pem"
 
 残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`、`[bench]`、`[[executors]]`、`[[providers]]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。
 
-- **Executor の実行形態**: Executor はホスト上で直接 Attempt を実行するか、種別（kind）が `incus` の場合はコンテナ内で実行します（[コンテナ実行](#コンテナ実行)を参照）。WSL 内で Attempt を実行していた Executor は廃止されており、それを宣言する設定（種別 `wsl2` またはラベル `environment = "wsl2"`）は拒否されます。Linux 向けのジョブは Linux ノード上またはコンテナ内で実行してください。
+- **Executor の実行形態**: Executor はホスト上で直接 Attempt を実行するか、種別（kind）が `incus` または `pct` の場合はコンテナ内で実行します（[コンテナ実行](#コンテナ実行)を参照）。WSL 内で Attempt を実行していた Executor は廃止されており、それを宣言する設定（種別 `wsl2` またはラベル `environment = "wsl2"`）は拒否されます。Linux 向けのジョブは Linux ノード上またはコンテナ内で実行してください。
 - **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。
 - **相対パスの基準**: `log_directory`（および `source_directory`）に相対パスを指定した場合、デーモンまたはエージェントの起動時の作業ディレクトリを基準に 1 度だけ解決され、Attempt には絶対パスが渡されます。
 - **接続要件**: エージェントは `insecure_http = true` を指定しない限り `http://` の URL を拒否します。ホストのデバイスコントローラ（`kairo controller`。[ハードウェア設定](#ハードウェア設定)を参照）も同じ方法で接続します。
@@ -956,7 +956,7 @@ argv = ["python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
 
 #### Incus Executor の要件と設定
 
-イメージを指定した Execution を受け付けるのはコンテナ実行用 Executor のみであり、コンテナ実行用 Executor はそれ以外の Execution を受け付けません。`kind = "incus"` の Executor は属性 `runtime = "incus"` を登録し（`labels` に `runtime` を手動指定すると拒否され、`kind` のみが設定できます）、イメージを持つ Execution のセレクタにはイメージ指定に基づいて `"container": true` が自動設定されます（呼び出し元から直接設定することはできません）。
+イメージを指定した Execution を受け付けるのはコンテナ実行用 Executor のみであり、コンテナ実行用 Executor はそれ以外の Execution を受け付けません。`kind = "incus"` と `kind = "pct"` の Executor は属性 `runtime`（値は kind と同じ）を登録し（`labels` に `runtime` を手動指定すると拒否され、`kind` のみが設定できます）、イメージを持つ Execution のセレクタにはイメージ指定に基づいて `"container": true` が自動設定されます（呼び出し元から直接設定することはできません）。
 
 `kind = "incus"` の Executor は Linux 上で動作し、ノード上の他の Executor と並存できます。
 
@@ -972,6 +972,36 @@ labels = { environment = "linux", site = "host-a" }
 - **Incus 6.3 以降**: OCI イメージ対応が必要です（Debian 13 の 6.0 LTS には対応がなく、Zabbly パッケージを利用する必要があります）。また、デフォルトプロファイルにストレージプールとネットワークが設定されている必要があります。
 - **GPU 利用時**: ノード上に `nvidia-container-cli`（`libnvidia-container-tools`）とドライバのユーザー空間ファイルが必要です。
 - **Proxmox LXC 内での実行**: 非特権 Proxmox LXC（`features: nesting=1,keyctl=1`）内で実行する場合、LXC 内部ではコンテナを特権扱い（`security.privileged`。LXC には UID マップが 1 つしかないため）にしますが、物理ホスト側からは引き続き非特権のまま保たれます。
+
+#### Proxmox コンテナ Executor（`kind = "pct"`）
+
+Proxmox VE ホスト上で動くエージェントは、`kind = "pct"` の Executor で、Attempt ごとに専用の Proxmox コンテナを作り、終わったら破棄します。ホスト上に作業用の常設コンテナを置かず、「消してよいか分からないコンテナ」が生まれないようにするためです。Kairo が作るコンテナは次の条件をすべて満たし、それ以外のゲストに Kairo が触れることはありません。
+
+- VMID は **1000〜1999** のみ（空いている最小の番号を使う）。
+- タグ `kairo`、ホスト名 `kairo-<attempt id>`、説明欄にどの Attempt のためのものかを記載。
+
+ランナー（`__kairo-pct-run`）の動作は次のとおりです。
+
+1. イメージをダイジェストで取得します（`skopeo copy docker://...@sha256:... oci-archive:`。Proxmox の pull はタグ指定しか受け付けないため）。テンプレートストレージに `kairo-<digest>.tar` として置き、2 回目以降は再利用します。
+2. 非特権コンテナとして作成します（`pct create`）。ルートディスクは Executor のストレージ上に作ります。メモリとコア数はホスト全体を与え、上限をかけません（予約はアドミッションの勘定であり、OS の上限ではありません）。Kairo が渡す領域を `/kairo` 配下にバインドマウントし、GPU はデバイスとして渡します。書き込み可能な領域の所有者は、コンテナの root に対応するホスト上の ID（`/etc/subuid` の root の範囲の先頭。既定は 100000）に変えます。
+3. 作成時にイメージ側の entrypoint が書き込まれるため、作成後に init を Kairo のもの（`__kairo-container-init`）に設定し、`/dev/shm` を広げてから起動します。
+4. 停止を待ち、`/kairo/run/exit` の終了コードを読んでコンテナを破棄します（`pct destroy --purge`）。
+
+ランナーが強制終了されて残ったコンテナは、掃除処理が破棄します。対象は、番号帯の中にあり、タグ `kairo` を持ち、Attempt がもうこのノードで動いていない、停止済みのコンテナだけです。
+
+```toml
+[[executors]]
+id = "host-a-pct"
+kind = "pct"
+labels = { site = "host-a" }
+# 以下は省略時の値
+# pct_storage = "local-lvm"            # ルートディスクを置くストレージ
+# pct_template_storage = "local"       # イメージ（OCI アーカイブ）を置くストレージ
+# pct_net = "name=eth0,bridge=vmbr0,ip=dhcp"  # net0（空文字でネットワークなし）
+# pct_rootfs_gib = 8                   # ルートディスクの大きさ
+```
+
+これらの設定は Executor の `labels` に書きます。必要な環境は、Proxmox VE 9.1 以降（OCI アーカイブからのコンテナ作成）と `skopeo`（Proxmox VE の依存として入っています）です。エージェントはホスト上で root として動かします。
 
 #### コンテナの起動・終了ライフサイクルとマウント構成
 

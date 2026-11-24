@@ -5,27 +5,31 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"kairo/internal/store"
 )
 
-// Containers (README: Containers). An executor of kind incus runs every
-// attempt in an Incus container of the attempt's image (store.Launch.Image,
+// Containers (README: Containers). An executor of kind incus or pct runs
+// every attempt in a container of the attempt's image (store.Launch.Image,
 // pinned by digest), and nothing else: the planner gives it only executions
-// in an image, and only it takes them (store.selectorMatches).
+// in an image, and only it takes them (store.selectorMatches). Kind incus
+// makes an Incus instance (container_linux.go); kind pct, run by an agent on
+// a Proxmox VE host, makes a Proxmox container in VMIDs 1000-1999
+// (container_pct_linux.go).
 //
 // The attempt's launcher is still its shim (shim.go), which runs this
-// binary as containerRunArg, the runner (container_linux.go): it makes the
-// instance kairo-<attempt id> from the image, starts it, waits for it to
-// stop, reads the exit the container wrote, deletes the instance and exits
-// with that exit; so the shim, adoption and quiescence are as for a host
-// attempt. In the container this binary runs as containerInitArg under
+// binary as the backend's runner: it makes the container kairo-<attempt id>
+// from the image, starts it, waits for it to stop, reads the exit the
+// container wrote, destroys the container and exits with that exit; so the
+// shim, adoption and quiescence are as for a host attempt. In the container this binary runs as containerInitArg under
 // Incus's own init: it confines the container as a confined host attempt is
 // confined (confineMounts: all read-only but what Kairo hands it), starts
 // the attempt's argv with its environment and directory, its output going
@@ -57,6 +61,7 @@ import (
 const (
 	containerRunArg  = "__kairo-incus-run"
 	containerInitArg = "__kairo-container-init"
+	pctRunArg        = "__kairo-pct-run"
 	containerRoot    = "/kairo"
 	containerSpecIn  = "/kairo/run/spec.json"
 	containerExitIn  = "/kairo/run/exit"
@@ -84,6 +89,8 @@ type containerSpec struct {
 	DriverRoot string   `json:"driver_root,omitempty"`
 	// RunDir is the node path of /kairo/run.
 	RunDir string `json:"run_dir"`
+	// PCT is how a Proxmox container is made (kind pct only).
+	PCT *pctSettings `json:"pct,omitempty"`
 
 	// In the container: the argv, its directory and environment (declared,
 	// then Kairo's), the paths it may write and its /tmp.
@@ -113,10 +120,22 @@ func (e *Local) containerDir(attemptID string) string {
 	return filepath.Join(e.LogDir, "containers", attemptID)
 }
 
+// containerOptions say how a backend's containers take what an attempt is
+// handed: runArg is the runner's argument; dirsOnly mounts directories only
+// (Proxmox bind-mounts no single file): the binary as a directory
+// (/kairo/bin) holding a hard link to it (a copy across filesystems), the
+// logs as one (/kairo/log) of hard links to them; pct is what a Proxmox
+// container is made with.
+type containerOptions struct {
+	runArg   string
+	dirsOnly bool
+	pct      *pctSettings
+}
+
 // containerCommand builds the launcher of an attempt in a container (the
 // runner, under the shim): it checks the attempt can run here, writes its
 // spec and returns the runner's command.
-func (e *Local) containerCommand(launch *store.Launch) (*exec.Cmd, error) {
+func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*exec.Cmd, error) {
 	if launch.Image == "" {
 		return nil, fmt.Errorf("executor %s runs attempts in containers: the execution names no image", e.ID)
 	}
@@ -153,20 +172,41 @@ func (e *Local) containerCommand(launch *store.Launch) (*exec.Cmd, error) {
 		}
 		f.Close()
 	}
+	binMount := containerMount{Source: self, Path: containerRoot + "/bin/kairo", ReadOnly: true}
+	logMounts := []containerMount{{Source: logs[0], Path: containerStdout}, {Source: logs[1], Path: containerStderr}}
+	writableLogs := []string{containerStdout, containerStderr}
+	if opts.dirsOnly {
+		binDir := filepath.Join(dir, "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			return nil, err
+		}
+		if _, err := os.Stat(filepath.Join(binDir, "kairo")); err != nil {
+			if err := linkOrCopy(self, filepath.Join(binDir, "kairo")); err != nil {
+				return nil, fmt.Errorf("hand the binary to the container: %w", err)
+			}
+		}
+		binMount = containerMount{Source: binDir, Path: containerRoot + "/bin", ReadOnly: true}
+		logDir, err := linkLogs(filepath.Join(dir, "log"), logs)
+		if err != nil {
+			return nil, err
+		}
+		logMounts = []containerMount{{Source: logDir, Path: path.Dir(containerStdout)}}
+		writableLogs = []string{path.Dir(containerStdout)}
+	}
 	spec := containerSpec{
 		Instance:  containerInstance(id),
 		AttemptID: id,
 		Image:     launch.Image,
 		RunDir:    runDir,
-		Mounts: []containerMount{
-			{Source: self, Path: containerRoot + "/bin/kairo", ReadOnly: true},
+		PCT:       opts.pct,
+		Mounts: append(append([]containerMount{
+			binMount,
 			{Source: runDir, Path: containerRoot + "/run"},
-			{Source: logs[0], Path: containerStdout},
-			{Source: logs[1], Path: containerStderr},
-			{Source: scratch, Path: containerRoot + "/scratch"},
-			{Source: output, Path: containerRoot + "/output"},
-		},
-		Writable: []string{containerRoot + "/run", containerStdout, containerStderr, containerRoot + "/scratch", containerRoot + "/output"},
+		}, logMounts...),
+			containerMount{Source: scratch, Path: containerRoot + "/scratch"},
+			containerMount{Source: output, Path: containerRoot + "/output"},
+		),
+		Writable: append(append([]string{containerRoot + "/run"}, writableLogs...), containerRoot+"/scratch", containerRoot+"/output"),
 		Tmp:      containerRoot + "/scratch/tmp",
 		Argv:     launch.Argv,
 	}
@@ -222,7 +262,7 @@ func (e *Local) containerCommand(launch *store.Launch) (*exec.Cmd, error) {
 	if err := os.WriteFile(specPath, body, 0o600); err != nil {
 		return nil, err
 	}
-	cmd := exec.Command(self, containerRunArg, specPath)
+	cmd := exec.Command(self, opts.runArg, specPath)
 	cmd.Dir = runDir
 	// the runner needs the agent's environment (PATH, HOME for incus), not
 	// the attempt's; it carries the attempt's id, so it is found as the
@@ -234,6 +274,90 @@ func (e *Local) containerCommand(launch *store.Launch) (*exec.Cmd, error) {
 	}
 	cmd.Env = append(cmd.Env, "KAIRO_ATTEMPT_ID="+id)
 	return cmd, nil
+}
+
+// pctSettings are what a Proxmox container is made with, from the
+// executor's attributes (pctSettingsOf).
+type pctSettings struct {
+	// Storage holds the containers' root disks (lvmthin: its thin pool);
+	// TemplateStorage the images, as OCI archives.
+	Storage         string `json:"storage"`
+	TemplateStorage string `json:"template_storage"`
+	// Net is the container's net0 (empty: none).
+	Net string `json:"net,omitempty"`
+	// RootfsGiB is the root disk's size.
+	RootfsGiB int `json:"rootfs_gib"`
+}
+
+// pctSettingsOf reads an executor's pct settings from its attributes
+// (pct_storage, pct_template_storage, pct_net, pct_rootfs_gib), with
+// Proxmox's defaults.
+func pctSettingsOf(attrs map[string]string) (*pctSettings, error) {
+	s := &pctSettings{Storage: "local-lvm", TemplateStorage: "local", Net: "name=eth0,bridge=vmbr0,ip=dhcp", RootfsGiB: 8}
+	if v := attrs["pct_storage"]; v != "" {
+		s.Storage = v
+	}
+	if v := attrs["pct_template_storage"]; v != "" {
+		s.TemplateStorage = v
+	}
+	if v, ok := attrs["pct_net"]; ok {
+		s.Net = v
+	}
+	if v := attrs["pct_rootfs_gib"]; v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("pct_rootfs_gib %q is no positive number of GiB", v)
+		}
+		s.RootfsGiB = n
+	}
+	return s, nil
+}
+
+// linkLogs makes dir with hard links stdout and stderr to an attempt's logs,
+// so the container appends to the logs the executor ships.
+func linkLogs(dir string, logs [2]string) (string, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	for i, name := range []string{"stdout", "stderr"} {
+		link := filepath.Join(dir, name)
+		if fi, err := os.Stat(link); err == nil {
+			if li, lerr := os.Stat(logs[i]); lerr == nil && os.SameFile(fi, li) {
+				continue
+			}
+			_ = os.Remove(link)
+		}
+		if err := os.Link(logs[i], link); err != nil {
+			return "", fmt.Errorf("link the attempt's log: %w", err)
+		}
+	}
+	return dir, nil
+}
+
+// linkOrCopy hard-links src to dst, or copies it when they are on
+// different filesystems.
+func linkOrCopy(src, dst string) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fi.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // translatePaths rewrites the values of env that are a node path in paths,

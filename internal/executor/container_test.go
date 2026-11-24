@@ -73,7 +73,7 @@ func TestContainerLaunchesAreRefusedElsewhere(t *testing.T) {
 	ctr := NewLocal("ctr", nil, t.TempDir(), logger)
 	ctr.Kind = "incus"
 	launch.Image = ""
-	if _, err := ctr.containerCommand(launch); err == nil || !strings.Contains(err.Error(), "names no image") {
+	if _, err := ctr.containerCommand(launch, containerOptions{runArg: containerRunArg}); err == nil || !strings.Contains(err.Error(), "names no image") {
 		t.Fatalf("no image: %v", err)
 	}
 	if got := containerInstance("att_0123abcd"); got != "kairo-att-0123abcd" {

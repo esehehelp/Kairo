@@ -3,10 +3,13 @@
 package executor
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -103,9 +106,17 @@ func runConfineHelper(args []string) {
 // confineMounts makes this mount namespace read-only but for writable (see
 // above). Every directory named must exist.
 func confineMounts(writable []string, tmp string) error {
+	// /proc and /dev/shm stay writable. One that is its own mount already
+	// is not bound onto itself: an unprivileged Proxmox container refuses
+	// binding /proc (its profile), and needs no bind to change it alone.
+	var system []string
 	for _, p := range []string{"/dev/shm", "/proc"} {
 		if fi, err := os.Stat(p); err == nil && fi.IsDir() {
-			writable = append(writable, p)
+			if mounted, known, err := isMountPoint(p); err == nil && known && mounted {
+				system = append(system, p)
+			} else {
+				writable = append(writable, p)
+			}
 		}
 	}
 	// each its own mount, before /tmp is covered (a directory under /tmp is
@@ -123,13 +134,44 @@ func confineMounts(writable []string, tmp string) error {
 			writable = append(writable, "/tmp")
 		}
 	}
-	if err := unix.MountSetattr(unix.AT_FDCWD, "/", unix.AT_RECURSIVE, &unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY}); err != nil {
-		return fmt.Errorf("make / read-only: %w", err)
+	if err := readOnlyBut(append(writable, system...)); err != nil {
+		return err
 	}
-	for _, w := range writable {
-		if err := unix.MountSetattr(unix.AT_FDCWD, w, unix.AT_RECURSIVE, &unix.MountAttr{Attr_clr: unix.MOUNT_ATTR_RDONLY}); err != nil {
-			return fmt.Errorf("make %s writable: %w", w, err)
+	return nil
+}
+
+// readOnlyBut makes every mount of this namespace read-only, one by one,
+// but those at or under keep. A mount is not made read-only while a file on
+// it is open for writing (EBUSY): a terminal's (devpts) or a device node
+// mounted on its own (a container's /dev/console), which the process writes
+// its console to, is left as it is; any other refusal fails.
+func readOnlyBut(keep []string) error {
+	body, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return err
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		fields := strings.Fields(line)
+		sep := slices.Index(fields, "-")
+		if len(fields) < 5 || sep < 0 || sep+1 >= len(fields) {
+			continue
+		}
+		point, fstype := filepath.Clean(unescapeMountField(fields[4])), fields[sep+1]
+		if slices.ContainsFunc(keep, func(k string) bool { return point == k || strings.HasPrefix(point, strings.TrimSuffix(k, "/")+"/") }) {
+			continue
+		}
+		err := unix.MountSetattr(unix.AT_FDCWD, point, 0, &unix.MountAttr{Attr_set: unix.MOUNT_ATTR_RDONLY})
+		switch {
+		case err == nil, errors.Is(err, unix.ENOENT):
+		case errors.Is(err, unix.EBUSY) && (fstype == "devpts" || isCharDevice(point)):
+		default:
+			return fmt.Errorf("make %s read-only: %w", point, err)
 		}
 	}
 	return nil
+}
+
+func isCharDevice(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }

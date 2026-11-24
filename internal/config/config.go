@@ -305,6 +305,15 @@ type Executor struct {
 // of the attempt's image (executor/container.go), on Linux.
 const KindIncus = "incus"
 
+// KindPCT is an executor that runs every attempt in a Proxmox VE container
+// of the attempt's image, made for it and destroyed after it
+// (executor/container_pct_linux.go), by an agent on the Proxmox host.
+const KindPCT = "pct"
+
+// containerKinds are the kinds whose executors run containers: they set the
+// "runtime" attribute and run on Linux only.
+var containerKinds = map[string]bool{KindIncus: true, KindPCT: true}
+
 // Attributes are what the executor registers to be matched by executor
 // selectors: its labels, and "runtime" naming its container runtime when it
 // runs containers (store.ContainerRuntimeAttribute), which only its kind
@@ -315,8 +324,8 @@ func (e Executor) Attributes() (map[string]string, error) {
 	if _, ok := e.Labels["runtime"]; ok {
 		return nil, fmt.Errorf("executor %s: label runtime is set by its kind, not declared", e.ID)
 	}
-	if e.Kind == KindIncus {
-		out["runtime"] = KindIncus
+	if containerKinds[e.Kind] {
+		out["runtime"] = e.Kind
 	}
 	return out, nil
 }
@@ -331,8 +340,8 @@ func checkExecutors(executors []Executor) error {
 		if _, err := e.Attributes(); err != nil {
 			return err
 		}
-		if e.Kind == KindIncus && runtime.GOOS != "linux" {
-			return fmt.Errorf("executor %s: kind incus runs on Linux only", e.ID)
+		if containerKinds[e.Kind] && runtime.GOOS != "linux" {
+			return fmt.Errorf("executor %s: kind %s runs on Linux only", e.ID, e.Kind)
 		}
 		if e.Kind == "wsl2" || e.Labels["environment"] == "wsl2" {
 			return fmt.Errorf("executor %s: WSL executors are retired; remove it from the configuration", e.ID)
