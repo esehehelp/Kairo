@@ -167,7 +167,7 @@ func (b pctBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, err
 	if err != nil {
 		return nil, nil, err
 	}
-	cmd, err := b.e.containerCommand(launch, containerOptions{runArg: pctRunArg, logDir: true, pct: settings})
+	cmd, err := b.e.containerCommand(launch, containerOptions{runArg: pctRunArg, dirsOnly: true, pct: settings})
 	return cmd, nil, err
 }
 

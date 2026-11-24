@@ -392,32 +392,6 @@ func devName(soname string) string {
 	return ""
 }
 
-// linkOrCopy hard-links src to dst, or copies it when they are on
-// different filesystems.
-func linkOrCopy(src, dst string) error {
-	if err := os.Link(src, dst); err == nil {
-		return nil
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	fi, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fi.Mode().Perm())
-	if err != nil {
-		return err
-	}
-	if _, err = io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
-}
-
 // containerInit runs under Incus's init, the container's first process: it
 // confines the container, starts the attempt's argv in its own process
 // group, reaps whatever ends in the container and, once the argv has

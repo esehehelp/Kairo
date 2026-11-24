@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -120,14 +121,15 @@ func (e *Local) containerDir(attemptID string) string {
 }
 
 // containerOptions say how a backend's containers take what an attempt is
-// handed: runArg is the runner's argument; logDir mounts the attempt's logs
-// as a directory (/kairo/log) of hard links to them rather than file by file
-// (Proxmox mounts directories only); pct is what a Proxmox container is
-// made with.
+// handed: runArg is the runner's argument; dirsOnly mounts directories only
+// (Proxmox bind-mounts no single file): the binary as a directory
+// (/kairo/bin) holding a hard link to it (a copy across filesystems), the
+// logs as one (/kairo/log) of hard links to them; pct is what a Proxmox
+// container is made with.
 type containerOptions struct {
-	runArg string
-	logDir bool
-	pct    *pctSettings
+	runArg   string
+	dirsOnly bool
+	pct      *pctSettings
 }
 
 // containerCommand builds the launcher of an attempt in a container (the
@@ -170,9 +172,20 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		}
 		f.Close()
 	}
+	binMount := containerMount{Source: self, Path: containerRoot + "/bin/kairo", ReadOnly: true}
 	logMounts := []containerMount{{Source: logs[0], Path: containerStdout}, {Source: logs[1], Path: containerStderr}}
 	writableLogs := []string{containerStdout, containerStderr}
-	if opts.logDir {
+	if opts.dirsOnly {
+		binDir := filepath.Join(dir, "bin")
+		if err := os.MkdirAll(binDir, 0o755); err != nil {
+			return nil, err
+		}
+		if _, err := os.Stat(filepath.Join(binDir, "kairo")); err != nil {
+			if err := linkOrCopy(self, filepath.Join(binDir, "kairo")); err != nil {
+				return nil, fmt.Errorf("hand the binary to the container: %w", err)
+			}
+		}
+		binMount = containerMount{Source: binDir, Path: containerRoot + "/bin", ReadOnly: true}
 		logDir, err := linkLogs(filepath.Join(dir, "log"), logs)
 		if err != nil {
 			return nil, err
@@ -187,7 +200,7 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		RunDir:    runDir,
 		PCT:       opts.pct,
 		Mounts: append(append([]containerMount{
-			{Source: self, Path: containerRoot + "/bin/kairo", ReadOnly: true},
+			binMount,
 			{Source: runDir, Path: containerRoot + "/run"},
 		}, logMounts...),
 			containerMount{Source: scratch, Path: containerRoot + "/scratch"},
@@ -319,6 +332,32 @@ func linkLogs(dir string, logs [2]string) (string, error) {
 		}
 	}
 	return dir, nil
+}
+
+// linkOrCopy hard-links src to dst, or copies it when they are on
+// different filesystems.
+func linkOrCopy(src, dst string) error {
+	if err := os.Link(src, dst); err == nil {
+		return nil
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	fi, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, fi.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err = io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
 }
 
 // translatePaths rewrites the values of env that are a node path in paths,
