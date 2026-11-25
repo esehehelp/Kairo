@@ -1003,6 +1003,8 @@ profiles:
 EOF
 ```
 
+pve-firewall を有効にしているホストでは、**入れる前に** `/etc/sysctl.d/90-kairo-bridge-nf.conf` に `net.bridge.bridge-nf-call-iptables = 1` と `net.bridge.bridge-nf-call-ip6tables = 1` を書きます。`incus-base` は入れるとき（更新のたびにも）`sysctl.d` を再適用します。そのとき Proxmox の `10-pve.conf` によってブリッジのフィルタが一瞬 0 に戻り（pve-firewall は実行時に 1 にしているだけです）、conntrack の追跡が途切れます。その結果、`firewall=1` のゲストどうしで張られていた接続が INVALID として捨てられます（TCP の再送が尽きる約 15 分後まで止まります）。
+
 Incus は自分の lxcfs（`/var/lib/incus-lxcfs`）を使い、Proxmox の LXC とは別に動きます。Incus が thin pool に作るボリューム（`images_*`、`containers_*`）は、Proxmox の一覧には出ません。
 
 #### Proxmox コンテナ Executor（`kind = "pct"`）
