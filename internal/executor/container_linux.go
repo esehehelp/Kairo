@@ -62,9 +62,7 @@ func incusNotFound(err error) bool {
 }
 
 // incusRuntime runs attempts' containers with Incus (oci.go): a container
-// is an instance named by its instance name. What stops an attempt (a force
-// stop, a quarantine) reaches the container's processes directly, as it
-// reaches a host attempt's: they carry its KAIRO_ATTEMPT_ID.
+// is an instance named by its instance name.
 type incusRuntime struct{}
 
 func (incusRuntime) run(ctx context.Context, spec containerSpec, logf func(string, ...any), made func(string)) (string, int, error) {
