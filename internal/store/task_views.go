@@ -422,7 +422,7 @@ func (s *Store) taskOutputs(ctx context.Context, taskScopeID string) (map[string
 			FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL),'[]')
 		FROM orchestration_task_executions o
 		JOIN execution_requests e ON e.id=o.execution_id`+taskRunStartJoin+`
-		JOIN data_objects d ON d.kind='output' AND d.source_id=`+executionRunID+`
+		JOIN data_objects d ON d.kind='output' AND d.source_id=`+taskRunID+`
 		WHERE o.task_scope_id=$1 ORDER BY o.execution_id,d.created_at,d.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var executionID string
 		var output TaskOutput

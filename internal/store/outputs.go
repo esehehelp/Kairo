@@ -33,8 +33,9 @@ type RunOutput struct {
 }
 
 // A run starts at the latest execution that is not a continuation, or at
-// the execution itself for direct work. Gang ranks share the leader's run
-// but have separate output directories. Keep writes and lookups in step.
+// the execution itself for direct work. The ranks of a gang (when there were
+// gangs: their rows stay) shared the leader's run but had separate output
+// directories. Keep writes and lookups in step.
 const executionRunJoins = `
 	LEFT JOIN gang_members gm ON gm.execution_id=e.id
 	LEFT JOIN execution_gangs g ON g.id=gm.gang_id
@@ -48,6 +49,9 @@ const taskRunStartJoin = `
 	) run_start ON true`
 
 const executionRunID = `COALESCE(run_start.execution_id,g.leader_execution_id,e.id) || CASE WHEN gm.rank>0 THEN '-rank' || gm.rank::text ELSE '' END`
+
+// taskRunID is the run of a task's execution o (taskRunStartJoin).
+const taskRunID = `COALESCE(run_start.execution_id,e.id)`
 
 func runIDTx(ctx context.Context, q queryer, executionID string) (string, error) {
 	var runID string
