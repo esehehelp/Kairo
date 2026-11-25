@@ -23,7 +23,7 @@ func (s *Server) applyProject(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	if err := everyTaskInAnImage(validated.Manifest); err != nil {
+	if err := validated.Manifest.EveryTaskInAnImage(); err != nil {
 		writeError(w, err)
 		return
 	}
@@ -43,22 +43,6 @@ func (s *Server) applyProject(w http.ResponseWriter, r *http.Request) {
 		"created":     applied.Created,
 		"unchanged":   applied.Unchanged,
 	})
-}
-
-// everyTaskInAnImage refuses a declaration with a task that names no
-// image: every executor runs containers, so such a task would wait for an
-// executor forever.
-func everyTaskInAnImage(m orchestration.Manifest) error {
-	var bare []string
-	for _, t := range m.Tasks {
-		if t.Execution.Image == "" {
-			bare = append(bare, t.Name)
-		}
-	}
-	if len(bare) == 0 {
-		return nil
-	}
-	return fmt.Errorf("every task runs in a container, and task(s) %s name no image: give each an image (image = \"NAME\" with an [images.NAME], or [defaults.execution] image)", strings.Join(bare, ", "))
 }
 
 // getProject is a project's status. Optional filters, all of which must

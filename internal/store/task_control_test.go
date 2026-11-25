@@ -553,3 +553,34 @@ func TestTaskDetail(t *testing.T) {
 		t.Fatalf("unknown task: %v", err)
 	}
 }
+
+// A task declared with a gang before gangs were gone makes no execution
+// now: its rerun is refused, and the orchestration pass blocks it with the
+// reason instead of failing for every other task.
+func TestAnOldGangTaskIsBlockedNotThePass(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	if _, err := store.ApplyProject(ctx, projectSpec(t, orchestrationManifest())); err != nil {
+		t.Fatal(err)
+	}
+	// prepare was declared as a gang (before gangs were refused)
+	if _, err := store.testExec(`UPDATE orchestration_tasks SET execution_template_json=jsonb_set(execution_template_json::jsonb,'{gang}','{"size":2}')::text WHERE name='prepare'`); err != nil {
+		t.Fatal(err)
+	}
+	// a task of another project is planned in the same pass
+	other := strings.ReplaceAll(orchestrationManifest(), `name = "orchestrated"`, `name = "other"`)
+	if _, err := store.ApplyProject(ctx, projectSpec(t, other)); err != nil {
+		t.Fatal(err)
+	}
+	tasks := projectTasks(t, store, "orchestrated")
+	if tasks["prepare"].State != "blocked" || !strings.Contains(string(tasks["prepare"].Result), "gangs are no more") {
+		t.Fatalf("the gang task: %+v", tasks["prepare"])
+	}
+	if others := projectTasks(t, store, "other"); others["prepare"].State != "running" && others["prepare"].State != "pending" {
+		t.Fatalf("the other project's task: %+v", others["prepare"])
+	}
+	// blocked, it is declared again, not rerun
+	_, err := store.RerunTask(ctx, "orchestrated", "prepare", "tester", "rerun-gang")
+	taskConflictError(t, err, "gangs are no more")
+}

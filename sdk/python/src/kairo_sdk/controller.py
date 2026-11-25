@@ -758,6 +758,17 @@ def _normalize_submission_template(
         raise ValueError("submission template project does not match delegation")
     if not template.get("argv") or not template.get("cwd"):
         raise ValueError("submission template requires argv and cwd")
+    # every execution runs in a container: the daemon refuses one without a
+    # pinned image, or with a cwd that is no absolute path in it; refused
+    # here, before it is journaled
+    image = template.get("image")
+    if not isinstance(image, str) or "@sha256:" not in image:
+        raise ValueError(
+            "submission template requires image: a reference pinned to its digest "
+            "(registry/repository@sha256:...); every execution runs in a container"
+        )
+    if not str(template["cwd"]).startswith("/"):
+        raise ValueError("submission template cwd must be an absolute path in the image")
     template.pop("client_request_id", None)
     template.pop("input_continuation_ref", None)
     return template

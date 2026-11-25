@@ -650,3 +650,18 @@ func digest(body []byte) string {
 	sum := sha256.Sum256(body)
 	return hex.EncodeToString(sum[:])
 }
+
+// EveryTaskInAnImage refuses a declaration with a task that names no
+// image: every executor runs containers, so such a task would never run.
+func (m Manifest) EveryTaskInAnImage() error {
+	var bare []string
+	for _, t := range m.Tasks {
+		if t.Execution.Image == "" {
+			bare = append(bare, t.Name)
+		}
+	}
+	if len(bare) == 0 {
+		return nil
+	}
+	return fmt.Errorf("every task runs in a container, and task(s) %s name no image: give each an image (image = \"NAME\" with an [images.NAME], or [defaults.execution] image)", strings.Join(bare, ", "))
+}

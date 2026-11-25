@@ -19,9 +19,11 @@ type fakeRuntime struct {
 	ran     bool
 }
 
-func (f *fakeRuntime) run(_ context.Context, spec containerSpec, _ func(string, ...any), made func(string)) (string, int, error) {
+func (f *fakeRuntime) run(_ context.Context, spec containerSpec, _ func(string, ...any), starting func(string) bool) (string, int, error) {
 	f.ran = true
-	made("ctr-" + spec.Instance)
+	if !starting("ctr-" + spec.Instance) {
+		return "ctr-" + spec.Instance, exitStoppedBeforeStart, nil
+	}
 	writeShimExit(filepath.Join(spec.RunDir, "exit"), f.exit) // as the container's init does
 	code, _ := readExitFile(filepath.Join(spec.RunDir, "exit"))
 	return "ctr-" + spec.Instance, code, nil

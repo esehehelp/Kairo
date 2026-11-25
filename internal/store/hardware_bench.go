@@ -657,6 +657,8 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 	if err != nil {
 		return BenchPlan{}, orchestration.Validated{}, err
 	}
+	// the image it runs in, as its task's execution is given it when planned
+	execution.Image = pinned.Pinned()
 	return BenchPlan{Run: run, Execution: execution, DryRun: req.DryRun}, declaration, nil
 }
 
@@ -826,6 +828,16 @@ func planBenchRunTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchRun
 			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s other than %s serves transfers (an executor's pack_addr)", req.HostID, peer)
 		}
 		run.NodeID, run.PeerNodeID, run.Target = nodes[0], &peer, peer
+		// one at a time on a node: two would share its link, and each
+		// measure a part of it
+		var busy string
+		err = tx.QueryRowContext(ctx, `SELECT id FROM bench_runs WHERE class=$1 AND state IN('waiting','running') AND (node_id IN($2,$3) OR peer_node_id IN($2,$3)) LIMIT 1`, BenchNetwork, run.NodeID, peer).Scan(&busy)
+		if err == nil {
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("%w: network bench %s is live on node %s or %s (one at a time on a node: they would share its link)", ErrBenchConflict, busy, run.NodeID, peer)
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return BenchRun{}, orchestration.Execution{}, err
+		}
 		return run, execution, nil
 	}
 	_ = configs
@@ -1146,6 +1158,20 @@ func (s *Store) benchRunOf(ctx context.Context, a benchActor) (BenchRun, int, er
 	return run, 1, err
 }
 
+// benchStillTx: the run is still in one of states, read under the write
+// lock: a run that failed after its actor read it (its deadline passed,
+// ReconcileBenchRuns) stays failed, whatever a late write of its driver.
+func benchStillTx(ctx context.Context, tx *sql.Tx, id string, states ...string) error {
+	var state string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM bench_runs WHERE id=$1`, id).Scan(&state); err != nil {
+		return err
+	}
+	if !slices.Contains(states, state) {
+		return fmt.Errorf("%w: bench run %s is %s", ErrBenchConflict, id, state)
+	}
+	return nil
+}
+
 // startBenchRun marks the run the actor carries out running and records what
 // its driver found (event hardware_bench_started, or hardware_bench_resumed
 // for a run that ran before). Starting again (a driver that retried, or
@@ -1175,6 +1201,9 @@ func (s *Store) startBenchRun(ctx context.Context, a benchActor, start BenchStar
 		return err
 	}
 	defer tx.Rollback()
+	if err = benchStillTx(ctx, tx, run.ID, BenchWaiting, BenchRunning); err != nil {
+		return err
+	}
 	t := now()
 	if _, err = tx.ExecContext(ctx, `UPDATE bench_runs SET state='running',started_at=COALESCE(started_at,$1),driver_build=$2,versions_json=$3,driver_version=COALESCE($4,driver_version),
 		device_json=COALESCE($5,device_json),idle_temperature_c=COALESCE(idle_temperature_c,$6) WHERE id=$7`,
@@ -1212,6 +1241,9 @@ func (s *Store) recordBenchKind(ctx context.Context, a benchActor, kind string, 
 		return err
 	}
 	defer tx.Rollback()
+	if err = benchStillTx(ctx, tx, run.ID, BenchWaiting, BenchRunning); err != nil {
+		return err
+	}
 	references, err := benchReferencesTx(ctx, tx, run.ID)
 	if err != nil {
 		return err
@@ -1260,6 +1292,9 @@ func (s *Store) addBenchPoints(ctx context.Context, a benchActor, points []Bench
 		return err
 	}
 	defer tx.Rollback()
+	if err = benchStillTx(ctx, tx, run.ID, BenchRunning); err != nil {
+		return err
+	}
 	for _, p := range points {
 		if !slices.Contains(run.Kinds, p.Kind) {
 			return fmt.Errorf("point %d: %q is not a kind of run %s", p.Seq, p.Kind, run.ID)
@@ -1342,6 +1377,9 @@ func (s *Store) finishBenchRun(ctx context.Context, a benchActor, leaseID string
 		return err
 	}
 	defer tx.Rollback()
+	if err = benchStillTx(ctx, tx, run.ID, BenchRunning); err != nil {
+		return err
+	}
 	merged, err := benchReferencesTx(ctx, tx, run.ID)
 	if err != nil {
 		return err

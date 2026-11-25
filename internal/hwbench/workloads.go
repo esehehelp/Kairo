@@ -76,7 +76,10 @@ func argv(kind string, status store.BenchStatus, programs store.NodeBench, disk,
 		}
 		out = append(out, "--path", disk)
 	case store.BenchNetwork:
-		out = append(out, "--pack-peer", peer, "--pack-run", status.Run.ID, "--pack-ca", packCA)
+		out = append(out, "--pack-peer", peer, "--pack-run", status.Run.ID)
+		if packCA != "" {
+			out = append(out, "--pack-ca", packCA)
+		}
 	}
 	return out, nil
 }

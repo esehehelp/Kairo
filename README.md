@@ -971,7 +971,7 @@ labels = { environment = "linux", site = "host-a" }
 
 - **Incus 6.3 以降**: OCI イメージ対応が必要です（Debian 13 の 6.0 LTS には対応がなく、Zabbly パッケージを利用する必要があります）。また、デフォルトプロファイルにストレージプールとネットワークが設定されている必要があります。
 - **GPU 利用時**: ノード上に `nvidia-container-cli`（`libnvidia-container-tools`）とドライバのユーザー空間ファイルが必要です。
-- **コンテナの権限**: ホスト上では、コンテナは非特権です。コンテナの root は、root の `/etc/subuid` の範囲の先頭の ID（既定は 100000。Proxmox のコンテナと同じ）です。コンテナが書き込む領域は、起動の前に、その ID の所有にします。そのため、以前のコンテナが書いたものも書き直せます。読み取り専用で渡すもの（データ、Kairo のバイナリ、GPU のドライバ）は、所有者を変えずに渡します。エージェント自身が非特権の LXC の中で動いているとき（入れ子）は、LXC には UID マップが 1 つしかないため、コンテナを特権にします（`security.privileged`。物理ホストから見れば非特権のままです）。
+- **コンテナの権限**: ホスト上では、コンテナは非特権です。コンテナの root は、root の `/etc/subuid` の範囲の先頭の ID（既定は 100000。Proxmox のコンテナと同じ）です。コンテナが書き込む領域は、起動の前に、コンテナの ID の範囲（root から 65536 個。uid と gid はそれぞれのマップから読みます）の外の ID が持つもの（ホストやエージェントが書いたもの）だけを、コンテナの root の所有にします。範囲の中の ID が持つもの（attempt が切り替えた利用者が書いたもの）はそのままにするので、同じキャッシュを使う別の attempt が走っていても、その持ち物は変わりません。たどるときはディレクトリを記述子で開き、リンクは一切たどりません（走っているコンテナがリンクを置いても、領域の外には及びません）。読み取り専用で渡すもの（データ、Kairo のバイナリ、GPU のドライバ）は、所有者を変えずに渡します。エージェント自身が非特権の LXC の中で動いているとき（入れ子）は、LXC には UID マップが 1 つしかないため、コンテナを特権にします（`security.privileged`。物理ホストから見れば非特権のままです）。
 - **AppArmor（Proxmox のホスト）**: Incus が作る AppArmor のプロファイルは ABI を宣言しません。Debian の既定の ABI のままだと、Proxmox のカーネル（7.0）はコンテナの中での UNIX ソケットの作成を拒否します（`failed protocol match`）。`/etc/apparmor/parser.conf` の `policy-features` を、Proxmox の LXC が使う `/etc/apparmor.d/abi/lxc` にします。
 
 Proxmox VE のホストに直接入れる場合の手順です（Debian 13）。VM のための依存を入れないよう、コンテナだけの `incus-base` を使います。
@@ -1968,7 +1968,9 @@ Execution の argv は、コンテナの中の Kairo のバイナリで動くド
 1. デーモンは run を作り、トークンを 1 つ発行します（`bench_runs.net_token`）。
 2. `NODE` の agent は 15 秒ごとに自分が測る run を尋ね（エージェント API の `net-benches`）、見つけた run ごとにドライバ（`hwbench.Driver`。Task のベンチマークと同じもの）を自分の中で動かします。ワークロードは agent 自身のバイナリ（`kairo bench run net-* --pack-peer ADDR --pack-run RUN --pack-ca CA`、トークンは環境変数 `KAIRO_BENCH_NET_TOKEN`）で、結果はエージェント API で報告します。
 3. 測られる側の agent は、転送の口（7475、TLS、HTTP/1.1）の `/bench/net/<run>` で接続を受け、トークンをデーモンに確かめてから（`net-bench-authorize`）、接続をベンチマークの対向（`kairo bench serve` と同じ処理）に切り替えます（`Upgrade: kairo-bench`）。測った値には TLS の分が含まれます。転送が実際に通る経路の値だからです。
-4. 作ってから 2 時間で終わらない run は失敗にします（測る側の agent がいない場合など）。
+4. 作ってから 2 時間で終わらない run は失敗にします（測る側の agent がいない場合など）。失敗にしたあとで測る側の agent が書き込んでも、run は失敗のままです。
+5. ノード 1 つにつき、生きている network ベンチは 1 本だけです（2 本が同じリンクを分け合って測ると、どちらの値も正しくないため）。測られる側の転送の口は、ベンチの接続を同時に 16 本まで受けます。
+6. `observe_only` の agent は、測ることも測られることもしません。`ca_file` を書いていない agent は、転送と同じく、システムの信頼するルートで相手の証明書を確かめます。
 
 #### ドライバの実行手順
 

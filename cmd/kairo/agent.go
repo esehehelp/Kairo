@@ -176,7 +176,7 @@ func agentCommand(args []string) error {
 		if err != nil {
 			return fmt.Errorf("packs certificate: %w", err)
 		}
-		server := executor.PackHTTPServer(cfg.Packs.Listen, cert, &executor.PackServer{Store: client, NodeID: cfg.Node.ID, Executors: running, Logger: logger})
+		server := executor.PackHTTPServer(cfg.Packs.Listen, cert, &executor.PackServer{Store: client, NodeID: cfg.Node.ID, Executors: running, Logger: logger, NoBench: cfg.ObserveOnly})
 		go func() {
 			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("pack server: %w", err)
@@ -191,8 +191,9 @@ func agentCommand(args []string) error {
 		logger.Info("pack server listening", "listen", cfg.Packs.Listen, "addr", cfg.Packs.Addr)
 	}
 	// network benches this node measures, against other nodes' transfer
-	// endpoints (whose certificates chain to the daemon's CA)
-	if cfg.CAFile != "" {
+	// endpoints (trusted as transfers trust them: the CA file, or the
+	// system's roots); an observe-only agent runs none
+	if !cfg.ObserveOnly {
 		go runNetBenches(ctx, client, cfg.Node.ID, cfg.CAFile, logger)
 	}
 	select {

@@ -3,6 +3,7 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -55,6 +56,12 @@ func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		// every executor runs containers: one without an image would wait
 		// for an executor forever
 		writeError(w, errors.New("every execution runs in a container: image (an image reference pinned to its digest, registry/repository@sha256:...) is required"))
+		return
+	}
+	if cwd := strings.TrimSpace(body.CWD); cwd != "" && !strings.HasPrefix(cwd, "/") {
+		// a direct execution runs in no source snapshot: its cwd is a path
+		// in the image
+		writeError(w, fmt.Errorf("cwd %q is no absolute path in the image (a direct execution runs in no source snapshot)", cwd))
 		return
 	}
 	if body.Executor.Labels == nil {

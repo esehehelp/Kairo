@@ -315,13 +315,13 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if err := planTaskExecution(ctx, tx, task, *task.rerunOrdinal, "rerun", trigger, continuation); err != nil {
+			if err := planOrBlock(ctx, tx, task, *task.rerunOrdinal, "rerun", trigger, continuation); err != nil {
 				return err
 			}
 			continue
 		}
 		if err != nil {
-			if err := planTaskExecution(ctx, tx, task, 0, "initial", map[string]any{"dependencies_succeeded": true}, nil); err != nil {
+			if err := planOrBlock(ctx, tx, task, 0, "initial", map[string]any{"dependencies_succeeded": true}, nil); err != nil {
 				return err
 			}
 			continue
@@ -384,7 +384,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 				}
 				if found {
 					trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "attempt_lost", "command_id": checkpoint.commandID, "continuation_ref": checkpoint.ref, "node": checkpoint.node}
-					if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "loss_continuation", trigger, &checkpoint.ref); err != nil {
+					if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "loss_continuation", trigger, &checkpoint.ref); err != nil {
 						return err
 					}
 					continue
@@ -414,7 +414,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		}
 		if terminated && !succeeded {
 			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "node_quarantine"}
-			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, nil); err != nil {
+			if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, nil); err != nil {
 				return err
 			}
 			continue
@@ -425,7 +425,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		}
 		if err == nil && commandState == "checkpointed" && current.ContinuationRef != nil {
 			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "command_id": commandID, "origin": commandOrigin, "continuation_ref": *current.ContinuationRef}
-			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "continuation", trigger, current.ContinuationRef); err != nil {
+			if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "continuation", trigger, current.ContinuationRef); err != nil {
 				return err
 			}
 			continue
@@ -601,10 +601,31 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	return plannedOrchestrationDecision{DecisionKey: decisionKey, TaskScopeID: task.taskScopeID, Ordinal: ordinal, Reason: reason, Spec: spec}, err
 }
 
+// unrunnableTask: a task's declaration makes no execution Kairo runs now
+// (a gang, declared before gangs were gone). The orchestration pass blocks
+// such a task with the reason; a rerun of it is refused.
+type unrunnableTask struct{ reason string }
+
+func (e unrunnableTask) Error() string { return e.reason }
+
+const gangsAreNoMore = "the task declares a gang: gangs are no more (every execution runs as one container); declare it again without one"
+
+// planOrBlock plans the task's next execution (planTaskExecution); a task
+// whose declaration makes none Kairo runs now is blocked with the reason,
+// so that it does not fail the pass that plans every other task.
+func planOrBlock(ctx context.Context, tx *sql.Tx, task orchestrationTaskRow, ordinal int, reason string, trigger map[string]any, continuation *string) error {
+	err := planTaskExecution(ctx, tx, task, ordinal, reason, trigger, continuation)
+	var u unrunnableTask
+	if errors.As(err, &u) {
+		return updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": u.reason})
+	}
+	return err
+}
+
 // taskExecutionSpec is the execution a task's template declares.
 func taskExecutionSpec(scope ScopePath, template orchestration.Execution, clientRequestID string, continuation *string) (ExecutionSpec, error) {
 	if template.Gang != nil {
-		return ExecutionSpec{}, errors.New("the task declares a gang: gangs are no more (every execution runs as one container)")
+		return ExecutionSpec{}, unrunnableTask{gangsAreNoMore}
 	}
 	executor, err := json.Marshal(template.Executor)
 	if err != nil {

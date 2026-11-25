@@ -647,9 +647,13 @@ type PackServer struct {
 	NodeID    string
 	Executors []*Local
 	Logger    *slog.Logger
+	// NoBench refuses network benches (an observe-only agent runs no work
+	// and serves none).
+	NoBench bool
 
-	mu     sync.Mutex
-	warned map[string]time.Time
+	mu         sync.Mutex
+	warned     map[string]time.Time
+	benchConns int
 }
 
 // warn logs a refusal at most once a minute per object.
@@ -676,6 +680,9 @@ func (p *PackServer) warn(objectID, message string, args ...any) {
 // measurement is minutes).
 const benchNetConnLimit = 30 * time.Minute
 
+// benchNetMaxConns bounds the network bench connections served at once.
+const benchNetMaxConns = 16
+
 // serveBenchNet hands a network bench's connection to the bench's server
 // (bench.ServeConn), once the daemon says its token is that of a live
 // network bench measuring this node (store.AuthorizeBenchNet): the bench
@@ -686,11 +693,31 @@ func (p *PackServer) serveBenchNet(w http.ResponseWriter, r *http.Request, runID
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	if p.NoBench {
+		http.Error(w, "this node serves no network bench (observe-only)", http.StatusServiceUnavailable)
+		return
+	}
 	if err := p.Store.AuthorizeBenchNet(r.Context(), p.NodeID, runID, token); err != nil {
 		p.warn(runID, "network bench refused", "remote", r.RemoteAddr, "error", err)
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
+	// as many connections as kairo bench serve takes
+	p.mu.Lock()
+	full := p.benchConns >= benchNetMaxConns
+	if !full {
+		p.benchConns++
+	}
+	p.mu.Unlock()
+	if full {
+		http.Error(w, "too many network bench connections", http.StatusServiceUnavailable)
+		return
+	}
+	defer func() {
+		p.mu.Lock()
+		p.benchConns--
+		p.mu.Unlock()
+	}()
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "the connection cannot be handed over", http.StatusHTTPVersionNotSupported)

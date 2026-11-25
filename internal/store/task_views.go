@@ -415,15 +415,19 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 	return detail, nil
 }
 
+// taskOutputs are the outputs of a task's executions; each rank of an old
+// gang (its rows stay) had its own.
 func (s *Store) taskOutputs(ctx context.Context, taskScopeID string) (map[string][]TaskOutput, error) {
 	out := map[string][]TaskOutput{}
 	err := eachRow(ctx, s.db, `SELECT o.execution_id,e.id,d.id,d.state,d.lifecycle,
 		COALESCE((SELECT json_agg(json_build_object('store_id',c.store_id,'path',c.path) ORDER BY c.store_id)
 			FROM object_copies c WHERE c.object_id=d.id AND c.state='verified' AND c.check_problem IS NULL),'[]')
 		FROM orchestration_task_executions o
-		JOIN execution_requests e ON e.id=o.execution_id`+taskRunStartJoin+`
-		JOIN data_objects d ON d.kind='output' AND d.source_id=`+taskRunID+`
-		WHERE o.task_scope_id=$1 ORDER BY o.execution_id,d.created_at,d.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		LEFT JOIN execution_gangs g ON g.leader_execution_id=o.execution_id
+		LEFT JOIN gang_members gm ON gm.gang_id=g.id
+		JOIN execution_requests e ON e.id=COALESCE(gm.execution_id,o.execution_id)`+taskRunStartJoin+`
+		JOIN data_objects d ON d.kind='output' AND d.source_id=`+executionRunID+`
+		WHERE o.task_scope_id=$1 ORDER BY o.execution_id,COALESCE(gm.rank,0),d.created_at,d.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var executionID string
 		var output TaskOutput
 		var locations []byte

@@ -145,7 +145,7 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 		case "pack-run":
 			fs.StringVar(&c.PackRun, name, c.PackRun, "with --pack-peer: the network bench run")
 		case "pack-ca":
-			fs.StringVar(&c.PackCA, name, c.PackCA, "with --pack-peer: the CA (PEM) the endpoint's certificate chains to")
+			fs.StringVar(&c.PackCA, name, c.PackCA, "with --pack-peer: the CA (PEM) the endpoint's certificate chains to (none: the system's roots)")
 		case "streams":
 			fs.IntVar(&c.Streams, name, c.Streams, "TCP connections: 1 or 4")
 		case "dir":
@@ -192,8 +192,8 @@ func (c *Config) Validate() error {
 	case "net-latency", "net-bandwidth":
 		switch {
 		case c.PackPeer != "":
-			if _, _, err := net.SplitHostPort(c.PackPeer); err != nil || c.PackRun == "" || c.PackCA == "" {
-				return errors.New("--pack-peer HOST:PORT takes --pack-run and --pack-ca")
+			if _, _, err := net.SplitHostPort(c.PackPeer); err != nil || c.PackRun == "" {
+				return errors.New("--pack-peer HOST:PORT takes --pack-run (and --pack-ca, or the system's roots are trusted)")
 			}
 		default:
 			if _, _, err := net.SplitHostPort(c.Peer); c.Peer == "" || err != nil {
