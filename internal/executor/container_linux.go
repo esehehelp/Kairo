@@ -523,6 +523,7 @@ func containerInit(specPath string) int {
 		fmt.Fprintln(stderr, "kairo container:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
+	defer endTheRest()
 	defer stopLoaders(loaders)
 	cmd := &exec.Cmd{Path: argv0, Args: spec.Argv, Dir: spec.CWD, Env: env, Stdout: stdout, Stderr: stderr,
 		SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
@@ -550,6 +551,54 @@ func containerInit(specPath string) int {
 		fmt.Fprintf(stderr, "kairo container: %s ended by signal %d (%v)\n", spec.Argv[0], int(sig), sig)
 	}
 	return writeShimExit(containerExitIn, exit)
+}
+
+// containerRestGrace is how long what the argv left running in the
+// container has between SIGTERM and SIGKILL once the argv has exited.
+const containerRestGrace = 10 * time.Second
+
+// endTheRest ends what the argv left running in the container (a daemon it
+// started), when this init is not the container's first process (Incus's
+// own init is): the container stops only once nothing is left, as it does
+// when its first process exits (pct), which ends the rest at once. SIGTERM
+// first, SIGKILL after containerRestGrace.
+func endTheRest() {
+	if os.Getpid() == 1 {
+		return
+	}
+	_ = syscall.Kill(-1, syscall.SIGTERM)
+	for deadline := time.Now().Add(containerRestGrace); time.Now().Before(deadline) && othersLeft(); {
+		for {
+			if pid, _ := syscall.Wait4(-1, nil, syscall.WNOHANG, nil); pid <= 0 {
+				break
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = syscall.Kill(-1, syscall.SIGKILL)
+}
+
+// othersLeft: a process other than the container's first and this one runs.
+func othersLeft() bool {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return false
+	}
+	me := os.Getpid()
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || pid == 1 || pid == me {
+			continue
+		}
+		if b, err := os.ReadFile("/proc/" + e.Name() + "/stat"); err == nil {
+			// a zombie is gone but for its parent's wait
+			if i := bytes.LastIndexByte(b, ')'); i > 0 && i+2 < len(b) && b[i+2] == 'Z' {
+				continue
+			}
+			return true
+		}
+	}
+	return false
 }
 
 // loaderReady bounds how long the init waits for a loader's socket.
