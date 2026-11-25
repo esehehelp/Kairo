@@ -541,17 +541,21 @@ func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File,
 	if found {
 		canonical.Name = declared.Name
 		if info, err := os.Stat(filepath.Join(c.dir, canonical.SHA256)); err == nil && info.Mode().IsRegular() && info.Size() == canonical.Size {
-			if err := c.placed(ctx, canonical); err != nil && !errors.Is(err, store.ErrRawEvicting) {
-				return loader.File{}, false, err
-			}
-			return canonical, true, nil
+			return c.handing(ctx, canonical)
 		}
-	} else if identity, ok := c.keptAsPublished(declared); ok {
-		// kept already under another URL: its bytes are what was published
-		if err := c.placed(ctx, identity); err != nil && !errors.Is(err, store.ErrRawEvicting) {
+	} else {
+		identity, ok, err := c.keptAsPublished(declared)
+		if err != nil {
 			return loader.File{}, false, err
 		}
-		return identity, true, nil
+		if ok {
+			// kept already under another URL: its bytes are what was
+			// published; its identity recorded for this URL too
+			if err := c.identified(ctx, identity); err != nil {
+				return loader.File{}, false, err
+			}
+			return c.handing(ctx, identity)
+		}
 	}
 	size := declared.Size
 	if found {
@@ -572,63 +576,100 @@ func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File,
 	if err != nil {
 		return loader.File{}, false, err
 	}
-	// installed, then placed: a crash between leaves a file the daemon does
-	// not know (made again over it), never a placement without its file;
-	// one there already (fetched for another URL, checked then) stays
-	installed := filepath.Join(c.dir, identity.SHA256)
-	err = os.Link(partial, installed)
-	os.Remove(partial)
-	fresh := err == nil
-	if err != nil && !errors.Is(err, os.ErrExist) {
+	// its identity first, then the file installed, then placed: a crash
+	// between leaves the file found again by its URL, never a placement
+	// without its file
+	if !found {
+		if err := c.identified(ctx, identity); err != nil {
+			os.Remove(partial)
+			return loader.File{}, false, err
+		}
+	}
+	if err := installRaw(partial, filepath.Join(c.dir, identity.SHA256), identity.Size); err != nil {
 		return loader.File{}, false, err
 	}
-	if err := c.placed(ctx, identity); err != nil {
-		if fresh {
-			removeUnheld(installed)
-		}
-		if !errors.Is(err, store.ErrRawEvicting) {
-			return loader.File{}, false, err
-		}
-		// being evicted as it was made: read from upstream, its identity kept
-		if err := c.retryDaemon(ctx, func() error { return c.w.Store.RawPlaced(ctx, c.w.ID, "", "", identity) }); err != nil {
-			return loader.File{}, false, err
-		}
-		return identity, false, nil
-	}
 	c.w.Logger.Info("raw file kept", "url", identity.URL, "sha256", identity.SHA256, "bytes", identity.Size, "store_id", c.storeID)
+	return c.handing(ctx, identity)
+}
+
+// identified records identity as what its URL was found to be.
+func (c *rawCache) identified(ctx context.Context, identity loader.File) error {
+	return c.retryDaemon(ctx, func() error { return c.w.Store.RawPlaced(ctx, c.w.ID, "", "", identity) })
+}
+
+// handing is a kept file about to be handed to its waiters: not evicted
+// for a while (rawHandGrace; the links to their views then hold it), and
+// placed (used now). A placement being evicted is handed all the same: the
+// eviction finds it held and leaves it.
+func (c *rawCache) handing(ctx context.Context, identity loader.File) (loader.File, bool, error) {
+	holdRaw(filepath.Join(c.dir, identity.SHA256))
+	if err := c.placed(ctx, identity); err != nil && !errors.Is(err, store.ErrRawEvicting) {
+		return loader.File{}, false, err
+	}
 	return identity, true, nil
 }
 
-// removeUnheld removes a raw file no view holds.
-func removeUnheld(path string) {
+// rawHandGrace is how long a raw file about to be handed is not evicted.
+const rawHandGrace = time.Minute
+
+// rawHeld are the raw files about to be handed, and since when (under
+// rawLinks).
+var rawHeld = map[string]time.Time{}
+
+func holdRaw(path string) {
 	rawLinks.Lock()
 	defer rawLinks.Unlock()
-	if links, err := linkCount(path); err == nil && links == 1 {
-		os.Remove(path)
+	now := time.Now()
+	for p, t := range rawHeld {
+		if now.Sub(t) > rawHandGrace {
+			delete(rawHeld, p)
+		}
 	}
+	rawHeld[path] = now
+}
+
+// installRaw puts a checked partial at installed: linked when nothing is
+// there; a file there already of its size stays (fetched for another URL,
+// checked then), one of another size (damaged) is replaced.
+func installRaw(partial, installed string, size int64) error {
+	defer os.Remove(partial)
+	rawLinks.Lock()
+	defer rawLinks.Unlock()
+	err := os.Link(partial, installed)
+	if errors.Is(err, os.ErrExist) {
+		if info, serr := os.Stat(installed); serr == nil && info.Mode().IsRegular() && info.Size() == size {
+			return nil
+		}
+		return os.Rename(partial, installed)
+	}
+	return err
 }
 
 // keptAsPublished is the identity of a file kept here under the sha256 the
 // declaration published (fetched for another URL), checked by reading it
 // whole; ok false when there is none, or it is not that.
-func (c *rawCache) keptAsPublished(declared loader.File) (loader.File, bool) {
+func (c *rawCache) keptAsPublished(declared loader.File) (loader.File, bool, error) {
 	if !sha256Name.MatchString(declared.PublishedSHA256) {
-		return loader.File{}, false
+		return loader.File{}, false, nil
 	}
 	f, err := os.Open(filepath.Join(c.dir, declared.PublishedSHA256))
 	if err != nil {
-		return loader.File{}, false
+		return loader.File{}, false, nil
 	}
 	defer f.Close()
 	id := newIdentifier(loader.DefaultChunkBytes)
 	if _, err := io.Copy(id, f); err != nil {
-		return loader.File{}, false
+		return loader.File{}, false, nil
 	}
 	identity := id.file(declared.Name, declared.URL)
-	if identity.SHA256 != declared.PublishedSHA256 || sameAsDeclared(identity, declared) != nil {
-		return loader.File{}, false
+	if identity.SHA256 != declared.PublishedSHA256 {
+		return loader.File{}, false, nil // damaged: fetched again
 	}
-	return identity, true
+	// the published sha256's bytes, not what else was published (its size)
+	if err := sameAsDeclared(identity, declared); err != nil {
+		return loader.File{}, false, err
+	}
+	return identity, true, nil
 }
 
 // notKept is a file not kept for want of room: identified (once) when it
@@ -932,6 +973,9 @@ func removeRaw(root, sha string) error {
 	}
 	rawLinks.Lock()
 	defer rawLinks.Unlock()
+	if t, ok := rawHeld[filepath.Join(root, rawDirName, sha)]; ok && time.Since(t) < rawHandGrace {
+		return fmt.Errorf("%w: raw file %s is about to be handed to an attempt", errEvictInUse, sha)
+	}
 	// held by attempts' views: removing its name frees nothing
 	if links, err := linkCount(filepath.Join(root, rawDirName, sha)); err == nil && links > 1 {
 		return fmt.Errorf("%w: raw file %s is held by %d attempts", errEvictInUse, sha, links-1)

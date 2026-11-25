@@ -466,7 +466,7 @@ func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (_ io.Re
 	}
 	client := h.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = defaultHTTP
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -489,17 +489,26 @@ func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (_ io.Re
 			resp.Body.Close()
 			return nil, fmt.Errorf("%w: %s has %d bytes, identified as %d", errLength, f.URL, resp.ContentLength, f.Size)
 		}
-		if _, err := io.CopyN(io.Discard, resp.Body, offset); err != nil { // no ranges there
-			resp.Body.Close()
+		body := newIdleBody(resp.Body, idle, cancel)
+		if _, err := io.CopyN(io.Discard, body, offset); err != nil { // no ranges there
+			body.Close()
 			return nil, err
 		}
-		return newIdleBody(resp.Body, idle, cancel), nil
+		return body, nil
 	}
 	resp.Body.Close()
 	return nil, fmt.Errorf("%s: %s", f.URL, resp.Status)
 }
 
 func (h HTTPOrigin) String() string { return "upstream" }
+
+// defaultHTTP is the client of an HTTPOrigin without one: an answer's
+// headers waited for 2 minutes at most.
+var defaultHTTP = func() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = 2 * time.Minute
+	return &http.Client{Transport: t}
+}()
 
 // idleBody is a response body given up (its request canceled) when a read
 // of it waits idle for a byte.

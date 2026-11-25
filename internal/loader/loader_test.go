@@ -734,3 +734,61 @@ func TestPositionsBehindTheStartOrPastTheEndAreRefused(t *testing.T) {
 		t.Fatalf("past the end at 39 of 38: %v", err)
 	}
 }
+
+// A rank taken before comes back only with its position; a rank away does
+// not hold the others up: its items are made again when it comes back.
+func TestARankAwayHoldsNoOneUp(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Sources = spec.Sources[:1]
+	spec.Epochs = 300 // 38 records each: 5700 per rank, past a rank's queue
+	want := collect(t, spec, dir, 2, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}, World: 2}).Serve(ctx, ln)
+	takeAll := func(c *Client) []string {
+		var got []string
+		for {
+			item, err := c.Next()
+			if err == io.EOF {
+				return got
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, fmt.Sprintf("%d.%d:%s", c.Position.Record, c.Position.Sub, item))
+		}
+	}
+	c0, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := c0.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resume := c0.Resume()
+	c0.Close()
+	// taken before: not without its position
+	if _, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 2, nil); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("rank 0 again without its position: %v", err)
+	}
+	c0, err = Dial(ctx, "tcp", ln.Addr().String(), 0, 2, resume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got0 := append([]string{fmt.Sprintf("%d.%d:%s", resume.Position.Record, resume.Position.Sub, first)}, takeAll(c0)...) // rank 1 never came
+	c0.Close()
+	c1, err := Dial(ctx, "tcp", ln.Addr().String(), 1, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got1 := takeAll(c1)
+	c1.Close()
+	if !reflect.DeepEqual(got0, want[0]) || !reflect.DeepEqual(got1, want[1]) {
+		t.Fatalf("rank 0 %d items (want %d), rank 1 %d (want %d)", len(got0), len(want[0]), len(got1), len(want[1]))
+	}
+}

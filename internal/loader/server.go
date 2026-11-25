@@ -240,6 +240,11 @@ func (s *Server) join(hello Hello) (int, error) {
 	if hello.Rank < 0 || hello.Rank >= world {
 		return 0, fmt.Errorf("no rank %d of %d", hello.Rank, world)
 	}
+	if hello.Position == nil && s.Loader.joinedBefore(hello.Rank) {
+		// what was handed ahead to the process before may not have been
+		// taken: only its position says where it stands
+		return 0, fmt.Errorf("rank %d was taken before: it comes back with its position and session (one stream per rank, kept open)", hello.Rank)
+	}
 	// a taker coming back right after its connection broke may find the old
 	// one not noticed gone yet: it is given a while to go
 	for deadline := time.Now().Add(rankReleaseWait); s.taken[hello.Rank]; {
@@ -266,6 +271,7 @@ func (s *Server) join(hello Hello) (int, error) {
 			return 0, err
 		}
 	}
+	s.Loader.attach(s.ctx, hello.Rank)
 	return hello.Rank, nil
 }
 
@@ -280,6 +286,7 @@ func (s *Server) leave(rank int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.taken, rank)
+	s.Loader.detach(rank)
 }
 
 func readFrame(r *bufio.Reader) (byte, []byte, error) {

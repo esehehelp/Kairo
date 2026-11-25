@@ -407,6 +407,9 @@ func (s *Store) RawPlaced(ctx context.Context, executorID, storeID, root string,
 		return err
 	}
 	if state == "evicting" {
+		if err := tx.Commit(); err != nil { // the identity stands
+			return err
+		}
 		return fmt.Errorf("%w: %s on %s", ErrRawEvicting, f.SHA256, storeID)
 	}
 	t := now()

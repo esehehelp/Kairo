@@ -32,6 +32,8 @@ type fakeRaws struct {
 	placed     []string // store id (empty: identity only) and sha256
 	counts     map[string]int64
 	refuse     error
+	// refusePlacement refuses placements on a store (identities pass)
+	refusePlacement error
 }
 
 func (f *fakeRaws) RawIdentity(_ context.Context, _, url string) (loader.File, bool, error) {
@@ -46,6 +48,9 @@ func (f *fakeRaws) RawPlaced(_ context.Context, _, storeID, _ string, file loade
 	defer f.mu.Unlock()
 	if f.refuse != nil {
 		return f.refuse
+	}
+	if storeID != "" && f.refusePlacement != nil {
+		return f.refusePlacement
 	}
 	if kept, ok := f.identities[file.URL]; ok && kept.SHA256 != file.SHA256 {
 		return fmt.Errorf("%w: another identity", store.ErrRawChanged)
@@ -122,7 +127,7 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 	if linked, err := os.ReadFile(filepath.Join(view1, sha)); err != nil || !bytes.Equal(linked, content) {
 		t.Fatalf("in the attempt's view: %v", err)
 	}
-	if strings.Join(fake.placed, ",") != "v/"+sha || gets.Load() != 1 {
+	if strings.Join(fake.placed, ",") != "/"+sha+",v/"+sha || gets.Load() != 1 { // its identity, then the file
 		t.Fatalf("placed %v after %d fetches", fake.placed, gets.Load())
 	}
 	deadline := time.Now().Add(10 * time.Second)
@@ -195,10 +200,8 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 	// a file views hold is not evicted (its name gone would free nothing);
 	// one no view holds is
 	held := filepath.Join(root, rawDirName, sha)
-	if links, _ := linkCount(held); links > 1 {
-		if err := removeRaw(root, sha); !errors.Is(err, errEvictInUse) {
-			t.Fatalf("evicting a held file: %v", err)
-		}
+	if err := removeRaw(root, sha); !errors.Is(err, errEvictInUse) {
+		t.Fatalf("evicting a file held (just handed, linked in views): %v", err)
 	}
 	unheld := strings.Repeat("e", 64)
 	if err := os.WriteFile(filepath.Join(root, rawDirName, unheld), []byte("x"), 0o644); err != nil {
@@ -294,5 +297,58 @@ func TestARawFileOfUnknownSizeIsNotKept(t *testing.T) {
 	}
 	if strings.Join(fake.placed, ",") != "/"+got.SHA256 {
 		t.Fatalf("placed %v", fake.placed)
+	}
+}
+
+// A file installed whose placement was not recorded (the agent went in
+// between) is found again by its URL, upstream gone.
+func TestAnInstalledRawFileIsFoundAgainByItsURL(t *testing.T) {
+	content := bytes.Repeat([]byte("a line\n"), 1000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "f.txt", time.Time{}, bytes.NewReader(content))
+	}))
+	root, err := os.MkdirTemp("", "kr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	fake := &fakeRaws{identities: map[string]loader.File{}, counts: map[string]int64{}}
+	var logs bytes.Buffer
+	e := storesExecutor(t, fake, &logs)
+	served := servedStore{decl: machine.Store{ID: "v", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}
+	cache, err := e.storeWork().rawCacheFor(served)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cache.floor = func() int64 { return 0 }
+	file := loader.File{Name: "f.txt", URL: srv.URL + "/f.txt"}
+	view, err := cache.attach(rawLaunch("att_0000000000000000000000000000000a", file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake.mu.Lock()
+	fake.refusePlacement = fmt.Errorf("%w: test", store.ErrStreamReportRefused)
+	fake.mu.Unlock()
+	if _, _, err := loader.NewAgent(view, loader.HTTPOrigin{}).Resolve(context.Background(), file); err == nil {
+		t.Fatal("handed though not placed")
+	}
+	// the agent went; upstream gone
+	cache.close()
+	e.storeWork().raws = nil
+	srv.Close()
+	fake.mu.Lock()
+	fake.refusePlacement = nil
+	fake.mu.Unlock()
+	again, err := e.storeWork().rawCacheFor(served)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.close()
+	again.floor = func() int64 { return 0 }
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	got, origin, err := loader.NewAgent(view, loader.HTTPOrigin{}).Resolve(ctx, file)
+	if err != nil || origin == (loader.HTTPOrigin{}) || got.Size != int64(len(content)) {
+		t.Fatalf("found again: %+v via %v: %v", got, origin, err)
 	}
 }

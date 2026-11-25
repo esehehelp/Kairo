@@ -56,6 +56,8 @@ type Loader struct {
 	world     int
 	delivered []Position // per rank: its next position not yet handed over
 	floor     []Position // per rank: where the stream was started (a checkpoint's)
+	present   []bool     // per rank: a process takes it now
+	joined    []bool     // per rank: a process took it since this loader started
 	gen       *generation
 	stopped   bool
 	hard      error
@@ -67,7 +69,14 @@ type Loader struct {
 // comes back from elsewhere than where it was handed makes another.
 type generation struct {
 	cancel context.CancelFunc
+	ctx    context.Context
 	queues []chan item
+	// rankCtx ends while its rank is away (no process takes it); overflow
+	// marks a rank away whose items no longer fitted: dropped from then on,
+	// the generation is made again when it comes back
+	rankCtx    []context.Context
+	rankCancel []context.CancelFunc
+	overflow   []bool
 	// budgets bound the bytes made ahead for each rank
 	budgets []*semaphore.Weighted
 	budget  int64
@@ -95,6 +104,7 @@ func (l *Loader) Start(ctx context.Context, world int, positions []Position) err
 		return fmt.Errorf("positions of %d ranks, for %d ranks (a run keeps its ranks)", len(positions), world)
 	}
 	l.world = world
+	l.present, l.joined = make([]bool, world), make([]bool, world)
 	l.delivered = make([]Position, world)
 	seen := make([]bool, world)
 	for r := range l.delivered {
@@ -152,10 +162,12 @@ func (l *Loader) startLocked(parent context.Context) {
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
-	gen := &generation{cancel: cancel, queues: make([]chan item, l.world), done: make(chan struct{}), budget: l.rankBudget()}
+	gen := &generation{cancel: cancel, ctx: ctx, queues: make([]chan item, l.world), done: make(chan struct{}), budget: l.rankBudget(), overflow: make([]bool, l.world)}
 	for r := range gen.queues {
 		gen.queues[r] = make(chan item, rankQueue)
 		gen.budgets = append(gen.budgets, semaphore.NewWeighted(gen.budget))
+		rctx, rcancel := context.WithCancel(ctx)
+		gen.rankCtx, gen.rankCancel = append(gen.rankCtx, rctx), append(gen.rankCancel, rcancel)
 	}
 	l.gen = gen
 	positions := append([]Position(nil), l.delivered...)
@@ -288,17 +300,83 @@ func (l *Loader) produce(ctx context.Context, gen *generation, positions []Posit
 	return nil
 }
 
+// put hands it to rank r's queue, waiting for room while a process takes
+// the rank; for a rank away, what fits is made ahead and, once something
+// does not, the rest of its items are dropped (made again when it comes
+// back), so that a rank away never holds the others up.
 func (l *Loader) put(ctx context.Context, gen *generation, r int, it item) error {
-	if err := gen.budgets[r].Acquire(ctx, gen.cost(it)); err != nil {
-		return err
+	cost := gen.cost(it)
+	for {
+		l.mu.Lock()
+		rctx, overflowed := gen.rankCtx[r], gen.overflow[r]
+		if !l.present[r] && !overflowed {
+			if gen.budgets[r].TryAcquire(cost) {
+				select {
+				case gen.queues[r] <- it:
+					l.mu.Unlock()
+					return nil
+				default:
+					gen.budgets[r].Release(cost)
+				}
+			}
+			gen.overflow[r], overflowed = true, true
+		}
+		l.mu.Unlock()
+		if overflowed {
+			return ctx.Err()
+		}
+		if err := gen.budgets[r].Acquire(rctx, cost); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			continue // the rank went away meanwhile
+		}
+		select {
+		case gen.queues[r] <- it:
+			return nil
+		case <-rctx.Done():
+			gen.budgets[r].Release(cost)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
 	}
-	select {
-	case gen.queues[r] <- it:
-		return nil
-	case <-ctx.Done():
-		gen.budgets[r].Release(gen.cost(it))
-		return ctx.Err()
+}
+
+// attach: a process takes rank r now. A generation that dropped its items
+// while it was away is made again (from where each rank was handed to).
+func (l *Loader) attach(ctx context.Context, r int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.present[r], l.joined[r] = true, true
+	gen := l.gen
+	if gen == nil || gen.rankCtx == nil || l.stopped || l.hard != nil {
+		return
 	}
+	if gen.overflow[r] {
+		l.startLocked(ctx)
+		return
+	}
+	if gen.rankCtx[r].Err() != nil {
+		gen.rankCtx[r], gen.rankCancel[r] = context.WithCancel(gen.ctx)
+	}
+}
+
+// detach: no process takes rank r now.
+func (l *Loader) detach(r int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.present[r] = false
+	if gen := l.gen; gen != nil && gen.rankCancel != nil {
+		gen.rankCancel[r]()
+	}
+}
+
+// joinedBefore: a process took rank r since this loader started.
+func (l *Loader) joinedBefore(r int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.joined[r]
 }
 
 // cost is what an item takes of its rank's budget (all of it at most).
