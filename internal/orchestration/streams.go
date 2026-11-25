@@ -36,6 +36,8 @@ type RawFile struct {
 	URL    string `json:"url"`
 	Size   int64  `json:"size,omitempty"`
 	SHA256 string `json:"sha256,omitempty"`
+	// SizeKnown: Size was published (a listing's; 0 then means empty).
+	SizeKnown bool `json:"size_known,omitempty"`
 }
 
 // Stream is [streams.NAME]: the records of raws in a fixed order for the
@@ -133,9 +135,17 @@ func normalizeStreams(m *Manifest) error {
 			if len(resolved) == 0 {
 				return fmt.Errorf("raw %q: no file of %s at %s matches %v", name, h.Repo, h.Revision, h.Files)
 			}
-			for _, f := range resolved {
-				if f.URL != HFFileURL(*h, f.Name) || f.Size < 0 || f.SHA256 != "" && !sha256Hex.MatchString(f.SHA256) {
-					return fmt.Errorf("raw %q: the listing's file %q is not one of %s at %s", name, f.Name, h.Repo, h.Revision)
+			for i, f := range resolved {
+				matches := false
+				for _, p := range h.Files {
+					ok, _ := path.Match(p, f.Name)
+					matches = matches || ok
+				}
+				if !matches || f.URL != HFFileURL(*h, f.Name) || f.Size < 0 || !f.SizeKnown || f.SHA256 != "" && !sha256Hex.MatchString(f.SHA256) {
+					return fmt.Errorf("raw %q: the listing's file %q is not one of %s at %s matching %v", name, f.Name, h.Repo, h.Revision, h.Files)
+				}
+				if i > 0 && resolved[i-1].Name >= f.Name {
+					return fmt.Errorf("raw %q: the listing is not in order by name, each once (%q after %q)", name, f.Name, resolved[i-1].Name)
 				}
 			}
 			files[name] = resolved

@@ -35,8 +35,8 @@ streams = ["mix"]
 func webListing() map[string][]RawFile {
 	h := HFRaw{Repo: "someone/web-ja", Revision: "0123456789abcdef0123456789abcdef01234567", Files: []string{"data/*.parquet"}}
 	return map[string][]RawFile{"web": {
-		{Name: "data/a.parquet", URL: HFFileURL(h, "data/a.parquet"), Size: 10, SHA256: strings.Repeat("a", 64)},
-		{Name: "data/b.parquet", URL: HFFileURL(h, "data/b.parquet"), Size: 20},
+		{Name: "data/a.parquet", URL: HFFileURL(h, "data/a.parquet"), Size: 10, SHA256: strings.Repeat("a", 64), SizeKnown: true},
+		{Name: "data/b.parquet", URL: HFFileURL(h, "data/b.parquet"), Size: 20, SizeKnown: true},
 	}}
 }
 

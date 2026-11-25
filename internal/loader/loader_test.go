@@ -334,9 +334,11 @@ func TestAStreamIsTheSameFromAnyPosition(t *testing.T) {
 		known.Sources[s].Records = map[string]int64{}
 		for i, f := range known.Sources[s].Files {
 			if s == 0 {
-				known.Sources[s].Records[f.SHA256] = int64(5 + i*3)
+				key, _ := RecordsKey(f.SHA256, known.Sources[s].Format, known.Sources[s].Field, f.Name)
+				known.Sources[s].Records[key] = int64(5 + i*3)
 			} else {
-				known.Sources[s].Records[f.SHA256] = 4
+				key, _ := RecordsKey(f.SHA256, known.Sources[s].Format, known.Sources[s].Field, f.Name)
+				known.Sources[s].Records[key] = 4
 			}
 		}
 	}
@@ -674,5 +676,45 @@ func TestALengthChangeIsAChangeAndNullIsNoString(t *testing.T) {
 	defer closeFn()
 	if _, err := rr.next(); err == nil {
 		t.Fatal("a null field taken as a string")
+	}
+}
+
+// A stream started from a checkpoint does not go back behind it, nor take
+// a position past its end for one.
+func TestPositionsBehindTheStartOrPastTheEndAreRefused(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Sources = spec.Sources[:1]
+	spec.Epochs = 1 // 38 records
+	serve := func(positions []Position) (context.CancelFunc, string) {
+		ctx, cancel := context.WithCancel(context.Background())
+		ln, _ := net.Listen("tcp", "127.0.0.1:0")
+		go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}, Positions: positions, World: 1}).Serve(ctx, ln)
+		return cancel, ln.Addr().String()
+	}
+	cancel, addr := serve([]Position{{Record: 40}})
+	c, err := Dial(context.Background(), "tcp", addr, 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Next(); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("past the end: %v", err)
+	}
+	c.Close()
+	cancel()
+	cancel, addr = serve([]Position{{Record: 10}})
+	defer cancel()
+	if _, err := Dial(context.Background(), "tcp", addr, 0, 1, &Position{Record: 5}); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("behind the start: %v", err)
+	}
+	c, err = Dial(context.Background(), "tcp", addr, 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if c.Position.Record != 10 {
+		t.Fatalf("started at %+v", c.Position)
+	}
+	if _, err := c.Next(); err != nil {
+		t.Fatal(err)
 	}
 }

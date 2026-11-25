@@ -9,9 +9,9 @@ import (
 
 // SourceSpec is a source of a stream, its files resolved: the raw data (or
 // data object) named, its weight in the mix, its format, its files in
-// declared order and, when known, each file's record count under this format
-// (by the file's sha256), which lets a stream start mid-way without reading
-// what comes before.
+// declared order and, when known, each file's record count read so (by
+// RecordsKey), which lets a stream start mid-way without reading what comes
+// before.
 type SourceSpec struct {
 	Name    string           `json:"name"`
 	Weight  int              `json:"weight"`
@@ -89,8 +89,15 @@ func (s *sourceStream) orderOf(e int64) []int {
 
 // count is the record count of file i, when known.
 func (s *sourceStream) count(i int) (int64, bool) {
-	n, ok := s.spec.Records[s.spec.Files[i].SHA256]
+	n, ok := s.spec.Records[s.recordsKey(s.spec.Files[i])]
 	return n, ok
+}
+
+// recordsKey is what a file's record count is kept under: its sha256 and
+// how this source reads it (RecordsKey).
+func (s *sourceStream) recordsKey(f File) string {
+	key, _ := RecordsKey(f.SHA256, s.spec.Format, s.spec.Field, f.Name)
+	return key
 }
 
 func (s *sourceStream) closeFile() {
@@ -202,7 +209,7 @@ func (s *sourceStream) endFile() {
 	if s.spec.Records == nil {
 		s.spec.Records = map[string]int64{}
 	}
-	s.spec.Records[f.SHA256] = s.inFile
+	s.spec.Records[s.recordsKey(f)] = s.inFile
 	s.closeFile()
 	s.file++
 }

@@ -98,6 +98,16 @@ func CountRecords(r io.Reader, name, format, field string) (int64, error) {
 	}
 }
 
+// RecordsKey is what a SourceSpec's Records keeps a file's count under: its
+// sha256 and the CountKey of how the source reads it.
+func RecordsKey(sha256, format, field, fileName string) (string, error) {
+	key, err := CountKey(format, field, fileName)
+	if err != nil {
+		return "", err
+	}
+	return sha256 + "|" + key, nil
+}
+
 // compressionOf is the compression of a file of this format named name.
 func (f format) compressionOf(name string) string {
 	if f.compression != "" {

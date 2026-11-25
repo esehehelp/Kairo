@@ -154,7 +154,7 @@ func (o *orderer) seek(ctx context.Context, g int64) error {
 	}
 	o.t, o.g = int(g%o.block), g
 	if o.t > len(o.recs) {
-		o.t = len(o.recs)
+		return fmt.Errorf("output %d is past the stream's end (%d)", g, o.j*o.block+int64(len(o.recs)))
 	}
 	return nil
 }

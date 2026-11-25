@@ -245,7 +245,10 @@ func (s *Server) join(hello Hello) (int, error) {
 			delete(s.taken, hello.Rank)
 			return 0, fmt.Errorf("position %+v is out of bounds", p)
 		}
-		s.Loader.resume(s.ctx, hello.Rank, p)
+		if err := s.Loader.resume(s.ctx, hello.Rank, p); err != nil {
+			delete(s.taken, hello.Rank)
+			return 0, err
+		}
 	}
 	return hello.Rank, nil
 }

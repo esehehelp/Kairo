@@ -58,6 +58,9 @@ import (
 // rawDirName is the directory of a volatile store raw files are kept in.
 const rawDirName = "raw"
 
+// maxSocketPath is the longest socket path a Unix socket binds to.
+const maxSocketPath = 107
+
 // rawViewGrace is how long a view stays after its attempt is no longer
 // seen running here (an agent restarted adopts its attempts meanwhile).
 const rawViewGrace = 10 * time.Minute
@@ -85,6 +88,7 @@ type rawCache struct {
 // rawFlight is a file being made ready, for every attempt asking for it.
 type rawFlight struct {
 	done     chan struct{}
+	declared loader.File // the declaration it was made under
 	identity loader.File
 	kept     bool
 	err      error
@@ -107,9 +111,32 @@ type rawWantReading struct {
 type rawView struct {
 	attempt string
 	dir     string
+	mu      sync.Mutex
 	wants   map[string]rawWant // by URL
 	ln      net.Listener
 	gone    time.Time // first seen not running here (zero: running)
+}
+
+// handed records the identity of a file handed to the view's attempt that
+// had none at its launch: handed again from the view, whatever is evicted
+// or restarted meanwhile.
+func (c *rawCache) handed(v *rawView, url string, identity loader.File) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	want := v.wants[url]
+	if want.File.Identified() {
+		return
+	}
+	identity.PublishedSHA256, identity.PublishedSize = want.File.PublishedSHA256, want.File.PublishedSize
+	want.File = identity
+	v.wants[url] = want
+	body, err := json.Marshal(v.wants)
+	if err == nil {
+		err = os.WriteFile(filepath.Join(c.dir, ".attempts", v.attempt+".json"), body, 0o600)
+	}
+	if err != nil {
+		c.w.Logger.Warn("raw view not kept", "attempt_id", v.attempt, "error", err)
+	}
 }
 
 // keepRawCaches starts the raw cache of each usable volatile store this
@@ -174,26 +201,7 @@ func (e *storeWorker) rawCacheFor(s servedStore) (*rawCache, error) {
 				e.Logger.Warn("raw file not fetched yet", "url", f.URL, "error", err)
 			}
 		}}}
-	// the views of attempts that had one: served again
-	if entries, err := os.ReadDir(filepath.Join(dir, ".attempts")); err == nil {
-		for _, entry := range entries {
-			id, ok := cutSuffix(entry.Name(), ".json")
-			if !ok || !attemptIDName.MatchString(id) {
-				continue
-			}
-			body, err := os.ReadFile(filepath.Join(dir, ".attempts", entry.Name()))
-			var wants map[string]rawWant
-			if err == nil {
-				err = json.Unmarshal(body, &wants)
-			}
-			if err == nil {
-				err = c.openView(id, wants)
-			}
-			if err != nil {
-				e.Logger.Warn("raw view not served again", "attempt_id", id, "error", err)
-			}
-		}
-	}
+	c.restoreViews()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if old, ok := e.raws[decl.ID]; ok && old.root == decl.Root {
@@ -205,6 +213,38 @@ func (e *storeWorker) rawCacheFor(s servedStore) (*rawCache, error) {
 	}
 	e.raws[decl.ID] = c
 	return c, nil
+}
+
+// restoreViews serves again the views of attempts that had one (an agent
+// restarted; one that failed before is tried again).
+func (c *rawCache) restoreViews() {
+	entries, err := os.ReadDir(filepath.Join(c.dir, ".attempts"))
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		id, ok := cutSuffix(entry.Name(), ".json")
+		if !ok || !attemptIDName.MatchString(id) {
+			continue
+		}
+		c.mu.Lock()
+		_, served := c.views[id]
+		c.mu.Unlock()
+		if served {
+			continue
+		}
+		body, err := os.ReadFile(filepath.Join(c.dir, ".attempts", entry.Name()))
+		var wants map[string]rawWant
+		if err == nil {
+			err = json.Unmarshal(body, &wants)
+		}
+		if err == nil {
+			err = c.openView(id, wants)
+		}
+		if err != nil {
+			c.w.Logger.Warn("raw view not served again", "attempt_id", id, "error", err)
+		}
+	}
 }
 
 func cutSuffix(s, suffix string) (string, bool) {
@@ -266,6 +306,9 @@ func (c *rawCache) openView(id string, wants map[string]rawWant) error {
 		return err
 	}
 	sock := filepath.Join(dir, loader.AgentSocket)
+	if len(sock) > maxSocketPath {
+		return fmt.Errorf("the raw view's socket %s is longer than %d bytes: a store root of at most %d characters", sock, maxSocketPath, maxSocketPath-(len(sock)-len(c.root)))
+	}
 	_ = os.Remove(sock)
 	ln, err := net.Listen("unix", sock)
 	if err != nil {
@@ -296,6 +339,9 @@ func (c *rawCache) sweep() {
 		return
 	}
 	c.swept = time.Now()
+	c.mu.Unlock()
+	c.restoreViews()
+	c.mu.Lock()
 	views := make([]*rawView, 0, len(c.views))
 	for _, v := range c.views {
 		views = append(views, v)
@@ -341,7 +387,9 @@ func (c *rawCache) serve(v *rawView, w http.ResponseWriter, r *http.Request) {
 		writeEnsure(w, http.StatusBadRequest, loader.EnsureAnswer{Error: "a request names a file by its URL"})
 		return
 	}
+	v.mu.Lock()
 	want, ok := v.wants[req.URL]
+	v.mu.Unlock()
 	if !ok {
 		writeEnsure(w, http.StatusForbidden, loader.EnsureAnswer{Error: req.URL + " is no file of this attempt's streams"})
 		return
@@ -369,6 +417,18 @@ func (c *rawCache) handOver(ctx context.Context, v *rawView, want rawWant) (int,
 		}
 		return http.StatusServiceUnavailable, answer
 	}
+	// held already in the view (handed before; evicted since or not): as it is
+	if want.File.Identified() && sha256Name.MatchString(want.File.SHA256) {
+		if info, err := os.Stat(filepath.Join(v.dir, want.File.SHA256)); err == nil && info.Mode().IsRegular() && info.Size() == want.File.Size {
+			if err := sameAsDeclared(want.File, want.File); err != nil {
+				return fail(err)
+			}
+			for _, reading := range want.Readings {
+				c.count(v, want.File, reading)
+			}
+			return http.StatusOK, loader.EnsureAnswer{File: want.File, Name: want.File.SHA256}
+		}
+	}
 	for again := 0; ; again++ {
 		identity, kept, err := c.ready(ctx, want.File)
 		if err != nil {
@@ -388,21 +448,27 @@ func (c *rawCache) handOver(ctx context.Context, v *rawView, want rawWant) (int,
 		if err != nil && !errors.Is(err, os.ErrExist) {
 			return fail(err)
 		}
+		c.handed(v, want.File.URL, identity)
 		for _, reading := range want.Readings {
-			c.count(identity, want.File.Name, reading)
+			c.count(v, identity, reading)
 		}
 		return http.StatusOK, loader.EnsureAnswer{File: identity, Name: identity.SHA256}
 	}
 }
 
-// sameAsDeclared: identity is the file a launch declared (its identity then,
-// or what was published of it).
+// sameAsDeclared: identity is the file a launch declared: its identity then
+// (when it had one) and what was published of it.
 func sameAsDeclared(identity, declared loader.File) error {
-	switch {
-	case declared.SHA256 != "" && declared.SHA256 != identity.SHA256,
-		declared.Size > 0 && declared.Size != identity.Size,
-		declared.Identified() && (declared.ChunkBytes != identity.ChunkBytes || !equalStrings(declared.Chunks, identity.Chunks)):
-		return fmt.Errorf("%w: %s is %s (%d bytes), declared %s (%d bytes)", loader.ErrChanged, identity.URL, identity.SHA256, identity.Size, declared.SHA256, declared.Size)
+	if declared.Identified() && (declared.SHA256 != identity.SHA256 || declared.Size != identity.Size || declared.ChunkBytes != identity.ChunkBytes || !equalStrings(declared.Chunks, identity.Chunks)) {
+		return fmt.Errorf("%w: %s is %s (%d bytes), identified as %s (%d bytes)", loader.ErrChanged, identity.URL, identity.SHA256, identity.Size, declared.SHA256, declared.Size)
+	}
+	pinned := identity
+	pinned.PublishedSHA256, pinned.PublishedSize = declared.PublishedSHA256, declared.PublishedSize
+	if !declared.Identified() && declared.SHA256 != "" && pinned.PublishedSHA256 == "" {
+		pinned.PublishedSHA256 = declared.SHA256
+	}
+	if why := pinned.AsPublished(); why != "" {
+		return fmt.Errorf("%w: %s", loader.ErrChanged, why)
 	}
 	return nil
 }
@@ -425,7 +491,7 @@ func (c *rawCache) ready(ctx context.Context, declared loader.File) (loader.File
 	c.mu.Lock()
 	f, ok := c.flights[declared.URL]
 	if !ok {
-		f = &rawFlight{done: make(chan struct{})}
+		f = &rawFlight{done: make(chan struct{}), declared: declared}
 		c.flights[declared.URL] = f
 		go func() {
 			// not an asker's context: others may wait on it
@@ -439,10 +505,28 @@ func (c *rawCache) ready(ctx context.Context, declared loader.File) (loader.File
 	c.mu.Unlock()
 	select {
 	case <-f.done:
+		// a flight failed on another declaration's pins: made again under
+		// this one's
+		if errors.Is(f.err, loader.ErrChanged) && !samePins(f.declared, declared) {
+			return c.ready(ctx, declared)
+		}
 		return f.identity, f.kept, f.err
 	case <-ctx.Done():
 		return loader.File{}, false, ctx.Err()
 	}
+}
+
+// samePins: a and b were declared with the same identity and published
+// values.
+func samePins(a, b loader.File) bool {
+	sizeA, sizeB := int64(-1), int64(-1)
+	if a.PublishedSize != nil {
+		sizeA = *a.PublishedSize
+	}
+	if b.PublishedSize != nil {
+		sizeB = *b.PublishedSize
+	}
+	return a.PublishedSHA256 == b.PublishedSHA256 && sizeA == sizeB && a.SHA256 == b.SHA256 && a.Size == b.Size && equalStrings(a.Chunks, b.Chunks)
 }
 
 // make makes a file ready: the identity the daemon has of it (or makes it),
@@ -465,12 +549,13 @@ func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File,
 	if size <= 0 {
 		size = c.contentLength(ctx, declared)
 	}
-	if !c.reserve(size) {
+	// a size not known is not kept: room is held for what is known only
+	if size <= 0 || !c.reserve(size) {
 		return c.notKept(ctx, declared, canonical, found)
 	}
 	defer c.release(size)
-	identity, partial, err := c.fetchInto(ctx, declared, canonical, found)
-	if errors.Is(err, syscall.ENOSPC) {
+	identity, partial, err := c.fetchInto(ctx, declared, canonical, found, size)
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, errPastReserved) {
 		return c.notKept(ctx, declared, canonical, found)
 	}
 	if err != nil {
@@ -506,7 +591,7 @@ func (c *rawCache) notKept(ctx context.Context, declared, canonical loader.File,
 
 // fetchInto fetches a file into .partial: the identity of the bytes
 // written, and where they are.
-func (c *rawCache) fetchInto(ctx context.Context, declared, canonical loader.File, found bool) (loader.File, string, error) {
+func (c *rawCache) fetchInto(ctx context.Context, declared, canonical loader.File, found bool, reserved int64) (loader.File, string, error) {
 	var suffix [8]byte
 	_, _ = rand.Read(suffix[:])
 	partial := filepath.Join(c.dir, ".partial", hex.EncodeToString(suffix[:]))
@@ -514,7 +599,7 @@ func (c *rawCache) fetchInto(ctx context.Context, declared, canonical loader.Fil
 	if err != nil {
 		return loader.File{}, "", err
 	}
-	identity, err := c.identifyInto(ctx, declared, canonical, found, out)
+	identity, err := c.identifyInto(ctx, declared, canonical, found, &cappedWriter{w: out, room: reserved})
 	if err == nil {
 		err = out.Sync()
 	}
@@ -556,10 +641,28 @@ func (c *rawCache) identifyInto(ctx context.Context, declared, canonical loader.
 		if err := sameAsDeclared(identity, canonical); err != nil {
 			return loader.File{}, err
 		}
-	} else if err := sameAsDeclared(identity, loader.File{URL: declared.URL, SHA256: declared.SHA256, Size: declared.Size}); err != nil {
+	} else if err := sameAsDeclared(identity, declared); err != nil {
 		return loader.File{}, err
 	}
 	return identity, nil
+}
+
+// errPastReserved: a body longer than the room held for it.
+var errPastReserved = errors.New("longer than the room held for it")
+
+// cappedWriter writes up to room bytes.
+type cappedWriter struct {
+	w    io.Writer
+	room int64
+}
+
+func (c *cappedWriter) Write(b []byte) (int, error) {
+	if int64(len(b)) > c.room {
+		return 0, errPastReserved
+	}
+	n, err := c.w.Write(b)
+	c.room -= int64(n)
+	return n, err
 }
 
 // identifier computes a file's identity from the bytes written to it.
@@ -666,39 +769,55 @@ func (c *rawCache) release(size int64) {
 	c.reserved -= size
 }
 
-// count counts, once, the records a kept file holds read as reading says,
-// and records the count with the daemon.
-func (c *rawCache) count(identity loader.File, name string, reading rawWantReading) {
-	key, err := loader.CountKey(reading.Format, reading.Field, name)
+// count counts, once, the records a file the attempt of view v was handed
+// holds read as reading says, from its link in the view (it stays while the
+// attempt runs), checking its bytes against its identity as it reads them;
+// only a count of bytes so checked is recorded with the daemon.
+func (c *rawCache) count(v *rawView, identity loader.File, reading rawWantReading) {
+	key, err := loader.CountKey(reading.Format, reading.Field, identity.Name)
 	if err != nil {
 		return
 	}
+	marker := identity.SHA256 + "|" + key
 	c.mu.Lock()
-	if c.counted[identity.SHA256+"|"+key] {
+	if c.counted[marker] {
 		c.mu.Unlock()
 		return
 	}
-	c.counted[identity.SHA256+"|"+key] = true
+	c.counted[marker] = true
 	c.mu.Unlock()
 	go func() {
-		f, err := os.Open(filepath.Join(c.dir, identity.SHA256))
-		if err != nil {
-			return // evicted since: counted another time
-		}
-		defer f.Close()
-		n, err := loader.CountRecords(f, name, reading.Format, reading.Field)
-		if err == nil {
-			err = c.retryDaemon(context.Background(), func() error {
-				return c.w.Store.RawRecords(context.Background(), c.w.ID, store.RecordsCount{URL: identity.URL, SHA256: identity.SHA256, Format: reading.Format, Field: reading.Field, Records: n})
-			})
-		}
+		err := c.countChecked(v, identity, reading)
 		if err != nil {
 			c.w.Logger.Warn("raw file's records not counted", "url", identity.URL, "error", err)
 			c.mu.Lock()
-			delete(c.counted, identity.SHA256+"|"+key)
+			delete(c.counted, marker)
 			c.mu.Unlock()
 		}
 	}()
+}
+
+func (c *rawCache) countChecked(v *rawView, identity loader.File, reading rawWantReading) error {
+	f, err := os.Open(filepath.Join(v.dir, identity.SHA256))
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	id := newIdentifier(identity.ChunkBytes)
+	n, err := loader.CountRecords(io.TeeReader(f, id), identity.Name, reading.Format, reading.Field)
+	if err != nil {
+		return err
+	}
+	// what the decoder did not read (a framing reading to the end reads all)
+	if _, err := io.Copy(id, f); err != nil {
+		return err
+	}
+	if got := id.file(identity.Name, identity.URL); got.SHA256 != identity.SHA256 || got.Size != identity.Size || !equalStrings(got.Chunks, identity.Chunks) {
+		return fmt.Errorf("%w: the kept %s is not its identity: not counted", loader.ErrChanged, identity.URL)
+	}
+	return c.retryDaemon(context.Background(), func() error {
+		return c.w.Store.RawRecords(context.Background(), c.w.ID, store.RecordsCount{URL: identity.URL, SHA256: identity.SHA256, Format: reading.Format, Field: reading.Field, Records: n})
+	})
 }
 
 // contentLength is what upstream says a file's size is (0: not said).
@@ -725,6 +844,10 @@ func (c *rawCache) contentLength(ctx context.Context, f loader.File) int64 {
 func removeRaw(root, sha string) error {
 	if !sha256Name.MatchString(sha) {
 		return fmt.Errorf("%w: raw file %q", errOutsideRoot, sha)
+	}
+	// held by attempts' views: removing its name frees nothing
+	if links, err := linkCount(filepath.Join(root, rawDirName, sha)); err == nil && links > 1 {
+		return fmt.Errorf("%w: raw file %s is held by %d attempts", errEvictInUse, sha, links-1)
 	}
 	err := os.Remove(filepath.Join(root, rawDirName, sha))
 	if errors.Is(err, os.ErrNotExist) {

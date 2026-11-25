@@ -108,6 +108,9 @@ func (a *Agent) ensure(ctx context.Context, f File) (EnsureAnswer, error) {
 	defer resp.Body.Close()
 	var answer EnsureAnswer
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 256<<20)).Decode(&answer); err != nil {
+		if resp.StatusCode/100 == 4 {
+			return EnsureAnswer{}, fmt.Errorf("%w: the node's agent: %s", ErrRefused, resp.Status)
+		}
 		return EnsureAnswer{}, fmt.Errorf("the node's agent: %s: %w", resp.Status, err)
 	}
 	switch {
@@ -120,9 +123,14 @@ func (a *Agent) ensure(ctx context.Context, f File) (EnsureAnswer, error) {
 	case !answer.File.Identified() || answer.File.URL != f.URL || !answer.Fallback && answer.Name != answer.File.SHA256:
 		return EnsureAnswer{}, fmt.Errorf("%w: the node's agent answered %s with %+v", ErrRefused, f.URL, answer)
 	}
-	// the answer is the file this loader was told to read
+	// the answer is the file this loader was told to read, as published
 	g := answer.File
-	if f.SHA256 != "" && f.SHA256 != g.SHA256 || f.Size > 0 && f.Size != g.Size || f.Identified() && (f.ChunkBytes != g.ChunkBytes || len(f.Chunks) != len(g.Chunks)) {
+	pinned := g
+	pinned.PublishedSHA256, pinned.PublishedSize = f.PublishedSHA256, f.PublishedSize
+	if why := pinned.AsPublished(); why != "" {
+		return EnsureAnswer{}, fmt.Errorf("%w: %s", ErrChanged, why)
+	}
+	if f.Identified() && (f.SHA256 != g.SHA256 || f.Size != g.Size || f.ChunkBytes != g.ChunkBytes || len(f.Chunks) != len(g.Chunks)) || !f.Identified() && f.SHA256 != "" && f.SHA256 != g.SHA256 {
 		return EnsureAnswer{}, fmt.Errorf("%w: %s is %s (%d bytes), declared %s (%d bytes)", ErrChanged, f.URL, g.SHA256, g.Size, f.SHA256, f.Size)
 	}
 	if f.Identified() {

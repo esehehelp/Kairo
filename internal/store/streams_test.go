@@ -138,7 +138,7 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 	}
 	for _, bad := range []string{
 		`{"continuation_ref":"ckpt-1"}`,
-		`{"continuation_ref":"ckpt-1","streams":{"other":{"world":1,"order":1,"positions":[{"rank":0,"record":5}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"other":{"world":1,"order":1,"positions":[{"rank":0,"record":5,"sub":0}]}}}`,
 		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":1,"order":1,"positions":[{"rank":1,"record":5}]}}}`,
 		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":2,"order":1,"positions":[{"rank":0,"record":5},{"rank":0,"record":6}]}}}`,
 		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":2,"order":1,"positions":[{"rank":0,"record":5}]}}}`,
@@ -146,6 +146,9 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":1,"order":2,"positions":[{"rank":0,"record":5}]}}}`,
 		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":1,"order":1,"positions":[{"rank":0,"record":5,"sub":4294967296}]}}}`,
 		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":0,"record":5}]}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":1,"order":1,"positions":[{}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":1,"order":1,"positions":[{"rank":0,"record":5}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"order":1,"positions":[{"rank":0,"record":5,"sub":0}]}}}`,
 	} {
 		if err := checkStreamPositionsTx(ctx, store.db, launch.Execution.ID, []byte(bad)); !errors.Is(err, ErrStreamPositions) {
 			t.Fatalf("%s: %v", bad, err)

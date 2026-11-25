@@ -55,6 +55,7 @@ type Loader struct {
 	mu        sync.Mutex
 	world     int
 	delivered []Position // per rank: its next position not yet handed over
+	floor     []Position // per rank: where the stream was started (a checkpoint's)
 	gen       *generation
 	stopped   bool
 	hard      error
@@ -106,6 +107,7 @@ func (l *Loader) Start(ctx context.Context, world int, positions []Position) err
 		seen[p.Rank] = true
 		l.delivered[p.Rank] = p
 	}
+	l.floor = append([]Position(nil), l.delivered...)
 	l.startLocked(ctx)
 	return nil
 }
@@ -268,7 +270,22 @@ func (l *Loader) produce(ctx context.Context, gen *generation, positions []Posit
 	if err := <-orderErr; err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
-	return ctx.Err()
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	// the stream ended: a rank that was to start past its end stood
+	// somewhere this stream never was
+	total := order.g
+	for _, p := range positions {
+		records := int64(0)
+		if r := int64(p.Rank); total > r {
+			records = (total - r + world - 1) / world
+		}
+		if p.Record > records || p.Record == records && p.Sub > 0 {
+			return fmt.Errorf("rank %d was to start at %+v, past the stream's end (its %d records)", p.Rank, p, records)
+		}
+	}
+	return nil
 }
 
 func (l *Loader) put(ctx context.Context, gen *generation, r int, it item) error {
@@ -357,12 +374,16 @@ func (l *Loader) took(gen *generation, r int, it item) (item, bool) {
 
 // resume makes the stream again when rank r comes back at p, not where it
 // was handed to: every other rank from where it was handed to.
-func (l *Loader) resume(ctx context.Context, r int, p Position) {
+func (l *Loader) resume(ctx context.Context, r int, p Position) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if f := l.floor[r]; p.Record < f.Record || p.Record == f.Record && p.Sub < f.Sub {
+		return fmt.Errorf("rank %d comes back at %+v, before where its stream started (%+v)", r, p, f)
+	}
 	if l.delivered[r] == p || l.stopped {
-		return
+		return nil
 	}
 	l.delivered[r] = p
 	l.startLocked(ctx)
+	return nil
 }

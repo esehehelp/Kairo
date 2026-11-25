@@ -81,7 +81,7 @@ func resolveRawListings(m *orchestration.Manifest) error {
 				if e.Type != "file" || !matchesAny(h.Files, e.Path) {
 					continue
 				}
-				f := orchestration.RawFile{Name: e.Path, URL: orchestration.HFFileURL(h, e.Path), Size: e.Size}
+				f := orchestration.RawFile{Name: e.Path, URL: orchestration.HFFileURL(h, e.Path), Size: e.Size, SizeKnown: true}
 				if e.LFS != nil {
 					f.Size, f.SHA256 = e.LFS.Size, e.LFS.OID
 				}

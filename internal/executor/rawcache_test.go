@@ -200,6 +200,13 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 		t.Fatalf("handed over, then evicted: %v", err)
 	}
 
+	// upstream gone: an attempt that holds a file is handed it again from
+	// its view
+	srv.Close()
+	if again, origin, err := agent.Resolve(ctx, file); err != nil || again.SHA256 != sha || origin == (loader.HTTPOrigin{}) {
+		t.Fatalf("held, upstream gone: %+v via %v: %v", again, origin, err)
+	}
+
 	// an agent restarted serves the views again
 	cache.close()
 	e.storeWork().raws = nil
@@ -214,5 +221,46 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 	again.floor = func() int64 { return 0 }
 	if _, _, err := loader.NewAgent(view2, loader.HTTPOrigin{}).Resolve(ctx, got); err != nil {
 		t.Fatalf("after a restart: %v", err)
+	}
+}
+
+// A file whose size upstream does not say is not kept: it is identified
+// once and read from upstream.
+func TestARawFileOfUnknownSizeIsNotKept(t *testing.T) {
+	content := bytes.Repeat([]byte("x\n"), 1000)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			return
+		}
+		w.(http.Flusher).Flush() // chunked: no length
+		w.Write(content)
+	}))
+	defer srv.Close()
+	root, err := os.MkdirTemp("", "kr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	fake := &fakeRaws{identities: map[string]loader.File{}, counts: map[string]int64{}}
+	var logs bytes.Buffer
+	e := storesExecutor(t, fake, &logs)
+	served := servedStore{decl: machine.Store{ID: "v", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}
+	cache, err := e.storeWork().rawCacheFor(served)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.close()
+	cache.floor = func() int64 { return 0 }
+	file := loader.File{Name: "u.txt", URL: srv.URL + "/u.txt"}
+	view, err := cache.attach(rawLaunch("att_00000000000000000000000000000009", file))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, origin, err := loader.NewAgent(view, loader.HTTPOrigin{}).Resolve(context.Background(), file)
+	if err != nil || origin != (loader.HTTPOrigin{}) || got.Size != int64(len(content)) {
+		t.Fatalf("unknown size: %+v via %v: %v", got, origin, err)
+	}
+	if strings.Join(fake.placed, ",") != "/"+got.SHA256 {
+		t.Fatalf("placed %v", fake.placed)
 	}
 }

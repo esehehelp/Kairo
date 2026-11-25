@@ -83,6 +83,31 @@ func streamPositions(decls []orchestration.StreamDecl, payload []byte) (map[stri
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return nil, fmt.Errorf("%w: %v", ErrStreamPositions, err)
 	}
+	// a position says its rank, record and sub: none is taken as 0
+	var written struct {
+		Streams map[string]struct {
+			World     *int `json:"world"`
+			Order     *int `json:"order"`
+			Positions []struct {
+				Rank   *int   `json:"rank"`
+				Record *int64 `json:"record"`
+				Sub    *int64 `json:"sub"`
+			} `json:"positions"`
+		} `json:"streams"`
+	}
+	if err := json.Unmarshal(payload, &written); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrStreamPositions, err)
+	}
+	for name, cp := range written.Streams {
+		if cp.World == nil || cp.Order == nil {
+			return nil, fmt.Errorf("%w: stream %s: no world or order", ErrStreamPositions, name)
+		}
+		for _, p := range cp.Positions {
+			if p.Rank == nil || p.Record == nil || p.Sub == nil {
+				return nil, fmt.Errorf("%w: stream %s: a position without its rank, record and sub", ErrStreamPositions, name)
+			}
+		}
+	}
 	out := map[string]StreamCheckpoint{}
 	for _, d := range decls {
 		cp, ok := body.Streams[d.Name]
@@ -169,7 +194,11 @@ func loaderSpecTx(ctx context.Context, q queryer, d orchestration.StreamDecl) (l
 	for _, src := range d.Stream.Sources {
 		s := loader.SourceSpec{Name: src.Raw, Weight: src.Weight, Format: src.Format, Field: src.Field, Records: map[string]int64{}}
 		for _, f := range d.Files[src.Raw] {
-			file := loader.File{Name: f.Name, URL: f.URL, Size: f.Size, SHA256: f.SHA256}
+			file := loader.File{Name: f.Name, URL: f.URL, Size: f.Size, SHA256: f.SHA256, PublishedSHA256: f.SHA256}
+			if f.SizeKnown {
+				size := f.Size
+				file.PublishedSize = &size
+			}
 			var chunks string
 			err := q.QueryRowContext(ctx, `SELECT size,sha256,chunk_bytes,chunks_json FROM raw_identities WHERE url=$1`, f.URL).Scan(&file.Size, &file.SHA256, &file.ChunkBytes, &chunks)
 			switch {
@@ -180,6 +209,11 @@ func loaderSpecTx(ctx context.Context, q queryer, d orchestration.StreamDecl) (l
 				if err := json.Unmarshal([]byte(chunks), &file.Chunks); err != nil {
 					return spec, fmt.Errorf("identity of %s: %w", f.URL, err)
 				}
+				// a file not what was published is read (and refused), never
+				// passed over by a count
+				if file.AsPublished() != "" {
+					break
+				}
 				key, err := loader.CountKey(src.Format, src.Field, f.Name)
 				if err != nil {
 					return spec, err
@@ -187,7 +221,8 @@ func loaderSpecTx(ctx context.Context, q queryer, d orchestration.StreamDecl) (l
 				var records int64
 				err = q.QueryRowContext(ctx, `SELECT records FROM raw_records WHERE sha256=$1 AND framing=$2`, file.SHA256, key).Scan(&records)
 				if err == nil {
-					s.Records[file.SHA256] = records
+					recordsKey, _ := loader.RecordsKey(file.SHA256, src.Format, src.Field, f.Name)
+					s.Records[recordsKey] = records
 				} else if !errors.Is(err, sql.ErrNoRows) {
 					return spec, err
 				}

@@ -28,6 +28,24 @@ type File struct {
 	SHA256     string   `json:"sha256"`
 	ChunkBytes int64    `json:"chunk_bytes"`
 	Chunks     []string `json:"chunks"`
+	// PublishedSHA256 and PublishedSize are what the file was declared
+	// with (a Hugging Face listing's sha256 and size; PublishedSize nil when
+	// none was), kept beside its identity: a file whose identity is not
+	// what was published is changed.
+	PublishedSHA256 string `json:"published_sha256,omitempty"`
+	PublishedSize   *int64 `json:"published_size,omitempty"`
+}
+
+// AsPublished reports why f's identity is not what was published of it
+// ("" when it is, or nothing was).
+func (f File) AsPublished() string {
+	switch {
+	case f.PublishedSHA256 != "" && f.PublishedSHA256 != f.SHA256:
+		return fmt.Sprintf("%s has sha256 %s, published as %s", f.Name, f.SHA256, f.PublishedSHA256)
+	case f.PublishedSize != nil && *f.PublishedSize != f.Size:
+		return fmt.Sprintf("%s has %d bytes, published as %d", f.Name, f.Size, *f.PublishedSize)
+	}
+	return ""
 }
 
 // DefaultChunkBytes is the chunk a file is checked by.
