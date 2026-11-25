@@ -196,7 +196,9 @@ func (e *storeWorker) rawCacheFor(s servedStore) (*rawCache, error) {
 			}
 			return total / 10
 		},
-		fetch: &loader.Fetcher{Origin: loader.HTTPOrigin{Client: &http.Client{}}, Problem: func(f loader.File, err error) {
+		// a flight gives up after a while of failures: asked again, the
+		// file may be here by then (fetched for another URL)
+		fetch: &loader.Fetcher{Origin: loader.HTTPOrigin{}, GiveUp: rawFlightGiveUp, Problem: func(f loader.File, err error) {
 			if err != nil {
 				e.Logger.Warn("raw file not fetched yet", "url", f.URL, "error", err)
 			}
@@ -540,6 +542,7 @@ func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File,
 	}
 	if found {
 		canonical.Name = declared.Name
+		holdRaw(filepath.Join(c.dir, canonical.SHA256)) // not evicted while looked at
 		if info, err := os.Stat(filepath.Join(c.dir, canonical.SHA256)); err == nil && info.Mode().IsRegular() && info.Size() == canonical.Size {
 			return c.handing(ctx, canonical)
 		}
@@ -602,12 +605,18 @@ func (c *rawCache) identified(ctx context.Context, identity loader.File) error {
 // placed (used now). A placement being evicted is handed all the same: the
 // eviction finds it held and leaves it.
 func (c *rawCache) handing(ctx context.Context, identity loader.File) (loader.File, bool, error) {
-	holdRaw(filepath.Join(c.dir, identity.SHA256))
+	path := filepath.Join(c.dir, identity.SHA256)
+	holdRaw(path)
 	if err := c.placed(ctx, identity); err != nil && !errors.Is(err, store.ErrRawEvicting) {
 		return loader.File{}, false, err
 	}
+	holdRaw(path) // from now: the waiters link it
 	return identity, true, nil
 }
+
+// rawFlightGiveUp is how long a fetch for the cache keeps failing before
+// its flight ends (the loader asks again; the cache looks here first).
+const rawFlightGiveUp = 3 * time.Minute
 
 // rawHandGrace is how long a raw file about to be handed is not evicted.
 const rawHandGrace = time.Minute
@@ -637,12 +646,26 @@ func installRaw(partial, installed string, size int64) error {
 	defer rawLinks.Unlock()
 	err := os.Link(partial, installed)
 	if errors.Is(err, os.ErrExist) {
-		if info, serr := os.Stat(installed); serr == nil && info.Mode().IsRegular() && info.Size() == size {
+		if info, serr := os.Stat(installed); serr == nil && info.Mode().IsRegular() && info.Size() == size && hashIs(installed, filepath.Base(installed)) {
 			return nil
 		}
 		return os.Rename(partial, installed)
 	}
 	return err
+}
+
+// hashIs: the file at path has sha256 sha.
+func hashIs(path, sha string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false
+	}
+	return hex.EncodeToString(h.Sum(nil)) == sha
 }
 
 // keptAsPublished is the identity of a file kept here under the sha256 the
@@ -927,7 +950,7 @@ func (c *rawCache) contentLength(ctx context.Context, f loader.File) int64 {
 	if err != nil {
 		return 0
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := loader.HTTPClient.Do(req)
 	if err != nil {
 		return 0
 	}

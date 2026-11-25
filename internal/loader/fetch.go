@@ -103,6 +103,9 @@ type Fetcher struct {
 	// Problem, when set, hears each failure and, with a nil error, that the
 	// file is being read again.
 	Problem func(f File, err error)
+	// GiveUp, when set, ends retrying after that long of failures in a row,
+	// with the last failure (0: retried until the context ends).
+	GiveUp time.Duration
 	// Resolve, when set, is asked for each file before it is read: the file
 	// as identified and where to read it from (the node's raw cache,
 	// agent.go). A file is then never read unidentified.
@@ -177,6 +180,7 @@ func (c *checkedReader) fill() error {
 		maxPause = 5 * time.Minute
 	}
 	failed := false
+	var failingSince time.Time
 	for {
 		data, err := c.readChunk()
 		if errors.Is(err, errLength) {
@@ -200,9 +204,15 @@ func (c *checkedReader) fill() error {
 			err = fmt.Errorf("%s chunk %d from %s does not match its sha256: reading it again", c.f.Name, c.chunk, c.x.Origin)
 		}
 		c.closeBody()
+		if !failed {
+			failingSince = time.Now()
+		}
 		failed = true
 		if c.x.Problem != nil {
 			c.x.Problem(c.f, err)
+		}
+		if c.x.GiveUp > 0 && time.Since(failingSince) > c.x.GiveUp {
+			return err
 		}
 		select {
 		case <-c.ctx.Done():
@@ -282,6 +292,7 @@ type identifyingReader struct {
 }
 
 func (r *identifyingReader) Read(p []byte) (int, error) {
+	var failingSince time.Time
 	pause := r.x.Retry
 	if pause <= 0 {
 		pause = time.Second
@@ -308,9 +319,15 @@ func (r *identifyingReader) Read(p []byte) (int, error) {
 				failed = false
 				continue
 			}
+			if !failed {
+				failingSince = time.Now()
+			}
 			failed = true
 			if r.x.Problem != nil {
 				r.x.Problem(r.f, err)
+			}
+			if r.x.GiveUp > 0 && time.Since(failingSince) > r.x.GiveUp {
+				return 0, err
 			}
 			select {
 			case <-r.ctx.Done():
@@ -466,7 +483,7 @@ func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (_ io.Re
 	}
 	client := h.Client
 	if client == nil {
-		client = defaultHTTP
+		client = HTTPClient
 	}
 	resp, err := client.Do(req)
 	if err != nil {
@@ -502,9 +519,10 @@ func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (_ io.Re
 
 func (h HTTPOrigin) String() string { return "upstream" }
 
-// defaultHTTP is the client of an HTTPOrigin without one: an answer's
-// headers waited for 2 minutes at most.
-var defaultHTTP = func() *http.Client {
+// HTTPClient is the client of an HTTPOrigin without one (and of Kairo's
+// other reads of upstream): an answer's headers waited for 2 minutes at
+// most.
+var HTTPClient = func() *http.Client {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.ResponseHeaderTimeout = 2 * time.Minute
 	return &http.Client{Transport: t}

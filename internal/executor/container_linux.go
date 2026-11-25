@@ -541,7 +541,7 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		// loader with it, never with a position of another attempt's
 		var session [16]byte
 		_, _ = rand.Read(session[:])
-		args := []string{self, "loader", "serve", "--spec", specPath, "--listen", "unix:" + sock, "--session", hex.EncodeToString(session[:])}
+		args := []string{self, "loader", "serve", "--spec", specPath, "--listen", "unix:" + sock, "--session", hex.EncodeToString(session[:]), "--state", filepath.Dir(specPath)}
 		if len(s.Positions) > 0 {
 			positions, _ := json.Marshal(s.Positions)
 			p := path.Join(dir, "positions.json")

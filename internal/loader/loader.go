@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -51,13 +52,16 @@ type Loader struct {
 	// Identified hears a file's identity once a source read it the first
 	// time (for Kairo to keep: later reads are checked against it).
 	Identified func(source int, f File)
+	// StateDir, when set, keeps which ranks were served across the
+	// loader's restarts (a file served-<rank> each).
+	StateDir string
 
 	mu        sync.Mutex
 	world     int
 	delivered []Position // per rank: its next position not yet handed over
 	floor     []Position // per rank: where the stream was started (a checkpoint's)
 	present   []bool     // per rank: a process takes it now
-	joined    []bool     // per rank: a process took it since this loader started
+	served    []bool     // per rank: it was handed an item (since the stream started: StateDir)
 	gen       *generation
 	stopped   bool
 	hard      error
@@ -104,7 +108,13 @@ func (l *Loader) Start(ctx context.Context, world int, positions []Position) err
 		return fmt.Errorf("positions of %d ranks, for %d ranks (a run keeps its ranks)", len(positions), world)
 	}
 	l.world = world
-	l.present, l.joined = make([]bool, world), make([]bool, world)
+	l.present, l.served = make([]bool, world), make([]bool, world)
+	if l.StateDir != "" {
+		for r := range l.served {
+			_, err := os.Stat(filepath.Join(l.StateDir, fmt.Sprintf("served-%d", r)))
+			l.served[r] = err == nil
+		}
+	}
 	l.delivered = make([]Position, world)
 	seen := make([]bool, world)
 	for r := range l.delivered {
@@ -174,8 +184,8 @@ func (l *Loader) startLocked(parent context.Context) {
 	go func() {
 		defer close(gen.done)
 		err := l.produce(ctx, gen, positions)
-		if ctx.Err() != nil {
-			return // made again from other positions, or stopped
+		if ctx.Err() != nil || errors.Is(err, errAllAway) {
+			return // made again from other positions (or when a rank comes back), or stopped
 		}
 		end := item{end: true}
 		l.mu.Lock()
@@ -321,7 +331,14 @@ func (l *Loader) put(ctx context.Context, gen *generation, r int, it item) error
 			}
 			gen.overflow[r], overflowed = true, true
 		}
+		allAway := overflowed
+		for q := range gen.overflow {
+			allAway = allAway && gen.overflow[q] && !l.present[q]
+		}
 		l.mu.Unlock()
+		if allAway {
+			return errAllAway // made again when a rank comes back
+		}
 		if overflowed {
 			return ctx.Err()
 		}
@@ -348,7 +365,7 @@ func (l *Loader) put(ctx context.Context, gen *generation, r int, it item) error
 func (l *Loader) attach(ctx context.Context, r int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.present[r], l.joined[r] = true, true
+	l.present[r] = true
 	gen := l.gen
 	if gen == nil || gen.rankCtx == nil || l.stopped || l.hard != nil {
 		return
@@ -372,11 +389,11 @@ func (l *Loader) detach(r int) {
 	}
 }
 
-// joinedBefore: a process took rank r since this loader started.
-func (l *Loader) joinedBefore(r int) bool {
+// servedBefore: rank r was handed an item since the stream started.
+func (l *Loader) servedBefore(r int) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return l.joined[r]
+	return l.served[r]
 }
 
 // cost is what an item takes of its rank's budget (all of it at most).
@@ -391,6 +408,9 @@ func (l *Loader) rankBudget() int64 {
 	}
 	return max(l.Spec.MemoryBytes/4/int64(l.world), 1<<20)
 }
+
+// errAllAway: no rank is taken and none has room: nothing is made for no one.
+var errAllAway = errors.New("every rank is away")
 
 // ErrRankTaken: a rank already has a process taking its records.
 var ErrRankTaken = errors.New("rank taken")
@@ -435,6 +455,14 @@ func (l *Loader) took(gen *generation, r int, it item) (item, bool) {
 	}
 	l.mu.Lock()
 	current := l.gen == gen
+	if current && !it.end && it.err == nil && !l.served[r] {
+		l.served[r] = true
+		if l.StateDir != "" {
+			if f, err := os.Create(filepath.Join(l.StateDir, fmt.Sprintf("served-%d", r))); err == nil {
+				f.Close()
+			}
+		}
+	}
 	if current && !it.end && it.err == nil {
 		switch {
 		case it.skip || it.last:

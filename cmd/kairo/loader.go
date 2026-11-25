@@ -23,6 +23,7 @@ func loaderServe(args []string) error {
 	world := fs.Int("world", 0, "the ranks the stream is split between (0: the first rank's hello says)")
 	positionsPath := fs.String("positions", "", "where each rank starts (JSON list of {rank, record, sub}); none: the start")
 	session := fs.String("session", "", "the session takers come back with (the same across this loader's restarts; none: a random one)")
+	state := fs.String("state", "", "a directory keeping which ranks were served across this loader's restarts")
 	origin := fs.String("origin", "http", "where files are read: http (each file's URL) or dir:DIR (files by name under DIR)")
 	rawDir := fs.String("raw", "", "the node's raw cache for this attempt (its directory, with the agent's socket): every file made ready, checked and identified there before it is read; without it, files are read from --origin, one never read before identified as it is read")
 	if _, err := parseFlags(fs, args); err != nil {
@@ -45,7 +46,7 @@ func loaderServe(args []string) error {
 			*world = len(positions)
 		}
 	}
-	var o loader.Origin = loader.HTTPOrigin{Client: http.DefaultClient}
+	var o loader.Origin = loader.HTTPOrigin{}
 	if dir, ok := strings.CutPrefix(*origin, "dir:"); ok {
 		o = loader.DirOrigin{Root: dir}
 	} else if *origin != "http" {
@@ -78,7 +79,7 @@ func loaderServe(args []string) error {
 		}
 		fetch.Resolve = agent.Resolve
 	}
-	l := &loader.Loader{Spec: spec, Fetch: fetch, Identified: func(_ int, f loader.File) {
+	l := &loader.Loader{Spec: spec, Fetch: fetch, StateDir: *state, Identified: func(_ int, f loader.File) {
 		fmt.Fprintf(os.Stderr, "kairo loader: %s identified: %d bytes, sha256 %s\n", f.Name, f.Size, f.SHA256)
 	}}
 	fmt.Fprintf(os.Stderr, "kairo loader: listening on %s\n", *listen)

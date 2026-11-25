@@ -119,7 +119,7 @@ def test_a_broken_connection_is_made_again_where_the_rank_stands() -> None:
         got = list(s)
         assert got == [b"r0", b"r1", b"r2", b"r4", b"r5", b"r5-bis", b"r6", b"r7", b"r8", b"r9"]
         assert loader.hellos[0].get("position") is None
-        assert loader.hellos[1]["position"] == {"record": 5, "sub": 1}
+        assert loader.hellos[1]["position"] == {"rank": 0, "record": 5, "sub": 1}
     finally:
         loader.close()
 

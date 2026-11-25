@@ -792,3 +792,49 @@ func TestARankAwayHoldsNoOneUp(t *testing.T) {
 		t.Fatalf("rank 0 %d items (want %d), rank 1 %d (want %d)", len(got0), len(want[0]), len(got1), len(want[1]))
 	}
 }
+
+// A rank served comes back only with its position, also to a loader started
+// again (StateDir); a rank never served joins as at the start; a position
+// is its own rank's.
+func TestServedRanksAreKeptAcrossALoadersRestart(t *testing.T) {
+	spec, dir := testData(t)
+	state := t.TempDir()
+	serve := func() (context.CancelFunc, string) {
+		ctx, cancel := context.WithCancel(context.Background())
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}, StateDir: state}, World: 2, Session: "s"}).Serve(ctx, ln)
+		return cancel, ln.Addr().String()
+	}
+	cancel, addr := serve()
+	c, err := Dial(context.Background(), "tcp", addr, 0, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Next(); err != nil {
+		t.Fatal(err)
+	}
+	resume := c.Resume()
+	c.Close()
+	cancel()
+	cancel, addr = serve() // started again
+	defer cancel()
+	if _, err := Dial(context.Background(), "tcp", addr, 0, 2, nil); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("served rank 0 without its position, the loader started again: %v", err)
+	}
+	if _, err := Dial(context.Background(), "tcp", addr, 1, 2, resume); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("rank 1 with rank 0's position: %v", err)
+	}
+	c, err = Dial(context.Background(), "tcp", addr, 0, 2, resume)
+	if err != nil || c.Position != resume.Position {
+		t.Fatalf("rank 0 with its position: %+v %v", c, err)
+	}
+	c.Close()
+	c1, err := Dial(context.Background(), "tcp", addr, 1, 2, nil)
+	if err != nil {
+		t.Fatalf("rank 1, never served: %v", err)
+	}
+	c1.Close()
+}

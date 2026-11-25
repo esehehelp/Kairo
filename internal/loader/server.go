@@ -240,10 +240,13 @@ func (s *Server) join(hello Hello) (int, error) {
 	if hello.Rank < 0 || hello.Rank >= world {
 		return 0, fmt.Errorf("no rank %d of %d", hello.Rank, world)
 	}
-	if hello.Position == nil && s.Loader.joinedBefore(hello.Rank) {
+	if hello.Position == nil && s.Loader.servedBefore(hello.Rank) {
 		// what was handed ahead to the process before may not have been
 		// taken: only its position says where it stands
-		return 0, fmt.Errorf("rank %d was taken before: it comes back with its position and session (one stream per rank, kept open)", hello.Rank)
+		return 0, fmt.Errorf("rank %d was served before: it comes back with its position and session (one stream per rank, kept open)", hello.Rank)
+	}
+	if hello.Position != nil && hello.Position.Rank != hello.Rank {
+		return 0, fmt.Errorf("rank %d comes back with rank %d's position", hello.Rank, hello.Position.Rank)
 	}
 	// a taker coming back right after its connection broke may find the old
 	// one not noticed gone yet: it is given a while to go
@@ -261,7 +264,6 @@ func (s *Server) join(hello Hello) (int, error) {
 	s.taken[hello.Rank] = true
 	if hello.Position != nil {
 		p := *hello.Position
-		p.Rank = hello.Rank
 		if p.Record < 0 || p.Record > maxRecord || p.Sub < 0 || p.Sub > maxSub {
 			delete(s.taken, hello.Rank)
 			return 0, fmt.Errorf("position %+v is out of bounds", p)

@@ -70,8 +70,8 @@ class Stream:
     ) -> None:
         self.address = address
         self.name = name or address
-        self.rank = rank
-        self.world = world
+        self._rank = rank
+        self._world = world
         self.window = max(2, window)
         self.reconnect_seconds = reconnect_seconds
         self.position: dict[str, int] = {"rank": rank, "record": 0, "sub": 0}
@@ -82,6 +82,16 @@ class Stream:
         self._ended = False
         self._connect(None)
 
+    @property
+    def rank(self) -> int:
+        """The rank this stream takes (fixed when it was opened)."""
+        return self._rank
+
+    @property
+    def world(self) -> int:
+        """The ranks of the stream, as the loader agreed (fixed)."""
+        return self._world
+
     # -- the connection -----------------------------------------------------
 
     def _connect(self, at: dict[str, int] | None) -> None:
@@ -91,7 +101,7 @@ class Stream:
             sock.connect(target)
             hello: dict[str, Any] = {"version": PROTOCOL_VERSION, "rank": self.rank, "world": self.world}
             if at is not None:
-                hello["position"] = {"record": int(at["record"]), "sub": int(at.get("sub", 0))}
+                hello["position"] = {"rank": self.rank, "record": int(at["record"]), "sub": int(at.get("sub", 0))}
                 hello["session"] = self._session
             sock.sendall(_frame(_HELLO, json.dumps(hello).encode()))
             reader = sock.makefile("rb", buffering=1 << 20)
