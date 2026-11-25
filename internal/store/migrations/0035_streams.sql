@@ -15,6 +15,19 @@ CREATE TABLE raw_identities(
  identified_at TEXT NOT NULL,
  attempt_id TEXT
 );
+-- raw files kept on a volatile store (<root>/raw/<sha256>) by the agent serving it, fetched and checked there before a
+-- loader is handed them; evicted least recently used first when the store runs short (evictions.go)
+CREATE TABLE raw_placements(
+ store_id TEXT NOT NULL,
+ root TEXT NOT NULL,
+ sha256 TEXT NOT NULL,
+ executor_id TEXT NOT NULL,
+ bytes BIGINT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN('ready','evicting')),
+ created_at TEXT NOT NULL,
+ last_used_at TEXT NOT NULL,
+ PRIMARY KEY(store_id,sha256)
+);
 CREATE TABLE raw_records(
  sha256 TEXT NOT NULL,
  framing TEXT NOT NULL,

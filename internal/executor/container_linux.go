@@ -548,6 +548,9 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		if report {
 			args = append(args, "--report")
 		}
+		if spec.RawDir != "" {
+			args = append(args, "--raw", spec.RawDir)
+		}
 		p := &loaderProc{stream: s.Name, args: args, dir: spec.CWD, env: env, logs: logs}
 		if err := p.start(); err != nil {
 			return procs, env, fmt.Errorf("stream %s: start its loader: %w", s.Name, err)

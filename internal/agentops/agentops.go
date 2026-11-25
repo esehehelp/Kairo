@@ -13,6 +13,7 @@ package agentops
 import (
 	"encoding/json"
 
+	"kairo/internal/loader"
 	"kairo/internal/machine"
 	"kairo/internal/store"
 )
@@ -224,6 +225,14 @@ type (
 		ObjectID   string `json:"object_id"`
 		StoreID    string `json:"store_id"`
 	}
+	// RawPlacedRequest is a raw file an executor fetched, checked and keeps
+	// on a volatile store (store.RawPlaced).
+	RawPlacedRequest struct {
+		ExecutorID string      `json:"executor_id"`
+		StoreID    string      `json:"store_id"`
+		Root       string      `json:"root"`
+		File       loader.File `json:"file"`
+	}
 	// KeepIdentityRequest is the file list beside an executor's copy of a
 	// dropped object (store.KeepIdentity).
 	KeepIdentityRequest struct {
@@ -353,6 +362,7 @@ var (
 	InputIsFile      = Op[InputPathRequest, OK]{Name: "input-is-file", Observe: Refused}
 	ClaimShed        = Op[ObjectStoreRequest, OK]{Name: "claim-shed", Observe: Refused}
 	KeepIdentity     = Op[KeepIdentityRequest, OK]{Name: "keep-identity", Observe: Refused, MaxBody: MaxIdentityList * 2}
+	RawPlaced        = Op[RawPlacedRequest, OK]{Name: "raw-placed", Observe: Refused, MaxBody: 64 << 20}
 	InventoryDurable = Op[InventoryRequest, store.DurableInventory]{Name: "inventory-durable", Observe: Refused}
 	AdoptCopies      = Op[AdoptCopiesRequest, AdoptedAnswer]{Name: "adopt-copies", Observe: Refused}
 	RecordCopy       = Op[RecordCopyRequest, OK]{Name: "record-copy", Observe: Refused}
@@ -406,7 +416,7 @@ var (
 var All = []Named{
 	Register, Observations, ReserveNext, EnsurePreemption, Stores, StoreObservation, AttemptScratch, ScratchToSettle,
 	SettleScratch, RunOutput, PacksToMake, RecordPack, CopiesToMake, RecordDescribed, AbandonPack, InPlaceSources,
-	InputGone, InputIsFile, ClaimShed, KeepIdentity, InventoryDurable, AdoptCopies, RecordCopy, FetchesToMake, RecordFetch,
+	InputGone, InputIsFile, ClaimShed, KeepIdentity, RawPlaced, InventoryDurable, AdoptCopies, RecordCopy, FetchesToMake, RecordFetch,
 	DeletionsToMake, SettleDeletion, SourcesInUse, EvictionsToMake, SettleEviction, ScrubsToMake, RecordScrub,
 	PackRead, UnlaunchedLeases, ValidateReservation, MarkLeasePrepared, ReleaseReservation, AuthorizeLaunch,
 	ActivateLaunch, SetLogPaths, LogProblem, MarkProcessExited, RecordTerminal, QuiescenceCandidates,

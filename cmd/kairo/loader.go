@@ -31,6 +31,7 @@ func loaderServe(args []string) error {
 	world := fs.Int("world", 0, "the ranks the stream is split between (0: the first rank's hello says)")
 	positionsPath := fs.String("positions", "", "where each rank starts (JSON list of {rank, record, sub}); none: the start")
 	origin := fs.String("origin", "http", "where files are read: http (each file's URL) or dir:DIR (files by name under DIR)")
+	rawDir := fs.String("raw", "", "the node's raw cache (its directory, with the agent's socket): every file made ready and checked there before it is read")
 	report := fs.Bool("report", false, "report what is learned of files (identities, record counts) to the daemon as the attempt (KAIRO_API_URL, KAIRO_ATTEMPT_TOKEN, KAIRO_API_CA)")
 	if _, err := parseFlags(fs, args); err != nil {
 		return err
@@ -78,6 +79,13 @@ func loaderServe(args []string) error {
 		}
 		fmt.Fprintf(os.Stderr, "kairo loader: %s: %v\n", f.Name, err)
 	}}
+	if *rawDir != "" {
+		agent := loader.NewAgent(*rawDir, o)
+		agent.Problem = func(f loader.File, err error) {
+			fmt.Fprintf(os.Stderr, "kairo loader: %s: %v\n", f.Name, err)
+		}
+		fetch.Resolve = agent.Resolve
+	}
 	l := &loader.Loader{Spec: spec, Fetch: fetch}
 	if *report {
 		r, err := newStreamReporter()
@@ -89,7 +97,7 @@ func loaderServe(args []string) error {
 			src := spec.Sources[source]
 			r.add(store.StreamReport{Records: []store.RecordsCount{{URL: f.URL, SHA256: f.SHA256, Format: src.Format, Field: src.Field, Records: records}}})
 		}
-		l.Identified = func(_ int, f loader.File) {
+		l.Identified = func(_ int, f loader.File) { // read without the raw cache only
 			fmt.Fprintf(os.Stderr, "kairo loader: %s identified: %d bytes, sha256 %s\n", f.Name, f.Size, f.SHA256)
 			r.add(store.StreamReport{Identities: []loader.File{f}})
 		}

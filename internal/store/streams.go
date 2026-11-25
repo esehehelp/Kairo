@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"kairo/internal/loader"
+	"kairo/internal/machine"
 	"kairo/internal/orchestration"
 )
 
@@ -236,27 +237,8 @@ func (s *Store) RecordStreamReport(ctx context.Context, attemptID, leaseID strin
 		if !ok {
 			return fmt.Errorf("%w: %s is no file of a stream this attempt reads", ErrStreamReportRefused, f.URL)
 		}
-		if f.Size < 0 || f.ChunkBytes < 1 || !sha256Hex.MatchString(f.SHA256) || int64(len(f.Chunks)) != (f.Size+f.ChunkBytes-1)/f.ChunkBytes {
-			return fmt.Errorf("identity of %s: a size, a sha256 and a hash per chunk", f.URL)
-		}
-		for _, c := range f.Chunks {
-			if !sha256Hex.MatchString(c) {
-				return fmt.Errorf("identity of %s: a chunk hash is not a sha256", f.URL)
-			}
-		}
-		if want.SHA256 != "" && want.SHA256 != f.SHA256 || want.Size > 0 && want.Size != f.Size {
-			return fmt.Errorf("%w: %s read as %s (%d bytes), published as %s (%d bytes)", ErrRawChanged, f.URL, f.SHA256, f.Size, want.SHA256, want.Size)
-		}
-		chunks, _ := json.Marshal(f.Chunks)
-		var size, chunkBytes int64
-		var sha, keptChunks string
-		err := tx.QueryRowContext(ctx, `INSERT INTO raw_identities(url,size,sha256,chunk_bytes,chunks_json,identified_at,attempt_id) VALUES($1,$2,$3,$4,$5,$6,$7)
-			ON CONFLICT(url) DO UPDATE SET url=raw_identities.url RETURNING size,sha256,chunk_bytes,chunks_json`, f.URL, f.Size, f.SHA256, f.ChunkBytes, string(chunks), t, attemptID).Scan(&size, &sha, &chunkBytes, &keptChunks)
-		if err != nil {
+		if err := keepIdentityTx(ctx, tx, want, f, attemptID); err != nil {
 			return err
-		}
-		if size != f.Size || sha != f.SHA256 || chunkBytes != f.ChunkBytes || keptChunks != string(chunks) {
-			return fmt.Errorf("%w: %s was %s (%d bytes) the first time it was read, %s (%d bytes) now", ErrRawChanged, f.URL, sha, size, f.SHA256, f.Size)
 		}
 	}
 	for _, r := range report.Records {
@@ -292,4 +274,104 @@ func (s *Store) RecordStreamReport(ctx context.Context, attemptID, leaseID strin
 		}
 	}
 	return tx.Commit()
+}
+
+// RawPlaced is a raw file the agent of executorID fetched, checked and kept
+// on volatile store storeID at root (<root>/raw/<sha256>), or handed a loader
+// again: its identity is recorded as a loader's would be (the first of its
+// URL stands; another is ErrRawChanged), the file kept as on the store (last
+// used now). With no store, a file too large to keep: its identity only.
+// The URL must be a file of a stream an execution leased on executorID
+// reads.
+func (s *Store) RawPlaced(ctx context.Context, executorID, storeID, root string, f loader.File) error {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	me, err := executorInfoTx(ctx, tx, executorID)
+	if err != nil {
+		return err
+	}
+	declared, err := declaredStores(ctx, tx)
+	if err != nil {
+		return err
+	}
+	served := storeID == ""
+	for _, d := range declared {
+		served = served || d.ID == storeID && d.Class == machine.StoreVolatile && d.Root == root && me.serves(d, executorID)
+	}
+	if !served {
+		return fmt.Errorf("%w: executor %s serves no volatile store %s at %s", ErrStreamReportRefused, executorID, storeID, root)
+	}
+	var want *orchestration.RawFile
+	err = eachRow(ctx, tx, `SELECT e.streams_json FROM leases l JOIN execution_requests e ON e.id=l.execution_id
+		WHERE l.executor_id=$1 AND l.state IN('reserved','prepared','active') AND e.streams_json IS NOT NULL`, []any{executorID}, func(rows *sql.Rows) error {
+		var body string
+		if err := rows.Scan(&body); err != nil {
+			return err
+		}
+		var decls []orchestration.StreamDecl
+		if err := json.Unmarshal([]byte(body), &decls); err != nil {
+			return err
+		}
+		for _, d := range decls {
+			for _, files := range d.Files {
+				for i := range files {
+					if files[i].URL == f.URL {
+						want = &files[i]
+					}
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if want == nil {
+		return fmt.Errorf("%w: %s is no file of a stream an execution leased on %s reads", ErrStreamReportRefused, f.URL, executorID)
+	}
+	if err := keepIdentityTx(ctx, tx, *want, f, ""); err != nil {
+		return err
+	}
+	if storeID == "" {
+		return tx.Commit()
+	}
+	t := now()
+	if _, err := tx.ExecContext(ctx, `INSERT INTO raw_placements(store_id,root,sha256,executor_id,bytes,state,created_at,last_used_at) VALUES($1,$2,$3,$4,$5,'ready',$6,$7)
+		ON CONFLICT(store_id,sha256) DO UPDATE SET root=excluded.root,executor_id=excluded.executor_id,bytes=excluded.bytes,state='ready',last_used_at=excluded.last_used_at`,
+		storeID, root, f.SHA256, executorID, f.Size, t, t); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// keepIdentityTx records f as what its URL was found to be (declared as
+// want), unless another identity of it stands (ErrRawChanged), or f is not
+// what was published of it.
+func keepIdentityTx(ctx context.Context, tx *sql.Tx, want orchestration.RawFile, f loader.File, attemptID string) error {
+	if f.Size < 0 || f.ChunkBytes < 1 || !sha256Hex.MatchString(f.SHA256) || int64(len(f.Chunks)) != (f.Size+f.ChunkBytes-1)/f.ChunkBytes {
+		return fmt.Errorf("identity of %s: a size, a sha256 and a hash per chunk", f.URL)
+	}
+	for _, c := range f.Chunks {
+		if !sha256Hex.MatchString(c) {
+			return fmt.Errorf("identity of %s: a chunk hash is not a sha256", f.URL)
+		}
+	}
+	if want.SHA256 != "" && want.SHA256 != f.SHA256 || want.Size > 0 && want.Size != f.Size {
+		return fmt.Errorf("%w: %s read as %s (%d bytes), published as %s (%d bytes)", ErrRawChanged, f.URL, f.SHA256, f.Size, want.SHA256, want.Size)
+	}
+	chunks, _ := json.Marshal(f.Chunks)
+	var size, chunkBytes int64
+	var sha, keptChunks string
+	err := tx.QueryRowContext(ctx, `INSERT INTO raw_identities(url,size,sha256,chunk_bytes,chunks_json,identified_at,attempt_id) VALUES($1,$2,$3,$4,$5,$6,$7)
+		ON CONFLICT(url) DO UPDATE SET url=raw_identities.url RETURNING size,sha256,chunk_bytes,chunks_json`, f.URL, f.Size, f.SHA256, f.ChunkBytes, string(chunks), now(), nullable(attemptID)).Scan(&size, &sha, &chunkBytes, &keptChunks)
+	if err != nil {
+		return err
+	}
+	if size != f.Size || sha != f.SHA256 || chunkBytes != f.ChunkBytes || keptChunks != string(chunks) {
+		return fmt.Errorf("%w: %s was %s (%d bytes) the first time it was read, %s (%d bytes) now", ErrRawChanged, f.URL, sha, size, f.SHA256, f.Size)
+	}
+	return nil
 }

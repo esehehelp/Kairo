@@ -85,12 +85,28 @@ type Fetcher struct {
 	// Problem, when set, hears each failure and, with a nil error, that the
 	// file is being read again.
 	Problem func(f File, err error)
+	// Resolve, when set, is asked for each file before it is read: the file
+	// as identified and where to read it from (the node's raw cache,
+	// agent.go). A file is then never read unidentified.
+	Resolve func(ctx context.Context, f File) (File, Origin, error)
 }
 
 // Open reads f from chunk on. A file never read before (no chunk hashes:
 // Identified) is read from its start, its identity made as it is read; its
 // sha256 and size, when published, are checked at its end.
 func (x *Fetcher) Open(ctx context.Context, f File, chunk int) (io.ReadCloser, error) {
+	if x.Resolve != nil {
+		resolved, origin, err := x.Resolve(ctx, f)
+		if err != nil {
+			return nil, err
+		}
+		if !resolved.Identified() {
+			return nil, fmt.Errorf("file %s was resolved without its identity", f.Name)
+		}
+		via := *x
+		via.Resolve, via.Origin = nil, origin
+		return via.Open(ctx, resolved, chunk)
+	}
 	if !f.Identified() {
 		if f.Name == "" || chunk != 0 || f.SHA256 != "" && !hexSHA256.MatchString(f.SHA256) {
 			return nil, fmt.Errorf("file %q, not identified yet, is read from its start", f.Name)
@@ -220,6 +236,9 @@ func (c *checkedReader) closeBody() {
 		c.body = nil
 	}
 }
+
+// Identity is the file as identified (what was checked).
+func (c *checkedReader) Identity() (File, bool) { return c.f, true }
 
 func (c *checkedReader) Close() error {
 	c.closeBody()

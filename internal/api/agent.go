@@ -205,6 +205,13 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentops.ObjectStoreRequest) (agentops.OK, error) {
 				return recorded(s.Store.ClaimShed(ctx, b.ExecutorID, b.ObjectID, b.StoreID))
 			}),
+		handle(s, agentops.RawPlaced,
+			func(ctx context.Context, b agentops.RawPlacedRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentops.RawPlacedRequest) (agentops.OK, error) {
+				return recorded(s.Store.RawPlaced(ctx, b.ExecutorID, b.StoreID, b.Root, b.File))
+			}),
 		handle(s, agentops.KeepIdentity,
 			func(ctx context.Context, b agentops.KeepIdentityRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.ExecutorID)

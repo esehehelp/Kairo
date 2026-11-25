@@ -66,6 +66,8 @@ func (e *storeWorker) evictDue(ctx context.Context) {
 			err = removeBrought(s.decl.Root, o.ObjectID)
 		case store.EvictTemporal:
 			err = e.evictTemporal(ctx, s, o)
+		case store.EvictRaw:
+			err = removeRaw(s.decl.Root, o.ObjectID)
 		default:
 			continue
 		}

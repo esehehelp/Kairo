@@ -188,8 +188,9 @@ var errSourceEnded = errors.New("source ended")
 func (s *sourceStream) endFile() {
 	if r, ok := s.body.(interface{ Identity() (File, bool) }); ok {
 		if f, done := r.Identity(); done {
+			was := s.spec.Files[s.order[s.file]]
 			s.spec.Files[s.order[s.file]] = f
-			if s.identified != nil {
+			if s.identified != nil && !was.Identified() {
 				s.identified(s.index, f)
 			}
 		}

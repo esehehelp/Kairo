@@ -45,6 +45,9 @@ type storeWorker struct {
 	// directory none of whose attempts runs here, by run.
 	outputSized map[string]int64
 
+	// raws are the raw caches of the volatile stores, by store (rawcache.go).
+	raws map[string]*rawCache
+
 	// The rounds: packing (pack.go), copies to a durable store
 	// (transfer.go), fetches (fetch.go), deleting copied sources and reading
 	// durable copies back (retire.go), evictions (evict.go), durable

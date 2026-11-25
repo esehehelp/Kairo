@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"kairo/internal/loader"
+	"kairo/internal/machine"
 	"kairo/internal/orchestration"
 )
 
@@ -167,5 +168,41 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 	got0 := streams[0].Positions
 	if !(got0[0] == (loader.Position{Rank: 1, Record: 4}) && got0[1] == (loader.Position{Rank: 0, Record: 5, Sub: 1})) {
 		t.Fatalf("positions %+v", got0)
+	}
+
+	// the raw cache: a file placed on a volatile store the executor serves
+	// is recorded (its identity checked as a loader's), and evicted first
+	// among what can be had again when the store runs short
+	addTestDisk(t, store, "node", "D:")
+	declareTestStore(t, store, machine.Store{ID: "vol", Class: machine.StoreVolatile, Node: "node", Executor: "ctr", Root: "D:/kairo-vol", Filesystem: "D:"})
+	if err := store.RawPlaced(ctx, "ctr", "vol", "D:/kairo-vol", f); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RawPlaced(ctx, "ctr", "", "", f); err != nil {
+		t.Fatalf("identity only: %v", err)
+	}
+	if err := store.RawPlaced(ctx, "ctr", "vol", "D:/kairo-vol", changed); !errors.Is(err, ErrRawChanged) {
+		t.Fatalf("another identity placed: %v", err)
+	}
+	if err := store.RawPlaced(ctx, "ctr", "vol", "D:/kairo-vol", other); !errors.Is(err, ErrStreamReportRefused) {
+		t.Fatalf("a file of no leased stream placed: %v", err)
+	}
+	if err := store.RawPlaced(ctx, "ctr", "none", "D:/x", f); !errors.Is(err, ErrStreamReportRefused) {
+		t.Fatalf("placed on a store not served: %v", err)
+	}
+	totalBytes, freeBytes := int64(100<<30), int64(1<<20)
+	if err := store.RecordStoreObservation(ctx, StoreObservation{StoreID: "vol", ExecutorID: "ctr", Root: "D:/kairo-vol", Usable: true, FreeBytes: &freeBytes, TotalBytes: &totalBytes}); err != nil {
+		t.Fatal(err)
+	}
+	evictions, err := store.EvictionsToMake(ctx, "ctr")
+	if err != nil || len(evictions) != 1 || evictions[0].Kind != EvictRaw || evictions[0].ObjectID != f.SHA256 {
+		t.Fatalf("evictions %+v %v", evictions, err)
+	}
+	if err := store.SettleEviction(ctx, EvictionSettled{ObjectID: f.SHA256, Kind: EvictRaw, StoreID: "vol", ExecutorID: "ctr", Evicted: true}); err != nil {
+		t.Fatal(err)
+	}
+	var left int
+	if err := store.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM raw_placements`).Scan(&left); err != nil || left != 0 {
+		t.Fatalf("placements left %d %v", left, err)
 	}
 }

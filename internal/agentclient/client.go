@@ -22,6 +22,7 @@ import (
 
 	"kairo/internal/agentops"
 	"kairo/internal/api"
+	"kairo/internal/loader"
 	"kairo/internal/machine"
 	"kairo/internal/store"
 )
@@ -213,6 +214,12 @@ func (c *Client) AdoptCopies(ctx context.Context, executorID, storeID, root stri
 // reserve; the files are removed only once it is claimed.
 func (c *Client) ClaimShed(ctx context.Context, executorID, objectID, storeID string) error {
 	return done(ctx, c, agentops.ClaimShed, agentops.ObjectStoreRequest{ExecutorID: executorID, ObjectID: objectID, StoreID: storeID})
+}
+
+// RawPlaced records a raw file the executor fetched, checked and keeps on a
+// volatile store, and its identity.
+func (c *Client) RawPlaced(ctx context.Context, executorID, storeID, root string, f loader.File) error {
+	return done(ctx, c, agentops.RawPlaced, agentops.RawPlacedRequest{ExecutorID: executorID, StoreID: storeID, Root: root, File: f})
 }
 
 // KeepIdentity sends the file list beside a copy of a dropped object, for
