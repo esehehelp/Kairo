@@ -196,7 +196,7 @@ func submitBody(requestID string) map[string]any {
 	return map[string]any{
 		"client_request_id": requestID, "project": "example-train",
 		"queue": "training", "task": "model", "argv": []string{"python", "train.py"},
-		"cwd": "/work", "checkpointable": true, "preemptible": true,
+		"cwd": "/work", "checkpointable": true, "preemptible": true, "image": testImage,
 		"executor": map[string]any{"labels": map[string]string{"environment": "wsl2"}},
 	}
 }
@@ -231,6 +231,24 @@ func TestExecutionSubmissionIsIdempotentAndCreatesScopes(t *testing.T) {
 	body["schema_version"] = 2
 	if status, payload = d.call(t, http.MethodPost, "/api/executions", d.admin, body); status != http.StatusBadRequest {
 		t.Fatalf("schema_version accepted: %d %s", status, payload)
+	}
+	// Every executor runs containers: an execution without an image has
+	// nowhere to run.
+	bare := submitBody("bare")
+	delete(bare, "image")
+	if status, payload = d.call(t, http.MethodPost, "/api/executions", d.admin, bare); status != http.StatusBadRequest || !bytes.Contains(payload, []byte("image")) {
+		t.Fatalf("an execution without an image: %d %s", status, payload)
+	}
+}
+
+// A task without an image has nowhere to run: its declaration is refused.
+func TestATaskWithoutAnImageIsRefusedAtApply(t *testing.T) {
+	d := newTestDaemon(t, false)
+	body := projectBody("uv", "run", "train")
+	delete(body["tasks"].([]any)[0].(map[string]any)["execution"].(map[string]any), "image")
+	status, raw := d.call(t, http.MethodPost, "/api/projects", d.admin, body)
+	if status != http.StatusBadRequest || !bytes.Contains(raw, []byte("train name no image")) {
+		t.Fatalf("apply of a task without an image: %d %s", status, raw)
 	}
 }
 
@@ -377,14 +395,19 @@ func TestForcedScopePause(t *testing.T) {
 	}
 }
 
+// testImage is the image the tests' executions run in.
+const testImage = "docker.io/library/python@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b"
+
 func projectBody(argv ...any) map[string]any {
 	return map[string]any{
 		"schema_version": 1,
 		"project":        map[string]any{"name": "example-app"},
+		"images":         map[string]any{"py": map[string]any{"ref": "python:3.12"}},
+		"image_pins":     map[string]any{"py": testImage},
 		"tasks": []any{map[string]any{
 			"name": "train", "queue": "training", "depends_on": []any{}, "policy": "RunToCompletion@v1",
 			"execution": map[string]any{
-				"schema_version": 2, "argv": argv, "cwd": "/work", "checkpointable": false, "preemptible": false,
+				"schema_version": 2, "argv": argv, "cwd": "/work", "checkpointable": false, "preemptible": false, "image": "py",
 				"executor": map[string]any{"labels": map[string]string{}}, "exclusive": []any{}, "capacity": map[string]any{},
 			},
 		}},

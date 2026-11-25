@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"kairo/internal/datainput"
 	"kairo/internal/store"
@@ -38,12 +39,22 @@ type submitExecutionRequest struct {
 	Confine bool `json:"confine,omitempty"`
 	// Store: the volatile store its scratch, output and cache go on.
 	Store string `json:"store,omitempty"`
+	// Image is the image the execution runs in, pinned to its digest
+	// (registry/repository@sha256:...): required, as every executor runs
+	// containers.
+	Image string `json:"image"`
 }
 
 func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 	var body submitExecutionRequest
 	if err := decode(r, &body); err != nil {
 		writeError(w, err)
+		return
+	}
+	if strings.TrimSpace(body.Image) == "" {
+		// every executor runs containers: one without an image would wait
+		// for an executor forever
+		writeError(w, errors.New("every execution runs in a container: image (an image reference pinned to its digest, registry/repository@sha256:...) is required"))
 		return
 	}
 	if body.Executor.Labels == nil {
@@ -62,7 +73,7 @@ func (s *Server) submitExecution(w http.ResponseWriter, r *http.Request) {
 		InputContinuationRef: body.InputContinuationRef, Exclusive: body.Exclusive, Capacity: body.Capacity,
 		Env: body.Env, ScratchTmpdir: body.ScratchTmpdir,
 		NotBefore: body.NotBefore, StartBy: body.StartBy, FinishBy: body.FinishBy,
-		Inputs: body.Inputs, Confine: body.Confine, Store: body.Store,
+		Inputs: body.Inputs, Confine: body.Confine, Store: body.Store, Image: body.Image,
 	})
 	if err != nil {
 		writeError(w, err)
