@@ -296,17 +296,22 @@ func ociRun(specPath string) int {
 	sigs := make(chan os.Signal, 8)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
+		// A stop reaches the runner more than once (its group, then each
+		// member): once the container is stopped, the rest is said.
+		stopped := false
 		for range sigs {
 			mu.Lock()
 			handle := current
 			mu.Unlock()
-			if handle == "" {
+			if handle == "" || stopped {
 				continue
 			}
 			logf("stopping %s", spec.Instance)
 			stopCtx, cancel := context.WithTimeout(ctx, (wslcStopSeconds+30)*time.Second)
 			if err := rt.stop(stopCtx, handle); err != nil {
 				logf("container %s not stopped: %v", spec.Instance, err)
+			} else {
+				stopped = true
 			}
 			cancel()
 		}
