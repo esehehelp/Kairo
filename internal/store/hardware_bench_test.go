@@ -471,8 +471,92 @@ func TestStorageBenchNeedsNoControllerAndHoldsItsDisk(t *testing.T) {
 		len(plan.Execution.Capacity.Disks) != 1 || plan.Execution.Capacity.Disks[0].Filesystem != "/srv" {
 		t.Fatalf("storage plan: %+v", plan)
 	}
-	// The network bench is rebuilt to run between the nodes' agents.
-	if _, err = store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:a", Node: "b"}); err == nil || !strings.Contains(err.Error(), "not available") {
-		t.Fatalf("network bench: %v", err)
+}
+
+// A network bench runs between two agents, with no task: the measuring
+// node's agent finds it with the other node's transfer endpoint and a
+// token, which that endpoint's agent checks; the measuring agent reports it
+// as a driver does; one not finished by its deadline fails.
+func TestANetworkBenchRunsBetweenTwoAgents(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupHost(t, store)
+	ctx := context.Background()
+	if err := store.UpsertExecutor(ctx, Executor{ID: "exec-a", NodeID: "a", Kind: "incus", Attributes: json.RawMessage(`{"site":"a","runtime":"incus","pack_addr":"10.0.0.1:7475"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	benchNode(t, store, "b")
+	plan, err := store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:b", Kinds: []string{"net-latency"}, DryRun: true})
+	if err != nil || plan.Run.NodeID != "a" || plan.Run.PeerNodeID == nil || *plan.Run.PeerNodeID != "b" || len(plan.Execution.Argv) != 0 {
+		t.Fatalf("plan: %+v %v", plan, err)
+	}
+	if _, err = store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:a"}); err == nil || !strings.Contains(err.Error(), "pack_addr") {
+		t.Fatalf("toward a node with no other endpoint: %v", err)
+	}
+	plan, err = store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:b", Kinds: []string{"net-latency"}})
+	if err != nil || plan.Run.ExecutionID != "" {
+		t.Fatalf("create: %+v %v", plan, err)
+	}
+	run := plan.Run.ID
+	benches, err := store.NetBenches(ctx, "b")
+	if err != nil || len(benches) != 1 || benches[0].RunID != run || benches[0].Addr != "10.0.0.1:7475" || !strings.HasPrefix(benches[0].Token, "kairo_bench_") {
+		t.Fatalf("b's benches: %+v %v", benches, err)
+	}
+	if other, err := store.NetBenches(ctx, "a"); err != nil || len(other) != 0 {
+		t.Fatalf("a measures nothing: %+v %v", other, err)
+	}
+	token := benches[0].Token
+	if err = store.AuthorizeBenchNet(ctx, "a", run, token); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct{ node, token string }{{"a", "kairo_bench_wrong"}, {"b", token}, {"a", ""}} {
+		if err = store.AuthorizeBenchNet(ctx, c.node, run, c.token); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%+v authorized: %v", c, err)
+		}
+	}
+	status, err := store.NetBenchStatus(ctx, "b", run)
+	if err != nil || status.Peer != "10.0.0.1:7475" || status.Rank != 1 || status.Run.ID != run {
+		t.Fatalf("status: %+v %v", status, err)
+	}
+	if _, err = store.NetBenchStatus(ctx, "a", run); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("the measured node's status: %v", err)
+	}
+	if err = store.NetBenchStart(ctx, "b", run, BenchStart{DriverBuild: "test"}); err != nil {
+		t.Fatal(err)
+	}
+	ref := BenchReference{Unit: "request", WorkPerSecond: []float64{1e4, 1e4, 1e4}, Mean: 1e4, Valid: true}
+	if err = store.NetBenchPoints(ctx, "b", run, []BenchPoint{{Seq: 0, Kind: "net-latency", Phase: PhaseMeasure, Valid: true}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.NetBenchKind(ctx, "b", run, "net-latency", ref); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.NetBenchFinish(ctx, "b", run, BenchFinish{Valid: true}); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := store.ListBenchRuns(ctx, "h", "net:b", false)
+	if err != nil || len(runs) != 1 || runs[0].State != BenchFinished || !runs[0].References["net-latency"].Valid {
+		t.Fatalf("runs: %+v %v", runs, err)
+	}
+	if err = store.AuthorizeBenchNet(ctx, "a", run, token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a finished run's token: %v", err)
+	}
+	// one its agent never finishes fails after its deadline
+	plan, err = store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:b", Kinds: []string{"net-latency"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.testExec(`UPDATE bench_runs SET created_at=$1 WHERE id=$2`, time.Now().UTC().Add(-3*time.Hour).Format(time.RFC3339Nano), plan.Run.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ReconcileBenchRuns(ctx); err != nil {
+		t.Fatal(err)
+	}
+	runs, err = store.ListBenchRuns(ctx, "h", "net:b", false)
+	failed := false
+	for _, r := range runs {
+		failed = failed || r.ID == plan.Run.ID && r.State == "failed"
+	}
+	if err != nil || len(runs) != 2 || !failed {
+		t.Fatalf("past its deadline: %+v %v", runs, err)
 	}
 }

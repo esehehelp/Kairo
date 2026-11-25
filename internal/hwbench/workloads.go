@@ -49,8 +49,9 @@ var workloads = map[string]workload{
 // argv is the command line of kind for the run status describes, with
 // programs, ending by itself after seconds (the driver stops it sooner when
 // it is done). disk is where a storage bench writes ("": its filesystem);
-// peer is the network bench's server (rank 0's address and port).
-func argv(kind string, status store.BenchStatus, programs store.NodeBench, disk, peer string, seconds int) ([]string, error) {
+// peer is the network bench's server: the transfer endpoint of the node it
+// measures, whose certificate chains to packCA.
+func argv(kind string, status store.BenchStatus, programs store.NodeBench, disk, peer, packCA string, seconds int) ([]string, error) {
 	w, ok := workloads[kind]
 	if !ok {
 		return nil, fmt.Errorf("bench kind %q has no workload", kind)
@@ -75,15 +76,7 @@ func argv(kind string, status store.BenchStatus, programs store.NodeBench, disk,
 		}
 		out = append(out, "--path", disk)
 	case store.BenchNetwork:
-		out = append(out, "--peer", peer)
+		out = append(out, "--pack-peer", peer, "--pack-run", status.Run.ID, "--pack-ca", packCA)
 	}
 	return out, nil
-}
-
-// serveArgv is rank 0's server of a network bench.
-func serveArgv(status store.BenchStatus, listen string) ([]string, error) {
-	if status.Programs.Kairo == "" {
-		return nil, fmt.Errorf("node reports no kairo binary ([bench] kairo_binary): cannot serve the network bench")
-	}
-	return []string{status.Programs.Kairo, "bench", "serve", "--listen", listen, "--idle-timeout", "3m"}, nil
 }

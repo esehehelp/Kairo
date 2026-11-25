@@ -4,12 +4,16 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,23 +45,48 @@ type helloReply struct {
 	Error string `json:"error,omitempty"`
 }
 
-// dialBench connects to the server and opens a connection in mode.
-func dialBench(ctx context.Context, peer, mode string, messageBytes int) (*net.TCPConn, *bufio.Reader, error) {
-	d := net.Dialer{Timeout: dialTimeout}
-	c, err := d.DialContext(ctx, "tcp", peer)
-	if err != nil {
-		return nil, nil, err
-	}
-	conn := c.(*net.TCPConn)
-	if err := conn.SetNoDelay(true); err != nil {
-		conn.Close()
-		return nil, nil, err
+// PackPathPrefix is where an agent's transfer endpoint (its pack server)
+// takes a network bench's connections: /bench/net/<run>, upgraded from
+// HTTP/1.1 (Upgrade: PackUpgrade) to the bench's protocol.
+const (
+	PackPathPrefix = "/bench/net/"
+	PackUpgrade    = "kairo-bench"
+	// TokenEnv names the variable holding a network bench's token for the
+	// transfer endpoint it measures.
+	TokenEnv = "KAIRO_BENCH_NET_TOKEN"
+)
+
+// dialBench connects to the server and opens a connection in mode: to kairo
+// bench serve (cfg.Peer), or through an agent's transfer endpoint
+// (cfg.PackPeer: TLS, as transfers go, upgraded to the bench's protocol).
+func dialBench(ctx context.Context, cfg *Config, mode string, messageBytes int) (net.Conn, *bufio.Reader, error) {
+	var conn net.Conn
+	var r *bufio.Reader
+	peer := cfg.Peer
+	if cfg.PackPeer != "" {
+		peer = cfg.PackPeer
+		c, br, err := dialPack(ctx, cfg)
+		if err != nil {
+			return nil, nil, err
+		}
+		conn, r = c, br
+	} else {
+		d := net.Dialer{Timeout: dialTimeout}
+		c, err := d.DialContext(ctx, "tcp", cfg.Peer)
+		if err != nil {
+			return nil, nil, err
+		}
+		if err := c.(*net.TCPConn).SetNoDelay(true); err != nil {
+			c.Close()
+			return nil, nil, err
+		}
+		conn, r = c, bufio.NewReader(c)
 	}
 	conn.SetDeadline(time.Now().Add(helloTimeout))
 	line, _ := json.Marshal(hello{Schema: Schema, Mode: mode, MessageBytes: messageBytes})
-	r := bufio.NewReader(conn)
 	var reply helloReply
-	if _, err = conn.Write(append(line, '\n')); err == nil {
+	_, err := conn.Write(append(line, '\n'))
+	if err == nil {
 		var raw []byte
 		if raw, err = r.ReadBytes('\n'); err == nil {
 			err = json.Unmarshal(raw, &reply)
@@ -68,10 +97,66 @@ func dialBench(ctx context.Context, peer, mode string, messageBytes int) (*net.T
 	}
 	if err != nil {
 		conn.Close()
-		return nil, nil, fmt.Errorf("hello to %s (is kairo bench serve listening there?): %w", peer, err)
+		return nil, nil, fmt.Errorf("hello to %s (is kairo bench serve, or the agent's transfer endpoint, listening there?): %w", peer, err)
 	}
 	conn.SetDeadline(time.Time{})
 	return conn, r, nil
+}
+
+// dialPack opens a connection to an agent's transfer endpoint and upgrades
+// it to the bench's protocol, with the run's token (TokenEnv).
+func dialPack(ctx context.Context, cfg *Config) (net.Conn, *bufio.Reader, error) {
+	pem, err := os.ReadFile(cfg.PackCA)
+	if err != nil {
+		return nil, nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, nil, fmt.Errorf("no certificate in %s", cfg.PackCA)
+	}
+	host, _, _ := net.SplitHostPort(cfg.PackPeer)
+	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: dialTimeout}, Config: &tls.Config{RootCAs: pool, ServerName: host, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12}}
+	c, err := d.DialContext(ctx, "tcp", cfg.PackPeer)
+	if err != nil {
+		return nil, nil, err
+	}
+	if tcp, ok := c.(*tls.Conn).NetConn().(*net.TCPConn); ok {
+		tcp.SetNoDelay(true)
+	}
+	c.SetDeadline(time.Now().Add(helloTimeout))
+	req := "GET " + PackPathPrefix + cfg.PackRun + " HTTP/1.1\r\nHost: " + cfg.PackPeer + "\r\nAuthorization: Bearer " + os.Getenv(TokenEnv) +
+		"\r\nConnection: Upgrade\r\nUpgrade: " + PackUpgrade + "\r\n\r\n"
+	br := bufio.NewReader(c)
+	var resp *http.Response
+	if _, err = io.WriteString(c, req); err == nil {
+		resp, err = http.ReadResponse(br, nil)
+	}
+	if err == nil && resp.StatusCode != http.StatusSwitchingProtocols {
+		err = fmt.Errorf("the transfer endpoint answered %s", resp.Status)
+	}
+	if err != nil {
+		c.Close()
+		return nil, nil, fmt.Errorf("network bench %s at %s: %w", cfg.PackRun, cfg.PackPeer, err)
+	}
+	return c, br, nil
+}
+
+// ServeConn serves one network bench connection for at most limit (an
+// agent's transfer endpoint hands it over once upgraded).
+func ServeConn(conn net.Conn, limit time.Duration) error {
+	if rec := serveConn(conn, limit); rec.Error != "" {
+		return errors.New(rec.Error)
+	}
+	return nil
+}
+
+// benchPeer is the peer measured: kairo bench serve's address, or the
+// agent's transfer endpoint's (pack:HOST:PORT).
+func benchPeer(cfg *Config) string {
+	if cfg.PackPeer != "" {
+		return "pack:" + cfg.PackPeer
+	}
+	return cfg.Peer
 }
 
 // connectionDevice describes the path a connection takes: its addresses,
@@ -79,6 +164,9 @@ func dialBench(ctx context.Context, peer, mode string, messageBytes int) (*net.T
 // its MTU, and the link speed the OS reports — a fact, which for a virtual
 // NIC or loopback may mean nothing.
 func connectionDevice(conn net.Conn) map[string]any {
+	if t, ok := conn.(*tls.Conn); ok {
+		conn = t.NetConn()
+	}
 	local, remote := conn.LocalAddr().(*net.TCPAddr), conn.RemoteAddr().(*net.TCPAddr)
 	d := map[string]any{"kind": "network", "local_addr": local.String(), "remote_addr": remote.String(), "interface": nil, "mtu": nil}
 	ifc := interfaceOf(local.IP)
@@ -122,10 +210,10 @@ func unblockOnDone(ctx context.Context, conns ...net.Conn) (stop func() bool) {
 
 func prepareNetLatency(ctx context.Context, cfg *Config, p *plan) error {
 	p.units = []string{"request"}
-	p.params["peer"] = cfg.Peer
+	p.params["peer"] = benchPeer(cfg)
 	p.params["message_bytes"] = latencyMessageBytes
 	p.params["tcp_nodelay"] = true
-	conn, r, err := dialBench(ctx, cfg.Peer, "echo", latencyMessageBytes)
+	conn, r, err := dialBench(ctx, cfg, "echo", latencyMessageBytes)
 	if err != nil {
 		return err
 	}
@@ -162,7 +250,7 @@ func prepareNetLatency(ctx context.Context, cfg *Config, p *plan) error {
 
 func prepareNetBandwidth(ctx context.Context, cfg *Config, p *plan) error {
 	p.units = []string{"byte"}
-	p.params["peer"] = cfg.Peer
+	p.params["peer"] = benchPeer(cfg)
 	p.params["streams"] = cfg.Streams
 	p.params["dir"] = cfg.Dir
 	p.params["buffer_bytes"] = bulkBufferBytes
@@ -177,7 +265,7 @@ func prepareNetBandwidth(ctx context.Context, cfg *Config, p *plan) error {
 		}
 	}
 	for range cfg.Streams {
-		conn, _, err := dialBench(ctx, cfg.Peer, mode, 0)
+		conn, _, err := dialBench(ctx, cfg, mode, 0)
 		if err != nil {
 			return err
 		}

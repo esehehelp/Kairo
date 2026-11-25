@@ -33,7 +33,11 @@ type Config struct {
 
 	Peer    string // network: host:port of kairo bench serve
 	Streams int    // net-bandwidth: connections
-	Dir     string // net-bandwidth: send|recv
+	// network through an agent's transfer endpoint (instead of Peer): its
+	// address (pack_addr), the bench run it is for, the CA its certificate
+	// chains to; the token is in TokenEnv
+	PackPeer, PackRun, PackCA string
+	Dir                       string // net-bandwidth: send|recv
 
 	// Tests replace the system probes.
 	freeSpace    func(dir string) (int64, error)
@@ -71,9 +75,9 @@ var workloads = []Workload{
 	{"disk-sustained", "continuous 1 MiB writes until --max-write-bytes, per-interval bandwidth (SLC cache cliffs)", "byte",
 		[]string{"path", "qd", "file-size", "keep-free", "max-write-bytes"}, func(c *Config) { c.Mode = "write"; c.QD = 32; c.FileSize = 8 * gib }},
 	{"net-latency", "TCP 64-byte ping-pong with kairo bench serve at --peer (TCP_NODELAY)", "request",
-		[]string{"peer"}, func(c *Config) {}},
+		[]string{"peer", "pack-peer", "pack-run", "pack-ca"}, func(c *Config) {}},
 	{"net-bandwidth", "TCP bulk transfer to (send) or from (recv) kairo bench serve at --peer", "byte",
-		[]string{"peer", "streams", "dir"}, func(c *Config) { c.Dir = "send" }},
+		[]string{"peer", "pack-peer", "pack-run", "pack-ca", "streams", "dir"}, func(c *Config) { c.Dir = "send" }},
 }
 
 // Workloads lists the workloads of kairo bench run.
@@ -135,7 +139,13 @@ func (c *Config) RegisterFlags(fs *flag.FlagSet) {
 		case "seed":
 			fs.Uint64Var(&c.Seed, name, c.Seed, "seed of the random offsets")
 		case "peer":
-			fs.StringVar(&c.Peer, name, c.Peer, "HOST:PORT of kairo bench serve (required)")
+			fs.StringVar(&c.Peer, name, c.Peer, "HOST:PORT of kairo bench serve (or --pack-peer)")
+		case "pack-peer":
+			fs.StringVar(&c.PackPeer, name, c.PackPeer, "HOST:PORT of an agent's transfer endpoint (pack_addr), measured over TLS with the token in "+TokenEnv)
+		case "pack-run":
+			fs.StringVar(&c.PackRun, name, c.PackRun, "with --pack-peer: the network bench run")
+		case "pack-ca":
+			fs.StringVar(&c.PackCA, name, c.PackCA, "with --pack-peer: the CA (PEM) the endpoint's certificate chains to")
 		case "streams":
 			fs.IntVar(&c.Streams, name, c.Streams, "TCP connections: 1 or 4")
 		case "dir":
@@ -180,8 +190,15 @@ func (c *Config) Validate() error {
 	case "disk-seq", "disk-rand", "disk-fsync", "disk-sustained":
 		return c.validateStorage()
 	case "net-latency", "net-bandwidth":
-		if _, _, err := net.SplitHostPort(c.Peer); c.Peer == "" || err != nil {
-			return errors.New("--peer HOST:PORT is required (the address of kairo bench serve)")
+		switch {
+		case c.PackPeer != "":
+			if _, _, err := net.SplitHostPort(c.PackPeer); err != nil || c.PackRun == "" || c.PackCA == "" {
+				return errors.New("--pack-peer HOST:PORT takes --pack-run and --pack-ca")
+			}
+		default:
+			if _, _, err := net.SplitHostPort(c.Peer); c.Peer == "" || err != nil {
+				return errors.New("--peer HOST:PORT (the address of kairo bench serve) or --pack-peer is required")
+			}
 		}
 		if c.Workload == "net-bandwidth" {
 			if c.Streams != 1 && c.Streams != 4 {

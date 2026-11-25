@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"os"
 	"os/exec"
 	"runtime"
 	"slices"
@@ -115,6 +116,10 @@ type Driver struct {
 	// of the filesystem measured, handed to its container); "": the
 	// filesystem itself.
 	Disk string
+	// Kairo is the kairo binary that runs the CPU, storage and network
+	// workloads when the status names none (a network bench's agent:
+	// itself); PackCA is the CA a network bench's endpoint chains to.
+	Kairo, PackCA string
 
 	status   store.BenchStatus
 	seq      int
@@ -241,9 +246,6 @@ func (d *Driver) Run(ctx context.Context, runID string) error {
 	}
 	if status.Run.ID != runID {
 		return fmt.Errorf("this attempt carries out bench run %s, not %s", status.Run.ID, runID)
-	}
-	if status.Run.Class == store.BenchNetwork && status.Rank == 0 {
-		return d.serve(ctx)
 	}
 	if !status.Run.Live() {
 		return fmt.Errorf("bench run %s is %s", runID, status.Run.State)
@@ -567,12 +569,10 @@ func (d *Driver) seconds(kind store.BenchKind, w workload, points int) int {
 }
 
 // peer is the network server: rank 0's address and port.
+// peer is a network bench's server: the transfer endpoint (pack_addr) of
+// the node it measures.
 func (d *Driver) peer() string {
-	env := d.Env
-	if env == nil {
-		return ""
-	}
-	return net.JoinHostPort(env("KAIRO_GANG_MASTER_ADDR"), env("KAIRO_GANG_MASTER_PORT"))
+	return d.status.Peer
 }
 
 func (d *Driver) runKind(ctx context.Context, name string) (store.BenchReference, error) {
@@ -590,6 +590,9 @@ func (d *Driver) runKind(ctx context.Context, name string) (store.BenchReference
 		}
 	}
 	programs := d.status.Programs
+	if programs.Kairo == "" {
+		programs.Kairo = d.Kairo
+	}
 	if w.gpu && programs.GPU == "" && d.GPU != nil {
 		gpu, err := d.GPU(ctx)
 		if err != nil {
@@ -597,7 +600,7 @@ func (d *Driver) runKind(ctx context.Context, name string) (store.BenchReference
 		}
 		programs.GPU = gpu
 	}
-	args, err := argv(name, d.status, programs, d.Disk, peer, d.seconds(kind, w, len(grid)))
+	args, err := argv(name, d.status, programs, d.Disk, peer, d.PackCA, d.seconds(kind, w, len(grid)))
 	if err != nil {
 		return store.BenchReference{}, err
 	}
@@ -968,60 +971,20 @@ func (d *Driver) waitServer(ctx context.Context, addr string) error {
 	}
 }
 
-// serve is rank 0 of a network bench: it serves the client rank until the
-// run ends, or the server exits by itself (idle). Suspended (the gang's
-// every rank is), it publishes the run's checkpoint: the leader's is the
-// one the task's continuation follows.
-func (d *Driver) serve(ctx context.Context) error {
-	args, err := serveArgv(d.status, d.peer())
-	if err != nil {
-		return err
-	}
-	proc, err := d.Runner.Start(ctx, args)
-	if err != nil {
-		return fmt.Errorf("start %s: %w", args[0], err)
-	}
-	d.logger().Info("serving the network bench", "listen", d.peer())
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for {
-			if _, err := proc.Next(); err != nil && !strings.Contains(err.Error(), "bench record") {
-				return // the output ended
-			}
-		}
-	}()
-	defer func() {
-		_ = proc.Stop()
-		<-done
-		_ = proc.Wait()
-	}()
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-done:
-			return nil
-		case <-time.After(d.Timing.Poll):
-		}
-		if status, err := d.refresh(ctx); err != nil || !status.Run.Live() {
-			return err
-		}
-		if err := d.safePoint(ctx); err != nil {
-			return d.leave(ctx, err)
-		}
-	}
-}
-
 // ExecRunner runs primitives as child processes, reading their records from
 // stdout; their stderr goes to Stderr.
 type ExecRunner struct {
 	Stderr io.Writer
+	// Env is added to the primitive's environment (a network bench's token).
+	Env []string
 }
 
 func (r ExecRunner) Start(ctx context.Context, argv []string) (Process, error) {
 	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
 	cmd.Stderr = r.Stderr
+	if len(r.Env) != 0 {
+		cmd.Env = append(os.Environ(), r.Env...)
+	}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		return nil, err

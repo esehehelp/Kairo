@@ -20,6 +20,7 @@ package store
 
 import (
 	"context"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -27,6 +28,7 @@ import (
 	"math"
 	"slices"
 	"strings"
+	"time"
 
 	"kairo/internal/id"
 	"kairo/internal/imageref"
@@ -342,12 +344,13 @@ const benchRunColumns = `id,host_id,device_id,class,kinds_json,node_id,peer_node
 func scanBenchRun(row interface{ Scan(...any) error }) (BenchRun, error) {
 	var r BenchRun
 	var kinds string
-	var versions, device, references sql.NullString
+	var versions, device, references, execution sql.NullString
 	var valid sql.NullBool
-	if err := row.Scan(&r.ID, &r.HostID, &r.DeviceID, &r.Class, &kinds, &r.NodeID, &r.PeerNodeID, &r.Target, &r.ExecutionID, &r.State, &r.RequestedBy, &r.CreatedAt, &r.StartedAt, &r.EndedAt,
+	if err := row.Scan(&r.ID, &r.HostID, &r.DeviceID, &r.Class, &kinds, &r.NodeID, &r.PeerNodeID, &r.Target, &execution, &r.State, &r.RequestedBy, &r.CreatedAt, &r.StartedAt, &r.EndedAt,
 		&r.DriverBuild, &versions, &r.DriverVersion, &device, &r.IdleTemperatureC, &references, &valid, &r.Reason); err != nil {
 		return r, err
 	}
+	r.ExecutionID = execution.String
 	if err := json.Unmarshal([]byte(kinds), &r.Kinds); err != nil {
 		return r, err
 	}
@@ -389,6 +392,9 @@ func (s *Store) CreateBenchRun(ctx context.Context, req BenchRequest) (BenchPlan
 	plan, declaration, err := planBenchTx(ctx, tx, req)
 	if err != nil || req.DryRun {
 		return plan, err
+	}
+	if plan.Run.Class == BenchNetwork {
+		return s.createNetBenchTx(ctx, tx, plan)
 	}
 	run := &plan.Run
 	if _, err = applyProjectTx(ctx, tx, declaration); err != nil {
@@ -434,6 +440,129 @@ func (s *Store) CreateBenchRun(ctx context.Context, req BenchRequest) (BenchPlan
 	}
 	return plan, tx.Commit()
 }
+
+// createNetBenchTx records a network bench run: no task, no execution; the
+// measuring node's agent finds it (NetBenches) with the token the other
+// node's agent checks (AuthorizeBenchNet).
+func (s *Store) createNetBenchTx(ctx context.Context, tx *sql.Tx, plan BenchPlan) (BenchPlan, error) {
+	run := &plan.Run
+	token, _, err := newSecret("kairo_bench_")
+	if err != nil {
+		return BenchPlan{}, err
+	}
+	kinds, err := json.Marshal(run.Kinds)
+	if err != nil {
+		return BenchPlan{}, err
+	}
+	run.State, run.CreatedAt = BenchWaiting, now()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO bench_runs(id,host_id,device_id,class,kinds_json,node_id,peer_node_id,target,state,requested_by,created_at,net_token) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+		run.ID, run.HostID, run.DeviceID, run.Class, string(kinds), run.NodeID, run.PeerNodeID, run.Target, run.State, run.RequestedBy, run.CreatedAt, token); err != nil {
+		return BenchPlan{}, err
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "hardware_bench_requested", nil, "bench_run", run.ID, nil, map[string]any{
+		"host_id": run.HostID, "device_id": run.DeviceID, "class": run.Class, "kinds": run.Kinds, "node_id": run.NodeID, "peer_node_id": *run.PeerNodeID, "actor": run.RequestedBy}); err != nil {
+		return BenchPlan{}, err
+	}
+	return plan, tx.Commit()
+}
+
+// nodePackAddrTx is the transfer endpoint a node's agent serves (an enabled
+// executor's pack_addr), "" for none.
+func nodePackAddrTx(ctx context.Context, q queryer, nodeID string) (string, error) {
+	var addr string
+	err := q.QueryRowContext(ctx, `SELECT COALESCE((attributes_json::jsonb)->>'pack_addr','') FROM executors WHERE node_id=$1 AND enabled
+		AND COALESCE((attributes_json::jsonb)->>'pack_addr','')<>'' ORDER BY id LIMIT 1`, nodeID).Scan(&addr)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return addr, err
+}
+
+// NetBench is a network bench a node's agent measures: its run, the
+// transfer endpoint it measures (the other node's pack_addr) and the token
+// that endpoint takes.
+type NetBench struct {
+	RunID string `json:"run_id"`
+	Addr  string `json:"addr"`
+	Token string `json:"token"`
+}
+
+// NetBenches are the live network benches nodeID's agent measures.
+func (s *Store) NetBenches(ctx context.Context, nodeID string) ([]NetBench, error) {
+	type pending struct{ run, server, token string }
+	var runs []pending
+	if err := eachRow(ctx, s.db, `SELECT id,node_id,net_token FROM bench_runs WHERE class=$1 AND peer_node_id=$2 AND state IN('waiting','running') AND net_token IS NOT NULL ORDER BY created_at`,
+		[]any{BenchNetwork, nodeID}, func(rows *sql.Rows) error {
+			var p pending
+			if err := rows.Scan(&p.run, &p.server, &p.token); err != nil {
+				return err
+			}
+			runs = append(runs, p)
+			return nil
+		}); err != nil {
+		return nil, err
+	}
+	out := []NetBench{}
+	for _, p := range runs {
+		addr, err := nodePackAddrTx(ctx, s.db, p.server)
+		if err != nil {
+			return nil, err
+		}
+		if addr != "" {
+			out = append(out, NetBench{RunID: p.run, Addr: addr, Token: p.token})
+		}
+	}
+	return out, nil
+}
+
+// NetBenchStatus is the status of a network bench for the agent of the node
+// that measures it: its run, where the next point goes, and the endpoint.
+func (s *Store) NetBenchStatus(ctx context.Context, nodeID, runID string) (BenchStatus, error) {
+	run, rank, err := s.benchRunOf(ctx, benchActor{nodeID: nodeID, runID: runID})
+	if err != nil {
+		return BenchStatus{}, err
+	}
+	status := BenchStatus{Run: run, Rank: rank, OtherWork: []string{}}
+	if status.Peer, err = nodePackAddrTx(ctx, s.db, run.NodeID); err != nil {
+		return status, err
+	}
+	err = s.db.QueryRowContext(ctx, `SELECT COALESCE(MAX(seq)+1,0) FROM bench_points WHERE run_id=$1`, run.ID).Scan(&status.NextSeq)
+	return status, err
+}
+
+// NetBenchStart, NetBenchPoints, NetBenchKind and NetBenchFinish are the
+// measuring agent's StartBenchRun, AddBenchPoints, RecordBenchKind and
+// FinishBenchRun.
+func (s *Store) NetBenchStart(ctx context.Context, nodeID, runID string, start BenchStart) error {
+	return s.startBenchRun(ctx, benchActor{nodeID: nodeID, runID: runID}, start)
+}
+
+func (s *Store) NetBenchPoints(ctx context.Context, nodeID, runID string, points []BenchPoint) error {
+	return s.addBenchPoints(ctx, benchActor{nodeID: nodeID, runID: runID}, points)
+}
+
+func (s *Store) NetBenchKind(ctx context.Context, nodeID, runID, kind string, ref BenchReference) error {
+	return s.recordBenchKind(ctx, benchActor{nodeID: nodeID, runID: runID}, kind, ref)
+}
+
+func (s *Store) NetBenchFinish(ctx context.Context, nodeID, runID string, finish BenchFinish) error {
+	return s.finishBenchRun(ctx, benchActor{nodeID: nodeID, runID: runID}, "", finish)
+}
+
+// AuthorizeBenchNet tells the agent of serverNodeID whether token is that of
+// a live network bench measuring it (runID): ErrNotFound if not.
+func (s *Store) AuthorizeBenchNet(ctx context.Context, serverNodeID, runID, token string) error {
+	var want sql.NullString
+	err := s.db.QueryRowContext(ctx, `SELECT net_token FROM bench_runs WHERE id=$1 AND class=$2 AND node_id=$3 AND state IN('waiting','running')`, runID, BenchNetwork, serverNodeID).Scan(&want)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && (!want.Valid || token == "" || subtle.ConstantTimeCompare([]byte(want.String), []byte(token)) != 1) {
+		return fmt.Errorf("%w: no live network bench %s measures node %s with this token", ErrNotFound, runID, serverNodeID)
+	}
+	return err
+}
+
+// netBenchDeadline: a network bench not finished this long after it was
+// asked for is failed (its measuring agent is gone, or never came).
+const netBenchDeadline = 2 * time.Hour
 
 // linkBenchExecutionsTx records an execution of a run.
 func linkBenchExecutionsTx(ctx context.Context, tx *sql.Tx, runID, executionID string) error {
@@ -504,6 +633,9 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 	run, template, err := planBenchRunTx(ctx, tx, req)
 	if err != nil {
 		return BenchPlan{}, orchestration.Validated{}, err
+	}
+	if run.Class == BenchNetwork {
+		return BenchPlan{Run: run, DryRun: req.DryRun}, orchestration.Validated{}, nil
 	}
 	image := BenchImage
 	if run.Class == BenchGPU {
@@ -670,7 +802,31 @@ func planBenchRunTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchRun
 		// The test files (disk-sustained's is 8 GiB) on the filesystem tested.
 		execution.Capacity = orchestration.CapacityRequest{CPUMillis: 1000, RAMBytes: 512 << 20, Disks: []orchestration.DiskRequest{{Filesystem: filesystem, ReserveBytes: 9 << 30}}}
 	case BenchNetwork:
-		return BenchRun{}, orchestration.Execution{}, errors.New("the network bench is being rebuilt to run between the nodes' agents: not available yet")
+		// between two nodes' agents, with no task: the peer's agent measures
+		// the transfer endpoint (pack_addr) of a node of the host
+		peer := strings.TrimPrefix(req.DeviceID, BenchNetPrefix)
+		var agent bool
+		if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM executors WHERE node_id=$1 AND enabled)`, peer).Scan(&agent); err != nil {
+			return BenchRun{}, orchestration.Execution{}, err
+		}
+		if !agent {
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("%w: node %s has no agent (no enabled executor) to measure from", ErrNotFound, peer)
+		}
+		nodes, configs, err = candidates(func(nodeID string, _ NodeBench) (bool, error) {
+			if nodeID == peer {
+				return false, nil
+			}
+			addr, err := nodePackAddrTx(ctx, tx, nodeID)
+			return addr != "", err
+		})
+		if err != nil {
+			return BenchRun{}, orchestration.Execution{}, err
+		}
+		if len(nodes) == 0 {
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s other than %s serves transfers (an executor's pack_addr)", req.HostID, peer)
+		}
+		run.NodeID, run.PeerNodeID, run.Target = nodes[0], &peer, peer
+		return run, execution, nil
 	}
 	_ = configs
 	execution.Argv, execution.CWD = []string{containerKairo, "hardware", "bench-run", "--run", run.ID}, "/"
@@ -818,10 +974,13 @@ type BenchStatus struct {
 	LastError         *string             `json:"last_error,omitempty"`
 	// OtherWork is what else uses the device: a process Kairo did not start
 	// on the GPU, other leases on the host's nodes (CPU) or reserving the
-	// filesystem (storage), a gang across the two nodes (network).
+	// filesystem (storage).
 	OtherWork []string `json:"other_work"`
 	// TemperatureC is the GPU's latest observed temperature.
 	TemperatureC *float64 `json:"temperature_c,omitempty"`
+	// Peer is, of a network bench, the transfer endpoint (pack_addr) it
+	// measures.
+	Peer string `json:"peer,omitempty"`
 	// NextSeq is the seq the run's next point takes: past the points an
 	// earlier attempt of a resumed run left.
 	NextSeq int `json:"next_seq"`
@@ -948,12 +1107,51 @@ type BenchStart struct {
 	IdleTemperatureC *float64                `json:"idle_temperature_c,omitempty"`
 }
 
-// StartBenchRun marks the run attemptID carries out running and records what
+// StartBenchRun marks the run attemptID carries out running (startBenchRun).
+func (s *Store) StartBenchRun(ctx context.Context, attemptID string, start BenchStart) error {
+	return s.startBenchRun(ctx, benchActor{attemptID: attemptID}, start)
+}
+
+// RecordBenchKind records the reference of a kind the run attemptID carries
+// out is done with (recordBenchKind).
+func (s *Store) RecordBenchKind(ctx context.Context, attemptID, kind string, ref BenchReference) error {
+	return s.recordBenchKind(ctx, benchActor{attemptID: attemptID}, kind, ref)
+}
+
+// AddBenchPoints records measurements of the run attemptID carries out
+// (addBenchPoints).
+func (s *Store) AddBenchPoints(ctx context.Context, attemptID string, points []BenchPoint) error {
+	return s.addBenchPoints(ctx, benchActor{attemptID: attemptID}, points)
+}
+
+// FinishBenchRun ends the run attemptID carries out (finishBenchRun).
+func (s *Store) FinishBenchRun(ctx context.Context, attemptID, leaseID string, finish BenchFinish) error {
+	return s.finishBenchRun(ctx, benchActor{attemptID: attemptID}, leaseID, finish)
+}
+
+// benchActor is who carries out a run: a bench task's attempt (its driver),
+// or, for a network bench, the measuring node's agent (nodeID, runID).
+type benchActor struct{ attemptID, nodeID, runID string }
+
+// benchRunOf is the run the actor carries out, and its rank (the measuring
+// node's agent: 1).
+func (s *Store) benchRunOf(ctx context.Context, a benchActor) (BenchRun, int, error) {
+	if a.attemptID != "" {
+		return s.BenchOfAttempt(ctx, a.attemptID)
+	}
+	run, err := scanBenchRun(s.db.QueryRowContext(ctx, `SELECT `+benchRunColumns+` FROM bench_runs WHERE id=$1 AND class=$2 AND peer_node_id=$3`, a.runID, BenchNetwork, a.nodeID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return BenchRun{}, 0, fmt.Errorf("%w: node %s measures no network bench %s", ErrNotFound, a.nodeID, a.runID)
+	}
+	return run, 1, err
+}
+
+// startBenchRun marks the run the actor carries out running and records what
 // its driver found (event hardware_bench_started, or hardware_bench_resumed
 // for a run that ran before). Starting again (a driver that retried, or
 // starts another kind) adds the versions it now knows.
-func (s *Store) StartBenchRun(ctx context.Context, attemptID string, start BenchStart) error {
-	run, _, err := s.BenchOfAttempt(ctx, attemptID)
+func (s *Store) startBenchRun(ctx context.Context, a benchActor, start BenchStart) error {
+	run, _, err := s.benchRunOf(ctx, a)
 	if err != nil {
 		return err
 	}
@@ -996,10 +1194,10 @@ func (s *Store) StartBenchRun(ctx context.Context, attemptID string, start Bench
 	return tx.Commit()
 }
 
-// RecordBenchKind records the reference of a kind the run attemptID carries
+// recordBenchKind records the reference of a kind the run the actor carries
 // out is done with: a resumed run does not measure it again.
-func (s *Store) RecordBenchKind(ctx context.Context, attemptID, kind string, ref BenchReference) error {
-	run, _, err := s.BenchOfAttempt(ctx, attemptID)
+func (s *Store) recordBenchKind(ctx context.Context, a benchActor, kind string, ref BenchReference) error {
+	run, _, err := s.benchRunOf(ctx, a)
 	if err != nil {
 		return err
 	}
@@ -1047,10 +1245,10 @@ func benchReferencesTx(ctx context.Context, tx *sql.Tx, runID string) (map[strin
 	return references, nil
 }
 
-// AddBenchPoints records measurements of the run attemptID carries out; a
+// addBenchPoints records measurements of the run the actor carries out; a
 // point sent again (same seq) replaces the earlier copy.
-func (s *Store) AddBenchPoints(ctx context.Context, attemptID string, points []BenchPoint) error {
-	run, _, err := s.BenchOfAttempt(ctx, attemptID)
+func (s *Store) addBenchPoints(ctx context.Context, a benchActor, points []BenchPoint) error {
+	run, _, err := s.benchRunOf(ctx, a)
 	if err != nil {
 		return err
 	}
@@ -1128,11 +1326,11 @@ func benchOutcome(kinds []string, references map[string]BenchReference, finish B
 	return BenchInvalid, false, reason
 }
 
-// FinishBenchRun ends the run attemptID carries out (events
+// finishBenchRun ends the run the actor carries out (events
 // hardware_bench_finished, and hardware_bench_invalid when no kind is valid)
 // and clears its bench setting.
-func (s *Store) FinishBenchRun(ctx context.Context, attemptID, leaseID string, finish BenchFinish) error {
-	run, _, err := s.BenchOfAttempt(ctx, attemptID)
+func (s *Store) finishBenchRun(ctx context.Context, a benchActor, leaseID string, finish BenchFinish) error {
+	run, _, err := s.benchRunOf(ctx, a)
 	if err != nil {
 		return err
 	}
@@ -1198,6 +1396,19 @@ func (s *Store) FinishBenchRun(ctx context.Context, attemptID, leaseID string, f
 func (s *Store) ReconcileBenchRuns(ctx context.Context) error {
 	type ended struct{ id, host, device, cause string }
 	var runs []ended
+	// a network bench (no task) its measuring agent did not finish in time
+	cutoff := time.Now().UTC().Add(-netBenchDeadline).Format(time.RFC3339Nano)
+	if err := eachRow(ctx, s.db, `SELECT id,host_id,device_id FROM bench_runs WHERE class=$1 AND execution_id IS NULL AND state IN('waiting','running') AND (created_at)::timestamptz<($2)::timestamptz`,
+		[]any{BenchNetwork, cutoff}, func(rows *sql.Rows) error {
+			r := ended{cause: "network bench not finished within " + netBenchDeadline.String()}
+			if err := rows.Scan(&r.id, &r.host, &r.device); err != nil {
+				return err
+			}
+			runs = append(runs, r)
+			return nil
+		}); err != nil {
+		return err
+	}
 	if err := eachRow(ctx, s.db, `SELECT b.id,b.host_id,b.device_id,COALESCE(e.terminal_cause,'') FROM bench_runs b JOIN execution_requests e ON e.id=b.execution_id
 		LEFT JOIN orchestration_tasks t ON t.task_scope_id=b.task_scope_id
 		WHERE b.state IN('waiting','running') AND (b.task_scope_id IS NULL AND e.state='terminal' OR t.state IN('succeeded','failed','blocked','stopped','cancelled'))`, nil, func(rows *sql.Rows) error {

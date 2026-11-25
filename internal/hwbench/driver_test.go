@@ -7,9 +7,7 @@ import (
 	"math"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
-	"time"
 
 	"kairo/internal/store"
 )
@@ -200,29 +198,31 @@ func TestOtherWorkThatStaysEndsTheRunInvalid(t *testing.T) {
 	run := store.BenchRun{ID: "bnc-4", HostID: "h", DeviceID: "net:b", Class: store.BenchNetwork, Kinds: []string{"net-latency"}, NodeID: "a", Target: "b", State: "waiting"}
 	d := newFakeDaemon(run, nil)
 	d.status.Rank = 1
-	d.status.OtherWork = []string{"gang gng-1 spans a and b"}
+	d.status.OtherWork = []string{"lease l-1 reserves /srv"}
 	driver := testDriver(d, &fakeRunner{d: d})
 	driver.Timing.OtherWorkWait = 0
 	if err := driver.Run(context.Background(), "bnc-4"); err != nil {
 		t.Fatal(err)
 	}
-	if d.finish == nil || d.finish.Valid || !strings.Contains(d.finish.Reason, "gang gng-1") {
+	if d.finish == nil || d.finish.Valid || !strings.Contains(d.finish.Reason, "lease l-1") {
 		t.Fatalf("finish: %+v", d.finish)
 	}
 }
 
-func TestNetworkClientReachesRankZero(t *testing.T) {
+// A network bench's agent measures the transfer endpoint of the other node
+// (the status's peer), with the run and the CA its certificate chains to,
+// once the endpoint takes connections.
+func TestNetworkBenchMeasuresTheTransferEndpoint(t *testing.T) {
 	run := store.BenchRun{ID: "bnc-4", HostID: "h", DeviceID: "net:b", Class: store.BenchNetwork, Kinds: []string{"net-bandwidth-send"}, NodeID: "a", Target: "b", State: "waiting"}
 	d := newFakeDaemon(run, nil)
 	d.status.Rank = 1
+	d.status.Peer = "10.0.0.1:7475"
 	r := &fakeRunner{d: d}
 	driver := testDriver(d, r)
-	driver.Env = func(key string) string {
-		return map[string]string{"KAIRO_GANG_MASTER_ADDR": "10.0.0.1", "KAIRO_GANG_MASTER_PORT": "29511"}[key]
-	}
+	driver.PackCA = "/etc/kairo/ca.pem"
 	dials := 0
 	driver.Dial = func(_ context.Context, addr string) error {
-		if dials++; addr != "10.0.0.1:29511" || dials < 3 {
+		if dials++; addr != "10.0.0.1:7475" || dials < 3 {
 			return io.ErrUnexpectedEOF
 		}
 		return nil
@@ -230,50 +230,8 @@ func TestNetworkClientReachesRankZero(t *testing.T) {
 	if err := driver.Run(context.Background(), "bnc-4"); err != nil {
 		t.Fatal(err)
 	}
-	if argv := strings.Join(r.argvs[0], " "); !strings.HasSuffix(argv, "--dir send --streams 4 --peer 10.0.0.1:29511") || !d.finish.Valid {
+	if argv := strings.Join(r.argvs[0], " "); !strings.HasSuffix(argv, "--dir send --streams 4 --pack-peer 10.0.0.1:7475 --pack-run bnc-4 --pack-ca /etc/kairo/ca.pem") || !d.finish.Valid {
 		t.Fatalf("argv %s, finish %+v", argv, d.finish)
-	}
-}
-
-// serveProcess is a bench server that runs until stopped.
-type serveProcess struct {
-	once    sync.Once
-	stopped chan struct{}
-}
-
-func (p *serveProcess) Next() (Record, error) {
-	<-p.stopped
-	return Record{}, io.EOF
-}
-func (p *serveProcess) Stop() error { p.once.Do(func() { close(p.stopped) }); return nil }
-func (p *serveProcess) Wait() error { return nil }
-
-type serveRunner struct{ argv []string }
-
-func (r *serveRunner) Start(_ context.Context, argv []string) (Process, error) {
-	r.argv = argv
-	return &serveProcess{stopped: make(chan struct{})}, nil
-}
-
-func TestNetworkServerRunsUntilTheRunEnds(t *testing.T) {
-	run := store.BenchRun{ID: "bnc-4", HostID: "h", DeviceID: "net:b", Class: store.BenchNetwork, Kinds: []string{"net-latency"}, NodeID: "a", Target: "b", State: "running"}
-	d := newFakeDaemon(run, nil)
-	d.onPoll = func(polls int, status *store.BenchStatus) {
-		if polls == 3 {
-			status.Run.State = "finished"
-		}
-	}
-	r := &serveRunner{}
-	driver := testDriver(d, r)
-	driver.Timing.Poll = time.Millisecond
-	driver.Env = func(key string) string {
-		return map[string]string{"KAIRO_GANG_MASTER_ADDR": "10.0.0.1", "KAIRO_GANG_MASTER_PORT": "29511"}[key]
-	}
-	if err := driver.Run(context.Background(), "bnc-4"); err != nil {
-		t.Fatal(err)
-	}
-	if strings.Join(r.argv, " ") != "/opt/kairo/kairo bench serve --listen 10.0.0.1:29511 --idle-timeout 3m" || d.polls != 3 || len(d.starts) != 0 {
-		t.Fatalf("argv %v, %d polls, starts %+v", r.argv, d.polls, d.starts)
 	}
 }
 
