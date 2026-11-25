@@ -57,6 +57,7 @@ func wslcExe() string {
 // wslcCommand runs wslc with args: its output, or why it failed.
 var wslcCommand = func(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, wslcExe(), args...)
+	ownProcessGroup(cmd)
 	var out, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	if err := cmd.Run(); err != nil {
@@ -103,6 +104,7 @@ func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string
 	for try := 1; ; try++ {
 		run := exec.Command(wslcExe(), wslcRunArgs(spec)...)
 		run.Stdout, run.Stderr = io.Discard, os.Stderr
+		ownProcessGroup(run)
 		err := run.Run()
 		if err == nil {
 			break
@@ -113,12 +115,31 @@ func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string
 		}
 		time.Sleep(time.Duration(try) * 3 * time.Second)
 	}
+	// the client may end before its container (killed): the container is
+	// seen stopped before its exit is read
+	for deadline := time.Now().Add((wslcStopSeconds + 60) * time.Second); wslcRunning(ctx, spec.Instance) && time.Now().Before(deadline); {
+		time.Sleep(time.Second)
+	}
 	exit, ok := readExitFile(filepath.Join(spec.RunDir, "exit"))
 	if !ok {
 		logf("the container stopped without writing its exit")
 		exit = -1
 	}
 	return spec.Instance, exit, nil
+}
+
+// wslcRunning: wslc has a container named name running.
+func wslcRunning(ctx context.Context, name string) bool {
+	list, err := wslcContainers(ctx)
+	if err != nil {
+		return false
+	}
+	for _, c := range list {
+		if c.Names == name {
+			return c.State == "running"
+		}
+	}
+	return false
 }
 
 func (wslcRuntime) stop(ctx context.Context, name string) error {
