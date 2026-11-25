@@ -167,6 +167,7 @@ func ctrlBreak(ctx context.Context, pid int) error {
 // then exits; otherwise it returns. main calls it before anything else.
 func RunHelper(args []string) {
 	runShim(args)
+	runWSLCHelper(args)
 	if len(args) != 3 || args[1] != ctrlBreakHelperArg {
 		return
 	}

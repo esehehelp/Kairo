@@ -44,21 +44,6 @@ func runContainerHelpers(args []string) {
 	}
 }
 
-func readContainerSpec(p string) (containerSpec, error) {
-	var spec containerSpec
-	body, err := os.ReadFile(p)
-	if err != nil {
-		return spec, err
-	}
-	if err := json.Unmarshal(body, &spec); err != nil {
-		return spec, fmt.Errorf("%s: %w", p, err)
-	}
-	if spec.Instance == "" || len(spec.Argv) == 0 {
-		return spec, fmt.Errorf("%s: no instance or argv", p)
-	}
-	return spec, nil
-}
-
 // incusCommand runs the incus client with stdin (nil: none) and returns
 // what it printed; a failure says what it printed on stderr.
 var incusCommand = func(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
@@ -408,9 +393,13 @@ func containerInit(specPath string) int {
 		fmt.Fprintln(os.Stderr, "kairo container:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
-	if err := confineMounts(spec.Writable, spec.Tmp); err != nil {
-		fmt.Fprintln(os.Stderr, "kairo container: confine:", err)
-		return writeShimExit(containerExitIn, shimNotConfined)
+	// a wslc container cannot mount: it runs as an ordinary user instead,
+	// to whom the image's files are read-only (container_wslc.go)
+	if spec.Runtime != "wslc" {
+		if err := confineMounts(spec.Writable, spec.Tmp); err != nil {
+			fmt.Fprintln(os.Stderr, "kairo container: confine:", err)
+			return writeShimExit(containerExitIn, shimNotConfined)
+		}
 	}
 	stdout, stderr := openContainerLog(containerStdout, os.Stdout), openContainerLog(containerStderr, os.Stderr)
 	if !waitForNetwork("/sys/class/net", "/proc/net/route", "/proc/net/ipv6_route", networkWait) {
@@ -434,17 +423,23 @@ func containerInit(specPath string) int {
 	defer stopLoaders(loaders)
 	cmd := &exec.Cmd{Path: argv0, Args: spec.Argv, Dir: spec.CWD, Env: env, Stdout: stdout, Stderr: stderr,
 		SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
-	// caught, not ignored: the argv starts with the default dispositions
+	// caught, not ignored: the argv starts with the default dispositions.
+	// A stop reaches the argv directly, as on a host, except in a wslc
+	// container (its processes are out of the agent's reach): its stop
+	// comes to this init, which passes it on to the argv's group.
 	sigs := make(chan os.Signal, 8)
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	go func() {
-		for range sigs {
-		}
-	}()
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(stderr, "kairo container: start:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
+	go func() {
+		for sig := range sigs {
+			if spec.Runtime == "wslc" {
+				_ = syscall.Kill(-cmd.Process.Pid, sig.(syscall.Signal))
+			}
+		}
+	}()
 	exit, sig := reapUntil(cmd.Process.Pid, loaders.restart)
 	if sig != 0 {
 		fmt.Fprintf(stderr, "kairo container: %s ended by signal %d (%v)\n", spec.Argv[0], int(sig), sig)
@@ -552,6 +547,9 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		}
 		if spec.RawDir != "" {
 			args = append(args, "--raw", spec.RawDir)
+		}
+		if spec.RawRequests != "" {
+			args = append(args, "--raw-requests", spec.RawRequests)
 		}
 		p := &loaderProc{stream: s.Name, args: args, dir: spec.CWD, env: env, logs: logs}
 		if err := p.start(); err != nil {

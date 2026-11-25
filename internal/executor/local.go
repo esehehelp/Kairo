@@ -569,7 +569,7 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 			var liveness processidentity.Liveness
 			var livenessErr error
 			if process.Namespace == "executor" {
-				liveness, livenessErr = e.backend().liveness(ctx, process.PID, process.ProcessIdentity)
+				liveness, livenessErr = e.backend().liveness(ctx, candidate.Attempt.ID, process.PID, process.ProcessIdentity)
 			} else {
 				liveness, livenessErr = processidentity.HostProcessLiveness(process.PID, process.ProcessIdentity)
 			}

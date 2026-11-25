@@ -23,6 +23,7 @@ func loaderServe(args []string) error {
 	world := fs.Int("world", 0, "the ranks the stream is split between (0: the first rank's hello says)")
 	positionsPath := fs.String("positions", "", "where each rank starts (JSON list of {rank, record, sub}); none: the start")
 	session := fs.String("session", "", "the session takers come back with (the same across this loader's restarts; none: a random one)")
+	rawRequests := fs.String("raw-requests", "", "with --raw: ask the node's agent through files in this directory, not its socket (a container in a VM)")
 	state := fs.String("state", "", "a directory keeping which ranks were served across this loader's restarts")
 	origin := fs.String("origin", "http", "where files are read: http (each file's URL) or dir:DIR (files by name under DIR)")
 	rawDir := fs.String("raw", "", "the node's raw cache for this attempt (its directory, with the agent's socket): every file made ready, checked and identified there before it is read; without it, files are read from --origin, one never read before identified as it is read")
@@ -74,6 +75,9 @@ func loaderServe(args []string) error {
 	}}
 	if *rawDir != "" {
 		agent := loader.NewAgent(*rawDir, o)
+		if *rawRequests != "" {
+			agent = loader.NewFileAgent(*rawDir, *rawRequests, o)
+		}
 		agent.Problem = func(f loader.File, err error) {
 			fmt.Fprintf(os.Stderr, "kairo loader: %s: %v\n", f.Name, err)
 		}

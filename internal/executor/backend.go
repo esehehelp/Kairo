@@ -27,9 +27,9 @@ type backend interface {
 	// confines the attempt itself). On an error the launch is refused; the
 	// command may still be returned (argv[0] not found: as built).
 	launcher(launch *store.Launch) (*exec.Cmd, *confinement, error)
-	// liveness is that of a process an attempt registered in the executor's
-	// namespace.
-	liveness(ctx context.Context, pid int, identity string) (processidentity.Liveness, error)
+	// liveness is that of a process attempt attemptID registered in the
+	// executor's namespace.
+	liveness(ctx context.Context, attemptID string, pid int, identity string) (processidentity.Liveness, error)
 	// ended: an attempt it ran has ended (its exit recorded).
 	ended(attemptID string)
 }
@@ -47,6 +47,8 @@ func (e *Local) backend() backend {
 		return incusBackend{e}
 	case config.KindPCT:
 		return pctBackend{e}
+	case config.KindWSLC:
+		return wslcBackend{e}
 	default:
 		return hostBackend{e}
 	}
@@ -128,7 +130,7 @@ func (b hostBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, er
 	return cmd, conf, nil
 }
 
-func (hostBackend) liveness(_ context.Context, pid int, identity string) (processidentity.Liveness, error) {
+func (hostBackend) liveness(_ context.Context, _ string, pid int, identity string) (processidentity.Liveness, error) {
 	return processidentity.HostProcessLiveness(pid, identity)
 }
 
@@ -143,7 +145,7 @@ func (b incusBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, e
 	return cmd, nil, err
 }
 
-func (incusBackend) liveness(_ context.Context, pid int, identity string) (processidentity.Liveness, error) {
+func (incusBackend) liveness(_ context.Context, _ string, pid int, identity string) (processidentity.Liveness, error) {
 	return processidentity.HostProcessLiveness(pid, identity)
 }
 
@@ -171,7 +173,7 @@ func (b pctBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, err
 	return cmd, nil, err
 }
 
-func (pctBackend) liveness(_ context.Context, pid int, identity string) (processidentity.Liveness, error) {
+func (pctBackend) liveness(_ context.Context, _ string, pid int, identity string) (processidentity.Liveness, error) {
 	return processidentity.HostProcessLiveness(pid, identity)
 }
 
