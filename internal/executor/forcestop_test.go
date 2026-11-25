@@ -30,6 +30,7 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	ForTestsRunKindlessAsProcesses()
 	RunHelper(os.Args)
 	runScratchHelper(os.Args)
 	if len(os.Args) == 3 && os.Args[1] == helperExitWhen {

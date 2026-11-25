@@ -29,23 +29,5 @@ labels = { site = "local" }
 gpu_binary = "D:/Kairo/kairo-bench-gpu.exe"
 executor_labels = { environment = "windows" }
 
-[[executors]]
-id = "win-local"
-kind = "windows"
-labels = { environment = "windows" }
-
-[[providers]]
-id = "nvidia-local"
-kind = "nvidia"
-observation_ttl_seconds = 15
-
-[[providers]]
-id = "host-local"
-kind = "host"
-observation_ttl_seconds = 15
-
-[[providers]]
-id = "filesystem-local"
-kind = "filesystem"
-filesystems = ["D:"]
-observation_ttl_seconds = 15
+# The daemon runs no jobs: [[executors]] and [[providers]] are a node
+# agent's (README "Node agents"), whose containers run the work.

@@ -85,7 +85,7 @@ func TestContainerLaunchesAreRefusedElsewhere(t *testing.T) {
 	host := NewLocal("host", nil, t.TempDir(), logger)
 	host.Kind = "linux"
 	launch := &store.Launch{Attempt: store.Attempt{ID: "att_0123"}, Image: "docker.io/library/python@sha256:" + strings.Repeat("a", 64), Argv: []string{"python"}, CWD: "/"}
-	if _, _, err := host.backend().launcher(launch); err == nil || !strings.Contains(err.Error(), "does not run containers") {
+	if _, err := host.backend().launcher(launch); err == nil || !strings.Contains(err.Error(), "runs no containers") {
 		t.Fatalf("a host executor: %v", err)
 	}
 	ctr := NewLocal("ctr", nil, t.TempDir(), logger)

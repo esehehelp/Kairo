@@ -22,14 +22,13 @@ import (
 // attempt's). The shim waits for the go-ahead on its stdin (the agent has
 // put it in the attempt's job object, handing it a handle to the job so the
 // job keeps its name while it runs, and recorded the attempt), starts the
-// attempt's command as its child (confined when asked, as confineCommand
-// does), lets what it is sent to stop it go by (the command, in its process
-// group, is sent the same), and writes the command's exit code to the
+// attempt's command (its runner) as its child, lets what it is sent to
+// stop it go by (the command, in its process group, is sent the same), and writes the command's exit code to the
 // attempt's exit file before it exits with it. An agent is thus not the
 // parent of the work: one restarted while the attempt runs adopts it
 // (AdoptableAttempts, Local.Adopt) and learns its exit from the exit file.
 //
-//	kairo __kairo-shim --exit FILE [--write DIR]... [--scratch DIR] -- PATH ARGV0 ARGV...
+//	kairo __kairo-shim --exit FILE -- PATH ARGV0 ARGV...
 const shimArg = "__kairo-shim"
 
 // Exit codes of a shim that ran no command: no go-ahead (the agent went
@@ -64,8 +63,7 @@ func shim(args []string, goAhead io.Reader) int {
 		for range stop {
 		}
 	}()
-	var exitFile, scratch string
-	var writable []string
+	var exitFile string
 	i := 0
 	for ; i < len(args); i++ {
 		if args[i] == "--" {
@@ -78,10 +76,6 @@ func shim(args []string, goAhead io.Reader) int {
 		switch args[i] {
 		case "--exit":
 			exitFile = args[i+1]
-		case "--write":
-			writable = append(writable, args[i+1])
-		case "--scratch":
-			scratch = args[i+1]
 		default:
 			fmt.Fprintf(os.Stderr, "kairo shim: unknown argument %q\n", args[i])
 			return shimNotStarted
@@ -90,7 +84,7 @@ func shim(args []string, goAhead io.Reader) int {
 	}
 	command := args[i:]
 	if exitFile == "" || len(command) < 2 {
-		fmt.Fprintln(os.Stderr, "kairo shim: usage: --exit FILE [--write DIR]... [--scratch DIR] -- PATH ARGV0 ARGV...")
+		fmt.Fprintln(os.Stderr, "kairo shim: usage: --exit FILE -- PATH ARGV0 ARGV...")
 		return shimNotStarted
 	}
 	var b [1]byte
@@ -98,19 +92,7 @@ func shim(args []string, goAhead io.Reader) int {
 		return shimNoGoAhead
 	}
 	cmd := &exec.Cmd{Path: command[0], Args: command[1:], Stdout: os.Stdout, Stderr: os.Stderr}
-	var release func()
-	if len(writable) > 0 {
-		r, err := confineCommand(cmd, writable, scratch)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "kairo shim:", err)
-			return writeShimExit(exitFile, shimNotConfined)
-		}
-		release = r
-	}
 	err := cmd.Start()
-	if release != nil {
-		release()
-	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "kairo shim: start:", err)
 		return writeShimExit(exitFile, shimNotStarted)
@@ -314,22 +296,16 @@ func (e *Local) watchAdopted(r AttemptRecord) {
 	e.finishAttempt(r, exit, nil)
 }
 
-// shimCommand wraps cmd, an attempt's command as built for it (confined as
-// conf says, when not nil), in its shim: the shim gets cmd's environment,
-// directory and process attributes (its own process group or console group,
-// which the command then shares); goAhead lets the command start.
-func shimCommand(cmd *exec.Cmd, exitFile string, conf *confinement) (shim *exec.Cmd, goAhead *os.File, err error) {
+// shimCommand wraps cmd, an attempt's launcher (its runner) as built for
+// it, in its shim: the shim gets cmd's environment, directory and process
+// attributes (its own process group or console group, which the command
+// then shares); goAhead lets the command start.
+func shimCommand(cmd *exec.Cmd, exitFile string) (shim *exec.Cmd, goAhead *os.File, err error) {
 	self, err := os.Executable()
 	if err != nil {
 		return nil, nil, err
 	}
 	args := []string{self, shimArg, "--exit", exitFile}
-	if conf != nil {
-		for _, w := range conf.writable {
-			args = append(args, "--write", w)
-		}
-		args = append(args, "--scratch", conf.scratch)
-	}
 	args = append(append(args, "--", cmd.Path), cmd.Args...)
 	r, w, err := os.Pipe()
 	if err != nil {

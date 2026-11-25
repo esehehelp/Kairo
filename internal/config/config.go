@@ -335,21 +335,20 @@ func (e Executor) Attributes() (map[string]string, error) {
 	return out, nil
 }
 
-// checkExecutors refuses executors whose attributes cannot be made, that
-// run containers on a system without Incus, or that would run inside WSL:
-// that executor kind is retired (Linux work runs on a Linux node or in a
-// container), and an agent taking one for a host executor would run Linux
-// command lines on Windows.
+// checkExecutors refuses executors whose attributes cannot be made, or that
+// run no containers (every executor runs its attempts in containers of
+// their images), or whose runtime is another system's.
 func checkExecutors(executors []Executor) error {
 	for _, e := range executors {
 		if _, err := e.Attributes(); err != nil {
 			return err
 		}
-		if system := containerKinds[e.Kind]; system != "" && runtime.GOOS != system {
-			return fmt.Errorf("executor %s: kind %s runs on %s only", e.ID, e.Kind, system)
+		system := containerKinds[e.Kind]
+		if system == "" {
+			return fmt.Errorf("executor %s: kind %q runs no containers; every executor runs its attempts in containers (incus, pct on Linux; wslc on Windows)", e.ID, e.Kind)
 		}
-		if e.Kind == "wsl2" || e.Labels["environment"] == "wsl2" {
-			return fmt.Errorf("executor %s: WSL executors are retired; remove it from the configuration", e.ID)
+		if runtime.GOOS != system {
+			return fmt.Errorf("executor %s: kind %s runs on %s only", e.ID, e.Kind, system)
 		}
 	}
 	return nil
@@ -391,14 +390,13 @@ func Load(path string) (Config, error) {
 	if c.Data.ScrubBytesPerDay < 0 {
 		return c, errors.New("data.scrub_bytes_per_day must not be negative")
 	}
-	// [node] names the control node itself. Executors and providers are
-	// optional: a control-only daemon runs no jobs, and every job host runs
-	// `kairo agent` instead.
+	// [node] names the control node itself. The daemon runs no jobs: every
+	// executor is a node agent's (`kairo agent`), whose containers run them.
 	if c.Node.ID == "" || c.Node.Name == "" {
 		return c, errors.New("node.id and node.name are required")
 	}
-	if err := checkExecutors(c.Executors); err != nil {
-		return c, err
+	if len(c.Executors) > 0 || len(c.Providers) > 0 {
+		return c, errors.New("the daemon runs no executors or providers: remove [[executors]] and [[providers]]; work runs on node agents (kairo agent)")
 	}
 	return c, validateTransport(c)
 }

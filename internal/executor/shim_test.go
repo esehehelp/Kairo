@@ -57,7 +57,7 @@ func TestARestartedAgentRecordsTheExitOfAnAttemptItAdopted(t *testing.T) {
 		t.Fatal(err)
 	}
 	// launched as an agent launches an attempt
-	shim, goAhead, err := shimCommand(cmd, exitPath(dir, "att"), nil)
+	shim, goAhead, err := shimCommand(cmd, exitPath(dir, "att"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +148,7 @@ func TestAShimWithoutTheGoAheadRunsNothing(t *testing.T) {
 	cmd := exec.Command(os.Args[0], helperExitWhen, marker)
 	prepareProcessTree(cmd)
 	hideTestConsole(cmd)
-	shim, goAhead, err := shimCommand(cmd, filepath.Join(dir, "exit"), nil)
+	shim, goAhead, err := shimCommand(cmd, filepath.Join(dir, "exit"))
 	if err != nil {
 		t.Fatal(err)
 	}
