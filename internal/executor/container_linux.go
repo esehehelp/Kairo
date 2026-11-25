@@ -148,9 +148,9 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 		return shimNotStarted, err
 	}
 	// On a host the container is unprivileged: its root is the first of
-	// root's subordinate ids, as a Proxmox container's (pct), and what it
-	// writes to is handed to that id before it starts, as pct's runner
-	// does, so that what either wrote the other can write again. Nested in
+	// root's subordinate ids (as a Proxmox container's), and what it
+	// writes to is handed to that id before it starts, so that what earlier
+	// containers on the node wrote it can write again. Nested in
 	// an unprivileged container (a Proxmox LXC) it cannot have a uid map of
 	// its own and is privileged instead: the outer container's root,
 	// unprivileged on the host.
@@ -205,13 +205,20 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 	if _, err := incusCommand(ctx, nil, "start", spec.Instance); err != nil {
 		return shimNotStarted, err
 	}
-	warned := false
+	warned, failures := false, 0
 	for {
 		st, err := instanceState(ctx, spec.Instance)
 		if incusNotFound(err) {
 			break
 		}
-		if err != nil && !warned {
+		// while it stops, its state may fail to read ("Invalid PID"): only a
+		// failure that lasts is told
+		if err != nil {
+			failures++
+		} else {
+			failures = 0
+		}
+		if failures >= 30 && !warned {
 			logf("state of %s not read: %v", spec.Instance, err)
 			warned = true
 		}

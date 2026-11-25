@@ -23,11 +23,11 @@ import (
 // which runs this binary as the OCI runner (ociRunArg); the runner has the
 // runtime make the attempt's container from its spec, waits for it to stop,
 // takes the exit its init wrote and removes the container. What differs
-// between runtimes (Incus on Linux, Proxmox's pct, wslc on Windows) is an
+// between runtimes (Incus on Linux, wslc on Windows) is an
 // ociRuntime; how an executor treats its containers, its ociCaps.
 
 // ociRunArg is the runner's argument (with the spec's path). The runners'
-// earlier arguments (containerRunArg, pctRunArg, wslcRunArg) still run it.
+// earlier arguments (containerRunArg, wslcRunArg) still run it.
 const ociRunArg = "__kairo-oci-run"
 
 // ociRuntime runs attempts' containers with one container runtime.
@@ -79,8 +79,6 @@ func ociCapsOf(kind string) (ociCaps, bool) {
 	switch kind {
 	case config.KindIncus:
 		return ociCaps{}, true
-	case config.KindPCT:
-		return ociCaps{dirsOnly: true}, true
 	case config.KindWSLC:
 		return ociCaps{dirsOnly: true, vm: true}, true
 	}
@@ -88,13 +86,10 @@ func ociCapsOf(kind string) (ociCaps, bool) {
 }
 
 // specRuntime is the runtime a container spec is of: its Runtime, or, for a
-// spec from before it named one, Incus or (with pct settings) pct.
+// spec from before it named one, Incus.
 func specRuntime(spec containerSpec) string {
-	switch {
-	case spec.Runtime != "":
+	if spec.Runtime != "" {
 		return spec.Runtime
-	case spec.PCT != nil:
-		return config.KindPCT
 	}
 	return config.KindIncus
 }
@@ -113,13 +108,6 @@ func (b ociBackend) launcher(launch *store.Launch) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("executor %s: kind %q runs no containers here (every executor runs containers: incus, pct, wslc)", b.e.ID, b.kind)
 	}
 	opts := containerOptions{runArg: ociRunArg, runtime: b.kind, dirsOnly: b.caps.dirsOnly, vm: b.caps.vm}
-	if b.kind == config.KindPCT {
-		settings, err := pctSettingsOf(b.e.Attributes)
-		if err != nil {
-			return nil, err
-		}
-		opts.pct = settings
-	}
 	return b.e.containerCommand(launch, opts)
 }
 
@@ -349,7 +337,7 @@ func runOCIHelper(args []string) {
 		return
 	}
 	switch args[1] {
-	case ociRunArg, containerRunArg, pctRunArg, wslcRunArg:
+	case ociRunArg, containerRunArg, wslcRunArg:
 		os.Exit(ociRun(args[2]))
 	}
 }

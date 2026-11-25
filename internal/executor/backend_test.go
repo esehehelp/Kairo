@@ -21,7 +21,6 @@ func TestTheBackendComesFromTheKind(t *testing.T) {
 	}{
 		{"linux", nil, "executor.ociBackend"},
 		{"incus", nil, "executor.ociBackend"},
-		{"pct", nil, "executor.ociBackend"},
 		{"wslc", nil, "executor.ociBackend"},
 	} {
 		e := NewLocal("x", nil, t.TempDir(), logger)
