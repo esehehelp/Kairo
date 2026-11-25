@@ -432,11 +432,17 @@ func translatePaths(env []string, paths map[string]string) []string {
 		name, value, _ := strings.Cut(kv, "=")
 		out[i] = kv
 		for _, node := range nodes {
-			if value == node {
+			// a node path of an agent on Windows (a drive letter) is
+			// compared with either separator; the container's is a Linux path
+			v, n := value, node
+			if len(node) >= 2 && node[1] == ':' {
+				v, n = strings.ReplaceAll(value, `\`, "/"), strings.ReplaceAll(node, `\`, "/")
+			}
+			if v == n {
 				out[i] = name + "=" + paths[node]
 				break
 			}
-			if rest, ok := strings.CutPrefix(value, strings.TrimSuffix(node, "/")+"/"); ok {
+			if rest, ok := strings.CutPrefix(v, strings.TrimSuffix(n, "/")+"/"); ok {
 				out[i] = name + "=" + paths[node] + "/" + rest
 				break
 			}

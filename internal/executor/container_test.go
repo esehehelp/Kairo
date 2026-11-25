@@ -40,6 +40,24 @@ func TestTranslatePaths(t *testing.T) {
 	if strings.Join(got, "\n") != strings.Join(want, "\n") {
 		t.Fatalf("got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
 	}
+	// an agent on Windows: its paths with either separator
+	got = translatePaths([]string{
+		`HOME=C:\_kairo-volatile\scratch\att_1\home`,
+		`KAIRO_CONTINUATION_REF=C:\_kairo-volatile\outputs\exe_1\ckpt\step_10.pt`,
+		"X=C:/_kairo-volatile/scratch/att_1/tmp",
+		`KAIRO_SCRATCH=C:\_kairo-volatile\scratch\att_1`,
+		`OTHER=C:\_kairo-volatile\scratch\att_10`,
+	}, map[string]string{`C:\_kairo-volatile\scratch\att_1`: "/kairo/scratch", `C:\_kairo-volatile\outputs\exe_1`: "/kairo/output"})
+	want = []string{
+		"HOME=/kairo/scratch/home",
+		"KAIRO_CONTINUATION_REF=/kairo/output/ckpt/step_10.pt",
+		"X=/kairo/scratch/tmp",
+		"KAIRO_SCRATCH=/kairo/scratch",
+		`OTHER=C:\_kairo-volatile\scratch\att_10`,
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("Windows: got\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
 }
 
 // In the container the attempt's variables replace the image's of the same
