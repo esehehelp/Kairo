@@ -567,7 +567,7 @@ kairo resource reconcile RESOURCE_ID --confirm-process-absent
 
 Executor はこのような残留プロセスを自動的に終了させます。
 
-1. 検知されてから 10 秒経過すると停止を要求します（`SIGTERM` を送信。なお Windows ではランチャーがすでに終了しているため、`CTRL_BREAK` は届きません）。
+1. 検知されてから 10 秒経過すると停止を要求します（ランナーはすでに終了しているので、エージェントがランタイムでコンテナを止めます）。
 2. さらに 30 秒経過すると強制終了（kill）します。対象となるのは、Attempt のコンテナ（ランタイムで即座に止めます）と、ランナーのプロセスグループ（Windows ではジョブオブジェクト）であり、[強制停止](#強制停止)（force stop）と同じ方法で特定されます。これら以外のプロセスが対象になることは決してありません。
 
 なお、エージェント再起動に伴ってロストした Attempt は終了済み（`exited`）ではないため、この自動終了の対象にはならずそのまま残されます。
@@ -1716,7 +1716,7 @@ GPU クロック、電力上限、プロセッサ設定の変更には、デー�
 
 `kairo task pause --force|-f [--grace 30s] [--reason ...] PROJECT QUEUE TASK`（`queue pause --force` および `project pause --force` も同様）は、チェックポイント対応の有無にかかわらず、対象となった実行を一時停止ではなく終了させる pause 操作です。
 
-- **開始済み Execution**: その Attempt に対して強制停止が発行され、担当 Executor（ノードエージェント）が Attempt のコンテナとランナーを停止します。まずグレースフル停止を試み（Windows はランチャーのプロセスグループへ `CTRL_BREAK` を送信、Linux はプロセスグループおよび該当 Attempt の `KAIRO_ATTEMPT_ID` を持つすべてのプロセスへ `SIGTERM` を送信）、グレース期間経過後も残っているプロセスを強制終了します（Windows は Attempt のジョブオブジェクト終了と `taskkill /T /F`、Linux は `SIGKILL`）。Execution は終了原因 `force_stopped` で終了し、進行中の `suspend` は待機されません。
+- **開始済み Execution**: その Attempt に対して強制停止が発行され、担当 Executor（ノードエージェント）が Attempt のコンテナとランナーを停止します。まずグレースフル停止を試み（ランナーのプロセスグループへ停止を送ります。Linux は `SIGTERM`、Windows は `CTRL_BREAK` です。ランナーがランタイムでコンテナを止め、ランナーがいなければエージェントがランタイムで直接止めます）、グレース期間経過後も残っているものを強制終了します（ランタイムでコンテナを kill し、ランナーのプロセスグループを kill します。Windows ではジョブオブジェクトの終了と `taskkill /T /F` です）。Execution は終了原因 `force_stopped` で終了し、進行中の `suspend` は待機されません。
 - **未開始 Execution**: 取り下げられ（`withdrawn_before_start`）、予約済みの Lease は通常の pause と同様に取消（revoke）されます。
 - **Lease 解放と静止判定**: Lease は通常の静止証明（quiescence proof）を経てのみ解放され、Executor がプロセスツリーの完全消滅も確認した時点で操作全体が `quiesced` となります。終了途中のプロセスは、ファイル（GPU のデバイスファイルを含む）を閉じてゾンビ状態になるよりも先に自身のメモリを解放するため、その段階で `/proc/PID/environ` から環境変数を読み取れなくなります（空になるかアクセスが拒否されます）。このため、`KAIRO_ATTEMPT_ID` によって特定されたプロセスは `starttime` とともに記憶され、同じ `starttime` で存在し続けており、ゾンビではなく、かつ環境変数が空または読み取り不可である間も生存中としてカウントされます。
 - **Task の最終状態**: Task は `stopped` 状態で終了し、継続実行や再起動は計画されません。また、後続 Task は失敗した Task の場合と同様にブロックされます。Task 結果には操作内容、実行者（actor）、および理由が記録されます。
@@ -1857,7 +1857,7 @@ Kairo が管理する Attempt には、以下の環境変数が渡されます�
 - **再開時**: `KAIRO_CONTINUATION_REF`
 - **volatile store**: Executor がvolatile store（[データストア](#データストア)を参照）を提供している場合は `KAIRO_SCRATCH` と `KAIRO_OUTPUT_DIR`
 
-SDK は、Attempt を Linux のコンテナで動くものとして扱います（プロセスの身元は `/proc/<pid>/stat` から読みます）。Python SDK の `DistributedAdapter` は、1 つの Attempt の中の torch の分散（1 つのコンテナの中の DDP）を協調させます。rank 0 だけがポーリングと応答を行い、チェックポイントは全 rank がそろって作ります。`local_continuation` は、Kairo が渡した継続の参照をそのまま返します（全 rank が同じコンテナのファイルを見るため、別ノードへの受け渡しはありません）。Gang 用の補助（`GangContext`、rank ごとの Attempt）はなくなりました。
+SDK は、Attempt を Linux のコンテナで動くものとして扱います（プロセスの身元は `/proc/<pid>/stat` から読みます）。Python SDK の `DistributedAdapter` は、1 つの Attempt の中の torch の分散（1 つのコンテナの中の DDP）を協調させます。rank 0 だけがポーリングと応答を行い、チェックポイントは全 rank がそろって作ります。`local_continuation` は、Kairo が渡した継続の参照をそのまま返します（全 rank が同じコンテナのファイルを見るため、別ノードへの受け渡しはありません。相対パスは各 rank の作業ディレクトリから読まれるので、rank ごとに作業ディレクトリを変えるなら絶対パスで公開します）。Gang 用の補助（`GangContext`、rank ごとの Attempt）はなくなりました。
 
 ### セーフポイントの挙動と Python・Rust SDK
 
@@ -1882,11 +1882,11 @@ kairo-sdk = { git = "https://github.com/esehehelp/Kairo", rev = "<commit>" }
 
 Rust の停止シグナルの処理（feature `signals`、`install_stop_handlers`）は Unix の `SIGTERM` だけを扱い、ほかの OS では何もしません（`request_stop` はどこでも使えます）。
 
-すべての SDK は、テストスイート内で `sdk/conformance/*.json` をリプレイして適合性を検証します。SDK のテストは Linux で走らせます（CI はコンテナの中）。Python のテストは Linux 以外で走らせると、プロセスの身元を Linux の形の仮の値に差し替えます。Rust のテストのうち、自分のプロセスを登録するものは Linux でだけ走ります。
+すべての SDK は、テストスイート内で `sdk/conformance/*.json` をリプレイして適合性を検証します。SDK のテストは Linux で走らせます（CI はコンテナの中）。Python のテストは Linux 以外で走らせると、プロセスの身元を Linux の形の仮の値に差し替えます（torch の複数 rank のうち、プロセスを登録するテストは Linux でだけ走ります）。Rust のテストのうち、自分のプロセスを登録するものは Linux でだけ走ります。
 
 ### プロジェクト管理の低レベルコントローラポリシー
 
-Execution API へ直接投入するプロジェクトでも、`ResumeAfterKairoPreemption` をオプトインで利用できます。ポリシースナップショットと正規化された投入内容（canonical submission）は、最初の API 呼び出しの前にプロジェクト側のコントローラジャーナルへ書き込まれます。投入内容には、ダイジェストで固定した `image` と、イメージの中の絶対パスの `cwd` が要ります（ないものは、ジャーナルに書く前に拒否します）。
+Execution API へ直接投入するプロジェクトでも、`ResumeAfterKairoPreemption` をオプトインで利用できます。ポリシースナップショットと正規化された投入内容（canonical submission）は、最初の API 呼び出しの前にプロジェクト側のコントローラジャーナルへ書き込まれます。投入内容には、ダイジェスト（`@sha256:` と 64 桁の 16 進数）で終わる `image` と、イメージの中の絶対パスの `cwd` が要ります。この 2 つがないもの、または形が違うものは、ジャーナルに書く前に拒否します。参照のそれ以外の部分はデーモンが確かめます。
 
 ```python
 from kairo_sdk import ControllerJournal, KairoControllerClient, ProjectController

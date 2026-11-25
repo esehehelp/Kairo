@@ -100,8 +100,11 @@ class DistributedAdapter:
         """The continuation Kairo handed this attempt, as a file this rank can open.
 
         Every rank of an attempt runs in its one container and sees the same
-        files: the reference itself. (``dest_dir`` and ``chunk_bytes`` are
-        kept for callers written when a rank could be on another node.)
+        files: the reference itself. A relative reference is read from each
+        rank's working directory; publish absolute paths (as Kairo imports
+        only those) when ranks change theirs. (``dest_dir`` and
+        ``chunk_bytes`` are kept for callers written when a rank could be on
+        another node.)
         Returns ``None`` when the attempt has no continuation.
         """
         del dest_dir, chunk_bytes

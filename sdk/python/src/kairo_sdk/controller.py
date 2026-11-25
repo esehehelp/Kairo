@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import time
 from collections.abc import Iterable, Mapping
@@ -747,6 +748,9 @@ class ProjectController:
             time.sleep(poll_interval_seconds)
 
 
+# a reference ending in its digest, as the daemon pins one
+_PINNED_IMAGE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}")
+
 def _normalize_submission_template(
     value: Mapping[str, Any], project: str
 ) -> dict[str, Any]:
@@ -760,9 +764,9 @@ def _normalize_submission_template(
         raise ValueError("submission template requires argv and cwd")
     # every execution runs in a container: the daemon refuses one without a
     # pinned image, or with a cwd that is no absolute path in it; refused
-    # here, before it is journaled
+    # here, before it is journaled (the daemon reads the rest of the reference)
     image = template.get("image")
-    if not isinstance(image, str) or "@sha256:" not in image:
+    if not isinstance(image, str) or not _PINNED_IMAGE.fullmatch(image):
         raise ValueError(
             "submission template requires image: a reference pinned to its digest "
             "(registry/repository@sha256:...); every execution runs in a container"

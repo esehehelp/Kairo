@@ -8,6 +8,11 @@ from pathlib import Path
 import pytest
 
 torch = pytest.importorskip("torch")
+# every rank registers its process: a spawned rank reads its identity from
+# /proc (the tests' stand-in elsewhere does not reach a new interpreter)
+pytestmark = pytest.mark.skipif(
+    not Path("/proc/self/stat").exists(), reason="ranks register a Linux process identity"
+)
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
