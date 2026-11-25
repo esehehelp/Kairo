@@ -300,10 +300,9 @@ func init() {
 				{"issue", "--dir DIR --host HOST [--host HOST ...]", "re-issue the server certificate from the existing CA", bind(tlsAction, "issue")},
 			},
 		}},
-		{name: "db", summary: "database maintenance (compact, import-sqlite)", group: &commandGroup{
+		{name: "db", summary: "database maintenance (compact)", group: &commandGroup{
 			subs: []command{
 				{"compact", "(--config DAEMON.toml | --database-url URL)", "prune resource observations and device samples and vacuum their tables", dbCompact},
-				{"import-sqlite", "--from KAIRO.db (--config DAEMON.toml | --to URL)", "copy a SQLite Kairo database into an empty PostgreSQL one and verify every table", dbImportSQLite},
 			},
 			aliases: map[string]string{"vacuum": "compact"},
 		}},

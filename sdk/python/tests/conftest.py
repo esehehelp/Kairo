@@ -24,6 +24,14 @@ def _isolated_kairo_environment(tmp_path_factory, monkeypatch: pytest.MonkeyPatc
     else:
         monkeypatch.setenv("HOME", str(empty))
         monkeypatch.setenv("XDG_CONFIG_HOME", str(empty))
+    if not Path("/proc/self/stat").exists():
+        # an attempt runs in a Linux container; run elsewhere, the tests give
+        # this process an identity of Linux's shape
+        identity = lambda: f"proc:{os.getpid()}:starttime:1"  # noqa: E731
+        monkeypatch.setattr(runtime, "_current_process_identity", identity)
+        from kairo_sdk import torch as kairo_torch
+
+        monkeypatch.setattr(kairo_torch, "_current_process_identity", identity)
     runtime._stop_signal.clear()
     yield
     runtime._stop_signal.clear()

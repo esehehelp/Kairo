@@ -1,6 +1,9 @@
 //! Reporters of one process share one session: one registration, one
 //! heartbeat thread (its own test binary: the session is process-wide and
 //! comes from the environment).
+// the session registers this process's identity, read from /proc: an
+// attempt runs in a Linux container
+#![cfg(target_os = "linux")]
 
 mod common;
 

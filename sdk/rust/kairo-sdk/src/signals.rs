@@ -14,8 +14,7 @@ pub fn stop_requested() -> bool {
     STOP.load(Ordering::SeqCst)
 }
 
-/// Make SIGTERM (Unix) and CTRL_BREAK (Windows) request a stop instead of
-/// terminating the process; the next safe point then checkpoints and returns
+/// Make SIGTERM request a stop instead of terminating the process; the next safe point then checkpoints and returns
 /// `true`.
 #[cfg(feature = "signals")]
 pub fn install_stop_handlers() -> std::io::Result<()> {
@@ -44,24 +43,11 @@ mod os {
     }
 }
 
-#[cfg(all(feature = "signals", windows))]
+/// Elsewhere (an attempt runs in a Linux container) there is no stop signal
+/// to catch: [`request_stop`] still works.
+#[cfg(all(feature = "signals", not(unix)))]
 mod os {
-    use windows_sys::Win32::System::Console::{SetConsoleCtrlHandler, CTRL_BREAK_EVENT};
-
-    unsafe extern "system" fn on_ctrl(event: u32) -> i32 {
-        if event == CTRL_BREAK_EVENT {
-            super::request_stop();
-            1
-        } else {
-            0
-        }
-    }
-
     pub(super) fn install() -> std::io::Result<()> {
-        // SAFETY: registers a handler that only stores an atomic.
-        if unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) } == 0 {
-            return Err(std::io::Error::last_os_error());
-        }
         Ok(())
     }
 }

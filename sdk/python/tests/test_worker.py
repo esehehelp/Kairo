@@ -16,7 +16,6 @@ from kairo_sdk import (
     AttemptSession,
     CommandJournal,
     DistributedAdapter,
-    GangContext,
     KairoAPIError,
     NoContinuationError,
     ProgressReporter,
@@ -180,20 +179,6 @@ def test_failed_checkpoint_command_is_rejected_and_the_worker_carries_on():
     assert not session.suspend_handled
 
 
-def test_gang_rank_acknowledges_its_own_command_like_rank_zero():
-    routes = worker_routes({"GET /api/worker/commands": suspend("cmd_rank1", kind="checkpoint"),
-                            "POST /api/worker/commands/cmd_rank1/acks": OK})
-    with serve(FakeDaemon(routes)) as daemon:
-        session = session_for(daemon.url)
-        session.gang = GangContext("gang_1", 1, 2, "10.0.0.2", 29500)
-        adapter = DistributedAdapter(session)
-        adapter._mirror_on_own_attempt(1, "checkpoint", "ckpt://rank0", None)
-        adapter._mirror_on_own_attempt(0, "checkpoint", "ckpt://rank0", None)  # rank 0 acknowledged its own
-    phases = [body["phase"] for body in acks(daemon)]
-    assert phases == ["accepted", "checkpointing", "checkpointed"]
-    assert acks(daemon)[-1]["payload"]["continuation_ref"] == "ckpt://rank0"
-
-
 # --------------------------------------------------------------------------
 # background heartbeat
 
@@ -274,36 +259,7 @@ def test_managed_safe_point_handles_commands_before_the_stop_signal():
 
 
 # --------------------------------------------------------------------------
-# gang, continuation
-
-
-def test_gang_context(monkeypatch):
-    for name, value in {
-        "KAIRO_GANG_ID": "gang_9", "KAIRO_GANG_RANK": "0", "KAIRO_GANG_SIZE": "4",
-        "KAIRO_GANG_MASTER_ADDR": "10.0.0.2", "KAIRO_GANG_MASTER_PORT": "29400",
-    }.items():
-        monkeypatch.setenv(name, value)
-    session = AttemptSession.from_environment()
-    assert session.gang == GangContext("gang_9", 0, 4, "10.0.0.2", 29400)
-
-
-@pytest.mark.parametrize(
-    ("name", "value", "message"),
-    [
-        ("KAIRO_GANG_RANK", "one", "KAIRO_GANG_RANK must be an integer"),
-        ("KAIRO_GANG_RANK", "4", "outside KAIRO_GANG_SIZE"),
-        ("KAIRO_GANG_MASTER_PORT", "70000", "KAIRO_GANG_MASTER_PORT"),
-    ],
-)
-def test_malformed_gang_is_an_error(monkeypatch, name, value, message):
-    for key, default in {
-        "KAIRO_GANG_ID": "gang_9", "KAIRO_GANG_RANK": "0", "KAIRO_GANG_SIZE": "4",
-        "KAIRO_GANG_MASTER_ADDR": "10.0.0.2", "KAIRO_GANG_MASTER_PORT": "29400",
-    }.items():
-        monkeypatch.setenv(key, default)
-    monkeypatch.setenv(name, value)
-    with pytest.raises(RuntimeError, match=message):
-        AttemptSession.from_environment()
+# continuation
 
 
 def test_continuation_or(monkeypatch):
@@ -527,20 +483,6 @@ def test_unanswered_publication_is_sent_again_before_anything_else():
     published = [body for body in acks(daemon) if body["phase"] == "checkpointed"]
     assert [body["payload"]["continuation_ref"] for body in published] == ["ckpt://9", "ckpt://9"]
     assert daemon.paths("GET").count("/api/worker/commands") == 1
-
-
-def test_gang_rank_tries_its_own_acknowledgement_again_after_a_failure():
-    routes = worker_routes({"GET /api/worker/commands": [UNAVAILABLE, suspend("cmd_rank1", kind="checkpoint")],
-                            "POST /api/worker/commands/cmd_rank1/acks": OK})
-    with serve(FakeDaemon(routes)) as daemon:
-        session = session_for(daemon.url)
-        session.gang = GangContext("gang_1", 1, 2, "10.0.0.2", 29500)
-        adapter = DistributedAdapter(session)
-        adapter._mirror_on_own_attempt(1, "checkpoint", "ckpt://rank0", None)
-        assert adapter._pending_mirror == ("checkpoint", "ckpt://rank0", None)
-        adapter._mirror_on_own_attempt(1, *adapter._pending_mirror)  # what the next safe point does
-        assert adapter._pending_mirror is None
-    assert [body["phase"] for body in acks(daemon)] == ["accepted", "checkpointing", "checkpointed"]
 
 
 def test_distributed_publication_without_an_answer_is_sent_again_before_anything_else():

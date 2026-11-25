@@ -29,16 +29,6 @@ impl fmt::Display for EnvError {
 
 impl std::error::Error for EnvError {}
 
-/// The gang an attempt belongs to: attempts started together, one per rank.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Gang {
-    pub id: String,
-    pub rank: u32,
-    pub size: u32,
-    pub master_addr: String,
-    pub master_port: u16,
-}
-
 /// A Kairo-managed attempt: where the daemon is, which attempt this process
 /// runs as, and the attempt's bearer token (never shown by `Debug`).
 #[derive(Clone)]
@@ -51,7 +41,6 @@ pub struct Attempt {
     continuation_ref: Option<String>,
     resource_ids: Vec<String>,
     resource_bindings: Vec<String>,
-    gang: Option<Gang>,
 }
 
 impl fmt::Debug for Attempt {
@@ -65,7 +54,6 @@ impl fmt::Debug for Attempt {
             .field("continuation_ref", &self.continuation_ref)
             .field("resource_ids", &self.resource_ids)
             .field("resource_bindings", &self.resource_bindings)
-            .field("gang", &self.gang)
             .finish()
     }
 }
@@ -104,22 +92,6 @@ impl Attempt {
         let list = |name: &str| -> Vec<String> {
             var(name).map(|v| v.split(',').filter(|s| !s.is_empty()).map(str::to_string).collect()).unwrap_or_default()
         };
-        let gang = match var("KAIRO_GANG_ID") {
-            None => None,
-            Some(id) => {
-                let field = |name: &str| {
-                    var(name).ok_or_else(|| EnvError(format!("KAIRO_GANG_ID is set but {name} is missing")))
-                };
-                fn number<T: std::str::FromStr>(name: &str, value: String) -> Result<T, EnvError> {
-                    value.trim().parse().map_err(|_| EnvError(format!("{name} {value:?} is not a valid number")))
-                }
-                let rank = number("KAIRO_GANG_RANK", field("KAIRO_GANG_RANK")?)?;
-                let size = number("KAIRO_GANG_SIZE", field("KAIRO_GANG_SIZE")?)?;
-                let master_addr = field("KAIRO_GANG_MASTER_ADDR")?;
-                let master_port = number("KAIRO_GANG_MASTER_PORT", field("KAIRO_GANG_MASTER_PORT")?)?;
-                Some(Gang { id, rank, size, master_addr, master_port })
-            }
-        };
         Ok(Some(Attempt {
             api_url: api_url.trim_end_matches('/').to_string(),
             execution_id,
@@ -129,7 +101,6 @@ impl Attempt {
             continuation_ref: var("KAIRO_CONTINUATION_REF"),
             resource_ids: list("KAIRO_RESOURCE_IDS"),
             resource_bindings: list("KAIRO_RESOURCE_BINDINGS"),
-            gang,
         }))
     }
 
@@ -158,10 +129,6 @@ impl Attempt {
 
     pub fn resource_bindings(&self) -> &[String] {
         &self.resource_bindings
-    }
-
-    pub fn gang(&self) -> Option<&Gang> {
-        self.gang.as_ref()
     }
 
     /// The DER certificates of `KAIRO_API_CA`: the only trust anchors for the

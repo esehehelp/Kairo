@@ -17,7 +17,6 @@ from kairo_sdk.runtime import _current_process_identity, _parse_proc_stat_startt
 DATA = Path(__file__).parent / "data"
 
 
-_IMPORTED_NS = time.time_ns()
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -273,18 +272,12 @@ def test_context_manager_background_heartbeat_reports_progress(control_server):
     assert body["progress"]["detail"] == {"loss": 1.2}
 
 
-def test_current_process_identity_uses_unix_nanoseconds():
+@pytest.mark.skipif(not os.path.exists("/proc/self/stat"), reason="an attempt runs in a Linux container")
+def test_current_process_identity_is_linux_start_time():
     identity = _current_process_identity()
-    if os.name == "nt":
-        pid_text, start_text = identity.removeprefix("pid:").split(":start:")
-        assert int(pid_text) > 0
-        # this process started before this module was imported, and not long
-        # before: however long the session has run since
-        assert 0 <= _IMPORTED_NS - int(start_text) < 600_000_000_000
-    else:
-        pid_text, start_text = identity.removeprefix("proc:").split(":starttime:")
-        assert int(pid_text) == os.getpid()
-        assert int(start_text) > 0
+    pid_text, start_text = identity.removeprefix("proc:").split(":starttime:")
+    assert int(pid_text) == os.getpid()
+    assert int(start_text) > 0
 
 
 def test_proc_stat_parser_reads_field_22_with_spaces_and_parentheses_in_comm():

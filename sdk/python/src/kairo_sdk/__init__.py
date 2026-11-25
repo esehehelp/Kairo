@@ -32,7 +32,6 @@ from .journal import CommandJournal
 from .runtime import (
     AttemptSession,
     CommandContext,
-    GangContext,
     ProgressEnvelope,
     ProgressReporter,
     SuspendResult,
@@ -55,7 +54,6 @@ __all__ = [
     "ControllerPolicy",
     "CoordinationEvent",
     "DistributedAdapter",
-    "GangContext",
     "KairoAPIError",
     "KairoClient",
     "KairoControllerClient",
