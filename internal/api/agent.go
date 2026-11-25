@@ -315,6 +315,43 @@ func (s *Server) agentOps() []agentOp {
 				read, err := s.Store.AuthorizePackRead(ctx, b.NodeID, b.ObjectID, b.Token)
 				return agentops.PackReadAnswer{Read: read}, err
 			}),
+		handle(s, agentops.NetBenches,
+			func(_ context.Context, b agentops.NetBenchesRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.NetBenchesRequest) (agentops.NetBenchesAnswer, error) {
+				benches, err := s.Store.NetBenches(ctx, b.NodeID)
+				return agentops.NetBenchesAnswer{Benches: benches}, err
+			}),
+		handle(s, agentops.NetBenchStatus,
+			func(_ context.Context, b agentops.NetBenchRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.NetBenchRequest) (agentops.NetBenchStatusAnswer, error) {
+				status, err := s.Store.NetBenchStatus(ctx, b.NodeID, b.RunID)
+				return agentops.NetBenchStatusAnswer{Status: status}, err
+			}),
+		handle(s, agentops.NetBenchStart,
+			func(_ context.Context, b agentops.NetBenchStartRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.NetBenchStartRequest) (agentops.OK, error) {
+				return recorded(s.Store.NetBenchStart(ctx, b.NodeID, b.RunID, b.Start))
+			}),
+		handle(s, agentops.NetBenchPoints,
+			func(_ context.Context, b agentops.NetBenchPointsRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.NetBenchPointsRequest) (agentops.OK, error) {
+				return recorded(s.Store.NetBenchPoints(ctx, b.NodeID, b.RunID, b.Points))
+			}),
+		handle(s, agentops.NetBenchKind,
+			func(_ context.Context, b agentops.NetBenchKindRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.NetBenchKindRequest) (agentops.OK, error) {
+				return recorded(s.Store.NetBenchKind(ctx, b.NodeID, b.RunID, b.Kind, b.Reference))
+			}),
+		handle(s, agentops.NetBenchFinish,
+			func(_ context.Context, b agentops.NetBenchFinishRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.NetBenchFinishRequest) (agentops.OK, error) {
+				return recorded(s.Store.NetBenchFinish(ctx, b.NodeID, b.RunID, b.Finish))
+			}),
+		handle(s, agentops.NetBenchAuthorize,
+			func(_ context.Context, b agentops.NetBenchAuthorizeRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.NetBenchAuthorizeRequest) (agentops.OK, error) {
+				return recorded(s.Store.AuthorizeBenchNet(ctx, b.NodeID, b.RunID, b.Token))
+			}),
 		handle(s, agentops.UnlaunchedLeases,
 			func(ctx context.Context, b agentops.UnlaunchedRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.ExecutorID)

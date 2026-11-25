@@ -65,6 +65,19 @@ func renderBenchPlan(w io.Writer, plan store.BenchPlan) error {
 	if run.PeerNodeID != nil {
 		where += " and " + *run.PeerNodeID
 	}
+	if run.Class == store.BenchNetwork && run.PeerNodeID != nil {
+		// between two agents, with no task
+		verb := "bench " + run.ID + " of"
+		if plan.DryRun {
+			verb = "would bench"
+		}
+		fmt.Fprintf(w, "%s %s/%s (%s: %s)\n", verb, run.HostID, run.DeviceID, run.Class, strings.Join(run.Kinds, ", "))
+		fmt.Fprintf(w, "  measured by node %s's agent against node %s's transfer endpoint (pack_addr, TLS), as transfers go; no task, nothing held\n", *run.PeerNodeID, run.NodeID)
+		if !plan.DryRun {
+			fmt.Fprintf(w, "  follow it with kairo hardware profile %s %s\n", run.HostID, run.DeviceID)
+		}
+		return nil
+	}
 	if plan.DryRun {
 		fmt.Fprintf(w, "would bench %s/%s (%s: %s) on %s\n", run.HostID, run.DeviceID, run.Class, strings.Join(run.Kinds, ", "), where)
 	} else {

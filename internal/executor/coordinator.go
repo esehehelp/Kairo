@@ -73,6 +73,9 @@ type Coordinator interface {
 	FetchesToMake(ctx context.Context, executorID string) ([]store.FetchOrder, error)
 	RecordFetch(ctx context.Context, made store.FetchMade) error
 	AuthorizePackRead(ctx context.Context, nodeID, objectID, token string) (store.PackRead, error)
+	// AuthorizeBenchNet: token is that of a live network bench measuring
+	// nodeID's transfer endpoint (runID).
+	AuthorizeBenchNet(ctx context.Context, nodeID, runID, token string) error
 	DeletionsToMake(ctx context.Context, executorID string) ([]store.DeletionOrder, error)
 	SettleDeletion(ctx context.Context, settled store.ObjectDeletion) error
 	EvictionsToMake(ctx context.Context, executorID string) ([]store.EvictionOrder, error)

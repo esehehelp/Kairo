@@ -1939,7 +1939,7 @@ controller.run_forever()
 | GPU | 対象 GPU（排他リクエストで対象 `device` を指定可能）、1 CPU、2 GiB | スイープ対象: `gemm`（bf16）、`copy`、`gemv-b1`、`gemv-b8`／デフォルト計測: `pcie-h2d`、`pcie-d2h`、`pcie-h2d-latency`、`pcie-d2h-latency` |
 | `cpu` | ノードの全 CPU（`cpu_millis_min` = 全量: 同じノードで他ジョブは並行実行されない）、4 GiB | スイープ対象: `cpu-compute`、`cpu-single`、`cpu-stream` |
 | `disk:FS` | `FS` 上の 9 GiB（テスト用ファイル） | `disk-seq-read`、`disk-seq-write`（qd 32）、`disk-rand-read`（qd 32）、`disk-rand-read-qd1`、`disk-rand-write`、`disk-fsync`、`disk-sustained` |
-| `net:NODE` | （作り直し中: 2 つのノードの agent どうしで測る形にします。それまでは拒否されます） | `net-latency`、`net-bandwidth-send`、`net-bandwidth-recv`（4 ストリーム） |
+| `net:NODE` | なし（Task にならず、2 つのノードの agent どうしで測ります。下記） | `net-latency`、`net-bandwidth-send`、`net-bandwidth-recv`（4 ストリーム） |
 
 #### 実行条件・競合・コンテナ
 
@@ -1960,6 +1960,15 @@ controller.run_forever()
 - **storage のベンチマーク**: Executor が、測るファイルシステムの上にディレクトリ `.kairo-bench` を作り、コンテナの `/kairo/bench-disk`（`KAIRO_BENCH_DISK`）に書き込み可能でマウントします。テスト用のファイルはそこに書かれます（コンテナ自身のディスクではなく、測るファイルシステムに）。
 
 Execution の argv は、コンテナの中の Kairo のバイナリで動くドライバ `/kairo/bin/kairo hardware bench-run --run ID` となります。ドライバは Attempt トークン（`KAIRO_API_URL`、`KAIRO_API_CA`、`KAIRO_ATTEMPT_TOKEN`）を使ってワーカー API 経由でデーモンと通信します。このトークンがアクセスできるのは自身の Attempt が担当する run のみであり（他の run へのアクセスは `403`、ベンチマーク以外の Attempt からのアクセスは `404`）、変更できる設定も自身の Lease に紐づく `bench` 設定のみです。
+
+#### ネットワークのベンチマーク（agent どうし）
+
+`net:NODE` は、ホスト側のノード（`--node`、既定はホストのノードのうち、転送の口（Executor の `pack_addr`）を持つ最初のもの）と `NODE` の間の通信を、データの転送（packs）と同じ経路で測ります。Task も Execution も作らず、何も予約しません。
+
+1. デーモンは run を作り、トークンを 1 つ発行します（`bench_runs.net_token`）。
+2. `NODE` の agent は 15 秒ごとに自分が測る run を尋ね（エージェント API の `net-benches`）、見つけた run ごとにドライバ（`hwbench.Driver`。Task のベンチマークと同じもの）を自分の中で動かします。ワークロードは agent 自身のバイナリ（`kairo bench run net-* --pack-peer ADDR --pack-run RUN --pack-ca CA`、トークンは環境変数 `KAIRO_BENCH_NET_TOKEN`）で、結果はエージェント API で報告します。
+3. 測られる側の agent は、転送の口（7475、TLS、HTTP/1.1）の `/bench/net/<run>` で接続を受け、トークンをデーモンに確かめてから（`net-bench-authorize`）、接続をベンチマークの対向（`kairo bench serve` と同じ処理）に切り替えます（`Upgrade: kairo-bench`）。測った値には TLS の分が含まれます。転送が実際に通る経路の値だからです。
+4. 作ってから 2 時間で終わらない run は失敗にします（測る側の agent がいない場合など）。
 
 #### ドライバの実行手順
 
@@ -2031,6 +2040,7 @@ Execution の argv は、コンテナの中の Kairo のバイナリで動くド
 kairo bench run WORKLOAD [--seconds S] [--interval S] [workload flags]
 kairo-bench-gpu WORKLOAD --device GPU-UUID [--seconds S] [--interval S] [flags]
 kairo bench serve --listen HOST:PORT        # net-latency / net-bandwidth の対向サーバ
+kairo bench run net-latency --pack-peer HOST:PORT --pack-run RUN --pack-ca CA   # agent の転送の口に対して（トークンは KAIRO_BENCH_NET_TOKEN）
 ```
 
 実行は `--seconds`（デフォルト `60`、`0` を指定すると停止されるまで無制限実行）の経過、または `SIGTERM`・Ctrl-C・`CTRL_BREAK` によって終了します。終了時は新規処理の発行を止め、実行中（in-flight）のリクエスト完了を待ってから、最終インターバルと終了レコードを書き出し、クリーンアップを行って終了コード `0` で終了します。

@@ -319,6 +319,51 @@ type (
 	}
 )
 
+// Network benches, between two nodes' agents (store.NetBench): the
+// measuring node's agent drives the run; the measured node's checks the
+// token at its transfer endpoint.
+type (
+	NetBenchesRequest struct {
+		NodeID string `json:"node_id"`
+	}
+	NetBenchesAnswer struct {
+		Benches []store.NetBench `json:"benches"`
+	}
+	NetBenchRequest struct {
+		NodeID string `json:"node_id"`
+		RunID  string `json:"run_id"`
+	}
+	NetBenchStatusAnswer struct {
+		Status store.BenchStatus `json:"status"`
+	}
+	NetBenchStartRequest struct {
+		NodeID string           `json:"node_id"`
+		RunID  string           `json:"run_id"`
+		Start  store.BenchStart `json:"start"`
+	}
+	NetBenchPointsRequest struct {
+		NodeID string             `json:"node_id"`
+		RunID  string             `json:"run_id"`
+		Points []store.BenchPoint `json:"points"`
+	}
+	NetBenchKindRequest struct {
+		NodeID    string               `json:"node_id"`
+		RunID     string               `json:"run_id"`
+		Kind      string               `json:"kind"`
+		Reference store.BenchReference `json:"reference"`
+	}
+	NetBenchFinishRequest struct {
+		NodeID string            `json:"node_id"`
+		RunID  string            `json:"run_id"`
+		Finish store.BenchFinish `json:"finish"`
+	}
+	NetBenchAuthorizeRequest struct {
+		NodeID string `json:"node_id"`
+		RunID  string `json:"run_id"`
+		Token  string `json:"token"`
+	}
+)
+
 // Device controllers.
 type (
 	ControllerRegisterRequest struct {
@@ -392,7 +437,15 @@ var (
 	ScrubsToMake     = Op[ExecutorRequest, ScrubsAnswer]{Name: "scrubs-to-make", Observe: Empty, Empty: ScrubsAnswer{Scrubs: []store.ScrubOrder{}}}
 	RecordScrub      = Op[RecordScrubRequest, OK]{Name: "record-scrub", Observe: Refused}
 	// The agent of a pack's node asks before handing it over.
-	PackRead             = Op[PackReadRequest, PackReadAnswer]{Name: "pack-read", Observe: Refused}
+	PackRead = Op[PackReadRequest, PackReadAnswer]{Name: "pack-read", Observe: Refused}
+	// Network benches (between agents).
+	NetBenches           = Op[NetBenchesRequest, NetBenchesAnswer]{Name: "net-benches", Observe: Empty, Empty: NetBenchesAnswer{Benches: []store.NetBench{}}}
+	NetBenchStatus       = Op[NetBenchRequest, NetBenchStatusAnswer]{Name: "net-bench-status", Observe: Refused}
+	NetBenchStart        = Op[NetBenchStartRequest, OK]{Name: "net-bench-start", Observe: Refused}
+	NetBenchPoints       = Op[NetBenchPointsRequest, OK]{Name: "net-bench-points", Observe: Refused}
+	NetBenchKind         = Op[NetBenchKindRequest, OK]{Name: "net-bench-kind", Observe: Refused}
+	NetBenchFinish       = Op[NetBenchFinishRequest, OK]{Name: "net-bench-finish", Observe: Refused}
+	NetBenchAuthorize    = Op[NetBenchAuthorizeRequest, OK]{Name: "net-bench-authorize", Observe: Refused}
 	UnlaunchedLeases     = Op[UnlaunchedRequest, LeasesAnswer]{Name: "unlaunched-leases", Observe: Empty, Empty: LeasesAnswer{Leases: []store.UnlaunchedLease{}}}
 	ValidateReservation  = Op[LeaseRequest, OK]{Name: "validate-reservation", Observe: Refused}
 	MarkLeasePrepared    = Op[LeaseRequest, OK]{Name: "mark-lease-prepared", Observe: Refused}
@@ -434,7 +487,7 @@ var All = []Named{
 	SettleScratch, RunOutput, PacksToMake, RecordPack, CopiesToMake, RecordDescribed, AbandonPack, InPlaceSources,
 	InputGone, InputIsFile, ClaimShed, KeepIdentity, RawPlaced, RawIdentity, RawRecords, InventoryDurable, AdoptCopies, RecordCopy, FetchesToMake, RecordFetch,
 	DeletionsToMake, SettleDeletion, SourcesInUse, EvictionsToMake, SettleEviction, ScrubsToMake, RecordScrub,
-	PackRead, UnlaunchedLeases, ValidateReservation, MarkLeasePrepared, ReleaseReservation, AuthorizeLaunch,
+	PackRead, NetBenches, NetBenchStatus, NetBenchStart, NetBenchPoints, NetBenchKind, NetBenchFinish, NetBenchAuthorize, UnlaunchedLeases, ValidateReservation, MarkLeasePrepared, ReleaseReservation, AuthorizeLaunch,
 	ActivateLaunch, SetLogPaths, LogProblem, MarkProcessExited, RecordTerminal, QuiescenceCandidates,
 	FinalizeQuiescence, QuarantineTerms, QuarantineTerminated, ForceStopOrders, ForceStopAcked, AttemptUsed,
 	ControllerRegister, DeviceSettings, DeviceReport, TrimsToMake, RecordTrim, DeviceSamples,

@@ -279,6 +279,42 @@ func (c *Client) AuthorizePackRead(ctx context.Context, nodeID, objectID, token 
 	return out.Read, err
 }
 
+// NetBenches are the network benches this node's agent measures.
+func (c *Client) NetBenches(ctx context.Context, nodeID string) ([]store.NetBench, error) {
+	out, err := do(ctx, c, agentops.NetBenches, agentops.NetBenchesRequest{NodeID: nodeID})
+	return out.Benches, err
+}
+
+// NetBenchStatus is a network bench's status, for the agent measuring it.
+func (c *Client) NetBenchStatus(ctx context.Context, nodeID, runID string) (store.BenchStatus, error) {
+	out, err := do(ctx, c, agentops.NetBenchStatus, agentops.NetBenchRequest{NodeID: nodeID, RunID: runID})
+	return out.Status, err
+}
+
+// NetBenchStart, NetBenchPoints, NetBenchKind and NetBenchFinish report a
+// network bench the agent measures.
+func (c *Client) NetBenchStart(ctx context.Context, nodeID, runID string, start store.BenchStart) error {
+	return done(ctx, c, agentops.NetBenchStart, agentops.NetBenchStartRequest{NodeID: nodeID, RunID: runID, Start: start})
+}
+
+func (c *Client) NetBenchPoints(ctx context.Context, nodeID, runID string, points []store.BenchPoint) error {
+	return done(ctx, c, agentops.NetBenchPoints, agentops.NetBenchPointsRequest{NodeID: nodeID, RunID: runID, Points: points})
+}
+
+func (c *Client) NetBenchKind(ctx context.Context, nodeID, runID, kind string, ref store.BenchReference) error {
+	return done(ctx, c, agentops.NetBenchKind, agentops.NetBenchKindRequest{NodeID: nodeID, RunID: runID, Kind: kind, Reference: ref})
+}
+
+func (c *Client) NetBenchFinish(ctx context.Context, nodeID, runID string, finish store.BenchFinish) error {
+	return done(ctx, c, agentops.NetBenchFinish, agentops.NetBenchFinishRequest{NodeID: nodeID, RunID: runID, Finish: finish})
+}
+
+// AuthorizeBenchNet asks whether token lets a network bench measure this
+// node's transfer endpoint.
+func (c *Client) AuthorizeBenchNet(ctx context.Context, nodeID, runID, token string) error {
+	return done(ctx, c, agentops.NetBenchAuthorize, agentops.NetBenchAuthorizeRequest{NodeID: nodeID, RunID: runID, Token: token})
+}
+
 // DeletionsToMake asks for the sources this executor is to delete now.
 func (c *Client) DeletionsToMake(ctx context.Context, executorID string) ([]store.DeletionOrder, error) {
 	out, err := do(ctx, c, agentops.DeletionsToMake, agentops.ExecutorRequest{ExecutorID: executorID})

@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	"kairo/internal/agentops"
+	"kairo/internal/bench"
 	"kairo/internal/machine"
 	"kairo/internal/store"
 )
@@ -670,9 +672,61 @@ func (p *PackServer) warn(objectID, message string, args ...any) {
 	p.Logger.Warn(message, append([]any{"object_id", objectID}, args...)...)
 }
 
+// benchNetConnLimit bounds one network bench connection (a kind's
+// measurement is minutes).
+const benchNetConnLimit = 30 * time.Minute
+
+// serveBenchNet hands a network bench's connection to the bench's server
+// (bench.ServeConn), once the daemon says its token is that of a live
+// network bench measuring this node (store.AuthorizeBenchNet): the bench
+// measures the path transfers take, TLS included.
+func (p *PackServer) serveBenchNet(w http.ResponseWriter, r *http.Request, runID string) {
+	token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok || token == "" || runID == "" || strings.Contains(runID, "/") || !strings.EqualFold(r.Header.Get("Upgrade"), bench.PackUpgrade) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	if err := p.Store.AuthorizeBenchNet(r.Context(), p.NodeID, runID, token); err != nil {
+		p.warn(runID, "network bench refused", "remote", r.RemoteAddr, "error", err)
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		http.Error(w, "the connection cannot be handed over", http.StatusHTTPVersionNotSupported)
+		return
+	}
+	conn, buf, err := hj.Hijack()
+	if err != nil {
+		return
+	}
+	defer conn.Close()
+	if _, err = buf.WriteString("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: " + bench.PackUpgrade + "\r\n\r\n"); err == nil {
+		err = buf.Flush()
+	}
+	if err != nil {
+		return
+	}
+	if err := bench.ServeConn(&bufferedConn{Conn: conn, r: buf.Reader}, benchNetConnLimit); err != nil {
+		p.Logger.Info("network bench connection ended", "run", runID, "remote", r.RemoteAddr, "error", err)
+	}
+}
+
+// bufferedConn reads what the HTTP server had buffered before the rest.
+type bufferedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (c *bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
 func (p *PackServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if runID, ok := strings.CutPrefix(r.URL.Path, bench.PackPathPrefix); ok {
+		p.serveBenchNet(w, r, runID)
 		return
 	}
 	name, ok := strings.CutPrefix(r.URL.Path, "/packs/")

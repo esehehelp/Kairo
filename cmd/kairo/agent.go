@@ -190,6 +190,11 @@ func agentCommand(args []string) error {
 		}()
 		logger.Info("pack server listening", "listen", cfg.Packs.Listen, "addr", cfg.Packs.Addr)
 	}
+	// network benches this node measures, against other nodes' transfer
+	// endpoints (whose certificates chain to the daemon's CA)
+	if cfg.CAFile != "" {
+		go runNetBenches(ctx, client, cfg.Node.ID, cfg.CAFile, logger)
+	}
 	select {
 	case <-ctx.Done():
 		shipper.Sweep(context.Background())
