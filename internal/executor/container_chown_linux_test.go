@@ -58,4 +58,13 @@ func TestChownTreeHandsOverOnlyWhatIsNotTheContainers(t *testing.T) {
 	if err := chownTree(filepath.Join(base, "missing"), m); err != nil {
 		t.Fatalf("a missing tree: %v", err)
 	}
+	// a file (an attempt's log, mounted writable) is handed over itself
+	log := filepath.Join(base, "att.stdout.log")
+	write(log, 0)
+	if err := chownTree(log, m); err != nil {
+		t.Fatalf("a file: %v", err)
+	}
+	if got := owner(log); got != 1000 {
+		t.Fatalf("the log: uid %d", got)
+	}
 }
