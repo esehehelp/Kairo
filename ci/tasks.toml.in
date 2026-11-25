@@ -8,8 +8,8 @@
 # PostgreSQL 17 (ci/check.sh start-pg); the unprivileged checks run as nobody. Nothing of a check outlives it but its
 # logs and the caches.
 #
-# The Windows checks unpack the commit's tree (copied by ci/kairo-ci.sh) into their scratch; on Windows attempts run at
-# Low integrity, where Git Bash does not start, so they run ci/check.ps1 in PowerShell.
+# The SDKs' checks run the same way, in a uv and a Rust image. The Windows build and tests run on GitHub's CI only
+# (.github/workflows/ci.yml): Kairo runs no Windows-native work (it runs Linux work in wslc containers on Windows).
 #
 # Priority -500: CI waits for everyone's work and preempts nothing (the lowest serving is -100).
 schema_version = 1
@@ -23,6 +23,12 @@ policy = "RunToCompletion@v1"
 
 [images.go]
 ref = "golang:1.26-bookworm"
+
+[images.uv]
+ref = "ghcr.io/astral-sh/uv:python3.12-bookworm"
+
+[images.rust]
+ref = "rust:1-bookworm"
 
 [sources.kairo]
 root = "@TREE@"
@@ -80,24 +86,15 @@ ram_bytes = 3221225472
 strength = "admitted"
 
 [[tasks]]
-name = "@SHA@-windows"
-[tasks.execution]
-argv = ["C:/Program Files/PowerShell/7/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $d=Join-Path $env:KAIRO_SCRATCH 'src'; New-Item -ItemType Directory -Force $d | Out-Null; & 'C:/Windows/System32/tar.exe' -xf '@CI_WINDOWS_DIR@/src/@SHA@.tar' -C $d; if ($LASTEXITCODE) { exit $LASTEXITCODE }; & 'C:/Program Files/PowerShell/7/pwsh.exe' -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $d 'ci/check.ps1') windows; $code=$LASTEXITCODE; Set-Location $env:KAIRO_SCRATCH; Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue; exit $code"]
-cwd = "@CI_WINDOWS_DIR@"
-[tasks.execution.executor]
-labels = { environment = "windows" }
-[tasks.execution.capacity]
-cpu_millis = 8000
-ram_bytes = 6442450944
-strength = "admitted"
-
-[[tasks]]
 name = "@SHA@-sdk-python"
 [tasks.execution]
-argv = ["C:/Program Files/PowerShell/7/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $d=Join-Path $env:KAIRO_SCRATCH 'src'; New-Item -ItemType Directory -Force $d | Out-Null; & 'C:/Windows/System32/tar.exe' -xf '@CI_WINDOWS_DIR@/src/@SHA@.tar' -C $d; if ($LASTEXITCODE) { exit $LASTEXITCODE }; & 'C:/Program Files/PowerShell/7/pwsh.exe' -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $d 'ci/check.ps1') sdk-python; $code=$LASTEXITCODE; Set-Location $env:KAIRO_SCRATCH; Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue; exit $code"]
-cwd = "@CI_WINDOWS_DIR@"
+image = "uv"
+source = "kairo"
+cwd = "."
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; mkdir -p \"$d\"; cp -a /kairo/src/. \"$d\"; cd \"$d\"; UV_CACHE_DIR=\"$KAIRO_CACHE_DIR/uv\" bash ci/check.sh sdk-python"]
 [tasks.execution.executor]
-labels = { environment = "windows" }
+labels = { site = "@CI_LINUX_SITE@" }
+node = "@CI_LINUX_NODE@"
 [tasks.execution.capacity]
 cpu_millis = 2000
 ram_bytes = 1073741824
@@ -106,10 +103,13 @@ strength = "admitted"
 [[tasks]]
 name = "@SHA@-sdk-rust"
 [tasks.execution]
-argv = ["C:/Program Files/PowerShell/7/pwsh.exe", "-NoProfile", "-NonInteractive", "-Command", "$ErrorActionPreference='Stop'; $d=Join-Path $env:KAIRO_SCRATCH 'src'; New-Item -ItemType Directory -Force $d | Out-Null; & 'C:/Windows/System32/tar.exe' -xf '@CI_WINDOWS_DIR@/src/@SHA@.tar' -C $d; if ($LASTEXITCODE) { exit $LASTEXITCODE }; & 'C:/Program Files/PowerShell/7/pwsh.exe' -NoProfile -NonInteractive -ExecutionPolicy Bypass -File (Join-Path $d 'ci/check.ps1') sdk-rust; $code=$LASTEXITCODE; Set-Location $env:KAIRO_SCRATCH; Remove-Item -Recurse -Force $d -ErrorAction SilentlyContinue; exit $code"]
-cwd = "@CI_WINDOWS_DIR@"
+image = "rust"
+source = "kairo"
+cwd = "."
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; mkdir -p \"$d\"; cp -a /kairo/src/. \"$d\"; cd \"$d\"; CARGO_HOME=\"$KAIRO_CACHE_DIR/cargo-home\" CARGO_TARGET_DIR=\"$KAIRO_CACHE_DIR/cargo-target\" PATH=\"/usr/local/cargo/bin:$PATH\" bash ci/check.sh sdk-rust"]
 [tasks.execution.executor]
-labels = { environment = "windows" }
+labels = { site = "@CI_LINUX_SITE@" }
+node = "@CI_LINUX_NODE@"
 [tasks.execution.capacity]
 cpu_millis = 4000
 ram_bytes = 2147483648

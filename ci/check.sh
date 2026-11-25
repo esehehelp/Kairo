@@ -7,9 +7,9 @@
 #   linux-root  the executor and process tests as root      (the Linux CI node)
 #   start-pg    start a test PostgreSQL 17 on 127.0.0.1:55432 when none is reachable (as root, in a check's container):
 #               portable binaries kept in KAIRO_CACHE_DIR, the data in KAIRO_SCRATCH, run as nobody
-#   windows     go vet, go test                             (the Windows CI node)
-#   sdk-python  the Python SDK's tests                      (the Windows CI node)
-#   sdk-rust    the Rust SDK's tests                        (the Windows CI node)
+#   windows     go vet, go test                             (GitHub's Windows runner)
+#   sdk-python  the Python SDK's tests                      (the CI node, in a uv image)
+#   sdk-rust    the Rust SDK's tests                        (the CI node, in a Rust image)
 # Store tests need PostgreSQL at KAIRO_TEST_PG (default 127.0.0.1:55432, kairo/kairo-test).
 set -euo pipefail
 check=${1:?usage: ci/check.sh CHECK}

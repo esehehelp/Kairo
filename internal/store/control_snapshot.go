@@ -7,17 +7,20 @@ import (
 	"fmt"
 	"time"
 
+	"kairo/internal/imageref"
 	"kairo/internal/orchestration"
 )
 
 // Kairo keeps itself (README: Kairo keeps itself): every control snapshot
 // interval the daemon declares a task of project kairo, queue
-// control-snapshot, on a node of the first durable store that reports its
-// kairo binary ([bench] kairo_binary): `kairo control snapshot`, which writes
-// what the daemon hands it (its database dump, code snapshots, configuration
-// and TLS: api/control.go) into the run's output directory. Like any output,
-// that is packed when the run ends and copied to every durable store, so the
-// control plane can be rebuilt from a durable store alone.
+// control-snapshot, in a container (ControlImage) on the node of the first
+// durable store that has a container executor: `kairo control snapshot`
+// (the agent's binary, mounted in every container at /kairo/bin/kairo),
+// which writes what the daemon hands it (its database dump, code snapshots,
+// configuration and TLS: api/control.go) into the run's output directory.
+// Like any output, that is packed when the run ends and copied to every
+// durable store, so the control plane can be rebuilt from a durable store
+// alone.
 
 const (
 	ControlProject = "kairo"
@@ -26,6 +29,10 @@ const (
 	// no CPU, RAM or GPU (the daemon dumps; the task only writes what it is
 	// sent), so it always fits and never makes room by suspending anything.
 	ControlPriority = 1_000_000
+	// ControlImage is what the task's container is made of: any image runs
+	// it (the binary is Kairo's, static); this one, pinned for good, is
+	// small and cached on the nodes already.
+	ControlImage = "docker.io/library/python:3.12-slim@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b"
 )
 
 // ControlSnapshotTask declares the control snapshot task of the slot at
@@ -58,15 +65,16 @@ func (s *Store) ControlSnapshotTask(ctx context.Context, at time.Time, every tim
 		tx.Rollback()
 		return "", err
 	}
-	// the first durable store whose node reports its kairo
-	var bench NodeBench
+	// the first durable store whose node runs containers
 	var node string
 	for _, target := range targets {
-		if bench, err = nodeBenchTx(ctx, tx, target.Node); err != nil {
+		var containers bool
+		if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM executors WHERE node_id=$1 AND enabled
+			AND COALESCE((attributes_json::jsonb)->>'`+ContainerRuntimeAttribute+`','')<>'')`, target.Node).Scan(&containers); err != nil {
 			tx.Rollback()
 			return "", err
 		}
-		if bench.Kairo != "" {
+		if containers {
 			node = target.Node
 			break
 		}
@@ -75,10 +83,16 @@ func (s *Store) ControlSnapshotTask(ctx context.Context, at time.Time, every tim
 	if node == "" {
 		return "", nil
 	}
-	execution := orchestration.Execution{SchemaVersion: 2, Priority: ControlPriority,
-		Argv: []string{bench.Kairo, "control", "snapshot"}, CWD: benchCWD(bench), Executor: benchSelector(node, bench)}
+	pinned, err := imageref.Parse(ControlImage)
+	if err != nil {
+		return "", err
+	}
+	execution := orchestration.Execution{SchemaVersion: 2, Priority: ControlPriority, Image: "control",
+		Argv: []string{containerKairo, "control", "snapshot"}, CWD: "/", Executor: orchestration.ExecutorSelector{Labels: map[string]string{}, Node: node}}
 	declaration, err := orchestration.Normalize(orchestration.Manifest{SchemaVersion: orchestration.SchemaVersion, Project: orchestration.Project{Name: ControlProject},
-		Tasks: []orchestration.Task{{Name: name, Queue: ControlQueue, DependsOn: []string{}, Policy: orchestration.PolicyRunToCompletion, Execution: execution}}})
+		Images:    map[string]orchestration.Image{"control": {Ref: ControlImage}},
+		ImagePins: map[string]string{"control": pinned.Pinned()},
+		Tasks:     []orchestration.Task{{Name: name, Queue: ControlQueue, DependsOn: []string{}, Policy: orchestration.PolicyRunToCompletion, Execution: execution}}})
 	if err != nil {
 		return "", fmt.Errorf("control snapshot task: %w", err)
 	}
@@ -96,6 +110,10 @@ func (s *Store) ControlSnapshotTask(ctx context.Context, at time.Time, every tim
 	}
 	return name, nil
 }
+
+// containerKairo is the agent's binary in every container (executor:
+// container.go).
+const containerKairo = "/kairo/bin/kairo"
 
 // AttemptQueue is the project and queue of the execution attempt attemptID
 // belongs to.
