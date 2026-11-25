@@ -50,9 +50,6 @@ const taskRunStartJoin = `
 
 const executionRunID = `COALESCE(run_start.execution_id,g.leader_execution_id,e.id) || CASE WHEN gm.rank>0 THEN '-rank' || gm.rank::text ELSE '' END`
 
-// taskRunID is the run of a task's execution o (taskRunStartJoin).
-const taskRunID = `COALESCE(run_start.execution_id,e.id)`
-
 func runIDTx(ctx context.Context, q queryer, executionID string) (string, error) {
 	var runID string
 	err := q.QueryRowContext(ctx, `SELECT `+executionRunID+` FROM execution_requests e`+executionRunJoins+` WHERE e.id=$1`, executionID).Scan(&runID)

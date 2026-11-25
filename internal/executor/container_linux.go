@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -24,6 +23,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 
 	"kairo/internal/imageref"
 )
@@ -66,12 +67,9 @@ func incusNotFound(err error) bool {
 // is an instance named by its instance name.
 type incusRuntime struct{}
 
-func (incusRuntime) run(ctx context.Context, spec containerSpec, logf func(string, ...any), made func(string)) (string, int, error) {
+func (incusRuntime) run(ctx context.Context, spec containerSpec, logf func(string, ...any), starting func(string) bool) (string, int, error) {
 	handle := ""
-	exit, err := runInstance(ctx, spec, logf, func() {
-		handle = spec.Instance
-		made(handle)
-	})
+	exit, err := runInstance(ctx, spec, logf, func() { handle = spec.Instance }, func() bool { return starting(spec.Instance) })
 	return handle, exit, err
 }
 
@@ -138,7 +136,7 @@ func (incusRuntime) containers(ctx context.Context) ([]ociContainer, error) {
 
 // runInstance makes, starts and waits for the attempt's instance; made is
 // called once it exists.
-func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...any), made func()) (int, error) {
+func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...any), made func(), starting func() bool) (int, error) {
 	ref, err := imageref.ParsePinned(spec.Image)
 	if err != nil {
 		return shimNotStarted, err
@@ -190,17 +188,22 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 	}
 	made()
 	if !nested {
-		root, err := instanceRootID(ctx, spec.Instance)
+		ids, err := instanceIDMap(ctx, spec.Instance)
 		if err != nil {
 			return shimNotStarted, err
 		}
 		for _, m := range spec.Mounts {
 			if !m.ReadOnly {
-				if err := chownTree(m.Source, root); err != nil {
+				if err := chownTree(m.Source, ids); err != nil {
 					return shimNotStarted, fmt.Errorf("hand %s to the container: %w", m.Source, err)
 				}
 			}
 		}
+	}
+	// a stop asked for before now: it is not started
+	if !starting() {
+		logf("asked to stop before %s started: not started", spec.Instance)
+		return exitStoppedBeforeStart, nil
 	}
 	if _, err := incusCommand(ctx, nil, "start", spec.Instance); err != nil {
 		return shimNotStarted, err
@@ -235,48 +238,137 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 	return code, nil
 }
 
-// instanceRootID is the host id of an unprivileged instance's root, from
-// the uid map Incus gives it when it starts.
-func instanceRootID(ctx context.Context, instance string) (int, error) {
+// idMap is where an unprivileged instance's ids are on the host: its root's
+// host uid and gid and how many ids follow each, as Incus maps them.
+type idMap struct {
+	uid, gid       uint32
+	uidLen, gidLen uint32
+}
+
+func (m idMap) ownsUID(id uint32) bool { return id >= m.uid && id-m.uid < m.uidLen }
+func (m idMap) ownsGID(id uint32) bool { return id >= m.gid && id-m.gid < m.gidLen }
+
+// instanceIDMap is the map Incus gives an unprivileged instance when it
+// starts (volatile.idmap.next).
+func instanceIDMap(ctx context.Context, instance string) (idMap, error) {
 	out, err := incusCommand(ctx, nil, "query", "/1.0/instances/"+instance)
 	if err != nil {
-		return 0, err
+		return idMap{}, err
 	}
 	var inst struct {
 		Config map[string]string `json:"config"`
 	}
 	if err := json.Unmarshal(out, &inst); err != nil {
-		return 0, err
+		return idMap{}, err
 	}
-	var idmap []struct {
-		Isuid  bool  `json:"Isuid"`
-		Hostid int   `json:"Hostid"`
-		Nsid   int   `json:"Nsid"`
-		Range  int64 `json:"Maprange"`
+	var entries []struct {
+		Isuid  bool   `json:"Isuid"`
+		Isgid  bool   `json:"Isgid"`
+		Hostid uint32 `json:"Hostid"`
+		Nsid   uint32 `json:"Nsid"`
+		Range  uint32 `json:"Maprange"`
 	}
-	if err := json.Unmarshal([]byte(inst.Config["volatile.idmap.next"]), &idmap); err != nil {
-		return 0, fmt.Errorf("instance %s: uid map: %w", instance, err)
+	if err := json.Unmarshal([]byte(inst.Config["volatile.idmap.next"]), &entries); err != nil {
+		return idMap{}, fmt.Errorf("instance %s: id map: %w", instance, err)
 	}
-	for _, m := range idmap {
-		if m.Isuid && m.Nsid == 0 && m.Range > 0 {
-			return m.Hostid, nil
+	var m idMap
+	for _, e := range entries {
+		if e.Nsid != 0 || e.Range == 0 {
+			continue
+		}
+		if e.Isuid && m.uidLen == 0 {
+			m.uid, m.uidLen = e.Hostid, e.Range
+		}
+		if e.Isgid && m.gidLen == 0 {
+			m.gid, m.gidLen = e.Hostid, e.Range
 		}
 	}
-	return 0, fmt.Errorf("instance %s: no uid map of its root", instance)
+	if m.uidLen == 0 || m.gidLen == 0 {
+		return idMap{}, fmt.Errorf("instance %s: no map of its root's uid and gid", instance)
+	}
+	return m, nil
 }
 
-// chownTree gives root (the directory and all under it, links not followed)
-// to uid, as the container's root; what is not there is no error.
-func chownTree(root string, uid int) error {
-	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
+// chownTree hands root and all under it to the container: what an id
+// outside its map owns (the host's, as what an agent wrote) goes to its
+// root; what one of its ids owns stays (a user an attempt switched to keeps
+// what it wrote, while another attempt runs). It walks by descriptors and
+// follows no link, so that a tree a running container changes cannot lead
+// it outside root. What is not there is no error.
+func chownTree(root string, m idMap) error {
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return &os.PathError{Op: "open", Path: root, Err: err}
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		_ = unix.Close(fd)
+		return &os.PathError{Op: "stat", Path: root, Err: err}
+	}
+	if err := m.hand(st, func(uid, gid int) error { return unix.Fchown(fd, uid, gid) }); err != nil {
+		_ = unix.Close(fd)
+		return &os.PathError{Op: "chown", Path: root, Err: err}
+	}
+	return chownDir(fd, root, m)
+}
+
+// chownDir is chownTree under the directory fd (which it closes).
+func chownDir(fd int, dir string, m idMap) error {
+	f := os.NewFile(uintptr(fd), dir)
+	defer f.Close()
+	names, err := f.Readdirnames(-1)
+	if err != nil {
+		return err
+	}
+	for _, name := range names {
+		p := filepath.Join(dir, name)
+		var st unix.Stat_t
+		if err := unix.Fstatat(fd, name, &st, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			if errors.Is(err, unix.ENOENT) {
+				continue
 			}
+			return &os.PathError{Op: "stat", Path: p, Err: err}
+		}
+		// a link's own owner, never its target's
+		if err := m.hand(st, func(uid, gid int) error { return unix.Fchownat(fd, name, uid, gid, unix.AT_SYMLINK_NOFOLLOW) }); err != nil && !errors.Is(err, unix.ENOENT) {
+			return &os.PathError{Op: "chown", Path: p, Err: err}
+		}
+		if st.Mode&unix.S_IFMT != unix.S_IFDIR {
+			continue
+		}
+		child, err := unix.Openat(fd, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		if err != nil {
+			// gone, or no directory now (a link put in its place): nothing
+			// of root's to walk
+			if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) {
+				continue
+			}
+			return &os.PathError{Op: "open", Path: p, Err: err}
+		}
+		if err := chownDir(child, p, m); err != nil {
 			return err
 		}
-		return os.Lchown(p, uid, uid)
-	})
+	}
+	return nil
+}
+
+// hand changes what st describes to the container's root's uid and gid,
+// each where an id outside the map owns it.
+func (m idMap) hand(st unix.Stat_t, chown func(uid, gid int) error) error {
+	uid, gid := -1, -1
+	if !m.ownsUID(st.Uid) {
+		uid = int(m.uid)
+	}
+	if !m.ownsGID(st.Gid) {
+		gid = int(m.gid)
+	}
+	if uid == -1 && gid == -1 {
+		return nil
+	}
+	return chown(uid, gid)
 }
 
 // inUserNamespace reports whether this process runs in a user namespace
@@ -570,7 +662,7 @@ const containerRestGrace = 10 * time.Second
 // when its first process exits (pct), which ends the rest at once. SIGTERM
 // first, SIGKILL after containerRestGrace.
 func endTheRest() {
-	if os.Getpid() == 1 {
+	if os.Getpid() == 1 || !inOwnPIDNamespace() {
 		return
 	}
 	_ = syscall.Kill(-1, syscall.SIGTERM)
@@ -583,6 +675,18 @@ func endTheRest() {
 		time.Sleep(100 * time.Millisecond)
 	}
 	_ = syscall.Kill(-1, syscall.SIGKILL)
+}
+
+// inOwnPIDNamespace: this process sees a pid namespace of its own (a
+// container's), not the host's, where the kernel's threads are seen
+// (kthreadd is pid 2): the init signals every process it sees only there.
+// With no /proc to tell, it is not.
+func inOwnPIDNamespace() bool {
+	if _, err := os.Stat("/proc/self/stat"); err != nil {
+		return false
+	}
+	b, err := os.ReadFile("/proc/2/comm")
+	return err != nil || strings.TrimSpace(string(b)) != "kthreadd"
 }
 
 // othersLeft: a process other than the container's first and this one runs.

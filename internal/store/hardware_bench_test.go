@@ -545,6 +545,10 @@ func TestANetworkBenchRunsBetweenTwoAgents(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// one at a time on a node: they would share its link
+	if _, err = store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:b", Kinds: []string{"net-latency"}, DryRun: true}); !errors.Is(err, ErrBenchConflict) {
+		t.Fatalf("a second network bench on the nodes: %v", err)
+	}
 	if _, err = store.testExec(`UPDATE bench_runs SET created_at=$1 WHERE id=$2`, time.Now().UTC().Add(-3*time.Hour).Format(time.RFC3339Nano), plan.Run.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -558,5 +562,9 @@ func TestANetworkBenchRunsBetweenTwoAgents(t *testing.T) {
 	}
 	if err != nil || len(runs) != 2 || !failed {
 		t.Fatalf("past its deadline: %+v %v", runs, err)
+	}
+	// its agent, late, does not bring it back
+	if err = store.NetBenchStart(ctx, "b", plan.Run.ID, BenchStart{DriverBuild: "late"}); !errors.Is(err, ErrBenchConflict) {
+		t.Fatalf("a late start: %v", err)
 	}
 }

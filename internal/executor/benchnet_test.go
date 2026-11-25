@@ -85,3 +85,24 @@ func TestANetworkBenchMeasuresThroughTheTransferEndpoint(t *testing.T) {
 		t.Fatalf("a pack without a token: %s", resp.Status)
 	}
 }
+
+// An observe-only agent's transfer endpoint serves no network bench.
+func TestAnObserveOnlyEndpointServesNoNetworkBench(t *testing.T) {
+	fake := &benchNetCoordinator{fakeCopies: newFakeCopies(), run: "bnc_1", token: "kairo_bench_secret"}
+	server := httptest.NewTLSServer(&PackServer{Store: fake, NodeID: "node", NoBench: true, Logger: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	defer server.Close()
+	req, err := http.NewRequest(http.MethodGet, server.URL+bench.PackPathPrefix+"bnc_1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer kairo_bench_secret")
+	req.Header.Set("Upgrade", bench.PackUpgrade)
+	resp, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("observe-only: %s", resp.Status)
+	}
+}

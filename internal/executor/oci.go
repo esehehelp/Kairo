@@ -37,7 +37,11 @@ type ociRuntime interface {
 	// ran; -1 when it ran and wrote none) and the handle remove takes (""
 	// when nothing was made). made gets the handle as soon as the container
 	// exists: a stop may come while it runs.
-	run(ctx context.Context, spec containerSpec, logf func(string, ...any), made func(handle string)) (handle string, exit int, err error)
+	//
+	// starting is called with the container's handle just before it starts
+	// it: false (a stop was asked for) and it does not start it, but
+	// returns exitStoppedBeforeStart.
+	run(ctx context.Context, spec containerSpec, logf func(string, ...any), starting func(handle string) bool) (handle string, exit int, err error)
 	// stop asks a running container to stop (its init passes it on to the
 	// argv).
 	stop(ctx context.Context, handle string) error
@@ -281,36 +285,34 @@ func ociRun(specPath string) int {
 		_ = os.Setenv("HOME", "/root")
 	}
 	ctx := context.Background()
+	// A stop reaches the runner more than once (its group, then each
+	// member): the first is acted on. One that comes before the container
+	// starts keeps it from starting; one that comes as it starts (the
+	// container not running yet) is tried again until it is.
 	var mu sync.Mutex
-	current := ""
+	current, stopAsked := "", false
+	done := make(chan struct{})
 	sigs := make(chan os.Signal, 8)
 	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	go func() {
-		// A stop reaches the runner more than once (its group, then each
-		// member): once the container is stopped, the rest is said.
-		stopped := false
 		for range sigs {
 			mu.Lock()
-			handle := current
+			first, handle := !stopAsked, current
+			stopAsked = true
 			mu.Unlock()
-			if handle == "" || stopped {
+			if !first || handle == "" {
 				continue
 			}
-			logf("stopping %s", spec.Instance)
-			stopCtx, cancel := context.WithTimeout(ctx, (wslcStopSeconds+30)*time.Second)
-			if err := rt.stop(stopCtx, handle); err != nil {
-				logf("container %s not stopped: %v", spec.Instance, err)
-			} else {
-				stopped = true
-			}
-			cancel()
+			go stopContainer(ctx, rt, handle, spec.Instance, done, logf)
 		}
 	}()
-	handle, exit, err := rt.run(ctx, spec, logf, func(h string) {
+	handle, exit, err := rt.run(ctx, spec, logf, func(h string) bool {
 		mu.Lock()
+		defer mu.Unlock()
 		current = h
-		mu.Unlock()
+		return !stopAsked
 	})
+	close(done)
 	signal.Stop(sigs)
 	if err != nil {
 		logf("%v", err)
@@ -324,6 +326,35 @@ func ociRun(specPath string) int {
 	}
 	_ = os.Remove(specPath)
 	return exit
+}
+
+// exitStoppedBeforeStart is the exit of an attempt whose container a stop
+// kept from starting: as a process ended by SIGTERM.
+const exitStoppedBeforeStart = 128 + 15
+
+// stopContainer asks the runtime to stop the container, again every few
+// seconds while it fails (it is starting: not running yet) until the
+// runner is done or the stop's time is up.
+func stopContainer(ctx context.Context, rt ociRuntime, handle, instance string, done <-chan struct{}, logf func(string, ...any)) {
+	logf("stopping %s", instance)
+	deadline := time.Now().Add((wslcStopSeconds + 30) * time.Second)
+	for {
+		stopCtx, cancel := context.WithDeadline(ctx, deadline)
+		err := rt.stop(stopCtx, handle)
+		cancel()
+		if err == nil {
+			return
+		}
+		if time.Now().After(deadline) {
+			logf("container %s not stopped: %v", instance, err)
+			return
+		}
+		select {
+		case <-done:
+			return
+		case <-time.After(2 * time.Second):
+		}
+	}
 }
 
 // runtimeFor is the runtime of an executor kind here (runtimeNamed; a test

@@ -92,13 +92,17 @@ type wslcRuntime struct{}
 
 // run pulls the image, removes a leftover of the same name and runs the
 // container in the foreground until it stops.
-func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string, ...any), made func(string)) (string, int, error) {
+func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string, ...any), starting func(string) bool) (string, int, error) {
 	logf("container %s of %s", spec.Instance, spec.Image)
 	if _, err := wslcCommand(ctx, "pull", "--quiet", spec.Image); err != nil {
 		return "", shimNotStarted, err
 	}
 	_, _ = wslcCommand(ctx, "remove", "--force", spec.Instance)
-	made(spec.Instance)
+	// a stop asked for before now: it is not started
+	if !starting(spec.Instance) {
+		logf("asked to stop before %s started: not started", spec.Instance)
+		return "", exitStoppedBeforeStart, nil
+	}
 	// wslc sometimes fails a run before it made the container (two runs
 	// started at once): made again, a few times
 	for try := 1; ; try++ {

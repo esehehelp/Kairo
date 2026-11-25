@@ -32,6 +32,7 @@ const (
 	dialTimeout         = 5 * time.Second
 	helloTimeout        = 10 * time.Second
 	serveMaxConnections = 16
+	maxHelloBytes       = 4096
 )
 
 type hello struct {
@@ -105,14 +106,19 @@ func dialBench(ctx context.Context, cfg *Config, mode string, messageBytes int) 
 
 // dialPack opens a connection to an agent's transfer endpoint and upgrades
 // it to the bench's protocol, with the run's token (TokenEnv).
+// With no --pack-ca, the system's roots are trusted, as transfers do with
+// no ca_file.
 func dialPack(ctx context.Context, cfg *Config) (net.Conn, *bufio.Reader, error) {
-	pem, err := os.ReadFile(cfg.PackCA)
-	if err != nil {
-		return nil, nil, err
-	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(pem) {
-		return nil, nil, fmt.Errorf("no certificate in %s", cfg.PackCA)
+	var pool *x509.CertPool
+	if cfg.PackCA != "" {
+		pem, err := os.ReadFile(cfg.PackCA)
+		if err != nil {
+			return nil, nil, err
+		}
+		pool = x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, nil, fmt.Errorf("no certificate in %s", cfg.PackCA)
+		}
 	}
 	host, _, _ := net.SplitHostPort(cfg.PackPeer)
 	d := tls.Dialer{NetDialer: &net.Dialer{Timeout: dialTimeout}, Config: &tls.Config{RootCAs: pool, ServerName: host, NextProtos: []string{"http/1.1"}, MinVersion: tls.VersionTLS12}}
@@ -457,8 +463,9 @@ func serveConn(raw net.Conn, limit time.Duration) serveRecord {
 		tcp.SetNoDelay(true)
 	}
 	raw.SetDeadline(began.Add(min(helloTimeout, limit)))
-	r := bufio.NewReader(c)
-	line, err := r.ReadBytes('\n')
+	// the hello is a line of one buffer at most (ErrBufferFull past it)
+	r := bufio.NewReaderSize(c, maxHelloBytes)
+	line, err := r.ReadSlice('\n')
 	var h hello
 	if err == nil {
 		err = json.Unmarshal(line, &h)

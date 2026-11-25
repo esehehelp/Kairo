@@ -65,7 +65,12 @@ func readProjectSpec(path string) (orchestration.Validated, error) {
 	if err := resolveRawListings(&manifest); err != nil {
 		return orchestration.Validated{}, err
 	}
-	return orchestration.Normalize(manifest)
+	validated, err := orchestration.Normalize(manifest)
+	if err != nil {
+		return validated, err
+	}
+	// as the daemon refuses it, before anything is staged
+	return validated, validated.Manifest.EveryTaskInAnImage()
 }
 
 // shortDigest is the first 12 hex digits of a digest.
