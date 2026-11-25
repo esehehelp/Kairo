@@ -102,6 +102,9 @@ func (e *Local) sampleUsage(ctx context.Context) {
 		sample := e.usageSampler
 		if sample == nil {
 			sample = e.sampleTrees
+			if b, ok := e.backend().(ociBackend); ok {
+				sample = b.sampleContainers // what the container uses, not its runner
+			}
 		}
 		samples := sample(ctx, targets)
 		for _, t := range targets {

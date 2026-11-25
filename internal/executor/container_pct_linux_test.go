@@ -163,7 +163,7 @@ func TestDestroyPCTOnlyInKairosRange(t *testing.T) {
 }
 
 // The sweep destroys only Kairo's containers: in its range, tagged kairo,
-// named for an attempt that no longer runs here, and stopped.
+// named for an attempt that no longer runs here (running or not).
 func TestPCTSweepDestroysOnlyKairosStoppedContainersOfEndedAttempts(t *testing.T) {
 	f := &fakePCT{answer: func(args []string) ([]byte, error) {
 		if args[0] == "pvesh" {
@@ -185,10 +185,9 @@ func TestPCTSweepDestroysOnlyKairosStoppedContainersOfEndedAttempts(t *testing.T
 	var logs bytes.Buffer
 	e := NewLocal("ctr", nil, t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
 	e.running = map[string]int{"att_run": 1}
-	caps, _ := ociCapsOf("pct")
-	e.storeWork().sweepContainers(context.Background(), pctRuntime{}, caps)
+	e.storeWork().sweepContainers(context.Background(), pctRuntime{})
 	destroyed := f.called("pct", "destroy")
-	if len(destroyed) != 1 || destroyed[0][2] != "1000" {
+	if len(destroyed) != 2 || destroyed[0][2] != "1000" || destroyed[1][2] != "1001" {
 		t.Fatalf("destroyed %v\n%s", destroyed, logs.String())
 	}
 }

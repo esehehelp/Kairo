@@ -99,18 +99,18 @@ func (h *treeHandle) activeProcesses() (int, error) {
 
 var errNoGracefulStop = errors.New("no graceful stop channel to this attempt (launched before force stop support, or by an earlier executor instance)")
 
-// stopTreeGracefully asks the attempt to stop: CTRL_BREAK to the launcher's
+// stopHostTree asks the attempt to stop: CTRL_BREAK to the launcher's
 // console process group.
-func (e *Local) stopTreeGracefully(ctx context.Context, t processTree) error {
+func (e *Local) stopHostTree(ctx context.Context, t processTree) error {
 	if t.handle == nil || !t.handle.group || t.pid == 0 {
 		return errNoGracefulStop
 	}
 	return ctrlBreak(ctx, t.pid)
 }
 
-// killTree terminates everything of the attempt: the job object and the
+// killHostTree terminates everything of the attempt: the job object and the
 // launcher's process tree (taskkill /T /F).
-func (e *Local) killTree(ctx context.Context, t processTree) error {
+func (e *Local) killHostTree(ctx context.Context, t processTree) error {
 	var errs []error
 	if t.handle != nil && t.handle.job != 0 {
 		if err := windows.TerminateJobObject(t.handle.job, 1); err != nil {
@@ -129,8 +129,8 @@ func (e *Local) killTree(ctx context.Context, t processTree) error {
 	return errors.Join(errs...)
 }
 
-// treeAlive reports whether any process of the attempt is left.
-func (e *Local) treeAlive(ctx context.Context, t processTree) (bool, error) {
+// hostTreeAlive reports whether any process of the attempt is left.
+func (e *Local) hostTreeAlive(ctx context.Context, t processTree) (bool, error) {
 	if t.handle != nil && t.handle.job != 0 {
 		n, err := t.handle.activeProcesses()
 		if err != nil {
@@ -141,6 +141,20 @@ func (e *Local) treeAlive(ctx context.Context, t processTree) (bool, error) {
 		}
 	}
 	return t.launcherAlive()
+}
+
+// The launcher's tree on Windows is its job object and process tree, as a
+// host attempt's: an attempt in a container (wslc) has nothing else here.
+func (e *Local) stopLauncherTree(ctx context.Context, t processTree) error {
+	return e.stopHostTree(ctx, t)
+}
+
+func (e *Local) killLauncherTree(ctx context.Context, t processTree) error {
+	return e.killHostTree(ctx, t)
+}
+
+func (e *Local) launcherTreeAlive(ctx context.Context, t processTree) (bool, error) {
+	return e.hostTreeAlive(ctx, t)
 }
 
 // ctrlBreakHelperArg runs this binary as a helper that sends CTRL_BREAK to a

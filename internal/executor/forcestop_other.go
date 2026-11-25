@@ -34,24 +34,46 @@ func RunHelper(args []string) {
 	runContainerHelpers(args)
 }
 
-// stopTreeGracefully sends SIGTERM to the launcher's process group and to every
+// stopHostTree sends SIGTERM to the launcher's process group and to every
 // process carrying the attempt's KAIRO_ATTEMPT_ID (which also reaches children
 // that left the group).
-func (e *Local) stopTreeGracefully(_ context.Context, t processTree) error {
-	return signalTree(t, syscall.SIGTERM)
+func (e *Local) stopHostTree(_ context.Context, t processTree) error {
+	return signalTree(t, syscall.SIGTERM, true)
 }
 
-// killTree sends SIGKILL to the same processes.
-func (e *Local) killTree(_ context.Context, t processTree) error {
-	return signalTree(t, syscall.SIGKILL)
+// killHostTree sends SIGKILL to the same processes.
+func (e *Local) killHostTree(_ context.Context, t processTree) error {
+	return signalTree(t, syscall.SIGKILL, true)
 }
 
-// treeAlive reports whether anything of the attempt runs: its launcher, a
+// stopLauncherTree sends SIGTERM to the launcher's process group alone (an
+// attempt in a container: its runner, which stops the container).
+func (e *Local) stopLauncherTree(_ context.Context, t processTree) error {
+	return signalTree(t, syscall.SIGTERM, false)
+}
+
+// killLauncherTree sends SIGKILL to the launcher's process group alone.
+func (e *Local) killLauncherTree(_ context.Context, t processTree) error {
+	return signalTree(t, syscall.SIGKILL, false)
+}
+
+// launcherTreeAlive reports whether the launcher or a process of its group
+// runs.
+func (e *Local) launcherTreeAlive(_ context.Context, t processTree) (bool, error) {
+	alive, err := t.launcherAlive()
+	if err != nil || alive {
+		return alive, err
+	}
+	members, err := groupPIDs(t)
+	return len(members) > 0, err
+}
+
+// hostTreeAlive reports whether anything of the attempt runs: its launcher, a
 // process of the launcher's process group (also once the launcher is gone,
 // and also one that dropped KAIRO_ATTEMPT_ID from its environment), or a
 // process carrying the attempt's KAIRO_ATTEMPT_ID (also one that left the
 // group). A /proc it cannot read makes the answer unknown, not "nothing".
-func (e *Local) treeAlive(_ context.Context, t processTree) (bool, error) {
+func (e *Local) hostTreeAlive(_ context.Context, t processTree) (bool, error) {
 	alive, err := t.launcherAlive()
 	if err != nil || alive {
 		return alive, err
@@ -64,7 +86,9 @@ func (e *Local) treeAlive(_ context.Context, t processTree) (bool, error) {
 	return len(pids) > 0, err
 }
 
-func signalTree(t processTree, sig syscall.Signal) error {
+// signalTree signals the launcher's process group and, with members, the
+// processes carrying the attempt's KAIRO_ATTEMPT_ID.
+func signalTree(t processTree, sig syscall.Signal, members bool) error {
 	var errs []error
 	if t.pid != 0 {
 		if alive, _ := t.launcherAlive(); alive {
@@ -77,15 +101,17 @@ func signalTree(t processTree, sig syscall.Signal) error {
 			}
 		}
 	}
-	members, err := groupPIDs(t)
+	group, err := groupPIDs(t)
 	if err != nil {
 		errs = append(errs, err)
 	}
-	pids, err := attemptPIDs(t.attemptID)
-	if err != nil {
-		errs = append(errs, err)
+	var pids []int
+	if members {
+		if pids, err = attemptPIDs(t.attemptID); err != nil {
+			errs = append(errs, err)
+		}
 	}
-	for _, pid := range append(members, pids...) {
+	for _, pid := range append(group, pids...) {
 		if err := syscall.Kill(pid, sig); err != nil && !errors.Is(err, syscall.ESRCH) {
 			errs = append(errs, err)
 		}

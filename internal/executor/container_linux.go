@@ -80,6 +80,32 @@ func (incusRuntime) stop(ctx context.Context, name string) error {
 	return err
 }
 
+func (incusRuntime) kill(ctx context.Context, name string) error {
+	if _, err := incusCommand(ctx, nil, "stop", name, "--force"); err != nil && !incusNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+// stats reads the instance's state: its memory in use (Incus says nothing
+// of the bytes it wrote).
+func (incusRuntime) stats(ctx context.Context, name string) (*int64, *int64, error) {
+	out, err := incusCommand(ctx, nil, "query", "/1.0/instances/"+name+"/state")
+	if err != nil {
+		return nil, nil, err
+	}
+	var st struct {
+		Memory struct {
+			Usage int64 `json:"usage"`
+		} `json:"memory"`
+	}
+	if err := json.Unmarshal(out, &st); err != nil {
+		return nil, nil, err
+	}
+	ram := st.Memory.Usage
+	return &ram, nil, nil
+}
+
 // remove deletes an instance (whatever the container wrote outside what
 // Kairo handed it goes with it).
 func (incusRuntime) remove(ctx context.Context, name string) error {
@@ -429,20 +455,22 @@ func containerInit(specPath string) int {
 	cmd := &exec.Cmd{Path: argv0, Args: spec.Argv, Dir: spec.CWD, Env: env, Stdout: stdout, Stderr: stderr,
 		SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
 	// caught, not ignored: the argv starts with the default dispositions.
-	// A stop reaches the argv directly, as on a host, except in a wslc
-	// container (its processes are out of the agent's reach): its stop
-	// comes to this init, which passes it on to the argv's group.
+	// A stop of the container comes to this init (its runtime stops it: the
+	// runner asks it to), which passes it on to the argv's group; lxc's halt
+	// signal (SIGPWR: pct, Incus) is passed on as SIGTERM.
 	sigs := make(chan os.Signal, 8)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGPWR)
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(stderr, "kairo container: start:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
 	go func() {
 		for sig := range sigs {
-			if spec.Runtime == "wslc" {
-				_ = syscall.Kill(-cmd.Process.Pid, sig.(syscall.Signal))
+			s := sig.(syscall.Signal)
+			if s == syscall.SIGPWR {
+				s = syscall.SIGTERM
 			}
+			_ = syscall.Kill(-cmd.Process.Pid, s)
 		}
 	}()
 	exit, sig := reapUntil(cmd.Process.Pid, loaders.restart)

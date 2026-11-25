@@ -23,6 +23,36 @@ type processTree struct {
 	handle    *treeHandle
 }
 
+// stopTreeGracefully asks the attempt to stop: a host attempt's whole tree;
+// an attempt in a container through its runtime (ociBackend: its runner
+// stops the container, whose init passes SIGTERM on to the argv).
+func (e *Local) stopTreeGracefully(ctx context.Context, t processTree) error {
+	if b, ok := e.backend().(ociBackend); ok {
+		return b.stopAttempt(ctx, t)
+	}
+	return e.stopHostTree(ctx, t)
+}
+
+// killTree ends what is left of the attempt: a host attempt's whole tree;
+// an attempt in a container, its container (killed by its runtime) and its
+// runner.
+func (e *Local) killTree(ctx context.Context, t processTree) error {
+	if b, ok := e.backend().(ociBackend); ok {
+		return b.killAttempt(ctx, t)
+	}
+	return e.killHostTree(ctx, t)
+}
+
+// treeAlive reports whether anything of the attempt runs: of a host
+// attempt, its tree; of an attempt in a container, its runner's tree or its
+// container.
+func (e *Local) treeAlive(ctx context.Context, t processTree) (bool, error) {
+	if b, ok := e.backend().(ociBackend); ok {
+		return b.attemptAlive(ctx, t)
+	}
+	return e.hostTreeAlive(ctx, t)
+}
+
 // forceStopCheckInterval spaces out liveness checks of a signalled tree.
 const forceStopCheckInterval = time.Second
 

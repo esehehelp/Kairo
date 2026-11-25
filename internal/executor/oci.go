@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -40,10 +41,15 @@ type ociRuntime interface {
 	// stop asks a running container to stop (its init passes it on to the
 	// argv).
 	stop(ctx context.Context, handle string) error
+	// kill ends a running container at once.
+	kill(ctx context.Context, handle string) error
 	// remove removes a container (one run made, or one a sweep found).
 	remove(ctx context.Context, handle string) error
 	// containers are the attempts' containers the runtime has.
 	containers(ctx context.Context) ([]ociContainer, error)
+	// stats is what a running container uses: its memory and the bytes it
+	// has written (nil: not known).
+	stats(ctx context.Context, handle string) (ram, written *int64, err error)
 }
 
 // ociContainer is an attempt's container as a runtime lists it.
@@ -53,14 +59,11 @@ type ociContainer struct {
 	handle  string
 }
 
-// ociCaps are how an executor treats the containers of a runtime.
+// ociCaps are how an executor treats the containers of a runtime. Every
+// container is stopped through its runtime (its init passes the stop on to
+// the argv) and its processes are alive while it runs, whether or not they
+// are in the host's sight.
 type ociCaps struct {
-	// argvOnHost: the argv's processes are on the agent's host (a
-	// container of the same kernel): a stop reaches them directly, as a
-	// host attempt's processes, and their liveness is a host process's. A
-	// container in a VM (wslc) is stopped through its runtime instead, and
-	// is alive while it runs.
-	argvOnHost bool
 	// dirsOnly: only directories are mounted (Proxmox and wslc bind no
 	// single file): the binary and the logs as directories of links.
 	dirsOnly bool
@@ -75,9 +78,9 @@ type ociCaps struct {
 func ociCapsOf(kind string) (ociCaps, bool) {
 	switch kind {
 	case config.KindIncus:
-		return ociCaps{argvOnHost: true}, true
+		return ociCaps{}, true
 	case config.KindPCT:
-		return ociCaps{argvOnHost: true, dirsOnly: true}, true
+		return ociCaps{dirsOnly: true}, true
 	case config.KindWSLC:
 		return ociCaps{dirsOnly: true, vm: true}, true
 	}
@@ -118,25 +121,107 @@ func (b ociBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, err
 	return cmd, nil, err
 }
 
-// liveness: a process on the host is looked at on the host; the processes
-// of a container in a VM are the container's: alive while it runs.
-func (b ociBackend) liveness(ctx context.Context, attemptID string, pid int, identity string) (processidentity.Liveness, error) {
-	if b.caps.argvOnHost {
-		return processidentity.HostProcessLiveness(pid, identity)
-	}
-	if b.rt == nil {
-		return processidentity.LivenessUnknown, fmt.Errorf("executor %s: kind %s does not run here", b.e.ID, b.kind)
-	}
-	list, err := b.rt.containers(ctx)
+// liveness: the processes an attempt registered are its container's:
+// alive while it runs.
+func (b ociBackend) liveness(ctx context.Context, attemptID string, _ int, _ string) (processidentity.Liveness, error) {
+	c, ok, err := b.container(ctx, attemptID)
 	if err != nil {
 		return processidentity.LivenessUnknown, err
 	}
-	for _, c := range list {
-		if c.attempt == attemptID && c.running {
-			return processidentity.LivenessAlive, nil
-		}
+	if ok && c.running {
+		return processidentity.LivenessAlive, nil
 	}
 	return processidentity.LivenessAbsent, nil
+}
+
+// container is the attempt's container, when the runtime has one.
+func (b ociBackend) container(ctx context.Context, attemptID string) (ociContainer, bool, error) {
+	if b.rt == nil {
+		return ociContainer{}, false, fmt.Errorf("executor %s: kind %s does not run here", b.e.ID, b.kind)
+	}
+	list, err := b.rt.containers(ctx)
+	if err != nil {
+		return ociContainer{}, false, err
+	}
+	for _, c := range list {
+		if c.attempt == attemptID {
+			return c, true, nil
+		}
+	}
+	return ociContainer{}, false, nil
+}
+
+// stopAttempt asks the attempt to stop: its runner, which stops the
+// container through the runtime; with no runner to ask (gone, or no way to
+// signal it), the container directly.
+func (b ociBackend) stopAttempt(ctx context.Context, t processTree) error {
+	if alive, _ := t.launcherAlive(); alive {
+		if err := b.e.stopLauncherTree(ctx, t); err == nil {
+			return nil
+		}
+	}
+	c, ok, err := b.container(ctx, t.attemptID)
+	if err != nil || !ok || !c.running {
+		return err
+	}
+	go func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), (wslcStopSeconds+30)*time.Second)
+		defer cancel()
+		if err := b.rt.stop(stopCtx, c.handle); err != nil {
+			b.e.Logger.Warn("container not stopped", "attempt_id", t.attemptID, "container", c.handle, "error", err)
+		}
+	}()
+	return nil
+}
+
+// killAttempt kills the attempt's container through the runtime, and its
+// runner's tree.
+func (b ociBackend) killAttempt(ctx context.Context, t processTree) error {
+	var errs []error
+	c, ok, err := b.container(ctx, t.attemptID)
+	switch {
+	case err != nil:
+		errs = append(errs, err)
+	case ok && c.running:
+		errs = append(errs, b.rt.kill(ctx, c.handle))
+	}
+	errs = append(errs, b.e.killLauncherTree(ctx, t))
+	return errors.Join(errs...)
+}
+
+// attemptAlive: the runner's tree or the container runs.
+func (b ociBackend) attemptAlive(ctx context.Context, t processTree) (bool, error) {
+	alive, err := b.e.launcherTreeAlive(ctx, t)
+	if err != nil || alive {
+		return alive, err
+	}
+	c, ok, err := b.container(ctx, t.attemptID)
+	return ok && c.running, err
+}
+
+// sampleContainers is what each target attempt's container uses, from its
+// runtime.
+func (b ociBackend) sampleContainers(ctx context.Context, targets []usageTarget) map[string]usageSample {
+	out := map[string]usageSample{}
+	if b.rt == nil {
+		return out
+	}
+	list, err := b.rt.containers(ctx)
+	if err != nil {
+		return out
+	}
+	for _, t := range targets {
+		for _, c := range list {
+			if c.attempt != t.attemptID || !c.running {
+				continue
+			}
+			ram, written, err := b.rt.stats(ctx, c.handle)
+			if err == nil {
+				out[t.attemptID] = usageSample{ram: ram, written: written}
+			}
+		}
+	}
+	return out
 }
 
 // ended removes what the attempt's container was made from (its spec holds
@@ -149,15 +234,14 @@ func (b ociBackend) ended(attemptID string) {
 
 func (b ociBackend) sweep(ctx context.Context) {
 	if b.rt != nil {
-		b.e.storeWork().sweepContainers(ctx, b.rt, b.caps)
+		b.e.storeWork().sweepContainers(ctx, b.rt)
 	}
 }
 
 // sweepContainers removes the containers of attempts that no longer run
-// here (a runner killed before it removed its container), and what they
-// were made from. A running one whose argv is on the host is left alone:
-// what an exited attempt left running is ended as on a host, which stops it.
-func (e *storeWorker) sweepContainers(ctx context.Context, rt ociRuntime, caps ociCaps) {
+// here (a runner killed before it removed its container), running or not,
+// and what they were made from.
+func (e *storeWorker) sweepContainers(ctx context.Context, rt ociRuntime) {
 	ctx, cancel := context.WithTimeout(ctx, containerSweepTimeout)
 	defer cancel()
 	list, err := rt.containers(ctx)
@@ -167,7 +251,7 @@ func (e *storeWorker) sweepContainers(ctx context.Context, rt ociRuntime, caps o
 	}
 	e.roundProblem(&e.containerSweeps, "", "", nil)
 	for _, c := range list {
-		if e.attemptRunsHere(c.attempt) || c.running && caps.argvOnHost {
+		if e.attemptRunsHere(c.attempt) {
 			continue
 		}
 		if err := rt.remove(ctx, c.handle); err != nil {
@@ -181,10 +265,10 @@ func (e *storeWorker) sweepContainers(ctx context.Context, rt ociRuntime, caps o
 
 // ociRun is the runner (the shim's launcher): it has the spec's runtime
 // make, run and remove the attempt's container, and exits with the exit its
-// init wrote. A stop of the attempt reaches the runner too: with the argv on
-// the host it reaches the argv directly and the runner stays to see the
-// container stop; in a VM the runner stops the container. It removes the
-// spec, which holds the attempt's token.
+// init wrote. A stop of the attempt (SIGTERM, CTRL_BREAK) reaches the
+// runner, which stops the container through the runtime: the container's
+// init passes it on to the argv, and the runtime kills what is left after
+// its grace. It removes the spec, which holds the attempt's token.
 func ociRun(specPath string) int {
 	logf := func(format string, a ...any) {
 		// the container appends to the same log: write at its end
@@ -198,7 +282,6 @@ func ociRun(specPath string) int {
 	}
 	kind := specRuntime(spec)
 	rt, ok := runtimeFor(kind)
-	caps, _ := ociCapsOf(kind)
 	if !ok {
 		logf("runtime %s does not run on %s", kind, runtime.GOOS)
 		return shimNotStarted
@@ -217,7 +300,7 @@ func ociRun(specPath string) int {
 			mu.Lock()
 			handle := current
 			mu.Unlock()
-			if caps.argvOnHost || handle == "" {
+			if handle == "" {
 				continue
 			}
 			logf("stopping %s", spec.Instance)
