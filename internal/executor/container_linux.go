@@ -148,9 +148,19 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 	if err != nil {
 		return shimNotStarted, err
 	}
+	// On a host the container is unprivileged, and what Kairo hands it is
+	// shifted into its ids (an idmapped mount): its root reads and writes
+	// them as the host's root. Nested in an unprivileged container (a
+	// Proxmox LXC) it cannot have a uid map of its own and is privileged
+	// instead: the outer container's root, unprivileged on the host.
+	nested := inUserNamespace()
 	devices := map[string]map[string]string{}
 	for i, m := range spec.Mounts {
-		devices[fmt.Sprintf("kairo-%d", i)] = map[string]string{"type": "disk", "source": m.Source, "path": m.Path, "readonly": strconv.FormatBool(m.ReadOnly)}
+		d := map[string]string{"type": "disk", "source": m.Source, "path": m.Path, "readonly": strconv.FormatBool(m.ReadOnly)}
+		if !nested {
+			d["shift"] = "true"
+		}
+		devices[fmt.Sprintf("kairo-%d", i)] = d
 	}
 	if len(spec.GPUs) > 0 {
 		gpus, driver, err := gpuDevices(spec.GPUs, spec.DriverRoot)
@@ -161,18 +171,16 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 			devices[name] = d
 		}
 		devices["kairo-nvidia"] = map[string]string{"type": "disk", "source": driver, "path": containerNVIDIA, "readonly": "true"}
+		if !nested {
+			devices["kairo-nvidia"]["shift"] = "true"
+		}
 	}
 	body, err := json.Marshal(map[string]any{
 		"config": map[string]string{
-			// nested in an unprivileged container (a Proxmox LXC), the
-			// container cannot have a uid map of its own: it is the outer
-			// container's root, unprivileged on the host
-			"security.privileged": "true",
+			"security.privileged": strconv.FormatBool(nested),
 			// Incus's own init is the container's first process and runs
-			// this one: neither carries the attempt's KAIRO_ATTEMPT_ID (only
-			// the argv's environment does), so a stop sent to the attempt's
-			// processes reaches the argv and not them (Incus's init would end
-			// the container before the exit is written)
+			// Kairo's: it passes a stop of the container on to the argv and
+			// writes the argv's exit
 			"oci.entrypoint": containerRoot + "/bin/kairo " + containerInitArg + " " + containerSpecIn,
 			"raw.lxc":        "lxc.mount.entry = tmpfs dev/shm tmpfs rw,nosuid,nodev,size=" + containerShm + ",create=dir 0 0",
 			"boot.autostart": "false",
@@ -211,6 +219,18 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 		return -1, nil
 	}
 	return code, nil
+}
+
+// inUserNamespace reports whether this process runs in a user namespace
+// other than the host's (an unprivileged container): its uid map is not the
+// whole range mapped to itself.
+func inUserNamespace() bool {
+	b, err := os.ReadFile("/proc/self/uid_map")
+	if err != nil {
+		return false
+	}
+	f := strings.Fields(string(b))
+	return !(len(f) == 3 && f[0] == "0" && f[1] == "0" && f[2] == "4294967295")
 }
 
 type incusState struct {

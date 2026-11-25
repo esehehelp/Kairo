@@ -973,7 +973,37 @@ labels = { environment = "linux", site = "host-a" }
 
 - **Incus 6.3 以降**: OCI イメージ対応が必要です（Debian 13 の 6.0 LTS には対応がなく、Zabbly パッケージを利用する必要があります）。また、デフォルトプロファイルにストレージプールとネットワークが設定されている必要があります。
 - **GPU 利用時**: ノード上に `nvidia-container-cli`（`libnvidia-container-tools`）とドライバのユーザー空間ファイルが必要です。
-- **Proxmox LXC 内での実行**: 非特権 Proxmox LXC（`features: nesting=1,keyctl=1`）内で実行する場合、LXC 内部ではコンテナを特権扱い（`security.privileged`。LXC には UID マップが 1 つしかないため）にしますが、物理ホスト側からは引き続き非特権のまま保たれます。
+- **コンテナの権限**: ホスト上では、コンテナは非特権です（コンテナの root はホストの `/etc/subuid` の範囲の ID）。Kairo が渡す領域（実行ディレクトリ、作業領域、データ、Kairo のバイナリ、GPU のドライバ）は ID をずらしてマウントします（idmapped mount、Incus のディスクデバイスの `shift`）。コンテナの root は、それらをホストの root として読み書きします。エージェント自身が非特権の LXC の中で動いているとき（入れ子）は、LXC には UID マップが 1 つしかないため、コンテナを特権にします（`security.privileged`。物理ホストから見れば非特権のままです）。
+
+Proxmox VE のホストに直接入れる場合の手順です（Debian 13）。VM のための依存を入れないよう、コンテナだけの `incus-base` を使います。
+
+```sh
+curl -fsSL https://pkgs.zabbly.com/key.asc -o /etc/apt/keyrings/zabbly.asc   # 指紋 4EFC 5906 96CB 15B8 7C73 A3AD 82CC 8797 C838 DCFD
+cat > /etc/apt/sources.list.d/zabbly-incus-stable.sources <<EOF
+Enabled: yes
+Types: deb
+URIs: https://pkgs.zabbly.com/incus/stable
+Suites: trixie
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/zabbly.asc
+EOF
+apt-get update && apt-get install --no-install-recommends incus-base
+# ストレージは Proxmox と同じ thin pool、ネットワークは vmbr0 へのブリッジ（DHCP）
+cat <<EOF | incus admin init --preseed
+storage_pools:
+- name: default
+  driver: lvm
+  config: {source: pve, lvm.vg.force_reuse: "true", lvm.thinpool_name: data}
+profiles:
+- name: default
+  devices:
+    root: {type: disk, path: /, pool: default}
+    eth0: {type: nic, name: eth0, nictype: bridged, parent: vmbr0}
+EOF
+```
+
+Incus は自分の lxcfs（`/var/lib/incus-lxcfs`）を使い、Proxmox の LXC とは別に動きます。Incus が thin pool に作るボリューム（`images_*`、`containers_*`）は、Proxmox の一覧には出ません。
 
 #### Proxmox コンテナ Executor（`kind = "pct"`）
 
