@@ -294,12 +294,24 @@ func instanceIDMap(ctx context.Context, instance string) (idMap, error) {
 // root; what one of its ids owns stays (a user an attempt switched to keeps
 // what it wrote, while another attempt runs). It walks by descriptors and
 // follows no link, so that a tree a running container changes cannot lead
-// it outside root. What is not there is no error.
+// it outside root. root may be a file (an attempt's log), handed over
+// itself. What is not there is no error.
 func chownTree(root string, m idMap) error {
-	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
-	if errors.Is(err, unix.ENOENT) {
+	var lst unix.Stat_t
+	if err := unix.Lstat(root, &lst); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return nil
+		}
+		return &os.PathError{Op: "stat", Path: root, Err: err}
+	}
+	if lst.Mode&unix.S_IFMT != unix.S_IFDIR {
+		// a file (an attempt's log): itself, a link's own owner
+		if err := m.hand(lst, func(uid, gid int) error { return unix.Fchownat(unix.AT_FDCWD, root, uid, gid, unix.AT_SYMLINK_NOFOLLOW) }); err != nil {
+			return &os.PathError{Op: "chown", Path: root, Err: err}
+		}
 		return nil
 	}
+	fd, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return &os.PathError{Op: "open", Path: root, Err: err}
 	}
