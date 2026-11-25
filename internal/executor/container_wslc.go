@@ -124,8 +124,20 @@ func wslcRun(specPath string) int {
 			cancel()
 		}
 	}()
-	if err := run.Run(); err != nil {
+	// wslc sometimes fails a run before it made the container (two runs
+	// started at once): made again, a few times
+	for try := 1; ; try++ {
+		err := run.Run()
+		if err == nil {
+			break
+		}
 		logf("wslc run %s: %v", spec.Instance, err)
+		if _, written := readExitFile(filepath.Join(spec.RunDir, "exit")); written || try == wslcRunTries || wslcHas(ctx, spec.Instance) {
+			break
+		}
+		time.Sleep(time.Duration(try) * 3 * time.Second)
+		run = exec.Command(wslcExe(), wslcRunArgs(spec)...)
+		run.Stdout, run.Stderr = io.Discard, os.Stderr
 	}
 	signal.Stop(sigs)
 	exit, ok := readExitFile(filepath.Join(spec.RunDir, "exit"))
@@ -140,6 +152,24 @@ func wslcRun(specPath string) int {
 	}
 	_ = os.Remove(specPath)
 	return exit
+}
+
+// wslcRunTries is how many times a run that failed before its container
+// was made is made.
+const wslcRunTries = 3
+
+// wslcHas: wslc has a container named name (an error: taken as having it).
+func wslcHas(ctx context.Context, name string) bool {
+	list, err := wslcContainers(ctx)
+	if err != nil {
+		return true
+	}
+	for _, c := range list {
+		if c.Names == name {
+			return true
+		}
+	}
+	return false
 }
 
 // runWSLCHelper runs the wslc runner when args name it, and does not return
