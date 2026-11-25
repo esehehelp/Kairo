@@ -13,15 +13,11 @@ import (
 	"kairo/internal/machine"
 )
 
-// benchNode gives node the bench programs of an agent's [bench] table.
-func benchNode(t *testing.T, store *Store, node string, gpu bool) {
+// benchNode makes node's executor (exec-<node>) one that runs containers,
+// where benches run.
+func benchNode(t *testing.T, store *Store, node string) {
 	t.Helper()
-	bench := map[string]any{"kairo": "/opt/kairo/kairo"}
-	if gpu {
-		bench["gpu"] = "/opt/kairo/kairo-bench-gpu"
-	}
-	attributes, _ := json.Marshal(map[string]any{"bench": bench})
-	if err := store.UpsertNode(context.Background(), Node{ID: node, Name: node, OS: "linux", Architecture: "amd64", Attributes: attributes, Enabled: true}); err != nil {
+	if err := store.UpsertExecutor(context.Background(), Executor{ID: "exec-" + node, NodeID: node, Kind: "incus", Attributes: json.RawMessage(`{"site":"` + node + `","runtime":"incus"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -74,12 +70,11 @@ func TestGPUBenchIsAnExclusiveLowestPriorityExecutionOfItsOwnRun(t *testing.T) {
 	setupHost(t, store)
 	ctx := context.Background()
 	req := BenchRequest{HostID: "h", DeviceID: "GPU-S", Kinds: []string{"gemm", "pcie"}, Actor: "operator"}
-	// Neither node reports a GPU bench binary yet.
-	if _, err := store.CreateBenchRun(ctx, req); err == nil || !strings.Contains(err.Error(), "GPU bench binary") {
-		t.Fatalf("no bench binary: %v", err)
+	// Neither node runs containers yet.
+	if _, err := store.CreateBenchRun(ctx, req); err == nil || !strings.Contains(err.Error(), "runs containers") {
+		t.Fatalf("no node running containers: %v", err)
 	}
-	benchNode(t, store, "a", true)
-	benchNode(t, store, "b", false)
+	benchNode(t, store, "a") // b runs no containers
 	cpuPoll(t, store, "a", 8000)
 	cpuPoll(t, store, "b", 8000)
 	for _, c := range []struct {
@@ -88,7 +83,7 @@ func TestGPUBenchIsAnExclusiveLowestPriorityExecutionOfItsOwnRun(t *testing.T) {
 	}{
 		{BenchRequest{HostID: "h", DeviceID: "GPU-S", Kinds: []string{"cpu-compute"}}, "not a gpu bench kind"},
 		{BenchRequest{HostID: "nowhere", DeviceID: "GPU-S"}, "not declared"},
-		{BenchRequest{HostID: "h", DeviceID: "GPU-S", Node: "b"}, "GPU bench binary"},
+		{BenchRequest{HostID: "h", DeviceID: "GPU-S", Node: "b"}, "runs containers"},
 		{BenchRequest{HostID: "h", DeviceID: "GPU-S", Node: "x"}, "not on host"},
 	} {
 		if _, err := store.CreateBenchRun(ctx, c.req); err == nil || !strings.Contains(err.Error(), c.want) {
@@ -104,8 +99,8 @@ func TestGPUBenchIsAnExclusiveLowestPriorityExecutionOfItsOwnRun(t *testing.T) {
 	want := []string{"gemm", "pcie-h2d", "pcie-d2h", "pcie-h2d-latency", "pcie-d2h-latency"}
 	e := plan.Execution
 	if !slices.Equal(plan.Run.Kinds, want) || plan.Run.NodeID != "a" || e.Priority != BenchPriority || e.Scope.Project != BenchProject || e.Scope.Queue != BenchQueue || e.Scope.Task != plan.Run.ID ||
-		len(e.Exclusive) != 1 || e.Exclusive[0].Device != "GPU-S" || !e.Preemptible || !e.Checkpointable || strings.Join(e.Argv, " ") != "/opt/kairo/kairo hardware bench-run --run "+plan.Run.ID ||
-		e.CWD != "/opt/kairo" || !strings.Contains(string(e.ExecutorSelector), `"node":"a"`) {
+		len(e.Exclusive) != 1 || e.Exclusive[0].Device != "GPU-S" || !e.Preemptible || !e.Checkpointable || strings.Join(e.Argv, " ") != "/kairo/bin/kairo hardware bench-run --run "+plan.Run.ID ||
+		e.CWD != "/" || !strings.Contains(string(e.ExecutorSelector), `"node":"a"`) {
 		t.Fatalf("plan: %+v", plan)
 	}
 	if runs, _ := store.ListBenchRuns(ctx, "h", "", false); len(runs) != 0 {
@@ -145,12 +140,15 @@ func TestGPUBenchIsAnExclusiveLowestPriorityExecutionOfItsOwnRun(t *testing.T) {
 	if launch.Lease.ExecutionID != plan.Run.ExecutionID {
 		t.Fatalf("launched %s, want the bench's %s", launch.Lease.ExecutionID, plan.Run.ExecutionID)
 	}
+	if !strings.HasPrefix(launch.Image, "docker.io/nvidia/cuda@sha256:") || launch.BenchDisk != "" {
+		t.Fatalf("a GPU bench runs in the CUDA image: %q %q", launch.Image, launch.BenchDisk)
+	}
 	run, rank, err := store.BenchOfAttempt(ctx, launch.Attempt.ID)
 	if err != nil || run.ID != plan.Run.ID || rank != 0 {
 		t.Fatalf("bench of attempt: %+v %d %v", run, rank, err)
 	}
 	status, err := store.BenchStatusOf(ctx, launch.Attempt.ID, launch.Lease.ID)
-	if err != nil || status.Programs.GPU != "/opt/kairo/kairo-bench-gpu" || status.Capabilities == nil || len(status.OtherWork) != 0 || status.Effective != nil {
+	if err != nil || status.Programs.Kairo != "/kairo/bin/kairo" || status.Programs.GPU != "" || status.Capabilities == nil || len(status.OtherWork) != 0 || status.Effective != nil {
 		t.Fatalf("status: %+v %v", status, err)
 	}
 	// The bench sets its device under its lease; the controller applies it.
@@ -218,7 +216,7 @@ func TestBenchRefusesDevicesItMayNotChange(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupHost(t, store)
 	ctx := context.Background()
-	benchNode(t, store, "a", true)
+	benchNode(t, store, "a")
 	if _, err := store.SetDeviceSetting(ctx, "h", "GPU-S", DeviceOwner{Kind: OwnerManual}, DeviceSettings{PowerLimitW: intp(250)}, "operator"); err != nil {
 		t.Fatal(err)
 	}
@@ -251,7 +249,7 @@ func TestCPUBenchHoldsTheWholeNodeCPU(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupHost(t, store)
 	ctx := context.Background()
-	benchNode(t, store, "a", false)
+	benchNode(t, store, "a")
 	if _, err := store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "cpu"}); err == nil || !strings.Contains(err.Error(), "its CPU") {
 		t.Fatalf("no CPU observed: %v", err)
 	}
@@ -286,7 +284,7 @@ func TestReconcileBenchRunsFailsARunWhoseExecutionEnded(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupHost(t, store)
 	ctx := context.Background()
-	benchNode(t, store, "a", true)
+	benchNode(t, store, "a")
 	cpuPoll(t, store, "a", 8000)
 	plan, err := store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "GPU-S", Kinds: []string{"copy"}})
 	if err != nil {
@@ -443,12 +441,12 @@ func TestPolicyDevicesShowTheLeaseAndItsUsage(t *testing.T) {
 	}
 }
 
-func TestStorageAndNetworkBenchesNeedNoControllerAndHoldTheirDevice(t *testing.T) {
+func TestStorageBenchNeedsNoControllerAndHoldsItsDisk(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupHost(t, store)
 	ctx := context.Background()
-	benchNode(t, store, "a", false)
-	benchNode(t, store, "b", false)
+	benchNode(t, store, "a")
+	benchNode(t, store, "b")
 	// a's filesystem provider reports /srv.
 	if err := store.UpsertProvider(ctx, "a-fs", "a", "filesystem", nil); err != nil {
 		t.Fatal(err)
@@ -473,21 +471,8 @@ func TestStorageAndNetworkBenchesNeedNoControllerAndHoldTheirDevice(t *testing.T
 		len(plan.Execution.Capacity.Disks) != 1 || plan.Execution.Capacity.Disks[0].Filesystem != "/srv" {
 		t.Fatalf("storage plan: %+v", plan)
 	}
-	plan, err = store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:a", Node: "b"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	g := plan.Execution.Gang
-	if plan.Run.Class != BenchNetwork || plan.Run.NodeID != "b" || *plan.Run.PeerNodeID != "a" || g == nil || g.Size != 2 || len(g.Ranks) != 2 ||
-		!strings.Contains(string(g.Ranks[0].ExecutorSelector), `"node":"b"`) || !strings.Contains(string(g.Ranks[1].ExecutorSelector), `"node":"a"`) {
-		t.Fatalf("network plan: %+v", plan)
-	}
-	// Both ranks' executions belong to the run.
-	var n int
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM bench_run_executions WHERE run_id=$1`, plan.Run.ID).Scan(&n); err != nil || n != 2 {
-		t.Fatalf("run executions: %d %v", n, err)
-	}
-	if _, err = store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:a", Node: "a"}); err == nil {
-		t.Fatal("a network bench from a node to itself was planned")
+	// The network bench is rebuilt to run between the nodes' agents.
+	if _, err = store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "net:a", Node: "b"}); err == nil || !strings.Contains(err.Error(), "not available") {
+		t.Fatalf("network bench: %v", err)
 	}
 }

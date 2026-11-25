@@ -207,6 +207,12 @@ func Main(ctx context.Context, runID string) error {
 		}
 	}()
 	d := &Driver{Daemon: client, Runner: ExecRunner{Stderr: os.Stderr}, Logger: logger, Env: os.Getenv, Timing: DefaultTiming(),
-		Continuation: os.Getenv("KAIRO_CONTINUATION_REF"), Stopping: stopping.Load}
+		Continuation: os.Getenv("KAIRO_CONTINUATION_REF"), Stopping: stopping.Load, Disk: os.Getenv("KAIRO_BENCH_DISK")}
+	// the GPU workload is built in the bench's container, once per node and
+	// source (kept in the project's cache)
+	d.GPU = func(ctx context.Context) (string, error) {
+		logger.Info("building kairo-bench-gpu (once per node and source)")
+		return BuildGPU(ctx, os.Getenv("KAIRO_CACHE_DIR"), os.Stderr)
+	}
 	return d.Run(ctx, runID)
 }

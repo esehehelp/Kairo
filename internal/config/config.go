@@ -55,42 +55,24 @@ type Config struct {
 	Providers    []Provider `toml:"providers"`
 }
 
-// Bench tells where the bench programs of a node are, for kairo hardware
-// bench: reported to the daemon with the node (its attributes' "bench").
-type Bench struct {
-	// KairoBinary runs the bench driver and the CPU, storage and network
-	// workloads (default: this kairo binary).
-	KairoBinary string `toml:"kairo_binary"`
-	// GPUBinary is kairo-bench-gpu; without it the node takes no GPU bench.
-	GPUBinary string `toml:"gpu_binary"`
-	// CWD is the benches' working directory (default: KairoBinary's).
-	CWD string `toml:"cwd"`
-	// ExecutorLabels pick the executor of the node that runs benches (one
-	// that runs the binaries above natively).
-	ExecutorLabels map[string]string `toml:"executor_labels"`
+// Bench is a [bench] table, which no configuration has any more: a bench
+// runs in a container, with the programs Kairo carries (README "Hardware
+// benches"). One still there is refused with that said.
+type Bench map[string]any
+
+// refuse is the error of a configuration that still has [bench].
+func (b Bench) refuse() error {
+	if len(b) == 0 {
+		return nil
+	}
+	return errors.New("[bench] is gone: hardware benches run in containers with the programs Kairo carries; remove the [bench] table")
 }
 
-// Attributes are node labels with the bench programs added under "bench".
-func (b Bench) Attributes(labels map[string]string) map[string]any {
-	out := map[string]any{}
+// NodeAttributes are what a node reports of itself: its labels.
+func NodeAttributes(labels map[string]string) map[string]any {
+	out := make(map[string]any, len(labels))
 	for k, v := range labels {
 		out[k] = v
-	}
-	kairo := b.KairoBinary
-	if kairo == "" {
-		kairo, _ = os.Executable()
-	}
-	bench := map[string]any{}
-	for key, value := range map[string]string{"kairo": kairo, "gpu": b.GPUBinary, "cwd": b.CWD} {
-		if value != "" {
-			bench[key] = value
-		}
-	}
-	if len(b.ExecutorLabels) != 0 {
-		bench["executor_labels"] = b.ExecutorLabels
-	}
-	if len(bench) != 0 {
-		out["bench"] = bench
 	}
 	return out
 }
@@ -398,6 +380,9 @@ func Load(path string) (Config, error) {
 	if len(c.Executors) > 0 || len(c.Providers) > 0 {
 		return c, errors.New("the daemon runs no executors or providers: remove [[executors]] and [[providers]]; work runs on node agents (kairo agent)")
 	}
+	if err := c.Bench.refuse(); err != nil {
+		return c, err
+	}
 	return c, validateTransport(c)
 }
 
@@ -598,6 +583,9 @@ func LoadAgent(path string) (Agent, error) {
 		return a, errors.New("at least one executor is required")
 	}
 	if err := checkExecutors(a.Executors); err != nil {
+		return a, err
+	}
+	if err := a.Bench.refuse(); err != nil {
 		return a, err
 	}
 	return a, nil

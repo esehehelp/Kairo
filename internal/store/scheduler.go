@@ -69,11 +69,15 @@ type Launch struct {
 	// relative to it.
 	Source *LaunchSource `json:"source,omitempty"`
 	// Image: the container image the attempt runs in, pinned by digest
-	// (images.go); "" for one that runs on its executor's host.
+	// (images.go).
 	Image string `json:"image,omitempty"`
 	// Streams: the streams the attempt reads, each made by a loader in its
 	// container (streams.go).
 	Streams []LaunchStream `json:"streams,omitempty"`
+	// BenchDisk: of a storage bench's attempt, the filesystem it measures
+	// (a node path, as its filesystem provider names it): the executor
+	// hands the container a directory there (hardware_bench.go).
+	BenchDisk string `json:"bench_disk,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -705,6 +709,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		if launch.Streams, err = launchStreamsTx(ctx, tx, executionID); err != nil {
 			return nil, err
 		}
+		if launch.BenchDisk, err = launchBenchDiskTx(ctx, tx, executionID); err != nil {
+			return nil, err
+		}
 		return launch, tx.Commit()
 	}
 	if leaseState != "prepared" || executionState != "waiting" {
@@ -781,6 +788,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err != nil {
 		return nil, err
 	}
+	benchDisk, err := launchBenchDiskTx(ctx, tx, executionID)
+	if err != nil {
+		return nil, err
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -808,6 +819,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		Source:               source,
 		Image:                image,
 		Streams:              streams,
+		BenchDisk:            benchDisk,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp

@@ -53,6 +53,8 @@ import (
 //	/kairo/src              KAIRO_SOURCE_DIR, the code snapshot (read-only)
 //	/kairo/inputs/<name>    KAIRO_INPUT_<NAME> (read-only)
 //	/kairo/nvidia           the node's NVIDIA driver files, with a GPU (read-only)
+//	/kairo/bench-disk       KAIRO_BENCH_DISK: of a storage bench, a directory
+//	                        (.kairo-bench) of the filesystem it measures
 //
 // The variables naming them are rewritten to those paths; the rest of the
 // environment is the image's, then the declared env, then Kairo's, as on a
@@ -132,6 +134,10 @@ func containerInstance(attemptID string) string {
 func (e *Local) containerDir(attemptID string) string {
 	return filepath.Join(e.LogDir, "containers", attemptID)
 }
+
+// benchDiskDir is the directory a storage bench writes in on the
+// filesystem it measures.
+const benchDiskDir = ".kairo-bench"
 
 // containerOptions say how a backend's containers take what an attempt is
 // handed: runArg is the runner's argument; dirsOnly mounts directories only
@@ -253,6 +259,17 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		spec.Mounts = append(spec.Mounts, containerMount{Source: cache, Path: containerRoot + "/cache"})
 		spec.Writable = append(spec.Writable, containerRoot+"/cache")
 		paths[cache] = containerRoot + "/cache"
+	}
+	if launch.BenchDisk != "" {
+		// a storage bench writes its test files on the filesystem it
+		// measures, not on the container's own disk
+		dir := filepath.Join(launch.BenchDisk+string(filepath.Separator), benchDiskDir)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return nil, fmt.Errorf("the storage bench's directory on %s: %w", launch.BenchDisk, err)
+		}
+		spec.Mounts = append(spec.Mounts, containerMount{Source: dir, Path: containerRoot + "/bench-disk"})
+		spec.Writable = append(spec.Writable, containerRoot+"/bench-disk")
+		env = setEnv(env, "KAIRO_BENCH_DISK", containerRoot+"/bench-disk")
 	}
 	if len(launch.Streams) > 0 {
 		s, ok := e.storeWork().storeFor(launch)
