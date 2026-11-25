@@ -118,8 +118,20 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 	if err := store.RawPlaced(ctx, "ctr", "", "", other); !errors.Is(err, ErrStreamReportRefused) {
 		t.Fatalf("a file of no stream leased there: %v", err)
 	}
-	if _, _, err := store.RawIdentity(ctx, "executor", url); !errors.Is(err, ErrStreamReportRefused) {
-		t.Fatalf("asked by an executor leasing nothing reading it: %v", err)
+	// the node's raw cache serves every executor of the node (it reports as
+	// one of them): another executor of the node is answered, one of
+	// another node is not
+	if _, found, err := store.RawIdentity(ctx, "executor", url); err != nil || !found {
+		t.Fatalf("asked by another executor of the node: %v %v", found, err)
+	}
+	if err := store.UpsertNode(ctx, Node{ID: "far", Name: "far", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.UpsertExecutor(ctx, Executor{ID: "far-ctr", NodeID: "far", Kind: "incus", Attributes: json.RawMessage(`{"runtime":"incus"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := store.RawIdentity(ctx, "far-ctr", url); !errors.Is(err, ErrStreamReportRefused) {
+		t.Fatalf("asked by an executor of a node leasing nothing reading it: %v", err)
 	}
 	streams, err := launchStreamsTx(ctx, store.db, launch.Execution.ID)
 	if err != nil {

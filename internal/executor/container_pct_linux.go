@@ -466,20 +466,6 @@ func containerRootID() (int, error) {
 	return 100000, nil
 }
 
-// chownTree gives root (the directory and all under it, links not followed)
-// to uid, as the container's root; what is not there is no error.
-func chownTree(root string, uid int) error {
-	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				return nil
-			}
-			return err
-		}
-		return os.Lchown(p, uid, uid)
-	})
-}
-
 // hostMemoryMiB is the host's memory (MemTotal): a container gets it all,
 // as a host attempt does; admission accounts for it.
 func hostMemoryMiB() (int, error) {
