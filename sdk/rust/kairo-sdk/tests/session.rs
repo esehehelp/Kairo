@@ -1,4 +1,7 @@
 //! The session's heartbeat thread against a fake daemon.
+// the session registers this process's identity, read from /proc: an
+// attempt runs in a Linux container
+#![cfg(target_os = "linux")]
 
 mod common;
 

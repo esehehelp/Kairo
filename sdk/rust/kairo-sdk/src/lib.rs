@@ -42,8 +42,8 @@ mod signals;
 
 pub use client::{classify_status, classify_transport, Command, Error, ErrorKind, Phase, Transport, WorkerClient};
 pub use compat::Progress;
-pub use env::{check_token_transport, is_loopback, Attempt, EnvError, Gang};
-pub use identity::{identity_from_filetime, identity_from_stat, process_identity};
+pub use env::{check_token_transport, is_loopback, Attempt, EnvError};
+pub use identity::{identity_from_stat, process_identity};
 pub use report::{phase, reporter, Reporter};
 #[doc(hidden)]
 pub use session::live_heartbeat_threads;

@@ -37,17 +37,6 @@ class SuspendResult:
 
 
 @dataclass(frozen=True)
-class GangContext:
-    """This attempt's place in a gang (``KAIRO_GANG_*``): one rank of ``size``."""
-
-    id: str
-    rank: int
-    size: int
-    master_addr: str
-    master_port: int
-
-
-@dataclass(frozen=True)
 class ProgressEnvelope:
     unit: str
     current: int | float
@@ -86,7 +75,7 @@ def _on_stop_signal(signum, _frame) -> None:
 def install_stop_signals() -> None:
     """Turn SIGTERM (and SIGBREAK on Windows) into a process-wide stop request.
 
-    Kairo's force stop sends CTRL_BREAK (Windows) or SIGTERM first and kills
+    Kairo's force stop sends SIGTERM first and kills
     the process only after a grace period, so a worker that installs these
     handlers can leave at its next safe point instead of being killed
     mid-step. :meth:`AttemptSession.safe_point` then returns ``True`` and
@@ -145,7 +134,6 @@ class AttemptSession:
         ca_der: bytes | None = None,
         node_id: str | None = None,
         executor_id: str | None = None,
-        gang: GangContext | None = None,
         stop_paths: Iterable[str | Path] = (),
         poll_interval_seconds: float = 1.0,
         heartbeat_interval_seconds: float = 10.0,
@@ -176,7 +164,6 @@ class AttemptSession:
         self._opener = _http.build_opener(ca_der=ca_der) if self.api_url is not None else None
         self.node_id = node_id
         self.executor_id = executor_id
-        self.gang = gang
         self.poll_interval_seconds = poll_interval_seconds
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.timeout_seconds = timeout_seconds
@@ -247,7 +234,6 @@ class AttemptSession:
             ca_der=ca_der,
             node_id=os.environ.get("KAIRO_NODE_ID"),
             executor_id=os.environ.get("KAIRO_EXECUTOR_ID"),
-            gang=_gang_from_environment(),
             stop_paths=stop_paths,
             poll_interval_seconds=poll_interval_seconds,
             heartbeat_interval_seconds=heartbeat_interval_seconds,
@@ -423,7 +409,7 @@ class AttemptSession:
         also stops the worker: ``checkpoint`` runs once, with ``reason``
         ``"stop_signal"`` and an empty ``command_id``, so the work can be
         resumed by hand, and ``True`` is returned. Nothing is acknowledged
-        for it: Kairo's force stop (CTRL_BREAK / SIGTERM first, a kill after
+        for it: Kairo's force stop (SIGTERM first, a kill after
         its grace period) plans no continuation. Keep that checkpoint within
         the grace period.
 
@@ -861,46 +847,6 @@ def _decode_ca_environment(text: str) -> bytes:
     return der
 
 
-_GANG_VARIABLES = (
-    "KAIRO_GANG_RANK",
-    "KAIRO_GANG_SIZE",
-    "KAIRO_GANG_MASTER_ADDR",
-    "KAIRO_GANG_MASTER_PORT",
-)
-
-
-def _gang_from_environment() -> GangContext | None:
-    gang_id = os.environ.get("KAIRO_GANG_ID")
-    if not gang_id:
-        return None
-    values = {name: os.environ.get(name, "") for name in _GANG_VARIABLES}
-    missing = [name for name, value in values.items() if not value]
-    if missing:
-        raise RuntimeError("KAIRO_GANG_ID is set but " + ", ".join(missing) + " is missing")
-    numbers: dict[str, int] = {}
-    for name in ("KAIRO_GANG_RANK", "KAIRO_GANG_SIZE", "KAIRO_GANG_MASTER_PORT"):
-        try:
-            numbers[name] = int(values[name])
-        except ValueError:
-            raise RuntimeError(f"{name} must be an integer, not {values[name]!r}") from None
-    rank, size, port = (
-        numbers["KAIRO_GANG_RANK"],
-        numbers["KAIRO_GANG_SIZE"],
-        numbers["KAIRO_GANG_MASTER_PORT"],
-    )
-    if size < 1 or not 0 <= rank < size:
-        raise RuntimeError(f"KAIRO_GANG_RANK {rank} is outside KAIRO_GANG_SIZE {size}")
-    if not 0 < port < 65536:
-        raise RuntimeError(f"KAIRO_GANG_MASTER_PORT {port} is not a TCP port")
-    return GangContext(
-        id=gang_id,
-        rank=rank,
-        size=size,
-        master_addr=values["KAIRO_GANG_MASTER_ADDR"],
-        master_port=port,
-    )
-
-
 def _stop_signal_context(session: "AttemptSession") -> CommandContext:
     """The checkpoint request a stop signal stands for (no Kairo command)."""
     return CommandContext(
@@ -926,9 +872,6 @@ def _csv_environment(name: str) -> tuple[str, ...]:
 # --------------------------------------------------------------------------
 # Process identity (sdk/conformance/identity.json)
 
-_UNIX_EPOCH_FILETIME = 116_444_736_000_000_000
-
-
 def process_identity_from_proc_stat(pid: int, stat_text: str) -> str | None:
     """Linux identity ``proc:PID:starttime:T`` from ``/proc/PID/stat`` text.
 
@@ -940,57 +883,17 @@ def process_identity_from_proc_stat(pid: int, stat_text: str) -> str | None:
         return None
 
 
-def process_identity_from_filetime(pid: int, creation_filetime: int) -> str:
-    """Windows identity ``pid:PID:start:NS``, NS the creation time in Unix nanoseconds.
-
-    Matches Go's ``windows.Filetime.Nanoseconds()``.
-    """
-    return f"pid:{pid}:start:{(creation_filetime - _UNIX_EPOCH_FILETIME) * 100}"
-
-
 def _current_process_identity() -> str:
+    # an attempt runs in a Linux container
     pid = os.getpid()
-    if os.name != "nt":
-        try:
-            stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
-        except OSError as error:
-            raise RuntimeError(f"cannot establish process identity for pid {pid}") from error
-        identity = process_identity_from_proc_stat(pid, stat_text)
-        if identity is None:
-            raise RuntimeError(f"cannot establish process identity for pid {pid}")
-        return identity
-    return process_identity_from_filetime(pid, _current_creation_filetime())
-
-
-def _current_creation_filetime() -> int:
-    import ctypes
-    from ctypes import wintypes
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.GetCurrentProcess.argtypes = []
-    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-    filetime_pointer = ctypes.POINTER(wintypes.FILETIME)
-    kernel32.GetProcessTimes.argtypes = [
-        wintypes.HANDLE,
-        filetime_pointer,
-        filetime_pointer,
-        filetime_pointer,
-        filetime_pointer,
-    ]
-    kernel32.GetProcessTimes.restype = wintypes.BOOL
-
-    created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
-    handle = kernel32.GetCurrentProcess()
-    if not kernel32.GetProcessTimes(
-        handle,
-        ctypes.byref(created),
-        ctypes.byref(exited),
-        ctypes.byref(kernel),
-        ctypes.byref(user),
-    ):
-        error_code = ctypes.get_last_error()
-        raise OSError(error_code, ctypes.FormatError(error_code))
-    return (created.dwHighDateTime << 32) | created.dwLowDateTime
+    try:
+        stat_text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError as error:
+        raise RuntimeError(f"cannot establish process identity for pid {pid}") from error
+    identity = process_identity_from_proc_stat(pid, stat_text)
+    if identity is None:
+        raise RuntimeError(f"cannot establish process identity for pid {pid}")
+    return identity
 
 
 def _parse_proc_stat_starttime(stat_text: str) -> int:

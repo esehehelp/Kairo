@@ -42,10 +42,6 @@ class DistributedAdapter:
         # Rank 0: a ``checkpointed`` acknowledgement whose answer did not
         # arrive, (command id, kind, payload), sent again before anything else.
         self._pending_publication: tuple[str, str, dict[str, Any]] | None = None
-        # A gang rank other than 0: the acknowledgement of its own command it
-        # still owes, (kind, continuation_ref, rejection), tried at every
-        # safe point until done.
-        self._pending_mirror: tuple[str, str | None, str | None] | None = None
 
     @staticmethod
     def _distribution():
@@ -71,26 +67,6 @@ class DistributedAdapter:
         else:
             registrations[0] = local
 
-        if self._own_attempts:
-            # A Kairo gang: every rank is an attempt of its own (on its own
-            # node), so each registers its process there and keeps its own
-            # heartbeat; its executor proves its quiescence from that.
-            local_error: str | None = None
-            try:
-                self.session.register_process(rank=rank, pid=local["pid"], process_identity=local["identity"])
-            except BaseException as exc:
-                self.session.last_control_error = exc
-                local_error = f"rank {rank}: Kairo process registration failed: {exc}"
-            errors_by_rank: list[Any] = [None] * world_size
-            if distributed:
-                dist.all_gather_object(errors_by_rank, local_error)
-            else:
-                errors_by_rank[0] = local_error
-            _raise_rank_errors(errors_by_rank)
-            self.session.start()
-            self._registered = True
-            return
-
         error: str | None = None
         if rank == 0:
             try:
@@ -112,16 +88,10 @@ class DistributedAdapter:
             self.session.start()
         self._registered = True
 
-    @property
-    def _own_attempts(self) -> bool:
-        """Whether every rank is an attempt of its own (a Kairo gang:
-        ``KAIRO_GANG_*``) rather than a process of rank 0's attempt."""
-        return self.session.gang is not None
-
     def close(self) -> None:
         dist, distributed = self._distribution()
         rank = dist.get_rank() if distributed else 0
-        if rank == 0 or self._own_attempts:
+        if rank == 0:
             self.session.close()
 
     def local_continuation(
@@ -129,57 +99,13 @@ class DistributedAdapter:
     ) -> str | None:
         """The continuation Kairo handed this attempt, as a file this rank can open.
 
-        Opt-in for projects whose continuation is a single file written by
-        rank 0: Kairo hands every rank the same reference, a path that may
-        exist only on rank 0's node. Every rank must call this together.
-        A rank that already sees the same bytes (size and SHA-256 equal to
-        rank 0's) gets the reference back; any other rank receives the file
-        from rank 0 over the process group into ``dest_dir`` under the same
-        file name, verified, and gets that path. A different file already at
-        that name is never overwritten. Any rank's failure raises on every
-        rank. Returns ``None`` when the attempt has no continuation.
+        Every rank of an attempt runs in its one container and sees the same
+        files: the reference itself. (``dest_dir`` and ``chunk_bytes`` are
+        kept for callers written when a rank could be on another node.)
+        Returns ``None`` when the attempt has no continuation.
         """
-        ref = self.session.input_continuation_ref
-        if not ref:
-            return None
-        dist, distributed = self._distribution()
-        if not distributed:
-            return ref
-        rank = dist.get_rank()
-        world_size = dist.get_world_size()
-
-        source: list[Any] = [None]
-        if rank == 0:
-            try:
-                source[0] = {"size": os.path.getsize(ref), "sha256": _sha256_file(ref)}
-            except OSError as exc:
-                source[0] = {"error": f"rank 0 cannot read continuation {ref}: {exc}"}
-        dist.broadcast_object_list(source, src=0)
-        if "error" in source[0]:
-            raise RuntimeError(source[0]["error"])
-        size, digest = source[0]["size"], source[0]["sha256"]
-
-        local, receive, error = ref, False, None
-        try:
-            if rank != 0 and not _same_file(ref, size, digest):
-                local = os.path.join(os.fspath(dest_dir), os.path.basename(ref))
-                if not os.path.exists(local):
-                    receive = True
-                elif not _same_file(local, size, digest):
-                    error = f"rank {rank}: {local} exists with other contents"
-        except OSError as exc:
-            error = f"rank {rank}: {exc}"
-        states: list[Any] = [None] * world_size
-        dist.all_gather_object(states, (receive, error))
-        _raise_rank_errors(state[1] for state in states)
-        if any(state[0] for state in states):
-            error = _broadcast_file(
-                dist, rank, ref, local if receive else None, size, digest, chunk_bytes
-            )
-            errors: list[Any] = [None] * world_size
-            dist.all_gather_object(errors, error)
-            _raise_rank_errors(errors)
-        return local
+        del dest_dir, chunk_bytes
+        return self.session.input_continuation_ref or None
 
     def _try_ack(
         self, command_id: str, phase: str, payload: dict[str, Any] | None = None
@@ -209,10 +135,7 @@ class DistributedAdapter:
         callbacks must consequently be idempotent by command ID. A
         ``checkpoint`` command (``kairo task checkpoint``) is checkpointed by
         every rank the same way and returns ``False``: every rank carries on,
-        also when the checkpoint fails (it is acknowledged ``rejected``). In a
-        Kairo gang every rank is an attempt of its own: rank 0 polls and
-        decides, and every other rank then acknowledges its own command of
-        the same kind the same way.
+        also when the checkpoint fails (it is acknowledged ``rejected``).
 
         The semantics follow :meth:`AttemptSession.safe_point`: unknown
         command kinds are skipped, a withdrawn command (HTTP 404) is dropped,
@@ -228,8 +151,6 @@ class DistributedAdapter:
         self.start()
         dist, distributed = self._distribution()
         rank = dist.get_rank() if distributed else 0
-        if self._pending_mirror is not None:
-            self._mirror_on_own_attempt(rank, *self._pending_mirror)
 
         envelope: list[Any] = [None]
         if rank == 0:
@@ -241,7 +162,6 @@ class DistributedAdapter:
         published = message.get("published")
         if published is not None:
             # Rank 0 got the answer of an earlier publication only now.
-            self._mirror_on_own_attempt(rank, published["kind"], published["continuation_ref"], None)
             if published["kind"] == "suspend":
                 self.session.suspend_handled = True
                 return True
@@ -283,7 +203,6 @@ class DistributedAdapter:
             reason = "; ".join(failures)
             if rank == 0:
                 self._try_ack(context.command_id, "rejected", {"reason": reason})
-            self._mirror_on_own_attempt(rank, context.kind, None, reason)
             if context.kind == "checkpoint":
                 # A checkpoint command asked for a copy, not for the run to
                 # end: refused, and every rank carries on.
@@ -318,65 +237,17 @@ class DistributedAdapter:
         outcome = acknowledgement[0]
         _raise_terminal(self.session, outcome["terminal"])
         if outcome["no_continuation"]:
-            self._mirror_on_own_attempt(rank, context.kind, None, "no continuation_ref")
             message = f"rank 0 checkpoint returned no continuation_ref for command {context.command_id}"
             if context.kind == "checkpoint":
                 self.session.last_checkpoint_error = NoContinuationError(message)
                 _log.warning("Kairo checkpoint %s published nothing; every rank carries on", context.command_id)
                 return False
             raise NoContinuationError(message)
-        if outcome["ok"]:
-            self._mirror_on_own_attempt(rank, context.kind, outcome["continuation_ref"], None)
         if context.kind == "checkpoint":
             return False  # published (or redelivered after a failed acknowledgement); every rank carries on
         if outcome["ok"]:
             self.session.suspend_handled = True
         return bool(outcome["ok"])
-
-    def _mirror_on_own_attempt(
-        self, rank: int, kind: str, continuation_ref: str | None, rejection: str | None
-    ) -> None:
-        """In a Kairo gang, rank ``rank`` (not 0) acknowledges its own
-        attempt's command of the same kind the way rank 0's was: published
-        with rank 0's ``continuation_ref``, or rejected. Every rank got one
-        (a checkpoint, or the suspend a gang hands every rank) and only rank
-        0 polls, so without this a rank's command stayed pending. No
-        collective: a failure keeps it (``_pending_mirror``) to be tried
-        again at the next safe point.
-        """
-        self._pending_mirror = None
-        if rank == 0 or not self._own_attempts:
-            return
-        session = self.session
-        pending = (kind, continuation_ref, rejection)
-        try:
-            commands = session.poll_commands()
-        except (AttemptRetired, AttemptFenced):
-            return  # the attempt is over: nothing to acknowledge
-        except BaseException as exc:
-            session.last_control_error = exc
-            self._pending_mirror = pending
-            return
-        for raw in commands:
-            if str(raw.get("kind") or "") != kind:
-                continue
-            command_id = str(raw["id"])
-            statuses = [self._try_ack(command_id, phase) for phase in ("accepted", "checkpointing")]
-            if "terminal" in statuses or "gone" in statuses:
-                return
-            if "failed" in statuses:
-                self._pending_mirror = pending
-                return
-            if rejection is not None:
-                status = self._try_ack(command_id, "rejected", {"reason": f"rank 0: {rejection}"})
-            elif continuation_ref:
-                status = self._try_ack(command_id, "checkpointed", {"continuation_ref": continuation_ref, "gang_rank": rank})
-            else:
-                return
-            if status == "failed":
-                # Repeating an acknowledgement Kairo already took is harmless.
-                self._pending_mirror = pending
-            return
 
     def _unanswered(self) -> bool:
         """Whether the last failed request of the session got no answer
@@ -476,84 +347,6 @@ def _raise_rank_errors(errors) -> None:
     failures = [error for error in errors if error]
     if failures:
         raise RuntimeError("; ".join(failures))
-
-
-def _sha256_file(path: str, block: int = 8 << 20) -> str:
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        while chunk := handle.read(block):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _same_file(path: str, size: int, digest: str) -> bool:
-    return os.path.isfile(path) and os.path.getsize(path) == size and _sha256_file(path) == digest
-
-
-def _broadcast_file(
-    dist, rank: int, ref: str, target: str | None, size: int, digest: str, chunk_bytes: int
-) -> str | None:
-    """Stream rank 0's file to every rank in chunks; ``target`` is where this rank keeps it.
-
-    Every rank takes part in every chunk's broadcast (a rank that needs
-    nothing discards it), and no I/O failure leaves the loop early, so the
-    collective sequence is the same on all ranks. Returns this rank's error.
-    """
-    import torch  # optional dependency, intentionally lazy
-
-    device = torch.device("cpu")
-    if dist.get_backend() == "nccl":
-        device = torch.device("cuda", torch.cuda.current_device())
-    buffer = torch.empty(min(chunk_bytes, max(size, 1)), dtype=torch.uint8, device=device)
-    error: str | None = None
-    reader = writer = partial = None
-    check = hashlib.sha256()
-    try:
-        if rank == 0:
-            reader = open(ref, "rb")
-        elif target is not None:
-            os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
-            partial = f"{target}.partial-{os.getpid()}"
-            writer = open(partial, "wb")
-    except OSError as exc:
-        error = f"rank {rank}: {exc}"
-    offset = 0
-    while offset < size:
-        length = min(buffer.numel(), size - offset)
-        view = buffer[:length]
-        if reader is not None and error is None:
-            try:
-                data = reader.read(length)
-                if len(data) != length:
-                    raise OSError(f"{ref} ended at {offset + len(data)} of {size} bytes")
-                view.copy_(torch.frombuffer(bytearray(data), dtype=torch.uint8))
-            except OSError as exc:
-                error = f"rank 0: reading {ref}: {exc}"
-        dist.broadcast(view, src=0)
-        if writer is not None and error is None:
-            data = view.cpu().numpy().tobytes()
-            check.update(data)
-            try:
-                writer.write(data)
-            except OSError as exc:
-                error = f"rank {rank}: writing {partial}: {exc}"
-        offset += length
-    if reader is not None:
-        reader.close()
-    if writer is not None:
-        try:
-            writer.flush()
-            os.fsync(writer.fileno())
-        except OSError as exc:
-            error = error or f"rank {rank}: writing {partial}: {exc}"
-        writer.close()
-        if error is None and check.hexdigest() != digest:
-            error = f"rank {rank}: the received continuation does not match rank 0's SHA-256"
-        if error is None:
-            os.replace(partial, target)
-        else:
-            os.remove(partial)
-    return error
 
 
 def _terminal_message(session: AttemptSession) -> dict[str, Any] | None:

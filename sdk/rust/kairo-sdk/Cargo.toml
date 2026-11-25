@@ -13,8 +13,8 @@ name = "kairo_sdk"
 path = "src/lib.rs"
 
 [features]
-# install_stop_handlers(): SIGTERM (Unix) and CTRL_BREAK (Windows) request a stop that safe_point honours.
-signals = ["dep:libc", "windows-sys/Win32_System_Console"]
+# install_stop_handlers(): SIGTERM requests a stop that safe_point honours.
+signals = ["dep:libc"]
 
 [dependencies]
 base64 = "0.23"
@@ -28,5 +28,3 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 [target.'cfg(unix)'.dependencies]
 libc = { version = "0.2", optional = true }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Threading"] }

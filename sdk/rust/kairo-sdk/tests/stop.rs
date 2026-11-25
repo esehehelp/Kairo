@@ -1,4 +1,7 @@
 //! A process-wide stop request (its own test binary: the flag is global).
+// the session registers this process's identity, read from /proc: an
+// attempt runs in a Linux container
+#![cfg(target_os = "linux")]
 
 mod common;
 

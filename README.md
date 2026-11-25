@@ -96,7 +96,7 @@ Task は永続的な論理オブジェクトであり、一連のイミュータ
 | `provenance` | コードスナップショット、ダイジェスト指定のコンテナイメージ | `sourcesnap`, `imageref`, `store/provenance` | [コードスナップショット](#コードスナップショット), [コンテナ実行](#コンテナ実行) |
 | `hardware` | マシン宣言、デバイス設定、動作点ポリシー、ベンチマーク、電力と消費電力量 | `machine`, `devicecontrol`, `hwpolicy`, `hwbench`, `bench`, `cpupower`, `store`（`device`, `device_policy`, `device_samples`, `hardware_bench`, `hardware_history`, `hosts`） | [マシン宣言](#マシン宣言), [ハードウェア設定](#ハードウェア設定), [ハードウェアベンチマーク](#ハードウェアベンチマーク), [電力と消費電力量](#電力と消費電力量) |
 | `access` | HTTP API とエージェント操作、トークン、TLS、プライベートファイル | `api`, `agentops`, `tlsutil`, `secfile`, `store`（`tokens`） | [認証と TLS](#認証と-tls), [HTTP API](#http-api) |
-| `support` | 決定ロック（decision lock）配下のストアトランザクションとイベントログ、設定、環境変数ルール、ID、時刻、外部コマンド、ビルドスタンプ、テスト | `store/dbtx`, `config`, `envspec`, `id`, `instant`, `extcmd`, `buildinfo`, `conformance`, `pgtest`, `sqliteimport` | [データベース](#データベース), [検証とテスト](#検証とテスト) |
+| `support` | 決定ロック（decision lock）配下のストアトランザクションとイベントログ、設定、環境変数ルール、ID、時刻、外部コマンド、ビルドスタンプ、テスト | `store/dbtx`, `config`, `envspec`, `id`, `instant`, `extcmd`, `buildinfo`, `conformance`, `pgtest` | [データベース](#データベース), [検証とテスト](#検証とテスト) |
 
 ### Execution のライフサイクル
 
@@ -401,7 +401,7 @@ ca_file = "/etc/kairo/ca.pem"
 # attempt_api_url = "https://192.0.2.12:7474"  # このノード上の Attempt に渡す KAIRO_API_URL
 ```
 
-残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`、`[bench]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
+残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[bench]` は拒否されます（ベンチマークはコンテナで走り、使うプログラムは Kairo が決めます）。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
 
 - **Executor の実行形態**: すべての Executor は Attempt をイメージのコンテナで実行します。種別（kind）は `incus`（Linux）と `wslc`（Windows）だけです（[コンテナ実行](#コンテナ実行)を参照）。ホストで直接実行する種別（以前の `linux`・`windows` など）、Proxmox のコンテナの種別（以前の `pct`）、WSL の種別（`wsl2`）を宣言する設定は拒否されます。
 - **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。
@@ -1857,7 +1857,7 @@ Kairo が管理する Attempt には、以下の環境変数が渡されます�
 - **再開時**: `KAIRO_CONTINUATION_REF`
 - **volatile store**: Executor がvolatile store（[データストア](#データストア)を参照）を提供している場合は `KAIRO_SCRATCH` と `KAIRO_OUTPUT_DIR`
 
-Python SDK の分散実行の補助（`DistributedAdapter`、`GangContext`）は、Kairo が Gang を走らせていた頃のものです。今の Kairo は `KAIRO_GANG_*` を渡さないため、これらは 1 つのプロセスとして振る舞います（SDK の整理で取り除く予定です）。
+SDK は、Attempt を Linux のコンテナで動くものとして扱います（プロセスの身元は `/proc/<pid>/stat` から読みます）。Python SDK の `DistributedAdapter` は、1 つの Attempt の中の torch の分散（1 つのコンテナの中の DDP）を協調させます。rank 0 だけがポーリングと応答を行い、チェックポイントは全 rank がそろって作ります。`local_continuation` は、Kairo が渡した継続の参照をそのまま返します（全 rank が同じコンテナのファイルを見るため、別ノードへの受け渡しはありません）。Gang 用の補助（`GangContext`、rank ごとの Attempt）はなくなりました。
 
 ### セーフポイントの挙動と Python・Rust SDK
 
@@ -1869,7 +1869,7 @@ Python SDK の分散実行の補助（`DistributedAdapter`、`GangContext`）は
 - **未知の Command**: 未知の Command 種別（command kind）はスキップされます。
 - **一時的な通信障害**: デーモンやネットワークが一時的に利用できない場合（ポーリング・ハートビート・応答における一時的エラーまたはリトライ対象エラー）は、そのセーフポイントでは Command が届いていないものとして扱われます。ワーカーは処理を継続し、エラーを `last_control_error` に保持したまま進み、Command は後から再送されます。
 
-- **停止シグナル**: `install_stop_signals()` を呼び出した後に `SIGTERM` / `CTRL_BREAK`（強制停止のグレースフルフェーズ）を受信すると、次のセーフポイントでコールバックが 1 回だけ実行され（reason は `stop_signal`、Command ID なし、応答送信なし）、`True` を返します。これにより、作業を手動で再開できる状態を保てます。
+- **停止シグナル**: `install_stop_signals()` を呼び出した後に `SIGTERM`（強制停止のグレースフルフェーズ。コンテナの init がランナーからの停止を Attempt に渡します）を受信すると、次のセーフポイントでコールバックが 1 回だけ実行され（reason は `stop_signal`、Command ID なし、応答送信なし）、`True` を返します。これにより、作業を手動で再開できる状態を保てます。
 - **退役・フェンス時**: トークンが拒否されたワーカー（Attempt が `quiesced` すなわち退役（retired）状態になった場合）や、フェンスされた（fenced）ワーカーは報告を停止します。
 
 Python SDK には、このほか `ProgressReporter`、`continuation_or`、`CommandJournal`（Command ID ごとにべき等なチェックポイントを管理）、`provenance.capture`、およびオペレータ向けの `KairoClient` が用意されています。
@@ -1880,11 +1880,13 @@ Rust クレート `sdk/rust/kairo-sdk`（ブロッキング実装、`ureq` + `ru
 kairo-sdk = { git = "https://github.com/esehehelp/Kairo", rev = "<commit>" }
 ```
 
-すべての SDK は、テストスイート内で `sdk/conformance/*.json` をリプレイして適合性を検証します。
+Rust の停止シグナルの処理（feature `signals`、`install_stop_handlers`）は Unix の `SIGTERM` だけを扱い、ほかの OS では何もしません（`request_stop` はどこでも使えます）。
+
+すべての SDK は、テストスイート内で `sdk/conformance/*.json` をリプレイして適合性を検証します。SDK のテストは Linux で走らせます（CI はコンテナの中）。Python のテストは Linux 以外で走らせると、プロセスの身元を Linux の形の仮の値に差し替えます。Rust のテストのうち、自分のプロセスを登録するものは Linux でだけ走ります。
 
 ### プロジェクト管理の低レベルコントローラポリシー
 
-Execution API へ直接投入するプロジェクトでも、`ResumeAfterKairoPreemption` をオプトインで利用できます。ポリシースナップショットと正規化された投入内容（canonical submission）は、最初の API 呼び出しの前にプロジェクト側のコントローラジャーナルへ書き込まれます。
+Execution API へ直接投入するプロジェクトでも、`ResumeAfterKairoPreemption` をオプトインで利用できます。ポリシースナップショットと正規化された投入内容（canonical submission）は、最初の API 呼び出しの前にプロジェクト側のコントローラジャーナルへ書き込まれます。投入内容には、ダイジェストで固定した `image` と、イメージの中の絶対パスの `cwd` が要ります（ないものは、ジャーナルに書く前に拒否します）。
 
 ```python
 from kairo_sdk import ControllerJournal, KairoControllerClient, ProjectController
@@ -2166,13 +2168,7 @@ CREATE DATABASE kairo OWNER kairo TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C';
 - **認証と読み取り専用接続**: 認証処理ではリクエストごとにトークンの失効を確認します。データベース接続はデフォルトで読み取り専用であり、トランザクション側で明示的に書き込み可能に設定した場合のみ書き込みが行われます。
 - **ラウンドトリップとポーリング最適化**: 各 SQL 文はサーバとの 1 回のラウンドトリップになります。プランニングパスは待機中の Execution 数にかかわらず固定で約 20 回（全スコープではなく、対象の Lease と候補 Execution が属するスコープ名のみを読み取るため）、ハートビートは約 5 回のラウンドトリップです。各 Executor は 1 秒あたり 4 回ポーリングするため、アイドル状態の環境ではプランニングパスをスキップします（[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）。
 
-バックアップには `pg_dump` を使用してください（データベースにはトークンハッシュが保存されているため、ダンプファイルはパスワードと同等に厳重に管理してください）。SQLite 時代のデータベース（`kairo-v3.db`）は、デーモンおよびエージェントを停止した状態で 1 度だけ移行します。
-
-```powershell
-kairo db import-sqlite --from local/kairo-v3.db --config kairo.toml   # または --to URL
-```
-
-このコマンドは移行元ファイルを読み取り専用で開きます（稼働中デーモンのスナップショットをインポートしたい場合は、あらかじめ `-wal` ファイルおよび `-shm` ファイルと一緒にコピーしておいてください）。移行先は空のデータベースである必要があり、最後の SQLite 版 Kairo のスキーマ（マイグレーション 1）を作成した上で、1 つのトランザクション内で全テーブルをコピーします。コミット前に全テーブルについて行数と主キー順の全行に対する SHA-256 ハッシュ（フラグ、整数、実数、テキストの各列型で値を正規化）を両データベースで同一の方法により算出して照合し、その後にそれ以降のマイグレーションを適用します。各テーブルにつき 1 行の結果を出力し、1 つでも差異があるテーブルがあれば何もインポートしません。なお、スキーマが完全な状態である必要があるため、移行元ファイルは最後の SQLite 版 Kairo で一度開かれたものである必要があります。
+バックアップには `pg_dump` を使用してください（データベースにはトークンハッシュが保存されているため、ダンプファイルはパスワードと同等に厳重に管理してください）。
 
 ## 稼働中環境のアップグレード
 

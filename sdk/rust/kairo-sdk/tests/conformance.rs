@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use kairo_sdk::{
-    check_token_transport, classify_status, classify_transport, identity_from_filetime, identity_from_stat,
+    check_token_transport, classify_status, classify_transport, identity_from_stat,
     is_loopback, Attempt, ErrorKind, Transport,
 };
 use serde_json::Value;
@@ -83,17 +83,6 @@ fn worker_env() {
         assert_eq!(a.resource_ids(), strings(&expect["resource_ids"]), "{name}");
         assert_eq!(a.resource_bindings(), strings(&expect["resource_bindings"]), "{name}");
         assert_eq!(a.continuation_ref(), expect["continuation_ref"].as_str(), "{name}");
-        match &expect["gang"] {
-            Value::Null => assert!(a.gang().is_none(), "{name}"),
-            g => {
-                let gang = a.gang().unwrap_or_else(|| panic!("{name}: no gang"));
-                assert_eq!(gang.id, g["id"].as_str().unwrap(), "{name}");
-                assert_eq!(gang.rank as u64, g["rank"].as_u64().unwrap(), "{name}");
-                assert_eq!(gang.size as u64, g["size"].as_u64().unwrap(), "{name}");
-                assert_eq!(gang.master_addr, g["master_addr"].as_str().unwrap(), "{name}");
-                assert_eq!(gang.master_port as u64, g["master_port"].as_u64().unwrap(), "{name}");
-            }
-        }
     }
 }
 
@@ -104,11 +93,6 @@ fn identity() {
         let pid = case["pid"].as_u64().unwrap() as u32;
         let got = identity_from_stat(pid, case["stat"].as_str().unwrap()).ok();
         assert_eq!(got.as_deref(), case["expect"].as_str(), "{case}");
-    }
-    for case in cases(&v, "windows") {
-        let pid = case["pid"].as_u64().unwrap() as u32;
-        let got = identity_from_filetime(pid, case["creation_filetime"].as_u64().unwrap());
-        assert_eq!(got, case["expect"].as_str().unwrap(), "{case}");
     }
 }
 

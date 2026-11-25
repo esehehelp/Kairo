@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import dataclasses
 import json
 import os
 import re
@@ -31,7 +30,7 @@ from kairo_sdk import (
     resolve_operator_settings,
 )
 from kairo_sdk import _http, errors
-from kairo_sdk.runtime import process_identity_from_filetime, process_identity_from_proc_stat
+from kairo_sdk.runtime import process_identity_from_proc_stat
 
 CONFORMANCE = Path(__file__).resolve().parents[2] / "conformance"
 DATA = Path(__file__).parent / "data"
@@ -161,9 +160,7 @@ def test_worker_environment(case, monkeypatch):
     session = AttemptSession.from_environment()
     assert session.managed is expect["managed"]
     if not expect["managed"]:
-        assert session.gang is None
         return
-    gang = dataclasses.asdict(session.gang) if session.gang is not None else None
     assert {
         "managed": session.managed,
         "api_url": session.api_url,
@@ -173,22 +170,17 @@ def test_worker_environment(case, monkeypatch):
         "resource_ids": list(session.resource_ids),
         "resource_bindings": list(session.resource_bindings),
         "continuation_ref": session.input_continuation_ref,
-        "gang": gang,
     } == expect
 
 
 # --------------------------------------------------------------------------
-# identity.json (both platforms' rules, on every OS)
+# identity.json (an attempt runs in a Linux container: Linux's rule; Windows'
+# is the agent's own, internal/processidentity)
 
 
 @pytest.mark.parametrize("case", cases("identity.json", "linux"))
 def test_linux_process_identity(case):
     assert process_identity_from_proc_stat(case["pid"], case["stat"]) == case["expect"]
-
-
-@pytest.mark.parametrize("case", cases("identity.json", "windows"))
-def test_windows_process_identity(case):
-    assert process_identity_from_filetime(case["pid"], case["creation_filetime"]) == case["expect"]
 
 
 # --------------------------------------------------------------------------

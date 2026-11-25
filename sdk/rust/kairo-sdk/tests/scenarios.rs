@@ -2,6 +2,9 @@
 //! session registers and heartbeats once, the safe point sends exactly the
 //! scripted requests, and closing sends a final heartbeat unless the attempt
 //! was retired or fenced.
+// the session registers this process's identity, read from /proc: an
+// attempt runs in a Linux container
+#![cfg(target_os = "linux")]
 
 mod common;
 
