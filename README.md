@@ -973,7 +973,8 @@ labels = { environment = "linux", site = "host-a" }
 
 - **Incus 6.3 以降**: OCI イメージ対応が必要です（Debian 13 の 6.0 LTS には対応がなく、Zabbly パッケージを利用する必要があります）。また、デフォルトプロファイルにストレージプールとネットワークが設定されている必要があります。
 - **GPU 利用時**: ノード上に `nvidia-container-cli`（`libnvidia-container-tools`）とドライバのユーザー空間ファイルが必要です。
-- **コンテナの権限**: ホスト上では、コンテナは非特権です（コンテナの root はホストの `/etc/subuid` の範囲の ID）。Kairo が渡す領域（実行ディレクトリ、作業領域、データ、Kairo のバイナリ、GPU のドライバ）は ID をずらしてマウントします（idmapped mount、Incus のディスクデバイスの `shift`）。コンテナの root は、それらをホストの root として読み書きします。エージェント自身が非特権の LXC の中で動いているとき（入れ子）は、LXC には UID マップが 1 つしかないため、コンテナを特権にします（`security.privileged`。物理ホストから見れば非特権のままです）。
+- **コンテナの権限**: ホスト上では、コンテナは非特権です。コンテナの root は、root の `/etc/subuid` の範囲の先頭の ID（既定は 100000）で、Proxmox のコンテナ（pct）と同じです。コンテナが書き込む領域は、起動の前に、その ID の所有にします（pct のランナーと同じです）。そのため、pct と Incus のどちらが書いたものも、もう一方が書き直せます。読み取り専用で渡すもの（データ、Kairo のバイナリ、GPU のドライバ）は、所有者を変えずに渡します。エージェント自身が非特権の LXC の中で動いているとき（入れ子）は、LXC には UID マップが 1 つしかないため、コンテナを特権にします（`security.privileged`。物理ホストから見れば非特権のままです）。
+- **AppArmor（Proxmox のホスト）**: Incus が作る AppArmor のプロファイルは ABI を宣言しません。Debian の既定の ABI のままだと、Proxmox のカーネル（7.0）はコンテナの中での UNIX ソケットの作成を拒否します（`failed protocol match`）。`/etc/apparmor/parser.conf` の `policy-features` を、Proxmox の LXC が使う `/etc/apparmor.d/abi/lxc` にします。
 
 Proxmox VE のホストに直接入れる場合の手順です（Debian 13）。VM のための依存を入れないよう、コンテナだけの `incus-base` を使います。
 

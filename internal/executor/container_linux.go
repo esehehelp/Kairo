@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -146,19 +147,17 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 	if err != nil {
 		return shimNotStarted, err
 	}
-	// On a host the container is unprivileged, and what Kairo hands it is
-	// shifted into its ids (an idmapped mount): its root reads and writes
-	// them as the host's root. Nested in an unprivileged container (a
-	// Proxmox LXC) it cannot have a uid map of its own and is privileged
-	// instead: the outer container's root, unprivileged on the host.
+	// On a host the container is unprivileged: its root is the first of
+	// root's subordinate ids, as a Proxmox container's (pct), and what it
+	// writes to is handed to that id before it starts, as pct's runner
+	// does, so that what either wrote the other can write again. Nested in
+	// an unprivileged container (a Proxmox LXC) it cannot have a uid map of
+	// its own and is privileged instead: the outer container's root,
+	// unprivileged on the host.
 	nested := inUserNamespace()
 	devices := map[string]map[string]string{}
 	for i, m := range spec.Mounts {
-		d := map[string]string{"type": "disk", "source": m.Source, "path": m.Path, "readonly": strconv.FormatBool(m.ReadOnly)}
-		if !nested {
-			d["shift"] = "true"
-		}
-		devices[fmt.Sprintf("kairo-%d", i)] = d
+		devices[fmt.Sprintf("kairo-%d", i)] = map[string]string{"type": "disk", "source": m.Source, "path": m.Path, "readonly": strconv.FormatBool(m.ReadOnly)}
 	}
 	if len(spec.GPUs) > 0 {
 		gpus, driver, err := gpuDevices(spec.GPUs, spec.DriverRoot)
@@ -169,9 +168,6 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 			devices[name] = d
 		}
 		devices["kairo-nvidia"] = map[string]string{"type": "disk", "source": driver, "path": containerNVIDIA, "readonly": "true"}
-		if !nested {
-			devices["kairo-nvidia"]["shift"] = "true"
-		}
 	}
 	body, err := json.Marshal(map[string]any{
 		"config": map[string]string{
@@ -193,6 +189,19 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 		return shimNotStarted, err
 	}
 	made()
+	if !nested {
+		root, err := instanceRootID(ctx, spec.Instance)
+		if err != nil {
+			return shimNotStarted, err
+		}
+		for _, m := range spec.Mounts {
+			if !m.ReadOnly {
+				if err := chownTree(m.Source, root); err != nil {
+					return shimNotStarted, fmt.Errorf("hand %s to the container: %w", m.Source, err)
+				}
+			}
+		}
+	}
 	if _, err := incusCommand(ctx, nil, "start", spec.Instance); err != nil {
 		return shimNotStarted, err
 	}
@@ -217,6 +226,50 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 		return -1, nil
 	}
 	return code, nil
+}
+
+// instanceRootID is the host id of an unprivileged instance's root, from
+// the uid map Incus gives it when it starts.
+func instanceRootID(ctx context.Context, instance string) (int, error) {
+	out, err := incusCommand(ctx, nil, "query", "/1.0/instances/"+instance)
+	if err != nil {
+		return 0, err
+	}
+	var inst struct {
+		Config map[string]string `json:"config"`
+	}
+	if err := json.Unmarshal(out, &inst); err != nil {
+		return 0, err
+	}
+	var idmap []struct {
+		Isuid  bool  `json:"Isuid"`
+		Hostid int   `json:"Hostid"`
+		Nsid   int   `json:"Nsid"`
+		Range  int64 `json:"Maprange"`
+	}
+	if err := json.Unmarshal([]byte(inst.Config["volatile.idmap.next"]), &idmap); err != nil {
+		return 0, fmt.Errorf("instance %s: uid map: %w", instance, err)
+	}
+	for _, m := range idmap {
+		if m.Isuid && m.Nsid == 0 && m.Range > 0 {
+			return m.Hostid, nil
+		}
+	}
+	return 0, fmt.Errorf("instance %s: no uid map of its root", instance)
+}
+
+// chownTree gives root (the directory and all under it, links not followed)
+// to uid, as the container's root; what is not there is no error.
+func chownTree(root string, uid int) error {
+	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		return os.Lchown(p, uid, uid)
+	})
 }
 
 // inUserNamespace reports whether this process runs in a user namespace
