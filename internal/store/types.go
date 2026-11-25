@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 
 	"kairo/internal/datainput"
+	"kairo/internal/orchestration"
 )
 
 type ScopePath struct {
@@ -117,6 +118,13 @@ type ExecutionSpec struct {
 	// else (the executor selector's "container", set from it). Left out of
 	// the digest when empty.
 	Image string `json:"image,omitempty"`
+	// Streams are the streams its attempts read, as its task declared them
+	// (streams.go, issue #43). Left out of the digest when empty.
+	Streams []orchestration.StreamDecl `json:"streams,omitempty"`
+	// InputCheckpointCommand: the command whose published checkpoint a
+	// continuation goes on from (its streams start where that checkpoint's
+	// payload says). Left out of the digest when empty.
+	InputCheckpointCommand string `json:"input_checkpoint_command,omitempty"`
 }
 
 // GangSpec describes a multi-node execution. Every rank asks for the

@@ -71,6 +71,9 @@ type Launch struct {
 	// Image: the container image the attempt runs in, pinned by digest
 	// (images.go); "" for one that runs on its executor's host.
 	Image string `json:"image,omitempty"`
+	// Streams: the streams the attempt reads, each made by a loader in its
+	// container (streams.go).
+	Streams []LaunchStream `json:"streams,omitempty"`
 }
 
 type gpuConstraints struct {
@@ -699,6 +702,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		if launch.Image, err = launchImageTx(ctx, tx, executionID); err != nil {
 			return nil, err
 		}
+		if launch.Streams, err = launchStreamsTx(ctx, tx, executionID); err != nil {
+			return nil, err
+		}
 		return launch, tx.Commit()
 	}
 	if leaseState != "prepared" || executionState != "waiting" {
@@ -771,6 +777,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err != nil {
 		return nil, err
 	}
+	streams, err := launchStreamsTx(ctx, tx, executionID)
+	if err != nil {
+		return nil, err
+	}
 	if err = tx.Commit(); err != nil {
 		return nil, err
 	}
@@ -797,6 +807,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		Store:                storeID.String,
 		Source:               source,
 		Image:                image,
+		Streams:              streams,
 	}
 	launch.Execution.State = "authorized"
 	launch.Execution.AuthorizedAt = &stamp

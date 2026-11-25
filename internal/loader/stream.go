@@ -2,6 +2,7 @@ package loader
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -17,6 +18,10 @@ type Spec struct {
 	ShuffleFiles bool         `json:"shuffle_files,omitempty"`
 	Epochs       int64        `json:"epochs"`
 	Stages       []Stage      `json:"stages,omitempty"`
+	// MemoryBytes is what the loader may hold (the stream's memory_bytes):
+	// a quarter of it, shared by the ranks, bounds what is made ahead for
+	// them (0: 64 MiB a rank).
+	MemoryBytes int64 `json:"memory_bytes,omitempty"`
 }
 
 // maxBlock bounds the records shuffled together (each kept in memory).
@@ -31,6 +36,13 @@ func (s Spec) check() error {
 	}
 	if s.Epochs < 0 {
 		return fmt.Errorf("epochs %d: 0 (no end) or more", s.Epochs)
+	}
+	for _, src := range s.Sources {
+		for _, f := range src.Files {
+			if why := f.AsPublished(); f.Identified() && why != "" {
+				return fmt.Errorf("%w: %s", ErrChanged, why)
+			}
+		}
 	}
 	for i, st := range s.Stages {
 		if len(st.Argv) == 0 {
@@ -54,7 +66,7 @@ type inputs struct {
 	ended   bool
 }
 
-func newInputs(spec Spec, fetch *Fetcher, learned func(int, string, int64)) (*inputs, error) {
+func newInputs(spec Spec, fetch *Fetcher, learned func(int, File, int64), identified func(int, File)) (*inputs, error) {
 	weights := make([]int, len(spec.Sources))
 	in := &inputs{epochs: spec.Epochs}
 	for i, src := range spec.Sources {
@@ -62,7 +74,7 @@ func newInputs(spec Spec, fetch *Fetcher, learned func(int, string, int64)) (*in
 		if weights[i] == 0 && len(spec.Sources) == 1 {
 			weights[i] = 1
 		}
-		s, err := newSourceStream(src, i, fetch, spec.ShuffleFiles, spec.Seed, learned)
+		s, err := newSourceStream(src, i, fetch, spec.ShuffleFiles, spec.Seed, learned, identified)
 		if err != nil {
 			in.Close()
 			return nil, err
@@ -75,6 +87,9 @@ func newInputs(spec Spec, fetch *Fetcher, learned func(int, string, int64)) (*in
 		return nil, err
 	}
 	in.mix = mix
+	if spec.Epochs > 0 {
+		in.sources[0].endEpoch = spec.Epochs
+	}
 	return in, nil
 }
 
@@ -101,13 +116,13 @@ func (in *inputs) next(ctx context.Context) ([]byte, bool, error) {
 		return nil, false, nil
 	}
 	s := in.mix.source(in.n)
-	rec, epoch, err := in.sources[s].next(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	if s == 0 && in.epochs > 0 && epoch >= in.epochs {
+	rec, _, err := in.sources[s].next(ctx)
+	if errors.Is(err, errSourceEnded) {
 		in.ended = true
 		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
 	}
 	in.n++
 	return rec, true, nil
@@ -146,7 +161,7 @@ func (o *orderer) seek(ctx context.Context, g int64) error {
 	}
 	o.t, o.g = int(g%o.block), g
 	if o.t > len(o.recs) {
-		o.t = len(o.recs)
+		return fmt.Errorf("output %d is past the stream's end (%d)", g, o.j*o.block+int64(len(o.recs)))
 	}
 	return nil
 }

@@ -57,7 +57,15 @@ func readProjectSpec(path string) (orchestration.Validated, error) {
 	if err != nil {
 		return orchestration.Validated{}, err
 	}
-	return orchestration.Parse(source)
+	manifest, err := orchestration.Decode(source)
+	if err != nil {
+		return orchestration.Validated{}, err
+	}
+	// the files of each Hugging Face raw at its commit (raw_listing.go)
+	if err := resolveRawListings(&manifest); err != nil {
+		return orchestration.Validated{}, err
+	}
+	return orchestration.Normalize(manifest)
 }
 
 // shortDigest is the first 12 hex digits of a digest.

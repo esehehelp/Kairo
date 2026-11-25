@@ -216,6 +216,7 @@ func (e *Local) tick(ctx context.Context) error {
 	e.endStep()
 	e.beginStep("stores")
 	e.storeWork().refreshStores(ctx)
+	e.storeWork().keepRawCaches()
 	e.storeWork().reportStores()
 	e.storeWork().settleScratch()
 	e.storeWork().makePacks()
@@ -581,7 +582,7 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 				allAbsent = false
 				continue
 			}
-			if err := e.Store.MarkAttemptProcessExited(ctx, candidate.Attempt.ID, process.Role, process.Rank, process.ProcessIdentity); err != nil && err != store.ErrNotFound {
+			if err := e.Store.MarkAttemptProcessExited(ctx, candidate.Attempt.ID, process.Role, process.Rank, process.ProcessIdentity); err != nil && !errors.Is(err, store.ErrNotFound) {
 				return err
 			}
 		}

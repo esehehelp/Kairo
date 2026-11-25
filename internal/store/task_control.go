@@ -255,6 +255,10 @@ func (s *Store) RerunTaskWith(ctx context.Context, project, name, actor, request
 	if err = json.Unmarshal([]byte(templateBody), &template); err != nil {
 		return RerunResult{}, err
 	}
+	// a stream goes on from a checkpoint only with the code that made it
+	if len(template.StreamDecls) > 0 && strings.TrimSpace(opts.FromCheckpoint) != "" && strings.TrimSpace(opts.Source) != "" {
+		return RerunResult{}, taskConflict{fmt.Sprintf("task %s reads streams: from a checkpoint, it goes on in the snapshot that made the checkpoint (its stages are part of where its streams stand), not in another", name)}
+	}
 	snapshot, err := rerunSnapshotTx(ctx, tx, task, template, strings.TrimSpace(opts.Source))
 	if err != nil {
 		return RerunResult{}, err

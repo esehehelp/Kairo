@@ -67,9 +67,17 @@ func permutation(n int, seed uint64) []int {
 	return p
 }
 
+// OrderVersion is the version of the order this package makes (every step
+// of it: files, records, mix, blocks, ranks): a checkpoint's positions say
+// which they are of, and a stream goes on only from positions of its own.
+const OrderVersion = 1
+
 // maxMixPeriod bounds the sum of a mix's weights: one period of its pattern
 // is kept.
 const maxMixPeriod = 1 << 16
+
+// maxMixTable bounds the counts a mixer keeps (8 bytes each): 8 MiB.
+const maxMixTable = 1 << 20
 
 // mixer interleaves sources by weight: a smooth weighted round robin (the
 // source whose credit is greatest goes next, the lowest index on a tie),
@@ -87,13 +95,16 @@ func newMixer(weights []int) (*mixer, error) {
 	}
 	total := 0
 	for i, w := range weights {
-		if w < 1 {
+		if w < 1 || w > maxMixPeriod {
 			return nil, fmt.Errorf("source %d has weight %d: weights are whole numbers from 1", i, w)
 		}
 		total += w
 	}
 	if total > maxMixPeriod {
 		return nil, fmt.Errorf("the weights add up to %d, more than %d", total, maxMixPeriod)
+	}
+	if total*len(weights) > maxMixTable {
+		return nil, fmt.Errorf("%d sources whose weights add up to %d: more than %d counts to keep (smaller weights, or fewer sources)", len(weights), total, maxMixTable)
 	}
 	m := &mixer{pattern: make([]int, total), counts: make([][]int64, total+1), weights: make([]int64, len(weights))}
 	credit := make([]int, len(weights))

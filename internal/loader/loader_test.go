@@ -334,9 +334,11 @@ func TestAStreamIsTheSameFromAnyPosition(t *testing.T) {
 		known.Sources[s].Records = map[string]int64{}
 		for i, f := range known.Sources[s].Files {
 			if s == 0 {
-				known.Sources[s].Records[f.SHA256] = int64(5 + i*3)
+				key, _ := RecordsKey(f.SHA256, known.Sources[s].Format, known.Sources[s].Field, f.Name)
+				known.Sources[s].Records[key] = int64(5 + i*3)
 			} else {
-				known.Sources[s].Records[f.SHA256] = 4
+				key, _ := RecordsKey(f.SHA256, known.Sources[s].Format, known.Sources[s].Field, f.Name)
+				known.Sources[s].Records[key] = 4
 			}
 		}
 	}
@@ -479,7 +481,7 @@ func TestATakerComesBackWhereItStands(t *testing.T) {
 		t.Fatal(err)
 	}
 	go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}, World: 1}).Serve(ctx, ln)
-	take := func(at *Position, n int) ([]string, Position) {
+	take := func(at *Resume, n int) ([]string, Resume) {
 		c, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, at)
 		if err != nil {
 			t.Fatal(err)
@@ -494,17 +496,21 @@ func TestATakerComesBackWhereItStands(t *testing.T) {
 			}
 			got = append(got, fmt.Sprintf("%d.%d:%s", c.Position.Record, c.Position.Sub, item))
 		}
-		return got, c.Position
+		return got, *c.Resume()
 	}
 	first, at := take(nil, 10)
 	second, at2 := take(&at, 10)
 	if !reflect.DeepEqual(append(first, second...), full[:20]) {
 		t.Fatalf("taken in two %v %v\nwant %v", first, second, full[:20])
 	}
-	back := Position{Record: 5}
+	back := Resume{Session: at.Session, Position: Position{Record: 5}}
 	third, _ := take(&back, 5)
-	if !reflect.DeepEqual(third, full[5:10]) || at2.Record != 20 {
+	if !reflect.DeepEqual(third, full[5:10]) || at2.Position.Record != 20 {
 		t.Fatalf("back at 5: %v want %v", third, full[5:10])
+	}
+	// a first hello does not say where it starts
+	if _, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, &Resume{Position: Position{Record: 5}}); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("a position without the session: %v", err)
 	}
 }
 
@@ -513,3 +519,326 @@ var goldenPermutation = []int{8, 3, 6, 5, 4, 0, 9, 2, 1, 7}
 
 func bufioReader(r io.Reader) *bufio.Reader { return bufio.NewReaderSize(r, 1<<16) }
 func bufioWriter(w io.Writer) *bufio.Writer { return bufio.NewWriterSize(w, 1<<16) }
+
+// A file never read before is read from its start, its identity made as
+// it is read (the same as Identify makes) and heard once it was read to its
+// end; one whose published sha256 is not what was read fails at its end.
+func TestAFileIsIdentifiedTheFirstTimeItIsRead(t *testing.T) {
+	spec, dir := testData(t)
+	want := map[string]File{}
+	for s := range spec.Sources {
+		for i, f := range spec.Sources[s].Files {
+			id, _ := Identify(bytes.NewReader(mustRead(t, filepath.Join(dir, filepath.FromSlash(f.Name)))), f.Name, DefaultChunkBytes)
+			want[f.Name] = id
+			spec.Sources[s].Files[i] = File{Name: f.Name}
+		}
+	}
+	full := collect(t, spec, dir, 1, nil)
+	var mu sync.Mutex
+	got := map[string]File{}
+	l := &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}, Identified: func(_ int, f File) {
+		mu.Lock()
+		got[f.Name] = f
+		mu.Unlock()
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	go (&Server{Loader: l, World: 1}).Serve(ctx, ln)
+	c, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var items []string
+	for {
+		item, err := c.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		items = append(items, fmt.Sprintf("%d.%d:%s", c.Position.Record, c.Position.Sub, item))
+	}
+	c.Close()
+	if !reflect.DeepEqual(items, full[0]) {
+		t.Fatal("read unidentified, another order")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != len(want) {
+		t.Fatalf("identified %d of %d files", len(got), len(want))
+	}
+	for name, w := range want {
+		if g := got[name]; g.SHA256 != w.SHA256 || g.Size != w.Size || !reflect.DeepEqual(g.Chunks, w.Chunks) {
+			t.Fatalf("%s identified as %+v, want %+v", name, g, w)
+		}
+	}
+	// a published sha256 that is not what is there
+	x := &Fetcher{Origin: DirOrigin{dir}}
+	r, err := x.Open(context.Background(), File{Name: "b-0.txt", SHA256: strings.Repeat("0", 64)}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, err := io.ReadAll(r); !errors.Is(err, ErrChanged) {
+		t.Fatalf("a published sha256 not matching: %v", err)
+	}
+}
+
+func mustRead(t *testing.T, p string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// countingOrigin counts the files opened.
+type countingOrigin struct {
+	DirOrigin
+	mu     sync.Mutex
+	opened map[string]int
+}
+
+func (o *countingOrigin) ReadFrom(ctx context.Context, f File, offset int64) (io.ReadCloser, error) {
+	o.mu.Lock()
+	o.opened[f.Name]++
+	o.mu.Unlock()
+	return o.DirOrigin.ReadFrom(ctx, f, offset)
+}
+
+// A stream of one epoch ends at its last record, opening nothing of a next
+// epoch; a rank coming back after the end is told the end again.
+func TestAStreamEndsAtItsLastEpochAndSaysSoAgain(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Sources = spec.Sources[:1]
+	spec.Epochs = 1
+	origin := &countingOrigin{DirOrigin: DirOrigin{dir}, opened: map[string]int{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: origin}}, World: 1}).Serve(ctx, ln)
+	c, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for {
+		if _, err := c.Next(); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		n++
+	}
+	at := c.Resume()
+	c.Close()
+	if n != 38 {
+		t.Fatalf("%d records of one epoch, want 38", n)
+	}
+	origin.mu.Lock()
+	for name, times := range origin.opened {
+		if times != 1 {
+			t.Fatalf("%s opened %d times: %v", name, times, origin.opened)
+		}
+	}
+	origin.mu.Unlock()
+	again, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer again.Close()
+	if _, err := again.Next(); err != io.EOF {
+		t.Fatalf("after the end, again: %v", err)
+	}
+}
+
+// An identified file whose length changed (longer or shorter) is changed;
+// a JSON null is not a string field.
+func TestALengthChangeIsAChangeAndNullIsNoString(t *testing.T) {
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte("abc"), 100)
+	p := filepath.Join(dir, "f")
+	os.WriteFile(p, data, 0o644)
+	f, _ := Identify(bytes.NewReader(data), "f", 128)
+	for _, changed := range [][]byte{append(append([]byte(nil), data...), 'x'), data[:250]} {
+		os.WriteFile(p, changed, 0o644)
+		r, err := (&Fetcher{Origin: DirOrigin{dir}, Retry: time.Millisecond}).Open(context.Background(), f, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = io.ReadAll(r)
+		r.Close()
+		if !errors.Is(err, ErrChanged) {
+			t.Fatalf("%d bytes for %d identified: %v", len(changed), len(data), err)
+		}
+	}
+	fm, _ := parseFormat("jsonl", "text")
+	rr, closeFn, _ := newRecordReader(bytes.NewReader([]byte(`{"text":null}`+"\n")), "x.jsonl", fm)
+	defer closeFn()
+	if _, err := rr.next(); err == nil {
+		t.Fatal("a null field taken as a string")
+	}
+}
+
+// A stream started from a checkpoint does not go back behind it, nor take
+// a position past its end for one.
+func TestPositionsBehindTheStartOrPastTheEndAreRefused(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Sources = spec.Sources[:1]
+	spec.Epochs = 1 // 38 records
+	serve := func(positions []Position) (context.CancelFunc, string) {
+		ctx, cancel := context.WithCancel(context.Background())
+		ln, _ := net.Listen("tcp", "127.0.0.1:0")
+		go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}, Positions: positions, World: 1}).Serve(ctx, ln)
+		return cancel, ln.Addr().String()
+	}
+	cancel, addr := serve([]Position{{Record: 40}})
+	c, err := Dial(context.Background(), "tcp", addr, 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Next(); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("past the end: %v", err)
+	}
+	c.Close()
+	cancel()
+	cancel, addr = serve([]Position{{Record: 10}})
+	defer cancel()
+	c, err = Dial(context.Background(), "tcp", addr, 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Position.Record != 10 {
+		t.Fatalf("started at %+v", c.Position)
+	}
+	if _, err := c.Next(); err != nil {
+		t.Fatal(err)
+	}
+	session := c.Session
+	c.Close()
+	if _, err := Dial(context.Background(), "tcp", addr, 0, 1, &Resume{Session: session, Position: Position{Record: 5}}); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("behind the start: %v", err)
+	}
+	// past the end, a primary source of known counts: refused at its seek
+	cancel2, addr2 := serve([]Position{{Record: 39}})
+	defer cancel2()
+	c, err = Dial(context.Background(), "tcp", addr2, 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Next(); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("past the end at 39 of 38: %v", err)
+	}
+}
+
+// A rank taken before comes back only with its position; a rank away does
+// not hold the others up: its items are made again when it comes back.
+func TestARankAwayHoldsNoOneUp(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Sources = spec.Sources[:1]
+	spec.Epochs = 300 // 38 records each: 5700 per rank, past a rank's queue
+	want := collect(t, spec, dir, 2, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}, World: 2}).Serve(ctx, ln)
+	takeAll := func(c *Client) []string {
+		var got []string
+		for {
+			item, err := c.Next()
+			if err == io.EOF {
+				return got
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, fmt.Sprintf("%d.%d:%s", c.Position.Record, c.Position.Sub, item))
+		}
+	}
+	c0, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := c0.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resume := c0.Resume()
+	c0.Close()
+	// taken before: not without its position
+	if _, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 2, nil); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("rank 0 again without its position: %v", err)
+	}
+	c0, err = Dial(ctx, "tcp", ln.Addr().String(), 0, 2, resume)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got0 := append([]string{fmt.Sprintf("%d.%d:%s", resume.Position.Record, resume.Position.Sub, first)}, takeAll(c0)...) // rank 1 never came
+	c0.Close()
+	c1, err := Dial(ctx, "tcp", ln.Addr().String(), 1, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got1 := takeAll(c1)
+	c1.Close()
+	if !reflect.DeepEqual(got0, want[0]) || !reflect.DeepEqual(got1, want[1]) {
+		t.Fatalf("rank 0 %d items (want %d), rank 1 %d (want %d)", len(got0), len(want[0]), len(got1), len(want[1]))
+	}
+}
+
+// A rank served comes back only with its position, also to a loader started
+// again (StateDir); a rank never served joins as at the start; a position
+// is its own rank's.
+func TestServedRanksAreKeptAcrossALoadersRestart(t *testing.T) {
+	spec, dir := testData(t)
+	state := t.TempDir()
+	serve := func() (context.CancelFunc, string) {
+		ctx, cancel := context.WithCancel(context.Background())
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// no world given: the first hello's, then the one kept
+		go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}, StateDir: state}, Session: "s"}).Serve(ctx, ln)
+		return cancel, ln.Addr().String()
+	}
+	cancel, addr := serve()
+	c, err := Dial(context.Background(), "tcp", addr, 0, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Next(); err != nil {
+		t.Fatal(err)
+	}
+	resume := c.Resume()
+	c.Close()
+	cancel()
+	cancel, addr = serve() // started again
+	defer cancel()
+	if _, err := Dial(context.Background(), "tcp", addr, 0, 1, nil); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("one rank of a stream started for two: %v", err)
+	}
+	if _, err := Dial(context.Background(), "tcp", addr, 0, 2, nil); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("served rank 0 without its position, the loader started again: %v", err)
+	}
+	if _, err := Dial(context.Background(), "tcp", addr, 1, 2, resume); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("rank 1 with rank 0's position: %v", err)
+	}
+	c, err = Dial(context.Background(), "tcp", addr, 0, 2, resume)
+	if err != nil || c.Position != resume.Position {
+		t.Fatalf("rank 0 with its position: %+v %v", c, err)
+	}
+	c.Close()
+	c1, err := Dial(context.Background(), "tcp", addr, 1, 2, nil)
+	if err != nil {
+		t.Fatalf("rank 1, never served: %v", err)
+	}
+	c1.Close()
+}

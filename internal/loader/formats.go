@@ -65,6 +65,49 @@ func parseFormat(s, field string) (format, error) {
 	return f, nil
 }
 
+// CountKey is what a file's record count is kept under: its framing, the
+// compression it is read with (the format's, else its name's) and the field.
+func CountKey(format, field, fileName string) (string, error) {
+	f, err := parseFormat(format, field)
+	if err != nil {
+		return "", err
+	}
+	return f.framing + "|" + f.compressionOf(fileName) + "|" + field, nil
+}
+
+// CountRecords is how many records r (a file named name, its bytes as
+// stored) holds read as format and field say.
+func CountRecords(r io.Reader, name, format, field string) (int64, error) {
+	f, err := parseFormat(format, field)
+	if err != nil {
+		return 0, err
+	}
+	records, closeFn, err := newRecordReader(r, name, f)
+	if err != nil {
+		return 0, err
+	}
+	defer closeFn()
+	var n int64
+	for {
+		if _, err := records.next(); err == io.EOF {
+			return n, nil
+		} else if err != nil {
+			return n, err
+		}
+		n++
+	}
+}
+
+// RecordsKey is what a SourceSpec's Records keeps a file's count under: its
+// sha256 and the CountKey of how the source reads it.
+func RecordsKey(sha256, format, field, fileName string) (string, error) {
+	key, err := CountKey(format, field, fileName)
+	if err != nil {
+		return "", err
+	}
+	return sha256 + "|" + key, nil
+}
+
 // compressionOf is the compression of a file of this format named name.
 func (f format) compressionOf(name string) string {
 	if f.compression != "" {
@@ -171,7 +214,11 @@ func (j *jsonlReader) next() ([]byte, error) {
 	raw, ok := object[j.field]
 	var value string
 	if ok {
-		err = json.Unmarshal(raw, &value)
+		if raw = bytes.TrimSpace(raw); len(raw) == 0 || raw[0] != '"' {
+			ok = false
+		} else {
+			err = json.Unmarshal(raw, &value)
+		}
 	}
 	if !ok || err != nil {
 		return nil, fmt.Errorf("%s line %d: no string field %q", j.lines.name, j.lines.line, j.field)

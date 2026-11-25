@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -27,6 +28,24 @@ type File struct {
 	SHA256     string   `json:"sha256"`
 	ChunkBytes int64    `json:"chunk_bytes"`
 	Chunks     []string `json:"chunks"`
+	// PublishedSHA256 and PublishedSize are what the file was declared
+	// with (a Hugging Face listing's sha256 and size; PublishedSize nil when
+	// none was), kept beside its identity: a file whose identity is not
+	// what was published is changed.
+	PublishedSHA256 string `json:"published_sha256,omitempty"`
+	PublishedSize   *int64 `json:"published_size,omitempty"`
+}
+
+// AsPublished reports why f's identity is not what was published of it
+// ("" when it is, or nothing was).
+func (f File) AsPublished() string {
+	switch {
+	case f.PublishedSHA256 != "" && f.PublishedSHA256 != f.SHA256:
+		return fmt.Sprintf("%s has sha256 %s, published as %s", f.Name, f.SHA256, f.PublishedSHA256)
+	case f.PublishedSize != nil && *f.PublishedSize != f.Size:
+		return fmt.Sprintf("%s has %d bytes, published as %d", f.Name, f.Size, *f.PublishedSize)
+	}
+	return ""
 }
 
 // DefaultChunkBytes is the chunk a file is checked by.
@@ -49,6 +68,9 @@ func (f File) check() error {
 	}
 	return nil
 }
+
+// Identified reports whether f has its identity (each chunk's sha256).
+func (f File) Identified() bool { return f.ChunkBytes > 0 }
 
 // chunkSize is the size of chunk i of f.
 func (f File) chunkSize(i int) int64 {
@@ -81,10 +103,41 @@ type Fetcher struct {
 	// Problem, when set, hears each failure and, with a nil error, that the
 	// file is being read again.
 	Problem func(f File, err error)
+	// GiveUp, when set, ends retrying after that long of failures in a row,
+	// with the last failure (0: retried until the context ends).
+	GiveUp time.Duration
+	// reask asks Resolve again (set on a fetcher Resolve made): where to
+	// read a file may have changed (kept on the node since)
+	reask func(ctx context.Context) (File, Origin, error)
+	// Resolve, when set, is asked for each file before it is read: the file
+	// as identified and where to read it from (the node's raw cache,
+	// agent.go). A file is then never read unidentified.
+	Resolve func(ctx context.Context, f File) (File, Origin, error)
 }
 
-// Open reads f from chunk on.
+// Open reads f from chunk on. A file never read before (no chunk hashes:
+// Identified) is read from its start, its identity made as it is read; its
+// sha256 and size, when published, are checked at its end.
 func (x *Fetcher) Open(ctx context.Context, f File, chunk int) (io.ReadCloser, error) {
+	if x.Resolve != nil {
+		resolved, origin, err := x.Resolve(ctx, f)
+		if err != nil {
+			return nil, err
+		}
+		if !resolved.Identified() {
+			return nil, fmt.Errorf("file %s was resolved without its identity", f.Name)
+		}
+		via := *x
+		via.Resolve, via.Origin = nil, origin
+		via.reask = func(ctx context.Context) (File, Origin, error) { return x.Resolve(ctx, f) }
+		return via.Open(ctx, resolved, chunk)
+	}
+	if !f.Identified() {
+		if f.Name == "" || chunk != 0 || f.SHA256 != "" && !hexSHA256.MatchString(f.SHA256) {
+			return nil, fmt.Errorf("file %q, not identified yet, is read from its start", f.Name)
+		}
+		return &identifyingReader{ctx: ctx, x: x, f: f, whole: sha256.New(), chunk: sha256.New()}, nil
+	}
 	if err := f.check(); err != nil {
 		return nil, err
 	}
@@ -131,11 +184,16 @@ func (c *checkedReader) fill() error {
 		maxPause = 5 * time.Minute
 	}
 	failed := false
+	var failingSince time.Time
 	for {
 		data, err := c.readChunk()
+		if errors.Is(err, errLength) {
+			// shorter or longer than identified: as bytes not matching
+			data, err = nil, nil
+		}
 		if err == nil {
 			sum := sha256.Sum256(data)
-			if hex.EncodeToString(sum[:]) == c.f.Chunks[c.chunk] {
+			if data != nil && hex.EncodeToString(sum[:]) == c.f.Chunks[c.chunk] && (c.chunk+1 < len(c.f.Chunks) || c.atEnd()) {
 				if failed && c.x.Problem != nil {
 					c.x.Problem(c.f, nil)
 				}
@@ -144,15 +202,29 @@ func (c *checkedReader) fill() error {
 			}
 			c.closeBody()
 			if c.mismatch == c.chunk+1 {
-				return fmt.Errorf("%w: %s chunk %d from %s is not what was identified", ErrChanged, c.f.Name, c.chunk, c.x.Origin)
+				return fmt.Errorf("%w: %s chunk %d from %s is not what was identified (its bytes or the file's length)", ErrChanged, c.f.Name, c.chunk, c.x.Origin)
 			}
 			c.mismatch = c.chunk + 1
 			err = fmt.Errorf("%s chunk %d from %s does not match its sha256: reading it again", c.f.Name, c.chunk, c.x.Origin)
 		}
 		c.closeBody()
+		if !failed {
+			failingSince = time.Now()
+		}
 		failed = true
 		if c.x.Problem != nil {
 			c.x.Problem(c.f, err)
+		}
+		if c.x.GiveUp > 0 && time.Since(failingSince) > c.x.GiveUp {
+			return err
+		}
+		if c.x.reask != nil && time.Since(failingSince) > reaskAfter {
+			// no progress from here: asked again where to read it
+			if again, origin, rerr := c.x.reask(c.ctx); rerr == nil && again.SHA256 == c.f.SHA256 && again.Size == c.f.Size && equalChunks(again.Chunks, c.f.Chunks) {
+				via := *c.x
+				via.Origin = origin
+				c.x, failingSince = &via, time.Now()
+			}
 		}
 		select {
 		case <-c.ctx.Done():
@@ -165,22 +237,54 @@ func (c *checkedReader) fill() error {
 	}
 }
 
+// reaskAfter is how long a file read from somewhere makes no progress
+// before the fetcher's Resolve is asked again where to read it.
+const reaskAfter = 3 * time.Minute
+
+func equalChunks(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // readChunk reads the next chunk's bytes from the origin, opening it there
 // when no body is open.
 func (c *checkedReader) readChunk() ([]byte, error) {
 	if c.body == nil {
 		body, err := c.x.Origin.ReadFrom(c.ctx, c.f, int64(c.chunk)*c.f.ChunkBytes)
 		if err != nil {
-			return nil, err
+			return nil, err // errLength among them
 		}
 		c.body = body
 	}
 	data := make([]byte, c.f.chunkSize(c.chunk))
 	if _, err := io.ReadFull(c.body, data); err != nil {
+		if errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("%w: %s ends before its chunk %d", errLength, c.f.Name, c.chunk)
+		}
 		return nil, fmt.Errorf("%s chunk %d from %s: %w", c.f.Name, c.chunk, c.x.Origin, err)
 	}
 	return data, nil
 }
+
+// atEnd reports whether the body has nothing past the file's last chunk.
+func (c *checkedReader) atEnd() bool {
+	var one [1]byte
+	n, err := c.body.Read(one[:])
+	for n == 0 && err == nil {
+		n, err = c.body.Read(one[:])
+	}
+	return n == 0
+}
+
+// errLength: what was read is not as long as the file was identified.
+var errLength = errors.New("length not as identified")
 
 func (c *checkedReader) closeBody() {
 	if c.body != nil {
@@ -189,8 +293,185 @@ func (c *checkedReader) closeBody() {
 	}
 }
 
+// Identity is the file as identified (what was checked).
+func (c *checkedReader) Identity() (File, bool) { return c.f, true }
+
 func (c *checkedReader) Close() error {
 	c.closeBody()
+	return nil
+}
+
+// identifyingReader reads a file the first time, making its identity: the
+// sha256 of the whole and of each DefaultChunkBytes. Its bytes are not
+// checked as they are given (there is nothing yet to check them against),
+// only at the end against a published sha256 and size.
+type identifyingReader struct {
+	ctx      context.Context
+	x        *Fetcher
+	f        File
+	body     io.ReadCloser
+	offset   int64
+	whole    hash.Hash
+	chunk    hash.Hash
+	inChunk  int64
+	chunks   []string
+	identity *File
+	broken   error
+	// failingSince is when reading last stopped making progress (zero:
+	// it makes progress)
+	failingSince time.Time
+}
+
+func (r *identifyingReader) Read(p []byte) (int, error) {
+	pause := r.x.Retry
+	if pause <= 0 {
+		pause = time.Second
+	}
+	maxPause := r.x.MaxRetry
+	if maxPause <= 0 {
+		maxPause = 5 * time.Minute
+	}
+	failed := false
+	for {
+		if r.identity != nil {
+			return 0, io.EOF
+		}
+		if r.broken != nil {
+			return 0, r.broken
+		}
+		if r.body == nil {
+			body, err := r.x.Origin.ReadFrom(r.ctx, r.f, r.offset)
+			if err == nil {
+				r.body = body
+				if failed && r.x.Problem != nil {
+					r.x.Problem(r.f, nil)
+				}
+				failed = false
+				continue
+			}
+			failed = true
+			if r.x.Problem != nil {
+				r.x.Problem(r.f, err)
+			}
+			if r.givingUp() {
+				return 0, err
+			}
+			select {
+			case <-r.ctx.Done():
+				return 0, r.ctx.Err()
+			case <-time.After(pause):
+			}
+			if pause *= 2; pause > maxPause {
+				pause = maxPause
+			}
+			continue
+		}
+		n, err := r.body.Read(p)
+		r.take(p[:n])
+		if n > 0 {
+			r.failingSince = time.Time{}
+		}
+		if err == io.EOF {
+			return n, r.finish()
+		}
+		if err != nil {
+			r.body.Close()
+			r.body = nil
+			if r.x.Problem != nil {
+				r.x.Problem(r.f, err)
+			}
+			if r.offset > 0 {
+				// another response from here may be of another version of
+				// the file: what is identified is read in one piece
+				r.broken = fmt.Errorf("%s broke off at byte %d the first time it was read (it is read again from its start): %w", r.f.URL, r.offset, err)
+				return n, nil
+			}
+			failed = true
+			if n > 0 {
+				return n, nil
+			}
+			if r.givingUp() {
+				return 0, err
+			}
+			select {
+			case <-r.ctx.Done():
+				return 0, r.ctx.Err()
+			case <-time.After(pause):
+			}
+			if pause *= 2; pause > maxPause {
+				pause = maxPause
+			}
+			continue
+		}
+		return n, nil
+	}
+}
+
+// givingUp: reading made no progress for the fetcher's GiveUp (a failing
+// stretch starts now when none is on).
+func (r *identifyingReader) givingUp() bool {
+	if r.failingSince.IsZero() {
+		r.failingSince = time.Now()
+	}
+	return r.x.GiveUp > 0 && time.Since(r.failingSince) > r.x.GiveUp
+}
+
+// take hashes what was read.
+func (r *identifyingReader) take(b []byte) {
+	r.whole.Write(b)
+	r.offset += int64(len(b))
+	for len(b) > 0 {
+		room := DefaultChunkBytes - r.inChunk
+		part := b
+		if int64(len(part)) > room {
+			part = part[:room]
+		}
+		r.chunk.Write(part)
+		r.inChunk += int64(len(part))
+		b = b[len(part):]
+		if r.inChunk == DefaultChunkBytes {
+			r.chunks = append(r.chunks, hex.EncodeToString(r.chunk.Sum(nil)))
+			r.chunk.Reset()
+			r.inChunk = 0
+		}
+	}
+}
+
+// finish makes the identity once the file was read to its end, checked
+// against what was published of it.
+func (r *identifyingReader) finish() error {
+	if r.inChunk > 0 {
+		r.chunks = append(r.chunks, hex.EncodeToString(r.chunk.Sum(nil)))
+	}
+	f := r.f
+	sum := hex.EncodeToString(r.whole.Sum(nil))
+	switch {
+	case f.SHA256 != "" && f.SHA256 != sum:
+		return fmt.Errorf("%w: %s has sha256 %s, published as %s", ErrChanged, f.Name, sum, f.SHA256)
+	case f.Size > 0 && f.Size != r.offset:
+		return fmt.Errorf("%w: %s has %d bytes, published as %d", ErrChanged, f.Name, r.offset, f.Size)
+	}
+	f.Size, f.SHA256, f.ChunkBytes, f.Chunks = r.offset, sum, DefaultChunkBytes, r.chunks
+	if f.Chunks == nil {
+		f.Chunks = []string{}
+	}
+	r.identity = &f
+	return io.EOF
+}
+
+// Identity is the file's identity once it was read to its end.
+func (r *identifyingReader) Identity() (File, bool) {
+	if r.identity == nil {
+		return File{}, false
+	}
+	return *r.identity, true
+}
+
+func (r *identifyingReader) Close() error {
+	if r.body != nil {
+		r.body.Close()
+		r.body = nil
+	}
 	return nil
 }
 
@@ -214,12 +495,26 @@ func (d DirOrigin) ReadFrom(_ context.Context, f File, offset int64) (io.ReadClo
 
 func (d DirOrigin) String() string { return d.Root }
 
-// HTTPOrigin reads files from their URL with a range request.
-type HTTPOrigin struct{ Client *http.Client }
+// HTTPOrigin reads files from their URL with a range request; a body that
+// sends nothing for Idle (default 2 minutes) while read is given up.
+type HTTPOrigin struct {
+	Client *http.Client
+	Idle   time.Duration
+}
 
-func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (io.ReadCloser, error) {
+func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (_ io.ReadCloser, err error) {
 	if !strings.HasPrefix(f.URL, "https://") && !strings.HasPrefix(f.URL, "http://") {
 		return nil, fmt.Errorf("file %s has no http(s) URL", f.Name)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+	idle := h.Idle
+	if idle <= 0 {
+		idle = 2 * time.Minute
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.URL, nil)
 	if err != nil {
@@ -230,27 +525,85 @@ func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (io.Read
 	}
 	client := h.Client
 	if client == nil {
-		client = http.DefaultClient
+		client = HTTPClient
 	}
+	waited := time.AfterFunc(idle, cancel) // the answer's headers, redirects and all
 	resp, err := client.Do(req)
+	if !waited.Stop() && err == nil {
+		resp.Body.Close()
+		err = fmt.Errorf("%s: no answer within %s", f.URL, idle)
+	}
 	if err != nil {
 		return nil, err
 	}
 	switch {
 	case resp.StatusCode == http.StatusPartialContent && offset > 0:
-		return resp.Body, nil
-	case resp.StatusCode == http.StatusOK:
-		if _, err := io.CopyN(io.Discard, resp.Body, offset); err != nil { // no ranges there
+		var start, end, total int64
+		if _, err := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes %d-%d/%d", &start, &end, &total); err != nil || start != offset {
 			resp.Body.Close()
+			return nil, fmt.Errorf("%s: asked from byte %d, answered %q", f.URL, offset, resp.Header.Get("Content-Range"))
+		}
+		if f.Identified() && total != f.Size {
+			resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s has %d bytes, identified as %d", errLength, f.URL, total, f.Size)
+		}
+		return newIdleBody(resp.Body, idle, cancel), nil
+	case resp.StatusCode == http.StatusOK:
+		if f.Identified() && resp.ContentLength >= 0 && resp.ContentLength != f.Size {
+			resp.Body.Close()
+			return nil, fmt.Errorf("%w: %s has %d bytes, identified as %d", errLength, f.URL, resp.ContentLength, f.Size)
+		}
+		body := newIdleBody(resp.Body, idle, cancel)
+		if _, err := io.CopyN(io.Discard, body, offset); err != nil { // no ranges there
+			body.Close()
 			return nil, err
 		}
-		return resp.Body, nil
+		return body, nil
 	}
 	resp.Body.Close()
 	return nil, fmt.Errorf("%s: %s", f.URL, resp.Status)
 }
 
 func (h HTTPOrigin) String() string { return "upstream" }
+
+// HTTPClient is the client of an HTTPOrigin without one (and of Kairo's
+// other reads of upstream): an answer's headers waited for 2 minutes at
+// most.
+var HTTPClient = func() *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.ResponseHeaderTimeout = 2 * time.Minute
+	return &http.Client{Transport: t}
+}()
+
+// idleBody is a response body given up (its request canceled) when a read
+// of it waits idle for a byte.
+type idleBody struct {
+	body   io.ReadCloser
+	idle   time.Duration
+	cancel context.CancelFunc
+	timer  *time.Timer
+}
+
+func newIdleBody(body io.ReadCloser, idle time.Duration, cancel context.CancelFunc) *idleBody {
+	b := &idleBody{body: body, idle: idle, cancel: cancel, timer: time.AfterFunc(idle, cancel)}
+	b.timer.Stop()
+	return b
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	b.timer.Reset(b.idle)
+	n, err := b.body.Read(p)
+	if !b.timer.Stop() && err != nil {
+		err = fmt.Errorf("nothing came for %s: %w", b.idle, err)
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	b.timer.Stop()
+	b.cancel()
+	return b.body.Close()
+}
 
 // Identify reads r to its end and makes the identity of a file of that
 // content: its size, sha256 and chunk hashes.

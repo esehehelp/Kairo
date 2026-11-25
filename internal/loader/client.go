@@ -19,21 +19,36 @@ type Client struct {
 	w        *bufio.Writer
 	Position Position
 	World    int
+	Session  string
 	// Window is how many items it asks for ahead (default 256).
 	Window      int
 	outstanding int
 }
 
+// Resume is where a taker coming back stands, and the session it was given.
+type Resume struct {
+	Session  string
+	Position Position
+}
+
+// Resume is where c stands, to come back with.
+func (c *Client) Resume() *Resume { return &Resume{Session: c.Session, Position: c.Position} }
+
 // Dial joins the loader at addr (network "unix" or "tcp") as rank of
 // world; at, when not nil, is where the taker is (coming back).
-func Dial(ctx context.Context, network, addr string, rank, world int, at *Position) (*Client, error) {
+func Dial(ctx context.Context, network, addr string, rank, world int, at *Resume) (*Client, error) {
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, network, addr)
 	if err != nil {
 		return nil, err
 	}
 	c := &Client{conn: conn, r: bufio.NewReaderSize(conn, 1<<20), w: bufio.NewWriter(conn), Window: 256}
-	if err := writeJSONFrame(c.w, frameHello, Hello{Version: ProtocolVersion, Rank: rank, World: world, Position: at}); err != nil {
+	hello := Hello{Version: ProtocolVersion, Rank: rank, World: world}
+	if at != nil {
+		p := at.Position
+		hello.Position, hello.Session = &p, at.Session
+	}
+	if err := writeJSONFrame(c.w, frameHello, hello); err != nil {
 		conn.Close()
 		return nil, err
 	}
@@ -51,7 +66,7 @@ func Dial(ctx context.Context, network, addr string, rank, world int, at *Positi
 		conn.Close()
 		return nil, fmt.Errorf("the loader answered a hello with a frame of type %d", kind)
 	}
-	c.Position, c.World = ready.Position, ready.World
+	c.Position, c.World, c.Session = ready.Position, ready.World, ready.Session
 	return c, nil
 }
 

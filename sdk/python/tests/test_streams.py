@@ -119,7 +119,7 @@ def test_a_broken_connection_is_made_again_where_the_rank_stands() -> None:
         got = list(s)
         assert got == [b"r0", b"r1", b"r2", b"r4", b"r5", b"r5-bis", b"r6", b"r7", b"r8", b"r9"]
         assert loader.hellos[0].get("position") is None
-        assert loader.hellos[1]["position"] == {"record": 5, "sub": 1}
+        assert loader.hellos[1]["position"] == {"rank": 0, "record": 5, "sub": 1}
     finally:
         loader.close()
 
@@ -138,3 +138,20 @@ def test_open_takes_the_address_and_rank_from_the_environment(monkeypatch: pytes
             streams.open("mix-v9")
     finally:
         loader.close()
+
+
+def test_a_checkpoint_carries_where_each_stream_stands() -> None:
+    from kairo_sdk.runtime import SuspendResult, suspend_payload
+
+    class Taken:
+        name = "mix"
+        world = 1
+        position = {"rank": 0, "record": 7, "sub": 1}
+
+    payload = suspend_payload(SuspendResult("ckpt", {"step": 3}), [Taken()])
+    assert payload == {
+        "step": 3,
+        "continuation_ref": "ckpt",
+        "streams": {"mix": {"world": 1, "order": 1, "positions": [{"rank": 0, "record": 7, "sub": 1}]}},
+    }
+    assert "streams" not in suspend_payload(SuspendResult("ckpt"))

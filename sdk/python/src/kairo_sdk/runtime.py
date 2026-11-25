@@ -9,7 +9,7 @@ import ssl
 import threading
 import time
 import urllib.parse
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -193,6 +193,8 @@ class AttemptSession:
         self.fenced = False
         self._terminal_error: KairoAPIError | None = None
         self.suspend_handled = False
+        # the streams of the safe point being handled (their positions go with a checkpoint)
+        self._streams: tuple[Any, ...] = ()
         self._stop_signal_handled = False
         # A ``checkpointed`` acknowledgement whose answer did not arrive:
         # (command id, kind, payload), sent again before anything else (_publish).
@@ -369,8 +371,13 @@ class AttemptSession:
         *,
         checkpoint: Callable[[CommandContext], SuspendResult | str | Path | None],
         progress: Mapping[str, Any] | ProgressEnvelope | None = None,
+        streams: Sequence[Any] = (),
     ) -> bool:
         """Handle pending commands; ``True`` means the worker must stop now.
+
+        ``streams`` (:mod:`kairo_sdk.streams`) the worker reads: where each
+        stands when a checkpoint is published goes with it, and the attempt
+        that goes on from that checkpoint is handed the records that follow.
 
         A ``suspend`` is acknowledged ``accepted`` and ``checkpointing``, then
         ``checkpoint`` runs and must return the continuation Kairo resumes
@@ -425,6 +432,7 @@ class AttemptSession:
         and :class:`~kairo_sdk.errors.KairoAPIError` (see its
         ``classification``) or a transport error that is not transient.
         """
+        self._streams = tuple(streams)
         if progress is not None:
             self.set_progress(progress)
         self._raise_if_terminal()
@@ -523,7 +531,7 @@ class AttemptSession:
                 _log.warning("Kairo checkpoint %s published nothing; the worker carries on", context.command_id)
                 return False
             raise NoContinuationError(message)
-        if not self._publish(context.command_id, context.kind, suspend_payload(result)):
+        if not self._publish(context.command_id, context.kind, suspend_payload(result, self._streams)):
             return False  # withdrawn, or kept to be sent again
         if context.kind == "checkpoint":
             return False  # published; the worker carries on
@@ -776,12 +784,44 @@ def normalize_suspend_result(value: SuspendResult | str | Path | None) -> Suspen
 _normalize_suspend_result = normalize_suspend_result  # compatibility alias
 
 
-def suspend_payload(result: SuspendResult) -> dict[str, Any]:
-    """The ``checkpointed`` acknowledgement payload for ``result``."""
+def suspend_payload(result: SuspendResult, streams: Mapping[str, Mapping[str, Any]] | Sequence[Any] = ()) -> dict[str, Any]:
+    """The ``checkpointed`` acknowledgement payload for ``result``, with
+    where each stream stands (``streams``: streams, or positions by name)."""
     payload = dict(result.payload)
     if result.continuation_ref is not None:
         payload["continuation_ref"] = result.continuation_ref
+    positions = streams if isinstance(streams, Mapping) else stream_positions(streams)
+    if positions:
+        payload["streams"] = {name: dict(entry) for name, entry in positions.items()}
     return payload
+
+
+# The version of the loader's order positions are of (internal/loader).
+ORDER_VERSION = 1
+
+
+def stream_positions(streams: Sequence[Any]) -> dict[str, dict[str, Any]]:
+    """Where each stream stands, by name: its ranks (``world``), the order's
+    version and this process's position of it."""
+    out: dict[str, dict[str, Any]] = {}
+    for stream in streams:
+        entry = out.setdefault(stream.name, {"world": int(stream.world), "order": ORDER_VERSION, "positions": []})
+        if entry["world"] != int(stream.world):
+            raise ValueError(f"stream {stream.name} taken as {entry['world']} and {stream.world} ranks")
+        entry["positions"].append(dict(stream.position))
+    return out
+
+
+def merge_stream_positions(parts: Iterable[Mapping[str, Mapping[str, Any]]]) -> dict[str, dict[str, Any]]:
+    """The positions of several processes (ranks), by stream."""
+    out: dict[str, dict[str, Any]] = {}
+    for part in parts:
+        for name, entry in part.items():
+            merged = out.setdefault(name, {"world": entry["world"], "order": entry["order"], "positions": []})
+            if merged["world"] != entry["world"] or merged["order"] != entry["order"]:
+                raise ValueError(f"stream {name}: ranks disagree on its world or order")
+            merged["positions"].extend(entry["positions"])
+    return out
 
 
 def split_der_certificates(data: bytes) -> tuple[bytes, ...]:

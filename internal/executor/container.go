@@ -99,6 +99,11 @@ type containerSpec struct {
 	Env      []string `json:"env"`
 	Writable []string `json:"writable"`
 	Tmp      string   `json:"tmp"`
+	// Streams the argv reads: a loader each, started before it in the
+	// container (startLoaders), reading raw files through the store's raw
+	// cache mounted at RawDir (rawcache.go).
+	Streams []store.LaunchStream `json:"streams,omitempty"`
+	RawDir  string               `json:"raw_dir,omitempty"`
 }
 
 // containerMount is a node path mounted in the container.
@@ -209,12 +214,29 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		Writable: append(append([]string{containerRoot + "/run"}, writableLogs...), containerRoot+"/scratch", containerRoot+"/output"),
 		Tmp:      containerRoot + "/scratch/tmp",
 		Argv:     launch.Argv,
+		Streams:  launch.Streams,
 	}
 	paths := map[string]string{scratch: containerRoot + "/scratch", output: containerRoot + "/output"}
 	if cache != "" {
 		spec.Mounts = append(spec.Mounts, containerMount{Source: cache, Path: containerRoot + "/cache"})
 		spec.Writable = append(spec.Writable, containerRoot+"/cache")
 		paths[cache] = containerRoot + "/cache"
+	}
+	if len(launch.Streams) > 0 {
+		s, ok := e.storeWork().storeFor(launch)
+		if !ok {
+			return nil, fmt.Errorf("%w: streams are read through a volatile store's raw cache (none here)", errConfineHere)
+		}
+		raw, err := e.storeWork().rawCacheFor(s)
+		if err != nil {
+			return nil, fmt.Errorf("the raw cache of store %s: %w", s.decl.ID, err)
+		}
+		view, err := raw.attach(launch)
+		if err != nil {
+			return nil, fmt.Errorf("the raw cache of store %s: %w", s.decl.ID, err)
+		}
+		spec.Mounts = append(spec.Mounts, containerMount{Source: view, Path: containerRoot + "/raw", ReadOnly: true})
+		spec.RawDir = containerRoot + "/raw"
 	}
 	for _, in := range launch.Inputs {
 		if in.Path == "" {

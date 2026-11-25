@@ -6,9 +6,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"golang.org/x/sync/semaphore"
 )
 
 // Position is where a rank stands in a stream: Record of its records taken
@@ -45,11 +50,20 @@ type Loader struct {
 	Stderr io.Writer
 	// Learned hears a file's record count once a source read it to its end
 	// (for Kairo to keep: a later start mid-way passes the file over).
-	Learned func(source int, sha256 string, records int64)
+	Learned func(source int, f File, records int64)
+	// Identified hears a file's identity once a source read it the first
+	// time (for Kairo to keep: later reads are checked against it).
+	Identified func(source int, f File)
+	// StateDir, when set, keeps which ranks were served across the
+	// loader's restarts (a file served-<rank> each).
+	StateDir string
 
 	mu        sync.Mutex
 	world     int
 	delivered []Position // per rank: its next position not yet handed over
+	floor     []Position // per rank: where the stream was started (a checkpoint's)
+	present   []bool     // per rank: a process takes it now
+	served    []bool     // per rank: it was handed an item (since the stream started: StateDir)
 	gen       *generation
 	stopped   bool
 	hard      error
@@ -61,8 +75,21 @@ type Loader struct {
 // comes back from elsewhere than where it was handed makes another.
 type generation struct {
 	cancel context.CancelFunc
+	ctx    context.Context
 	queues []chan item
-	done   chan struct{}
+	// rankCtx ends while its rank is away (no process takes it); overflow
+	// marks a rank away whose items no longer fitted: dropped from then on,
+	// the generation is made again when it comes back
+	rankCtx    []context.Context
+	rankCancel []context.CancelFunc
+	overflow   []bool
+	// budgets bound the bytes made ahead for each rank
+	budgets []*semaphore.Weighted
+	budget  int64
+	done    chan struct{}
+	// last is what each rank is handed once the stream ended or failed and
+	// its queue is empty (handed again to one that comes back)
+	last *item
 }
 
 // Start makes the stream for world ranks from their positions (nil: from
@@ -79,17 +106,40 @@ func (l *Loader) Start(ctx context.Context, world int, positions []Position) err
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if len(positions) > 0 && len(positions) != world {
+		return fmt.Errorf("positions of %d ranks, for %d ranks (a run keeps its ranks)", len(positions), world)
+	}
 	l.world = world
+	l.present, l.served = make([]bool, world), make([]bool, world)
+	if l.StateDir != "" {
+		// the ranks it was started for, and those served, kept across restarts
+		if kept := l.keptWorldLocked(); kept != 0 && kept != world {
+			return fmt.Errorf("the stream was started for %d ranks, not %d (a run keeps its ranks)", kept, world)
+		}
+		if err := os.WriteFile(filepath.Join(l.StateDir, "world"), []byte(strconv.Itoa(world)), 0o644); err != nil {
+			return fmt.Errorf("the stream's state: %w", err)
+		}
+		for r := range l.served {
+			_, err := os.Stat(filepath.Join(l.StateDir, fmt.Sprintf("served-%d", r)))
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("the stream's state: %w", err)
+			}
+			l.served[r] = err == nil
+		}
+	}
 	l.delivered = make([]Position, world)
+	seen := make([]bool, world)
 	for r := range l.delivered {
 		l.delivered[r] = Position{Rank: r}
 	}
 	for _, p := range positions {
-		if p.Rank < 0 || p.Rank >= world {
-			return fmt.Errorf("a position of rank %d, for %d ranks", p.Rank, world)
+		if p.Rank < 0 || p.Rank >= world || seen[p.Rank] || p.Record < 0 || p.Record > maxRecord || p.Sub < 0 || p.Sub > maxSub {
+			return fmt.Errorf("positions %v are not one each of ranks 0..%d", positions, world-1)
 		}
+		seen[p.Rank] = true
 		l.delivered[p.Rank] = p
 	}
+	l.floor = append([]Position(nil), l.delivered...)
 	l.startLocked(ctx)
 	return nil
 }
@@ -123,33 +173,40 @@ func (l *Loader) startLocked(parent context.Context) {
 	if l.gen != nil {
 		l.gen.cancel()
 	}
+	if l.hard != nil {
+		// a stream that failed is not made again
+		gen := &generation{cancel: func() {}, queues: make([]chan item, l.world), done: make(chan struct{}), last: &item{err: l.hard}}
+		for r := range gen.queues {
+			gen.queues[r] = make(chan item)
+		}
+		close(gen.done)
+		l.gen = gen
+		return
+	}
 	ctx, cancel := context.WithCancel(parent)
-	gen := &generation{cancel: cancel, queues: make([]chan item, l.world), done: make(chan struct{})}
+	gen := &generation{cancel: cancel, ctx: ctx, queues: make([]chan item, l.world), done: make(chan struct{}), budget: l.rankBudget(), overflow: make([]bool, l.world)}
 	for r := range gen.queues {
 		gen.queues[r] = make(chan item, rankQueue)
+		gen.budgets = append(gen.budgets, semaphore.NewWeighted(gen.budget))
+		rctx, rcancel := context.WithCancel(ctx)
+		gen.rankCtx, gen.rankCancel = append(gen.rankCtx, rctx), append(gen.rankCancel, rcancel)
 	}
 	l.gen = gen
 	positions := append([]Position(nil), l.delivered...)
 	go func() {
 		defer close(gen.done)
 		err := l.produce(ctx, gen, positions)
-		if ctx.Err() != nil {
-			return // made again from other positions, or stopped
+		if ctx.Err() != nil || errors.Is(err, errAllAway) {
+			return // made again from other positions (or when a rank comes back), or stopped
 		}
 		end := item{end: true}
+		l.mu.Lock()
 		if err != nil {
 			end = item{err: err}
-			l.mu.Lock()
 			l.hard = err
-			l.mu.Unlock()
 		}
-		for _, q := range gen.queues {
-			select {
-			case q <- end:
-			case <-ctx.Done():
-				return
-			}
-		}
+		gen.last = &end
+		l.mu.Unlock()
 	}()
 }
 
@@ -162,7 +219,7 @@ func (l *Loader) produce(ctx context.Context, gen *generation, positions []Posit
 			start = g
 		}
 	}
-	in, err := newInputs(l.Spec, l.Fetch, l.Learned)
+	in, err := newInputs(l.Spec, l.Fetch, l.Learned, l.Identified)
 	if err != nil {
 		return err
 	}
@@ -215,10 +272,12 @@ func (l *Loader) produce(ctx context.Context, gen *generation, positions []Posit
 	for grp := range out {
 		r, k := int(grp.g%world), grp.g/world
 		outs, sub := grp.recs, int64(0)
-		if k == positions[r].Record {
+		if k == positions[r].Record && positions[r].Sub > 0 {
+			// a position within a record names one of its outputs: a record
+			// giving fewer is not what it gave before (its stages changed)
 			sub = positions[r].Sub
-			if sub > int64(len(outs)) {
-				sub = int64(len(outs))
+			if sub >= int64(len(outs)) {
+				return fmt.Errorf("rank %d stands at output %d of its record %d, which gives %d outputs now: not the stream it was", r, sub, k, len(outs))
 			}
 			outs = outs[sub:]
 		}
@@ -245,17 +304,145 @@ func (l *Loader) produce(ctx context.Context, gen *generation, positions []Posit
 	if err := <-orderErr; err != nil && !errors.Is(err, context.Canceled) {
 		return err
 	}
-	return ctx.Err()
-}
-
-func (l *Loader) put(ctx context.Context, gen *generation, r int, it item) error {
-	select {
-	case gen.queues[r] <- it:
-		return nil
-	case <-ctx.Done():
+	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	// the stream ended: a rank that was to start past its end stood
+	// somewhere this stream never was
+	total := order.g
+	for _, p := range positions {
+		records := int64(0)
+		if r := int64(p.Rank); total > r {
+			records = (total - r + world - 1) / world
+		}
+		if p.Record > records || p.Record == records && p.Sub > 0 {
+			return fmt.Errorf("rank %d was to start at %+v, past the stream's end (its %d records)", p.Rank, p, records)
+		}
+	}
+	return nil
 }
+
+// put hands it to rank r's queue, waiting for room while a process takes
+// the rank; for a rank away, what fits is made ahead and, once something
+// does not, the rest of its items are dropped (made again when it comes
+// back), so that a rank away never holds the others up.
+func (l *Loader) put(ctx context.Context, gen *generation, r int, it item) error {
+	cost := gen.cost(it)
+	for {
+		l.mu.Lock()
+		rctx, overflowed := gen.rankCtx[r], gen.overflow[r]
+		if !l.present[r] && !overflowed {
+			if gen.budgets[r].TryAcquire(cost) {
+				select {
+				case gen.queues[r] <- it:
+					l.mu.Unlock()
+					return nil
+				default:
+					gen.budgets[r].Release(cost)
+				}
+			}
+			gen.overflow[r], overflowed = true, true
+		}
+		allAway := overflowed
+		for q := range gen.overflow {
+			allAway = allAway && gen.overflow[q] && !l.present[q]
+		}
+		l.mu.Unlock()
+		if allAway {
+			return errAllAway // made again when a rank comes back
+		}
+		if overflowed {
+			return ctx.Err()
+		}
+		if err := gen.budgets[r].Acquire(rctx, cost); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			continue // the rank went away meanwhile
+		}
+		select {
+		case gen.queues[r] <- it:
+			return nil
+		case <-rctx.Done():
+			gen.budgets[r].Release(cost)
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+		}
+	}
+}
+
+// attach: a process takes rank r now. A generation that dropped its items
+// while it was away is made again (from where each rank was handed to).
+func (l *Loader) attach(ctx context.Context, r int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.present[r] = true
+	gen := l.gen
+	if gen == nil || gen.rankCtx == nil || l.stopped || l.hard != nil {
+		return
+	}
+	if gen.overflow[r] {
+		l.startLocked(ctx)
+		return
+	}
+	if gen.rankCtx[r].Err() != nil {
+		gen.rankCtx[r], gen.rankCancel[r] = context.WithCancel(gen.ctx)
+	}
+}
+
+// detach: no process takes rank r now.
+func (l *Loader) detach(r int) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.present[r] = false
+	if gen := l.gen; gen != nil && gen.rankCancel != nil {
+		gen.rankCancel[r]()
+	}
+}
+
+// keptWorld is the ranks the stream was started for before (StateDir; 0:
+// not started before).
+func (l *Loader) keptWorld() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.keptWorldLocked()
+}
+
+func (l *Loader) keptWorldLocked() int {
+	if l.StateDir == "" {
+		return 0
+	}
+	body, err := os.ReadFile(filepath.Join(l.StateDir, "world"))
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(body)))
+	return n
+}
+
+// servedBefore: rank r was handed an item since the stream started.
+func (l *Loader) servedBefore(r int) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.served[r]
+}
+
+// cost is what an item takes of its rank's budget (all of it at most).
+func (gen *generation) cost(it item) int64 {
+	return min(int64(len(it.data))+64, gen.budget)
+}
+
+// rankBudget is the bytes made ahead for each rank.
+func (l *Loader) rankBudget() int64 {
+	if l.Spec.MemoryBytes <= 0 {
+		return 64 << 20
+	}
+	return max(l.Spec.MemoryBytes/4/int64(l.world), 1<<20)
+}
+
+// errAllAway: no rank is taken and none has room: nothing is made for no one.
+var errAllAway = errors.New("every rank is away")
 
 // ErrRankTaken: a rank already has a process taking its records.
 var ErrRankTaken = errors.New("rank taken")
@@ -273,34 +460,77 @@ func (l *Loader) take(r int, wait time.Duration) (item, bool) {
 	defer timer.Stop()
 	select {
 	case it := <-gen.queues[r]:
+		return l.took(gen, r, it)
+	case <-gen.done:
+		// what was made is handed over first, then the end, again and again
+		select {
+		case it := <-gen.queues[r]:
+			return l.took(gen, r, it)
+		default:
+		}
 		l.mu.Lock()
-		current := l.gen == gen
-		if current && !it.end && it.err == nil {
-			switch {
-			case it.skip || it.last:
-				l.delivered[r] = Position{Rank: r, Record: it.record + 1}
-			default:
-				l.delivered[r] = Position{Rank: r, Record: it.record, Sub: it.sub + 1}
-			}
-		}
+		last, current := gen.last, l.gen == gen
 		l.mu.Unlock()
-		if !current {
-			return item{}, false // of a generation made again since
+		if last == nil || !current {
+			return item{}, false
 		}
-		return it, true
+		return *last, true
 	case <-timer.C:
 		return item{}, false
 	}
 }
 
+// took records what rank r was handed from gen: where it stands now.
+func (l *Loader) took(gen *generation, r int, it item) (item, bool) {
+	if gen.budgets != nil && !it.end && it.err == nil {
+		gen.budgets[r].Release(gen.cost(it))
+	}
+	l.mu.Lock()
+	current := l.gen == gen
+	if current && !it.end && it.err == nil && !l.served[r] {
+		l.served[r] = true
+		if l.StateDir != "" {
+			f, err := os.Create(filepath.Join(l.StateDir, fmt.Sprintf("served-%d", r)))
+			if err == nil {
+				err = f.Close()
+			}
+			if err != nil {
+				// a rank served but not known so after a restart could start
+				// again where it was: the stream fails instead
+				l.hard = fmt.Errorf("the stream's state: %w", err)
+				l.startLocked(context.Background())
+				l.mu.Unlock()
+				return item{}, false
+			}
+		}
+	}
+	if current && !it.end && it.err == nil {
+		switch {
+		case it.skip || it.last:
+			l.delivered[r] = Position{Rank: r, Record: it.record + 1}
+		default:
+			l.delivered[r] = Position{Rank: r, Record: it.record, Sub: it.sub + 1}
+		}
+	}
+	l.mu.Unlock()
+	if !current {
+		return item{}, false // of a generation made again since
+	}
+	return it, true
+}
+
 // resume makes the stream again when rank r comes back at p, not where it
 // was handed to: every other rank from where it was handed to.
-func (l *Loader) resume(ctx context.Context, r int, p Position) {
+func (l *Loader) resume(ctx context.Context, r int, p Position) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if f := l.floor[r]; p.Record < f.Record || p.Record == f.Record && p.Sub < f.Sub {
+		return fmt.Errorf("rank %d comes back at %+v, before where its stream started (%+v)", r, p, f)
+	}
 	if l.delivered[r] == p || l.stopped {
-		return
+		return nil
 	}
 	l.delivered[r] = p
 	l.startLocked(ctx)
+	return nil
 }

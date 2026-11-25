@@ -32,6 +32,9 @@ const evictRetryAfter = time.Hour
 const (
 	EvictPlacement = "placement"
 	EvictTemporal  = "temporal"
+	// EvictRaw: a raw file kept for streams (<root>/raw/<sha256>, ObjectID
+	// its sha256): fetched again from upstream when read again.
+	EvictRaw = "raw"
 )
 
 // EvictionOrder is something its executor is to evict from StoreID at Root:
@@ -142,6 +145,23 @@ func (s *Store) EvictionsToMake(ctx context.Context, executorID string) ([]Evict
 			if o.Kind == EvictTemporal && sourceOwnership(declared, o.ObjectKind, me.nodeID, d.ID, d.Root, o.Path, o.SourceID) != "" {
 				continue
 			}
+			var claim sql.Result
+			if o.Kind == EvictRaw {
+				// a loader reading it reads on: the file goes once it is closed
+				claim, err = tx.ExecContext(ctx, `UPDATE raw_placements SET state='evicting' WHERE store_id=$1 AND sha256=$2 AND state='ready'`, d.ID, o.ObjectID)
+				if err != nil {
+					return nil, err
+				}
+				if n, _ := claim.RowsAffected(); n != 1 {
+					continue
+				}
+				if err = appendCoordinationEventTx(ctx, tx, "eviction_ordered", nil, "raw", o.ObjectID, nil, map[string]any{"kind": o.Kind, "store_id": d.ID, "bytes": o.Bytes}); err != nil {
+					return nil, err
+				}
+				need -= o.Bytes
+				out = append(out, o)
+				continue
+			}
 			pinned, err := pinnedSourceTx(ctx, tx, o.ObjectID)
 			if err != nil {
 				return nil, err
@@ -149,7 +169,6 @@ func (s *Store) EvictionsToMake(ctx context.Context, executorID string) ([]Evict
 			if pinned != "" {
 				continue
 			}
-			var claim sql.Result
 			if o.Kind == EvictPlacement {
 				if err := checkTransition(recPlacement, "ready", "evicting"); err != nil {
 					return nil, err
@@ -240,10 +259,30 @@ func evictionsOnStoreTx(ctx context.Context, tx *sql.Tx, d machine.Store, execut
 			return list[i].order.ObjectID < list[j].order.ObjectID
 		})
 	}
+	var raws []candidate
+	rawState := "ready"
+	if claimed {
+		rawState = "evicting"
+	}
+	err = eachRow(ctx, tx, `SELECT sha256,bytes,last_used_at,created_at FROM raw_placements WHERE store_id=$1 AND root=$2 AND executor_id=$3 AND state=$4`,
+		[]any{d.ID, d.Root, executorID, rawState}, func(rows *sql.Rows) error {
+			c := candidate{order: EvictionOrder{Kind: EvictRaw, StoreID: d.ID, Root: d.Root}}
+			var last string
+			if err := rows.Scan(&c.order.ObjectID, &c.order.Bytes, &last, &c.created); err != nil {
+				return err
+			}
+			c.lastUsed = sql.NullString{String: last, Valid: true}
+			raws = append(raws, c)
+			return nil
+		})
+	if err != nil {
+		return nil, err
+	}
 	byUse(placements)
+	byUse(raws)
 	byUse(temporal)
-	out := make([]EvictionOrder, 0, len(placements)+len(temporal))
-	for _, c := range append(placements, temporal...) {
+	out := make([]EvictionOrder, 0, len(placements)+len(raws)+len(temporal))
+	for _, c := range append(append(placements, raws...), temporal...) {
 		out = append(out, c.order)
 	}
 	return out, nil
@@ -266,6 +305,27 @@ func (s *Store) SettleEviction(ctx context.Context, settled EvictionSettled) err
 	var nodeID string
 	var bytes int64
 	switch settled.Kind {
+	case EvictRaw:
+		var executorID, state string
+		err = tx.QueryRowContext(ctx, `SELECT r.executor_id,r.state,r.bytes,x.node_id FROM raw_placements r JOIN executors x ON x.id=r.executor_id
+			WHERE r.store_id=$1 AND r.sha256=$2 FOR UPDATE OF r`, settled.StoreID, settled.ObjectID).Scan(&executorID, &state, &bytes, &nodeID)
+		if errors.Is(err, sql.ErrNoRows) {
+			return tx.Commit() // forgotten already
+		}
+		if err != nil {
+			return err
+		}
+		if executorID != settled.ExecutorID {
+			return fmt.Errorf("raw file %s on %s is executor %s's, not %s's", settled.ObjectID, settled.StoreID, executorID, settled.ExecutorID)
+		}
+		if state != "evicting" {
+			return tx.Commit()
+		}
+		if settled.Evicted {
+			_, err = tx.ExecContext(ctx, `DELETE FROM raw_placements WHERE store_id=$1 AND sha256=$2`, settled.StoreID, settled.ObjectID)
+		} else {
+			_, err = tx.ExecContext(ctx, `UPDATE raw_placements SET state='ready',last_used_at=$1 WHERE store_id=$2 AND sha256=$3`, t, settled.StoreID, settled.ObjectID)
+		}
 	case EvictPlacement:
 		var executorID, state string
 		err = tx.QueryRowContext(ctx, `SELECT p.executor_id,p.state,COALESCE(p.bytes,0),x.node_id FROM object_placements p JOIN executors x ON x.id=p.executor_id

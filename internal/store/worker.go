@@ -217,6 +217,13 @@ func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch
 	} else if err != nil {
 		return err
 	}
+	if phase == "checkpointed" {
+		// a checkpoint of an execution reading streams says where each of
+		// their ranks stood, or it is no checkpoint to go on from
+		if err := checkStreamPositionsTx(ctx, tx, executionID, payload); err != nil {
+			return err
+		}
+	}
 	t := now()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO command_acks(command_id,attempt_id,coordination_epoch,phase,payload_json,created_at) VALUES($1,$2,$3,$4,$5,$6)`, commandID, attemptID, epoch, phase, string(payload), t); err != nil {
 		return err

@@ -9,9 +9,9 @@ import (
 
 // SourceSpec is a source of a stream, its files resolved: the raw data (or
 // data object) named, its weight in the mix, its format, its files in
-// declared order and, when known, each file's record count under this format
-// (by the file's sha256), which lets a stream start mid-way without reading
-// what comes before.
+// declared order and, when known, each file's record count read so (by
+// RecordsKey), which lets a stream start mid-way without reading what comes
+// before.
 type SourceSpec struct {
 	Name    string           `json:"name"`
 	Weight  int              `json:"weight"`
@@ -31,8 +31,14 @@ type sourceStream struct {
 	fetch   *Fetcher
 	shuffle bool
 	seed    uint64
-	// learned hears a file's record count once it was read to its end.
-	learned func(source int, sha256 string, records int64)
+	// learned hears a file's record count once it was read to its end;
+	// identified a file's identity once it was read the first time.
+	learned    func(source int, f File, records int64)
+	identified func(source int, f File)
+
+	// endEpoch: this source's records end where its epoch endEpoch would
+	// begin (0: they do not); nothing of that epoch is opened
+	endEpoch int64
 
 	epoch   int64
 	order   []int
@@ -44,7 +50,7 @@ type sourceStream struct {
 	read    int64 // records given since the source's first
 }
 
-func newSourceStream(spec SourceSpec, index int, fetch *Fetcher, shuffle bool, seed uint64, learned func(int, string, int64)) (*sourceStream, error) {
+func newSourceStream(spec SourceSpec, index int, fetch *Fetcher, shuffle bool, seed uint64, learned func(int, File, int64), identified func(int, File)) (*sourceStream, error) {
 	f, err := parseFormat(spec.Format, spec.Field)
 	if err != nil {
 		return nil, fmt.Errorf("source %s: %w", spec.Name, err)
@@ -53,11 +59,20 @@ func newSourceStream(spec SourceSpec, index int, fetch *Fetcher, shuffle bool, s
 		return nil, fmt.Errorf("source %s has no files", spec.Name)
 	}
 	for _, file := range spec.Files {
+		if !file.Identified() {
+			continue // identified the first time it is read
+		}
 		if err := file.check(); err != nil {
 			return nil, fmt.Errorf("source %s: %w", spec.Name, err)
 		}
 	}
-	return &sourceStream{spec: spec, index: index, format: f, fetch: fetch, shuffle: shuffle, seed: seed, learned: learned}, nil
+	spec.Files = append([]File(nil), spec.Files...)
+	records := make(map[string]int64, len(spec.Records))
+	for k, v := range spec.Records {
+		records[k] = v
+	}
+	spec.Records = records
+	return &sourceStream{spec: spec, index: index, format: f, fetch: fetch, shuffle: shuffle, seed: seed, learned: learned, identified: identified}, nil
 }
 
 // orderOf is the order of the files in epoch e.
@@ -73,9 +88,23 @@ func (s *sourceStream) orderOf(e int64) []int {
 }
 
 // count is the record count of file i, when known.
+// errPastEnd: a position past a stream's end (a stream never stood there).
+var errPastEnd = errors.New("past the stream's end")
+
 func (s *sourceStream) count(i int) (int64, bool) {
-	n, ok := s.spec.Records[s.spec.Files[i].SHA256]
+	f := s.spec.Files[i]
+	if !f.Identified() || f.AsPublished() != "" {
+		return 0, false // read (and checked), never passed over by a count
+	}
+	n, ok := s.spec.Records[s.recordsKey(f)]
 	return n, ok
+}
+
+// recordsKey is what a file's record count is kept under: its sha256 and
+// how this source reads it (RecordsKey).
+func (s *sourceStream) recordsKey(f File) string {
+	key, _ := RecordsKey(f.SHA256, s.spec.Format, s.spec.Field, f.Name)
+	return key
 }
 
 func (s *sourceStream) closeFile() {
@@ -122,6 +151,9 @@ func (s *sourceStream) seek(ctx context.Context, n int64) error {
 	}
 	if known {
 		s.epoch = n / perEpoch
+		if s.endEpoch > 0 && s.epoch >= s.endEpoch {
+			s.epoch = s.endEpoch - 1
+		}
 		s.read = s.epoch * perEpoch
 	}
 	s.order = s.orderOf(s.epoch)
@@ -130,6 +162,9 @@ func (s *sourceStream) seek(ctx context.Context, n int64) error {
 		if s.file == len(s.order) {
 			if emptyEpoch {
 				return fmt.Errorf("source %s has no records", s.spec.Name)
+			}
+			if s.endEpoch > 0 && s.epoch+1 >= s.endEpoch {
+				return fmt.Errorf("%w: source %s has %d records, not %d", errPastEnd, s.spec.Name, s.read, n)
 			}
 			s.epoch, s.file, s.order, emptyEpoch = s.epoch+1, 0, s.orderOf(s.epoch+1), true
 			continue
@@ -160,16 +195,28 @@ func (s *sourceStream) seek(ctx context.Context, n int64) error {
 	return nil
 }
 
+// errSourceEnded: the source's last epoch gave its last record.
+var errSourceEnded = errors.New("source ended")
+
 // endFile: the file being read gave its last record.
 func (s *sourceStream) endFile() {
+	if r, ok := s.body.(interface{ Identity() (File, bool) }); ok {
+		if f, done := r.Identity(); done {
+			was := s.spec.Files[s.order[s.file]]
+			s.spec.Files[s.order[s.file]] = f
+			if s.identified != nil && !was.Identified() {
+				s.identified(s.index, f)
+			}
+		}
+	}
 	f := s.spec.Files[s.order[s.file]]
 	if _, ok := s.count(s.order[s.file]); !ok && s.learned != nil {
-		s.learned(s.index, f.SHA256, s.inFile)
+		s.learned(s.index, f, s.inFile)
 	}
 	if s.spec.Records == nil {
 		s.spec.Records = map[string]int64{}
 	}
-	s.spec.Records[f.SHA256] = s.inFile
+	s.spec.Records[s.recordsKey(f)] = s.inFile
 	s.closeFile()
 	s.file++
 }
@@ -184,6 +231,9 @@ func (s *sourceStream) next(ctx context.Context) ([]byte, int64, error) {
 		if s.file == len(s.order) {
 			if emptyEpoch {
 				return nil, 0, fmt.Errorf("source %s has no records", s.spec.Name)
+			}
+			if s.endEpoch > 0 && s.epoch+1 >= s.endEpoch {
+				return nil, 0, errSourceEnded
 			}
 			s.epoch, s.file, s.order, emptyEpoch = s.epoch+1, 0, s.orderOf(s.epoch+1), true
 			continue

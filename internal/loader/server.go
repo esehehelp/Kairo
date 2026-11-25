@@ -3,7 +3,9 @@ package loader
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +41,13 @@ const (
 	frameError  = 7
 )
 
+// maxRecord and maxSub bound a position (record*W+rank stays far from
+// overflowing).
+const (
+	maxRecord = int64(1) << 48
+	maxSub    = int64(1) << 31
+)
+
 // rankReleaseWait is how long a hello waits for the connection its rank
 // had to be noticed gone (a handler notices within its take wait).
 const rankReleaseWait = 5 * time.Second
@@ -55,12 +64,17 @@ type Hello struct {
 	Rank     int       `json:"rank"`
 	World    int       `json:"world"`
 	Position *Position `json:"position,omitempty"`
+	// Session is the one a ready gave: a taker coming back says it with
+	// its position (none: a first hello, which starts where the loader says).
+	Session string `json:"session,omitempty"`
 }
 
-// Ready answers a hello: where the rank starts.
+// Ready answers a hello: where the rank starts, and the session to come
+// back with.
 type Ready struct {
 	Position Position `json:"position"`
 	World    int      `json:"world"`
+	Session  string   `json:"session"`
 }
 
 // Server hands a loader's records to its takers, one connection per rank.
@@ -70,6 +84,9 @@ type Server struct {
 	// nil for the start; World the ranks (0: the first hello's).
 	Positions []Position
 	World     int
+	// Session names this stream to takers coming back (the same across
+	// the loader's restarts in one attempt; "" for a random one).
+	Session string
 
 	mu      sync.Mutex
 	started bool
@@ -81,6 +98,9 @@ type Server struct {
 func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	s.mu.Lock()
 	s.ctx, s.taken = ctx, map[int]bool{}
+	if s.Session == "" {
+		s.Session = randomSession()
+	}
 	s.mu.Unlock()
 	go func() {
 		<-ctx.Done()
@@ -119,7 +139,7 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) {
 	}
 	defer s.leave(rank)
 	start := s.Loader.Delivered()[rank]
-	if err := writeJSONFrame(w, frameReady, Ready{Position: start, World: s.Loader.World()}); err != nil {
+	if err := writeJSONFrame(w, frameReady, Ready{Position: start, World: s.Loader.World(), Session: s.Session}); err != nil {
 		return
 	}
 	credits := make(chan uint32, 16)
@@ -206,6 +226,9 @@ func (s *Server) join(hello Hello) (int, error) {
 	if !s.started {
 		world := s.World
 		if world == 0 {
+			world = s.Loader.keptWorld() // started before (StateDir)
+		}
+		if world == 0 {
 			world = hello.World
 		}
 		if err := s.Loader.Start(s.ctx, world, s.Positions); err != nil {
@@ -220,6 +243,9 @@ func (s *Server) join(hello Hello) (int, error) {
 	if hello.Rank < 0 || hello.Rank >= world {
 		return 0, fmt.Errorf("no rank %d of %d", hello.Rank, world)
 	}
+	if hello.Position != nil && hello.Position.Rank != hello.Rank {
+		return 0, fmt.Errorf("rank %d comes back with rank %d's position", hello.Rank, hello.Position.Rank)
+	}
 	// a taker coming back right after its connection broke may find the old
 	// one not noticed gone yet: it is given a while to go
 	for deadline := time.Now().Add(rankReleaseWait); s.taken[hello.Rank]; {
@@ -230,19 +256,43 @@ func (s *Server) join(hello Hello) (int, error) {
 		time.Sleep(20 * time.Millisecond)
 		s.mu.Lock()
 	}
+	if hello.Position == nil && s.Loader.servedBefore(hello.Rank) {
+		// (after the old connection went: it may have been handed items
+		// meanwhile) what was handed ahead to the process before may not
+		// have been taken: only its position says where it stands
+		return 0, fmt.Errorf("rank %d was served before: it comes back with its position and session (one stream per rank, kept open)", hello.Rank)
+	}
+	if hello.Position != nil && hello.Session != s.Session {
+		return 0, fmt.Errorf("a position comes back with the session this stream gave (a stream starts where Kairo's checkpoint says, not where a taker says)")
+	}
 	s.taken[hello.Rank] = true
 	if hello.Position != nil {
 		p := *hello.Position
-		p.Rank = hello.Rank
-		s.Loader.resume(s.ctx, hello.Rank, p)
+		if p.Record < 0 || p.Record > maxRecord || p.Sub < 0 || p.Sub > maxSub {
+			delete(s.taken, hello.Rank)
+			return 0, fmt.Errorf("position %+v is out of bounds", p)
+		}
+		if err := s.Loader.resume(s.ctx, hello.Rank, p); err != nil {
+			delete(s.taken, hello.Rank)
+			return 0, err
+		}
 	}
+	s.Loader.attach(s.ctx, hello.Rank)
 	return hello.Rank, nil
+}
+
+// randomSession is a session no one could have been given before.
+func randomSession() string {
+	var b [16]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 func (s *Server) leave(rank int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.taken, rank)
+	s.Loader.detach(rank)
 }
 
 func readFrame(r *bufio.Reader) (byte, []byte, error) {

@@ -14,7 +14,7 @@ import (
 )
 
 // loaderServe: kairo loader serve --spec SPEC.json --listen
-// unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--origin
+// unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--session S] [--origin
 // http|dir:DIR].
 func loaderServe(args []string) error {
 	fs := newFlags("loader serve")
@@ -22,7 +22,10 @@ func loaderServe(args []string) error {
 	listen := fs.String("listen", "", "where the ranks connect: unix:PATH or tcp:HOST:PORT")
 	world := fs.Int("world", 0, "the ranks the stream is split between (0: the first rank's hello says)")
 	positionsPath := fs.String("positions", "", "where each rank starts (JSON list of {rank, record, sub}); none: the start")
+	session := fs.String("session", "", "the session takers come back with (the same across this loader's restarts; none: a random one)")
+	state := fs.String("state", "", "a directory keeping which ranks were served across this loader's restarts")
 	origin := fs.String("origin", "http", "where files are read: http (each file's URL) or dir:DIR (files by name under DIR)")
+	rawDir := fs.String("raw", "", "the node's raw cache for this attempt (its directory, with the agent's socket): every file made ready, checked and identified there before it is read; without it, files are read from --origin, one never read before identified as it is read")
 	if _, err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -38,8 +41,12 @@ func loaderServe(args []string) error {
 		if err := readJSONFile(*positionsPath, &positions); err != nil {
 			return err
 		}
+		// a run goes on with the ranks its positions are of
+		if *world == 0 {
+			*world = len(positions)
+		}
 	}
-	var o loader.Origin = loader.HTTPOrigin{Client: http.DefaultClient}
+	var o loader.Origin = loader.HTTPOrigin{}
 	if dir, ok := strings.CutPrefix(*origin, "dir:"); ok {
 		o = loader.DirOrigin{Root: dir}
 	} else if *origin != "http" {
@@ -65,12 +72,18 @@ func loaderServe(args []string) error {
 		}
 		fmt.Fprintf(os.Stderr, "kairo loader: %s: %v\n", f.Name, err)
 	}}
-	l := &loader.Loader{Spec: spec, Fetch: fetch, Learned: func(source int, sha string, records int64) {
-		line, _ := json.Marshal(map[string]any{"learned": map[string]any{"source": source, "sha256": sha, "records": records}})
-		fmt.Fprintln(os.Stderr, string(line))
+	if *rawDir != "" {
+		agent := loader.NewAgent(*rawDir, o)
+		agent.Problem = func(f loader.File, err error) {
+			fmt.Fprintf(os.Stderr, "kairo loader: %s: %v\n", f.Name, err)
+		}
+		fetch.Resolve = agent.Resolve
+	}
+	l := &loader.Loader{Spec: spec, Fetch: fetch, StateDir: *state, Identified: func(_ int, f loader.File) {
+		fmt.Fprintf(os.Stderr, "kairo loader: %s identified: %d bytes, sha256 %s\n", f.Name, f.Size, f.SHA256)
 	}}
 	fmt.Fprintf(os.Stderr, "kairo loader: listening on %s\n", *listen)
-	return (&loader.Server{Loader: l, Positions: positions, World: *world}).Serve(ctx, ln)
+	return (&loader.Server{Loader: l, Positions: positions, World: *world, Session: *session}).Serve(ctx, ln)
 }
 
 // loaderIdentify prints the identity of files (local paths or URLs): what

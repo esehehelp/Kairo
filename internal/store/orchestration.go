@@ -555,6 +555,32 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	if spec.Image, err = taskImageTx(ctx, tx, task.taskScopeID); err != nil {
 		return plannedOrchestrationDecision{}, err
 	}
+	// a continuation goes on from one published checkpoint: its command
+	if id, _ := trigger["command_id"].(string); continuation != nil && id != "" {
+		spec.InputCheckpointCommand = id
+	}
+	// and runs what its predecessor ran (a rerun in another snapshot goes on
+	// in that snapshot); one reading streams runs what made its checkpoint
+	// (its stages are part of where its streams stand)
+	if len(spec.Streams) > 0 && spec.InputCheckpointCommand != "" {
+		var snapshot, image sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT e.source_snapshot_id,e.image_ref FROM commands c JOIN execution_requests e ON e.id=c.execution_id WHERE c.id=$1`,
+			spec.InputCheckpointCommand).Scan(&snapshot, &image); err != nil {
+			return plannedOrchestrationDecision{}, err
+		}
+		spec.SourceSnapshot, spec.Image = snapshot.String, image.String
+	} else if pred, _ := trigger["predecessor_execution_id"].(string); pred != "" && (reason == "continuation" || reason == "loss_continuation") {
+		var snapshot, image sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT source_snapshot_id,image_ref FROM execution_requests WHERE id=$1`, pred).Scan(&snapshot, &image); err != nil {
+			return plannedOrchestrationDecision{}, err
+		}
+		if snapshot.Valid {
+			spec.SourceSnapshot = snapshot.String
+		}
+		if image.Valid {
+			spec.Image = image.String
+		}
+	}
 	// a rerun in another snapshot of the task's source (kairo task rerun
 	// --source) runs in it; the execution records which
 	if id, _ := trigger["source_snapshot_id"].(string); reason == "rerun" && id != "" {
@@ -618,6 +644,11 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 		Regenerable:          template.Regenerable,
 		NotBefore:            string(template.NotBefore),
 		FinishBy:             string(template.FinishBy),
+		Streams:              template.StreamDecls,
+	}
+	// what each stream's loader holds is the task's too
+	for _, s := range template.StreamDecls {
+		spec.Capacity.RAMBytes += s.Stream.MemoryBytes
 	}
 	// A continuation goes on from where its run was suspended: it started
 	// long ago, so a start_by says nothing of it.

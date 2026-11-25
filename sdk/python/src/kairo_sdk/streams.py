@@ -66,21 +66,36 @@ class Stream:
         *,
         name: str = "",
         window: int = 256,
-        position: dict[str, int] | None = None,
         reconnect_seconds: float = 120.0,
     ) -> None:
         self.address = address
         self.name = name or address
-        self.rank = rank
-        self.world = world
+        self._rank = rank
+        self._world = world
         self.window = max(2, window)
         self.reconnect_seconds = reconnect_seconds
-        self.position: dict[str, int] = {"rank": rank, "record": 0, "sub": 0}
+        self._position: dict[str, int] = {"rank": rank, "record": 0, "sub": 0}
+        self._session = ""
         self._sock: socket.socket | None = None
         self._reader: Any = None
         self._outstanding = 0
         self._ended = False
-        self._connect(position)
+        self._connect(None)
+
+    @property
+    def rank(self) -> int:
+        """The rank this stream takes (fixed when it was opened)."""
+        return self._rank
+
+    @property
+    def position(self) -> dict[str, int]:
+        """Where this rank stands (a copy: the stream keeps its own)."""
+        return dict(self._position)
+
+    @property
+    def world(self) -> int:
+        """The ranks of the stream, as the loader agreed (fixed)."""
+        return self._world
 
     # -- the connection -----------------------------------------------------
 
@@ -91,7 +106,8 @@ class Stream:
             sock.connect(target)
             hello: dict[str, Any] = {"version": PROTOCOL_VERSION, "rank": self.rank, "world": self.world}
             if at is not None:
-                hello["position"] = {"record": int(at["record"]), "sub": int(at.get("sub", 0))}
+                hello["position"] = {"rank": self.rank, "record": int(at["record"]), "sub": int(at.get("sub", 0))}
+                hello["session"] = self._session
             sock.sendall(_frame(_HELLO, json.dumps(hello).encode()))
             reader = sock.makefile("rb", buffering=1 << 20)
             kind, payload = _read_frame(reader)
@@ -107,7 +123,11 @@ class Stream:
         ready = json.loads(payload)
         self._close_socket()
         self._sock, self._reader, self._outstanding = sock, reader, 0
-        self.position = {"rank": self.rank, "record": int(ready["position"]["record"]), "sub": int(ready["position"]["sub"])}
+        if int(ready["world"]) != self.world:
+            sock.close()
+            raise StreamError(f"stream {self.name}: the loader serves {ready['world']} ranks, not {self.world}")
+        self._session = str(ready.get("session", ""))
+        self._position = {"rank": self.rank, "record": int(ready["position"]["record"]), "sub": int(ready["position"]["sub"])}
 
     def _target(self) -> tuple[int, Any]:
         if self.address.startswith("unix:"):
@@ -122,7 +142,7 @@ class Stream:
         pause = 0.5
         while True:
             try:
-                self._connect(self.position)
+                self._connect(self._position)
                 return
             except StreamError:
                 raise
@@ -177,14 +197,14 @@ class Stream:
             if kind == _ITEM:
                 record, sub, flags = struct.unpack_from("<QIB", payload)
                 if flags & 1:
-                    self.position = {"rank": self.rank, "record": record + 1, "sub": 0}
+                    self._position = {"rank": self.rank, "record": record + 1, "sub": 0}
                 else:
-                    self.position = {"rank": self.rank, "record": record, "sub": sub + 1}
+                    self._position = {"rank": self.rank, "record": record, "sub": sub + 1}
                 self._outstanding -= 1
                 return payload[13:]
             if kind == _SKIP:
                 (record,) = struct.unpack("<Q", payload)
-                self.position = {"rank": self.rank, "record": record + 1, "sub": 0}
+                self._position = {"rank": self.rank, "record": record + 1, "sub": 0}
                 continue
             if kind == _END:
                 raise StopIteration
@@ -206,8 +226,8 @@ def dataset(name: str, decode: Callable[[bytes], Any] | None = None, **kwargs: A
 
         def __iter__(self) -> Iterator[Any]:
             info = torch.utils.data.get_worker_info()
-            if info is not None and info.num_workers > 1:
-                raise StreamError(f"stream {name}: one process takes a rank's records: use num_workers=0")
+            if info is not None:
+                raise StreamError(f"stream {name}: the training process takes a rank's records itself (its position goes with its checkpoints): use num_workers=0")
             if self.stream is None:
                 self.stream = open(name, **kwargs)
             for item in self.stream:

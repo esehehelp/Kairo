@@ -84,6 +84,7 @@ func storeMoveWait(ctx context.Context, q queryer, d machine.Store) (string, err
 		{"copies being made there", `SELECT root FROM object_copies WHERE store_id=$1 AND state='copying'`},
 		{"objects being brought there or evicted", `SELECT root FROM object_placements WHERE store_id=$1 AND state IN('fetching','evicting')`},
 		{"objects being fetched from it", `SELECT source_root FROM object_placements WHERE source_store_id=$1 AND state='fetching'`},
+		{"raw files being evicted there", `SELECT root FROM raw_placements WHERE store_id=$1 AND state='evicting'`},
 	} {
 		n := 0
 		err := eachRow(ctx, q, check.query, []any{d.ID}, func(rows *sql.Rows) error {
@@ -181,6 +182,7 @@ func completeStoreMoveTx(ctx context.Context, tx *sql.Tx, declared machine.Store
 		{"object_copies", "object_id||'/'||store_id", "store_id", []string{"root", "path", "manifest_path"}},
 		{"object_placements", "object_id||'/'||store_id", "store_id", []string{"root", "path"}},
 		{"object_placements", "object_id||'/'||store_id", "source_store_id", []string{"source_root"}},
+		{"raw_placements", "sha256||'/'||store_id", "store_id", []string{"root"}},
 	} {
 		type change struct {
 			key    string

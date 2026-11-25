@@ -6,7 +6,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"debug/elf"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -421,6 +424,14 @@ func containerInit(specPath string) int {
 		fmt.Fprintln(stderr, "kairo container:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
+	// each stream's loader, its socket ready before the argv starts
+	loaders, env, err := startLoaders(spec, env, stderr)
+	if err != nil {
+		stopLoaders(loaders)
+		fmt.Fprintln(stderr, "kairo container:", err)
+		return writeShimExit(containerExitIn, shimNotStarted)
+	}
+	defer stopLoaders(loaders)
 	cmd := &exec.Cmd{Path: argv0, Args: spec.Argv, Dir: spec.CWD, Env: env, Stdout: stdout, Stderr: stderr,
 		SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
 	// caught, not ignored: the argv starts with the default dispositions
@@ -434,11 +445,168 @@ func containerInit(specPath string) int {
 		fmt.Fprintln(stderr, "kairo container: start:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
-	exit, sig := reapUntil(cmd.Process.Pid)
+	exit, sig := reapUntil(cmd.Process.Pid, loaders.restart)
 	if sig != 0 {
 		fmt.Fprintf(stderr, "kairo container: %s ended by signal %d (%v)\n", spec.Argv[0], int(sig), sig)
 	}
 	return writeShimExit(containerExitIn, exit)
+}
+
+// loaderReady bounds how long the init waits for a loader's socket.
+const loaderReady = 30 * time.Second
+
+// loaderRestarts: times a loader that ended is started again; its readers
+// come back where they stand.
+const loaderRestarts = 5
+
+// loaderProc is a stream's loader: how it is started, and its process.
+type loaderProc struct {
+	stream   string
+	args     []string
+	dir      string
+	env      []string
+	logs     *os.File
+	pid      int
+	restarts int
+}
+
+// loaderProcs are an attempt's loaders.
+type loaderProcs []*loaderProc
+
+func (p *loaderProc) start() error {
+	cmd := &exec.Cmd{Path: p.args[0], Args: p.args, Dir: p.dir, Env: p.env, Stdout: p.logs, Stderr: p.logs, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	p.pid = cmd.Process.Pid
+	return nil
+}
+
+// restart starts again the loader whose process pid ended (reaped), up to
+// loaderRestarts times: its readers come back at their positions.
+func (l loaderProcs) restart(pid int) {
+	for _, p := range l {
+		if p.pid != pid {
+			continue
+		}
+		p.pid = 0
+		_ = syscall.Kill(-pid, syscall.SIGKILL) // its stages
+		if p.restarts >= loaderRestarts {
+			fmt.Fprintf(p.logs, "kairo container: the loader of stream %s ended %d times: not started again\n", p.stream, p.restarts+1)
+			return
+		}
+		p.restarts++
+		if err := p.start(); err != nil {
+			fmt.Fprintf(p.logs, "kairo container: the loader of stream %s ended and did not start again: %v\n", p.stream, err)
+			return
+		}
+		fmt.Fprintf(p.logs, "kairo container: the loader of stream %s ended; started again (%d)\n", p.stream, p.restarts)
+	}
+}
+
+// startLoaders starts a loader (kairo loader serve) for each stream the
+// argv reads, its spec, positions and socket in /kairo/run/streams/<name>,
+// its stages run from the argv's directory, what it learns reported to the
+// daemon as the attempt; the environment the argv gets has each stream's
+// socket (KAIRO_STREAM_<NAME>).
+func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs, []string, error) {
+	if len(spec.Streams) == 0 {
+		return nil, env, nil
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return nil, env, err
+	}
+	var procs loaderProcs
+	for _, s := range spec.Streams {
+		dir := path.Join(containerRoot, "run", "streams", s.Name)
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return procs, env, err
+		}
+		ls := s.Spec
+		for i := range ls.Stages {
+			if ls.Stages[i].Dir == "" {
+				ls.Stages[i].Dir = spec.CWD
+			}
+		}
+		specPath, sock := path.Join(dir, "spec.json"), path.Join(dir, "socket")
+		body, err := json.Marshal(ls)
+		if err != nil {
+			return procs, env, err
+		}
+		if err := os.WriteFile(specPath, body, 0o600); err != nil {
+			return procs, env, err
+		}
+		// one session for the attempt: takers come back to a restarted
+		// loader with it, never with a position of another attempt's
+		var session [16]byte
+		_, _ = rand.Read(session[:])
+		args := []string{self, "loader", "serve", "--spec", specPath, "--listen", "unix:" + sock, "--session", hex.EncodeToString(session[:]), "--state", filepath.Dir(specPath)}
+		if len(s.Positions) > 0 {
+			positions, _ := json.Marshal(s.Positions)
+			p := path.Join(dir, "positions.json")
+			if err := os.WriteFile(p, positions, 0o600); err != nil {
+				return procs, env, err
+			}
+			args = append(args, "--positions", p, "--world", strconv.Itoa(s.World))
+		}
+		if spec.RawDir != "" {
+			args = append(args, "--raw", spec.RawDir)
+		}
+		p := &loaderProc{stream: s.Name, args: args, dir: spec.CWD, env: env, logs: logs}
+		if err := p.start(); err != nil {
+			return procs, env, fmt.Errorf("stream %s: start its loader: %w", s.Name, err)
+		}
+		procs = append(procs, p)
+		deadline := time.Now().Add(loaderReady)
+		for {
+			if _, err := os.Stat(sock); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return procs, env, fmt.Errorf("stream %s: its loader did not listen within %s", s.Name, loaderReady)
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		env = append(env, s.Env+"=unix:"+sock)
+	}
+	return procs, env, nil
+}
+
+// stopLoaders ends the loaders' process groups (their stages with them):
+// asked to end, then killed.
+func stopLoaders(procs loaderProcs) {
+	var groups []int
+	for _, p := range procs {
+		if p.pid > 0 {
+			groups = append(groups, p.pid)
+			p.restarts = loaderRestarts // not started again
+		}
+	}
+	if len(groups) == 0 {
+		return
+	}
+	for _, g := range groups {
+		_ = syscall.Kill(-g, syscall.SIGTERM)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		alive := false
+		for _, g := range groups {
+			if syscall.Kill(-g, 0) == nil {
+				alive = true
+			}
+		}
+		if !alive {
+			return
+		}
+		var ws syscall.WaitStatus
+		_, _ = syscall.Wait4(-1, &ws, syscall.WNOHANG, nil)
+		time.Sleep(50 * time.Millisecond)
+	}
+	for _, g := range groups {
+		_ = syscall.Kill(-g, syscall.SIGKILL)
+	}
 }
 
 // networkWait bounds how long the init waits for the container's network:
@@ -489,7 +657,7 @@ func hasDefaultRoute(route4, route6 string) bool {
 // reapUntil reaps the container's processes until pid exits, and returns
 // its exit (-1 when a signal ended it, as exec's ExitCode says, with the
 // signal).
-func reapUntil(pid int) (int, syscall.Signal) {
+func reapUntil(pid int, other func(pid int)) (int, syscall.Signal) {
 	for {
 		var ws syscall.WaitStatus
 		wpid, err := syscall.Wait4(-1, &ws, 0, nil)
@@ -498,6 +666,9 @@ func reapUntil(pid int) (int, syscall.Signal) {
 		}
 		if err != nil {
 			return -1, 0
+		}
+		if wpid != pid && other != nil {
+			other(wpid)
 		}
 		if wpid == pid {
 			if ws.Exited() {

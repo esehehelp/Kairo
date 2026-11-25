@@ -14,7 +14,7 @@ import (
 // The answer names what changed, not the project's whole status.
 func (s *Server) applyProject(w http.ResponseWriter, r *http.Request) {
 	var manifest orchestration.Manifest
-	if err := decode(r, &manifest); err != nil {
+	if err := decodeUpTo(r, &manifest, 64<<20); err != nil {
 		writeError(w, err)
 		return
 	}
