@@ -18,12 +18,15 @@ import (
 )
 
 type Manifest struct {
-	SchemaVersion        int                `toml:"schema_version" json:"schema_version"`
-	ClientRequestID      string             `toml:"client_request_id" json:"client_request_id"`
-	Project              string             `toml:"project" json:"project"`
-	Queue                string             `toml:"queue" json:"queue,omitempty"`
-	Task                 string             `toml:"task" json:"task,omitempty"`
-	Argv                 []string           `toml:"argv" json:"argv"`
+	SchemaVersion   int      `toml:"schema_version" json:"schema_version"`
+	ClientRequestID string   `toml:"client_request_id" json:"client_request_id"`
+	Project         string   `toml:"project" json:"project"`
+	Queue           string   `toml:"queue" json:"queue,omitempty"`
+	Task            string   `toml:"task" json:"task,omitempty"`
+	Argv            []string `toml:"argv" json:"argv"`
+	// Image is the image the execution runs in, pinned to its digest
+	// (registry/repository@sha256:...); every executor runs containers.
+	Image                string             `toml:"image" json:"image,omitempty"`
 	CWD                  string             `toml:"cwd" json:"cwd"`
 	Priority             int                `toml:"priority" json:"priority"`
 	Checkpointable       bool               `toml:"checkpointable" json:"checkpointable"`

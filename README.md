@@ -958,7 +958,7 @@ argv = ["python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
 
 #### Incus Executor の要件と設定
 
-イメージを指定した Execution を受け付けるのはコンテナ実行用 Executor のみであり、コンテナ実行用 Executor はそれ以外の Execution を受け付けません。`kind = "incus"`・`kind = "pct"`・`kind = "wslc"` の Executor は属性 `runtime`（値は kind と同じ）を登録し（`labels` に `runtime` を手動指定すると拒否され、`kind` のみが設定できます）、イメージを持つ Execution のセレクタにはイメージ指定に基づいて `"container": true` が自動設定されます（呼び出し元から直接設定することはできません）。
+**すべての Task はコンテナで動きます。** image を指定しない Task を含む宣言は `kairo project apply` で拒否され、image を持たない Execution の直接投入（`POST /api/executions`、`kairo execution submit`。`image` にはダイジェスト固定の参照 `registry/repository@sha256:...` を書きます）も拒否されます。どの Executor もコンテナを動かすため、そうした仕事は実行先がなく、待ち続けるだけだからです。イメージを指定した Execution を受け付けるのはコンテナ実行用 Executor のみであり、コンテナ実行用 Executor はそれ以外の Execution を受け付けません。`kind = "incus"`・`kind = "pct"`・`kind = "wslc"` の Executor は属性 `runtime`（値は kind と同じ）を登録し（`labels` に `runtime` を手動指定すると拒否され、`kind` のみが設定できます）、イメージを持つ Execution のセレクタにはイメージ指定に基づいて `"container": true` が自動設定されます（呼び出し元から直接設定することはできません）。
 
 `kind = "incus"` の Executor は Linux 上で動作し、ノード上の他の Executor と並存できます。
 

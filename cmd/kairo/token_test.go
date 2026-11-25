@@ -157,7 +157,7 @@ func TestTokenCreateSaveFeedsTheClient(t *testing.T) {
 		t.Fatalf("doctor: %q", out)
 	}
 	path := filepath.Join(t.TempDir(), "execution.toml")
-	writeFile(t, path, "schema_version = 2\nclient_request_id = \"req-1\"\nproject = \"p\"\nargv = [\"echo\"]\ncwd = \".\"\n")
+	writeFile(t, path, "schema_version = 2\nclient_request_id = \"req-1\"\nproject = \"p\"\nargv = [\"echo\"]\ncwd = \"/\"\nimage = \"docker.io/library/python@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b\"\n")
 	if out, err = captureStdout(t, func() error { return run([]string{"execution", "submit", "--api", server.URL, path}) }); err != nil {
 		t.Fatalf("submit against the real API: %v %s", err, out)
 	}

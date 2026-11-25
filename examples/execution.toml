@@ -3,14 +3,16 @@ client_request_id = "example-001"
 project = "example-train"
 queue = "training"
 task = "pretrain"
+# the image it runs in, pinned to its digest; cwd is a path in it
+image = "docker.io/library/python@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b"
 argv = ["python", "train.py"]
-cwd = "D:/work/example-train"
+cwd = "/work"
 priority = 0
 checkpointable = true
 preemptible = true
 
 [executor]
-labels = { environment = "windows" }
+labels = { site = "host-a" }
 
 [[exclusive]]
 kind = "gpu"

@@ -3,6 +3,15 @@ schema_version = 1
 [project]
 name = "example-project"
 
+# Every task runs in a container: its image, and the project's code
+# (a snapshot of this directory, read-only at /kairo/src).
+[images.uv]
+ref = "ghcr.io/astral-sh/uv:python3.12-bookworm"
+
+[sources.example-project]
+root = "."
+paths = ["src", "configs", "pyproject.toml", "uv.lock"]
+
 [[tasks]]
 name = "train"
 queue = "training"
@@ -12,13 +21,15 @@ policy = "RunToCompletion@v1"
 [tasks.execution]
 schema_version = 2
 argv = ["uv", "run", "project", "train", "--config", "configs/train/model-v1.toml"]
-cwd = "D:/work/example-project"
+image = "uv"
+source = "example-project"
+cwd = "."
 priority = 10
 checkpointable = true
 preemptible = true
 
 [tasks.execution.executor]
-labels = { environment = "windows" }
+labels = { site = "host-a" }
 
 [[tasks.execution.exclusive]]
 kind = "gpu"
@@ -44,13 +55,15 @@ policy = "RunToCompletion@v1"
 [tasks.execution]
 schema_version = 2
 argv = ["uv", "run", "project", "export", "--config", "configs/export/model-v1.toml"]
-cwd = "D:/work/example-project"
+image = "uv"
+source = "example-project"
+cwd = "."
 priority = 10
 checkpointable = false
 preemptible = false
 
 [tasks.execution.executor]
-labels = { environment = "windows" }
+labels = { site = "host-a" }
 
 [[tasks.execution.exclusive]]
 kind = "gpu"

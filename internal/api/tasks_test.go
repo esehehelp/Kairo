@@ -160,14 +160,15 @@ func TestTaskDetailOverTheAPI(t *testing.T) {
 	expectError(t, "unknown task", status, raw, http.StatusNotFound, "not_found")
 }
 
-// launchNext launches the next waiting execution on executor "executor".
+// launchNext launches the next waiting execution on executor "executor",
+// which runs containers (the tasks' images).
 func (d *testDaemon) launchNext(t *testing.T) *store.Launch {
 	t.Helper()
 	ctx := context.Background()
 	if err := d.store.UpsertNode(ctx, store.Node{ID: "node", Name: "node", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.store.UpsertExecutor(ctx, store.Executor{ID: "executor", NodeID: "node", Kind: "local", Attributes: json.RawMessage(`{}`), Enabled: true}); err != nil {
+	if err := d.store.UpsertExecutor(ctx, store.Executor{ID: "executor", NodeID: "node", Kind: "incus", Attributes: json.RawMessage(`{"runtime":"incus"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	reservation, err := d.store.ReserveNext(ctx, "executor")

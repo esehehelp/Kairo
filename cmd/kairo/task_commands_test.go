@@ -366,6 +366,8 @@ func TestVersionComparesCLIAndDaemon(t *testing.T) {
 const applySpec = `schema_version = 1
 [project]
 name = "p"
+[images.py]
+ref = "docker.io/library/python@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b"
 [[tasks]]
 name = "t"
 queue = "q"
@@ -375,6 +377,7 @@ policy = "RunToCompletion@v1"
 schema_version = 2
 argv = ["worker"]
 cwd = "/work"
+image = "py"
 checkpointable = false
 preemptible = false
 [[tasks]]
@@ -386,6 +389,7 @@ policy = "RunToCompletion@v1"
 schema_version = 2
 argv = ["worker"]
 cwd = "/work"
+image = "py"
 checkpointable = false
 preemptible = false
 `
