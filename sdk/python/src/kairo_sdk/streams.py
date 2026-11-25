@@ -236,6 +236,31 @@ def dataset(name: str, decode: Callable[[bytes], Any] | None = None, **kwargs: A
     return StreamDataset()
 
 
+def sample(item: bytes) -> dict[str, bytes]:
+    """A WebDataset sample (format ``webdataset`` without a field) as its
+    members by name: ``__key__`` and each extension (``jpg``, ``json``, ...)."""
+    out: dict[str, bytes] = {}
+    view = memoryview(item)
+    try:
+        (count,) = struct.unpack_from("<I", view, 0)
+        at = 4
+        for _ in range(count):
+            (size,) = struct.unpack_from("<I", view, at)
+            name = bytes(view[at + 4 : at + 4 + size]).decode()
+            at += 4 + size
+            (size,) = struct.unpack_from("<I", view, at)
+            data = bytes(view[at + 4 : at + 4 + size])
+            if len(data) != size:
+                raise struct.error("cut short")
+            out[name] = data
+            at += 4 + size
+    except struct.error as err:
+        raise StreamError(f"not a sample: {err}") from err
+    if at != len(item):
+        raise StreamError(f"not a sample: {len(item) - at} bytes after its members")
+    return out
+
+
 def _frame(kind: int, payload: bytes) -> bytes:
     return struct.pack("<IB", len(payload) + 1, kind) + payload
 

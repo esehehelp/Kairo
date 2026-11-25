@@ -146,7 +146,7 @@ func TestFormatsFrameRecords(t *testing.T) {
 	if got := readAll(t, []byte("whole\nfile"), "x", "file", ""); !reflect.DeepEqual(got, []string{"whole\nfile"}) {
 		t.Fatalf("file %q", got)
 	}
-	for _, bad := range []struct{ f, field string }{{"csv", ""}, {"text.xz", ""}, {"text", "x"}} {
+	for _, bad := range []struct{ f, field string }{{"xml", ""}, {"text.xz", ""}, {"text", "x"}, {"parquet.gz", ""}} {
 		if _, err := parseFormat(bad.f, bad.field); err == nil {
 			t.Fatalf("format %+v taken", bad)
 		}

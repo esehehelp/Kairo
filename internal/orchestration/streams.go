@@ -2,6 +2,7 @@ package orchestration
 
 import (
 	"fmt"
+	"kairo/internal/loader"
 	"net/url"
 	"path"
 	"regexp"
@@ -82,11 +83,10 @@ type StreamDecl struct {
 }
 
 var (
-	streamName  = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
-	hfRepo      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$`)
-	commitHash  = regexp.MustCompile(`^[0-9a-f]{40}$`)
-	sha256Hex   = regexp.MustCompile(`^[0-9a-f]{64}$`)
-	knownFormat = map[string]bool{"text": true, "jsonl": true, "lenbin": true, "file": true}
+	streamName = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
+	hfRepo     = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+	commitHash = regexp.MustCompile(`^[0-9a-f]{40}$`)
+	sha256Hex  = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
 // StreamEnv is the environment variable of stream name: KAIRO_STREAM_ and
@@ -196,9 +196,8 @@ func normalizeStreams(m *Manifest) error {
 			if _, ok := m.Raws[src.Raw]; !ok {
 				return fmt.Errorf("stream %q source %d reads raw %q, which is no [raws.%s]", name, i, src.Raw, src.Raw)
 			}
-			framing, compression, _ := strings.Cut(src.Format, ".")
-			if !knownFormat[framing] || compression != "" && compression != "zst" && compression != "gz" && compression != "bz2" || src.Field != "" && framing != "jsonl" {
-				return fmt.Errorf("stream %q source %d: format %q (field %q): text, jsonl, lenbin or file, then .zst, .gz or .bz2 or nothing; a field for jsonl", name, i, src.Format, src.Field)
+			if _, err := loader.CountKey(src.Format, src.Field, ""); err != nil {
+				return fmt.Errorf("stream %q source %d: %w", name, i, err)
 			}
 			if src.Weight == 0 {
 				s.Sources[i].Weight = 1
