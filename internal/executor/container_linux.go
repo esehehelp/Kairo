@@ -306,7 +306,9 @@ func chownTree(root string, m idMap) error {
 	}
 	if lst.Mode&unix.S_IFMT != unix.S_IFDIR {
 		// a file (an attempt's log): itself, a link's own owner
-		if err := m.hand(lst, func(uid, gid int) error { return unix.Fchownat(unix.AT_FDCWD, root, uid, gid, unix.AT_SYMLINK_NOFOLLOW) }); err != nil {
+		if err := m.hand(lst, func(uid, gid int) error {
+			return unix.Fchownat(unix.AT_FDCWD, root, uid, gid, unix.AT_SYMLINK_NOFOLLOW)
+		}); err != nil {
 			return &os.PathError{Op: "chown", Path: root, Err: err}
 		}
 		return nil
