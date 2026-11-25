@@ -67,6 +67,11 @@ func permutation(n int, seed uint64) []int {
 	return p
 }
 
+// OrderVersion is the version of the order this package makes (every step
+// of it: files, records, mix, blocks, ranks): a checkpoint's positions say
+// which they are of, and a stream goes on only from positions of its own.
+const OrderVersion = 1
+
 // maxMixPeriod bounds the sum of a mix's weights: one period of its pattern
 // is kept.
 const maxMixPeriod = 1 << 16

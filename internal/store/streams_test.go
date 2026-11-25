@@ -77,39 +77,49 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 		t.Fatalf("RAM %d (the task's and the loader's): %v", ram, err)
 	}
 
-	// what the loader learned
+	// what the agent learned: an identity (the first of a URL stands), a
+	// record count it counted (the first stands), for an executor whose
+	// leased executions' streams read the file
 	f, err := loader.Identify(strings.NewReader("whatever the file holds"), "part-0.jsonl.zst", loader.DefaultChunkBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
 	f.URL = url
-	report := StreamReport{Identities: []loader.File{f}, Records: []RecordsCount{{URL: url, SHA256: f.SHA256, Format: "jsonl.zst", Field: "text", Records: 42}}}
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, report); err != nil {
+	if _, found, err := store.RawIdentity(ctx, "ctr", url); err != nil || found {
+		t.Fatalf("an identity before any: %v %v", found, err)
+	}
+	if err := store.RawPlaced(ctx, "ctr", "", "", f); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, report); err != nil {
-		t.Fatalf("the same again: %v", err)
+	if kept, found, err := store.RawIdentity(ctx, "ctr", url); err != nil || !found || kept.SHA256 != f.SHA256 || len(kept.Chunks) != 1 {
+		t.Fatalf("identity %+v %v %v", kept, found, err)
 	}
 	changed := f
 	changed.SHA256 = strings.Repeat("e", 64)
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, StreamReport{Identities: []loader.File{changed}}); !errors.Is(err, ErrRawChanged) {
+	if err := store.RawPlaced(ctx, "ctr", "", "", changed); !errors.Is(err, ErrRawChanged) {
 		t.Fatalf("another identity of the URL: %v", err)
 	}
-	wrongCount := StreamReport{Records: []RecordsCount{{URL: url, SHA256: f.SHA256, Format: "jsonl.zst", Field: "text", Records: 41}}}
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, wrongCount); !errors.Is(err, ErrRawChanged) {
+	count := RecordsCount{URL: url, SHA256: f.SHA256, Format: "jsonl.zst", Field: "text", Records: 42}
+	if err := store.RawRecords(ctx, "ctr", count); err != nil {
+		t.Fatal(err)
+	}
+	wrong := count
+	wrong.Records = 41
+	if err := store.RawRecords(ctx, "ctr", wrong); !errors.Is(err, ErrRawChanged) {
 		t.Fatalf("another record count: %v", err)
 	}
-	otherFormat := StreamReport{Records: []RecordsCount{{URL: url, SHA256: f.SHA256, Format: "text", Records: 7}}}
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, otherFormat); !errors.Is(err, ErrStreamReportRefused) {
+	asText := count
+	asText.Format, asText.Field = "text", ""
+	if err := store.RawRecords(ctx, "ctr", asText); !errors.Is(err, ErrStreamReportRefused) {
 		t.Fatalf("a count as no source reads it: %v", err)
-	}
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch+1, report); !errors.Is(err, ErrStaleEpoch) {
-		t.Fatalf("another epoch: %v", err)
 	}
 	other := f
 	other.URL = "https://example.org/elsewhere"
-	if err := store.RecordStreamReport(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, StreamReport{Identities: []loader.File{other}}); !errors.Is(err, ErrStreamReportRefused) {
-		t.Fatalf("a file of no stream of the attempt: %v", err)
+	if err := store.RawPlaced(ctx, "ctr", "", "", other); !errors.Is(err, ErrStreamReportRefused) {
+		t.Fatalf("a file of no stream leased there: %v", err)
+	}
+	if _, _, err := store.RawIdentity(ctx, "executor", url); !errors.Is(err, ErrStreamReportRefused) {
+		t.Fatalf("asked by an executor leasing nothing reading it: %v", err)
 	}
 	streams, err := launchStreamsTx(ctx, store.db, launch.Execution.ID)
 	if err != nil {
@@ -128,16 +138,20 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 	}
 	for _, bad := range []string{
 		`{"continuation_ref":"ckpt-1"}`,
-		`{"continuation_ref":"ckpt-1","streams":{"other":[{"rank":0,"record":5}]}}`,
-		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":1,"record":5}]}}`,
-		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":0,"record":5},{"rank":0,"record":6}]}}`,
-		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":0,"record":-1}]}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"other":{"world":1,"order":1,"positions":[{"rank":0,"record":5}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":1,"order":1,"positions":[{"rank":1,"record":5}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":2,"order":1,"positions":[{"rank":0,"record":5},{"rank":0,"record":6}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":2,"order":1,"positions":[{"rank":0,"record":5}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":1,"order":1,"positions":[{"rank":0,"record":-1}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":1,"order":2,"positions":[{"rank":0,"record":5}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":1,"order":1,"positions":[{"rank":0,"record":5,"sub":4294967296}]}}}`,
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":0,"record":5}]}}`,
 	} {
 		if err := checkStreamPositionsTx(ctx, store.db, launch.Execution.ID, []byte(bad)); !errors.Is(err, ErrStreamPositions) {
 			t.Fatalf("%s: %v", bad, err)
 		}
 	}
-	good := `{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":1,"record":4,"sub":0},{"rank":0,"record":5,"sub":1}]}}`
+	good := `{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":2,"order":1,"positions":[{"rank":1,"record":4,"sub":0},{"rank":0,"record":5,"sub":1}]}}}`
 	if err := checkStreamPositionsTx(ctx, store.db, launch.Execution.ID, []byte(good)); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +163,7 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 	// another publication of the same reference does not stand for it
 	if _, err := store.testExec(`INSERT INTO command_acks(command_id,attempt_id,coordination_epoch,phase,payload_json,created_at)
 		VALUES('cmd_1',$1,$2,'checkpointed',$3,'2026-11-25T00:00:01Z')`, launch.Attempt.ID, launch.Lease.CoordinationEpoch,
-		`{"continuation_ref":"ckpt-1","streams":{"mix-1":[{"rank":0,"record":99},{"rank":1,"record":99}]}}`); err != nil {
+		`{"continuation_ref":"ckpt-1","streams":{"mix-1":{"world":2,"order":1,"positions":[{"rank":0,"record":99},{"rank":1,"record":99}]}}}`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.testExec(`UPDATE execution_requests SET input_continuation_ref='ckpt-1' WHERE id=$1`, launch.Execution.ID); err != nil {
@@ -162,7 +176,7 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	streams, err = launchStreamsTx(ctx, store.db, launch.Execution.ID)
-	if err != nil || len(streams[0].Positions) != 2 {
+	if err != nil || len(streams[0].Positions) != 2 || streams[0].World != 2 {
 		t.Fatalf("continuation streams %+v %v", streams, err)
 	}
 	got0 := streams[0].Positions

@@ -462,7 +462,7 @@ key_file = "/etc/kairo/pack-key.pem"
 | `POST` | `/api/hardware/{host}/{device}/bench` | `admin` |
 | `GET` | `/api/hardware/{host}/profile`（`?device=`） | `read` |
 | `POST` | `/api/agent/{operation}`, `/api/agent/logs` | `node` |
-| `POST` | `/api/worker/heartbeat`, `/api/worker/processes`, `/api/worker/streams` | worker |
+| `POST` | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
 | `GET` | `/api/worker/commands` | worker |
 | `POST` | `/api/worker/commands/{command}/acks` | worker |
 | `GET` | `/api/worker/bench`, `/api/worker/bench/cpu-energy` | worker（ベンチマークの Attempt） |
@@ -1765,21 +1765,23 @@ streams = ["mix"]           # → KAIRO_STREAM_MIX
 
 ### raw キャッシュ
 
-学習側に渡すのは、照合が済んだバイトだけです。そのために、raw ファイルはノードの volatile store を一度経由します。
+学習側に渡すのは、照合が済んだバイトだけです。そのために、raw ファイルはノードの volatile store を一度経由します。識別情報とレコード数は、他の Run も頼りにするため、すべて agent が自分で計算したものだけを記録します（学習コードが送るものは記録しません）。
 
-- **置き場所**: Attempt の volatile store（`<root>/raw/<sha256>`）。コンテナには読み取り専用で `/kairo/raw` としてマウントされ、そのノードの agent のソケット（`/kairo/raw/.agent.sock`）が入っています。
-- **手順**: Loader はファイルを読む前に agent に頼みます（`POST /ensure`）。agent は、置いてあればそれを渡します。なければ、上流から `<root>/raw/.partial` へ 1 回だけ取り寄せながら、識別情報があればチャンクごとに照合し、なければ識別情報を作って最後に公開済みの sha256 とサイズと照合します。そして、識別情報とファイルを置いたことをデーモンに記録（エージェント操作 `raw-placed`、テーブル `raw_identities`・`raw_placements`）してから、置き場所へ名前を変えて渡します。Loader は置かれたファイルを、チャンクごとにもう一度照合しながら読みます。照合が合わない、公開済みの値と違う、デーモンが別の識別情報を記録している、のいずれかなら、何も残さずに stream を止めます（`raw data changed`）。
-- **大きすぎるファイル**: store の空きから予約分を引いた量より大きいファイルは置きません。agent は識別のためだけに一度読み（記録はする）、Loader はそのファイルを上流から照合しながら読みます（初回は 2 回取り寄せることになります）。
-- **追い出し**: 置いたファイルは、store の空きが下限を下回ると、最後に使われたのが古いものから消されます（[エビクション](#エビクションevicting)）。読んでいる最中の Loader は、そのまま読み続けられます。消えたファイルが再び要るときは、上流から取り寄せ直します。
-- **同時の依頼**: 同じ URL への依頼が重なったら、取り寄せは 1 回にまとめます。
-- **Loader 単体**: `kairo loader serve --raw DIR` で、このキャッシュを使います。`--raw` なしでは上流（`--origin`）から直接読み、まだ識別されていないファイルは読みながら識別します（そのときは、末尾で照合するまで照合前のバイトが渡ります）。
+- **置き場所**: Attempt の volatile store に、取り寄せたファイル（`<root>/raw/<sha256>`）と、取り寄せ中のもの（`<root>/raw/.partial`）を置きます。どちらも、どの Attempt にも見せません。
+- **Attempt ごとの窓口**: stream を読む Attempt には、起動時に専用の窓口 `<root>/raw/views/<attempt id>/` を作り、そのコンテナに読み取り専用で `/kairo/raw` としてマウントします。中身は、その Attempt 専用の agent のソケット（`.sock`）と、渡したファイルのハードリンクだけです。そのソケットへの依頼はその Attempt のものとして扱い、起動時（デーモンから来た Launch）にその Attempt の stream が読むと宣言されたファイルしか受け付けません。窓口の一覧は `<root>/raw/.attempts/<attempt id>.json` に残し、agent が再起動しても、走り続けている Attempt の窓口を開き直します。Attempt がそのノードで 10 分見えなくなったら、窓口を消します。
+- **手順**: Loader はファイルを読む前に、URL を示して agent に頼みます（`POST /ensure`）。agent は、その URL についてデーモンが持つ識別情報（最初の 1 つ）を先に聞き（エージェント操作 `raw-identity`）、それと同じファイルを置いてあれば使います。なければ上流から `.partial` へ 1 回だけ取り寄せながら、書いたバイトそのものからファイル全体とチャンクごとの sha256 を計算し、デーモンの識別情報（あれば）と、公開済みの sha256・サイズと照合します。識別情報とファイルを置いたことをデーモンに記録し（`raw-placed`。デーモンが応えない間は、照合済みのファイルを残したまま 1 時間まで記録し直します）、置き場所へ名前を変えます。最後に、依頼した Attempt 自身の宣言（起動時の識別情報、または公開済みの値）とも照合してから、その窓口へハードリンクして渡します。Loader はそのファイルを、チャンクごとにもう一度照合しながら読みます。照合が合わない、公開済みの値と違う、デーモンが別の識別情報を記録している、のいずれかなら、何も残さずに stream を止めます（`raw data changed`）。宣言にないファイルの依頼は拒否され、stream は止まります。
+- **レコード数**: 置いたファイルは、その Attempt の source が読む形式・フィールドごとに、agent が数えてデーモンに記録します（`raw-records`。最初の数が残り、違う数は `raw data changed`）。以後の起動は、この数でファイルを丸ごと飛ばして途中から始められます。
+- **大きすぎるファイル**: store の空き（追い出しの下限と、取り寄せ中のほかのファイルの分を引いた量）より大きいファイルは置きません。取り寄せの途中でディスクが一杯になったときも同じです。まだ識別されていなければ agent が識別のためだけに一度読み（記録はする）、Loader はそのファイルを上流から照合しながら読みます（初回は 2 回取り寄せることになり、コンテナから上流へ出られる必要があります）。
+- **追い出し**: 置いたファイルは、store の空きが下限を下回ると、最後に使われたのが古いものから消されます（[エビクション](#エビクションevicting)）。すでに渡したものは各 Attempt の窓口のハードリンクとして残り、その Attempt が終わるまで読めます。消えたファイルが再び要るときは、上流から取り寄せ直します。
+- **同時の依頼**: 同じ URL への依頼が重なったら、取り寄せは 1 回にまとめ、結果は依頼した Attempt ごとに、それぞれの宣言と照合します。
+- **Loader 単体**: `kairo loader serve --raw DIR` で、このキャッシュ（その Attempt の窓口）を使います。`--raw` なしでは上流（`--origin`）から直接読み、まだ識別されていないファイルは読みながら識別します（そのときは、末尾で照合するまで照合前のバイトが渡り、識別情報はどこにも記録されません）。
 
 ### 起動、識別、位置
 
 - **起動**: Attempt のコンテナの中で、本体より先に stream ごとに `kairo loader serve` が起動します。spec と位置は `/kairo/run/streams/<名前>/`、ソケットは同じ場所の `socket` です。ソケットができてから本体が `KAIRO_STREAM_<NAME>=unix:...` 付きで起動し、本体が終わると Loader（とその stage）も終わります。stage は Task の image とソースで、Task の `cwd` から動きます。Loader のログは Attempt の stderr に出ます。
-- **識別**: ファイルの識別情報は、raw キャッシュの agent が記録します（上記）。分かったレコード数は、Loader が Attempt（その Lease と epoch）としてデーモンに送ります（`POST /api/worker/streams`、テーブル `raw_records`。raw キャッシュなしで動く Loader は識別情報もここに送ります）。受け付けるのは、その Attempt の stream が読むファイルのものだけです。URL ごとに最初の識別情報が残り、公開済みの値と違うもの、すでにあるものと少しでも違うもの（サイズ、sha256、チャンク）は `raw data changed` です。レコード数は、識別済みのファイルを、その Attempt の stream のどれかが読む形式・フィールドで数えたものだけを、区切り・実際の圧縮・フィールドごとに残します（違う数は `raw data changed`）。以後の起動では、どのチャンクもこれと照合され、長さが違えば（短くても長くても）変わったものとして扱います。
-- **位置と checkpoint**: SDK の `safe_point(..., streams=[train])`（torch の `DistributedAdapter.safe_point(..., streams=[train])` は全 rank の位置を集めます）は、checkpoint を公開するとき、各 stream の各 rank の位置を `checkpointed` の payload に `"streams": {NAME: [位置...]}` として入れます。stream を読む Execution の checkpoint は、読むすべての stream について rank 0〜W-1 の位置がちょうど 1 つずつ（負の値なし）なければ拒否されます（`safe_point` に stream を渡し忘れると、公開されません）。
-- **続き**: continuation（suspend 後、ロスト後、`rerun --from-checkpoint`）は、続けるもとの checkpoint を、その command で覚えています（`input_checkpoint_command_id`）。Loader は、その command の受理された payload が言う位置から始め、rank の数（W）はその位置の数に固定されます（別の数で接続した rank は拒否されます）。同じ参照で公開された別の checkpoint の位置が使われることはありません。また、continuation は前の Execution と同じコードスナップショットとイメージで動きます（`rerun --source` で別のスナップショットに替えた Run は、その続きもそのスナップショットです）。
+- **識別**: ファイルの識別情報とレコード数は、raw キャッシュの agent が計算して記録します（上記。テーブル `raw_identities`・`raw_records`）。受け付けるのは、その Executor に Lease のある Execution の stream が読むファイルのものだけです。URL ごとに最初の識別情報が残り、公開済みの値と違うもの、すでにあるものと少しでも違うもの（サイズ、sha256、チャンク）は `raw data changed` です。レコード数は、区切り・実際の圧縮・フィールドごとに残します。以後の起動では、どのチャンクもこれと照合され、長さが違えば（短くても長くても）変わったものとして扱います。
+- **位置と checkpoint**: SDK の `safe_point(..., streams=[train])`（torch の `DistributedAdapter.safe_point(..., streams=[train])` は全 rank の位置を集めます）は、checkpoint を公開するとき、各 stream について rank の数（`world`）、順番の版（`order`、いまは 1）、各 rank の位置を `checkpointed` の payload に `"streams": {NAME: {"world": W, "order": 1, "positions": [...]}}` として入れます。stream を読む Execution の checkpoint は、読むすべての stream について、順番の版が同じで、rank 0〜W-1 の位置がちょうど 1 つずつ（負の値なし、上限内）なければ拒否されます（`safe_point` に stream を渡し忘れると、公開されません）。
+- **続き**: continuation（suspend 後、ロスト後、`rerun --from-checkpoint`）は、続けるもとの checkpoint を、その command で覚えています（`input_checkpoint_command_id`）。Loader は、その command の受理された payload が言う位置から始め、rank の数は payload の `world` に固定されます（別の数で接続した rank は拒否されます）。同じ参照で公開された別の checkpoint の位置が使われることはありません。あるレコードの途中の位置（`sub`）は、そのレコードの出力がそれより少なければ誤りとして stream を止めます（stage が変わったということなので、調整はしません）。stream を読む Task の continuation は、その checkpoint を公開した Execution と同じコードスナップショットとイメージで動きます（stage も位置の一部だからです）。そのため、そうした Task に `rerun --from-checkpoint` と `--source` を同時に指定すると拒否されます。stream を読まない Task の continuation は、前の Execution と同じスナップショットとイメージで動きます（`rerun --source` で替えた Run は、その続きもそのスナップショットです）。
 - **ストリームの終わりと失敗**: 終わり（`end`）と失敗（`error`）は、取り逃した rank が接続し直したときにも、もう一度渡されます。失敗した stream は、巻き戻しで作り直されることはありません。Loader のプロセスが終わったら、コンテナの init が起動し直し（5 回まで）、各 rank は自分の位置で接続し直します。
 - **メモリ**: 各 rank のために先に作っておく分は、件数（4096 件）とバイト数（`memory_bytes` の 4 分の 1 を rank で分けた分、最低 1 MiB。宣言がなければ rank ごとに 64 MiB）の両方で抑えます。
 

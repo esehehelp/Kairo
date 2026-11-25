@@ -58,6 +58,10 @@ type Coordinator interface {
 	// RawPlaced: a raw file fetched, checked and kept on a volatile store
 	// for streams (rawcache.go), and its identity.
 	RawPlaced(ctx context.Context, executorID, storeID, root string, f loader.File) error
+	// RawIdentity: what a raw file was found to be the first time it was
+	// read; RawRecords: how many records a kept one holds, as counted here.
+	RawIdentity(ctx context.Context, executorID, url string) (loader.File, bool, error)
+	RawRecords(ctx context.Context, executorID string, count store.RecordsCount) error
 	// InputGone: an input's path is not there at launch.
 	InputGone(ctx context.Context, executorID, objectID, path string) error
 	// InputIsFile: an import read in place is a file, not a directory.

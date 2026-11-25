@@ -231,7 +231,11 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		if err != nil {
 			return nil, fmt.Errorf("the raw cache of store %s: %w", s.decl.ID, err)
 		}
-		spec.Mounts = append(spec.Mounts, containerMount{Source: raw.dir, Path: containerRoot + "/raw", ReadOnly: true})
+		view, err := raw.attach(launch)
+		if err != nil {
+			return nil, fmt.Errorf("the raw cache of store %s: %w", s.decl.ID, err)
+		}
+		spec.Mounts = append(spec.Mounts, containerMount{Source: view, Path: containerRoot + "/raw", ReadOnly: true})
 		spec.RawDir = containerRoot + "/raw"
 	}
 	for _, in := range launch.Inputs {

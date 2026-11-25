@@ -216,6 +216,7 @@ func (e *Local) tick(ctx context.Context) error {
 	e.endStep()
 	e.beginStep("stores")
 	e.storeWork().refreshStores(ctx)
+	e.storeWork().keepRawCaches()
 	e.storeWork().reportStores()
 	e.storeWork().settleScratch()
 	e.storeWork().makePacks()

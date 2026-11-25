@@ -560,8 +560,16 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 		spec.InputCheckpointCommand = id
 	}
 	// and runs what its predecessor ran (a rerun in another snapshot goes on
-	// in that snapshot)
-	if pred, _ := trigger["predecessor_execution_id"].(string); pred != "" && (reason == "continuation" || reason == "loss_continuation") {
+	// in that snapshot); one reading streams runs what made its checkpoint
+	// (its stages are part of where its streams stand)
+	if len(spec.Streams) > 0 && spec.InputCheckpointCommand != "" {
+		var snapshot, image sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT e.source_snapshot_id,e.image_ref FROM commands c JOIN execution_requests e ON e.id=c.execution_id WHERE c.id=$1`,
+			spec.InputCheckpointCommand).Scan(&snapshot, &image); err != nil {
+			return plannedOrchestrationDecision{}, err
+		}
+		spec.SourceSnapshot, spec.Image = snapshot.String, image.String
+	} else if pred, _ := trigger["predecessor_execution_id"].(string); pred != "" && (reason == "continuation" || reason == "loss_continuation") {
 		var snapshot, image sql.NullString
 		if err := tx.QueryRowContext(ctx, `SELECT source_snapshot_id,image_ref FROM execution_requests WHERE id=$1`, pred).Scan(&snapshot, &image); err != nil {
 			return plannedOrchestrationDecision{}, err

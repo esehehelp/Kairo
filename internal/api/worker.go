@@ -74,23 +74,6 @@ func (s *Server) protectCheckpoint(ctx context.Context, attemptID string, payloa
 	}
 }
 
-// workerStreams keeps what an attempt's loader learned of the files its
-// streams read (store.RecordStreamReport): a file's identity the first time
-// it was read (each chunk's sha256: up to 64 MiB of them), records counts.
-func (s *Server) workerStreams(w http.ResponseWriter, r *http.Request) {
-	worker := workerIdentity(r)
-	var body store.StreamReport
-	err := decodeUpTo(r, &body, 64<<20)
-	if err == nil {
-		err = s.Store.RecordStreamReport(r.Context(), worker.AttemptID, worker.LeaseID, worker.Epoch, body)
-	}
-	if err != nil {
-		writeError(w, err)
-		return
-	}
-	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
-}
-
 func (s *Server) workerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	worker := workerIdentity(r)
 	var body struct {

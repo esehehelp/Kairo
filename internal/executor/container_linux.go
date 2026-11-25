@@ -515,7 +515,6 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 	if err != nil {
 		return nil, env, err
 	}
-	report := containerEnvValue(env, "KAIRO_API_URL") != "" && containerEnvValue(env, "KAIRO_ATTEMPT_TOKEN") != ""
 	var procs loaderProcs
 	for _, s := range spec.Streams {
 		dir := path.Join(containerRoot, "run", "streams", s.Name)
@@ -543,10 +542,7 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 			if err := os.WriteFile(p, positions, 0o600); err != nil {
 				return procs, env, err
 			}
-			args = append(args, "--positions", p)
-		}
-		if report {
-			args = append(args, "--report")
+			args = append(args, "--positions", p, "--world", strconv.Itoa(s.World))
 		}
 		if spec.RawDir != "" {
 			args = append(args, "--raw", spec.RawDir)

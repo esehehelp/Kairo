@@ -212,6 +212,21 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentops.RawPlacedRequest) (agentops.OK, error) {
 				return recorded(s.Store.RawPlaced(ctx, b.ExecutorID, b.StoreID, b.Root, b.File))
 			}),
+		handle(s, agentops.RawIdentity,
+			func(ctx context.Context, b agentops.RawIdentityRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentops.RawIdentityRequest) (agentops.RawIdentityAnswer, error) {
+				f, found, err := s.Store.RawIdentity(ctx, b.ExecutorID, b.URL)
+				return agentops.RawIdentityAnswer{File: f, Found: found}, err
+			}),
+		handle(s, agentops.RawRecords,
+			func(ctx context.Context, b agentops.RawRecordsRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentops.RawRecordsRequest) (agentops.OK, error) {
+				return recorded(s.Store.RawRecords(ctx, b.ExecutorID, b.Count))
+			}),
 		handle(s, agentops.KeepIdentity,
 			func(ctx context.Context, b agentops.KeepIdentityRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.ExecutorID)

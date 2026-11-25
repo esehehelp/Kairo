@@ -39,6 +39,13 @@ const (
 	frameError  = 7
 )
 
+// maxRecord and maxSub bound a position (record*W+rank stays far from
+// overflowing).
+const (
+	maxRecord = int64(1) << 48
+	maxSub    = int64(1) << 31
+)
+
 // rankReleaseWait is how long a hello waits for the connection its rank
 // had to be noticed gone (a handler notices within its take wait).
 const rankReleaseWait = 5 * time.Second
@@ -234,6 +241,10 @@ func (s *Server) join(hello Hello) (int, error) {
 	if hello.Position != nil {
 		p := *hello.Position
 		p.Rank = hello.Rank
+		if p.Record < 0 || p.Record > maxRecord || p.Sub < 0 || p.Sub > maxSub {
+			delete(s.taken, hello.Rank)
+			return 0, fmt.Errorf("position %+v is out of bounds", p)
+		}
 		s.Loader.resume(s.ctx, hello.Rank, p)
 	}
 	return hello.Rank, nil

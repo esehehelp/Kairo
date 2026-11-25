@@ -28,7 +28,7 @@ import (
 // reader before it is checked against an identity.
 
 // AgentSocket is the agent's socket in a raw directory.
-const AgentSocket = ".agent.sock"
+const AgentSocket = ".sock"
 
 // EnsureAnswer is the agent's answer to /ensure.
 type EnsureAnswer struct {
@@ -58,10 +58,14 @@ func NewAgent(dir string, upstream Origin) *Agent {
 	return &Agent{Dir: dir, Upstream: upstream, client: &http.Client{Transport: transport}}
 }
 
+// ErrRefused: the node's agent will not make a file ready for this
+// attempt (no file of its streams, a request it does not understand).
+var ErrRefused = errors.New("raw file refused")
+
 // Resolve has the agent make f ready: the file as identified and where to
-// read it (the raw directory, or upstream when it is not kept). The agent
-// being away is waited out; a file not what it was identified as is
-// ErrChanged.
+// read it (the attempt's raw view, or upstream when it is not kept). The
+// agent being away is waited out; a file not what it was identified or
+// declared as is ErrChanged; one the agent refuses is ErrRefused.
 func (a *Agent) Resolve(ctx context.Context, f File) (File, Origin, error) {
 	pause := time.Second
 	for {
@@ -72,7 +76,7 @@ func (a *Agent) Resolve(ctx context.Context, f File) (File, Origin, error) {
 			}
 			return answer.File, cachedOrigin{path: filepath.Join(a.Dir, answer.Name)}, nil
 		}
-		if errors.Is(err, ErrChanged) || ctx.Err() != nil {
+		if errors.Is(err, ErrChanged) || errors.Is(err, ErrRefused) || ctx.Err() != nil {
 			return File{}, nil, err
 		}
 		if a.Problem != nil {
@@ -88,7 +92,7 @@ func (a *Agent) Resolve(ctx context.Context, f File) (File, Origin, error) {
 }
 
 func (a *Agent) ensure(ctx context.Context, f File) (EnsureAnswer, error) {
-	body, err := json.Marshal(f)
+	body, err := json.Marshal(map[string]string{"url": f.URL})
 	if err != nil {
 		return EnsureAnswer{}, err
 	}
@@ -109,10 +113,24 @@ func (a *Agent) ensure(ctx context.Context, f File) (EnsureAnswer, error) {
 	switch {
 	case answer.Changed:
 		return EnsureAnswer{}, fmt.Errorf("%w: %s", ErrChanged, answer.Error)
+	case resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusBadRequest:
+		return EnsureAnswer{}, fmt.Errorf("%w: %s: %s", ErrRefused, f.URL, answer.Error)
 	case resp.StatusCode != http.StatusOK || answer.Error != "":
 		return EnsureAnswer{}, fmt.Errorf("the node's agent: %s: %s", resp.Status, answer.Error)
 	case !answer.File.Identified() || answer.File.URL != f.URL || !answer.Fallback && answer.Name != answer.File.SHA256:
-		return EnsureAnswer{}, fmt.Errorf("the node's agent answered %s with %+v", f.URL, answer)
+		return EnsureAnswer{}, fmt.Errorf("%w: the node's agent answered %s with %+v", ErrRefused, f.URL, answer)
+	}
+	// the answer is the file this loader was told to read
+	g := answer.File
+	if f.SHA256 != "" && f.SHA256 != g.SHA256 || f.Size > 0 && f.Size != g.Size || f.Identified() && (f.ChunkBytes != g.ChunkBytes || len(f.Chunks) != len(g.Chunks)) {
+		return EnsureAnswer{}, fmt.Errorf("%w: %s is %s (%d bytes), declared %s (%d bytes)", ErrChanged, f.URL, g.SHA256, g.Size, f.SHA256, f.Size)
+	}
+	if f.Identified() {
+		for i := range f.Chunks {
+			if f.Chunks[i] != g.Chunks[i] {
+				return EnsureAnswer{}, fmt.Errorf("%w: %s chunk %d is not as declared", ErrChanged, f.URL, i)
+			}
+		}
 	}
 	return answer, nil
 }

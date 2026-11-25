@@ -784,7 +784,7 @@ def normalize_suspend_result(value: SuspendResult | str | Path | None) -> Suspen
 _normalize_suspend_result = normalize_suspend_result  # compatibility alias
 
 
-def suspend_payload(result: SuspendResult, streams: Mapping[str, list[dict[str, int]]] | Sequence[Any] = ()) -> dict[str, Any]:
+def suspend_payload(result: SuspendResult, streams: Mapping[str, Mapping[str, Any]] | Sequence[Any] = ()) -> dict[str, Any]:
     """The ``checkpointed`` acknowledgement payload for ``result``, with
     where each stream stands (``streams``: streams, or positions by name)."""
     payload = dict(result.payload)
@@ -792,15 +792,35 @@ def suspend_payload(result: SuspendResult, streams: Mapping[str, list[dict[str, 
         payload["continuation_ref"] = result.continuation_ref
     positions = streams if isinstance(streams, Mapping) else stream_positions(streams)
     if positions:
-        payload["streams"] = {name: list(ranks) for name, ranks in positions.items()}
+        payload["streams"] = {name: dict(entry) for name, entry in positions.items()}
     return payload
 
 
-def stream_positions(streams: Sequence[Any]) -> dict[str, list[dict[str, int]]]:
-    """Where each stream stands, by name: one position per stream here."""
-    out: dict[str, list[dict[str, int]]] = {}
+# The version of the loader's order positions are of (internal/loader).
+ORDER_VERSION = 1
+
+
+def stream_positions(streams: Sequence[Any]) -> dict[str, dict[str, Any]]:
+    """Where each stream stands, by name: its ranks (``world``), the order's
+    version and this process's position of it."""
+    out: dict[str, dict[str, Any]] = {}
     for stream in streams:
-        out.setdefault(stream.name, []).append(dict(stream.position))
+        entry = out.setdefault(stream.name, {"world": int(stream.world), "order": ORDER_VERSION, "positions": []})
+        if entry["world"] != int(stream.world):
+            raise ValueError(f"stream {stream.name} taken as {entry['world']} and {stream.world} ranks")
+        entry["positions"].append(dict(stream.position))
+    return out
+
+
+def merge_stream_positions(parts: Iterable[Mapping[str, Mapping[str, Any]]]) -> dict[str, dict[str, Any]]:
+    """The positions of several processes (ranks), by stream."""
+    out: dict[str, dict[str, Any]] = {}
+    for part in parts:
+        for name, entry in part.items():
+            merged = out.setdefault(name, {"world": entry["world"], "order": entry["order"], "positions": []})
+            if merged["world"] != entry["world"] or merged["order"] != entry["order"]:
+                raise ValueError(f"stream {name}: ranks disagree on its world or order")
+            merged["positions"].extend(entry["positions"])
     return out
 
 

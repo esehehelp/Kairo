@@ -1,24 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
 	"strings"
-	"time"
 
 	"kairo/internal/loader"
-	"kairo/internal/store"
 )
 
 // loaderServe: kairo loader serve --spec SPEC.json --listen
@@ -31,8 +23,7 @@ func loaderServe(args []string) error {
 	world := fs.Int("world", 0, "the ranks the stream is split between (0: the first rank's hello says)")
 	positionsPath := fs.String("positions", "", "where each rank starts (JSON list of {rank, record, sub}); none: the start")
 	origin := fs.String("origin", "http", "where files are read: http (each file's URL) or dir:DIR (files by name under DIR)")
-	rawDir := fs.String("raw", "", "the node's raw cache (its directory, with the agent's socket): every file made ready and checked there before it is read")
-	report := fs.Bool("report", false, "report what is learned of files (identities, record counts) to the daemon as the attempt (KAIRO_API_URL, KAIRO_ATTEMPT_TOKEN, KAIRO_API_CA)")
+	rawDir := fs.String("raw", "", "the node's raw cache for this attempt (its directory, with the agent's socket): every file made ready, checked and identified there before it is read; without it, files are read from --origin, one never read before identified as it is read")
 	if _, err := parseFlags(fs, args); err != nil {
 		return err
 	}
@@ -86,22 +77,9 @@ func loaderServe(args []string) error {
 		}
 		fetch.Resolve = agent.Resolve
 	}
-	l := &loader.Loader{Spec: spec, Fetch: fetch}
-	if *report {
-		r, err := newStreamReporter()
-		if err != nil {
-			return err
-		}
-		go r.run(ctx)
-		l.Learned = func(source int, f loader.File, records int64) {
-			src := spec.Sources[source]
-			r.add(store.StreamReport{Records: []store.RecordsCount{{URL: f.URL, SHA256: f.SHA256, Format: src.Format, Field: src.Field, Records: records}}})
-		}
-		l.Identified = func(_ int, f loader.File) { // read without the raw cache only
-			fmt.Fprintf(os.Stderr, "kairo loader: %s identified: %d bytes, sha256 %s\n", f.Name, f.Size, f.SHA256)
-			r.add(store.StreamReport{Identities: []loader.File{f}})
-		}
-	}
+	l := &loader.Loader{Spec: spec, Fetch: fetch, Identified: func(_ int, f loader.File) {
+		fmt.Fprintf(os.Stderr, "kairo loader: %s identified: %d bytes, sha256 %s\n", f.Name, f.Size, f.SHA256)
+	}}
 	fmt.Fprintf(os.Stderr, "kairo loader: listening on %s\n", *listen)
 	return (&loader.Server{Loader: l, Positions: positions, World: *world}).Serve(ctx, ln)
 }
@@ -157,97 +135,6 @@ func loaderIdentify(args []string) error {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	return enc.Encode(out)
-}
-
-// streamReporter sends what a loader learned to the daemon, as its attempt.
-type streamReporter struct {
-	client *http.Client
-	url    string
-	token  string
-	queue  chan store.StreamReport
-}
-
-func newStreamReporter() (*streamReporter, error) {
-	api, token := os.Getenv("KAIRO_API_URL"), os.Getenv("KAIRO_ATTEMPT_TOKEN")
-	if api == "" || token == "" {
-		return nil, errors.New("--report needs KAIRO_API_URL and KAIRO_ATTEMPT_TOKEN (an attempt's environment)")
-	}
-	transport := http.DefaultTransport.(*http.Transport).Clone()
-	transport.Proxy = nil // the daemon is reached directly, its token sent nowhere else
-	if ca := os.Getenv("KAIRO_API_CA"); ca != "" {
-		der, err := base64.StdEncoding.DecodeString(ca)
-		if err != nil {
-			return nil, fmt.Errorf("KAIRO_API_CA: %w", err)
-		}
-		certs, err := x509.ParseCertificates(der)
-		if err != nil {
-			return nil, fmt.Errorf("KAIRO_API_CA: %w", err)
-		}
-		pool := x509.NewCertPool()
-		for _, c := range certs {
-			pool.AddCert(c)
-		}
-		transport.TLSClientConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
-	}
-	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &streamReporter{client: &http.Client{Transport: transport, Timeout: time.Minute, CheckRedirect: noRedirect}, url: strings.TrimRight(api, "/") + "/api/worker/streams", token: token, queue: make(chan store.StreamReport, 1024)}, nil
-}
-
-func (r *streamReporter) add(report store.StreamReport) {
-	select {
-	case r.queue <- report:
-	default:
-		fmt.Fprintln(os.Stderr, "kairo loader: too much to report; a report dropped")
-	}
-}
-
-// run sends each report, trying again for a while when the daemon is away.
-func (r *streamReporter) run(ctx context.Context) {
-	for {
-		var report store.StreamReport
-		select {
-		case report = <-r.queue:
-		case <-ctx.Done():
-			return
-		}
-		body, _ := json.Marshal(report)
-		pause := time.Second
-		for try := 1; ; try++ {
-			err := r.send(ctx, body)
-			if err == nil {
-				break
-			}
-			if try == 10 || ctx.Err() != nil {
-				fmt.Fprintf(os.Stderr, "kairo loader: a report not kept: %v\n", err)
-				break
-			}
-			select {
-			case <-time.After(pause):
-			case <-ctx.Done():
-				return
-			}
-			pause = min(pause*2, time.Minute)
-		}
-	}
-}
-
-func (r *streamReporter) send(ctx context.Context, body []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, r.url, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+r.token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := r.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode/100 != 2 {
-		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return fmt.Errorf("%s: %s", resp.Status, bytes.TrimSpace(msg))
-	}
-	return nil
 }
 
 func readJSONFile(path string, v any) error {

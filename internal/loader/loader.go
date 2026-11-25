@@ -100,7 +100,7 @@ func (l *Loader) Start(ctx context.Context, world int, positions []Position) err
 		l.delivered[r] = Position{Rank: r}
 	}
 	for _, p := range positions {
-		if p.Rank < 0 || p.Rank >= world || seen[p.Rank] || p.Record < 0 || p.Sub < 0 {
+		if p.Rank < 0 || p.Rank >= world || seen[p.Rank] || p.Record < 0 || p.Record > maxRecord || p.Sub < 0 || p.Sub > maxSub {
 			return fmt.Errorf("positions %v are not one each of ranks 0..%d", positions, world-1)
 		}
 		seen[p.Rank] = true
@@ -236,10 +236,12 @@ func (l *Loader) produce(ctx context.Context, gen *generation, positions []Posit
 	for grp := range out {
 		r, k := int(grp.g%world), grp.g/world
 		outs, sub := grp.recs, int64(0)
-		if k == positions[r].Record {
+		if k == positions[r].Record && positions[r].Sub > 0 {
+			// a position within a record names one of its outputs: a record
+			// giving fewer is not what it gave before (its stages changed)
 			sub = positions[r].Sub
-			if sub > int64(len(outs)) {
-				sub = int64(len(outs))
+			if sub >= int64(len(outs)) {
+				return fmt.Errorf("rank %d stands at output %d of its record %d, which gives %d outputs now: not the stream it was", r, sub, k, len(outs))
 			}
 			outs = outs[sub:]
 		}

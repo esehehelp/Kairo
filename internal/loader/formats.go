@@ -75,6 +75,29 @@ func CountKey(format, field, fileName string) (string, error) {
 	return f.framing + "|" + f.compressionOf(fileName) + "|" + field, nil
 }
 
+// CountRecords is how many records r (a file named name, its bytes as
+// stored) holds read as format and field say.
+func CountRecords(r io.Reader, name, format, field string) (int64, error) {
+	f, err := parseFormat(format, field)
+	if err != nil {
+		return 0, err
+	}
+	records, closeFn, err := newRecordReader(r, name, f)
+	if err != nil {
+		return 0, err
+	}
+	defer closeFn()
+	var n int64
+	for {
+		if _, err := records.next(); err == io.EOF {
+			return n, nil
+		} else if err != nil {
+			return n, err
+		}
+		n++
+	}
+}
+
 // compressionOf is the compression of a file of this format named name.
 func (f format) compressionOf(name string) string {
 	if f.compression != "" {

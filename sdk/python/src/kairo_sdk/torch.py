@@ -15,6 +15,7 @@ from .runtime import (
     _stop_signal_context,
     normalize_suspend_result,
     stop_requested,
+    merge_stream_positions,
     stream_positions,
     suspend_payload,
 )
@@ -272,10 +273,12 @@ class DistributedAdapter:
         else:
             gathered[0] = local
         failures = [error for error, _ in gathered if error is not None]
-        positions: dict[str, list[dict[str, int]]] = {}
-        for _, by_name in gathered:
-            for name, ranks in by_name.items():
-                positions.setdefault(name, []).extend(ranks)
+        positions: dict[str, dict[str, Any]] = {}
+        if not failures:
+            try:
+                positions = merge_stream_positions(by_name for _, by_name in gathered)
+            except ValueError as exc:
+                failures = [f"stream positions: {exc}"]
         if failures:
             reason = "; ".join(failures)
             if rank == 0:
