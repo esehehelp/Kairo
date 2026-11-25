@@ -8,15 +8,14 @@ import (
 	"path/filepath"
 	"strings"
 
-	"kairo/internal/config"
 	"kairo/internal/envspec"
 	"kairo/internal/processidentity"
 	"kairo/internal/store"
 )
 
 // An executor runs its attempts one way, its backend, chosen once from its
-// kind (Local.backend): on its host (hostBackend) or in an Incus container
-// of the attempt's image (incusBackend, container.go). Only what differs
+// kind (Local.backend): on its host (hostBackend) or in a container of the
+// attempt's image (ociBackend, oci.go). Only what differs
 // between them is here; leases, the shim and adoption, logs, usage,
 // force-stop orders and the stores are Local's, the same for every backend.
 // Both run in the node's namespace: they read the node's paths, reach the
@@ -35,23 +34,18 @@ type backend interface {
 }
 
 // instanceSweeper is a backend that removes, now and then, what attempts
-// that no longer run left behind (incusBackend: stopped instances).
+// that no longer run left behind (ociBackend: their containers).
 type instanceSweeper interface {
 	sweep(ctx context.Context)
 }
 
 // backend is this executor's backend, from its kind.
 func (e *Local) backend() backend {
-	switch e.Kind {
-	case config.KindIncus:
-		return incusBackend{e}
-	case config.KindPCT:
-		return pctBackend{e}
-	case config.KindWSLC:
-		return wslcBackend{e}
-	default:
-		return hostBackend{e}
+	if caps, ok := ociCapsOf(e.Kind); ok {
+		rt, _ := runtimeFor(e.Kind)
+		return ociBackend{e: e, kind: e.Kind, caps: caps, rt: rt}
 	}
+	return hostBackend{e}
 }
 
 // refuseImage refuses an execution in an image on a backend that runs no
@@ -135,53 +129,3 @@ func (hostBackend) liveness(_ context.Context, _ string, pid int, identity strin
 }
 
 func (hostBackend) ended(string) {}
-
-// incusBackend runs every attempt in an Incus container of its image
-// (container.go).
-type incusBackend struct{ e *Local }
-
-func (b incusBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, error) {
-	cmd, err := b.e.containerCommand(launch, containerOptions{runArg: containerRunArg})
-	return cmd, nil, err
-}
-
-func (incusBackend) liveness(_ context.Context, _ string, pid int, identity string) (processidentity.Liveness, error) {
-	return processidentity.HostProcessLiveness(pid, identity)
-}
-
-// ended removes what the attempt's container was made from (its spec holds
-// its token) and has its instance, left by a runner that was killed, swept
-// at the next tick.
-func (b incusBackend) ended(attemptID string) {
-	_ = os.RemoveAll(b.e.containerDir(attemptID))
-	b.e.storeWork().sweepSoon()
-}
-
-func (b incusBackend) sweep(ctx context.Context) { b.e.storeWork().sweepContainers(ctx) }
-
-// pctBackend runs every attempt in a Proxmox VE container of its image, in
-// VMIDs 1000-1999, made for it and destroyed after it
-// (container_pct_linux.go). Its agent runs on the Proxmox host.
-type pctBackend struct{ e *Local }
-
-func (b pctBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, error) {
-	settings, err := pctSettingsOf(b.e.Attributes)
-	if err != nil {
-		return nil, nil, err
-	}
-	cmd, err := b.e.containerCommand(launch, containerOptions{runArg: pctRunArg, dirsOnly: true, pct: settings})
-	return cmd, nil, err
-}
-
-func (pctBackend) liveness(_ context.Context, _ string, pid int, identity string) (processidentity.Liveness, error) {
-	return processidentity.HostProcessLiveness(pid, identity)
-}
-
-// ended removes what the attempt's container was made from and has its
-// container, left by a runner that was killed, swept at the next tick.
-func (b pctBackend) ended(attemptID string) {
-	_ = os.RemoveAll(b.e.containerDir(attemptID))
-	b.e.storeWork().sweepSoon()
-}
-
-func (b pctBackend) sweep(ctx context.Context) { b.e.storeWork().sweepPCT(ctx) }

@@ -9,12 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"net"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
@@ -81,48 +79,73 @@ var pctTool = func(ctx context.Context, name string, args ...string) ([]byte, er
 	return out.Bytes(), nil
 }
 
-// pctRun is the runner of an attempt in a Proxmox container (see above):
-// it exits with the exit the container wrote (-1 when it wrote none).
-func pctRun(specPath string) int {
-	logf := func(format string, a ...any) {
-		_, _ = os.Stderr.Seek(0, io.SeekEnd)
-		fmt.Fprintf(os.Stderr, "kairo container: "+format+"\n", a...)
-	}
-	spec, err := readContainerSpec(specPath)
-	if err != nil {
-		logf("%v", err)
-		return shimNotStarted
-	}
+// pctRuntime runs attempts' containers with Proxmox's pct (oci.go): a
+// container is named by its VMID. What stops the attempt reaches its
+// processes in the container directly.
+type pctRuntime struct{}
+
+func (pctRuntime) run(ctx context.Context, spec containerSpec, logf func(string, ...any), made func(string)) (string, int, error) {
 	if spec.PCT == nil {
-		logf("%s: no pct settings", specPath)
-		return shimNotStarted
+		return "", shimNotStarted, errors.New("a pct container's spec has no pct settings")
 	}
-	// what stops the attempt reaches its processes in the container
-	// directly; the runner stays to see the container stop
-	sigs := make(chan os.Signal, 8)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	go func() {
-		for range sigs {
-		}
-	}()
-	vmid, exit, err := runPCT(context.Background(), spec, logf)
+	vmid, exit, err := runPCT(ctx, spec, logf, func(vmid int) { made(strconv.Itoa(vmid)) })
+	if vmid == 0 {
+		return "", exit, err
+	}
+	return strconv.Itoa(vmid), exit, err
+}
+
+func (pctRuntime) stop(ctx context.Context, vmid string) error {
+	_, err := pctTool(ctx, "pct", "shutdown", vmid, "--timeout", strconv.Itoa(wslcStopSeconds), "--forceStop", "1")
+	return err
+}
+
+func (pctRuntime) remove(ctx context.Context, vmid string) error {
+	n, err := strconv.Atoi(vmid)
 	if err != nil {
-		logf("%v", err)
+		return err
 	}
-	if vmid != 0 {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		if err := destroyPCT(ctx, vmid); err != nil {
-			logf("container %d not destroyed: %v", vmid, err)
+	return destroyPCT(ctx, n)
+}
+
+// containers are the containers of Kairo's range tagged kairo.
+func (pctRuntime) containers(ctx context.Context) ([]ociContainer, error) {
+	node, err := os.Hostname()
+	if err != nil {
+		return nil, err
+	}
+	out, err := pctTool(ctx, "pvesh", "get", "/nodes/"+node+"/lxc", "--output-format", "json")
+	if err != nil {
+		return nil, err
+	}
+	var cts []struct {
+		VMID   json.Number `json:"vmid"`
+		Name   string      `json:"name"`
+		Status string      `json:"status"`
+		Tags   string      `json:"tags"`
+	}
+	if err := json.Unmarshal(out, &cts); err != nil {
+		return nil, err
+	}
+	var list []ociContainer
+	for _, ct := range cts {
+		vmid, err := strconv.Atoi(ct.VMID.String())
+		if err != nil || vmid < pctFirstVMID || vmid > pctLastVMID {
+			continue
 		}
-		cancel()
+		if !slices.Contains(strings.FieldsFunc(ct.Tags, func(r rune) bool { return r == ';' || r == ',' || r == ' ' }), pctTag) {
+			continue
+		}
+		if id, ok := attemptOfInstance(ct.Name); ok {
+			list = append(list, ociContainer{attempt: id, running: ct.Status != "stopped", handle: strconv.Itoa(vmid)})
+		}
 	}
-	_ = os.Remove(specPath)
-	return exit
+	return list, nil
 }
 
 // runPCT makes, starts and waits for the attempt's container; vmid is the
-// container made (0: none).
-func runPCT(ctx context.Context, spec containerSpec, logf func(string, ...any)) (vmid, exit int, err error) {
+// container made (0: none), also told to made as soon as it exists.
+func runPCT(ctx context.Context, spec containerSpec, logf func(string, ...any), made func(int)) (vmid, exit int, err error) {
 	ref, err := imageref.ParsePinned(spec.Image)
 	if err != nil {
 		return 0, shimNotStarted, err
@@ -152,6 +175,7 @@ func runPCT(ctx context.Context, spec containerSpec, logf func(string, ...any)) 
 	if err != nil {
 		return 0, shimNotStarted, err
 	}
+	made(vmid)
 	logf("container %d (%s)", vmid, spec.Instance)
 	// /dev/shm as large as a data loader's batches need, and Kairo's init;
 	// written after the creation, which takes the image's entrypoint
@@ -447,57 +471,6 @@ func hostMemoryMiB() (int, error) {
 		}
 	}
 	return 0, errors.New("no MemTotal in /proc/meminfo")
-}
-
-// sweepPCT destroys the stopped containers of Kairo's range, tagged kairo,
-// whose attempt no longer runs here (a runner that was killed destroyed
-// none), and what they were made from. A running one is left alone: what an
-// exited attempt left running is ended as on a host, which stops it.
-func (e *storeWorker) sweepPCT(ctx context.Context) {
-	node, err := os.Hostname()
-	if err != nil {
-		e.roundProblem(&e.containerSweeps, "", "containers not listed", err)
-		return
-	}
-	out, err := pctTool(ctx, "pvesh", "get", "/nodes/"+node+"/lxc", "--output-format", "json")
-	if err != nil {
-		e.roundProblem(&e.containerSweeps, "", "containers not listed", err)
-		return
-	}
-	var cts []struct {
-		VMID   json.Number `json:"vmid"`
-		Name   string      `json:"name"`
-		Status string      `json:"status"`
-		Tags   string      `json:"tags"`
-	}
-	if err := json.Unmarshal(out, &cts); err != nil {
-		e.roundProblem(&e.containerSweeps, "", "containers not listed", err)
-		return
-	}
-	e.roundProblem(&e.containerSweeps, "", "", nil)
-	for _, ct := range cts {
-		vmid, err := strconv.Atoi(ct.VMID.String())
-		if err != nil || vmid < pctFirstVMID || vmid > pctLastVMID || ct.Status != "stopped" {
-			continue
-		}
-		if !slices.Contains(strings.FieldsFunc(ct.Tags, func(r rune) bool { return r == ';' || r == ',' || r == ' ' }), pctTag) {
-			continue
-		}
-		rest, ok := strings.CutPrefix(ct.Name, "kairo-att-")
-		if !ok {
-			continue
-		}
-		attempt := "att_" + rest
-		if e.attemptRunsHere(attempt) {
-			continue
-		}
-		if err := destroyPCT(ctx, vmid); err != nil {
-			e.roundProblem(&e.containerSweeps, ct.Name, "container not destroyed", err)
-			continue
-		}
-		_ = os.RemoveAll(e.containerDir(attempt))
-		e.Logger.Info("container of an attempt no longer running destroyed", "vmid", vmid, "attempt_id", attempt)
-	}
 }
 
 // hostNameservers are the nameservers of the host's resolver configuration

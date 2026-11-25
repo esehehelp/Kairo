@@ -143,9 +143,11 @@ type containerOptions struct {
 	runArg   string
 	dirsOnly bool
 	pct      *pctSettings
-	// wslc: a wslc container (container_wslc.go): its init is the Linux
-	// build beside this binary, raw files are asked for as files.
-	wslc bool
+	// runtime names the container's runtime (spec.Runtime); vm: it runs in
+	// a VM (ociCaps.vm): its init is the Linux build beside this binary, it
+	// runs as an ordinary user and asks for raw files as files.
+	runtime string
+	vm      bool
 }
 
 // containerCommand builds the launcher of an attempt in a container (the
@@ -178,7 +180,7 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 	// what runs in the container: this binary, or (wslc, on Windows) its
 	// Linux build beside it
 	initBinary := self
-	if opts.wslc {
+	if opts.vm {
 		initBinary = filepath.Join(filepath.Dir(self), wslcLinuxBinary)
 		if _, err := os.Stat(initBinary); err != nil {
 			return nil, fmt.Errorf("a wslc container's init is the Linux build of kairo beside the agent: %w", err)
@@ -236,8 +238,8 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		Argv:     launch.Argv,
 		Streams:  launch.Streams,
 	}
-	if opts.wslc {
-		spec.Runtime = "wslc"
+	spec.Runtime = opts.runtime
+	if opts.vm {
 		// the ordinary user it runs as has no home in the image: one in
 		// the scratch
 		home := filepath.Join(scratch, "home")
@@ -261,7 +263,7 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		if err != nil {
 			return nil, fmt.Errorf("the raw cache of store %s: %w", s.decl.ID, err)
 		}
-		view, requests, err := raw.attach(launch, opts.wslc)
+		view, requests, err := raw.attach(launch, opts.vm)
 		if err != nil {
 			return nil, fmt.Errorf("the raw cache of store %s: %w", s.decl.ID, err)
 		}
@@ -307,7 +309,7 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 			spec.GPUs = append(spec.GPUs, resourceBinding(r))
 		}
 	}
-	if len(spec.GPUs) > 0 && !opts.wslc {
+	if len(spec.GPUs) > 0 && !opts.vm {
 		// wslc hands its containers the WSL GPU's driver itself
 		spec.DriverRoot = filepath.Join(e.LogDir, "containers", "nvidia")
 	}

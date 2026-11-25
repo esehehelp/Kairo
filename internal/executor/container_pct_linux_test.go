@@ -185,7 +185,8 @@ func TestPCTSweepDestroysOnlyKairosStoppedContainersOfEndedAttempts(t *testing.T
 	var logs bytes.Buffer
 	e := NewLocal("ctr", nil, t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
 	e.running = map[string]int{"att_run": 1}
-	e.storeWork().sweepPCT(context.Background())
+	caps, _ := ociCapsOf("pct")
+	e.storeWork().sweepContainers(context.Background(), pctRuntime{}, caps)
 	destroyed := f.called("pct", "destroy")
 	if len(destroyed) != 1 || destroyed[0][2] != "1000" {
 		t.Fatalf("destroyed %v\n%s", destroyed, logs.String())
