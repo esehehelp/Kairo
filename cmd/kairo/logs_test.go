@@ -9,7 +9,7 @@ import (
 )
 
 // logsFixture: task "train" with execution #1 (att_1, exited) and #2
-// (att_2, running); task "gang" with a two-rank execution.
+// (att_2, running).
 func logsFixture() *contractAPI {
 	f := newContractAPI()
 	f.details["train"] = map[string]any{"name": "train", "queue": "gpu", "state": "running", "executions": []map[string]any{
@@ -17,13 +17,6 @@ func logsFixture() *contractAPI {
 			"attempts": []map[string]any{{"id": "att_1", "execution_id": "exe_1", "state": "exited"}}},
 		{"ordinal": 2, "execution_id": "exe_2", "state": "started", "attempt_id": "att_2",
 			"attempts": []map[string]any{{"id": "att_2", "execution_id": "exe_2", "state": "running"}}},
-	}}
-	f.details["gang"] = map[string]any{"name": "gang", "queue": "gpu", "state": "running", "executions": []map[string]any{
-		{"ordinal": 1, "execution_id": "exe_g0", "state": "started", "attempt_id": "att_g0",
-			"gang": []map[string]any{
-				{"rank": 0, "execution_id": "exe_g0", "state": "started", "attempt_id": "att_g0"},
-				{"rank": 1, "execution_id": "exe_g1", "state": "started", "attempt_id": "att_g1"},
-			}},
 	}}
 	f.details["fresh"] = map[string]any{"name": "fresh", "queue": "gpu", "state": "pending", "executions": []any{}}
 	f.setTask("fresh", map[string]any{"queue": "gpu", "state": "pending", "executions": []any{}})
@@ -36,8 +29,6 @@ func logsFixture() *contractAPI {
 	f.appendLog("att_2", "stderr", "warn\n")
 	f.appendLog("att_1", "stdout", "first run\n")
 	f.appendLog("att_1", "stderr", "")
-	f.appendLog("att_g0", "stdout", "rank zero\n")
-	f.appendLog("att_g1", "stdout", "rank one\n")
 	return f
 }
 
@@ -99,10 +90,8 @@ func TestTaskLogsTailsBothStreamsOfTheLatestAttempt(t *testing.T) {
 func TestTaskLogsReportsNoLogOncePerAttempt(t *testing.T) {
 	f := logsFixture()
 	delete(f.logs, "att_1")
-	delete(f.logs["att_g1"], "stdout")
 	f.noLogs = map[string]string{
 		"att_1":  "launch_aborted: launch failed before activation:\nsnapshot unavailable",
-		"att_g1": "executor_identity_lost; scratch kept at D:/kairo/scratch/att_g1",
 	}
 	server := f.serve(t)
 	clock := useFakeClock(t, base)
@@ -115,7 +104,6 @@ func TestTaskLogsReportsNoLogOncePerAttempt(t *testing.T) {
 		{[]string{"train", "--attempt", "1", "-f"}, aborted},
 		{[]string{"train", "--attempt", "1", "--stream", "stderr", "--tail", "0"}, aborted},
 		{[]string{"train", "--attempt", "all", "--tail", "1"}, aborted + "==> #2 stdout (att_2) <==\nline 100\n==> #2 stderr (att_2) <==\nwarn\n"},
-		{[]string{"gang", "--rank", "1"}, "attempt att_g1 wrote no log: executor_identity_lost; scratch kept at D:/kairo/scratch/att_g1\n"},
 	} {
 		out, err := captureStdout(t, func() error {
 			return run(append([]string{"task", "logs", "--api", server.URL, "p"}, tc.args...))
@@ -201,28 +189,6 @@ func TestTaskLogsFollowsTheStreamThatHasALog(t *testing.T) {
 		if strings.Contains(request, "offset=") && strings.Contains(request, "stream=stderr") {
 			t.Fatalf("polled missing stderr: %s", request)
 		}
-	}
-}
-
-func TestTaskLogsGangRank(t *testing.T) {
-	server := logsFixture().serve(t)
-	out, err := captureStdout(t, func() error {
-		return run([]string{"task", "logs", "--api", server.URL, "p", "gang", "--stream", "stdout"})
-	})
-	if err != nil || out != "rank zero\n" {
-		t.Fatalf("rank 0: %v %q", err, out)
-	}
-	out, err = captureStdout(t, func() error {
-		return run([]string{"task", "logs", "--api", server.URL, "p", "gang", "--stream", "stdout", "--rank", "1"})
-	})
-	if err != nil || out != "rank one\n" {
-		t.Fatalf("rank 1: %v %q", err, out)
-	}
-	if err := run([]string{"task", "logs", "--api", server.URL, "p", "gang", "--rank", "2"}); err == nil || !strings.Contains(err.Error(), "no gang rank 2") {
-		t.Fatalf("rank 2: %v", err)
-	}
-	if err := run([]string{"task", "logs", "--api", server.URL, "p", "train", "--rank", "1"}); err == nil || !strings.Contains(err.Error(), "not a gang") {
-		t.Fatalf("--rank on a plain task: %v", err)
 	}
 }
 

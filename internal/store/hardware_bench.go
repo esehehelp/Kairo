@@ -435,14 +435,9 @@ func (s *Store) CreateBenchRun(ctx context.Context, req BenchRequest) (BenchPlan
 	return plan, tx.Commit()
 }
 
-// linkBenchExecutionsTx records an execution of a run: the leader's, and a
-// gang's members.
+// linkBenchExecutionsTx records an execution of a run.
 func linkBenchExecutionsTx(ctx context.Context, tx *sql.Tx, runID, executionID string) error {
-	if _, err := tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) VALUES($1,$2,0) ON CONFLICT DO NOTHING`, executionID, runID); err != nil {
-		return err
-	}
-	_, err := tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) SELECT m.execution_id,$1,m.rank FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id
-		WHERE g.leader_execution_id=$2 AND m.rank>0 ON CONFLICT DO NOTHING`, runID, executionID)
+	_, err := tx.ExecContext(ctx, `INSERT INTO bench_run_executions(execution_id,run_id,rank) VALUES($1,$2,0) ON CONFLICT DO NOTHING`, executionID, runID)
 	return err
 }
 
@@ -723,22 +718,6 @@ func nodeCPUMillisTx(ctx context.Context, q queryer, nodeID string) (int64, erro
 	return total.Int64, err
 }
 
-// gangSpanningTx is a live gang (other than the one led by except) with ranks
-// on both nodes, or "".
-func gangSpanningTx(ctx context.Context, q queryer, nodeA, nodeB, except string) (string, error) {
-	var gang string
-	err := q.QueryRowContext(ctx, `SELECT gp.gang_id FROM gang_placements gp
-		JOIN gang_placement_leases a ON a.placement_id=gp.id JOIN leases la ON la.id=a.lease_id
-		JOIN gang_placement_leases b ON b.placement_id=gp.id JOIN leases lb ON lb.id=b.lease_id
-		JOIN execution_gangs g ON g.id=gp.gang_id
-		WHERE gp.state IN('placed','launched') AND a.node_id=$1 AND b.node_id=$2 AND la.state IN`+liveLeaseStates+` AND lb.state IN`+liveLeaseStates+` AND g.leader_execution_id<>$3
-		LIMIT 1`, nodeA, nodeB, except).Scan(&gang)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	return gang, err
-}
-
 // ListBenchRuns is every bench of host (of deviceID when given), oldest
 // first, with their points when points is set.
 func (s *Store) ListBenchRuns(ctx context.Context, hostID, deviceID string, points bool) ([]BenchRun, error) {
@@ -934,17 +913,6 @@ func (s *Store) BenchStatusOf(ctx context.Context, attemptID, leaseID string) (B
 	case BenchStorage:
 		err = add(`SELECT DISTINCT 'lease '||l.id||' reserves '||li.filesystem FROM leases l JOIN executors x ON x.id=l.executor_id JOIN lease_items li ON li.lease_id=l.id
 			WHERE x.node_id=$1 AND l.state IN`+liveLeaseStates+` AND l.id<>$2 AND li.kind='disk' AND li.filesystem=$3`, run.NodeID, leaseID, run.Target)
-	case BenchNetwork:
-		var gang string
-		if gang, err = gangSpanningTx(ctx, tx, run.NodeID, run.Target, run.ExecutionID); err == nil && gang != "" {
-			status.OtherWork = append(status.OtherWork, "gang "+gang+" spans "+run.NodeID+" and "+run.Target)
-		}
-		if err == nil {
-			// a gang placed the other way round spans the nodes too
-			if gang, err = gangSpanningTx(ctx, tx, run.Target, run.NodeID, run.ExecutionID); err == nil && gang != "" && !slices.Contains(status.OtherWork, "gang "+gang+" spans "+run.NodeID+" and "+run.Target) {
-				status.OtherWork = append(status.OtherWork, "gang "+gang+" spans "+run.NodeID+" and "+run.Target)
-			}
-		}
 	}
 	return status, err
 }

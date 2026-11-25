@@ -49,6 +49,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"kairo/internal/store/dbtx"
 	"math"
 	"slices"
 	"sort"
@@ -91,10 +92,6 @@ type planExecutor struct {
 	id, nodeID, attributes, nodeAttributes string
 }
 
-func (e planExecutor) gang() gangExecutor {
-	return gangExecutor{id: e.id, nodeID: e.nodeID, attributes: e.attributes, nodeAttributes: e.nodeAttributes}
-}
-
 type planGPU struct {
 	id, nodeID, device string
 	fresh              bool
@@ -118,7 +115,6 @@ type planLease struct {
 	id, executionID, attemptID, executorID, nodeID, projectID, label string
 	epoch                                                            int64
 	priority                                                         int
-	gang                                                             bool
 	startedAt                                                        time.Time
 	// victim: a running cooperative attempt that priority preemption may
 	// suspend; suspending: it already has a live suspend command.
@@ -165,8 +161,6 @@ type planCandidate struct {
 	executionCandidate
 	label     string
 	demand    planDemand
-	gangID    string
-	ranks     []planRank
 	submitted time.Time
 	// inputsWait: why it is not admitted yet for its inputs (inputs.go);
 	// empty when it has none, or each is where it is planned.
@@ -417,7 +411,6 @@ func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
 func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT l.id,l.execution_id,COALESCE(l.attempt_id,''),l.executor_id,x.node_id,x.enabled,l.state,l.coordination_epoch,COALESCE(a.state,''),
 		e.priority,e.checkpointable,e.preemptible,e.state,e.project_scope_id,COALESCE(e.task_scope_id,e.queue_scope_id,e.project_scope_id),COALESCE(e.started_at,''),
-		EXISTS(SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id),
 		COALESCE((SELECT MIN(CASE WHEN COALESCE(rr.policy_json::jsonb->>'on_unattributed_activity','wait')='allow' THEN 1 ELSE 0 END)
 			FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='exclusive' AND rr.kind='gpu'),0),
 		u.ram_bytes,u.disk_written_bytes,u.observed_at,
@@ -441,7 +434,7 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 		var leaseState, attemptState, executionState, started string
 		var u usage
 		if err = rows.Scan(&l.id, &l.executionID, &l.attemptID, &l.executorID, &l.nodeID, &executorEnabled, &leaseState, &l.epoch, &attemptState,
-			&l.priority, &checkpointable, &preemptible, &executionState, &l.projectID, &l.label, &started, &l.gang, &l.allowsUnattributed,
+			&l.priority, &checkpointable, &preemptible, &executionState, &l.projectID, &l.label, &started, &l.allowsUnattributed,
 			&u.ram, &u.disk, &u.at, &l.cpuLendable, &l.queueID, &l.taskID, &l.argvJSON, &l.attemptStarted, &l.attemptExited); err != nil {
 			rows.Close()
 			return err
@@ -571,8 +564,7 @@ func (m *planModel) executor(executorID string) (planExecutor, bool) {
 // node and matches the selector (executors of one node share its resources),
 // else the one the pass chose.
 func (m *planModel) onNode(slot planSlot, caller planExecutor, selector string) planExecutor {
-	if caller.id != "" && caller.nodeID == slot.executor.nodeID && selectorMatches(selector, caller.nodeID, caller.attributes) &&
-		(slot.rank != 0 || slot.executor.gang().attribute("interconnect_addr") == "" || caller.gang().attribute("interconnect_addr") != "") {
+	if caller.id != "" && caller.nodeID == slot.executor.nodeID && selectorMatches(selector, caller.nodeID, caller.attributes) {
 		return caller
 	}
 	return slot.executor
@@ -993,14 +985,11 @@ func (p *planner) order(candidates []*planCandidate, visit func(*planCandidate) 
 }
 
 // slotsFor lists, per node, the executor a demand would run on there.
-func (p *planner) slotsFor(selector string, leader bool) []planExecutor {
+func (p *planner) slotsFor(selector string) []planExecutor {
 	var slots []planExecutor
 	seen := map[string]bool{}
 	for _, e := range p.m.executors {
 		if seen[e.nodeID] || !selectorMatches(selector, e.nodeID, e.attributes) {
-			continue
-		}
-		if leader && e.gang().attribute("interconnect_addr") == "" {
 			continue
 		}
 		seen[e.nodeID] = true
@@ -1022,13 +1011,10 @@ func (p *planner) place(c *planCandidate) planPlacement {
 // decide is place without the deadline note; start is when the candidate is
 // expected to start when it waits (zero: not known).
 func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
-	ranks := c.ranks
-	if c.gangID == "" {
-		ranks = []planRank{{rank: 0, candidate: c.executionCandidate, demand: c.demand}}
-	}
+	ranks := []planRank{{rank: 0, candidate: c.executionCandidate, demand: c.demand}}
 	options := make([][]planExecutor, len(ranks))
 	for i, r := range ranks {
-		options[i] = p.slotsFor(r.candidate.selectorJSON, c.gangID != "" && r.rank == 0)
+		options[i] = p.slotsFor(r.candidate.selectorJSON)
 		if len(options[i]) == 0 {
 			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + "no live executor matches the executor labels"}}, time.Time{}
 		}
@@ -1049,9 +1035,9 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 		p.commit(c, slots)
 		return planPlacement{slots: slots}, time.Time{}
 	}
-	// Nowhere to go now. A single execution whose every node refuses it by
-	// its own policy ends here.
-	if c.gangID == "" {
+	// Nowhere to go now. An execution whose every node refuses it by its own
+	// policy ends here.
+	{
 		terminal, reason := true, ""
 		for _, e := range options[0] {
 			f := p.m.fit(e.nodeID, ranks[0].demand, ov, noneFreed)
@@ -1363,11 +1349,8 @@ func formatAbout(d time.Duration) string {
 	return fmt.Sprintf("%dh%02dm", minutes/60, minutes%60)
 }
 
-func rankPrefix(c *planCandidate, r planRank) string {
-	if c.gangID == "" {
-		return ""
-	}
-	return fmt.Sprintf("rank %d: ", r.rank)
+func rankPrefix(*planCandidate, planRank) string {
+	return ""
 }
 
 // assign puts every rank on a distinct node (all or nothing), each on the
@@ -1438,9 +1421,6 @@ func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot
 		}
 		if x.priority != y.priority {
 			return x.priority < y.priority
-		}
-		if x.gang != y.gang {
-			return !x.gang // a gang victim stops every rank
 		}
 		if !x.startedAt.Equal(y.startedAt) {
 			return x.startedAt.After(y.startedAt)
@@ -1572,50 +1552,28 @@ func (p *planner) reaches(l *planLease, nodes map[string]bool) bool {
 //
 // It costs a fixed number of queries whatever the number of candidates (one
 // round trip each, which matters with the database across a network): the
-// candidates with their gangs, the members of those gangs, and the resource
-// requests of all of them.
+// candidates, and the resource requests of all of them.
 func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planCandidate, error) {
 	var candidates []*planCandidate
-	var gangIDs []string
-	err := eachRow(ctx, tx, `SELECT `+candidateColumns+`,COALESCE(gm.gang_id,'')
-		FROM execution_requests e LEFT JOIN gang_members gm ON gm.execution_id=e.id
+	err := eachRow(ctx, tx, `SELECT `+candidateColumns+`
+		FROM execution_requests e
 		WHERE e.state='waiting'
 		AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.execution_id=e.id AND l.state!='released')
 		AND NOT EXISTS (
 			SELECT 1 FROM admission_gates g
 			WHERE g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) AND g.state!='open'
 		)
-		AND (gm.rank IS NULL OR gm.rank=0)
 		ORDER BY e.priority DESC,e.submitted_at,e.id`, nil, func(rows *sql.Rows) error {
 		c := &planCandidate{}
-		if err := scanCandidate(rows, &c.executionCandidate, &c.gangID); err != nil {
+		if err := scanCandidate(rows, &c.executionCandidate); err != nil {
 			return err
 		}
 		c.submitted, _ = time.Parse(time.RFC3339Nano, c.execution.SubmittedAt)
-		if c.gangID != "" {
-			gangIDs = append(gangIDs, c.gangID)
-		}
 		candidates = append(candidates, c)
 		return nil
 	})
 	if err != nil {
 		return nil, err
-	}
-	members := map[string][]gangMember{}
-	if len(gangIDs) > 0 {
-		err = eachRow(ctx, tx, `SELECT `+candidateColumns+`,gm.gang_id,gm.rank FROM gang_members gm JOIN execution_requests e ON e.id=gm.execution_id
-			WHERE gm.gang_id=ANY($1::text[]) ORDER BY gm.gang_id,gm.rank`, []any{gangIDs}, func(rows *sql.Rows) error {
-			var member gangMember
-			var gangID string
-			if err := scanCandidate(rows, &member.candidate, &gangID, &member.rank); err != nil {
-				return err
-			}
-			members[gangID] = append(members[gangID], member)
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
 	}
 	ids := make([]string, 0, len(candidates))
 	for _, c := range candidates {
@@ -1626,11 +1584,6 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 	}
 	if err = loadStoreMoveWaits(ctx, tx, candidates, ids); err != nil {
 		return nil, err
-	}
-	for _, gang := range members {
-		for _, member := range gang {
-			ids = append(ids, member.candidate.execution.ID)
-		}
 	}
 	demands, err := loadDemandsTx(ctx, tx, ids)
 	if err != nil {
@@ -1654,11 +1607,6 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 		c.label = m.labels[c.execution.ProjectScopeID] + "/" + m.labels[task]
 		c.demand = demands[c.execution.ID]
 		c.demand.priority = c.execution.Priority
-		for _, member := range members[c.gangID] {
-			demand := demands[member.candidate.execution.ID]
-			demand.priority = c.execution.Priority
-			c.ranks = append(c.ranks, planRank{rank: member.rank, candidate: member.candidate, demand: demand})
-		}
 	}
 	return candidates, nil
 }
@@ -1900,3 +1848,14 @@ func unique(values []string) []string {
 	}
 	return out
 }
+
+// scanCandidate reads an execution's candidate columns (and extra ones).
+func scanCandidate(row interface{ Scan(...any) error }, c *executionCandidate, extra ...any) error {
+	return row.Scan(append([]any{&c.execution.ID, &c.execution.ProjectScopeID, &c.execution.QueueScopeID, &c.execution.TaskScopeID, &c.execution.ClientRequestID, &c.execution.SpecDigest, &c.execution.State, &c.argvJSON, &c.execution.CWD, &c.selectorJSON, &c.execution.Priority, &c.execution.Checkpointable, &c.execution.Preemptible, &c.execution.InputContinuationRef, &c.execution.TerminalCause, &c.execution.SubmittedAt, &c.execution.AuthorizedAt, &c.execution.StartedAt, &c.execution.TerminalAt, &c.execution.NotBefore, &c.execution.StartBy, &c.execution.FinishBy}, extra...)...)
+}
+
+// queryer runs queries in a transaction or on the database.
+type queryer = dbtx.Queryer
+
+// candidateColumns are the execution columns scanCandidate reads.
+const candidateColumns = `e.id,e.project_scope_id,e.queue_scope_id,e.task_scope_id,e.client_request_id,e.spec_digest,e.state,e.argv_json,e.cwd,e.executor_selector_json,e.priority,e.checkpointable,e.preemptible,e.input_continuation_ref,e.terminal_cause,e.submitted_at,e.authorized_at,e.started_at,e.terminal_at,e.not_before,e.start_by,e.finish_by`

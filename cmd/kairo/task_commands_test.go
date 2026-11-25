@@ -227,7 +227,6 @@ func showFixture() *contractAPI {
 					"energy":         map[string]any{"gpu_joules": 4428000, "gpu_seconds_covered": 3590, "partial": true, "updated_at": stamp(base.Add(-3 * time.Hour))},
 					"ram_peak_bytes": 9 << 30}}},
 			{"ordinal": 2, "execution_id": "exe_2", "reason": "retry", "state": "waiting",
-				"gang": []map[string]any{{"rank": 0, "execution_id": "exe_2", "state": "waiting"}, {"rank": 1, "execution_id": "exe_2r1", "state": "authorized", "node_id": "host-a"}},
 				"waiting": []map[string]any{
 					{"reason_code": "external_claim", "detail": map[string]any{"resource_id": "GPU-1234", "pid": 4242}, "created_at": stamp(base.Add(-10 * time.Minute))},
 					{"reason_code": "scope_gate_closed", "scope": "task", "detail": map[string]any{"closed_by": "alice"}, "created_at": stamp(base.Add(-20 * time.Minute))},
@@ -269,7 +268,6 @@ func TestTaskShowRendersTheDetail(t *testing.T) {
 		"  energy:     GPU 1.23 kWh (partial)\n",
 		"  ram:        peak 9.0 GiB seen (sampled every 15 s)\n",
 		"execution #2 (retry)  waiting\n",
-		"  gang:       rank 1 exe_2r1 authorized node host-a\n",
 		"  waiting:    external_claim on GPU-1234 (pid=4242) (since 10-13 11:50)\n",
 		"  waiting:    scope_gate_closed: the task is paused by alice (since 10-13 11:40)\n",
 	} {

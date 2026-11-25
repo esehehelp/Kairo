@@ -326,18 +326,13 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			}
 			continue
 		}
-		// A gang is read as a whole: terminal only when every rank is, and so on.
-		gang, err := gangAggregateTx(ctx, tx, &current)
-		if err != nil {
-			return err
-		}
 		if current.ExecutionState != "terminal" {
 			if err := updateTaskState(ctx, tx, task.taskScopeID, "running", nil); err != nil {
 				return err
 			}
 			continue
 		}
-		// A forced pause ended this execution (or a rank of its gang): the task
+		// A forced pause ended this execution: the task
 		// is stopped once nothing of it holds resources. No continuation or
 		// restart is planned, whatever the exit or checkpoint.
 		stopped, err := forceStoppedTx(ctx, tx, current.ExecutionID)
@@ -371,7 +366,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		// or a launch cut short, or by kairo resource reconcile), the task goes
 		// on from its latest published checkpoint, on the node that published
 		// it (the reference is a path there); with none it is blocked as any.
-		if !gang.gang && current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" {
+		if current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" {
 			var template orchestration.Execution
 			if err := json.Unmarshal([]byte(task.template), &template); err != nil {
 				return err
@@ -411,23 +406,11 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			continue
 		}
 		succeeded := current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "")
-		// A gang rank failed to launch after other ranks had started: the gang
-		// never ran as a whole, so run it again from the start.
-		if gang.gang && gang.launchAborted && !succeeded {
-			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "gang_launch"}
-			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "gang_restart", trigger, nil); err != nil {
-				return err
-			}
-			continue
-		}
 		// A node quarantine terminated this attempt (it could not checkpoint):
-		// run the task again from the start instead of failing it. For a gang,
-		// any rank terminated by a quarantine counts.
-		terminated := gang.quarantined
-		if !gang.gang {
-			if terminated, err = quarantineTerminatedTx(ctx, tx, *current.AttemptID); err != nil {
-				return err
-			}
+		// run the task again from the start instead of failing it.
+		terminated, err := quarantineTerminatedTx(ctx, tx, *current.AttemptID)
+		if err != nil {
+			return err
 		}
 		if terminated && !succeeded {
 			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "node_quarantine"}
@@ -594,14 +577,14 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 		if err != nil {
 			return plannedOrchestrationDecision{}, err
 		}
-		if node != "" && spec.Gang == nil {
+		if node != "" {
 			if err = pinNodeSpec(&spec, node); err != nil {
 				return plannedOrchestrationDecision{}, err
 			}
 		}
 	}
 	if reason == "loss_continuation" {
-		if node, _ := trigger["node"].(string); node != "" && spec.Gang == nil {
+		if node, _ := trigger["node"].(string); node != "" {
 			if err = pinNodeSpec(&spec, node); err != nil {
 				return plannedOrchestrationDecision{}, err
 			}
@@ -620,6 +603,9 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 
 // taskExecutionSpec is the execution a task's template declares.
 func taskExecutionSpec(scope ScopePath, template orchestration.Execution, clientRequestID string, continuation *string) (ExecutionSpec, error) {
+	if template.Gang != nil {
+		return ExecutionSpec{}, errors.New("the task declares a gang: gangs are no more (every execution runs as one container)")
+	}
 	executor, err := json.Marshal(template.Executor)
 	if err != nil {
 		return ExecutionSpec{}, err
@@ -654,27 +640,6 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 	// long ago, so a start_by says nothing of it.
 	if continuation == nil {
 		spec.StartBy = string(template.StartBy)
-	}
-	if template.Gang != nil {
-		gang := GangSpec{Size: template.Gang.Size, Port: template.Gang.Port}
-		for _, r := range template.Gang.Ranks {
-			rank := GangRank{Rank: r.Rank, Argv: r.Argv, CWD: r.CWD, Env: r.Env}
-			if r.Executor != nil {
-				if rank.ExecutorSelector, err = json.Marshal(r.Executor); err != nil {
-					return ExecutionSpec{}, err
-				}
-			}
-			if r.Exclusive != nil {
-				exclusive := convertExclusive(*r.Exclusive)
-				rank.Exclusive = &exclusive
-			}
-			if r.Capacity != nil {
-				capacity := convertCapacity(*r.Capacity)
-				rank.Capacity = &capacity
-			}
-			gang.Ranks = append(gang.Ranks, rank)
-		}
-		spec.Gang = &gang
 	}
 	return spec, nil
 }

@@ -25,9 +25,6 @@ type Reservation struct {
 	CWD             string             `json:"cwd"`
 	Resources       []ResourceInstance `json:"resources"`
 	GateGenerations map[string]int64   `json:"gate_generations"`
-	// Gang is set for one rank of a placed gang (informational: AuthorizeLaunch
-	// reads the placement from the store).
-	Gang *GangLaunch `json:"gang,omitempty"`
 }
 
 // Launch is a single-use authorization. It contains coordination facts only;
@@ -45,9 +42,8 @@ type Launch struct {
 	CWD                  string             `json:"cwd"`
 	Resources            []ResourceInstance `json:"resources"`
 	InputContinuationRef *string            `json:"input_continuation_ref,omitempty"`
-	Gang                 *GangLaunch        `json:"gang,omitempty"`
-	// Env is the execution's declared environment (a gang rank's already
-	// merged with the gang's), read from the store, never from the caller.
+	// Env is the execution's declared environment, read from the store,
+	// never from the caller.
 	Env map[string]string `json:"env,omitempty"`
 	// ScratchTmpdir: the execution points TMPDIR, TMP and TEMP at its scratch.
 	ScratchTmpdir bool `json:"scratch_tmpdir,omitempty"`
@@ -107,16 +103,10 @@ type executionCandidate struct {
 }
 
 // ReserveNext runs a planning pass (planner.go) and reserves for executorID
-// what the pass places on it: one execution, or, when the pass places a gang
-// anywhere, every rank of it (this executor's rank, if any, is handed over).
-// Priority orders coordination admission; it does not imply retry or
-// workflow semantics. A pass that reserves nothing records every waiting
-// execution's reason.
+// the execution the pass places on it. Priority orders coordination
+// admission; it does not imply retry or workflow semantics. A pass that
+// reserves nothing records every waiting execution's reason.
 func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservation, error) {
-	// A gang rank already placed on this executor is handed over first.
-	if reservation, err := s.deliverGangLease(ctx, executorID); reservation != nil || err != nil {
-		return reservation, err
-	}
 	if time.Since(time.Unix(0, s.lastPass.Load())) < idlePassInterval {
 		if work, err := s.planWork(ctx); err != nil || !work {
 			return nil, err
@@ -147,7 +137,6 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	caller, _ := m.executor(executorID)
 	waits := map[string]planWait{}
 	var reservation *Reservation
-	gangPlaced := false
 	err = p.order(candidates, func(c *planCandidate) (bool, error) {
 		placement := p.place(c)
 		switch {
@@ -155,15 +144,6 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 			return false, terminalizeAdmissionTx(ctx, tx, c.execution, placement.terminal)
 		case len(placement.slots) == 0:
 			waits[c.execution.ID] = placement.wait
-		case c.gangID != "":
-			for i, slot := range placement.slots {
-				placement.slots[i].executor = m.onNode(slot, caller, c.ranks[i].candidate.selectorJSON)
-			}
-			placed, placeErr := placeGangTx(ctx, tx, c.gangID, placement.slots)
-			if placeErr != nil || placed {
-				gangPlaced = placed
-				return true, placeErr
-			}
 		case m.onNode(placement.slots[0], caller, c.selectorJSON).id != executorID:
 			slot := placement.slots[0]
 			waits[c.execution.ID] = planWait{reason: "awaiting_executor", node: slot.fit.node, message: "placed on executor " + slot.executor.id + ", which reserves it when it next polls"}
@@ -179,7 +159,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	}
 	// A pass cut short by a reservation has seen only the executions ahead of
 	// it: their reasons are kept, the others' left as they were.
-	complete := reservation == nil && !gangPlaced
+	complete := reservation == nil
 	if err = saveWaitsTx(ctx, tx, waits, complete); err == nil && complete {
 		err = saveNodeAlertsTx(ctx, tx, m)
 	}
@@ -194,9 +174,6 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	}
 	if complete {
 		s.lastPass.Store(started.UnixNano())
-	}
-	if gangPlaced {
-		return s.deliverGangLease(ctx, executorID)
 	}
 	return reservation, nil
 }
@@ -694,10 +671,8 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		if launch.RunID, err = runIDTx(ctx, tx, executionID); err != nil {
 			return nil, err
 		}
-		if launch.Gang == nil || launch.Gang.Rank == 0 {
-			if launch.Inputs, err = resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON); err != nil {
-				return nil, err
-			}
+		if launch.Inputs, err = resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON); err != nil {
+			return nil, err
 		}
 		launch.Env, launch.ScratchTmpdir, launch.Confine, launch.Store = env, scratchTmpdir, confine || s.confinesAll(time.Now()), storeID.String
 		if launch.Source, err = launchSourceTx(ctx, tx, executionID); err != nil {
@@ -727,11 +702,6 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		return nil, err
 	} else if moving != "" {
 		return nil, fmt.Errorf("%w: %s", ErrGateClosed, moving)
-	}
-	// Launch barrier: a gang rank launches only once every rank is prepared.
-	gang, err := gangLaunchGateTx(ctx, tx, reservation.Lease.ID)
-	if err != nil {
-		return nil, err
 	}
 	attemptID, stamp := id.New("att"), now()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO attempts(id,execution_id,state,executor_id,coordination_epoch,authorized_at) VALUES($1,$2,'authorized',$3,$4,$5)`, attemptID, executionID, executorID, leaseEpoch, stamp); err != nil {
@@ -769,12 +739,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err != nil {
 		return nil, err
 	}
-	// a gang's inputs are rank 0's to read
-	var inputs []LaunchInput
-	if gang == nil || gang.Rank == 0 {
-		if inputs, err = resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON); err != nil {
-			return nil, err
-		}
+	inputs, err := resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON)
+	if err != nil {
+		return nil, err
 	}
 	source, err := launchSourceTx(ctx, tx, executionID)
 	if err != nil {
@@ -809,7 +776,6 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		CWD:                  reservation.CWD,
 		Resources:            append([]ResourceInstance(nil), reservation.Resources...),
 		InputContinuationRef: reservation.Execution.InputContinuationRef,
-		Gang:                 gang,
 		Env:                  env,
 		ScratchTmpdir:        scratchTmpdir,
 		RunID:                runID,
@@ -848,13 +814,6 @@ func reissueLaunchTx(ctx context.Context, tx *sql.Tx, reservation *Reservation, 
 	if err = validateLeaseGatesTx(ctx, tx, leaseID); err != nil {
 		return nil, err
 	}
-	gang, placementState, err := gangLaunchTx(ctx, tx, leaseID)
-	if err != nil {
-		return nil, err
-	}
-	if gang != nil && placementState == "aborted" {
-		return nil, ErrGangAborted
-	}
 	token, tokenHash, err := newSecret("")
 	if err != nil {
 		return nil, err
@@ -889,7 +848,6 @@ func reissueLaunchTx(ctx context.Context, tx *sql.Tx, reservation *Reservation, 
 		CWD:                  reservation.CWD,
 		Resources:            append([]ResourceInstance(nil), reservation.Resources...),
 		InputContinuationRef: reservation.Execution.InputContinuationRef,
-		Gang:                 gang,
 	}
 	launch.Execution.State = "authorized"
 	if authorizedAt.Valid {

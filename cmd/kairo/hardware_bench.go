@@ -83,9 +83,6 @@ func renderBenchPlan(w io.Writer, plan store.BenchPlan) error {
 	for _, d := range e.Capacity.Disks {
 		holds = append(holds, formatSize(d.ReserveBytes)+" of "+d.Filesystem)
 	}
-	if e.Gang != nil {
-		holds = append(holds, fmt.Sprintf("a %d-rank gang", e.Gang.Size))
-	}
 	yields := "never preempted; waits for every other execution"
 	if e.Preemptible {
 		yields = "waits for every other execution; preemptible: suspended at its next point for work that needs the device, it resumes with the kinds not done"

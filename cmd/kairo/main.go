@@ -113,7 +113,7 @@ func serve(args []string) error {
 	}
 	st.SetDataPolicy(store.DataPolicy{ScrubInterval: scrubEvery, ScrubBytesPerDay: daemonConfig.Data.ScrubBytesPerDay, ConfineFrom: confineFrom, RunSnapshotInterval: runSnapshotEvery})
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
+	// The external-command helper (internal/extcmd) logs through the default.
 	slog.SetDefault(logger)
 	attributes, _ := json.Marshal(config.NodeAttributes(daemonConfig.Node.Labels))
 	if err := st.UpsertNode(context.Background(), store.Node{ID: daemonConfig.Node.ID, Name: daemonConfig.Node.Name, OS: daemonConfig.Node.OS, Architecture: daemonConfig.Node.Architecture, Attributes: attributes, Enabled: true}); err != nil {
@@ -284,10 +284,6 @@ func serve(args []string) error {
 			for {
 				if err := st.ReconcileNodeQuarantines(ctx); err != nil && ctx.Err() == nil {
 					logger.Error("node quarantine reconciliation failed", "error", err)
-				}
-				// Gangs: abort placements not prepared in time, keep launched ranks to one fate.
-				if err := st.ReconcileGangs(ctx); err != nil && ctx.Err() == nil {
-					logger.Error("gang reconciliation failed", "error", err)
 				}
 				select {
 				case <-ctx.Done():
