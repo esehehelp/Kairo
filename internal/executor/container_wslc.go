@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -123,6 +124,59 @@ func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string
 func (wslcRuntime) stop(ctx context.Context, name string) error {
 	_, err := wslcCommand(ctx, "stop", "--time", fmt.Sprint(wslcStopSeconds), name)
 	return err
+}
+
+func (wslcRuntime) kill(ctx context.Context, name string) error {
+	_, err := wslcCommand(ctx, "kill", name)
+	return err
+}
+
+// stats reads `wslc stats`: memory in use and the bytes written (BlockIO's
+// second figure).
+func (wslcRuntime) stats(ctx context.Context, name string) (*int64, *int64, error) {
+	out, err := wslcCommand(ctx, "stats", "--format", "json", name)
+	if err != nil {
+		return nil, nil, err
+	}
+	var s struct {
+		MemUsage string `json:"MemUsage"`
+		BlockIO  string `json:"BlockIO"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(bytes.SplitN(out, []byte("\n"), 2)[0]), &s); err != nil {
+		return nil, nil, fmt.Errorf("wslc stats: %w", err)
+	}
+	var ram, written *int64
+	if mem, _, ok := strings.Cut(s.MemUsage, "/"); ok {
+		if n, err := parseSize(mem); err == nil {
+			ram = &n
+		}
+	}
+	if _, w, ok := strings.Cut(s.BlockIO, "/"); ok {
+		if n, err := parseSize(w); err == nil {
+			written = &n
+		}
+	}
+	return ram, written, nil
+}
+
+// parseSize reads a size as docker-style tools print it: 859MiB, 6.79MB,
+// 0B (decimal and binary units).
+func parseSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	units := []struct {
+		suffix string
+		bytes  float64
+	}{{"KiB", 1 << 10}, {"MiB", 1 << 20}, {"GiB", 1 << 30}, {"TiB", 1 << 40}, {"kB", 1e3}, {"KB", 1e3}, {"MB", 1e6}, {"GB", 1e9}, {"TB", 1e12}, {"B", 1}}
+	for _, u := range units {
+		if num, ok := strings.CutSuffix(s, u.suffix); ok {
+			v, err := strconv.ParseFloat(strings.TrimSpace(num), 64)
+			if err != nil {
+				return 0, fmt.Errorf("size %q: %w", s, err)
+			}
+			return int64(v * u.bytes), nil
+		}
+	}
+	return 0, fmt.Errorf("size %q: no unit", s)
 }
 
 func (wslcRuntime) remove(ctx context.Context, name string) error {

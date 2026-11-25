@@ -100,6 +100,31 @@ func (pctRuntime) stop(ctx context.Context, vmid string) error {
 	return err
 }
 
+func (pctRuntime) kill(ctx context.Context, vmid string) error {
+	_, err := pctTool(ctx, "pct", "stop", vmid)
+	return err
+}
+
+// stats reads the container's status: memory in use and bytes written.
+func (pctRuntime) stats(ctx context.Context, vmid string) (*int64, *int64, error) {
+	node, err := os.Hostname()
+	if err != nil {
+		return nil, nil, err
+	}
+	out, err := pctTool(ctx, "pvesh", "get", "/nodes/"+node+"/lxc/"+vmid+"/status/current", "--output-format", "json")
+	if err != nil {
+		return nil, nil, err
+	}
+	var st struct {
+		Mem       int64 `json:"mem"`
+		DiskWrite int64 `json:"diskwrite"`
+	}
+	if err := json.Unmarshal(out, &st); err != nil {
+		return nil, nil, err
+	}
+	return &st.Mem, &st.DiskWrite, nil
+}
+
 func (pctRuntime) remove(ctx context.Context, vmid string) error {
 	n, err := strconv.Atoi(vmid)
 	if err != nil {

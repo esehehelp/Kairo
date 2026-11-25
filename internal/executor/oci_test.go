@@ -27,35 +27,43 @@ func (f *fakeRuntime) run(_ context.Context, spec containerSpec, _ func(string, 
 	return "ctr-" + spec.Instance, code, nil
 }
 func (f *fakeRuntime) stop(context.Context, string) error { return nil }
+func (f *fakeRuntime) kill(context.Context, string) error { return nil }
+func (f *fakeRuntime) stats(context.Context, string) (*int64, *int64, error) {
+	ram, written := int64(1<<20), int64(4096)
+	return &ram, &written, nil
+}
 func (f *fakeRuntime) remove(_ context.Context, h string) error {
 	f.removed = append(f.removed, h)
 	return nil
 }
 func (f *fakeRuntime) containers(context.Context) ([]ociContainer, error) { return f.list, nil }
 
-// The sweep removes the containers of attempts that no longer run here: a
-// stopped one always, a running one only when its argv is out of the host's
-// sight (in a VM); never one whose attempt runs here.
+// The sweep removes the containers of attempts that no longer run here,
+// running or not; never one whose attempt runs here.
 func TestTheSweepRemovesContainersOfAttemptsNoLongerRunning(t *testing.T) {
-	for _, c := range []struct {
-		caps ociCaps
-		want []string
-	}{
-		{ociCaps{argvOnHost: true}, []string{"stopped"}},
-		{ociCaps{vm: true}, []string{"stopped", "running"}},
-	} {
-		f := &fakeRuntime{list: []ociContainer{
-			{attempt: "att_a", handle: "stopped"},
-			{attempt: "att_b", running: true, handle: "running"},
-			{attempt: "att_here", handle: "here"},
-		}}
-		var logs bytes.Buffer
-		e := NewLocal("ctr", nil, t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
-		e.running = map[string]int{"att_here": 1}
-		e.storeWork().sweepContainers(context.Background(), f, c.caps)
-		if !slices.Equal(f.removed, c.want) {
-			t.Fatalf("%+v: removed %v, want %v\n%s", c.caps, f.removed, c.want, logs.String())
+	f := &fakeRuntime{list: []ociContainer{
+		{attempt: "att_a", handle: "stopped"},
+		{attempt: "att_b", running: true, handle: "running"},
+		{attempt: "att_here", handle: "here"},
+	}}
+	var logs bytes.Buffer
+	e := NewLocal("ctr", nil, t.TempDir(), slog.New(slog.NewTextHandler(&logs, nil)))
+	e.running = map[string]int{"att_here": 1}
+	e.storeWork().sweepContainers(context.Background(), f)
+	if !slices.Equal(f.removed, []string{"stopped", "running"}) {
+		t.Fatalf("removed %v\n%s", f.removed, logs.String())
+	}
+}
+
+// Docker-style sizes, as wslc prints them.
+func TestParseSize(t *testing.T) {
+	for in, want := range map[string]int64{"859MiB": 859 << 20, "6.79MB": 6790000, "0B": 0, "1.5GiB": 3 << 29, "826kB": 826000} {
+		if got, err := parseSize(in); err != nil || got != want {
+			t.Fatalf("%s: %d %v, want %d", in, got, err, want)
 		}
+	}
+	if _, err := parseSize("12"); err == nil {
+		t.Fatal("a size without a unit")
 	}
 }
 
