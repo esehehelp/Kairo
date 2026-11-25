@@ -72,7 +72,6 @@ func TestObserveOnlyRecordsExternalActivityWithoutAllocating(t *testing.T) {
 	}}
 	executor := NewLocal("e", st, t.TempDir(), nil)
 	executor.NodeID = "n"
-	executor.Kind = "windows"
 	executor.Attributes = map[string]string{"environment": "windows"}
 	executor.ObserveOnly = true
 	executor.Providers = map[string]provider.Provider{"gpu-provider": p}

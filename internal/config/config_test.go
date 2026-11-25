@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -12,10 +13,16 @@ const daemonBase = `
 [node]
 id = "host"
 name = "host"
-[[executors]]
-id = "local"
-kind = "windows"
 `
+
+// testKind is a container executor kind that runs on this system.
+var testKind = map[string]string{"windows": "wslc"}[runtime.GOOS]
+
+func init() {
+	if testKind == "" {
+		testKind = "incus"
+	}
+}
 
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
@@ -65,7 +72,7 @@ func TestTLSDefaultsAdvertiseToHTTPS(t *testing.T) {
 }
 
 func TestAgentRefusesPlainHTTPUnlessAsked(t *testing.T) {
-	base := "token = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n[[executors]]\nid = \"host-a-linux\"\nkind = \"linux\"\n"
+	base := "token = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n[[executors]]\nid = \"host-a-linux\"\nkind = \"" + testKind + "\"\n"
 	for _, c := range []struct {
 		name, head, wantErr string
 	}{
@@ -90,6 +97,16 @@ func TestAgentRefusesPlainHTTPUnlessAsked(t *testing.T) {
 func TestExampleConfigLoads(t *testing.T) {
 	if _, err := Load(filepath.Join("..", "..", "examples", "kairo.toml")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// The daemon runs no jobs: executors and providers in its configuration
+// are refused.
+func TestADaemonWithExecutorsIsRefused(t *testing.T) {
+	for _, extra := range []string{"[[executors]]\nid = \"x\"\nkind = \"incus\"\n", "[[providers]]\nid = \"p\"\nkind = \"host\"\n"} {
+		if _, err := Load(writeConfig(t, daemonBase+extra)); err == nil || !strings.Contains(err.Error(), "runs no executors") {
+			t.Fatalf("%q: %v", extra, err)
+		}
 	}
 }
 
@@ -138,20 +155,19 @@ func TestAgentStillRequiresAnExecutor(t *testing.T) {
 	}
 }
 
-// A WSL executor (its kind, or its environment label) is refused: that
-// kind is retired, and taken for a host executor it would run Linux command
-// lines on Windows.
-func TestAgentRefusesAWSLExecutor(t *testing.T) {
-	base := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host\"\nname = \"host\"\n[[executors]]\nid = \"wsl-exec\"\n"
-	for _, decl := range []string{"kind = \"wsl2\"\n", "kind = \"local\"\nlabels = { environment = \"wsl2\" }\n"} {
-		if _, err := LoadAgent(writeConfig(t, base+decl)); err == nil || !strings.Contains(err.Error(), "WSL executors are retired") {
+// An executor of a kind that runs no containers (a host kind, the retired
+// WSL one) is refused: every executor runs its attempts in containers.
+func TestAgentRefusesAnExecutorThatRunsNoContainers(t *testing.T) {
+	base := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host\"\nname = \"host\"\n[[executors]]\nid = \"x\"\n"
+	for _, decl := range []string{"kind = \"wsl2\"\n", "kind = \"local\"\n", "kind = \"linux\"\n", "kind = \"windows\"\n"} {
+		if _, err := LoadAgent(writeConfig(t, base+decl)); err == nil || !strings.Contains(err.Error(), "runs no containers") {
 			t.Fatalf("%q: %v", decl, err)
 		}
 	}
 }
 
 func TestLogMinFreeDefaultsAndRefusesNegative(t *testing.T) {
-	agentBase := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n[[executors]]\nid = \"host-a-linux\"\nkind = \"linux\"\n"
+	agentBase := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n[[executors]]\nid = \"host-a-linux\"\nkind = \"" + testKind + "\"\n"
 	c, err := Load(writeConfig(t, daemonBase))
 	if err != nil || c.LogMinFreeMiB != DefaultLogMinFreeMiB {
 		t.Fatalf("daemon default: %d %v", c.LogMinFreeMiB, err)
@@ -216,7 +232,7 @@ func TestDatabaseFromTheFileTheEnvironmentAndAPasswordFile(t *testing.T) {
 }
 
 func TestAgentPacksAreAllOrNothing(t *testing.T) {
-	agentBase := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n[[executors]]\nid = \"host-a-linux\"\nkind = \"linux\"\n"
+	agentBase := "server_url = \"https://192.0.2.12:7474\"\ntoken = \"kairo_node_x\"\n[node]\nid = \"host-a\"\nname = \"host-a\"\n[[executors]]\nid = \"host-a-linux\"\nkind = \"" + testKind + "\"\n"
 	full := "[packs]\nlisten = \":7475\"\naddr = \"192.0.2.14:7475\"\ncert_file = \"pack.pem\"\nkey_file = \"pack-key.pem\"\n"
 	a, err := LoadAgent(writeConfig(t, agentBase+full))
 	if err != nil || a.Packs.Listen != ":7475" || a.Packs.Addr != "192.0.2.14:7475" {

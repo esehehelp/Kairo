@@ -1,16 +1,10 @@
 package executor
 
 import (
-	"bytes"
 	"context"
 	"errors"
-	"io/fs"
-	"strconv"
-	"strings"
-	"syscall"
 	"time"
 
-	"kairo/internal/processidentity"
 	"kairo/internal/store"
 )
 
@@ -45,7 +39,6 @@ type usageTarget struct {
 	attemptID string
 	pid       int
 	identity  string
-	job       usageJob
 }
 
 // usageSample is what one attempt's tree uses; nil is not known.
@@ -84,15 +77,12 @@ func (e *Local) sampleUsage(ctx context.Context) {
 	}
 	targets := make([]usageTarget, 0, len(e.usage))
 	for attemptID, u := range e.usage {
-		targets = append(targets, usageTarget{attemptID: attemptID, pid: u.pid, identity: u.identity, job: duplicateJob(e.trees[attemptID])})
+		targets = append(targets, usageTarget{attemptID: attemptID, pid: u.pid, identity: u.identity})
 	}
 	e.usageRunning, e.usageSampled = true, time.Now()
 	e.mu.Unlock()
 	go func() {
 		defer func() {
-			for _, t := range targets {
-				t.job.close()
-			}
 			e.mu.Lock()
 			e.usageRunning = false
 			e.mu.Unlock()
@@ -101,10 +91,7 @@ func (e *Local) sampleUsage(ctx context.Context) {
 		defer cancel()
 		sample := e.usageSampler
 		if sample == nil {
-			sample = e.sampleTrees
-			if b, ok := e.backend().(ociBackend); ok {
-				sample = b.sampleContainers // what the container uses, not its runner
-			}
+			sample = e.backend().sample
 		}
 		samples := sample(ctx, targets)
 		for _, t := range targets {
@@ -166,126 +153,4 @@ func sumTree(pids []int, ram, written func(int) (int64, error)) usageSample {
 		s.written = &writtenTotal
 	}
 	return s
-}
-
-// procEntry is one process of a /proc table.
-type procEntry struct {
-	identity string
-	parent   int
-	attempt  string // its KAIRO_ATTEMPT_ID, "" when it has none or it cannot be read
-}
-
-// sampleProcTrees samples attempts' trees from a Linux /proc (fsys): an
-// attempt's processes are those carrying its KAIRO_ATTEMPT_ID (as force stop
-// finds them) and the descendants of its launcher, while the launcher is
-// still the process it launched. RAM is the sum of their PSS
-// (smaps_rollup), bytes written of their write_bytes less
-// cancelled_write_bytes (io); both need the processes to be the executor's
-// user's, or the executor to run as root. A launcher that is gone with no
-// process carrying the attempt's id gives an unknown sample.
-func sampleProcTrees(fsys fs.FS, self int, targets []usageTarget) map[string]usageSample {
-	procs := readProcTable(fsys, self)
-	children := map[int][]int{}
-	for pid, p := range procs {
-		children[p.parent] = append(children[p.parent], pid)
-	}
-	out := map[string]usageSample{}
-	for _, t := range targets {
-		members := map[int]bool{}
-		for pid, p := range procs {
-			if p.attempt == t.attemptID {
-				members[pid] = true
-			}
-		}
-		if root, ok := procs[t.pid]; ok && root.identity == t.identity {
-			visited := map[int]bool{}
-			for stack := []int{t.pid}; len(stack) > 0; {
-				pid := stack[len(stack)-1]
-				stack = stack[:len(stack)-1]
-				if !visited[pid] {
-					visited[pid], members[pid] = true, true
-					stack = append(stack, children[pid]...)
-				}
-			}
-		}
-		if len(members) == 0 {
-			out[t.attemptID] = usageSample{}
-			continue
-		}
-		pids := make([]int, 0, len(members))
-		for pid := range members {
-			pids = append(pids, pid)
-		}
-		out[t.attemptID] = sumTree(pids, func(pid int) (int64, error) {
-			kb, err := procField(fsys, pid, "smaps_rollup", "Pss:")
-			return kb * 1024, err
-		}, func(pid int) (int64, error) {
-			written, err := procField(fsys, pid, "io", "write_bytes:")
-			if err != nil {
-				return 0, err
-			}
-			cancelled, err := procField(fsys, pid, "io", "cancelled_write_bytes:")
-			return max(written-cancelled, 0), err
-		})
-	}
-	return out
-}
-
-// readProcTable reads the live processes of a /proc, but self (zombies have
-// exited; a process that exits while being read is left out).
-func readProcTable(fsys fs.FS, self int) map[int]procEntry {
-	entries, err := fs.ReadDir(fsys, ".")
-	if err != nil {
-		return nil
-	}
-	procs := map[int]procEntry{}
-	for _, entry := range entries {
-		pid, err := strconv.Atoi(entry.Name())
-		if err != nil || pid == self {
-			continue
-		}
-		stat, err := fs.ReadFile(fsys, entry.Name()+"/stat")
-		if err != nil {
-			continue
-		}
-		identity, err := processidentity.LinuxIdentityFromStat(pid, string(stat))
-		if err != nil {
-			continue
-		}
-		// The fields after the command name: state, then the parent's pid.
-		fields := strings.Fields(string(stat[bytes.LastIndexByte(stat, ')')+1:]))
-		if fields[0] == "Z" || fields[0] == "X" {
-			continue
-		}
-		parent, _ := strconv.Atoi(fields[1])
-		p := procEntry{identity: identity, parent: parent}
-		if environ, err := fs.ReadFile(fsys, entry.Name()+"/environ"); err == nil {
-			for _, kv := range bytes.Split(environ, []byte{0}) {
-				if value, ok := bytes.CutPrefix(kv, []byte("KAIRO_ATTEMPT_ID=")); ok {
-					p.attempt = string(value)
-					break
-				}
-			}
-		}
-		procs[pid] = p
-	}
-	return procs
-}
-
-// procField returns the number after key in /proc/PID/name, errProcessGone
-// when the process has exited.
-func procField(fsys fs.FS, pid int, name, key string) (int64, error) {
-	body, err := fs.ReadFile(fsys, strconv.Itoa(pid)+"/"+name)
-	if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
-		return 0, errProcessGone
-	}
-	if err != nil {
-		return 0, err
-	}
-	for _, line := range strings.Split(string(body), "\n") {
-		if fields := strings.Fields(line); len(fields) >= 2 && fields[0] == key {
-			return strconv.ParseInt(fields[1], 10, 64)
-		}
-	}
-	return 0, errors.New("/proc/" + strconv.Itoa(pid) + "/" + name + " has no " + key)
 }

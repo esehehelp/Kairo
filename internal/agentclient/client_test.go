@@ -283,9 +283,10 @@ func TestRemoteExecutorRunsAttemptToRelease(t *testing.T) {
 	t.Setenv("AGENTCLIENT_DECLARED", "from the agent")
 
 	nodeLogs := t.TempDir()
+	// its attempt runs as a plain process (no container runtime here)
+	executor.ForTestsRunKindlessAsProcesses()
 	exec := executor.NewLocal("remote-exec", c, nodeLogs, nil)
 	exec.NodeID = "remote"
-	exec.Kind = "linux"
 	exec.Attributes = map[string]string{"environment": "remote-test"}
 	exec.APIURL = ts.URL
 	exec.APICA = apiCA

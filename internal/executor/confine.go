@@ -3,8 +3,6 @@ package executor
 import (
 	"context"
 	"errors"
-	"fmt"
-	"os/exec"
 	"strings"
 
 	"kairo/internal/store"
@@ -100,37 +98,4 @@ func setEnv(env []string, name, value string) []string {
 		}
 	}
 	return append(out, name+"="+value)
-}
-
-// confinement is what a confined attempt may write; its shim confines the
-// command with it (confineCommand).
-type confinement struct {
-	writable []string
-	scratch  string
-}
-
-// confine readies cmd, an attempt's command, to be confined (see above): its
-// temporary directory is its scratch, and the directories it may write are
-// made ready as confineCommand makes them (which also tells, before
-// anything starts, that it can be confined here).
-func (e *Local) confine(cmd *exec.Cmd) (*confinement, error) {
-	scratch, output, cache := confinedDirs(cmd.Env)
-	if scratch == "" || output == "" {
-		return nil, fmt.Errorf("%w: no scratch and output directory here (no usable volatile store)", errConfineHere)
-	}
-	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {
-		cmd.Env = setEnv(cmd.Env, name, scratch)
-	}
-	writable := []string{scratch, output}
-	if cache != "" {
-		writable = append(writable, cache)
-	}
-	release, err := confineCommand(&exec.Cmd{Path: cmd.Path, Args: cmd.Args}, writable, scratch)
-	if err != nil {
-		return nil, err
-	}
-	if release != nil {
-		release()
-	}
-	return &confinement{writable: writable, scratch: scratch}, nil
 }

@@ -90,7 +90,7 @@ Task は永続的な論理オブジェクトであり、一連のイミュータ
 | `orchestration` | ProjectSpec、Task（イミュータブル）、ポリシーによる判断、再実行（rerun） | `orchestration`, `store`（`orchestration`, `task_control`, `task_views`） | [クイックスタートと基本操作](#クイックスタートと基本操作), [CLI からの Task 監視とログ確認](#cli-からの-task-監視とログ確認) |
 | `coordination` | Execution（ワンショット）、Attempt、Lease、Command、スコープゲート（Scope gate）、Gang、隔離（quarantine）、強制停止 | `store`（`execution`, `scheduler`, `worker`, `scopes`, `gang`, `quarantine`, `forcestop`）, `execution` | [コーディネーションモデル](#コーディネーションモデル), [Gang 実行](#gang-実行) |
 | `planning` | 環境全体に対する 1 回のパスでの処理: 配置、バックフィル、プリエンプション、実行時間の推定、アドミッション計上 | `store`（`planner`, `preemption`, `estimate`） | [アドミッション制御とプランニング](#アドミッション制御とプランニング), [実行時間の推定](#実行時間の推定) |
-| `execution` | Executor のバックエンドを通じた起動（ホスト上または Incus コンテナ内: `executor/backend.go`）、shim と引き継ぎ（adoption）、コンファインメント（Confinement）、強制停止、静止（quiescence）、使用量計測、観測 | `executor`, `processidentity`, `provider`, `agentclient` | [エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ), [コンテナ実行](#コンテナ実行), [強制停止](#強制停止) |
+| `execution` | Executor のバックエンドを通じた起動（ランタイムのコンテナ内: `executor/backend.go`、`executor/oci.go`）、shim と引き継ぎ（adoption）、コンファインメント（Confinement）、強制停止、静止（quiescence）、使用量計測、観測 | `executor`, `processidentity`, `provider`, `agentclient` | [エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ), [コンテナ実行](#コンテナ実行), [強制停止](#強制停止) |
 | `data` | ストア（store）、`scratch`・`output`・`cache` ディレクトリ、データオブジェクト・pack・コピー・レプリカ、インポート・Run スナップショット・チェックポイント・時系列データ、フェッチ・エビクション・リードバック（read-back）・インベントリ | `store`（`packs`, `copies`, `replicas`, `deletions`, `imports`, `inputs`, `placements`, `evictions`, `temporal`, `regenerate`, `transfer`, `runsnapshots`, `checkpoints`, `inventory_durable`, `scrub`, `shed`, `control_snapshot`）, `executor`（ストアワーカー `storeworker.go`: `datastore`, `pack`, `transfer`, `fetch`, `retire`, `evict`, `inventory`, `storefs`）, `machine`, `datainput` | [データストア](#データストア), [自己バックアップ](#自己バックアップ) |
 | `loader` | ストリーム: raw データの取得と照合、決まった順番（混合・シャッフル・rank への分割）、stage、ソケットでの受け渡し、位置 | `loader` | [Loader（ストリーム）](#loaderストリーム) |
 | `provenance` | コードスナップショット、ダイジェスト指定のコンテナイメージ | `sourcesnap`, `imageref`, `store/provenance` | [コードスナップショット](#コードスナップショット), [コンテナ実行](#コンテナ実行) |
@@ -401,9 +401,9 @@ ca_file = "/etc/kairo/ca.pem"
 # attempt_api_url = "https://192.0.2.12:7474"  # このノード上の Attempt に渡す KAIRO_API_URL
 ```
 
-残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`、`[bench]`、`[[executors]]`、`[[providers]]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。
+残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`、`[bench]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
 
-- **Executor の実行形態**: Executor はホスト上で直接 Attempt を実行するか、種別（kind）が `incus` または `pct` の場合はコンテナ内で実行します（[コンテナ実行](#コンテナ実行)を参照）。WSL 内で Attempt を実行していた Executor は廃止されており、それを宣言する設定（種別 `wsl2` またはラベル `environment = "wsl2"`）は拒否されます。Linux 向けのジョブは Linux ノード上またはコンテナ内で実行してください。
+- **Executor の実行形態**: すべての Executor は Attempt をイメージのコンテナで実行します。種別（kind）は `incus`・`pct`（Linux）と `wslc`（Windows）だけです（[コンテナ実行](#コンテナ実行)を参照）。ホストで直接実行する種別（以前の `linux`・`windows` など）や WSL の種別（`wsl2`）を宣言する設定は拒否されます。
 - **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。
 - **相対パスの基準**: `log_directory`（および `source_directory`）に相対パスを指定した場合、デーモンまたはエージェントの起動時の作業ディレクトリを基準に 1 度だけ解決され、Attempt には絶対パスが渡されます。
 - **接続要件**: エージェントは `insecure_http = true` を指定しない限り `http://` の URL を拒否します。ホストのデバイスコントローラ（`kairo controller`。[ハードウェア設定](#ハードウェア設定)を参照）も同じ方法で接続します。
@@ -494,7 +494,7 @@ key_file = "/etc/kairo/pack-key.pem"
 
 ### Attempt ログの取得
 
-`GET /api/attempts/{id}/log?stream=stdout|stderr&offset=N&limit=M` は、デーモンが保持している Attempt のログ（デーモン自身の Executor が書き込んだもの、またはエージェントから転送されたもの）を生バイト列で返します。
+`GET /api/attempts/{id}/log?stream=stdout|stderr&offset=N&limit=M` は、デーモンが保持している Attempt のログ（エージェントから転送されたもの）を生バイト列で返します。
 
 - **パラメータ**: `stream` のデフォルトは `stderr`、`limit` のデフォルトは `1 MiB`（最大 `8 MiB`）です。代わりに `tail=N` を指定すると、末尾 N バイトを返します。
 - **レスポンスヘッダ**: `Kairo-Log-Size` に現在のサイズ、`Kairo-Log-Next-Offset` に次回の読み取り開始位置が返されます（今回のボディの開始位置は `Kairo-Log-Next-Offset` からボディ長を引いた値です）。
@@ -568,7 +568,7 @@ kairo resource reconcile RESOURCE_ID --confirm-process-absent
 Executor はこのような残留プロセスを自動的に終了させます。
 
 1. 検知されてから 10 秒経過すると停止を要求します（`SIGTERM` を送信。なお Windows ではランチャーがすでに終了しているため、`CTRL_BREAK` は届きません）。
-2. さらに 30 秒経過すると強制終了（kill）します。対象となるのは、ジョブオブジェクト、ランチャーのプロセスグループ、および当該 Attempt の `KAIRO_ATTEMPT_ID` を持つプロセスであり、それぞれ[強制停止](#強制停止)（force stop）と同じ方法で特定されます。これら以外のプロセスが対象になることは決してありません。
+2. さらに 30 秒経過すると強制終了（kill）します。対象となるのは、Attempt のコンテナ（ランタイムで即座に止めます）と、ランナーのプロセスグループ（Windows ではジョブオブジェクト）であり、[強制停止](#強制停止)（force stop）と同じ方法で特定されます。これら以外のプロセスが対象になることは決してありません。
 
 なお、エージェント再起動に伴ってロストした Attempt は終了済み（`exited`）ではないため、この自動終了の対象にはならずそのまま残されます。
 
@@ -666,10 +666,10 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 
 利用可能な volatile store を持たない（したがって `scratch` や `output` ディレクトリを持たない）Executor 上でのコンファインメント起動は拒否されます（`launch_aborted: cannot confine the attempt here: ...`）。コンファインメント設定は、Execution 側で明示的に要求された場合にのみ Execution のダイジェストに含まれます。
 
-OS ごとの実装と制約は次のとおりです。
+実装はランタイムごとに次のとおりです。
 
-- **Linux**: ランチャーはエージェント自身のバイナリであり、独自のマウント名前空間（mount namespace）内で実行されます（Go がマウントを private にするため、ノード本体へは影響しません）。上記の 3 ディレクトリ、`/dev/shm`、および `/proc` をそれぞれ自身にバインドマウントし、さらに `scratch` 配下の `tmp` ディレクトリを `/tmp` の上にバインドマウントします。そのうえで `/` から再帰的にすべてのマウントを読み取り専用にし（`mount_setattr`）、上記のマウント先だけを再び書き込み可能に戻してから、`PATH` 上で検索した Attempt の `argv` をそのまま `exec` します。これにより PID、プロセスグループ、作成時刻は Attempt 自身のものとなります。エージェントにはマウント操作権限が必要です（稼働中のコンテナ内と同様の `root` 権限）。デバイスはそのまま利用可能です。コンファインメントを実行できない場合は、理由を stderr に出力して終了コード `126`（`argv` が見つからない場合は `127`）で終了します。
-- **Windows**: ランチャーはエージェントのトークンを Low 整合性レベル（Low integrity）に複製したもので実行され、上記の 3 ディレクトリに Low ラベルが付与されます（配下に作成されるものへも継承されます）。Low 整合性プロセスは従来読み取れた場所を読み取れますが、書き込みは Low ラベルの付いた対象のみに制限され、子プロセスもこのトークンを継承します。CUDA、Python、ネイティブプログラムはこの環境で動作しますが、セッションレベルで名前付きオブジェクトを作成するプログラム（MSYS や Git Bash のツール群など）は起動できません。
+- **Incus・pct（Linux）**: コンテナの init（`__kairo-container-init`）が、コンテナのマウント名前空間の中で閉じ込めます。上記の 3 ディレクトリ、`/dev/shm`、および `/proc` をそれぞれ自身にバインドマウントし、さらに `scratch` 配下の `tmp` ディレクトリを `/tmp` の上にバインドマウントします。そのうえで `/` から再帰的にすべてのマウントを読み取り専用にし（`mount_setattr`）、上記のマウント先だけを再び書き込み可能に戻してから `argv` を起動します。デバイスはそのまま利用可能です。閉じ込められない場合は、理由を stderr に出力して終了コード `126` で終了します。
+- **wslc（Windows）**: コンテナの中でマウントを作れない（`CAP_SYS_ADMIN` がない）ため、マウントによる閉じ込めの代わりに、`argv` を一般ユーザー（`1000:1000`）で実行します（[WSL コンテナ Executor](#wsl-コンテナ-executorkind--wslc) を参照）。
 
 #### 配置・バックフィル・プリエンプション
 
@@ -693,7 +693,7 @@ OS ごとの実装と制約は次のとおりです。
   - **CPU**: ノードの総 CPU から、そのノード上の予約（reservation）の合計を差し引いた値です。
   - **RAM**: 「総メモリ − 予約合計」と、「観測された空きメモリ − 各予約のうち Attempt がまだ使っていない分」のうち小さい方を用います。Executor がサンプリングした Attempt の実使用量は 2 分間有効として計上され、サンプルがない場合は予約全額が計上されます。
     - 同種の過去実行のうち使用量がサンプリングされた成功 Run が 3 件以上ある場合、予約の計上額には実績ベースの上限が適用されます。上限は、最も具体的な実行時間推定キー（プログラム・サブコマンド・設定ファイル、プログラム・サブコマンド、または数字をマスクした Task 名のいずれか。キュー全体やプロジェクト全体は対象外）を共有する直近 5 件の Run における Attempt 最大実使用量の 1.5 倍 + 512 MiB とし、かつその Attempt の現在の実使用量を下回ることはありません。
-    - ただし、GPU を保持している Lease は常に予約全額が計上されます。CUDA がピン留め（pin）するホストメモリはサンプリング値に含まれないためです（Linux では PSS、Windows では private working set を計測しており、どちらも pinned memory を含まず、さらに Windows ではモデル重みなどのメモリマップドファイルも含まれません）。スワップのないホストでメモリが枯渇するとハングするため、この保護を行っています。
+    - ただし、GPU を保持している Lease は常に予約全額が計上されます。CUDA がピン留め（pin）するホストメモリはサンプリング値に含まれないためです（コンテナのランタイムが報告するメモリ使用量 を計測しており、どちらも pinned memory を含まず、さらに Windows ではモデル重みなどのメモリマップドファイルも含まれません）。スワップのないホストでメモリが枯渇するとハングするため、この保護を行っています。
     - これにより、過大に宣言されたメモリ（実際には 300 MiB しか使わないジョブに 8 GiB を宣言した場合など）で使われない分を抱え込み続けるのを防ぎつつ、実際に大きく使うジョブ（10.7 GiB 使った実績に対して 16 GiB を宣言した場合など）は引き続き全額計上されます。サンプリング間隔は 15 秒であり、1.5 倍 + 512 MiB の余裕（headroom）はこの間隔での増加に備えるためのものです。
   - **Disk**: 観測された空き容量から、その上の全予約を差し引いた値です。書き込みバイト数はディスク上に実際に残る容量を過大評価するため（書き換えられたチェックポイントが二重計上されるなど）、書き込み量によって予約額が減らされることはありません。ディスク要求は、自身の `min_free_after_bytes` とディスクウォーターマークの双方の空き容量を確保します。
 - **弾性 CPU（Elastic CPU）**: `[capacity]`（Task では `[tasks.execution.capacity]`）配下の `cpu_millis_min`（上限は `cpu_millis`）は、Execution が最低限維持する CPU 量です。予約 CPU の残余分は同等以上の優先度を持つ Execution に貸し出され、元のジョブを停止させずに横に並走させて処理速度を落とすだけで共存できます（例: `cpu_millis = 16000`、`cpu_millis_min = 4000` で宣言されたサーバは、同等以上の優先度の評価ジョブに対して 12 CPU 分を貸し出して並走を許容します）。より低い優先度の Execution には一切貸し出しません。
@@ -751,10 +751,9 @@ Executor は 15 秒ごとに、自身が起動した各 Attempt のリソース�
 
 サンプリングはティックと並行して 1 回ずつ実行され、1 回の上限は 15 秒に制限されているため、ティック処理をブロックすることはありません。RAM は Attempt のプロセス群が保持しているメモリ量、書き込みバイト数はプロセス群が書き込んだ量を表し、以前のサンプル値を下回ることはありません。
 
-- **Linux**: Attempt の `KAIRO_ATTEMPT_ID` を持つプロセスおよびランチャーの子孫プロセスを対象とし、PSS（`smaps_rollup`）の合計と、`/proc/PID/io` の `write_bytes` から `cancelled_write_bytes` を引いた値の合計を集計します。
-- **Windows**: Attempt のジョブオブジェクトに属するプロセスを対象とし、そのプライベートワーキングセットの合計およびジョブ全体の書き込みバイト数を集計します。ジョブオブジェクトがない場合は、親 PID をたどって特定したランチャーとその子孫プロセスを対象とし、生存中に書き込んだバイト数を集計します。
+数値はコンテナのランタイムの統計から取ります（Incus は `incus query` のメモリ使用量で、書き込みバイト数は不明として扱います。pct は `pvesh` の `mem`・`diskwrite`、wslc は `wslc stats`）。コンテナのランナーではなく、コンテナそのものが使った量です。
 
-読み取れないプロセスがある場合（他ユーザーのプロセスや `smaps_rollup` を持たないカーネルなど）、その数値は不明扱いとなり、アドミッション制御は予約量全体を計上します。エージェント再起動後に引き継がれた（adopted）Attempt はエージェント自身が起動したものと同様にサンプリングされますが、見失われた（lost）Attempt はサンプリングされません。
+統計が読めない場合、その数値は不明扱いとなり、アドミッション制御は予約量全体を計上します。エージェント再起動後に引き継がれた（adopted）Attempt はエージェント自身が起動したものと同様にサンプリングされますが、見失われた（lost）Attempt はサンプリングされません。
 
 ### Attempt ログ
 
@@ -1060,11 +1059,11 @@ labels = { site = "host-w" }
 
 #### コンテナの起動・終了ライフサイクルとマウント構成
 
-Attempt のランチャーはホスト実行時と同様に shim であり、エージェントのバイナリをランナー（`__kairo-oci-run`）として起動します。ランナーはどのランタイムでも同じで、ランタイムごとの違い（作り方・止め方・消し方・一覧）だけをランタイムの実装（`ociRuntime`：Incus・pct・wslc）が持ちます。後片付け（ランナーが強制終了されて残ったコンテナの削除）、止め方、プロセスの生死の判定、使用量の測り方も共通です（下記）。以前のランナーの引数（`__kairo-incus-run`・`__kairo-pct-run`・`__kairo-wslc-run`）も受け付けます。Incus のときは、ランナーはイメージからインスタンス `kairo-<attempt id>` を作成し（`incus init REMOTE:REPOSITORY@DIGEST`。初回はそのレジストリ用の OCI リモートを追加）、起動して停止を待ち、コンテナが書き出した終了コードを読み取ってインスタンスを削除し、その終了コードで終了します（終了コードが書かれていなかった場合は `-1`）。実行中にエージェントが再起動しても、他の Attempt と同様に引き継がれます（[エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ) を参照）。
+Attempt のランチャーは shim であり、エージェントのバイナリをランナー（`__kairo-oci-run`）として起動します。ランナーはどのランタイムでも同じで、ランタイムごとの違い（作り方・止め方・消し方・一覧）だけをランタイムの実装（`ociRuntime`：Incus・pct・wslc）が持ちます。後片付け（ランナーが強制終了されて残ったコンテナの削除）、止め方、プロセスの生死の判定、使用量の測り方も共通です（下記）。以前のランナーの引数（`__kairo-incus-run`・`__kairo-pct-run`・`__kairo-wslc-run`）も受け付けます。Incus のときは、ランナーはイメージからインスタンス `kairo-<attempt id>` を作成し（`incus init REMOTE:REPOSITORY@DIGEST`。初回はそのレジストリ用の OCI リモートを追加）、起動して停止を待ち、コンテナが書き出した終了コードを読み取ってインスタンスを削除し、その終了コードで終了します（終了コードが書かれていなかった場合は `-1`）。実行中にエージェントが再起動しても、他の Attempt と同様に引き継がれます（[エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ) を参照）。
 
 コンテナ内では、読み取り専用でマウントされた同一のバイナリが Incus 自身の init の配下でコンテナ用 init（`__kairo-container-init`）として動作します。
 
-- コンファインメントされたホスト Attempt と同様にコンテナ内を制限します（Kairo が渡すディレクトリ以外はすべて読み取り専用、`/tmp` は scratch 配下のディレクトリ、`/proc` と `/dev/shm` は書き込み可能。[アドミッション制御とプランニング](#アドミッション制御とプランニング) のコンファインメントを参照）。
+- コンファインメント（`confine`）の指定どおりにコンテナ内を制限します（Kairo が渡すディレクトリ以外はすべて読み取り専用、`/tmp` は scratch 配下のディレクトリ、`/proc` と `/dev/shm` は書き込み可能。[アドミッション制御とプランニング](#アドミッション制御とプランニング) のコンファインメントを参照）。
 - 指定されたディレクトリで `argv` を専用のプロセスグループとして起動し、その出力を Attempt のログへ追記します。
 - コンテナ内で終了したプロセスを回収（reap）し、`argv` の終了コードを書き出します（シグナルで終了した場合はそのシグナルも Attempt の stderr に書き出します）。
 - `__kairo-container-init` 自身が終了するとコンテナが停止し、内部に残っていたプロセスもすべて終了します。
@@ -1094,9 +1093,9 @@ Kairo が渡した領域以外に Attempt が書き込んだ内容はインス�
 #### 環境変数・GPU 受け渡し・制約事項
 
 - **環境変数と `/dev/shm`**: コンテナの環境変数は「イメージの環境変数 → 宣言された env → Kairo の環境変数」の順に構築されます。Kairo が渡すパスはすべて上記のコンテナ内パスとなり、その配下を指すパスも書き換えられます（例: 継続時の `KAIRO_CONTINUATION_REF`）。エージェント自身の環境変数はコンテナには渡されません。`/dev/shm` はメモリの最大半分を上限とする tmpfs です（PyTorch のデータローダワーカーがバッチ共有に使用します。ここに書き込まれた分はメモリ使用量となります）。
-- **GPU の受け渡し**: Lease された GPU は UUID から特定されたデバイスノード（`/dev/nvidia<minor>`）および制御デバイスとしてコンテナに渡されます。ドライバのライブラリとプログラム群は `nvidia-container-cli list` が列挙するものをドライババージョンごとに 1 回 `<log dir>/containers/nvidia/<version>` にまとめて配置し（soname 付きでリンク）、`/kairo/nvidia` にマウントします（`lib` を `LD_LIBRARY_PATH` の先頭に、`bin` を `PATH` の末尾に追加）。`CUDA_VISIBLE_DEVICES` にはホスト実行時と同様に UUID が設定されます。なお、ネストされたコンテナ内では cgroup のデバイスプログラムを読み込めないためデバイスアクセス自体はフェンスされません。ホスト実行時と同様、その GPU が Attempt の所有物であるのは Kairo が Lease していることに基づきます。
-- **プロセス帰属・チェックポイント・後始末**: コンテナ内のプロセスも他の Attempt と同様に `KAIRO_ATTEMPT_ID` を持つため、GPU プロセスの帰属、メモリ使用量のサンプリング、強制停止、終了済み Attempt の残留プロセス終了処理がいずれも機能します。コンテナが公開するチェックポイントはコンテナ内パス（`/kairo/output/...`）を指すためインポートは行われず（[実行中ジョブのチェックポイント保護](#実行中ジョブのチェックポイント保護) を参照）、チェックポイント公開が指示する Run スナップショットによって保持されます。また、Executor は 10 分ごと、およびコンテナ上の Attempt 終了直後に、もはやそこで実行されていない Attempt の停止済みインスタンスを削除します（ランナーが強制終了された場合はランナーによる削除が行われないためです）。
-- **現時点の制約**: Gang 実行および Windows には未対応であり、実行中コンテナの状態そのものを保持する機能もまだありません。処理の継続はホスト実行時と同様に、ジョブ自身のチェックポイントから再開します。
+- **GPU の受け渡し**: Lease された GPU は UUID から特定されたデバイスノード（`/dev/nvidia<minor>`）および制御デバイスとしてコンテナに渡されます。ドライバのライブラリとプログラム群は `nvidia-container-cli list` が列挙するものをドライババージョンごとに 1 回 `<log dir>/containers/nvidia/<version>` にまとめて配置し（soname 付きでリンク）、`/kairo/nvidia` にマウントします（`lib` を `LD_LIBRARY_PATH` の先頭に、`bin` を `PATH` の末尾に追加）。`CUDA_VISIBLE_DEVICES` には UUID が設定されます。なお、ネストされたコンテナ内では cgroup のデバイスプログラムを読み込めないためデバイスアクセス自体はフェンスされません。その GPU が Attempt の所有物であるのは、Kairo が Lease していることに基づきます。
+- **プロセス帰属・チェックポイント・後始末**: Incus・pct のコンテナ内のプロセスはホストの `/proc` から見え、`KAIRO_ATTEMPT_ID` を持つため、GPU プロセスの帰属が機能します。止め方・生死・使用量はランタイムを通します（上記）。コンテナが公開するチェックポイントはコンテナ内パス（`/kairo/output/...`）を指すためインポートは行われず（[実行中ジョブのチェックポイント保護](#実行中ジョブのチェックポイント保護) を参照）、チェックポイント公開が指示する Run スナップショットによって保持されます。また、Executor は 10 分ごと、およびコンテナ上の Attempt 終了直後に、もはやそこで実行されていない Attempt のインスタンスを削除します（ランナーが強制終了された場合はランナーによる削除が行われないためです）。
+- **現時点の制約**: Gang 実行には対応しません。実行中コンテナの状態そのものを保持する機能もまだなく、処理の継続はジョブ自身のチェックポイントから再開します。
 
 ### データストア
 
@@ -1748,7 +1747,7 @@ GPU クロック、電力上限、プロセッサ設定の変更には、デー�
 
 `kairo task pause --force|-f [--grace 30s] [--reason ...] PROJECT QUEUE TASK`（`queue pause --force` および `project pause --force` も同様）は、チェックポイント対応の有無にかかわらず、対象となった実行を一時停止ではなく終了させる pause 操作です。
 
-- **開始済み Execution**: その Attempt に対して強制停止が発行され、担当 Executor（デーモン内蔵またはノードエージェント）がプロセスツリー全体を停止します。まずグレースフル停止を試み（Windows はランチャーのプロセスグループへ `CTRL_BREAK` を送信、Linux はプロセスグループおよび該当 Attempt の `KAIRO_ATTEMPT_ID` を持つすべてのプロセスへ `SIGTERM` を送信）、グレース期間経過後も残っているプロセスを強制終了します（Windows は Attempt のジョブオブジェクト終了と `taskkill /T /F`、Linux は `SIGKILL`）。Execution は終了原因 `force_stopped` で終了し、進行中の `suspend` は待機されません。
+- **開始済み Execution**: その Attempt に対して強制停止が発行され、担当 Executor（ノードエージェント）が Attempt のコンテナとランナーを停止します。まずグレースフル停止を試み（Windows はランチャーのプロセスグループへ `CTRL_BREAK` を送信、Linux はプロセスグループおよび該当 Attempt の `KAIRO_ATTEMPT_ID` を持つすべてのプロセスへ `SIGTERM` を送信）、グレース期間経過後も残っているプロセスを強制終了します（Windows は Attempt のジョブオブジェクト終了と `taskkill /T /F`、Linux は `SIGKILL`）。Execution は終了原因 `force_stopped` で終了し、進行中の `suspend` は待機されません。
 - **未開始 Execution**: 取り下げられ（`withdrawn_before_start`）、予約済みの Lease は通常の pause と同様に取消（revoke）されます。
 - **Lease 解放と静止判定**: Lease は通常の静止証明（quiescence proof）を経てのみ解放され、Executor がプロセスツリーの完全消滅も確認した時点で操作全体が `quiesced` となります。終了途中のプロセスは、ファイル（GPU のデバイスファイルを含む）を閉じてゾンビ状態になるよりも先に自身のメモリを解放するため、その段階で `/proc/PID/environ` から環境変数を読み取れなくなります（空になるかアクセスが拒否されます）。このため、`KAIRO_ATTEMPT_ID` によって特定されたプロセスは `starttime` とともに記憶され、同じ `starttime` で存在し続けており、ゾンビではなく、かつ環境変数が空または読み取り不可である間も生存中としてカウントされます。
 - **Task の最終状態**: Task は `stopped` 状態で終了し、継続実行や再起動は計画されません。また、後続 Task は失敗した Task の場合と同様にブロックされます。Task 結果には操作内容、実行者（actor）、および理由が記録されます。

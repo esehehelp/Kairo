@@ -19,7 +19,7 @@ gpu_binary = "/opt/kairo/kairo-bench-gpu"
 executor_labels = { environment = "linux" }
 [[executors]]
 id = "linux"
-kind = "linux"
+kind = "`+testKind+`"
 `)
 	cfg, err := LoadAgent(path)
 	if err != nil {

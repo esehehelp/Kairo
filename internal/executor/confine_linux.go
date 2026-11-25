@@ -6,102 +6,20 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
-	"syscall"
 
 	"golang.org/x/sys/unix"
 )
 
-// On Linux a confined attempt's launcher is this binary run as
-// confineHelperArg in a mount namespace of its own (CLONE_NEWNS; Go makes
-// its mounts private, so nothing done there reaches the node): it binds a
-// directory of the scratch over /tmp, binds each writable directory (and
-// /tmp, /dev/shm and /proc) onto itself, makes every mount read-only
-// (mount_setattr, recursively from /), makes those writable again, and
-// execs the attempt's argv (looked up on its PATH) in its place, so the
-// launcher's pid, process group and creation time are the attempt's. The
-// agent must be able to make mounts (root, as in the containers it runs
-// in); devices stay usable (a read-only mount does not stop writing to a
-// device), and nothing is hidden: everything else is read as before.
-
-const confineHelperArg = "__kairo-confine"
-
-// confineCommand turns cmd into the confining launcher (see above).
-func confineCommand(cmd *exec.Cmd, writable []string, scratch string) (func(), error) {
-	self, err := os.Executable()
-	if err != nil {
-		return nil, fmt.Errorf("%w: %v", errConfineHere, err)
-	}
-	tmp := filepath.Join(scratch, "tmp")
-	if err := os.Mkdir(tmp, 0o777); err != nil && !os.IsExist(err) {
-		return nil, fmt.Errorf("%w: make %s: %v", errConfineHere, tmp, err)
-	}
-	if err := os.Chmod(tmp, 0o777|os.ModeSticky); err != nil {
-		return nil, fmt.Errorf("%w: %v", errConfineHere, err)
-	}
-	args := []string{self, confineHelperArg, "--tmp", tmp}
-	for _, w := range writable {
-		args = append(args, "--write", w)
-	}
-	args = append(append(args, "--"), cmd.Args...)
-	// the attempt's argv[0] is looked up by the launcher, on its own PATH
-	cmd.Path, cmd.Args, cmd.Err = self, args, nil
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	cmd.SysProcAttr.Unshareflags |= syscall.CLONE_NEWNS
-	return nil, nil
-}
-
-// runConfineHelper runs the confining launcher when args name it, and never
-// returns then: it execs the attempt, or exits 126 (could not confine or
-// exec) or 127 (argv[0] not found), saying why on stderr.
-func runConfineHelper(args []string) {
-	if len(args) < 2 || args[1] != confineHelperArg {
-		return
-	}
-	var writable []string
-	tmp := ""
-	i := 2
-	for ; i < len(args); i++ {
-		switch {
-		case args[i] == "--":
-			i++
-		case args[i] == "--write" && i+1 < len(args):
-			writable = append(writable, args[i+1])
-			i++
-			continue
-		case args[i] == "--tmp" && i+1 < len(args):
-			tmp = args[i+1]
-			i++
-			continue
-		default:
-			fmt.Fprintf(os.Stderr, "kairo confine: unknown argument %q\n", args[i])
-			os.Exit(126)
-		}
-		break
-	}
-	argv := args[i:]
-	if len(argv) == 0 {
-		fmt.Fprintln(os.Stderr, "kairo confine: no command")
-		os.Exit(126)
-	}
-	if err := confineMounts(writable, tmp); err != nil {
-		fmt.Fprintln(os.Stderr, "kairo confine:", err)
-		os.Exit(126)
-	}
-	path, err := exec.LookPath(argv[0])
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "kairo confine:", err)
-		os.Exit(127)
-	}
-	err = syscall.Exec(path, argv, os.Environ())
-	fmt.Fprintln(os.Stderr, "kairo confine: exec:", err)
-	os.Exit(126)
-}
+// A container's init confines its argv (container_linux.go): in the
+// container's mount namespace it binds a directory of the scratch over
+// /tmp, binds each writable directory (and /tmp, /dev/shm and /proc) onto
+// itself, makes every mount read-only (mount_setattr, recursively from /)
+// and makes those writable again. Devices stay usable (a read-only mount
+// does not stop writing to a device), and nothing is hidden: everything
+// else is read as before.
 
 // confineMounts makes this mount namespace read-only but for writable (see
 // above). Every directory named must exist.

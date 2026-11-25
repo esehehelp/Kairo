@@ -12,7 +12,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -20,7 +19,6 @@ import (
 	"kairo/internal/config"
 	"kairo/internal/executor"
 	"kairo/internal/hwpolicy"
-	"kairo/internal/provider"
 	"kairo/internal/secfile"
 	"kairo/internal/store"
 	"kairo/internal/tlsutil"
@@ -117,55 +115,9 @@ func serve(args []string) error {
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
 	slog.SetDefault(logger)
-	providerSet := map[string]provider.Provider{}
 	attributes, _ := json.Marshal(daemonConfig.Bench.Attributes(daemonConfig.Node.Labels))
 	if err := st.UpsertNode(context.Background(), store.Node{ID: daemonConfig.Node.ID, Name: daemonConfig.Node.Name, OS: daemonConfig.Node.OS, Architecture: daemonConfig.Node.Architecture, Attributes: attributes, Enabled: true}); err != nil {
 		return err
-	}
-	for _, p := range daemonConfig.Providers {
-		if err := st.UpsertProvider(context.Background(), p.ID, daemonConfig.Node.ID, p.Kind, nil); err != nil {
-			return err
-		}
-		ttl := time.Duration(p.ObservationTTLSeconds) * time.Second
-		switch p.Kind {
-		case "nvidia":
-			providerSet[p.ID] = &provider.NVIDIA{ProviderID: p.ID, NodeID: daemonConfig.Node.ID, TTL: ttl}
-		case "host":
-			providerSet[p.ID] = &provider.Host{ProviderID: p.ID, NodeID: daemonConfig.Node.ID, TTL: ttl}
-		case "filesystem":
-			providerSet[p.ID] = &provider.Filesystem{ProviderID: p.ID, NodeID: daemonConfig.Node.ID, Filesystems: p.Filesystems, TTL: ttl}
-		default:
-			return fmt.Errorf("unsupported provider kind %q", p.Kind)
-		}
-	}
-	// Attempts a previous run of this daemon's executors launched that still
-	// run are adopted, as an agent adopts them (agent.go).
-	ours := map[string]bool{}
-	for _, e := range daemonConfig.Executors {
-		ours[e.ID] = e.Enabled == nil || *e.Enabled
-	}
-	records := executor.AdoptableAttempts(daemonConfig.LogDirectory, ours, logger)
-	var adopted []string
-	for _, e := range daemonConfig.Executors {
-		enabled := e.Enabled == nil || *e.Enabled
-		labels, err := e.Attributes()
-		if err != nil {
-			return err
-		}
-		attrs, _ := json.Marshal(labels)
-		if err := st.UpsertExecutor(context.Background(), store.Executor{ID: e.ID, NodeID: daemonConfig.Node.ID, Kind: e.Kind, Attributes: attrs, Enabled: enabled}); err != nil {
-			return err
-		}
-		if enabled {
-			stale, kept, err := st.ReregisterExecutor(context.Background(), e.ID, executor.Adopted(records))
-			if err != nil {
-				return fmt.Errorf("startup reconciliation: %w", err)
-			}
-			adopted = append(adopted, kept...)
-			if stale > 0 {
-				logger.Warn("executor has stale leases pending reconciliation", "executor_id", e.ID, "count", stale)
-			}
-		}
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -190,9 +142,8 @@ func serve(args []string) error {
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
 	}
-	// With TLS the daemon's CA goes to every attempt (KAIRO_API_CA) so its
-	// processes can verify the daemon they report to.
-	apiCA := ""
+	// With TLS the CA must be one attempts can be given (KAIRO_API_CA, by
+	// their agents) to verify the daemon they report to.
 	if daemonConfig.TLS() {
 		cert, err := tls.LoadX509KeyPair(daemonConfig.TLSCertFile, daemonConfig.TLSKeyFile)
 		if err != nil {
@@ -204,7 +155,7 @@ func serve(args []string) error {
 		if err != nil {
 			return fmt.Errorf("read TLS CA: %w", err)
 		}
-		if apiCA, err = tlsutil.CAEnv(caPEM); err != nil {
+		if _, err = tlsutil.CAEnv(caPEM); err != nil {
 			return fmt.Errorf("TLS CA %s: %w", daemonConfig.TLSCAFile, err)
 		}
 		// Attempts reach the daemon at advertise_url and trust only the CA:
@@ -218,7 +169,7 @@ func serve(args []string) error {
 			return fmt.Errorf("TLS certificate %s does not serve advertise_url %s with CA %s (kairo tls issue --host %s): %w", daemonConfig.TLSCertFile, daemonConfig.AdvertiseURL, daemonConfig.TLSCAFile, advertised.Hostname(), err)
 		}
 	}
-	errCh := make(chan error, 1+len(daemonConfig.Executors))
+	errCh := make(chan error, 1)
 	go func() {
 		logger.Info("control plane listening", "address", daemonConfig.Listen, "tls", daemonConfig.TLS(), "database", config.RedactDatabase(dsn))
 		serve := server.ListenAndServe
@@ -387,33 +338,6 @@ func serve(args []string) error {
 					return
 				case <-ticker.C:
 				}
-			}
-		}()
-	}
-	// A control-only daemon has no executors (and no providers): it runs the
-	// API and the reconcilers above, and every job host runs `kairo agent`.
-	if len(daemonConfig.Executors) == 0 {
-		logger.Info("control-only daemon: no local executors; jobs run on node agents", "node_id", daemonConfig.Node.ID)
-	}
-	for _, configured := range daemonConfig.Executors {
-		if configured.Enabled != nil && !*configured.Enabled {
-			continue
-		}
-		configured := configured
-		exec := executor.NewLocal(configured.ID, st, daemonConfig.LogDirectory, logger)
-		exec.APIURL = strings.TrimRight(daemonConfig.AdvertiseURL, "/")
-		exec.APICA = apiCA
-		exec.NodeID = daemonConfig.Node.ID
-		exec.Kind = configured.Kind
-		exec.Attributes = configured.Labels
-		exec.ObserveOnly = daemonConfig.ObserveOnly
-		exec.ObservationInterval = time.Duration(daemonConfig.ObservationIntervalSeconds) * time.Second
-		exec.MinLogFreeBytes = int64(daemonConfig.LogMinFreeMiB) << 20
-		exec.Providers = providerSet
-		exec.Adopt(records, adopted)
-		go func() {
-			if err := exec.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-				errCh <- err
 			}
 		}()
 	}

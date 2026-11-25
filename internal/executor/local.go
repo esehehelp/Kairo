@@ -121,7 +121,7 @@ type Local struct {
 
 	// Attempt usage (usage.go): the running attempts this instance samples,
 	// whether a round is running and when the last one started. usageSampler
-	// replaces sampleTrees in tests.
+	// replaces the backend's sample in tests.
 	usage        map[string]*usageState
 	usageRunning bool
 	usageSampled time.Time
@@ -868,7 +868,7 @@ func (e *Local) start(launch *store.Launch) error {
 		}
 	}()
 	// the launcher as this executor's backend builds it (backend.go)
-	cmd, conf, err := e.backend().launcher(launch)
+	cmd, err := e.backend().launcher(launch)
 	e.forgetScratch(launch.Attempt.ID)
 	if err != nil {
 		return err
@@ -886,7 +886,7 @@ func (e *Local) start(launch *store.Launch) error {
 	if err := os.MkdirAll(recordsDir(e.LogDir), 0o755); err != nil {
 		return err
 	}
-	shim, goAhead, err := shimCommand(cmd, exitPath(e.LogDir, id), conf)
+	shim, goAhead, err := shimCommand(cmd, exitPath(e.LogDir, id))
 	if err != nil {
 		return err
 	}

@@ -108,17 +108,19 @@ type ociBackend struct {
 	rt   ociRuntime
 }
 
-func (b ociBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, error) {
+func (b ociBackend) launcher(launch *store.Launch) (*exec.Cmd, error) {
+	if b.rt == nil {
+		return nil, fmt.Errorf("executor %s: kind %q runs no containers here (every executor runs containers: incus, pct, wslc)", b.e.ID, b.kind)
+	}
 	opts := containerOptions{runArg: ociRunArg, runtime: b.kind, dirsOnly: b.caps.dirsOnly, vm: b.caps.vm}
 	if b.kind == config.KindPCT {
 		settings, err := pctSettingsOf(b.e.Attributes)
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		opts.pct = settings
 	}
-	cmd, err := b.e.containerCommand(launch, opts)
-	return cmd, nil, err
+	return b.e.containerCommand(launch, opts)
 }
 
 // liveness: the processes an attempt registered are its container's:
@@ -151,10 +153,10 @@ func (b ociBackend) container(ctx context.Context, attemptID string) (ociContain
 	return ociContainer{}, false, nil
 }
 
-// stopAttempt asks the attempt to stop: its runner, which stops the
-// container through the runtime; with no runner to ask (gone, or no way to
-// signal it), the container directly.
-func (b ociBackend) stopAttempt(ctx context.Context, t processTree) error {
+// stop asks the attempt to stop: its runner, which stops the container
+// through the runtime; with no runner to ask (gone, or no way to signal
+// it), the container directly.
+func (b ociBackend) stop(ctx context.Context, t processTree) error {
 	if alive, _ := t.launcherAlive(); alive {
 		if err := b.e.stopLauncherTree(ctx, t); err == nil {
 			return nil
@@ -174,9 +176,9 @@ func (b ociBackend) stopAttempt(ctx context.Context, t processTree) error {
 	return nil
 }
 
-// killAttempt kills the attempt's container through the runtime, and its
+// kill kills the attempt's container through the runtime, and its
 // runner's tree.
-func (b ociBackend) killAttempt(ctx context.Context, t processTree) error {
+func (b ociBackend) kill(ctx context.Context, t processTree) error {
 	var errs []error
 	c, ok, err := b.container(ctx, t.attemptID)
 	switch {
@@ -189,8 +191,8 @@ func (b ociBackend) killAttempt(ctx context.Context, t processTree) error {
 	return errors.Join(errs...)
 }
 
-// attemptAlive: the runner's tree or the container runs.
-func (b ociBackend) attemptAlive(ctx context.Context, t processTree) (bool, error) {
+// alive: the runner's tree or the container runs.
+func (b ociBackend) alive(ctx context.Context, t processTree) (bool, error) {
 	alive, err := b.e.launcherTreeAlive(ctx, t)
 	if err != nil || alive {
 		return alive, err
@@ -199,9 +201,9 @@ func (b ociBackend) attemptAlive(ctx context.Context, t processTree) (bool, erro
 	return ok && c.running, err
 }
 
-// sampleContainers is what each target attempt's container uses, from its
-// runtime.
-func (b ociBackend) sampleContainers(ctx context.Context, targets []usageTarget) map[string]usageSample {
+// sample is what each target attempt's container uses, from its runtime
+// (what the container uses, not its runner).
+func (b ociBackend) sample(ctx context.Context, targets []usageTarget) map[string]usageSample {
 	out := map[string]usageSample{}
 	if b.rt == nil {
 		return out

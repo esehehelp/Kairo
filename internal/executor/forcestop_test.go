@@ -30,6 +30,7 @@ const (
 )
 
 func TestMain(m *testing.M) {
+	ForTestsRunKindlessAsProcesses()
 	RunHelper(os.Args)
 	runScratchHelper(os.Args)
 	if len(os.Args) == 3 && os.Args[1] == helperExitWhen {
@@ -230,7 +231,9 @@ func TestForceStopKillsWhatIgnoresTheGracefulStop(t *testing.T) {
 func TestForceStopKillsWhatTheLauncherLeftBehind(t *testing.T) {
 	cmd, handle, child := startTestTree(t, helperOrphan)
 	e := &Local{ID: "e", Logger: slog.Default()}
-	tree := processTree{attemptID: "att-" + helperOrphan, pid: cmd.Process.Pid, handle: handle}
+	// the launcher's process group (its pid) is the attempt's, also once it
+	// is gone, as the attempt's registered pid gives it (attemptTree)
+	tree := processTree{attemptID: "att-" + helperOrphan, pid: cmd.Process.Pid, group: cmd.Process.Pid, handle: handle}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		if alive, _ := tree.launcherAlive(); !alive {

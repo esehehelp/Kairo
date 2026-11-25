@@ -29,10 +29,11 @@ func testLaunch() *store.Launch {
 	}
 }
 
-// launcherOf is the launcher e's backend builds for launch (backend.go).
+// launcherOf is the launcher the test backend builds for launch: the
+// attempt's environment as Kairo gives it (attemptEnv) over this process's.
 func launcherOf(t *testing.T, e *Local, launch *store.Launch) *exec.Cmd {
 	t.Helper()
-	cmd, _, err := e.backend().launcher(launch)
+	cmd, err := procBackend{e}.launcher(launch)
 	if err != nil && (cmd == nil || !errors.Is(err, exec.ErrNotFound)) {
 		t.Fatal(err)
 	}
