@@ -43,6 +43,7 @@ func runContainerHelpers(args []string) {
 // what it printed; a failure says what it printed on stderr.
 var incusCommand = func(ctx context.Context, stdin []byte, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "incus", args...)
+	ownProcessGroup(cmd)
 	if stdin != nil {
 		cmd.Stdin = bytes.NewReader(stdin)
 	}

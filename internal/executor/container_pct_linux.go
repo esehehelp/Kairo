@@ -71,6 +71,7 @@ var (
 // returns what it printed; a failure says what it printed on stderr.
 var pctTool = func(ctx context.Context, name string, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	ownProcessGroup(cmd)
 	var out, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	if err := cmd.Run(); err != nil {
