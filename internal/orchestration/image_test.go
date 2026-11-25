@@ -28,7 +28,7 @@ const pin = "docker.io/library/python@sha256:5e2bdb1b0d542d5039cffb8181c65930093
 
 // A task runs in a declared image, its reference written in full; the pins
 // an apply sends are not part of the digest and must be of the image's
-// repository; an image not declared, a gang, or a cwd that is not absolute
+// repository; an image not declared, a gang (no more), or a cwd that is not absolute
 // without a source are refused.
 func TestATaskRunsInADeclaredImage(t *testing.T) {
 	v, err := Parse([]byte(imageManifest))
@@ -56,7 +56,7 @@ func TestATaskRunsInADeclaredImage(t *testing.T) {
 		{`image = "py"`, `image = "other"`, "which is no [images.other]"},
 		{`ref = "python:3.12-slim"`, `ref = "Python"`, "repository element"},
 		{"source = \"code\"\n", "cwd = \"work\"\n", "must be an absolute path in the image"},
-		{`image = "py"`, "image = \"py\"\n[tasks.execution.gang]\nsize = 2", "a gang does not run in an image"},
+		{`image = "py"`, "image = \"py\"\n[tasks.execution.gang]\nsize = 2", "gangs are no more"},
 	} {
 		if _, err := Parse([]byte(strings.Replace(imageManifest, bad.from, bad.to, 1))); err == nil || !strings.Contains(err.Error(), bad.want) {
 			t.Fatalf("%s: %v", bad.to, err)

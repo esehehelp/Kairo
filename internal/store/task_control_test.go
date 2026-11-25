@@ -167,19 +167,6 @@ func TestCancelWithdrawsAnAuthorizedExecutionAndRevokesItsLease(t *testing.T) {
 	}
 }
 
-func TestCancelWithdrawsEveryGangRank(t *testing.T) {
-	store := openCoordinationStore(t)
-	setupGangInventory(t, store)
-	gangProject(t, store, false)
-	result, err := store.CancelTask(context.Background(), "gangs", "ddp", "tester", false)
-	if err != nil || len(result.Withdrawn) != 2 {
-		t.Fatalf("cancel: %+v %v", result, err)
-	}
-	if task := gangTaskState(t, store); task.State != "cancelled" {
-		t.Fatalf("task: %+v", task)
-	}
-}
-
 // The reconciler reads a planned decision, then submits it; a cancel can land
 // on either side of the submission. A cancel committed first abandons the
 // decision, which is then never submitted; a cancel committed after finds the
@@ -367,39 +354,6 @@ func TestRerunRefusesLiveTasks(t *testing.T) {
 	taskConflictError(t, err, "execution "+manual.ID+" of orchestrated/work/prepare is not terminal (waiting)")
 }
 
-func TestRerunOfAFailedGangRunsTheWholeGangAgain(t *testing.T) {
-	store := openCoordinationStore(t)
-	setupGangInventory(t, store)
-	gangProject(t, store, false)
-	rank0, rank1 := launchGang(t, store)
-	finishGangRank(t, store, rank0, 3)
-	finishGangRank(t, store, rank1, 0)
-	if task := gangTaskState(t, store); task.State != "failed" {
-		t.Fatalf("gang: %+v", task)
-	}
-	if _, err := store.RerunTask(context.Background(), "gangs", "ddp", "tester", ""); err != nil {
-		t.Fatal(err)
-	}
-	task := gangTaskState(t, store)
-	if task.State != "running" || len(task.Executions) != 2 || task.Executions[1].Reason != "rerun" {
-		t.Fatalf("gang: %+v", task)
-	}
-	detail, err := store.GetTaskDetail(context.Background(), "gangs", "ddp")
-	if err != nil || len(detail.Executions) != 2 {
-		t.Fatalf("detail: %+v %v", detail, err)
-	}
-	old := detail.Executions[0]
-	if len(old.Gang) != 2 || old.Gang[1].NodeID == nil || *old.Gang[1].NodeID != "node-b" || old.Gang[0].AttemptID == nil {
-		t.Fatalf("old gang: %+v", old.Gang)
-	}
-	if fresh := detail.Executions[1]; len(fresh.Gang) != 2 || fresh.Gang[0].State != "waiting" || len(fresh.Attempts) != 0 {
-		t.Fatalf("new gang: %+v", fresh)
-	}
-	if len(old.Attempts) != 1 || old.Attempts[0].NodeID == nil || *old.Attempts[0].NodeID != "node-a" {
-		t.Fatalf("leader attempt: %+v", old.Attempts)
-	}
-}
-
 func TestProjectStatusFilters(t *testing.T) {
 	store := openCoordinationStore(t)
 	cpuProject(t, store)
@@ -500,7 +454,7 @@ func TestTaskDetail(t *testing.T) {
 	if attempt.NodeID == nil || *attempt.NodeID != "node" || attempt.StdoutPath == nil || *attempt.StdoutPath != "logs/a.stdout.log" || !strings.Contains(string(attempt.Progress), "loss") {
 		t.Fatalf("attempt: %+v", attempt)
 	}
-	if execution.Waiting != nil || execution.Gang != nil {
+	if execution.Waiting != nil {
 		t.Fatalf("a started execution waits: %+v", execution)
 	}
 	if attempt.LogProblems != nil || detail.Paused != nil {

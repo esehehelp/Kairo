@@ -78,10 +78,6 @@ type ExecutionSpec struct {
 	InputContinuationRef *string            `json:"input_continuation_ref,omitempty"`
 	Exclusive            []ExclusiveRequest `json:"exclusive"`
 	Capacity             CapacityRequest    `json:"capacity"`
-	// Gang runs the execution as Size processes, one per node, started together
-	// (see gang.go). The submitted execution is rank 0 (the leader); ranks
-	// 1..Size-1 are member executions created with it.
-	Gang *GangSpec `json:"gang,omitempty"`
 	// Env is added to the attempt's environment (envspec.Validate); it never
 	// overrides what Kairo sets. Left out of the digest when empty.
 	Env map[string]string `json:"env,omitempty"`
@@ -125,44 +121,6 @@ type ExecutionSpec struct {
 	// continuation goes on from (its streams start where that checkpoint's
 	// payload says). Left out of the digest when empty.
 	InputCheckpointCommand string `json:"input_checkpoint_command,omitempty"`
-}
-
-// GangSpec describes a multi-node execution. Every rank asks for the
-// execution's resources on its own node unless it gives its own; Ranks
-// overrides argv, cwd, the executor selector, exclusive or capacity of single
-// ranks (a Windows rank and a Linux rank need different paths, a two-GPU
-// node and a one-GPU node different requests) and merges a rank's env over the
-// execution's.
-type GangSpec struct {
-	Size int `json:"size"`
-	// Port is the rendezvous port on rank 0's interconnect address; 0 picks a
-	// free one in 29500-29999 on that node at placement.
-	Port  int        `json:"port,omitempty"`
-	Ranks []GangRank `json:"ranks,omitempty"`
-}
-
-type GangRank struct {
-	Rank             int               `json:"rank"`
-	Argv             []string          `json:"argv,omitempty"`
-	CWD              string            `json:"cwd,omitempty"`
-	ExecutorSelector json.RawMessage   `json:"executor_selector,omitempty"`
-	Env              map[string]string `json:"env,omitempty"`
-	// Exclusive and Capacity, when set, replace the execution's for this rank
-	// (an empty Exclusive asks for no GPU). Absent from the JSON when unset, so
-	// existing gang digests do not change.
-	Exclusive *[]ExclusiveRequest `json:"exclusive,omitempty"`
-	Capacity  *CapacityRequest    `json:"capacity,omitempty"`
-}
-
-// GangLaunch is what one rank of a placed gang is told at launch: its rank and
-// where rank 0 listens. It is read from the placement, never from the caller.
-type GangLaunch struct {
-	GangID      string `json:"gang_id"`
-	PlacementID string `json:"placement_id"`
-	Rank        int    `json:"rank"`
-	Size        int    `json:"size"`
-	MasterAddr  string `json:"master_addr"`
-	MasterPort  int    `json:"master_port"`
 }
 
 type ExecutionRequest struct {

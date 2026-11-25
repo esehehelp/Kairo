@@ -264,34 +264,3 @@ func TestSchedulerCreatesOnlyOneLiveReservationPerExecution(t *testing.T) {
 		t.Fatalf("live leases=%d err=%v", liveLeases, err)
 	}
 }
-
-func TestSchedulerNeverSelectsOneResourceTwiceWithinGang(t *testing.T) {
-	store := openCoordinationStore(t)
-	setupSchedulerInventory(t, store)
-	ctx := context.Background()
-	if err := store.UpsertResourceInstance(ctx, ResourceInstance{ID: "gpu-1", NodeID: "node", ProviderID: "gpu-provider", Kind: "gpu", StableIdentity: "GPU-1", Binding: json.RawMessage(`{"index":1}`), AdminState: "enabled"}); err != nil {
-		t.Fatal(err)
-	}
-	declareTestGPU(t, store, "GPU-1", "node")
-	total, free := int64(24<<30), int64(23<<30)
-	observed := time.Now().UTC()
-	if err := store.RecordObservation(ctx, Observation{ResourceID: "gpu-1", ObservedAt: observed.Format(time.RFC3339Nano), ValidUntil: observed.Add(time.Minute).Format(time.RFC3339Nano), TotalBytes: &total, FreeBytes: &free}); err != nil {
-		t.Fatal(err)
-	}
-	spec := schedulerExecutionSpec("multi-clause-gang")
-	spec.Exclusive = append(spec.Exclusive, spec.Exclusive[0])
-	if _, _, err := store.SubmitExecution(ctx, spec); err != nil {
-		t.Fatal(err)
-	}
-	reservation, err := store.ReserveNext(ctx, "executor")
-	if err != nil || reservation == nil {
-		t.Fatalf("reserve: %+v %v", reservation, err)
-	}
-	if len(reservation.Resources) != 2 || reservation.Resources[0].ID == reservation.Resources[1].ID {
-		t.Fatalf("gang reused a physical resource: %+v", reservation.Resources)
-	}
-	var itemCount int
-	if err = store.db.QueryRow(`SELECT COUNT(*) FROM lease_items WHERE lease_id=$1 AND kind='gpu'`, reservation.Lease.ID).Scan(&itemCount); err != nil || itemCount != 2 {
-		t.Fatalf("gpu lease items=%d err=%v", itemCount, err)
-	}
-}

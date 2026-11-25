@@ -39,7 +39,6 @@ cwd = "/work"
 	}
 	for name, execution := range map[string]string{
 		"not checkpointable": "continue_after_loss = true\n",
-		"a gang":             "checkpointable = true\ncontinue_after_loss = true\n[tasks.execution.gang]\nsize = 2\n",
 	} {
 		if _, err := Parse([]byte(spec(execution))); err == nil || !strings.Contains(err.Error(), "continue_after_loss") {
 			t.Errorf("%s: %v", name, err)

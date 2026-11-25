@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"maps"
 	"testing"
@@ -15,14 +14,8 @@ func TestExecutionSpecWithoutEnvKeepsItsDigest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ganged := testExecutionSpec("pin")
-	ganged.Gang = &GangSpec{Size: 2, Ranks: []GangRank{{Rank: 1, Argv: []string{"linux-train"}, CWD: "/srv", ExecutorSelector: json.RawMessage(`{"labels":{"environment":"linux"}}`)}}}
-	_, _, gang, err := normalizeExecutionSpec(ganged)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if plain != "5ba34f7519c722dff5f40c160567a9de6b3717cd942bf7419b93f4db664861f6" || gang != "ccb3e6ea80a44533e8a35314ffc7ddf3cd105264d8004f1bfb442074f9d3e659" {
-		t.Fatalf("digests changed: %s %s", plain, gang)
+	if plain != "5ba34f7519c722dff5f40c160567a9de6b3717cd942bf7419b93f4db664861f6" {
+		t.Fatalf("digest changed: %s", plain)
 	}
 	withEnv := testExecutionSpec("pin")
 	withEnv.Env = map[string]string{}
@@ -80,59 +73,5 @@ func TestSubmitExecutionEnvReachesTheLaunch(t *testing.T) {
 	}
 	if !maps.Equal(launch.Env, spec.Env) {
 		t.Fatalf("launch env: %v", launch.Env)
-	}
-}
-
-// A ProjectSpec task's env is copied into its execution; a gang rank's env is
-// merged over the task's for that rank only.
-func TestGangRankEnvMergesOverTaskEnv(t *testing.T) {
-	store := openCoordinationStore(t)
-	setupGangInventory(t, store)
-	parsed := projectSpec(t, `schema_version = 1
-[project]
-name = "gangs"
-[[tasks]]
-name = "ddp"
-queue = "training"
-depends_on = []
-policy = "RunToCompletion@v1"
-[tasks.execution]
-schema_version = 2
-argv = ["wsl-train"]
-cwd = "/mnt/d/work"
-[tasks.execution.executor]
-labels = { environment = "windows" }
-[tasks.execution.env]
-PYTHONUTF8 = "1"
-NCCL_DEBUG = "WARN"
-[[tasks.execution.exclusive]]
-kind = "gpu"
-count = 1
-[tasks.execution.gang]
-size = 2
-[[tasks.execution.gang.ranks]]
-rank = 1
-argv = ["linux-train"]
-cwd = "/srv/work"
-executor = { labels = { environment = "linux" } }
-env = { NCCL_DEBUG = "INFO", GLOO_LOG = "1" }
-`)
-	ctx := context.Background()
-	if _, err := store.ApplyProject(ctx, parsed); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.ReconcileProjectTasks(ctx); err != nil {
-		t.Fatal(err)
-	}
-	rank0, rank1 := launchGang(t, store)
-	if want := map[string]string{"PYTHONUTF8": "1", "NCCL_DEBUG": "WARN"}; !maps.Equal(rank0.launch.Env, want) {
-		t.Fatalf("rank 0 env: %v", rank0.launch.Env)
-	}
-	if want := map[string]string{"PYTHONUTF8": "1", "NCCL_DEBUG": "INFO", "GLOO_LOG": "1"}; !maps.Equal(rank1.launch.Env, want) {
-		t.Fatalf("rank 1 env: %v", rank1.launch.Env)
-	}
-	member, err := store.GetExecution(ctx, rank1.launch.Execution.ID)
-	if err != nil || member.Env["NCCL_DEBUG"] != "INFO" {
-		t.Fatalf("rank 1 execution: %+v %v", member, err)
 	}
 }

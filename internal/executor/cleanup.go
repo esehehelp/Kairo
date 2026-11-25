@@ -126,7 +126,7 @@ func (e *Local) retryCleanups(ctx context.Context) {
 }
 
 // sweepUnlaunched gives up the unlaunched leases of this executor that this
-// instance does not hold (neither at the gang barrier nor in its cleanups).
+// instance does not hold (not in its cleanups).
 // A daemon without the operation answers with an error, reported once.
 func (e *Local) sweepUnlaunched(ctx context.Context) {
 	if time.Since(e.lastUnlaunchedSweep) < unlaunchedSweepInterval {
@@ -144,10 +144,9 @@ func (e *Local) sweepUnlaunched(ctx context.Context) {
 	e.unlaunchedSweepFailing = false
 	for _, u := range leases {
 		e.mu.Lock()
-		_, held := e.pendingGang[u.Lease.ID]
 		_, cleaning := e.pendingCleanups[u.Lease.ID]
 		e.mu.Unlock()
-		if held || cleaning {
+		if cleaning {
 			continue
 		}
 		e.Logger.Warn("releasing a reservation this executor does not hold (its answer never arrived)", "lease_id", u.Lease.ID, "execution_id", u.Lease.ExecutionID, "state", u.Lease.State)

@@ -50,10 +50,10 @@ Task は永続的な論理オブジェクトであり、一連のイミュータ
   - [ノード隔離](#ノード隔離)
   - [ノードフェンス](#ノードフェンス)
   - [強制停止](#強制停止)
-  - [Gang 実行](#gang-実行)
+  - [Gang（廃止）](#gang廃止)
 - [Loader（ストリーム）](#loaderストリーム)
 - [Worker SDK](#worker-sdk)
-  - [管理対象 Attempt に渡される環境変数と Gang 連携](#管理対象-attempt-に渡される環境変数と-gang-連携)
+  - [管理対象 Attempt に渡される環境変数](#管理対象-attempt-に渡される環境変数)
   - [セーフポイントの挙動と Python・Rust SDK](#セーフポイントの挙動と-pythonrust-sdk)
   - [プロジェクト管理の低レベルコントローラポリシー](#プロジェクト管理の低レベルコントローラポリシー)
 - [パイロット受け入れ契約](#パイロット受け入れ契約)
@@ -88,7 +88,7 @@ Task は永続的な論理オブジェクトであり、一連のイミュータ
 | レイヤー | 担当内容 | パッケージ | 関連セクション |
 |---|---|---|---|
 | `orchestration` | ProjectSpec、Task（イミュータブル）、ポリシーによる判断、再実行（rerun） | `orchestration`, `store`（`orchestration`, `task_control`, `task_views`） | [クイックスタートと基本操作](#クイックスタートと基本操作), [CLI からの Task 監視とログ確認](#cli-からの-task-監視とログ確認) |
-| `coordination` | Execution（ワンショット）、Attempt、Lease、Command、スコープゲート（Scope gate）、Gang、隔離（quarantine）、強制停止 | `store`（`execution`, `scheduler`, `worker`, `scopes`, `gang`, `quarantine`, `forcestop`）, `execution` | [コーディネーションモデル](#コーディネーションモデル), [Gang 実行](#gang-実行) |
+| `coordination` | Execution（ワンショット）、Attempt、Lease、Command、スコープゲート（Scope gate）、隔離（quarantine）、強制停止 | `store`（`execution`, `scheduler`, `worker`, `scopes`, `quarantine`, `forcestop`）, `execution` | [コーディネーションモデル](#コーディネーションモデル) |
 | `planning` | 環境全体に対する 1 回のパスでの処理: 配置、バックフィル、プリエンプション、実行時間の推定、アドミッション計上 | `store`（`planner`, `preemption`, `estimate`） | [アドミッション制御とプランニング](#アドミッション制御とプランニング), [実行時間の推定](#実行時間の推定) |
 | `execution` | Executor のバックエンドを通じた起動（ランタイムのコンテナ内: `executor/backend.go`、`executor/oci.go`）、shim と引き継ぎ（adoption）、コンファインメント（Confinement）、強制停止、静止（quiescence）、使用量計測、観測 | `executor`, `processidentity`, `provider`, `agentclient` | [エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ), [コンテナ実行](#コンテナ実行), [強制停止](#強制停止) |
 | `data` | ストア（store）、`scratch`・`output`・`cache` ディレクトリ、データオブジェクト・pack・コピー・レプリカ、インポート・Run スナップショット・チェックポイント・時系列データ、フェッチ・エビクション・リードバック（read-back）・インベントリ | `store`（`packs`, `copies`, `replicas`, `deletions`, `imports`, `inputs`, `placements`, `evictions`, `temporal`, `regenerate`, `transfer`, `runsnapshots`, `checkpoints`, `inventory_durable`, `scrub`, `shed`, `control_snapshot`）, `executor`（ストアワーカー `storeworker.go`: `datastore`, `pack`, `transfer`, `fetch`, `retire`, `evict`, `inventory`, `storefs`）, `machine`, `datainput` | [データストア](#データストア), [自己バックアップ](#自己バックアップ) |
@@ -185,13 +185,13 @@ Task の `depends_on`（およびそれに伴う `task = "T"` 入力）には、
 
 #### 環境変数（`env`）と `argv` の扱い
 
-`[tasks.execution.env]`（および Execution TOML の `[env]`）を使うと、`powershell -Command '$env:...'` や `env A=B` のようなラッパーを使わずに Attempt の環境変数を設定できます。`[defaults.execution.env]` はキー単位でマージされ、`[[tasks.execution.gang.ranks]]` エントリの `env` は該当 rank に対して Task の `env` へ上書きマージされます。
+`[tasks.execution.env]`（および Execution TOML の `[env]`）を使うと、`powershell -Command '$env:...'` や `env A=B` のようなラッパーを使わずに Attempt の環境変数を設定できます。`[defaults.execution.env]` はキー単位でマージされます。
 
 環境変数の適用優先順位は次のとおりです（後から適用されるものが優先）。
 
 1. Executor 自身の環境変数を継承します。
 2. 宣言された環境変数を適用します（`PATH` などの上書きも可能です。Windows では変数名を大文字・小文字を区別せずに比較します）。
-3. Kairo が設定する環境変数（`KAIRO_*`、Gang 関連変数、割り当て GPU 向けの `CUDA_VISIBLE_DEVICES`、`scratch_tmpdir` 有効時の `TMPDIR` / `TMP` / `TEMP`）を適用します。これらは宣言側で上書きできません。
+3. Kairo が設定する環境変数（`KAIRO_*`、割り当て GPU 向けの `CUDA_VISIBLE_DEVICES`、`scratch_tmpdir` 有効時の `TMPDIR` / `TMP` / `TEMP`）を適用します。これらは宣言側で上書きできません。
 
 また、次の制約があります。
 
@@ -205,13 +205,13 @@ Task の `depends_on`（およびそれに伴う `task = "T"` 入力）には、
 
 #### キャンセル（`kairo task cancel`）
 
-`kairo task cancel [--dry-run] PROJECT [QUEUE] TASK` は、実行中でない Task（依存先待ち、`pending`、`blocked`、または一時停止中の Task）を終了させます。未開始の Execution（すべての Gang rank を含む）をすべて取り下げ、Task を `cancelled` 状態にします。後続 Task は失敗した Task に依存する場合と同様にブロックされます。
+`kairo task cancel [--dry-run] PROJECT [QUEUE] TASK` は、実行中でない Task（依存先待ち、`pending`、`blocked`、または一時停止中の Task）を終了させます。未開始の Execution をすべて取り下げ、Task を `cancelled` 状態にします。後続 Task は失敗した Task に依存する場合と同様にブロックされます。
 
 既に開始され終了状態に達していない Execution がある間はキャンセルが拒否されるため、先に Task を一時停止するか、`task pause --force` を実行してください。既存のチェックポイントやその他の出力ファイルはそのまま残されます。なお、開始前の Execution を `execution withdraw` で取り下げた場合も、その Task は `cancelled` 状態になります。
 
 #### 実行中 Task のチェックポイント作成（`kairo task checkpoint`）
 
-`kairo task checkpoint [--wait] [--timeout 30m] PROJECT [QUEUE] TASK` は、Task の実行中のすべての Attempt（すべての Gang rank）に対し、次の安全なタイミングでチェックポイントを公開したうえで実行を続行するよう要求します。
+`kairo task checkpoint [--wait] [--timeout 30m] PROJECT [QUEUE] TASK` は、Task の実行中のすべての Attempt に対し、次の安全なタイミングでチェックポイントを公開したうえで実行を続行するよう要求します。
 
 - `checkpoint` コマンド（origin は `operator_checkpoint`）が発行され、suspend と同様に `accepted`、`checkpointing`、そしてパスを `continuation_ref` として含む `checkpointed` で応答されます。
 - ただし、Attempt は `running`、Lease は `active` のまま維持され、作成されたチェックポイントは Attempt の継続（continuation）にはなりません（イベントも `checkpoint_published` ではなく `checkpoint_saved` となります）。
@@ -228,7 +228,7 @@ Task の `depends_on`（およびそれに伴う `task = "T"` 入力）には、
 
 `kairo task rerun` には次のオプションを指定できます（両方を併用して、修正したコードでチェックポイントから再開することも可能です）。
 
-- `--from-checkpoint latest|COMMAND_ID`（Gang ではないチェックポイント対応 Task が対象）: 最初からではなく、その Task が公開したチェックポイント（`latest`、または `checkpointed` 応答済みの suspend / checkpoint コマンドの `COMMAND_ID`、`GET /api/commands/{id}` で確認可能）から再開します。新しい Execution は、チェックポイント付き中断の再開時と同様に、そのチェックポイント参照（`KAIRO_CONTINUATION_REF`）の継続（continuation）として作成されます。参照先がそのノード上のパスであるため、チェックポイントを公開した Attempt のノードへ配置が計画され、CLI には使用されるチェックポイントが出力されます。チェックポイントを一度も公開していない Task や、該当 Task のチェックポイントではないコマンドを指定した場合は拒否されます。
+- `--from-checkpoint latest|COMMAND_ID`（チェックポイント対応 Task が対象）: 最初からではなく、その Task が公開したチェックポイント（`latest`、または `checkpointed` 応答済みの suspend / checkpoint コマンドの `COMMAND_ID`、`GET /api/commands/{id}` で確認可能）から再開します。新しい Execution は、チェックポイント付き中断の再開時と同様に、そのチェックポイント参照（`KAIRO_CONTINUATION_REF`）の継続（continuation）として作成されます。参照先がそのノード上のパスであるため、チェックポイントを公開した Attempt のノードへ配置が計画され、CLI には使用されるチェックポイントが出力されます。チェックポイントを一度も公開していない Task や、該当 Task のチェックポイントではないコマンドを指定した場合は拒否されます。
 - `--source current|SNAPSHOT`（ソース上で実行する Task が対象）: 宣言時に紐づけられたスナップショットとは別の、同じソースのスナップショット上で実行します。`current` を指定すると、そのソースに対して最新の `project apply` が送信したスナップショットを使用します（コードを修正して同じファイルを再適用しても既存 Task の宣言自体は変わらないため、このオプションで修正を反映させます）。あるいはスナップショット ID を直接指定することもできます。新しい Execution には実行に使用したスナップショットが記録される一方、Task 自体は元のスナップショットに紐づいたまま維持されるため、後続 Task や入力参照は引き続き同じ Task 名を指定できます。デーモンが保持していないスナップショットや別ソースのスナップショットは拒否されます。
 
 `kairo project prune [--write] FILE` は、まだ実行可能な Task とそれらが必要とする依存先 Task を報告します（`--write` を指定すると、残す各 Task のダイジェストを維持したまま `FILE` を書き換えます）。
@@ -296,7 +296,7 @@ GPU 上の外部利用は次の基準で分類されます。
 | コマンド | 出力内容 |
 |---|---|
 | `kairo task list PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]` | 稼働中（live）の Task と直近 24 時間以内に更新された Task（`--all` で全 Task）を表形式（name、queue、state、execution、start、elapsed、および exit / reason / progress / pause）で出力し、続けてプロジェクトの状態別件数を表示 |
-| `kairo task show PROJECT [QUEUE] TASK [--json]` | 単一 Task の詳細を表示: 宣言内容、`env`、依存先 Task と後続 Task、スコープゲート（閉じている場合は閉じた操作者と日時）、各 Execution とその Attempt・ノード・終了結果、出力オブジェクト（ID・状態・ライフサイクル・検証済みコピーの保存先、JSON では `outputs`）、ログのパスとサイズ、ログに関する問題、GPU の消費電力量（`energy: GPU 1.23 kWh (partial)`）、予約量と並べて表示されるプロセスの最大 RAM 使用観測値（`ram: peak 9.0 GiB seen (sampled every 15 s)`）、Gang の各 rank、待機中 Execution の待機理由 |
+| `kairo task show PROJECT [QUEUE] TASK [--json]` | 単一 Task の詳細を表示: 宣言内容、`env`、依存先 Task と後続 Task、スコープゲート（閉じている場合は閉じた操作者と日時）、各 Execution とその Attempt・ノード・終了結果、出力オブジェクト（ID・状態・ライフサイクル・検証済みコピーの保存先、JSON では `outputs`）、ログのパスとサイズ、ログに関する問題、GPU の消費電力量（`energy: GPU 1.23 kWh (partial)`）、予約量と並べて表示されるプロセスの最大 RAM 使用観測値（`ram: peak 9.0 GiB seen (sampled every 15 s)`）、待機中 Execution の待機理由 |
 | `kairo task logs PROJECT [QUEUE] TASK [--stream stdout\|stderr\|both] [--tail N] [-f] [--attempt latest\|all\|N] [--rank R]` | 最新 Attempt のログの末尾 N 行（デフォルト 50 行、`0` で全行）を出力（エージェントノード上の Attempt にも対応）。`-f` を指定すると、Attempt が終了してログの追記が止まるまで追従 |
 | `kairo task wait PROJECT [QUEUE] TASK [TASK...] \| PROJECT --match PREFIX [--until terminal\|started] [--timeout D] [--stall D]` | 状態変化ごとに 1 行出力（`10:01:33 hello running -> succeeded`）。デーモンに到達できない間は `DOWN` / `UP`、実行中 Task のログが期間 `D` の間増えなければ `STALL` を出力。すべて成功（または開始）なら終了コード `0`、それ以外の結果で終わったものがあれば `1`、タイムアウトなら `2`、引数や参照エラーなら `3` で終了 |
 | `kairo project watch PROJECT [--match PREFIX] [--exit-when-idle]` | 状態変化、進捗（Task ごとに 1 分に 1 回）、10 分ごとのサマリを出力。`--exit-when-idle` を指定すると `pending` や `running` の Task がなくなった時点で終了（監視対象に成功しなかった Task があれば終了コード `1`） |
@@ -482,7 +482,7 @@ key_file = "/etc/kairo/pack-key.pem"
 
 フィルタ条件にかかわらず、`state_counts` にはすべての Task が集計されます。各 Task には `created_at` と `updated_at` が含まれ、各 Execution には Attempt、Executor、タイムスタンプ、および `detail` を除いた最新の進捗（progress）が含まれます。
 
-**`GET /api/projects/{project}/tasks/{task}`** では上記に加え、宣言内容（`spec`）、依存先 Task、後続 Task、スコープゲート（閉鎖中のゲートには、そのゲートを閉じた pause 操作由来の `closed_by` と `closed_at` を含む）、さらに Execution ごとの Attempt 一覧（ログのパスとサイズ、`log_problems`、`energy` を含む）・Gang rank・`waiting` の理由が返されます。閉鎖中のゲートによって保留されている稼働中（live）の Task には、最も内側の閉鎖ゲートを示す `paused` が含まれます。
+**`GET /api/projects/{project}/tasks/{task}`** では上記に加え、宣言内容（`spec`）、依存先 Task、後続 Task、スコープゲート（閉鎖中のゲートには、そのゲートを閉じた pause 操作由来の `closed_by` と `closed_at` を含む）、さらに Execution ごとの Attempt 一覧（ログのパスとサイズ、`log_problems`、`energy` を含む）・`waiting` の理由が返されます。閉鎖中のゲートによって保留されている稼働中（live）の Task には、最も内側の閉鎖ゲートを示す `paused` が含まれます。
 
 その他のプロジェクト・Task 操作の入出力は以下のとおりです。
 
@@ -637,7 +637,7 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 入力の読み込み・配置・保護ルールは以下のとおりです。
 
 - **読み込み場所とディレクトリ保証**: 入力は、Attempt が実行されるノード上の既存の場所から読み込まれます。具体的には、volatile store 上にまだ残っている Run の `output` ディレクトリ、インポート元にまだ残っているディレクトリ（未削除、または `--delete-source` なしで保持されているもの）、あるいはそのノードへ持ち込まれたデータオブジェクト（[データストア](#データストア)の持ち込み入力（brought inputs）参照）です。入力は常にディレクトリとして提供されます。単一ファイルをインポートした場合は、元の場所から直接読まれることはなく、元のノード上であっても他ノードと同様に「そのファイルを格納したディレクトリ」として持ち込まれます（これにより、どのノードでも `${KAIRO_INPUT_X}/<name>` で同じように読み込めます）。
-- **配置先ノードの決定**: 入力を持つ Execution（Task または直接 Execution）は、Executor セレクタで `node` 自体を明示指定している場合や Gang（入力は rank 0 のみに渡されます）である場合を除き、次の優先順でノードにプランニングされます。
+- **配置先ノードの決定**: 入力を持つ Execution（Task または直接 Execution）は、Executor セレクタで `node` 自体を明示指定している場合を除き、次の優先順でノードにプランニングされます。
   1. すべての入力が揃っている最初のノード
   2. 最初の入力が存在するノード
   3. そのオブジェクトが作成されたノード
@@ -648,11 +648,11 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 
 #### 実行環境・ライフサイクル設定
 
-- **ソース（`source`）**: Task の `[tasks.execution]` に `source = "NAME"` を指定すると、Task 宣言時点で作成されたプロジェクトの `[sources.NAME]` のコードスナップショット内で Attempt を実行します（後述の[コードスナップショット](#コードスナップショット)参照）。`cwd` はスナップショットに対する相対パスとなります（デフォルトは `.`。絶対パスやスナップショット外に出る `cwd` は拒否されます）。現時点では Gang には未対応です。設定されている場合のみ Task のダイジェストに含まれますが、スナップショット自体はダイジェストに含まれません。
-- **コンテナイメージ（`image`）**: Task の `[tasks.execution]` に `image = "NAME"` を指定すると、Task 宣言時点でプロジェクトの `[images.NAME]` の参照が指していたダイジェストのコンテナ内で Attempt を実行します（後述の[コンテナ実行](#コンテナ実行)参照）。実行はコンテナを実行する Executor 上で行われ、その種の Executor はコンテナ以外のジョブを実行しません。現時点では Gang には未対応です。設定されている場合のみ Task のダイジェストに含まれますが、イメージのダイジェスト自体は含まれません。
-- **再生成可能出力（`regenerable`）**: Task の `[tasks.execution]` に `regenerable = true` を指定すると、その Run が `output` ディレクトリに書き出す内容は Task の再実行によって再生成できることを宣言します（別所に保管されたソースから構築するデータセットなど）。その出力は一時データ（temporal data。[データストア](#データストア)参照）として扱われて durable store へはコピーされず、参照先のノードで必要になった際に Kairo が Task を再実行して再生成することがあります。Gang には非対応です。設定されている場合のみ Execution のダイジェストに含まれます。
-- **ロスト後の自動継続（`continue_after_loss`）**: チェックポイント可能な Task（Gang 以外）の `[tasks.execution]` に `continue_after_loss = true` を指定すると、Attempt がロストした場合（ノードの電源断やエージェント消失など、理由 `executor_identity_lost`）に Task をブロックせず続行させます。Task は、ロストした Attempt のプロセスが何も動作し得ない状態になるまで（つまり、コマンド未起動またはノード再起動済みでデーモンが自動解放するか、`kairo resource reconcile` によって `stale` な Lease が解放されるまで）`running` を維持します。その後、公開済みの最新チェックポイント（サスペンド時、オペレータによる実行、または `data_protection` チェックポイントコマンドによるもの）から、それを公開したノード上で継続（continuation、理由 `loss_continuation`）として再開します（`kairo task rerun --from-checkpoint latest` と同等の挙動）。チェックポイントが 1 つも公開されていない場合は、この設定がない場合と同様にブロックされます。設定されている場合のみ Task のダイジェストに含まれます。
-- **ストア指定（`store`）**: `[tasks.execution]`（または Execution マニフェスト）に `store = "ID"` を指定すると、Attempt の `scratch`、Run の `output`、`cache` ディレクトリの配置先となる volatile store（[マシン宣言](#マシン宣言)参照）を明示できます。指定しない場合は Executor が担当する最初のストアが使われます（[データストア](#データストア)参照）が、大容量の出力に余裕のあるストアを選びたい場合などに使用します。この Execution は（Executor セレクタで `node` を直接指定していない限り）指定ストアを持つノードにプランニングされます。そのストアを利用可能な volatile store として担当していない Executor 上での起動は拒否されます（`launch_aborted: store ID is not a usable volatile store executor E serves`）。Gang には非対応です。設定されている場合のみ Execution のダイジェストに含まれます。
+- **ソース（`source`）**: Task の `[tasks.execution]` に `source = "NAME"` を指定すると、Task 宣言時点で作成されたプロジェクトの `[sources.NAME]` のコードスナップショット内で Attempt を実行します（後述の[コードスナップショット](#コードスナップショット)参照）。`cwd` はスナップショットに対する相対パスとなります（デフォルトは `.`。絶対パスやスナップショット外に出る `cwd` は拒否されます）。設定されている場合のみ Task のダイジェストに含まれますが、スナップショット自体はダイジェストに含まれません。
+- **コンテナイメージ（`image`）**: Task の `[tasks.execution]` に `image = "NAME"` を指定すると、Task 宣言時点でプロジェクトの `[images.NAME]` の参照が指していたダイジェストのコンテナ内で Attempt を実行します（後述の[コンテナ実行](#コンテナ実行)参照）。実行はコンテナを実行する Executor 上で行われ、その種の Executor はコンテナ以外のジョブを実行しません。設定されている場合のみ Task のダイジェストに含まれますが、イメージのダイジェスト自体は含まれません。
+- **再生成可能出力（`regenerable`）**: Task の `[tasks.execution]` に `regenerable = true` を指定すると、その Run が `output` ディレクトリに書き出す内容は Task の再実行によって再生成できることを宣言します（別所に保管されたソースから構築するデータセットなど）。その出力は一時データ（temporal data。[データストア](#データストア)参照）として扱われて durable store へはコピーされず、参照先のノードで必要になった際に Kairo が Task を再実行して再生成することがあります。設定されている場合のみ Execution のダイジェストに含まれます。
+- **ロスト後の自動継続（`continue_after_loss`）**: チェックポイント可能な Task の `[tasks.execution]` に `continue_after_loss = true` を指定すると、Attempt がロストした場合（ノードの電源断やエージェント消失など、理由 `executor_identity_lost`）に Task をブロックせず続行させます。Task は、ロストした Attempt のプロセスが何も動作し得ない状態になるまで（つまり、コマンド未起動またはノード再起動済みでデーモンが自動解放するか、`kairo resource reconcile` によって `stale` な Lease が解放されるまで）`running` を維持します。その後、公開済みの最新チェックポイント（サスペンド時、オペレータによる実行、または `data_protection` チェックポイントコマンドによるもの）から、それを公開したノード上で継続（continuation、理由 `loss_continuation`）として再開します（`kairo task rerun --from-checkpoint latest` と同等の挙動）。チェックポイントが 1 つも公開されていない場合は、この設定がない場合と同様にブロックされます。設定されている場合のみ Task のダイジェストに含まれます。
+- **ストア指定（`store`）**: `[tasks.execution]`（または Execution マニフェスト）に `store = "ID"` を指定すると、Attempt の `scratch`、Run の `output`、`cache` ディレクトリの配置先となる volatile store（[マシン宣言](#マシン宣言)参照）を明示できます。指定しない場合は Executor が担当する最初のストアが使われます（[データストア](#データストア)参照）が、大容量の出力に余裕のあるストアを選びたい場合などに使用します。この Execution は（Executor セレクタで `node` を直接指定していない限り）指定ストアを持つノードにプランニングされます。そのストアを利用可能な volatile store として担当していない Executor 上での起動は拒否されます（`launch_aborted: store ID is not a usable volatile store executor E serves`）。設定されている場合のみ Execution のダイジェストに含まれます。
 
 #### コンファインメント（`confine`）
 
@@ -673,16 +673,15 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 
 #### 配置・バックフィル・プリエンプション
 
-- **配置（Placement）**: Execution が収まるノードのうち、配置後に残る空き GPU 数が最も少ないノードを選びます（これにより CPU ジョブは GPU ノードを避け、GPU ジョブは可能な限り少数のノードへ集約されます）。同数の場合は空き CPU が最も多いノードを選びます。Gang の各 rank は互いに異なるノードに配置され、全 rank を配置できるか 1 つも配置しないか（all or none）のいずれかとなります。
+- **配置（Placement）**: Execution が収まるノードのうち、配置後に残る空き GPU 数が最も少ないノードを選びます（これにより CPU ジョブは GPU ノードを避け、GPU ジョブは可能な限り少数のノードへ集約されます）。同数の場合は空き CPU が最も多いノードを選びます。
 - **バックフィル（Backfill）**: 現時点でどのノードにも収まらない Execution は、障害となっている Lease 群が終了した際に実行される見込みのノード上で、すでに利用可能なリソースを「開始予定時刻」（必要な数の Lease が終了すると見込まれる時刻。[実行時間の推定](#実行時間の推定)参照）以降について確保（hold）します。
   - 後続の Execution は、誰も確保していないリソースではそのまま実行でき、誰かが確保しているリソースであっても、その開始予定時刻より前に終了する見込みであれば実行できます。
   - 自身に実行時間の推定値がない Execution や、開始予定時刻を推定できない先行 Execution（妨げとなっている Lease に推定値がない場合）によって確保されているリソースについては、バックフィル実行されません。
   - 待機理由には開始予定時刻が表示されます。
   - 自然終了しない要因で阻まれている場合は確保（hold）を行いません。該当するのは、Kairo 以外が起動した GPU 上のプロセス、プロセスで説明できないアクティビティ、古い観測結果（`stale_observation`）、ノード容量の絶対的不足、ディスクウォーターマーク超過です。
-- **プリエンプション（Preemption）**: どのノードにも収まらない Execution（優先度は問わず、Gang も対象）は、自身より低い優先度を持ち、`checkpointable` かつ `preemptible` であり、かつ自身の配置を妨げている GPU または RAM を保持している Execution を、必要最小限の数だけサスペンドできます。対象の選定順は次のとおりです。
+- **プリエンプション（Preemption）**: どのノードにも収まらない Execution（優先度は問わず）は、自身より低い優先度を持ち、`checkpointable` かつ `preemptible` であり、かつ自身の配置を妨げている GPU または RAM を保持している Execution を、必要最小限の数だけサスペンドできます。対象の選定順は次のとおりです。
   1. すでにサスペンド処理中のもの
   2. 優先度が最も低いもの
-  3. Gang より単体 Execution
   4. 開始時刻が最も新しいもの
 
   CPU やディスクの不足は待機対象であり、他ジョブをサスペンドする理由にはなりません。また、候補すべてをサスペンドしてもなお空きが足りない場合（GPU は空くが他ジョブが保持する RAM が足りない場合など）は 1 つもサスペンドせず待機し、候補が保持しているリソースではなくサスペンドしてもなお不足するリソースを待機理由として示します（例: `insufficient_ram: host-a: 28.0 GiB ram needed, 24.0 GiB free even were infer/serve-r3 (priority -100) suspended, so none is suspended for it; and host-a: 1 GPU(s) needed, 0 usable; leased by infer/serve-r3 (priority -100)`）。
@@ -1065,7 +1064,7 @@ Kairo が渡した領域以外に Attempt が書き込んだ内容はインス�
 - **環境変数と `/dev/shm`**: コンテナの環境変数は「イメージの環境変数 → 宣言された env → Kairo の環境変数」の順に構築されます。Kairo が渡すパスはすべて上記のコンテナ内パスとなり、その配下を指すパスも書き換えられます（例: 継続時の `KAIRO_CONTINUATION_REF`）。エージェント自身の環境変数はコンテナには渡されません。`/dev/shm` はメモリの最大半分を上限とする tmpfs です（PyTorch のデータローダワーカーがバッチ共有に使用します。ここに書き込まれた分はメモリ使用量となります）。
 - **GPU の受け渡し**: Lease された GPU は UUID から特定されたデバイスノード（`/dev/nvidia<minor>`）および制御デバイスとしてコンテナに渡されます。ドライバのライブラリとプログラム群は `nvidia-container-cli list` が列挙するものをドライババージョンごとに 1 回 `<log dir>/containers/nvidia/<version>` にまとめて配置し（soname 付きでリンク）、`/kairo/nvidia` にマウントします（`lib` を `LD_LIBRARY_PATH` の先頭に、`bin` を `PATH` の末尾に追加）。`CUDA_VISIBLE_DEVICES` には UUID が設定されます。なお、ネストされたコンテナ内では cgroup のデバイスプログラムを読み込めないためデバイスアクセス自体はフェンスされません。その GPU が Attempt の所有物であるのは、Kairo が Lease していることに基づきます。
 - **プロセス帰属・チェックポイント・後始末**: Incus のコンテナ内のプロセスはホストの `/proc` から見え、`KAIRO_ATTEMPT_ID` を持つため、GPU プロセスの帰属が機能します。止め方・生死・使用量はランタイムを通します（上記）。コンテナが公開するチェックポイントはコンテナ内パス（`/kairo/output/...`）を指すためインポートは行われず（[実行中ジョブのチェックポイント保護](#実行中ジョブのチェックポイント保護) を参照）、チェックポイント公開が指示する Run スナップショットによって保持されます。また、Executor は 10 分ごと、およびコンテナ上の Attempt 終了直後に、もはやそこで実行されていない Attempt のインスタンスを削除します（ランナーが強制終了された場合はランナーによる削除が行われないためです）。
-- **現時点の制約**: Gang 実行には対応しません。実行中コンテナの状態そのものを保持する機能もまだなく、処理の継続はジョブ自身のチェックポイントから再開します。
+- **現時点の制約**: 実行中コンテナの状態そのものを保持する機能はまだなく、処理の継続はジョブ自身のチェックポイントから再開します。
 
 ### データストア
 
@@ -1177,7 +1176,7 @@ Kairo はこのディレクトリを削除せず、現時点では専用クラ�
 
 Run が保持すべき出力データは、scratch が作成されるストアと同じストア上の output ディレクトリ `<root>/outputs/<run id>` に保存されます。このディレクトリには Run ID を記したマーカーファイル `.kairo-output` が置かれ、環境変数 `KAIRO_OUTPUT_DIR` で渡されます。
 
-ここで **Run** とは、ある Execution とそれに続く継続（continuation）のまとまりを指します。具体的には、継続ではない Task の Execution（初回実行、rerun、ノード隔離や Gang 起動失敗後の再スタート）とそれに連なる継続群（Run ID は起点となる Execution の ID）、あるいは直接実行（direct execution）が 1 つの Run になります。Gang の rank 0 以外の rank では、Run ID は `<leader's run>-rank<r>` となります。
+ここで **Run** とは、ある Execution とそれに続く継続（continuation）のまとまりを指します。具体的には、継続ではない Task の Execution（初回実行、rerun、ノード隔離後の再スタート）とそれに連なる継続群（Run ID は起点となる Execution の ID）、あるいは直接実行（direct execution）が 1 つの Run になります。（以前の Gang の rank 0 以外の rank では、Run ID は `<leader's run>-rank<r>` でした。）
 
 そのストア上で起動される同一 Run のすべての Attempt には同じディレクトリが割り当てられます。最初の Attempt がディレクトリを作成し、継続（continuation）は前の Attempt がそこに書き込んだ内容（チェックポイントなど）をそのまま見つけることができます。一方、再実行（rerun）や別 Task には別のディレクトリが割り当てられるため、ある Run のファイルが別の Run と衝突することはありません。別ノードに配置された継続には、そのノード側で独自のディレクトリが割り当てられます（以前のノードのディレクトリを持ち込む機能は P1c で対応されます）。
 
@@ -1191,7 +1190,7 @@ Run が終了すると、output ディレクトリはパッキングされ、dur
 
 Kairo が保持するデータは、書き込みが完全に止まった後に、データが書かれたそのストア上でパッキングされます。パッキング対象となるタイミングは以下のとおりです。
 
-- **Run の output ディレクトリ**: Run が終了し（Task が `pending` でも `running` でもなくなったか、その Task の再実行が始まった時点。直接実行では終端状態に達した時点。Gang の各 rank は leader と同時）、かつ最後にそのディレクトリを受け取った Attempt が `quiesced`（静止）した時点。なお、チェックポイントで一時中断された Run には後続の継続があるため、まだ終了したとはみなされません。
+- **Run の output ディレクトリ**: Run が終了し（Task が `pending` でも `running` でもなくなったか、その Task の再実行が始まった時点。直接実行では終端状態に達した時点）、かつ最後にそのディレクトリを受け取った Attempt が `quiesced`（静止）した時点。なお、チェックポイントで一時中断された Run には後続の継続があるため、まだ終了したとはみなされません。
 - **失敗した Attempt の保持中 scratch**: その Attempt が `quiesced` した時点（ロストした Attempt は、プロセスがまだ書き込んでいる可能性があるため、リコンサイルが完了するまで待機します）。
 
 パッキング対象はそれぞれ 1 つのデータオブジェクトとして管理されます（`data_objects` テーブルで `packing` から `packed` へ遷移。イベントは `pack_ordered`、`packed`）。パッキングは 1 度だけ実行され、現在のストア宣言が依然としてそのパスを該当ディレクトリとして指している間にのみ実施されます（ストア移動前に指示されたオブジェクトは、宣言が再びそのパスを指すようになるまで再配布されません）。実行はディレクトリを作成した Executor が担当し、1 分ごとに `packs-to-make` で対象を取得して完了後に `record-pack` で記録します。
@@ -1393,7 +1392,7 @@ durable store が保管するのは、作り直せないもの（学習の結果
 
 - **表示内容**: 種別（kind）、プロジェクト、名前、ノード、状態（`packing`、`packed`、`abandoned`）、ファイル数、コンテンツおよび pack のバイト数、検証済みコピー数（およびそのうち 1 つのパス）、ソースの状態（`present`、`deleting`、`deleted`、`kept`、`evicting`、`evicted` とその理由）。
 - **`--task`（クエリパラメータ `task`）**: 指定した Task 名の全 Run の output を選択します。特定プロジェクトに絞るには `--project` を併用します。
-- **`--execution`（クエリパラメータ `execution`）**: 指定した Execution が属する Run の output を選択します。継続（continuation）の Execution であってもその Run 全体が対象になり、Gang の leader を指定した場合は各 rank の output も含まれます。
+- **`--execution`（クエリパラメータ `execution`）**: 指定した Execution が属する Run の output を選択します。継続（continuation）の Execution であってもその Run 全体が対象になります（以前の Gang の leader を指定した場合は、各 rank の output も含まれます）。
 - これらのフィルタは `--json` 指定時にも適用されます。
 
 #### Run スナップショット
@@ -1727,42 +1726,15 @@ GPU クロック、電力上限、プロセッサ設定の変更には、デー�
 - `force_stop_not_picked_up`: Executor はポーリングしているにもかかわらず強制停止指示を取得していない状態（対象ノードのエージェントログを確認してください）。
 - `executor_unreachable`: Executor との通信が確認できていない状態。
 
-### Gang 実行
+### Gang（廃止）
 
-`[tasks.execution.gang]` を設定すると、複数ホストにまたがる DDP 学習やパイプライン並列サーバのように、1 つの Task を別々のノード上で `size` 個の rank として実行できます。各 rank はそれぞれのノード上で Task に定義されたリソースを要求します。個別の rank については `[[tasks.execution.gang.ranks]]` で `argv`、`cwd`、`executor` ラベル、`exclusive`、`capacity` を上書きできます。
-
-```toml
-[tasks.execution.gang]
-size = 2
-[[tasks.execution.gang.ranks]]
-rank = 1
-argv = ["/root/.local/bin/uv", "run", "train.py"]
-cwd = "/srv/project"
-executor = { labels = { environment = "linux" } }
-[[tasks.execution.gang.ranks.exclusive]]   # この rank を実行するノードには GPU が 2 基ある
-kind = "gpu"
-count = 2
-same_node = true
-[tasks.execution.gang.ranks.capacity]
-ram_bytes = 17179869184
-```
-
-rank ごとの `exclusive`（GPU 不要の場合は `exclusive = []`）や `capacity` は、その rank について Task 側の定義全体を置き換えます。これらを指定しない rank は Task 側の定義をそのまま要求します。また、Task の `env` は全 rank に渡されるため、いずれかの rank が GPU を Lease する構成では `env` に `CUDA_VISIBLE_DEVICES` を設定することはできません。
-
-Gang 実行の動作ルールは以下のとおりです。
-
-- **実行単位と結果判定**: 各 rank は通常の Execution として扱われます。オーケストレーションが追跡するのは rank 0（leader）ですが、Task 全体の結果は全 rank を通して判定されます。
-- **一括配置（All-or-nothing placement）**: すべての rank に対し、それぞれ異なるノード上の Lease を単一トランザクションで一括確保します。rank 0 が配置されるノードには `interconnect_addr` ラベルが必要です。
-- **起動同期と中断**: すべての rank が `prepared` 状態になるまで、どの rank も起動されません。2 分以内に全 rank の準備が完了しない場合、または起動前にいずれかの Lease を失った場合、その配置（placement）は中断され、全 rank が再び待機状態に戻ります。中断理由（placement に保持され、ログにも出力されます）には、各 rank の Executor、その Executor が rank の Lease を受信したかどうか、および Executor の `last_seen_at` が記録されます。
-- **環境変数の注入**: 各 rank の起動時には、`RANK`、`WORLD_SIZE`、`MASTER_ADDR`（rank 0 の `interconnect_addr`）、`MASTER_PORT`（rank 0 のノード上で空いている `29500`〜`29999` のポート）、および `KAIRO_GANG_*` が設定されます。さらに、`interconnect_ifname` ラベルを持つ Executor では `NCCL_SOCKET_IFNAME` と `GLOO_SOCKET_IFNAME` も設定されます。
-- **運命共同体（One fate）**: いずれかの rank が終了コード `0` またはチェックポイント以外の理由で停止した場合、他のすべての rank も終了させられます。いずれか 1 つの rank に送られた `suspend`（pause、プリエンプション、隔離によるもの）は全 rank へ送信されます。また、他の rank が起動した後に一部の rank の起動が失敗した場合は、Gang 全体が再起動されます（オーケストレーション理由 `gang_restart`）。
-- **プリエンプション**: 待機中の Gang は単一の Execution と同様にプリエンプションを行います（各 rank が自身の配置先ノード上で実行。[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）。また、実行中の rank が他のジョブによってプリエンプションされることもあります。
+複数のノードにまたがって 1 つの Task を rank ごとに走らせる Gang（`[tasks.execution.gang]`）は、なくなりました（2026-11、すべての実行をコンテナ 1 つにそろえたため）。Gang を宣言する Task は `kairo project apply` で理由つきで拒否されます。過去の Gang の実行の記録はデータベースに残りますが、rank ごとの表示（`task show` の `gang`、`task logs --rank`）はありません。
 
 ## Loader（ストリーム）
 
 データセットは、できるだけネットワークとメモリの中だけで扱います（issue #43）。Corpus/Mix は作り置きせず、学習しながら raw データから作って流します（[データの手放し](#データの手放しdrop)）。Loader はそのための仕組みで、raw データを取り寄せて sha256 で確かめ、決まった順番のレコード列にして、学習プロセス（の各 rank）にソケットで渡します。どこまで渡したか（位置）を指定すれば、そのちょうど次のレコードから同じ順番で続きます。
 
-Task は宣言した stream を読みます（コンテナで動く Task のみ。gang は未対応。Windows の GPU は wslc のコンテナから使います。ホストの Executor では使えません）。まだないもの（#43）:
+Task は宣言した stream を読みます（Windows の GPU は wslc のコンテナから使います）。まだないもの（#43）:
 
 - raw キャッシュの LAN での共有（いまは各ノードが上流から 1 回ずつ取り寄せます）と、メモリでの保持
 - data object（`object = ...`）の source、非公開の Hugging Face ファイルの取得
@@ -1876,7 +1848,7 @@ with AttemptSession.from_environment() as kairo:
             break
 ```
 
-### 管理対象 Attempt に渡される環境変数と Gang 連携
+### 管理対象 Attempt に渡される環境変数
 
 Kairo が管理する Attempt には、以下の環境変数が渡されます。
 
@@ -1884,9 +1856,8 @@ Kairo が管理する Attempt には、以下の環境変数が渡されます�
 - **配置・リソース割り当て**: `KAIRO_NODE_ID`、`KAIRO_EXECUTOR_ID`、`KAIRO_RESOURCE_IDS`、`KAIRO_RESOURCE_BINDINGS`、および `CUDA_VISIBLE_DEVICES`（Lease された GPU の UUID が設定され、インデックス番号は決して使用されません）
 - **再開時**: `KAIRO_CONTINUATION_REF`
 - **volatile store**: Executor がvolatile store（[データストア](#データストア)を参照）を提供している場合は `KAIRO_SCRATCH` と `KAIRO_OUTPUT_DIR`
-- **Gang 実行**: Gang rank 向けの環境変数
 
-分散実行時は rank 0 が Command のポーリングと応答（acknowledge）を行います。PyTorch アダプタはその Command を全 rank へブロードキャストし、各 rank のコールバックを実行したうえで、分散バリア（distributed barrier）の完了後にのみ継続（continuation）を公開します。Command は再送される可能性があるため、チェックポイントの公開処理は Command ID ごとにべき等（idempotent）である必要があります。
+Python SDK の分散実行の補助（`DistributedAdapter`、`GangContext`）は、Kairo が Gang を走らせていた頃のものです。今の Kairo は `KAIRO_GANG_*` を渡さないため、これらは 1 つのプロセスとして振る舞います（SDK の整理で取り除く予定です）。
 
 ### セーフポイントの挙動と Python・Rust SDK
 
@@ -1897,11 +1868,11 @@ Kairo が管理する Attempt には、以下の環境変数が渡されます�
 - **コールバック失敗時**: コールバックが失敗した場合、または継続を返さなかった場合は `rejected` を応答します。このとき、`suspend` であればエラーが送出（raise）されますが、`checkpoint` Command であればワーカーは処理を継続します（実行の終了ではなくコピーの作成を求めているに過ぎないためです）。
 - **未知の Command**: 未知の Command 種別（command kind）はスキップされます。
 - **一時的な通信障害**: デーモンやネットワークが一時的に利用できない場合（ポーリング・ハートビート・応答における一時的エラーまたはリトライ対象エラー）は、そのセーフポイントでは Command が届いていないものとして扱われます。ワーカーは処理を継続し、エラーを `last_control_error` に保持したまま進み、Command は後から再送されます。
-- **Gang 実行**: Kairo Gang 内では、`DistributedAdapter` がすべての rank をそれぞれの Attempt として登録し、ハートビートを送信します。rank 0 がポーリングして判断を行い、他のすべての rank も同じ手順で自身の Command に応答します。
+
 - **停止シグナル**: `install_stop_signals()` を呼び出した後に `SIGTERM` / `CTRL_BREAK`（強制停止のグレースフルフェーズ）を受信すると、次のセーフポイントでコールバックが 1 回だけ実行され（reason は `stop_signal`、Command ID なし、応答送信なし）、`True` を返します。これにより、作業を手動で再開できる状態を保てます。
 - **退役・フェンス時**: トークンが拒否されたワーカー（Attempt が `quiesced` すなわち退役（retired）状態になった場合）や、フェンスされた（fenced）ワーカーは報告を停止します。
 
-Python SDK には、このほか `ProgressReporter`、`GangContext`、`continuation_or`、`CommandJournal`（Command ID ごとにべき等なチェックポイントを管理）、`provenance.capture`、およびオペレータ向けの `KairoClient` が用意されています。
+Python SDK には、このほか `ProgressReporter`、`continuation_or`、`CommandJournal`（Command ID ごとにべき等なチェックポイントを管理）、`provenance.capture`、およびオペレータ向けの `KairoClient` が用意されています。
 
 Rust クレート `sdk/rust/kairo-sdk`（ブロッキング実装、`ureq` + `rustls`）も同じワーカー側機能を実装しています。`Attempt::from_env`、1 つのハートビートスレッドと `safe_point` を備えた `Session`、プロセス全体で共有される `reporter(unit)` / `phase` 進捗ハンドル、および `example-app` の旧 `kairo-progress` と互換性のある `kairo_sdk::Progress` を提供します。依存関係は git 経由で指定します。
 
@@ -1951,7 +1922,7 @@ controller.run_forever()
 4. プロジェクトが選択した短時間・高優先度の Execution によって協調的プリエンプション（cooperative preemption）を発動できること。オーケストレーション対象のジョブを再開するかどうかはバージョン管理された Task ポリシーが決定し、Execution API を直接利用するユーザーにはプロジェクト管理コントローラの選択肢が残されていること。
 5. 同一 Command が再送されても、チェックポイントの公開処理が破損しないこと。
 6. 静的な Task DAG では、すべての依存先が成功した後にのみ対象ノード（Task）が投入され、リプレイを行っても 1 つのポリシー判定に対して重複した Execution が作成されないこと。
-7. 2 GPU の DDP Execution は all-or-nothing の Gang Lease を取得し、Lease 解放前にすべての rank が静止（`quiesced`）すること。
+7. （廃止）2 GPU の DDP Execution は all-or-nothing の Gang Lease を取得し、Lease 解放前にすべての rank が静止（`quiesced`）すること。Gang はなくなりました（[Gang（廃止）](#gang廃止)）。
 
 クラウドのプロビジョニング、上記 4 種類以外のロール、サービスの監視・常駐管理（service supervision）、cron / フェアシェアスケジューリング、および CPU / RAM の厳格な強制制限（hard enforcement）は、このパイロットの対象外です。
 

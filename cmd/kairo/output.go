@@ -62,10 +62,9 @@ type taskExecution struct {
 	Progress         json.RawMessage `json:"progress"`
 	AdmissionWait    *string         `json:"admission_wait"`
 	// Task detail only.
-	Attempts []attemptInfo        `json:"attempts"` // at most one
-	Gang     []store.TaskGangRank `json:"gang"`
-	Waiting  []map[string]any     `json:"waiting"`
-	Outputs  []store.TaskOutput   `json:"outputs"`
+	Attempts []attemptInfo      `json:"attempts"` // at most one
+	Waiting  []map[string]any   `json:"waiting"`
+	Outputs  []store.TaskOutput `json:"outputs"`
 }
 
 type attemptInfo struct {

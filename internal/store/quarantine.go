@@ -219,13 +219,11 @@ func (s *Store) requestQuarantineTermination(ctx context.Context, attemptID, exe
 	return tx.Commit()
 }
 
-// ListQuarantineTerminations returns the terminations executorID still has to
-// carry out, with the attempt's launcher process: those of a node quarantine
-// and those of a gang one of whose ranks stopped (gang.go).
+// ListQuarantineTerminations returns the terminations of node quarantines
+// executorID still has to carry out, with the attempt's launcher process.
 func (s *Store) ListQuarantineTerminations(ctx context.Context, executorID string) ([]QuarantineTermination, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity,t.requested_at FROM quarantine_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=$1 AND t.state='pending'
-		UNION ALL SELECT t.attempt_id,t.execution_id,a.pid,a.process_identity,t.requested_at FROM gang_terminations t JOIN attempts a ON a.id=t.attempt_id WHERE t.executor_id=$2 AND t.state='pending'
-		ORDER BY 5`, executorID, executorID)
+		ORDER BY 5`, executorID)
 	if err != nil {
 		return nil, err
 	}
@@ -263,10 +261,6 @@ func (s *Store) MarkQuarantineTerminated(ctx context.Context, attemptID string) 
 	table, event := "quarantine_terminations", "quarantine_terminated"
 	var executionID string
 	err = tx.QueryRowContext(ctx, `SELECT execution_id FROM quarantine_terminations WHERE attempt_id=$1`, attemptID).Scan(&executionID)
-	if errors.Is(err, sql.ErrNoRows) {
-		table, event = "gang_terminations", "gang_terminated"
-		err = tx.QueryRowContext(ctx, `SELECT execution_id FROM gang_terminations WHERE attempt_id=$1`, attemptID).Scan(&executionID)
-	}
 	if errors.Is(err, sql.ErrNoRows) {
 		return ErrNotFound
 	} else if err != nil {

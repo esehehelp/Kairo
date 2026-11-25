@@ -408,10 +408,9 @@ func selectorNodesTx(ctx context.Context, q queryer, selector string) (map[strin
 // executor selector names a node itself: a node no executor of which the
 // labels match would never take it (issue #17). With no such node anywhere
 // it goes on the best node for its inputs, to wait there for an executor
-// (no_executor) and say what its inputs wait for. A gang is not pinned: its
-// ranks go on distinct nodes (rank 0 reads the inputs).
+// (no_executor) and say what its inputs wait for.
 func pinInputNodeTx(ctx context.Context, q queryer, project string, spec *ExecutionSpec) error {
-	if len(spec.Inputs) == 0 && spec.Store == "" || spec.Gang != nil {
+	if len(spec.Inputs) == 0 && spec.Store == "" {
 		return nil
 	}
 	var selector map[string]any
@@ -622,7 +621,7 @@ func loadInputsWaits(ctx context.Context, tx *sql.Tx, candidates []*planCandidat
 	}
 	for _, c := range candidates {
 		body, ok := inputs[c.execution.ID]
-		if !ok || c.gangID != "" {
+		if !ok {
 			continue
 		}
 		if c.inputsWait, err = inputsWaitTx(ctx, tx, declared, c.execution.ProjectScopeID, c.selectorJSON, body); err != nil {

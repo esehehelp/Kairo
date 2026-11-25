@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"kairo/internal/api"
-	"kairo/internal/store"
 )
 
 // Attempt logs over GET /api/attempts/{id}/log: kairo logs ATTEMPT_ID reads
@@ -87,10 +86,9 @@ type logOptions struct {
 	tail    *int
 	follow  *bool
 	attempt *string
-	rank    *int
 }
 
-func addLogFlags(fs *flag.FlagSet, withRank bool) logOptions {
+func addLogFlags(fs *flag.FlagSet) logOptions {
 	o := logOptions{
 		stream:  fs.String("stream", "both", "stdout, stderr or both"),
 		tail:    fs.Int("tail", 50, "print the last N lines of each stream (0: the whole log)"),
@@ -98,9 +96,6 @@ func addLogFlags(fs *flag.FlagSet, withRank bool) logOptions {
 		attempt: fs.String("attempt", "latest", "latest, all, or an ordinal (task: execution #N; execution: its Nth attempt)"),
 	}
 	fs.BoolVar(o.follow, "f", false, "shorthand for --follow")
-	if withRank {
-		o.rank = fs.Int("rank", 0, "gang rank whose attempt to show")
-	}
 	return o
 }
 
@@ -131,7 +126,7 @@ func (o logOptions) validate() ([]string, error) {
 
 // logTarget is one attempt whose logs are printed.
 type logTarget struct {
-	label       string // "#2", "#2 rank 1" ("" for an execution's attempt)
+	label       string // "#2" ("" for an execution's attempt)
 	executionID string // "" when not known (kairo logs)
 	attemptID   string
 }
@@ -140,7 +135,7 @@ type logTarget struct {
 func taskLogs(args []string) error {
 	fs := newFlags("task logs")
 	api := apiFlag(fs)
-	opts := addLogFlags(fs, true)
+	opts := addLogFlags(fs)
 	positional, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -163,7 +158,7 @@ func taskLogs(args []string) error {
 		if err != nil {
 			return nil, "", err
 		}
-		targets, err := taskLogTargets(task, *opts.attempt, *opts.rank)
+		targets, err := taskLogTargets(task, *opts.attempt)
 		return targets, "task " + ref.task + " is " + task.State, err
 	}
 	// Until the attempt exists, -f polls the task's status, not its detail.
@@ -187,7 +182,7 @@ func taskLogs(args []string) error {
 func executionLogs(args []string) error {
 	fs := newFlags("execution logs")
 	api := apiFlag(fs)
-	opts := addLogFlags(fs, false)
+	opts := addLogFlags(fs)
 	positional, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -239,8 +234,8 @@ func executionAttempt(client *apiClient, executionID string) (*attemptInfo, erro
 }
 
 // taskLogTargets picks the attempts of `task logs`: of the latest execution,
-// of execution #N, or of all; for a gang, the attempt of the given rank.
-func taskLogTargets(task *taskDetail, which string, rank int) ([]logTarget, error) {
+// of execution #N, or of all.
+func taskLogTargets(task *taskDetail, which string) ([]logTarget, error) {
 	executions := task.Executions
 	if which != "all" {
 		e := task.execution(which)
@@ -261,24 +256,6 @@ func taskLogTargets(task *taskDetail, which string, rank int) ([]logTarget, erro
 	var targets []logTarget
 	for _, e := range executions {
 		label := "#" + strconv.Itoa(e.Ordinal)
-		if len(e.Gang) > 0 {
-			var picked *store.TaskGangRank
-			for i := range e.Gang {
-				if e.Gang[i].Rank == rank {
-					picked = &e.Gang[i]
-				}
-			}
-			if picked == nil {
-				return nil, fmt.Errorf("execution #%d of task %s has no gang rank %d", e.Ordinal, task.Name, rank)
-			}
-			if picked.AttemptID != nil {
-				targets = append(targets, logTarget{label: fmt.Sprintf("%s rank %d", label, rank), executionID: picked.ExecutionID, attemptID: *picked.AttemptID})
-			}
-			continue
-		}
-		if rank != 0 {
-			return nil, fmt.Errorf("task %s is not a gang: --rank does not apply", task.Name)
-		}
 		if id := e.attemptID(); id != "" {
 			targets = append(targets, logTarget{label: label, executionID: e.ExecutionID, attemptID: id})
 		}
