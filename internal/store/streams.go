@@ -247,13 +247,15 @@ var ErrRawChanged = errors.New("raw data changed")
 var ErrRawEvicting = errors.New("raw file being evicted")
 
 // leasedStreamFileTx is every declaration of url among the streams of the
-// executions leased on executorID (live: reserved to releasing), and how
-// their sources read it (format, field); none when none reads it.
+// executions leased on executorID's node (live: reserved to releasing), on
+// any of its executors: a node's raw cache serves them all and reports as
+// one of them. And how their sources read it (format, field); none when
+// none reads it.
 func leasedStreamFileTx(ctx context.Context, q queryer, executorID, url string) ([]orchestration.RawFile, []RecordsCount, error) {
 	var wants []orchestration.RawFile
 	var readings []RecordsCount
-	err := eachRow(ctx, q, `SELECT e.streams_json FROM leases l JOIN execution_requests e ON e.id=l.execution_id
-		WHERE l.executor_id=$1 AND l.state IN('reserved','prepared','active','releasing') AND e.streams_json IS NOT NULL`, []any{executorID}, func(rows *sql.Rows) error {
+	err := eachRow(ctx, q, `SELECT e.streams_json FROM leases l JOIN execution_requests e ON e.id=l.execution_id JOIN executors x ON x.id=l.executor_id
+		WHERE x.node_id=(SELECT node_id FROM executors WHERE id=$1) AND l.state IN('reserved','prepared','active','releasing') AND e.streams_json IS NOT NULL`, []any{executorID}, func(rows *sql.Rows) error {
 		var body string
 		if err := rows.Scan(&body); err != nil {
 			return err
@@ -278,14 +280,15 @@ func leasedStreamFileTx(ctx context.Context, q queryer, executorID, url string) 
 }
 
 // RawIdentity is what url was found to be the first time it was read, for
-// the agent of executorID (whose leased executions' streams read it).
+// the agent of executorID (whose node's leased executions' streams read
+// it).
 func (s *Store) RawIdentity(ctx context.Context, executorID, url string) (loader.File, bool, error) {
 	wants, _, err := leasedStreamFileTx(ctx, s.db, executorID, url)
 	if err != nil {
 		return loader.File{}, false, err
 	}
 	if len(wants) == 0 {
-		return loader.File{}, false, fmt.Errorf("%w: %s is no file of a stream an execution leased on %s reads", ErrStreamReportRefused, url, executorID)
+		return loader.File{}, false, fmt.Errorf("%w: %s is no file of a stream an execution leased on the node of %s reads", ErrStreamReportRefused, url, executorID)
 	}
 	f := loader.File{URL: url}
 	var chunks string
@@ -390,7 +393,7 @@ func (s *Store) RawPlaced(ctx context.Context, executorID, storeID, root string,
 		return err
 	}
 	if len(wants) == 0 {
-		return fmt.Errorf("%w: %s is no file of a stream an execution leased on %s reads", ErrStreamReportRefused, f.URL, executorID)
+		return fmt.Errorf("%w: %s is no file of a stream an execution leased on the node of %s reads", ErrStreamReportRefused, f.URL, executorID)
 	}
 	if err := keepIdentityTx(ctx, tx, wants, f, ""); err != nil {
 		return err
