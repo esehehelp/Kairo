@@ -10,10 +10,10 @@ import (
 	"kairo/internal/machine"
 )
 
-// The daemon declares one control-snapshot task per interval, on the node of
-// the first durable store, running that node's kairo and reserving nothing (so
-// it never suspends anything to fit); none while no durable store or no kairo
-// is there to run it.
+// The daemon declares one control-snapshot task per interval, in a container
+// on the node of the first durable store, running the agent's kairo there and
+// reserving nothing (so it never suspends anything to fit); none while no
+// durable store or no container executor is there to run it.
 func TestControlSnapshotTaskOnceASlotOnTheFirstDurableStoresNode(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)
@@ -29,10 +29,9 @@ func TestControlSnapshotTaskOnceASlotOnTheFirstDurableStoresNode(t *testing.T) {
 		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "D:/durable", Filesystem: "D:"},
 	)
 	if name, err := store.ControlSnapshotTask(ctx, at, time.Hour); err != nil || name != "" {
-		t.Fatalf("without kairo on the node: %q %v", name, err)
+		t.Fatalf("without a container executor on the node: %q %v", name, err)
 	}
-	attributes, _ := json.Marshal(map[string]any{"bench": map[string]any{"kairo": "C:/kairo/kairo.exe", "executor_labels": map[string]string{"environment": "windows"}}})
-	if err := store.UpsertNode(ctx, Node{ID: "node", Name: "node", OS: "windows", Architecture: "amd64", Attributes: attributes, Enabled: true}); err != nil {
+	if err := store.UpsertExecutor(ctx, Executor{ID: "node-ctr", NodeID: "node", Kind: "pct", Attributes: json.RawMessage(`{"runtime":"pct"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	name, err := store.ControlSnapshotTask(ctx, at, time.Hour)
@@ -52,9 +51,12 @@ func TestControlSnapshotTaskOnceASlotOnTheFirstDurableStoresNode(t *testing.T) {
 	if err = holder.Rollback(); err != nil {
 		t.Fatal(err)
 	}
-	var queue, template string
-	if err = store.db.QueryRowContext(ctx, `SELECT queue_name,execution_template_json FROM orchestration_tasks WHERE name=$1`, name).Scan(&queue, &template); err != nil {
+	var queue, template, image string
+	if err = store.db.QueryRowContext(ctx, `SELECT queue_name,execution_template_json,image_ref FROM orchestration_tasks WHERE name=$1`, name).Scan(&queue, &template, &image); err != nil {
 		t.Fatal(err)
+	}
+	if image != "docker.io/library/python@sha256:191083cdf6c7bda8c76158983163ead5d5cf7b77cf3033e805bb0f5296f51b4b" {
+		t.Fatalf("the task's image: %s", image)
 	}
 	var execution struct {
 		Argv     []string `json:"argv"`
@@ -72,8 +74,8 @@ func TestControlSnapshotTaskOnceASlotOnTheFirstDurableStoresNode(t *testing.T) {
 	if err = json.Unmarshal([]byte(template), &execution); err != nil {
 		t.Fatal(err)
 	}
-	if queue != ControlQueue || len(execution.Argv) != 3 || execution.Argv[0] != "C:/kairo/kairo.exe" || execution.Argv[1] != "control" || execution.Argv[2] != "snapshot" ||
-		execution.CWD != "C:/kairo" || execution.Priority != ControlPriority || execution.Capacity.CPUMillis != 0 || execution.Capacity.RAMBytes != 0 || execution.Executor.Node != "node" || execution.Executor.Labels["environment"] != "windows" {
+	if queue != ControlQueue || len(execution.Argv) != 3 || execution.Argv[0] != "/kairo/bin/kairo" || execution.Argv[1] != "control" || execution.Argv[2] != "snapshot" ||
+		execution.CWD != "/" || execution.Priority != ControlPriority || execution.Capacity.CPUMillis != 0 || execution.Capacity.RAMBytes != 0 || execution.Executor.Node != "node" {
 		t.Fatalf("task %s in %s: %s", name, queue, template)
 	}
 	if next, err := store.ControlSnapshotTask(ctx, at.Add(time.Hour), time.Hour); err != nil || next != "snapshot-20261116T0200Z" {
@@ -87,29 +89,24 @@ func TestControlSnapshotTaskOnceASlotOnTheFirstDurableStoresNode(t *testing.T) {
 	}
 }
 
-// A node whose executors all run containers (a Proxmox host's pct executor)
-// takes no control snapshot, which runs the node's kairo on the host: the
-// next durable store's node does.
-func TestControlSnapshotSkipsANodeThatRunsOnlyContainers(t *testing.T) {
+// The control snapshot runs in a container: a durable store's node that
+// runs no containers is passed over for the next one's. (The bench driver
+// still runs on a host: a containers-only node reports no bench.)
+func TestControlSnapshotRunsOnANodeThatRunsContainers(t *testing.T) {
 	store := openCoordinationStore(t)
-	setupSchedulerInventory(t, store)
+	setupSchedulerInventory(t, store) // node "node": a host executor only
 	addTestDisk(t, store, "node", "D:")
 	ctx := context.Background()
-	bench, _ := json.Marshal(map[string]any{"bench": map[string]any{"kairo": "/srv/kairo/bin/kairo"}})
-	if err := store.UpsertNode(ctx, Node{ID: "ctr", Name: "ctr", OS: "linux", Architecture: "amd64", Attributes: bench, Enabled: true}); err != nil {
+	if err := store.UpsertNode(ctx, Node{ID: "ctr", Name: "ctr", OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := store.UpsertExecutor(ctx, Executor{ID: "ctr-pct", NodeID: "ctr", Kind: "pct", Attributes: json.RawMessage(`{"runtime":"pct"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	addTestDisk(t, store, "ctr", "/")
-	winBench, _ := json.Marshal(map[string]any{"bench": map[string]any{"kairo": "C:/kairo/kairo.exe"}})
-	if err := store.UpsertNode(ctx, Node{ID: "node", Name: "node", OS: "windows", Architecture: "amd64", Attributes: winBench, Enabled: true}); err != nil {
-		t.Fatal(err)
-	}
 	declareTestStore(t, store,
-		machine.Store{ID: "a-durable", Class: machine.StoreDurable, Node: "ctr", Root: "/srv/durable", Filesystem: "/"},
-		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Root: "D:/durable", Filesystem: "D:"},
+		machine.Store{ID: "a-durable", Class: machine.StoreDurable, Node: "node", Root: "D:/durable", Filesystem: "D:"},
+		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "ctr", Root: "/srv/durable", Filesystem: "/"},
 	)
 	if b, err := nodeBenchTx(ctx, store.db, "ctr"); err != nil || b.Kairo != "" {
 		t.Fatalf("a containers-only node reports a bench: %+v %v", b, err)
@@ -119,7 +116,7 @@ func TestControlSnapshotSkipsANodeThatRunsOnlyContainers(t *testing.T) {
 		t.Fatalf("declared %q %v", name, err)
 	}
 	var node string
-	if err := store.db.QueryRowContext(ctx, `SELECT (execution_template_json::jsonb)->'executor'->>'node' FROM orchestration_tasks WHERE name=$1`, name).Scan(&node); err != nil || node != "node" {
+	if err := store.db.QueryRowContext(ctx, `SELECT (execution_template_json::jsonb)->'executor'->>'node' FROM orchestration_tasks WHERE name=$1`, name).Scan(&node); err != nil || node != "ctr" {
 		t.Fatalf("on node %q %v", node, err)
 	}
 }

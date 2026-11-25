@@ -2227,7 +2227,7 @@ kairo db import-sqlite --from local/kairo-v3.db --config kairo.toml   # また�
 
 コントロールプレーンのデータも他のデータと本質的に変わらないため、Kairo 自身が同じ仕組みでこれを保全します。デーモン設定の `control_snapshot_minutes`（デフォルト `60`、負の値で無効）ごとに、デーモンはプロジェクト `kairo`、キュー `control-snapshot`、名前 `snapshot-<UTC slot>`（例: `snapshot-20261116T0100Z`）の Task を宣言します。
 
-この Task は `kairo control snapshot` を実行するもので、`[bench]` の `kairo_binary` を報告しているノードに属する最初の durable store を選び、そのノードの `kairo_binary` を用いて、当該 durable store の `executor_labels` に合致する Executor 上で実行されます。durable store が 1 つも宣言されていない間、または対象ノードが `kairo` バイナリを報告していない間は何も実行されません。有効な Executor がすべてコンテナ実行用（`kind = "incus"` / `"pct"`）のノードは、ベンチマークのドライバも control snapshot も（ホスト上で `kairo` を動かすため）受け付けられないので、`kairo` バイナリを報告していないものとして扱われ、次の durable store のノードが選ばれます。優先度は他のあらゆるジョブより高く、CPU・RAM・GPU のいずれも予約しないため（ダンプ処理はデーモン側で行い、Task は受け取った内容を書き出すだけのため）、他ジョブに待たされることも、空きを作るために他ジョブを中断することもありません。
+この Task は `kairo control snapshot` をコンテナの中で実行します。コンテナ Executor のあるノードに属する最初の durable store を選び、そのノードのコンテナ Executor で、固定したイメージ（`python:3.12-slim` をダイジェストで固定。どのコンテナにもマウントされるエージェント自身のバイナリ `/kairo/bin/kairo` を動かすだけなので、イメージは何でもかまいません）から動かします。durable store が 1 つも宣言されていない間、または対象ノードにコンテナ Executor がない間は何も実行されません。優先度は他のあらゆるジョブより高く、CPU・RAM・GPU のいずれも予約しないため（ダンプ処理はデーモン側で行い、Task は受け取った内容を書き出すだけのため）、他ジョブに待たされることも、空きを作るために他ジョブを中断することもありません。
 
 Task は自身の Attempt トークンを用いてデーモンからスナップショットを取得し（`GET /api/worker/control-snapshot`。このキューの Attempt のみに許可）、Run の `output` ディレクトリに `kairo-control-<time>.tar` として書き出します。Run 終了時には通常の出力と同様に pack され、すべての durable store へコピーされます。tar アーカイブの中身は次のとおりです。
 
@@ -2287,31 +2287,23 @@ git diff --check
 
 Kairo 自身の CI は Kairo 上で実行します。`bash ci/kairo-ci.sh [REV] [--wait]` を実行すると、指定コミットのチェック群をプロジェクト `kairo-ci`（キュー `ci`、`ci/tasks.toml.in` にコミットの短縮 SHA を埋め込んだ定義）の Task として宣言します。これにより、コードが実際に動作する稼働環境自身のノード上で、他の作業とまったく同じアドミッション制御の下でチェックが走ります。
 
-スクリプトは `site.env`（[運用スクリプト](#運用スクリプト)を参照）の指定に従って対象コミットのツリー（`git archive`）を各チェック実行ノードへコピーし、送信したツリーを状態ディレクトリ配下の `ci/` に保持します。
+スクリプトは対象コミットのツリー（`git archive`）をコードスナップショットとして送り、`site.env`（[運用スクリプト](#運用スクリプト)を参照）が指す CI ノードのコンテナ Executor で、チェックごとにコンテナを作って実行します。
 
 ```sh
-CI_WINDOWS_ROOT=/c/Users/me/AppData/Local/kairo/ci-windows  # Windows のチェックの展開先
-CI_LINUX_NODE=host-b-work                                   # Linux のチェックを走らせるノード
-CI_LINUX_SITE=host-b                                        # そのノードの site ラベル
-CI_LINUX_HOST=root@192.0.2.252                              # そのノードの Proxmox ホスト
-CI_LINUX_VMID=116                                           # そのノードのコンテナ
+CI_LINUX_NODE=host-b        # チェックを走らせるノード（コンテナ Executor のあるもの）
+CI_LINUX_SITE=host-b        # そのノードの site ラベル
 ```
 
-各 Task はコピーされたツリーを自身の `scratch`（`KAIRO_SCRATCH`）に展開し、そこから `ci/check.sh CHECK` を実行します（チェック内容もそのコミット時点のものであり、実行中に読み込むファイルが外部から書き換わることはありません）。Go・`uv`・`cargo` のキャッシュはプロジェクトのキャッシュディレクトリ（`KAIRO_CACHE_DIR`）に配置し、完了時に展開したツリーを削除します。Attempt は他のジョブと同様にコンファインメントされるため（[アドミッション制御とプランニング](#アドミッション制御とプランニング)を参照）、書き込みが許可されるのはこれらのみです。なお、`win-local` 上では Low integrity で実行されるため Git Bash が起動せず、Windows 向けチェックは `ci/check.sh` ではなく PowerShell で `ci/check.ps1 CHECK` を実行します。
+各 Task はスナップショット（`/kairo/src`）を自身の `scratch`（`KAIRO_SCRATCH`）にコピーし、そこから `ci/check.sh CHECK` を実行します（チェック内容もそのコミット時点のものです）。Go・`uv`・`cargo` のキャッシュはプロジェクトのキャッシュディレクトリ（`KAIRO_CACHE_DIR`）に置きます。
 
-実行されるチェックと対象ノードの構成は次のとおりです。
-
-- **`host-b-work` 上のチェック**:
-  - `<sha>-linux`（`gofmt`、Linux / Windows 向け `go vet`、`go test`）および `<sha>-linux-race`: 読み取り不可・削除不可ファイルのテストが本来の意味を持つよう、非特権ユーザー（`ci`）で実行します。
-  - `<sha>-linux-root`: Executor・プロセス・Provider のテストを `root` で実行します。
-  - **ノード環境**: Go、`gcc`（`-race` 用）、および `127.0.0.1:55432` のテスト用 PostgreSQL 17 を備えています（テストデータベースの削除時に他の接続を切断する必要があるため、テストコンテナと同様にロールはスーパーユーザーの `kairo`。localhost のみでリッスンし、`fsync` はオフ）。
-- **`win-local` 上のチェック**:
-  - `<sha>-windows`、`<sha>-sdk-python`、`<sha>-sdk-rust`
-  - **ノード環境**: 前述のローカルテスト用コンテナを使用します。
+- `<sha>-linux`（`gofmt`、Linux / Windows 向け `go vet`、`go test`）と `<sha>-linux-race`: golang のイメージで、テスト用の PostgreSQL 17 を自分で立て（`ci/check.sh start-pg`）、非特権ユーザー（nobody）で実行します。
+- `<sha>-linux-root`: Executor・プロセス・Provider のテストを `root` で実行します。
+- `<sha>-sdk-python`・`<sha>-sdk-rust`: uv のイメージと Rust のイメージで、各 SDK のテストを実行します。
+- Windows 向けのビルドとテスト（`windows`）は GitHub の CI だけで実行します。Kairo は Windows ネイティブの仕事を動かさないためです（Windows では wslc のコンテナで Linux の仕事を動かします）。
 
 スケジューリングと運用上の操作は次のとおりです。
 
-- **優先度とメモリ予約**: すべてのチェックは優先度 `-500` で実行されるため、他のすべての作業の完了を待ち、何もプリエンプトしません。また、`host-b-work` 上の各チェックは搭載メモリ 4 GiB のうち 3 GiB を予約するため、プランナはこれらを 1 つずつ順番に実行します。
+- **優先度とメモリ予約**: すべてのチェックは優先度 `-500` で実行されるため、他のすべての作業の完了を待ち、何もプリエンプトしません。各チェックは CPU と RAM を予約し、入りきらない分は順番を待ちます。
 - **待機・ログ確認・再実行**: `--wait` を付けると全チェックの完了を待機し（`kairo task wait --match`）、すべて成功した場合のみ終了コード `0` で終了します。失敗内容の確認には `kairo task logs kairo-ci ci <sha>-<check>` を、個別チェックの再実行には `kairo task rerun` を使用します（宣言済みの Task は不変であるため、1 つのコミットに対する宣言は 1 回のみです）。
 
 なお、実機の NVIDIA GPU、プロセス強制終了（process-kill）、および DDP 実行のテストは通常の単体テストではなくホスト固有の統合テストであり、コントローラによる実際のクロック・電力上限・プロセッサ設定の変更テストも同様です（コントローラの通常テストではフェイクのアクチュエータを使用します）。ベンチマークテストは極小のワークロード（`TempDir` 上の数 MiB のファイル、ループバック通信）のみを実行し、`kairo-bench-gpu` はビルド検証のみが行われます（GPU ベンチマークの実測はアイドル状態の GPU 上で実行する前提です）。ベンチマークドライバと動作点ポリシーはスクリプト化された JSON 行とフェイクのデーモン・コントローラを用いてテストされており、各種カーブ特性・定常状態・熱制限がフェイクの想定どおりに振る舞うかどうかは、実際のアイドル状態のハードウェア上でのみ確認できます。
