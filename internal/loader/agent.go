@@ -3,6 +3,8 @@ package loader
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -159,3 +161,67 @@ func (c cachedOrigin) ReadFrom(_ context.Context, _ File, offset int64) (io.Read
 }
 
 func (c cachedOrigin) String() string { return c.path }
+
+// NewFileAgent is the agent of raw directory dir asked through files in
+// requests (FileTransport): for a loader in a container that cannot reach
+// the agent's socket (one in a VM: wslc).
+func NewFileAgent(dir, requests string, upstream Origin) *Agent {
+	a := NewAgent(dir, upstream)
+	a.client = &http.Client{Transport: FileTransport{Dir: requests}}
+	return a
+}
+
+// FileTransport carries a loader's requests to the node's agent as files
+// in Dir: the request body written as <id>.req (whole: written aside, then
+// renamed), the agent's answer read from <id>.resp (a FileAnswer).
+type FileTransport struct{ Dir string }
+
+// FileAnswer is the agent's answer to a request made as a file.
+type FileAnswer struct {
+	Status int          `json:"status"`
+	Answer EnsureAnswer `json:"answer"`
+}
+
+func (t FileTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	var body []byte
+	if r.Body != nil {
+		b, err := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+		r.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+		body = b
+	}
+	var raw [12]byte
+	_, _ = rand.Read(raw[:])
+	id := hex.EncodeToString(raw[:])
+	tmp, req, resp := filepath.Join(t.Dir, id+".tmp"), filepath.Join(t.Dir, id+".req"), filepath.Join(t.Dir, id+".resp")
+	if err := os.WriteFile(tmp, body, 0o666); err != nil {
+		return nil, err
+	}
+	if err := os.Rename(tmp, req); err != nil {
+		os.Remove(tmp)
+		return nil, err
+	}
+	defer os.Remove(resp)
+	tick := time.NewTicker(50 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		data, err := os.ReadFile(resp)
+		if err == nil {
+			var a FileAnswer
+			if err := json.Unmarshal(data, &a); err != nil {
+				return nil, fmt.Errorf("the node's agent answered %s: %w", id, err)
+			}
+			answer, _ := json.Marshal(a.Answer)
+			return &http.Response{StatusCode: a.Status, Status: fmt.Sprintf("%d %s", a.Status, http.StatusText(a.Status)),
+				Header: http.Header{"Content-Type": {"application/json"}}, Body: io.NopCloser(bytes.NewReader(answer)), Request: r}, nil
+		}
+		select {
+		case <-r.Context().Done():
+			os.Remove(req) // not taken yet: taken back
+			return nil, r.Context().Err()
+		case <-tick.C:
+		}
+	}
+}

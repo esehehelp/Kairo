@@ -101,9 +101,17 @@ type containerSpec struct {
 	Tmp      string   `json:"tmp"`
 	// Streams the argv reads: a loader each, started before it in the
 	// container (startLoaders), reading raw files through the store's raw
-	// cache mounted at RawDir (rawcache.go).
-	Streams []store.LaunchStream `json:"streams,omitempty"`
-	RawDir  string               `json:"raw_dir,omitempty"`
+	// cache mounted at RawDir (rawcache.go); RawRequests, when set, is where
+	// a loader asks the node's agent for them as files (a container in a
+	// VM cannot reach the agent's socket: wslc).
+	Streams     []store.LaunchStream `json:"streams,omitempty"`
+	RawDir      string               `json:"raw_dir,omitempty"`
+	RawRequests string               `json:"raw_requests,omitempty"`
+	// Runtime is the container's runtime when it matters to the init:
+	// "wslc", whose containers cannot mount (the init does not confine them:
+	// they run as an ordinary user) and whose processes the agent cannot
+	// reach (the init passes a stop on to the argv).
+	Runtime string `json:"runtime,omitempty"`
 }
 
 // containerMount is a node path mounted in the container.
@@ -135,6 +143,9 @@ type containerOptions struct {
 	runArg   string
 	dirsOnly bool
 	pct      *pctSettings
+	// wslc: a wslc container (container_wslc.go): its init is the Linux
+	// build beside this binary, raw files are asked for as files.
+	wslc bool
 }
 
 // containerCommand builds the launcher of an attempt in a container (the
@@ -164,6 +175,15 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 	if err != nil {
 		return nil, err
 	}
+	// what runs in the container: this binary, or (wslc, on Windows) its
+	// Linux build beside it
+	initBinary := self
+	if opts.wslc {
+		initBinary = filepath.Join(filepath.Dir(self), wslcLinuxBinary)
+		if _, err := os.Stat(initBinary); err != nil {
+			return nil, fmt.Errorf("a wslc container's init is the Linux build of kairo beside the agent: %w", err)
+		}
+	}
 	dir := e.containerDir(id)
 	runDir := filepath.Join(dir, "run")
 	if err := os.MkdirAll(runDir, 0o700); err != nil {
@@ -177,7 +197,7 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		}
 		f.Close()
 	}
-	binMount := containerMount{Source: self, Path: containerRoot + "/bin/kairo", ReadOnly: true}
+	binMount := containerMount{Source: initBinary, Path: containerRoot + "/bin/kairo", ReadOnly: true}
 	logMounts := []containerMount{{Source: logs[0], Path: containerStdout}, {Source: logs[1], Path: containerStderr}}
 	writableLogs := []string{containerStdout, containerStderr}
 	if opts.dirsOnly {
@@ -186,7 +206,7 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 			return nil, err
 		}
 		if _, err := os.Stat(filepath.Join(binDir, "kairo")); err != nil {
-			if err := linkOrCopy(self, filepath.Join(binDir, "kairo")); err != nil {
+			if err := linkOrCopy(initBinary, filepath.Join(binDir, "kairo")); err != nil {
 				return nil, fmt.Errorf("hand the binary to the container: %w", err)
 			}
 		}
@@ -216,6 +236,16 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		Argv:     launch.Argv,
 		Streams:  launch.Streams,
 	}
+	if opts.wslc {
+		spec.Runtime = "wslc"
+		// the ordinary user it runs as has no home in the image: one in
+		// the scratch
+		home := filepath.Join(scratch, "home")
+		if err := os.MkdirAll(home, 0o777); err != nil {
+			return nil, err
+		}
+		env = setEnv(env, "HOME", home)
+	}
 	paths := map[string]string{scratch: containerRoot + "/scratch", output: containerRoot + "/output"}
 	if cache != "" {
 		spec.Mounts = append(spec.Mounts, containerMount{Source: cache, Path: containerRoot + "/cache"})
@@ -231,12 +261,17 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		if err != nil {
 			return nil, fmt.Errorf("the raw cache of store %s: %w", s.decl.ID, err)
 		}
-		view, err := raw.attach(launch)
+		view, requests, err := raw.attach(launch, opts.wslc)
 		if err != nil {
 			return nil, fmt.Errorf("the raw cache of store %s: %w", s.decl.ID, err)
 		}
 		spec.Mounts = append(spec.Mounts, containerMount{Source: view, Path: containerRoot + "/raw", ReadOnly: true})
 		spec.RawDir = containerRoot + "/raw"
+		if requests != "" {
+			spec.Mounts = append(spec.Mounts, containerMount{Source: requests, Path: containerRoot + "/raw-requests"})
+			spec.Writable = append(spec.Writable, containerRoot+"/raw-requests")
+			spec.RawRequests = containerRoot + "/raw-requests"
+		}
 	}
 	for _, in := range launch.Inputs {
 		if in.Path == "" {
@@ -272,7 +307,8 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 			spec.GPUs = append(spec.GPUs, resourceBinding(r))
 		}
 	}
-	if len(spec.GPUs) > 0 {
+	if len(spec.GPUs) > 0 && !opts.wslc {
+		// wslc hands its containers the WSL GPU's driver itself
 		spec.DriverRoot = filepath.Join(e.LogDir, "containers", "nvidia")
 	}
 	body, err := json.Marshal(spec)
@@ -493,4 +529,19 @@ func findOCIRemote(list []byte, addr string) (string, error) {
 		}
 	}
 	return "", nil
+}
+
+func readContainerSpec(p string) (containerSpec, error) {
+	var spec containerSpec
+	body, err := os.ReadFile(p)
+	if err != nil {
+		return spec, err
+	}
+	if err := json.Unmarshal(body, &spec); err != nil {
+		return spec, fmt.Errorf("%s: %w", p, err)
+	}
+	if spec.Instance == "" || len(spec.Argv) == 0 {
+		return spec, fmt.Errorf("%s: no instance or argv", p)
+	}
+	return spec, nil
 }

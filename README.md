@@ -958,7 +958,7 @@ argv = ["python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
 
 #### Incus Executor の要件と設定
 
-イメージを指定した Execution を受け付けるのはコンテナ実行用 Executor のみであり、コンテナ実行用 Executor はそれ以外の Execution を受け付けません。`kind = "incus"` と `kind = "pct"` の Executor は属性 `runtime`（値は kind と同じ）を登録し（`labels` に `runtime` を手動指定すると拒否され、`kind` のみが設定できます）、イメージを持つ Execution のセレクタにはイメージ指定に基づいて `"container": true` が自動設定されます（呼び出し元から直接設定することはできません）。
+イメージを指定した Execution を受け付けるのはコンテナ実行用 Executor のみであり、コンテナ実行用 Executor はそれ以外の Execution を受け付けません。`kind = "incus"`・`kind = "pct"`・`kind = "wslc"` の Executor は属性 `runtime`（値は kind と同じ）を登録し（`labels` に `runtime` を手動指定すると拒否され、`kind` のみが設定できます）、イメージを持つ Execution のセレクタにはイメージ指定に基づいて `"container": true` が自動設定されます（呼び出し元から直接設定することはできません）。
 
 `kind = "incus"` の Executor は Linux 上で動作し、ノード上の他の Executor と並存できます。
 
@@ -1005,6 +1005,26 @@ labels = { site = "host-a" }
 
 これらの設定は Executor の `labels` に書きます。必要な環境は、Proxmox VE 9.1 以降（OCI アーカイブからのコンテナ作成）と `skopeo`（Proxmox VE の依存として入っています）です。エージェントはホスト上で root として動かします。
 
+#### WSL コンテナ Executor（`kind = "wslc"`）
+
+Windows 上のエージェントは、`kind = "wslc"` の Executor で、Attempt ごとに WSL のコンテナ（`wslc`、WSL 3 以降に付属）を作り、終わったら削除します。Windows の GPU を Linux の仕事で使うための Executor です（Windows でしか動かない仕事は Kairo の対象外です）。
+
+```toml
+[[executors]]
+id = "host-w-wslc"
+kind = "wslc"
+labels = { site = "host-w" }
+```
+
+- **ランナー**（`__kairo-wslc-run`）: イメージをダイジェストで取得し（`wslc pull`）、同じ名前の残りを消してから、`wslc run` を前景で動かして停止を待ち、`/kairo/run/exit` の終了コードを読んでコンテナを削除します。Attempt の停止（CTRL_BREAK）が届くと、`wslc stop` でコンテナを止めます。
+- **init**: エージェントの横に置いた Linux 版のバイナリ `kairo-linux` を `/kairo/bin/kairo` にマウントし、`__kairo-container-init` として動かします（`ops/windows/replace-agent.ps1` が Windows 版と一緒に置きます）。
+- **閉じ込めの代わりに一般ユーザーで動かす**: wslc のコンテナはマウントができない（CAP_SYS_ADMIN がない）ため、init は Incus/pct のような読み取り専用化をしません。代わりにコンテナ全体を uid 1000 で動かします。Kairo が渡す領域は書けますが、イメージのファイルは書けないので、`/kairo` の外に書いたものは黙って消えず、書いた時点で失敗します（`/tmp` だけは書けますが、`TMPDIR` は scratch を指します）。`HOME` は scratch の `home` です。実行時に root を前提とするイメージ（実行中の `pip install` など）は動きません。
+- **停止**: コンテナのプロセスは WSL の VM の中にあり、エージェントから見えません。そのため停止はランナーに届き、ランナーがコンテナを止め、init が `argv` のプロセスグループへ SIGTERM を渡します（30 秒後に wslc が強制終了します）。プロセスの生死は、コンテナが動いているかどうかで判断します。
+- **GPU**: `--gpus all` で WSL の GPU（`/dev/dxg` と `/usr/lib/wsl/lib`）を渡し、`CUDA_VISIBLE_DEVICES` に Lease した GPU の UUID を入れます。glibc のイメージに限ります（alpine では wslc の GPU フックが失敗します）。
+- **ネットワーク**: コンテナは wslc のブリッジから外へ出られ、デーモンにも直接届きます。
+- **stream**: コンテナは VM の中にあるため、raw キャッシュの窓口のソケットに届きません。Loader は窓口の横のディレクトリ（`/kairo/raw-requests`）にファイルを置いて agent に依頼し（`kairo loader serve --raw-requests`）、agent はそれを 0.1 秒ごとに見て、ソケットと同じように答えます。
+- **掃除**: ランナーが強制終了されて残ったコンテナ（`kairo-att-*` で、Attempt がもうこのノードで動いていないもの）は、掃除処理が削除します。
+
 #### コンテナの起動・終了ライフサイクルとマウント構成
 
 Attempt のランチャーはホスト実行時と同様に shim であり、エージェントのバイナリをランナー（`__kairo-incus-run`）として起動します。ランナーはイメージからインスタンス `kairo-<attempt id>` を作成し（`incus init REMOTE:REPOSITORY@DIGEST`。初回はそのレジストリ用の OCI リモートを追加）、起動して停止を待ち、コンテナが書き出した終了コードを読み取ってインスタンスを削除し、その終了コードで終了します（終了コードが書かれていなかった場合は `-1`）。実行中にエージェントが再起動しても、他の Attempt と同様に引き継がれます（[エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ) を参照）。
@@ -1027,7 +1047,8 @@ Kairo が渡した領域以外に Attempt が書き込んだ内容はインス�
 | `/kairo/cache` | `KAIRO_CACHE_DIR` |
 | `/kairo/src` | `KAIRO_SOURCE_DIR`、コードスナップショット（読み取り専用） |
 | `/kairo/inputs/<name>` | `KAIRO_INPUT_<NAME>`（読み取り専用） |
-| `/kairo/nvidia` | ノードの NVIDIA ドライバファイル群（GPU 利用時、読み取り専用） |
+| `/kairo/nvidia` | ノードの NVIDIA ドライバファイル群（GPU 利用時、読み取り専用。wslc では使わない） |
+| `/kairo/raw`, `/kairo/raw-requests` | stream の raw キャッシュの窓口（読み取り専用）と、wslc での依頼の置き場 |
 | `/kairo/run`, `/kairo/log`, `/kairo/bin` | init の spec と終了コード、ログ、バイナリ |
 
 #### 環境変数・GPU 受け渡し・制約事項
@@ -1732,7 +1753,7 @@ Gang 実行の動作ルールは以下のとおりです。
 
 データセットは、できるだけネットワークとメモリの中だけで扱います（issue #43）。Corpus/Mix は作り置きせず、学習しながら raw データから作って流します（[データの手放し](#データの手放しdrop)）。Loader はそのための仕組みで、raw データを取り寄せて sha256 で確かめ、決まった順番のレコード列にして、学習プロセス（の各 rank）にソケットで渡します。どこまで渡したか（位置）を指定すれば、そのちょうど次のレコードから同じ順番で続きます。
 
-Task は宣言した stream を読みます（コンテナで動く Task のみ。gang は未対応。Windows の GPU は wslc のコンテナ（#41）から使う予定で、ホストの Executor では使えません）。まだないもの（#43）:
+Task は宣言した stream を読みます（コンテナで動く Task のみ。gang は未対応。Windows の GPU は wslc のコンテナから使います。ホストの Executor では使えません）。まだないもの（#43）:
 
 - raw キャッシュの LAN での共有（いまは各ノードが上流から 1 回ずつ取り寄せます）と、メモリでの保持
 - data object（`object = ...`）の source、非公開の Hugging Face ファイルの取得

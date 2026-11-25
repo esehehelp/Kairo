@@ -116,6 +116,20 @@ type rawView struct {
 	wants   map[string]rawWant // by URL
 	ln      net.Listener
 	gone    time.Time // first seen not running here (zero: running)
+	// requests, when set, is where its loaders ask as files (wslc); stop
+	// ends its watching
+	requests string
+	stop     chan struct{}
+}
+
+// close stops serving the view.
+func (v *rawView) close() {
+	v.ln.Close()
+	select {
+	case <-v.stop:
+	default:
+		close(v.stop)
+	}
 }
 
 // handed records the identity of a file handed to the view's attempt that
@@ -250,6 +264,11 @@ func (c *rawCache) restoreViews() {
 	}
 }
 
+func isDir(p string) bool {
+	info, err := os.Stat(p)
+	return err == nil && info.IsDir()
+}
+
 func cutSuffix(s, suffix string) (string, bool) {
 	if len(s) < len(suffix) || s[len(s)-len(suffix):] != suffix {
 		return "", false
@@ -261,13 +280,15 @@ func (c *rawCache) close() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, v := range c.views {
-		v.ln.Close()
+		v.close()
 	}
 }
 
 // attach makes the view of a launch's attempt (its streams' files), to be
-// mounted at /kairo/raw in its container; the directory it is.
-func (c *rawCache) attach(launch *store.Launch) (string, error) {
+// mounted at /kairo/raw in its container: the directory it is, and with
+// asFiles the directory its loaders ask in as files (wslc: a container in
+// a VM cannot reach the view's socket), beside it.
+func (c *rawCache) attach(launch *store.Launch, asFiles bool) (string, string, error) {
 	wants := map[string]rawWant{}
 	for _, s := range launch.Streams {
 		for _, src := range s.Spec.Sources {
@@ -281,20 +302,82 @@ func (c *rawCache) attach(launch *store.Launch) (string, error) {
 	}
 	body, err := json.Marshal(wants)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	id := launch.Attempt.ID
 	if !attemptIDName.MatchString(id) {
-		return "", fmt.Errorf("attempt id %q", id)
+		return "", "", fmt.Errorf("attempt id %q", id)
+	}
+	requests := ""
+	if asFiles {
+		requests = filepath.Join(c.dir, "views", id+rawRequestsSuffix)
+		if err := os.MkdirAll(requests, 0o777); err != nil {
+			return "", "", err
+		}
 	}
 	if err := writeFileAtomic(filepath.Join(c.dir, ".attempts", id+".json"), body); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := c.openView(id, wants); err != nil {
-		return "", err
+		return "", "", err
 	}
-	return filepath.Join(c.dir, "views", id), nil
+	return filepath.Join(c.dir, "views", id), requests, nil
 }
+
+// rawRequestsSuffix names the directory beside a view where its loaders
+// ask as files.
+const rawRequestsSuffix = ".requests"
+
+// watchRequests answers the requests v's loaders write as files in
+// v.requests (loader.FileTransport): each <id>.req taken, handed over as
+// over the socket, answered in <id>.resp; until the view is closed.
+func (c *rawCache) watchRequests(v *rawView) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-v.stop
+		cancel()
+	}()
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		entries, err := os.ReadDir(v.requests)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			id, ok := cutSuffix(entry.Name(), ".req")
+			if !ok || !requestIDName.MatchString(id) {
+				continue
+			}
+			taken := filepath.Join(v.requests, id+".taken")
+			if os.Rename(filepath.Join(v.requests, entry.Name()), taken) != nil {
+				continue
+			}
+			go func() {
+				body, err := os.ReadFile(taken)
+				_ = os.Remove(taken)
+				status, answer := http.StatusBadRequest, loader.EnsureAnswer{Error: "a request names a file by its URL"}
+				var req ensureRequest
+				if err == nil && json.Unmarshal(body, &req) == nil && req.URL != "" {
+					status, answer = c.ensureFor(ctx, v, req.URL)
+				}
+				out, _ := json.Marshal(loader.FileAnswer{Status: status, Answer: answer})
+				resp := filepath.Join(v.requests, id+".resp")
+				if err := writeFileAtomic(resp, out); err != nil {
+					c.w.Logger.Warn("raw request not answered", "attempt_id", v.attempt, "error", err)
+				}
+			}()
+		}
+	}
+}
+
+// requestIDName is a request's id (loader.FileTransport).
+var requestIDName = regexp.MustCompile(`^[0-9a-f]{16,64}$`)
 
 // openView serves an attempt's view on its socket.
 func (c *rawCache) openView(id string, wants map[string]rawWant) error {
@@ -322,7 +405,13 @@ func (c *rawCache) openView(id string, wants map[string]rawWant) error {
 		ln.Close()
 		return err
 	}
-	v := &rawView{attempt: id, dir: dir, wants: wants, ln: ln}
+	v := &rawView{attempt: id, dir: dir, wants: wants, ln: ln, stop: make(chan struct{})}
+	// asked as files too, when the attempt's container cannot reach the
+	// socket (attach made the directory)
+	if requests := dir + rawRequestsSuffix; isDir(requests) {
+		v.requests = requests
+		go c.watchRequests(v)
+	}
 	c.mu.Lock()
 	c.views[id] = v
 	c.mu.Unlock()
@@ -362,10 +451,13 @@ func (c *rawCache) sweep() {
 		if time.Since(v.gone) < rawViewGrace {
 			continue
 		}
-		v.ln.Close()
+		v.close()
 		c.mu.Lock()
 		delete(c.views, v.attempt)
 		c.mu.Unlock()
+		if v.requests != "" {
+			_ = os.RemoveAll(v.requests)
+		}
 		if err := os.RemoveAll(v.dir); err != nil {
 			c.w.Logger.Warn("raw view not removed", "attempt_id", v.attempt, "error", err)
 			continue
@@ -390,15 +482,20 @@ func (c *rawCache) serve(v *rawView, w http.ResponseWriter, r *http.Request) {
 		writeEnsure(w, http.StatusBadRequest, loader.EnsureAnswer{Error: "a request names a file by its URL"})
 		return
 	}
+	status, answer := c.ensureFor(r.Context(), v, req.URL)
+	writeEnsure(w, status, answer)
+}
+
+// ensureFor answers v's attempt asking for url: a file of its streams
+// handed over, or refused.
+func (c *rawCache) ensureFor(ctx context.Context, v *rawView, url string) (int, loader.EnsureAnswer) {
 	v.mu.Lock()
-	want, ok := v.wants[req.URL]
+	want, ok := v.wants[url]
 	v.mu.Unlock()
 	if !ok {
-		writeEnsure(w, http.StatusForbidden, loader.EnsureAnswer{Error: req.URL + " is no file of this attempt's streams"})
-		return
+		return http.StatusForbidden, loader.EnsureAnswer{Error: url + " is no file of this attempt's streams"}
 	}
-	status, answer := c.handOver(r.Context(), v, want)
-	writeEnsure(w, status, answer)
+	return c.handOver(ctx, v, want)
 }
 
 func writeEnsure(w http.ResponseWriter, status int, answer loader.EnsureAnswer) {

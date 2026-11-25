@@ -44,4 +44,13 @@ for ($i = 0; $i -lt 30 -and -not $copied; $i++) {
 if (-not $copied) { Move-Item $backup $exe -Force }
 Remove-Item $hold -Force
 if (-not $copied) { Log "copy of $New failed; the old agent starts again"; exit 1 }
+# The Linux build beside it is the init of wslc containers (ops/build.sh makes both). Unlinked, not written over:
+# running containers hold hard links to the old one.
+$linuxNew = $New -replace '\.exe$', '-linux'
+if (Test-Path $linuxNew) {
+  $linux = Join-Path $bin 'kairo-linux'
+  if (Test-Path $linux) { Remove-Item $linux -Force }
+  Copy-Item $linuxNew $linux
+  Log "installed $linuxNew as $linux (the init of wslc containers)"
+}
 Log "installed $version as $exe; the supervisor starts it within 15 s"

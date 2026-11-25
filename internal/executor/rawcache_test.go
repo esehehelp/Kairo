@@ -111,7 +111,7 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 	file := loader.File{Name: "raw.txt", URL: srv.URL + "/raw.txt"}
 	other := loader.File{Name: "raw2.txt", URL: srv.URL + "/raw2.txt", SHA256: strings.Repeat("0", 64)}
 	const a1, a2 = "att_00000000000000000000000000000001", "att_00000000000000000000000000000002"
-	view1, err := cache.attach(rawLaunch(a1, file, other))
+	view1, _, err := cache.attach(rawLaunch(a1, file, other), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -155,7 +155,7 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 	}
 
 	// another attempt: from the cache
-	view2, err := cache.attach(rawLaunch(a2, got))
+	view2, _, err := cache.attach(rawLaunch(a2, got), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 	// refused by the daemon: a change
 	third := loader.File{Name: "raw3.txt", URL: srv.URL + "/raw3.txt"}
 	const a3 = "att_00000000000000000000000000000003"
-	view3, err := cache.attach(rawLaunch(a3, third))
+	view3, _, err := cache.attach(rawLaunch(a3, third), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,7 +226,7 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 	srv.Close()
 	fourth := loader.File{Name: "raw4.txt", URL: srv.URL + "/raw4.txt", PublishedSHA256: sha}
 	const a4 = "att_00000000000000000000000000000004"
-	view4, err := cache.attach(rawLaunch(a4, fourth))
+	view4, _, err := cache.attach(rawLaunch(a4, fourth), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +294,7 @@ func TestARawFileOfUnknownSizeIsNotKept(t *testing.T) {
 	defer cache.close()
 	cache.floor = func() int64 { return 0 }
 	file := loader.File{Name: "u.txt", URL: srv.URL + "/u.txt"}
-	view, err := cache.attach(rawLaunch("att_00000000000000000000000000000009", file))
+	view, _, err := cache.attach(rawLaunch("att_00000000000000000000000000000009", file), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -329,7 +329,7 @@ func TestAnInstalledRawFileIsFoundAgainByItsURL(t *testing.T) {
 	}
 	cache.floor = func() int64 { return 0 }
 	file := loader.File{Name: "f.txt", URL: srv.URL + "/f.txt"}
-	view, err := cache.attach(rawLaunch("att_0000000000000000000000000000000a", file))
+	view, _, err := cache.attach(rawLaunch("att_0000000000000000000000000000000a", file), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -357,5 +357,49 @@ func TestAnInstalledRawFileIsFoundAgainByItsURL(t *testing.T) {
 	got, origin, err := loader.NewAgent(view, loader.HTTPOrigin{}).Resolve(ctx, file)
 	if err != nil || origin == (loader.HTTPOrigin{}) || got.Size != int64(len(content)) {
 		t.Fatalf("found again: %+v via %v: %v", got, origin, err)
+	}
+}
+
+// A loader that cannot reach the view's socket (a container in a VM) asks
+// through files and is handed the same file.
+func TestARawFileIsAskedForThroughFiles(t *testing.T) {
+	content := bytes.Repeat([]byte("asked as a file\n"), 100)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.ServeContent(w, r, "f.txt", time.Time{}, bytes.NewReader(content))
+	}))
+	defer srv.Close()
+	root, err := os.MkdirTemp("", "kr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	fake := &fakeRaws{identities: map[string]loader.File{}, counts: map[string]int64{}}
+	var logs bytes.Buffer
+	e := storesExecutor(t, fake, &logs)
+	served := servedStore{decl: machine.Store{ID: "v", Class: machine.StoreVolatile, Root: root}, fs: localStoreFS{}, usable: true}
+	cache, err := e.storeWork().rawCacheFor(served)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cache.close()
+	cache.floor = func() int64 { return 0 }
+	file := loader.File{Name: "f.txt", URL: srv.URL + "/f.txt"}
+	view, requests, err := cache.attach(rawLaunch("att_0000000000000000000000000000000b", file), true)
+	if err != nil || requests == "" {
+		t.Fatalf("attach: %q %v", requests, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	got, origin, err := loader.NewFileAgent(view, requests, loader.HTTPOrigin{}).Resolve(ctx, file)
+	if err != nil || origin == (loader.HTTPOrigin{}) || got.Size != int64(len(content)) {
+		t.Fatalf("through files: %+v via %v: %v", got, origin, err)
+	}
+	// a file of no stream of the attempt: refused, through files too
+	other := loader.File{Name: "o.txt", URL: srv.URL + "/o.txt"}
+	if _, _, err := loader.NewFileAgent(view, requests, loader.HTTPOrigin{}).Resolve(ctx, other); !errors.Is(err, loader.ErrRefused) {
+		t.Fatalf("not the attempt's, through files: %v", err)
+	}
+	if left, _ := os.ReadDir(requests); len(left) != 0 {
+		t.Fatalf("left in the requests: %v", left)
 	}
 }
