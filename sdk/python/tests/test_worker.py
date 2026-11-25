@@ -228,10 +228,12 @@ def restore_signals():
 
 
 def test_stop_signal_makes_safe_point_return_true(restore_signals, tmp_path: Path):
+    breaking = signal.getsignal(signal.SIGBREAK) if hasattr(signal, "SIGBREAK") else None
     install_stop_signals()
     assert signal.getsignal(signal.SIGTERM) is runtime._on_stop_signal
     if hasattr(signal, "SIGBREAK"):
-        assert signal.getsignal(signal.SIGBREAK) is runtime._on_stop_signal
+        # SIGTERM is the one stop signal: Ctrl-Break is left to its handler
+        assert signal.getsignal(signal.SIGBREAK) is breaking
     session = AttemptSession(api_url=None, execution_id=None, attempt_id=None)
     assert session.safe_point(checkpoint=lambda _c: None) is False
     signal.raise_signal(signal.SIGTERM)

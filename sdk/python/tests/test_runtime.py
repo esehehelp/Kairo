@@ -304,14 +304,9 @@ def test_distributed_adapter_supports_single_process_suspend(tmp_path: Path, con
         if path == "/api/worker/processes"
     )
     assert registration["pid"] > 0
-    if os.name == "nt":
-        assert registration["process_identity"].startswith(
-            f"pid:{registration['pid']}:start:"
-        )
-    else:
-        assert registration["process_identity"].startswith(
-            f"proc:{registration['pid']}:starttime:"
-        )
+    assert registration["process_identity"].startswith(
+        f"proc:{registration['pid']}:starttime:"
+    )
     assert [ack["phase"] for ack in _Handler.acks] == [
         "accepted",
         "checkpointing",
@@ -331,3 +326,19 @@ def test_unknown_worker_command_is_skipped_without_an_ack(control_server):
     assert not session.safe_point(checkpoint=checkpoint)
     assert not called
     assert _Handler.acks == []
+
+
+def test_an_unmanaged_session_needs_no_process_identity(monkeypatch):
+    # only registering a managed attempt's process reads /proc: a script run
+    # outside Kairo (on Windows, say) keeps working
+    from kairo_sdk import runtime
+
+    def unknown() -> str:
+        raise RuntimeError("no /proc here")
+
+    monkeypatch.setattr(runtime, "_current_process_identity", unknown)
+    session = AttemptSession(api_url=None, execution_id=None, attempt_id=None)
+    assert session.safe_point(checkpoint=lambda _c: None) is False
+    reporter = runtime.ProgressReporter.from_environment("step", total=3)
+    reporter.add()
+    assert reporter.session is None

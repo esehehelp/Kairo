@@ -73,7 +73,7 @@ def _on_stop_signal(signum, _frame) -> None:
 
 
 def install_stop_signals() -> None:
-    """Turn SIGTERM (and SIGBREAK on Windows) into a process-wide stop request.
+    """Turn SIGTERM into a process-wide stop request.
 
     Kairo's force stop sends SIGTERM first and kills
     the process only after a grace period, so a worker that installs these
@@ -82,8 +82,6 @@ def install_stop_signals() -> None:
     :func:`stop_requested` tells why. Call from the main thread.
     """
     signal.signal(signal.SIGTERM, _on_stop_signal)
-    if hasattr(signal, "SIGBREAK"):
-        signal.signal(signal.SIGBREAK, _on_stop_signal)
 
 
 def stop_requested() -> bool:
@@ -189,9 +187,22 @@ class AttemptSession:
         # Waits between the tries of a ``checkpointed`` acknowledgement within
         # one safe point.
         self.publication_retry_delays: tuple[float, ...] = (1.0, 2.0)
-        self.process_identity = _current_process_identity()
+        self._process_identity: str | None = None
         self._process_registered = False
         self._registration_lock = threading.Lock()
+
+    @property
+    def process_identity(self) -> str:
+        """This process's identity (``proc:PID:starttime:T``), read from
+        ``/proc`` when first needed: only registering a managed attempt's
+        process needs it, so an unmanaged session runs anywhere."""
+        if self._process_identity is None:
+            self._process_identity = _current_process_identity()
+        return self._process_identity
+
+    @process_identity.setter
+    def process_identity(self, value: str) -> None:
+        self._process_identity = value
 
     @classmethod
     def from_environment(

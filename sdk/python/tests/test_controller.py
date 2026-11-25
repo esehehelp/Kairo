@@ -727,3 +727,30 @@ def test_user_config_dir_matches_go(tmp_path: Path, monkeypatch: pytest.MonkeyPa
         assert _user_config_dir() is None
         monkeypatch.delenv("XDG_CONFIG_HOME")
         assert _user_config_dir() == tmp_path / "home" / ".config"
+
+
+@pytest.mark.parametrize(
+    "image",
+    [
+        None,
+        "docker.io/library/python:3.12",
+        "docker.io/library/python@sha256:oops",
+        "docker.io/library/python@sha256:" + "0" * 63,
+        "docker.io/library/python@sha256:" + "A" * 64,
+    ],
+)
+def test_a_submission_without_a_pinned_image_is_refused_before_the_journal(
+    tmp_path: Path, image: str | None
+):
+    api = FakeAPI(complete_preemption_events())
+    controller = ProjectController(api, ControllerJournal(tmp_path / "controller.db"))
+    submission = template()
+    if image is None:
+        del submission["image"]
+    else:
+        submission["image"] = image
+    with pytest.raises(ValueError, match="pinned to its digest"):
+        controller.submit_with_resume_after_kairo_preemption(
+            activity_id="jalm-300m-v3", project="example-train", submission=submission
+        )
+    assert api.calls == []
