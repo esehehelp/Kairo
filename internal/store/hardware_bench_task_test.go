@@ -113,8 +113,11 @@ func TestAGPUBenchIsPreemptedAndItsContinuationCarriesOnTheRun(t *testing.T) {
 	if err = store.AddBenchPoints(ctx, first.Attempt.ID, points[2:]); err != nil {
 		t.Fatal(err)
 	}
-	// Work of a higher priority needs the GPU: the bench is suspended.
-	if _, _, err = store.SubmitExecution(ctx, sharedSpec("train", "a", 0)); err != nil {
+	// Work of a higher priority needs the GPU: the bench is suspended. It
+	// runs in an image, as all work does (exec-a runs containers).
+	work := sharedSpec("train", "a", 0)
+	work.Image = testImagePin
+	if _, _, err = store.SubmitExecution(ctx, work); err != nil {
 		t.Fatal(err)
 	}
 	if reservation, err := store.ReserveNext(ctx, "exec-a"); err != nil || reservation != nil {

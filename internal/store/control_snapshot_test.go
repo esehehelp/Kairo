@@ -108,8 +108,8 @@ func TestControlSnapshotRunsOnANodeThatRunsContainers(t *testing.T) {
 		machine.Store{ID: "a-durable", Class: machine.StoreDurable, Node: "node", Root: "D:/durable", Filesystem: "D:"},
 		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "ctr", Root: "/srv/durable", Filesystem: "/"},
 	)
-	if b, err := nodeBenchTx(ctx, store.db, "ctr"); err != nil || b.Kairo != "" {
-		t.Fatalf("a containers-only node reports a bench: %+v %v", b, err)
+	if b, err := nodeBenchTx(ctx, store.db, "ctr"); err != nil || b.Kairo != containerKairo {
+		t.Fatalf("a node that runs containers runs benches in them: %+v %v", b, err)
 	}
 	name, err := store.ControlSnapshotTask(ctx, time.Date(2026, 11, 24, 7, 0, 0, 0, time.UTC), time.Hour)
 	if err != nil || name == "" {
