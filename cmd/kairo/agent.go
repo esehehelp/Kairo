@@ -103,7 +103,7 @@ func agentCommand(args []string) error {
 		attrs, _ := json.Marshal(labels)
 		executors = append(executors, store.Executor{ID: e.ID, NodeID: cfg.Node.ID, Kind: e.Kind, Attributes: attrs, Enabled: e.Enabled == nil || *e.Enabled})
 	}
-	nodeAttrs, _ := json.Marshal(cfg.Bench.Attributes(cfg.Node.Labels))
+	nodeAttrs, _ := json.Marshal(config.NodeAttributes(cfg.Node.Labels))
 	node := store.Node{ID: cfg.Node.ID, Name: cfg.Node.Name, OS: cfg.Node.OS, Architecture: cfg.Node.Architecture, Attributes: nodeAttrs, Enabled: true}
 
 	// The attempts an earlier run of this agent launched that still run (or

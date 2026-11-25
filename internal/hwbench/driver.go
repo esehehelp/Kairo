@@ -108,6 +108,13 @@ type Driver struct {
 	// Stopping reports whether a stop signal came (SIGTERM, CTRL_BREAK: the
 	// graceful phase of a force stop); nil: none comes.
 	Stopping func() bool
+	// GPU gives the GPU workload's program when the node names none (its
+	// container builds it: BuildGPU); nil: the node's is used.
+	GPU func(ctx context.Context) (string, error)
+	// Disk is where a storage bench writes (KAIRO_BENCH_DISK: a directory
+	// of the filesystem measured, handed to its container); "": the
+	// filesystem itself.
+	Disk string
 
 	status   store.BenchStatus
 	seq      int
@@ -582,7 +589,15 @@ func (d *Driver) runKind(ctx context.Context, name string) (store.BenchReference
 			return store.BenchReference{}, err
 		}
 	}
-	args, err := argv(name, d.status, peer, d.seconds(kind, w, len(grid)))
+	programs := d.status.Programs
+	if w.gpu && programs.GPU == "" && d.GPU != nil {
+		gpu, err := d.GPU(ctx)
+		if err != nil {
+			return store.BenchReference{}, err
+		}
+		programs.GPU = gpu
+	}
+	args, err := argv(name, d.status, programs, d.Disk, peer, d.seconds(kind, w, len(grid)))
 	if err != nil {
 		return store.BenchReference{}, err
 	}

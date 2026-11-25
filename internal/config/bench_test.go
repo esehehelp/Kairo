@@ -2,41 +2,36 @@ package config
 
 import (
 	"encoding/json"
-	"os"
 	"strings"
 	"testing"
 )
 
-func TestBenchProgramsAreReportedWithTheNode(t *testing.T) {
-	path := writeConfig(t, `server_url = "https://192.0.2.12:7474"
+// A node reports its labels; a [bench] table, whose programs now come with
+// Kairo into the bench's container, is refused with that said.
+func TestBenchTableIsRefusedAndNodesReportTheirLabels(t *testing.T) {
+	agent := `server_url = "https://192.0.2.12:7474"
 token = "kairo_node_x"
 [node]
 id = "host-a-train"
 name = "host-a-train"
 labels = { interconnect_addr = "10.0.0.2" }
-[bench]
-gpu_binary = "/opt/kairo/kairo-bench-gpu"
-executor_labels = { environment = "linux" }
 [[executors]]
-id = "linux"
-kind = "`+testKind+`"
-`)
-	cfg, err := LoadAgent(path)
+id = "ctr"
+kind = "` + testKind + `"
+`
+	cfg, err := LoadAgent(writeConfig(t, agent))
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, err := json.Marshal(cfg.Bench.Attributes(cfg.Node.Labels))
-	if err != nil {
-		t.Fatal(err)
+	body, err := json.Marshal(NodeAttributes(cfg.Node.Labels))
+	if err != nil || string(body) != `{"interconnect_addr":"10.0.0.2"}` {
+		t.Fatalf("attributes %s %v", body, err)
 	}
-	self, _ := os.Executable()
-	selfJSON, _ := json.Marshal(self)
-	for _, want := range []string{`"interconnect_addr":"10.0.0.2"`, `"gpu":"/opt/kairo/kairo-bench-gpu"`, `"executor_labels":{"environment":"linux"}`, `"kairo":` + string(selfJSON)} {
-		if !strings.Contains(string(body), want) {
-			t.Fatalf("attributes %s lack %s", body, want)
-		}
+	bench := "[bench]\ngpu_binary = \"/opt/kairo/kairo-bench-gpu\"\n"
+	if _, err := LoadAgent(writeConfig(t, agent+bench)); err == nil || !strings.Contains(err.Error(), "[bench] is gone") {
+		t.Fatalf("agent [bench]: %v", err)
 	}
-	if _, err = Load(writeConfig(t, daemonBase+"[bench]\nkairo_binary = \"D:/Kairo/kairo.exe\"\n")); err != nil {
+	if _, err := Load(writeConfig(t, daemonBase+bench)); err == nil || !strings.Contains(err.Error(), "[bench] is gone") {
 		t.Fatalf("daemon [bench]: %v", err)
 	}
 }

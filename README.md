@@ -1998,9 +1998,9 @@ controller.run_forever()
 | GPU | 対象 GPU（排他リクエストで対象 `device` を指定可能）、1 CPU、2 GiB | スイープ対象: `gemm`（bf16）、`copy`、`gemv-b1`、`gemv-b8`／デフォルト計測: `pcie-h2d`、`pcie-d2h`、`pcie-h2d-latency`、`pcie-d2h-latency` |
 | `cpu` | ノードの全 CPU（`cpu_millis_min` = 全量: 同じノードで他ジョブは並行実行されない）、4 GiB | スイープ対象: `cpu-compute`、`cpu-single`、`cpu-stream` |
 | `disk:FS` | `FS` 上の 9 GiB（テスト用ファイル） | `disk-seq-read`、`disk-seq-write`（qd 32）、`disk-rand-read`（qd 32）、`disk-rand-read-qd1`、`disk-rand-write`、`disk-fsync`、`disk-sustained` |
-| `net:NODE` | 2-rank Gang: ホスト側ノード（`--node`、通常の Gang と同様に `interconnect_addr` が必要）上の rank 0 が `KAIRO_GANG_MASTER_ADDR:PORT` でサーバ起動（`kairo bench serve`）、`NODE` 上の rank 1 が計測を実行 | `net-latency`、`net-bandwidth-send`、`net-bandwidth-recv`（4 ストリーム） |
+| `net:NODE` | （作り直し中: 2 つのノードの agent どうしで測る形にします。それまでは拒否されます） | `net-latency`、`net-bandwidth-send`、`net-bandwidth-recv`（4 ストリーム） |
 
-#### 実行条件・競合・バイナリ検出
+#### 実行条件・競合・コンテナ
 
 - `--kinds` には個別の種別名、またはプレフィックスによるグループ指定（`pcie`、`gemv` 等）を渡せます。
 - GPU および CPU のベンチマークは設定をスイープするため、以下の場合は拒否されます。
@@ -2009,17 +2009,16 @@ controller.run_forever()
   - コントローラが対象デバイスのサポート機能をまだ報告していない段階
   - 対象デバイスに手動設定（manual setting）が適用されている間
 - ストレージおよびネットワークのベンチマークはデフォルト設定で計測するため、コントローラは不要です。
-- 1 デバイスにつき待機中または実行中にできるベンチマークは 1 つまでです（競合時は `409 bench_conflict`）。ネットワークベンチマークは、その 2 ノード間にまたがる別の Gang が存在する間は拒否されます。
+- 1 デバイスにつき待機中または実行中にできるベンチマークは 1 つまでです（競合時は `409 bench_conflict`）。
 - `--dry-run` を指定すると、実行を投入せずに run の内容、Lease、および argv を出力します。
 
-各ベンチマーク用プログラムの配置場所は、各ノードが登録時にエージェント（デーモン自身のノードではデーモン）の設定ファイルの `[bench]` セクションから報告します。
+ベンチマークは、ほかの仕事と同じくコンテナで実行されます。対象のデバイスを持ち、コンテナの Executor を持つノードで走り、ノードでの準備や設定（以前の `[bench]`）は要りません（`[bench]` が残っている設定は拒否されます）。
 
-- `kairo_binary`: `kairo` バイナリのパス（デフォルト: そのノードの `kairo` バイナリ自身）
-- `gpu_binary`: `kairo-bench-gpu` のパス（未設定のノードでは GPU ベンチマークは実行されない）
-- `cwd`: 作業ディレクトリ（デフォルト: `kairo` バイナリの配置ディレクトリ）
-- `executor_labels`: ベンチマークをネイティブ実行する Executor を指定するラベル
+- **イメージ**: CPU と storage のベンチマークは制御スナップショットと同じ小さなイメージ（`store.BenchImage`）、GPU のベンチマークはダイジェスト固定の CUDA 13.3 devel イメージ（`store.BenchGPUImage`。GPU ノードのドライバが対応する版）で走ります。
+- **GPU のプログラム**: `kairo-bench-gpu` のソースは `kairo` のバイナリに埋め込まれています（`bench/gpu`）。ドライバは最初の GPU の種別の前に、イメージの CUDA ツールキット（`nvcc`、`bench/gpu/Makefile` の `CUBLAS_STATIC=1` と同じフラグ）でビルドし、プロジェクト `kairo` のキャッシュ（`KAIRO_CACHE_DIR`）に、ソースのダイジェストの名前で置きます。同じノードの次のベンチマークは、ソースが変わるまでそれを使います。ビルド文字列は `src-<ダイジェスト>` です。
+- **storage のベンチマーク**: Executor が、測るファイルシステムの上にディレクトリ `.kairo-bench` を作り、コンテナの `/kairo/bench-disk`（`KAIRO_BENCH_DISK`）に書き込み可能でマウントします。テスト用のファイルはそこに書かれます（コンテナ自身のディスクではなく、測るファイルシステムに）。
 
-Execution の argv はドライバである `kairo hardware bench-run --run ID` となります。ドライバは Attempt トークン（`KAIRO_API_URL`、`KAIRO_API_CA`、`KAIRO_ATTEMPT_TOKEN`）を使ってワーカー API 経由でデーモンと通信します。このトークンがアクセスできるのは自身の Attempt が担当する run のみであり（他の run へのアクセスは `403`、ベンチマーク以外の Attempt からのアクセスは `404`）、変更できる設定も自身の Lease に紐づく `bench` 設定のみです。
+Execution の argv は、コンテナの中の Kairo のバイナリで動くドライバ `/kairo/bin/kairo hardware bench-run --run ID` となります。ドライバは Attempt トークン（`KAIRO_API_URL`、`KAIRO_API_CA`、`KAIRO_ATTEMPT_TOKEN`）を使ってワーカー API 経由でデーモンと通信します。このトークンがアクセスできるのは自身の Attempt が担当する run のみであり（他の run へのアクセスは `403`、ベンチマーク以外の Attempt からのアクセスは `404`）、変更できる設定も自身の Lease に紐づく `bench` 設定のみです。
 
 #### ドライバの実行手順
 
@@ -2039,7 +2038,7 @@ Execution の argv はドライバである `kairo hardware bench-run --run ID` 
    - **計測点が無効（invalid）になる条件**:
      - 設定が適用されなかった、または計測終了時点で維持されていなかった
      - サーマルイベント理由（`0x20`、`0x40`）を伴い、実測クロックがグラフィックスクロック上限を 2% 以上下回った（この状態ではクロック上限の意味をなさないため。一方、上限を設定しない（uncapped）計測点は発熱を含めたデバイスの実挙動を計測します）
-     - 他の何かがデバイスを使用していた（GPU 上の Kairo 以外が起動したプロセス、CPU ベンチマーク時の同一ホスト内ノード上の別 Lease、対象ファイルシステムを予約している別 Lease、対象 2 ノード間にまたがる Gang）
+     - 他の何かがデバイスを使用していた（GPU 上の Kairo 以外が起動したプロセス、CPU ベンチマーク時の同一ホスト内ノード上の別 Lease、対象ファイルシステムを予約している別 Lease）
      - 手動設定（manual setting）またはポリシー設定が有効だった
      - プリミティブが一切処理を行わなかった、または途中で終了した
    - **種別全体の判定と記録**:
@@ -2165,7 +2164,7 @@ kairo bench serve --listen HOST:PORT        # net-latency / net-bandwidth の対
 
 ### GPU ベンチマーク
 
-`bench/gpu/kairo-bench-gpu.cu`（CUDA C++、cuBLAS、NVML）は、`compute_86` PTX フォールバック付きの Ampere アーキテクチャ（`sm_86`、RTX 3080 / 3060）向けに別途ビルドします。
+`bench/gpu/kairo-bench-gpu.cu`（CUDA C++、cuBLAS、NVML）は、`compute_86` PTX フォールバック付きの Ampere アーキテクチャ（`sm_86`、RTX 3080 / 3060）向けのプログラムです。ベンチマークではコンテナの中でビルドされます（上記）。手でビルドする場合は次のとおりです。
 
 ```text
 cmd /c bench\gpu\build-windows.cmd     # CUDA 13.x + MSVC 2022 x64（vswhere 経由で vcvars64 を検出）
@@ -2238,7 +2237,7 @@ kairo db import-sqlite --from local/kairo-v3.db --config kairo.toml   # また�
 - **デーモンの方がエージェントより古い場合**: デーモンはエージェントからのログ障害レポート（エージェント側でログに記録されます）、電力サンプルを含む観測データ（その結果、そのノードのリソースが `stale` になります）、および引き継ぎ対象の Attempt を持つエージェントの登録（デーモンが入れ替わるまでリトライし続けます）を拒否します。
 - **データベーススキーマ**: 古いデータベースを開いたデーモンは不足しているスキーママイグレーションを適用します（[データベース](#データベース)を参照）。古いバイナリは新しいスキーマを拒否するため、バックアップは必ず残しておいてください。
 
-ベンチマークのドライバは、実行ノード上の `kairo` バイナリ（`[bench]` の `kairo_binary`）です。ベンチマークが Task になる前の古いドライバは Command をポーリングしないため中断（suspend）に応答せず、それをプリエンプトする処理や一時停止操作は以前と同様に完了まで待機します（強制停止による終了は引き続き可能です）が、ベンチマーク自体はそのまま正常に完了します。逆に古いデーモンは中断されない Execution としてベンチマークを投入しますが、新しいドライバでも従来どおり実行できます。
+ベンチマークのドライバは、コンテナにマウントされた Kairo のバイナリです。ベンチマークが Task になる前の古いドライバは Command をポーリングしないため中断（suspend）に応答せず、それをプリエンプトする処理や一時停止操作は以前と同様に完了まで待機します（強制停止による終了は引き続き可能です）が、ベンチマーク自体はそのまま正常に完了します。逆に古いデーモンは中断されない Execution としてベンチマークを投入しますが、新しいドライバでも従来どおり実行できます。
 
 ### 運用スクリプト
 

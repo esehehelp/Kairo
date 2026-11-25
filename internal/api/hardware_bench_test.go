@@ -11,17 +11,17 @@ import (
 	"kairo/internal/store"
 )
 
-// benchAttempt declares host "h" over node "work" (with its CPU, bench
-// programs and an executor), creates a CPU bench and launches it; it returns
+// benchAttempt declares host "h" over node "work" (with its CPU and an
+// executor that runs containers), creates a CPU bench and launches it; it returns
 // the bench attempt's token, the controller's token and the run.
 func benchAttempt(t *testing.T, d *testDaemon) (string, string, store.BenchRun) {
 	t.Helper()
 	ctx := context.Background()
 	ctl := declareHost(t, d)
-	if err := d.store.UpsertNode(ctx, store.Node{ID: "work", Name: "work", OS: "linux", Architecture: "amd64", Attributes: json.RawMessage(`{"bench":{"kairo":"/usr/local/bin/kairo"}}`), Enabled: true}); err != nil {
+	if err := d.store.UpsertNode(ctx, store.Node{ID: "work", Name: "work", OS: "linux", Architecture: "amd64", Attributes: json.RawMessage(`{}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
-	if err := d.store.UpsertExecutor(ctx, store.Executor{ID: "work-exec", NodeID: "work", Kind: "local", Attributes: json.RawMessage(`{}`), Enabled: true}); err != nil {
+	if err := d.store.UpsertExecutor(ctx, store.Executor{ID: "work-exec", NodeID: "work", Kind: "incus", Attributes: json.RawMessage(`{"runtime":"incus"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	if err := d.store.UpsertProvider(ctx, "work-host", "work", "host", nil); err != nil {
@@ -72,7 +72,7 @@ func TestBenchAttemptReachesOnlyItsOwnRun(t *testing.T) {
 	token, ctl, run := benchAttempt(t, d)
 	status, body := d.call(t, "GET", "/api/worker/bench?run="+run.ID, token, nil)
 	var bench store.BenchStatus
-	if status != http.StatusOK || json.Unmarshal(body, &bench) != nil || bench.Run.ID != run.ID || bench.Programs.Kairo != "/usr/local/bin/kairo" || bench.Capabilities == nil {
+	if status != http.StatusOK || json.Unmarshal(body, &bench) != nil || bench.Run.ID != run.ID || bench.Programs.Kairo != "/kairo/bin/kairo" || bench.Capabilities == nil {
 		t.Fatalf("status: %d %s", status, body)
 	}
 	if status, body = d.call(t, "GET", "/api/worker/bench?run=bnc_other", token, nil); status != http.StatusForbidden {

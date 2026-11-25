@@ -87,7 +87,7 @@ func TestAGPUBenchIsPreemptedAndItsContinuationCarriesOnTheRun(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupHost(t, store)
 	ctx := context.Background()
-	benchNode(t, store, "a", true)
+	benchNode(t, store, "a")
 	cpuPoll(t, store, "a", 8000)
 	plan, err := store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "GPU-S", Kinds: []string{"gemm", "copy"}})
 	if err != nil {
@@ -113,8 +113,11 @@ func TestAGPUBenchIsPreemptedAndItsContinuationCarriesOnTheRun(t *testing.T) {
 	if err = store.AddBenchPoints(ctx, first.Attempt.ID, points[2:]); err != nil {
 		t.Fatal(err)
 	}
-	// Work of a higher priority needs the GPU: the bench is suspended.
-	if _, _, err = store.SubmitExecution(ctx, sharedSpec("train", "a", 0)); err != nil {
+	// Work of a higher priority needs the GPU: the bench is suspended. It
+	// runs in an image, as all work does (exec-a runs containers).
+	work := sharedSpec("train", "a", 0)
+	work.Image = testImagePin
+	if _, _, err = store.SubmitExecution(ctx, work); err != nil {
 		t.Fatal(err)
 	}
 	if reservation, err := store.ReserveNext(ctx, "exec-a"); err != nil || reservation != nil {
@@ -214,7 +217,7 @@ func TestAForceStoppedBenchFailsWithoutItsResults(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupHost(t, store)
 	ctx := context.Background()
-	benchNode(t, store, "a", true)
+	benchNode(t, store, "a")
 	cpuPoll(t, store, "a", 8000)
 	plan, err := store.CreateBenchRun(ctx, BenchRequest{HostID: "h", DeviceID: "GPU-S", Kinds: []string{"copy", "gemm"}})
 	if err != nil {

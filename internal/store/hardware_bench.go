@@ -8,11 +8,14 @@ package store
 // it never displaces work, work never runs beside it, and work that needs
 // the device suspends it at its next point. The task's continuation carries
 // on the same run (benchTaskExecutionTx): the kinds it finished stay, the one
-// it was measuring is measured again. Its argv is the bench driver (`kairo
-// hardware bench-run`), which asks for its settings and reports its
-// measurements through the worker API with its attempt token; it can reach
-// only its own run (BenchOfAttempt) and set only its own lease's bench
-// setting, which goes with the lease. What a run measures are facts about
+// it was measuring is measured again. It runs in a container, as all work
+// does (BenchImage; BenchGPUImage for a GPU, whose CUDA toolkit builds the
+// GPU workload there), on a node of the host with a container executor. Its
+// argv is the bench driver (`kairo hardware bench-run`, Kairo's binary in
+// the container), which asks for its settings and reports its measurements
+// through the worker API with its attempt token; it can reach only its own
+// run (BenchOfAttempt) and set only its own lease's bench setting, which
+// goes with the lease. What a run measures are facts about
 // this device, compared only with its own references and earlier runs.
 
 import (
@@ -26,14 +29,23 @@ import (
 	"strings"
 
 	"kairo/internal/id"
+	"kairo/internal/imageref"
 	"kairo/internal/machine"
 	"kairo/internal/orchestration"
 )
 
-// Bench tasks run in this project and queue, at BenchPriority.
+// Bench tasks run in this project and queue, at BenchPriority, in these
+// images.
 const (
 	BenchProject = "kairo"
 	BenchQueue   = "hardware-bench"
+	// BenchImage runs the CPU and storage benches: Kairo's static binary
+	// needs nothing of it (the control snapshot's image, cached already).
+	BenchImage = ControlImage
+	// BenchGPUImage runs a GPU bench: its CUDA toolkit (13.3, which the
+	// nodes' drivers support) builds kairo-bench-gpu from the source Kairo
+	// carries, once per node and source (cached in the project's cache).
+	BenchGPUImage = "docker.io/nvidia/cuda:13.3.1-devel-ubuntu24.04@sha256:4ff859525f99de5782aa73607ce24219b07dddd48d12b97c1c301d7e1cfb0a87"
 	// BenchPriority is below anything an operator would submit: a bench waits
 	// for every other execution, is never a reason to suspend one, and is
 	// suspended for any of them that needs its device.
@@ -160,18 +172,13 @@ func selectBenchKinds(class string, names []string) ([]string, error) {
 	return out, nil
 }
 
-// NodeBench is what a node's agent (or the daemon, for its own node) reports
-// of the bench programs there, from the [bench] table of its configuration:
-// node attributes under "bench".
+// NodeBench are the bench programs a bench on a node runs, in its
+// container: Kairo's binary (the driver, and the CPU, storage and network
+// workloads), and kairo-bench-gpu when known beforehand ("": the driver
+// builds it in the GPU image).
 type NodeBench struct {
-	// Kairo is the kairo binary that runs the bench driver.
 	Kairo string `json:"kairo,omitempty"`
-	// GPU is kairo-bench-gpu; a node without it takes no GPU bench.
-	GPU string `json:"gpu,omitempty"`
-	// CWD is the bench's working directory (default: Kairo's directory).
-	CWD string `json:"cwd,omitempty"`
-	// ExecutorLabels pick the node's executor that runs benches.
-	ExecutorLabels map[string]string `json:"executor_labels,omitempty"`
+	GPU   string `json:"gpu,omitempty"`
 }
 
 // BenchRequest asks for a bench of a host's device.
@@ -503,8 +510,19 @@ func planBenchTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchPlan, 
 	if err != nil {
 		return BenchPlan{}, orchestration.Validated{}, err
 	}
+	image := BenchImage
+	if run.Class == BenchGPU {
+		image = BenchGPUImage
+	}
+	pinned, err := imageref.Parse(image)
+	if err != nil {
+		return BenchPlan{}, orchestration.Validated{}, err
+	}
+	template.Image = "bench"
 	declaration, err := orchestration.Normalize(orchestration.Manifest{SchemaVersion: orchestration.SchemaVersion, Project: orchestration.Project{Name: BenchProject},
-		Tasks: []orchestration.Task{{Name: run.ID, Queue: BenchQueue, DependsOn: []string{}, Policy: orchestration.PolicyRunToCompletion, Execution: template}}})
+		Images:    map[string]orchestration.Image{"bench": {Ref: image}},
+		ImagePins: map[string]string{"bench": pinned.Pinned()},
+		Tasks:     []orchestration.Task{{Name: run.ID, Queue: BenchQueue, DependsOn: []string{}, Policy: orchestration.PolicyRunToCompletion, Execution: template}}})
 	if err != nil {
 		return BenchPlan{}, orchestration.Validated{}, fmt.Errorf("bench task: %w", err)
 	}
@@ -608,16 +626,16 @@ func planBenchRunTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchRun
 	var configs map[string]NodeBench
 	switch class {
 	case BenchGPU:
-		nodes, configs, err = candidates(func(nodeID string, bench NodeBench) (bool, error) {
+		nodes, configs, err = candidates(func(nodeID string, _ NodeBench) (bool, error) {
 			var declared int
 			err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM machine_gpus WHERE uuid=$1 AND node_id=$2`, req.DeviceID, nodeID).Scan(&declared)
-			return declared != 0 && bench.GPU != "", err
+			return declared != 0, err
 		})
 		if err != nil {
 			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if len(nodes) == 0 {
-			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s that holds %s reports a GPU bench binary and kairo ([bench] gpu_binary and kairo_binary of its agent)", req.HostID, req.DeviceID)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s that holds %s runs containers (an enabled container executor)", req.HostID, req.DeviceID)
 		}
 		run.NodeID = nodes[0]
 		execution.Exclusive = []orchestration.ExclusiveRequest{{Kind: "gpu", Count: 1, Device: req.DeviceID}}
@@ -635,7 +653,7 @@ func planBenchRunTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchRun
 			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if len(nodes) == 0 {
-			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s reports kairo ([bench] kairo_binary of its agent) and its CPU", req.HostID)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s runs containers and reports its CPU", req.HostID)
 		}
 		run.NodeID = nodes[0]
 		// The whole node's CPU, none of it lent: nothing else runs beside it.
@@ -651,103 +669,47 @@ func planBenchRunTx(ctx context.Context, tx *sql.Tx, req BenchRequest) (BenchRun
 			return BenchRun{}, orchestration.Execution{}, err
 		}
 		if len(nodes) == 0 {
-			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s reports kairo ([bench] kairo_binary of its agent) and the filesystem %s (a filesystem provider's path)", req.HostID, filesystem)
+			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s runs containers and reports the filesystem %s (a filesystem provider's path)", req.HostID, filesystem)
 		}
 		run.NodeID, run.Target = nodes[0], filesystem
 		// The test files (disk-sustained's is 8 GiB) on the filesystem tested.
 		execution.Capacity = orchestration.CapacityRequest{CPUMillis: 1000, RAMBytes: 512 << 20, Disks: []orchestration.DiskRequest{{Filesystem: filesystem, ReserveBytes: 9 << 30}}}
 	case BenchNetwork:
-		peer := strings.TrimPrefix(req.DeviceID, BenchNetPrefix)
-		nodes, configs, err = candidates(func(nodeID string, _ NodeBench) (bool, error) { return nodeID != peer, nil })
-		if err != nil {
-			return BenchRun{}, orchestration.Execution{}, err
-		}
-		if len(nodes) == 0 {
-			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("no node of host %s other than %s reports kairo ([bench] kairo_binary of its agent)", req.HostID, peer)
-		}
-		peerBench, err := nodeBenchTx(ctx, tx, peer)
-		if errors.Is(err, ErrNotFound) {
-			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("%w: peer node %s", ErrNotFound, peer)
-		}
-		if err != nil {
-			return BenchRun{}, orchestration.Execution{}, err
-		}
-		if peerBench.Kairo == "" {
-			return BenchRun{}, orchestration.Execution{}, fmt.Errorf("peer node %s reports no kairo binary ([bench] kairo_binary of its agent)", peer)
-		}
-		run.NodeID, run.PeerNodeID, run.Target = nodes[0], &peer, peer
-		if gang, err := gangSpanningTx(ctx, tx, run.NodeID, peer, ""); err != nil || gang != "" {
-			if err == nil {
-				err = fmt.Errorf("%w: gang %s spans nodes %s and %s: the network between them is in use", ErrBenchConflict, gang, run.NodeID, peer)
-			}
-			return BenchRun{}, orchestration.Execution{}, err
-		}
-		configs[peer] = peerBench
-		execution.Capacity = orchestration.CapacityRequest{CPUMillis: 1000, RAMBytes: 512 << 20}
-		// Rank 0 (the server) on the host's node, rank 1 (the client) on the peer.
-		server, client := benchSelector(run.NodeID, configs[run.NodeID]), benchSelector(peer, peerBench)
-		execution.Gang = &orchestration.Gang{Size: 2, Ranks: []orchestration.GangRank{
-			{Rank: 0, Argv: benchArgv(configs[run.NodeID], run.ID), CWD: benchCWD(configs[run.NodeID]), Executor: &server},
-			{Rank: 1, Argv: benchArgv(peerBench, run.ID), CWD: benchCWD(peerBench), Executor: &client},
-		}}
+		return BenchRun{}, orchestration.Execution{}, errors.New("the network bench is being rebuilt to run between the nodes' agents: not available yet")
 	}
-	bench := configs[run.NodeID]
-	execution.Argv, execution.CWD, execution.Executor = benchArgv(bench, run.ID), benchCWD(bench), benchSelector(run.NodeID, bench)
+	_ = configs
+	execution.Argv, execution.CWD = []string{containerKairo, "hardware", "bench-run", "--run", run.ID}, "/"
+	execution.Executor = orchestration.ExecutorSelector{Labels: map[string]string{}, Node: run.NodeID}
 	return run, execution, nil
 }
 
-func benchArgv(bench NodeBench, runID string) []string {
-	return []string{bench.Kairo, "hardware", "bench-run", "--run", runID}
-}
-
-func benchCWD(bench NodeBench) string {
-	if bench.CWD != "" {
-		return bench.CWD
-	}
-	// The node's path, whatever the daemon's OS separates paths with.
-	switch i := strings.LastIndexAny(bench.Kairo, `/\`); {
-	case i > 0:
-		return bench.Kairo[:i]
-	case i == 0:
-		return bench.Kairo[:1]
-	}
-	return "."
-}
-
-func benchSelector(nodeID string, bench NodeBench) orchestration.ExecutorSelector {
-	labels := bench.ExecutorLabels
-	if labels == nil {
-		labels = map[string]string{}
-	}
-	return orchestration.ExecutorSelector{Labels: labels, Node: nodeID}
-}
-
-// nodeBenchTx is the bench configuration a node reports (none: zero). A
-// node whose enabled executors all run containers (a Proxmox host's pct
-// executor) reports none: the bench driver and the control snapshot run the
-// node's kairo binary on the host, which none of them would take.
+// nodeBenchTx is what a bench on the node runs (zero: the node runs no
+// benches): a node with an enabled container executor runs them in
+// containers, with Kairo's binary at containerKairo.
 func nodeBenchTx(ctx context.Context, q queryer, nodeID string) (NodeBench, error) {
-	var attributes string
-	err := q.QueryRowContext(ctx, `SELECT attributes_json FROM nodes WHERE id=$1`, nodeID).Scan(&attributes)
-	if errors.Is(err, sql.ErrNoRows) {
+	var known, containers bool
+	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM nodes WHERE id=$1), EXISTS(SELECT 1 FROM executors WHERE node_id=$1 AND enabled
+		AND COALESCE((attributes_json::jsonb)->>'`+ContainerRuntimeAttribute+`','')<>'')`, nodeID).Scan(&known, &containers); err != nil {
+		return NodeBench{}, err
+	}
+	if !known {
 		return NodeBench{}, fmt.Errorf("%w: node %s", ErrNotFound, nodeID)
 	}
-	if err != nil {
-		return NodeBench{}, err
-	}
-	var values struct {
-		Bench NodeBench `json:"bench"`
-	}
-	_ = json.Unmarshal([]byte(attributes), &values)
-	var host bool
-	if err := q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM executors WHERE node_id=$1 AND enabled
-		AND COALESCE((attributes_json::jsonb)->>'`+ContainerRuntimeAttribute+`','')='')`, nodeID).Scan(&host); err != nil {
-		return NodeBench{}, err
-	}
-	if !host {
+	if !containers {
 		return NodeBench{}, nil
 	}
-	return values.Bench, nil
+	return NodeBench{Kairo: containerKairo}, nil
+}
+
+// launchBenchDiskTx is the filesystem a storage bench's execution measures
+// ("" for any other execution).
+func launchBenchDiskTx(ctx context.Context, q queryer, executionID string) (string, error) {
+	var target sql.NullString
+	err := q.QueryRowContext(ctx, `SELECT r.target FROM bench_run_executions x JOIN bench_runs r ON r.id=x.run_id WHERE x.execution_id=$1 AND r.class=$2`, executionID, BenchStorage).Scan(&target)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return target.String, err
 }
 
 // nodeCPUMillisTx is the CPU a node's host provider last reported (0: none).
