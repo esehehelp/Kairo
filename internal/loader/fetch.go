@@ -106,6 +106,9 @@ type Fetcher struct {
 	// GiveUp, when set, ends retrying after that long of failures in a row,
 	// with the last failure (0: retried until the context ends).
 	GiveUp time.Duration
+	// reask asks Resolve again (set on a fetcher Resolve made): where to
+	// read a file may have changed (kept on the node since)
+	reask func(ctx context.Context) (File, Origin, error)
 	// Resolve, when set, is asked for each file before it is read: the file
 	// as identified and where to read it from (the node's raw cache,
 	// agent.go). A file is then never read unidentified.
@@ -126,6 +129,7 @@ func (x *Fetcher) Open(ctx context.Context, f File, chunk int) (io.ReadCloser, e
 		}
 		via := *x
 		via.Resolve, via.Origin = nil, origin
+		via.reask = func(ctx context.Context) (File, Origin, error) { return x.Resolve(ctx, f) }
 		return via.Open(ctx, resolved, chunk)
 	}
 	if !f.Identified() {
@@ -214,6 +218,14 @@ func (c *checkedReader) fill() error {
 		if c.x.GiveUp > 0 && time.Since(failingSince) > c.x.GiveUp {
 			return err
 		}
+		if c.x.reask != nil && time.Since(failingSince) > reaskAfter {
+			// no progress from here: asked again where to read it
+			if again, origin, rerr := c.x.reask(c.ctx); rerr == nil && again.SHA256 == c.f.SHA256 && again.Size == c.f.Size && equalChunks(again.Chunks, c.f.Chunks) {
+				via := *c.x
+				via.Origin = origin
+				c.x, failingSince = &via, time.Now()
+			}
+		}
 		select {
 		case <-c.ctx.Done():
 			return c.ctx.Err()
@@ -223,6 +235,22 @@ func (c *checkedReader) fill() error {
 			pause = maxPause
 		}
 	}
+}
+
+// reaskAfter is how long a file read from somewhere makes no progress
+// before the fetcher's Resolve is asked again where to read it.
+const reaskAfter = 3 * time.Minute
+
+func equalChunks(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 // readChunk reads the next chunk's bytes from the origin, opening it there
@@ -289,10 +317,12 @@ type identifyingReader struct {
 	chunks   []string
 	identity *File
 	broken   error
+	// failingSince is when reading last stopped making progress (zero:
+	// it makes progress)
+	failingSince time.Time
 }
 
 func (r *identifyingReader) Read(p []byte) (int, error) {
-	var failingSince time.Time
 	pause := r.x.Retry
 	if pause <= 0 {
 		pause = time.Second
@@ -319,14 +349,11 @@ func (r *identifyingReader) Read(p []byte) (int, error) {
 				failed = false
 				continue
 			}
-			if !failed {
-				failingSince = time.Now()
-			}
 			failed = true
 			if r.x.Problem != nil {
 				r.x.Problem(r.f, err)
 			}
-			if r.x.GiveUp > 0 && time.Since(failingSince) > r.x.GiveUp {
+			if r.givingUp() {
 				return 0, err
 			}
 			select {
@@ -341,6 +368,9 @@ func (r *identifyingReader) Read(p []byte) (int, error) {
 		}
 		n, err := r.body.Read(p)
 		r.take(p[:n])
+		if n > 0 {
+			r.failingSince = time.Time{}
+		}
 		if err == io.EOF {
 			return n, r.finish()
 		}
@@ -360,6 +390,9 @@ func (r *identifyingReader) Read(p []byte) (int, error) {
 			if n > 0 {
 				return n, nil
 			}
+			if r.givingUp() {
+				return 0, err
+			}
 			select {
 			case <-r.ctx.Done():
 				return 0, r.ctx.Err()
@@ -372,6 +405,15 @@ func (r *identifyingReader) Read(p []byte) (int, error) {
 		}
 		return n, nil
 	}
+}
+
+// givingUp: reading made no progress for the fetcher's GiveUp (a failing
+// stretch starts now when none is on).
+func (r *identifyingReader) givingUp() bool {
+	if r.failingSince.IsZero() {
+		r.failingSince = time.Now()
+	}
+	return r.x.GiveUp > 0 && time.Since(r.failingSince) > r.x.GiveUp
 }
 
 // take hashes what was read.
@@ -485,7 +527,12 @@ func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (_ io.Re
 	if client == nil {
 		client = HTTPClient
 	}
+	waited := time.AfterFunc(idle, cancel) // the answer's headers, redirects and all
 	resp, err := client.Do(req)
+	if !waited.Stop() && err == nil {
+		resp.Body.Close()
+		err = fmt.Errorf("%s: no answer within %s", f.URL, idle)
+	}
 	if err != nil {
 		return nil, err
 	}

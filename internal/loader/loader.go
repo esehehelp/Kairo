@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -110,8 +112,18 @@ func (l *Loader) Start(ctx context.Context, world int, positions []Position) err
 	l.world = world
 	l.present, l.served = make([]bool, world), make([]bool, world)
 	if l.StateDir != "" {
+		// the ranks it was started for, and those served, kept across restarts
+		if kept := l.keptWorldLocked(); kept != 0 && kept != world {
+			return fmt.Errorf("the stream was started for %d ranks, not %d (a run keeps its ranks)", kept, world)
+		}
+		if err := os.WriteFile(filepath.Join(l.StateDir, "world"), []byte(strconv.Itoa(world)), 0o644); err != nil {
+			return fmt.Errorf("the stream's state: %w", err)
+		}
 		for r := range l.served {
 			_, err := os.Stat(filepath.Join(l.StateDir, fmt.Sprintf("served-%d", r)))
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("the stream's state: %w", err)
+			}
 			l.served[r] = err == nil
 		}
 	}
@@ -389,6 +401,26 @@ func (l *Loader) detach(r int) {
 	}
 }
 
+// keptWorld is the ranks the stream was started for before (StateDir; 0:
+// not started before).
+func (l *Loader) keptWorld() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.keptWorldLocked()
+}
+
+func (l *Loader) keptWorldLocked() int {
+	if l.StateDir == "" {
+		return 0
+	}
+	body, err := os.ReadFile(filepath.Join(l.StateDir, "world"))
+	if err != nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimSpace(string(body)))
+	return n
+}
+
 // servedBefore: rank r was handed an item since the stream started.
 func (l *Loader) servedBefore(r int) bool {
 	l.mu.Lock()
@@ -458,8 +490,17 @@ func (l *Loader) took(gen *generation, r int, it item) (item, bool) {
 	if current && !it.end && it.err == nil && !l.served[r] {
 		l.served[r] = true
 		if l.StateDir != "" {
-			if f, err := os.Create(filepath.Join(l.StateDir, fmt.Sprintf("served-%d", r))); err == nil {
-				f.Close()
+			f, err := os.Create(filepath.Join(l.StateDir, fmt.Sprintf("served-%d", r)))
+			if err == nil {
+				err = f.Close()
+			}
+			if err != nil {
+				// a rank served but not known so after a restart could start
+				// again where it was: the stream fails instead
+				l.hard = fmt.Errorf("the stream's state: %w", err)
+				l.startLocked(context.Background())
+				l.mu.Unlock()
+				return item{}, false
 			}
 		}
 	}

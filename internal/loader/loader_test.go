@@ -805,7 +805,8 @@ func TestServedRanksAreKeptAcrossALoadersRestart(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}, StateDir: state}, World: 2, Session: "s"}).Serve(ctx, ln)
+		// no world given: the first hello's, then the one kept
+		go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}, StateDir: state}, Session: "s"}).Serve(ctx, ln)
 		return cancel, ln.Addr().String()
 	}
 	cancel, addr := serve()
@@ -821,6 +822,9 @@ func TestServedRanksAreKeptAcrossALoadersRestart(t *testing.T) {
 	cancel()
 	cancel, addr = serve() // started again
 	defer cancel()
+	if _, err := Dial(context.Background(), "tcp", addr, 0, 1, nil); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("one rank of a stream started for two: %v", err)
+	}
 	if _, err := Dial(context.Background(), "tcp", addr, 0, 2, nil); !errors.Is(err, ErrStreamFailed) {
 		t.Fatalf("served rank 0 without its position, the loader started again: %v", err)
 	}

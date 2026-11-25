@@ -88,7 +88,8 @@ type rawCache struct {
 // rawFlight is a file being made ready, for every attempt asking for it.
 type rawFlight struct {
 	done     chan struct{}
-	declared loader.File // the declaration it was made under
+	askers   sync.WaitGroup // those waiting on it, until each released it
+	declared loader.File    // the declaration it was made under
 	identity loader.File
 	kept     bool
 	err      error
@@ -432,20 +433,24 @@ func (c *rawCache) handOver(ctx context.Context, v *rawView, want rawWant) (int,
 		}
 	}
 	for again := 0; ; again++ {
-		identity, kept, err := c.ready(ctx, want.File)
+		identity, kept, release, err := c.ready(ctx, want.File)
 		if err != nil {
+			release()
 			return fail(err)
 		}
 		if err := sameAsDeclared(identity, want.File); err != nil {
+			release()
 			return fail(err)
 		}
 		if !kept {
+			release()
 			return http.StatusOK, loader.EnsureAnswer{File: identity, Fallback: true}
 		}
 		link := filepath.Join(v.dir, identity.SHA256)
 		rawLinks.Lock()
 		err = os.Link(filepath.Join(c.dir, identity.SHA256), link)
 		rawLinks.Unlock()
+		release() // linked (or not): the view holds it now
 		if errors.Is(err, os.ErrNotExist) && again == 0 {
 			continue // evicted since: made ready again
 		}
@@ -490,33 +495,45 @@ func equalStrings(a, b []string) bool {
 }
 
 // ready makes the file of declared's URL ready once for every asker: its
-// identity, and whether it is kept here.
-func (c *rawCache) ready(ctx context.Context, declared loader.File) (loader.File, bool, error) {
+// identity, and whether it is kept here. A kept file stays (pinned: not
+// evicted) until every asker called its release (after linking it).
+func (c *rawCache) ready(ctx context.Context, declared loader.File) (loader.File, bool, func(), error) {
 	c.mu.Lock()
 	f, ok := c.flights[declared.URL]
 	if !ok {
 		f = &rawFlight{done: make(chan struct{}), declared: declared}
 		c.flights[declared.URL] = f
+		f.askers.Add(1)
 		go func() {
 			// not an asker's context: others may wait on it
-			f.identity, f.kept, f.err = c.make(context.Background(), declared)
+			var pinned string
+			f.identity, f.kept, pinned, f.err = c.make(context.Background(), declared)
 			c.mu.Lock()
-			delete(c.flights, declared.URL)
+			delete(c.flights, declared.URL) // no one joins it from now
 			c.mu.Unlock()
 			close(f.done)
+			if pinned != "" {
+				f.askers.Wait()
+				unpinRaw(pinned)
+			}
 		}()
+	} else {
+		f.askers.Add(1)
 	}
 	c.mu.Unlock()
+	release := sync.OnceFunc(f.askers.Done)
 	select {
 	case <-f.done:
 		// a flight failed on another declaration's pins: made again under
 		// this one's
 		if errors.Is(f.err, loader.ErrChanged) && !samePins(f.declared, declared) {
+			release()
 			return c.ready(ctx, declared)
 		}
-		return f.identity, f.kept, f.err
+		return f.identity, f.kept, release, f.err
 	case <-ctx.Done():
-		return loader.File{}, false, ctx.Err()
+		release()
+		return loader.File{}, false, func() {}, ctx.Err()
 	}
 }
 
@@ -534,31 +551,39 @@ func samePins(a, b loader.File) bool {
 }
 
 // make makes a file ready: the identity the daemon has of it (or makes it),
-// the file kept here when there is room.
-func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File, bool, error) {
+// the file kept here when there is room, pinned (the path returned) from
+// when it was looked at.
+func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File, bool, string, error) {
 	canonical, found, err := c.identityOf(ctx, declared.URL)
 	if err != nil {
-		return loader.File{}, false, err
+		return loader.File{}, false, "", err
 	}
 	if found {
 		canonical.Name = declared.Name
-		holdRaw(filepath.Join(c.dir, canonical.SHA256)) // not evicted while looked at
-		if info, err := os.Stat(filepath.Join(c.dir, canonical.SHA256)); err == nil && info.Mode().IsRegular() && info.Size() == canonical.Size {
-			return c.handing(ctx, canonical)
+		path := filepath.Join(c.dir, canonical.SHA256)
+		pinRaw(path)
+		if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() && info.Size() == canonical.Size {
+			return c.handing(ctx, canonical, path)
 		}
-	} else {
+		unpinRaw(path)
+	} else if sha256Name.MatchString(declared.PublishedSHA256) {
+		path := filepath.Join(c.dir, declared.PublishedSHA256)
+		pinRaw(path)
 		identity, ok, err := c.keptAsPublished(declared)
 		if err != nil {
-			return loader.File{}, false, err
+			unpinRaw(path)
+			return loader.File{}, false, "", err
 		}
 		if ok {
 			// kept already under another URL: its bytes are what was
 			// published; its identity recorded for this URL too
 			if err := c.identified(ctx, identity); err != nil {
-				return loader.File{}, false, err
+				unpinRaw(path)
+				return loader.File{}, false, "", err
 			}
-			return c.handing(ctx, identity)
+			return c.handing(ctx, identity, path)
 		}
+		unpinRaw(path)
 	}
 	size := declared.Size
 	if found {
@@ -569,15 +594,17 @@ func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File,
 	}
 	// a size not known is not kept: room is held for what is known only
 	if size <= 0 || !c.reserve(size) {
-		return c.notKept(ctx, declared, canonical, found)
+		identity, kept, err := c.notKept(ctx, declared, canonical, found)
+		return identity, kept, "", err
 	}
 	defer c.release(size)
 	identity, partial, err := c.fetchInto(ctx, declared, canonical, found, size)
 	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, errPastReserved) {
-		return c.notKept(ctx, declared, canonical, found)
+		identity, kept, err := c.notKept(ctx, declared, canonical, found)
+		return identity, kept, "", err
 	}
 	if err != nil {
-		return loader.File{}, false, err
+		return loader.File{}, false, "", err
 	}
 	// its identity first, then the file installed, then placed: a crash
 	// between leaves the file found again by its URL, never a placement
@@ -585,14 +612,17 @@ func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File,
 	if !found {
 		if err := c.identified(ctx, identity); err != nil {
 			os.Remove(partial)
-			return loader.File{}, false, err
+			return loader.File{}, false, "", err
 		}
 	}
-	if err := installRaw(partial, filepath.Join(c.dir, identity.SHA256), identity.Size); err != nil {
-		return loader.File{}, false, err
+	path := filepath.Join(c.dir, identity.SHA256)
+	pinRaw(path)
+	if err := installRaw(partial, path, identity.Size); err != nil {
+		unpinRaw(path)
+		return loader.File{}, false, "", err
 	}
 	c.w.Logger.Info("raw file kept", "url", identity.URL, "sha256", identity.SHA256, "bytes", identity.Size, "store_id", c.storeID)
-	return c.handing(ctx, identity)
+	return c.handing(ctx, identity, path)
 }
 
 // identified records identity as what its URL was found to be.
@@ -600,41 +630,38 @@ func (c *rawCache) identified(ctx context.Context, identity loader.File) error {
 	return c.retryDaemon(ctx, func() error { return c.w.Store.RawPlaced(ctx, c.w.ID, "", "", identity) })
 }
 
-// handing is a kept file about to be handed to its waiters: not evicted
-// for a while (rawHandGrace; the links to their views then hold it), and
-// placed (used now). A placement being evicted is handed all the same: the
-// eviction finds it held and leaves it.
-func (c *rawCache) handing(ctx context.Context, identity loader.File) (loader.File, bool, error) {
-	path := filepath.Join(c.dir, identity.SHA256)
-	holdRaw(path)
+// handing is a kept file, pinned at path, about to be handed to its
+// askers: placed (used now). A placement being evicted is handed all the
+// same: the eviction finds it pinned and leaves it.
+func (c *rawCache) handing(ctx context.Context, identity loader.File, path string) (loader.File, bool, string, error) {
 	if err := c.placed(ctx, identity); err != nil && !errors.Is(err, store.ErrRawEvicting) {
-		return loader.File{}, false, err
+		unpinRaw(path)
+		return loader.File{}, false, "", err
 	}
-	holdRaw(path) // from now: the waiters link it
-	return identity, true, nil
+	return identity, true, path, nil
 }
 
-// rawFlightGiveUp is how long a fetch for the cache keeps failing before
-// its flight ends (the loader asks again; the cache looks here first).
+// rawFlightGiveUp is how long a fetch for the cache makes no progress
+// before its flight ends (the loader asks again; the cache looks here
+// first).
 const rawFlightGiveUp = 3 * time.Minute
 
-// rawHandGrace is how long a raw file about to be handed is not evicted.
-const rawHandGrace = time.Minute
+// rawPins are the raw files about to be handed (under rawLinks): not
+// evicted while pinned.
+var rawPins = map[string]int{}
 
-// rawHeld are the raw files about to be handed, and since when (under
-// rawLinks).
-var rawHeld = map[string]time.Time{}
-
-func holdRaw(path string) {
+func pinRaw(path string) {
 	rawLinks.Lock()
 	defer rawLinks.Unlock()
-	now := time.Now()
-	for p, t := range rawHeld {
-		if now.Sub(t) > rawHandGrace {
-			delete(rawHeld, p)
-		}
+	rawPins[path]++
+}
+
+func unpinRaw(path string) {
+	rawLinks.Lock()
+	defer rawLinks.Unlock()
+	if rawPins[path]--; rawPins[path] <= 0 {
+		delete(rawPins, path)
 	}
-	rawHeld[path] = now
 }
 
 // installRaw puts a checked partial at installed: linked when nothing is
@@ -996,7 +1023,7 @@ func removeRaw(root, sha string) error {
 	}
 	rawLinks.Lock()
 	defer rawLinks.Unlock()
-	if t, ok := rawHeld[filepath.Join(root, rawDirName, sha)]; ok && time.Since(t) < rawHandGrace {
+	if rawPins[filepath.Join(root, rawDirName, sha)] > 0 {
 		return fmt.Errorf("%w: raw file %s is about to be handed to an attempt", errEvictInUse, sha)
 	}
 	// held by attempts' views: removing its name frees nothing

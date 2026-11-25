@@ -200,8 +200,15 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 	// a file views hold is not evicted (its name gone would free nothing);
 	// one no view holds is
 	held := filepath.Join(root, rawDirName, sha)
+	pinRaw(held) // about to be handed
 	if err := removeRaw(root, sha); !errors.Is(err, errEvictInUse) {
-		t.Fatalf("evicting a file held (just handed, linked in views): %v", err)
+		t.Fatalf("evicting a file about to be handed: %v", err)
+	}
+	unpinRaw(held)
+	if links, _ := linkCount(held); links > 1 {
+		if err := removeRaw(root, sha); !errors.Is(err, errEvictInUse) {
+			t.Fatalf("evicting a file linked in views: %v", err)
+		}
 	}
 	unheld := strings.Repeat("e", 64)
 	if err := os.WriteFile(filepath.Join(root, rawDirName, unheld), []byte("x"), 0o644); err != nil {

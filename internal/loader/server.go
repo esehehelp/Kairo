@@ -226,6 +226,9 @@ func (s *Server) join(hello Hello) (int, error) {
 	if !s.started {
 		world := s.World
 		if world == 0 {
+			world = s.Loader.keptWorld() // started before (StateDir)
+		}
+		if world == 0 {
 			world = hello.World
 		}
 		if err := s.Loader.Start(s.ctx, world, s.Positions); err != nil {
@@ -240,11 +243,6 @@ func (s *Server) join(hello Hello) (int, error) {
 	if hello.Rank < 0 || hello.Rank >= world {
 		return 0, fmt.Errorf("no rank %d of %d", hello.Rank, world)
 	}
-	if hello.Position == nil && s.Loader.servedBefore(hello.Rank) {
-		// what was handed ahead to the process before may not have been
-		// taken: only its position says where it stands
-		return 0, fmt.Errorf("rank %d was served before: it comes back with its position and session (one stream per rank, kept open)", hello.Rank)
-	}
 	if hello.Position != nil && hello.Position.Rank != hello.Rank {
 		return 0, fmt.Errorf("rank %d comes back with rank %d's position", hello.Rank, hello.Position.Rank)
 	}
@@ -257,6 +255,12 @@ func (s *Server) join(hello Hello) (int, error) {
 		s.mu.Unlock()
 		time.Sleep(20 * time.Millisecond)
 		s.mu.Lock()
+	}
+	if hello.Position == nil && s.Loader.servedBefore(hello.Rank) {
+		// (after the old connection went: it may have been handed items
+		// meanwhile) what was handed ahead to the process before may not
+		// have been taken: only its position says where it stands
+		return 0, fmt.Errorf("rank %d was served before: it comes back with its position and session (one stream per rank, kept open)", hello.Rank)
 	}
 	if hello.Position != nil && hello.Session != s.Session {
 		return 0, fmt.Errorf("a position comes back with the session this stream gave (a stream starts where Kairo's checkpoint says, not where a taker says)")

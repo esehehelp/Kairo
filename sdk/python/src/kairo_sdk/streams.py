@@ -74,7 +74,7 @@ class Stream:
         self._world = world
         self.window = max(2, window)
         self.reconnect_seconds = reconnect_seconds
-        self.position: dict[str, int] = {"rank": rank, "record": 0, "sub": 0}
+        self._position: dict[str, int] = {"rank": rank, "record": 0, "sub": 0}
         self._session = ""
         self._sock: socket.socket | None = None
         self._reader: Any = None
@@ -86,6 +86,11 @@ class Stream:
     def rank(self) -> int:
         """The rank this stream takes (fixed when it was opened)."""
         return self._rank
+
+    @property
+    def position(self) -> dict[str, int]:
+        """Where this rank stands (a copy: the stream keeps its own)."""
+        return dict(self._position)
 
     @property
     def world(self) -> int:
@@ -122,7 +127,7 @@ class Stream:
             sock.close()
             raise StreamError(f"stream {self.name}: the loader serves {ready['world']} ranks, not {self.world}")
         self._session = str(ready.get("session", ""))
-        self.position = {"rank": self.rank, "record": int(ready["position"]["record"]), "sub": int(ready["position"]["sub"])}
+        self._position = {"rank": self.rank, "record": int(ready["position"]["record"]), "sub": int(ready["position"]["sub"])}
 
     def _target(self) -> tuple[int, Any]:
         if self.address.startswith("unix:"):
@@ -137,7 +142,7 @@ class Stream:
         pause = 0.5
         while True:
             try:
-                self._connect(self.position)
+                self._connect(self._position)
                 return
             except StreamError:
                 raise
@@ -192,14 +197,14 @@ class Stream:
             if kind == _ITEM:
                 record, sub, flags = struct.unpack_from("<QIB", payload)
                 if flags & 1:
-                    self.position = {"rank": self.rank, "record": record + 1, "sub": 0}
+                    self._position = {"rank": self.rank, "record": record + 1, "sub": 0}
                 else:
-                    self.position = {"rank": self.rank, "record": record, "sub": sub + 1}
+                    self._position = {"rank": self.rank, "record": record, "sub": sub + 1}
                 self._outstanding -= 1
                 return payload[13:]
             if kind == _SKIP:
                 (record,) = struct.unpack("<Q", payload)
-                self.position = {"rank": self.rank, "record": record + 1, "sub": 0}
+                self._position = {"rank": self.rank, "record": record + 1, "sub": 0}
                 continue
             if kind == _END:
                 raise StopIteration
