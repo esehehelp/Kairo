@@ -53,8 +53,9 @@ func TestQuiescenceWaitsForWhatTheAttemptLeftRunning(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	pid := cmd.Process.Pid // the launcher's: its process group's number
 	fake := &fakeQuiescence{candidate: store.QuiescenceCandidate{
-		Attempt: store.Attempt{ID: attemptID, State: "exited", CoordinationEpoch: 1},
+		Attempt: store.Attempt{ID: attemptID, State: "exited", CoordinationEpoch: 1, PID: &pid},
 		Lease:   store.Lease{ID: "lea", CoordinationEpoch: 1, State: "releasing"},
 	}}
 	e := NewLocal("e", fake, t.TempDir(), slog.Default())
@@ -66,7 +67,7 @@ func TestQuiescenceWaitsForWhatTheAttemptLeftRunning(t *testing.T) {
 	if fake.finalized != 0 {
 		t.Fatalf("released while child %d runs", child)
 	}
-	if err := e.killTree(ctx, processTree{attemptID: attemptID, handle: handle}); err != nil {
+	if err := e.killTree(ctx, processTree{attemptID: attemptID, group: pid, handle: handle}); err != nil {
 		t.Fatal(err)
 	}
 	deadline = time.Now().Add(15 * time.Second)
@@ -104,8 +105,9 @@ func TestQuiescenceEndsWhatTheAttemptLeftRunning(t *testing.T) {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	pid := cmd.Process.Pid // the launcher's: its process group's number
 	fake := &fakeQuiescence{candidate: store.QuiescenceCandidate{
-		Attempt: store.Attempt{ID: attemptID, State: "exited", CoordinationEpoch: 1},
+		Attempt: store.Attempt{ID: attemptID, State: "exited", CoordinationEpoch: 1, PID: &pid},
 		Lease:   store.Lease{ID: "lea", CoordinationEpoch: 1, State: "releasing"},
 	}}
 	var logs bytes.Buffer

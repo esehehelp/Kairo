@@ -42,8 +42,8 @@ func (f *fakeTerminations) done() bool {
 }
 
 // A termination whose launcher already exited still ends what the launcher
-// left behind (found through the job object, or the processes carrying the
-// attempt's KAIRO_ATTEMPT_ID), and is recorded only once nothing is left.
+// left behind (found through the job object, or the launcher's process
+// group), and is recorded only once nothing is left.
 func TestTerminationEndsWhatTheLauncherLeftBehindBeforeItIsRecorded(t *testing.T) {
 	cmd, handle, child := startTestTree(t, helperOrphan)
 	attemptID := "att-" + helperOrphan
@@ -58,7 +58,8 @@ func TestTerminationEndsWhatTheLauncherLeftBehindBeforeItIsRecorded(t *testing.T
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	fake := &fakeTerminations{term: store.QuarantineTermination{AttemptID: attemptID, ExecutionID: "exe"}}
+	pid := cmd.Process.Pid // the launcher's: its process group's number
+	fake := &fakeTerminations{term: store.QuarantineTermination{AttemptID: attemptID, ExecutionID: "exe", PID: &pid}}
 	e := NewLocal("e", fake, t.TempDir(), slog.Default())
 	e.running[attemptID] = cmd.Process.Pid
 	e.trees = map[string]*treeHandle{attemptID: handle}

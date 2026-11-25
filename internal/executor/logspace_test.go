@@ -36,7 +36,7 @@ func logSpaceStore(t *testing.T, mode string) *store.Store {
 
 func logSpaceExecutor(st Coordinator, logDir string, free func(string) (int64, error)) *Local {
 	e := NewLocal("e", st, logDir, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	e.NodeID, e.Kind = "n", "local"
+	e.NodeID = "n"
 	e.Attributes = map[string]string{"environment": "log-test"}
 	e.MinLogFreeBytes = 1 << 30
 	e.FreeSpace = free
