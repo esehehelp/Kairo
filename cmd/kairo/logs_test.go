@@ -91,7 +91,7 @@ func TestTaskLogsReportsNoLogOncePerAttempt(t *testing.T) {
 	f := logsFixture()
 	delete(f.logs, "att_1")
 	f.noLogs = map[string]string{
-		"att_1":  "launch_aborted: launch failed before activation:\nsnapshot unavailable",
+		"att_1": "launch_aborted: launch failed before activation:\nsnapshot unavailable",
 	}
 	server := f.serve(t)
 	clock := useFakeClock(t, base)
