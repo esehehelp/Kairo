@@ -953,16 +953,30 @@ func (c *rawCache) countChecked(v *rawView, identity loader.File, reading rawWan
 	}
 	defer f.Close()
 	id := newIdentifier(identity.ChunkBytes)
-	n, err := loader.CountRecords(io.TeeReader(f, id), identity.Name, reading.Format, reading.Field)
-	if err != nil {
-		return err
-	}
-	// what the decoder did not read (a framing reading to the end reads all)
-	if _, err := io.Copy(id, f); err != nil {
-		return err
-	}
-	if got := id.file(identity.Name, identity.URL); got.SHA256 != identity.SHA256 || got.Size != identity.Size || !equalStrings(got.Chunks, identity.Chunks) {
-		return fmt.Errorf("%w: the kept %s is not its identity: not counted", loader.ErrChanged, identity.URL)
+	var n int64
+	if loader.RandomAccess(reading.Format) {
+		// checked whole first, then read at random (the same inode: the
+		// view's link)
+		if _, err := io.Copy(id, f); err != nil {
+			return err
+		}
+		if got := id.file(identity.Name, identity.URL); got.SHA256 != identity.SHA256 || got.Size != identity.Size || !equalStrings(got.Chunks, identity.Chunks) {
+			return fmt.Errorf("%w: the kept %s is not its identity: not counted", loader.ErrChanged, identity.URL)
+		}
+		if n, err = loader.CountRecordsAt(f, identity.Size, identity.Name, reading.Format, reading.Field); err != nil {
+			return err
+		}
+	} else {
+		if n, err = loader.CountRecords(io.TeeReader(f, id), identity.Name, reading.Format, reading.Field); err != nil {
+			return err
+		}
+		// what the decoder did not read (a framing reading to the end reads all)
+		if _, err := io.Copy(id, f); err != nil {
+			return err
+		}
+		if got := id.file(identity.Name, identity.URL); got.SHA256 != identity.SHA256 || got.Size != identity.Size || !equalStrings(got.Chunks, identity.Chunks) {
+			return fmt.Errorf("%w: the kept %s is not its identity: not counted", loader.ErrChanged, identity.URL)
+		}
 	}
 	return c.retryDaemon(context.Background(), func() error {
 		return c.w.Store.RawRecords(context.Background(), c.w.ID, store.RecordsCount{URL: identity.URL, SHA256: identity.SHA256, Format: reading.Format, Field: reading.Field, Records: n})

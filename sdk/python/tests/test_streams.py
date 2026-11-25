@@ -155,3 +155,15 @@ def test_a_checkpoint_carries_where_each_stream_stands() -> None:
         "streams": {"mix": {"world": 1, "order": 1, "positions": [{"rank": 0, "record": 7, "sub": 1}]}},
     }
     assert "streams" not in suspend_payload(SuspendResult("ckpt"))
+
+
+def test_a_webdataset_sample_is_its_members_by_name() -> None:
+    def member(name: bytes, data: bytes) -> bytes:
+        return struct.pack("<I", len(name)) + name + struct.pack("<I", len(data)) + data
+
+    item = struct.pack("<I", 3) + member(b"__key__", b"shard/001") + member(b"jpg", b"image") + member(b"json", b"{}")
+    assert streams.sample(item) == {"__key__": b"shard/001", "jpg": b"image", "json": b"{}"}
+    with pytest.raises(streams.StreamError):
+        streams.sample(item[:-1])
+    with pytest.raises(streams.StreamError):
+        streams.sample(item + b"x")

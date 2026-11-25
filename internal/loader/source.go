@@ -123,6 +123,19 @@ func (s *sourceStream) Close() { s.closeFile() }
 
 func (s *sourceStream) openFile(ctx context.Context) error {
 	f := s.spec.Files[s.order[s.file]]
+	if RandomAccess(s.format.framing) {
+		at, err := s.fetch.openAt(ctx, f)
+		if err != nil {
+			return fmt.Errorf("source %s: %w", s.spec.Name, err)
+		}
+		reader, closeFn, err := newRecordReaderAt(at, at.Size(), f.Name, s.format)
+		if err != nil {
+			at.Close()
+			return fmt.Errorf("source %s: %w", s.spec.Name, err)
+		}
+		s.reader, s.closeFn, s.body, s.inFile = reader, closeFn, at, 0
+		return nil
+	}
 	body, err := s.fetch.Open(ctx, f, 0)
 	if err != nil {
 		return fmt.Errorf("source %s: %w", s.spec.Name, err)
