@@ -126,7 +126,8 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := streams[0].Spec.Sources[0]
-	if !got.Files[0].Identified() || got.Files[0].SHA256 != f.SHA256 || len(got.Files[0].Chunks) != 1 || got.Records[f.SHA256] != 42 {
+	recordsKey, _ := loader.RecordsKey(f.SHA256, got.Format, got.Field, got.Files[0].Name)
+	if !got.Files[0].Identified() || got.Files[0].SHA256 != f.SHA256 || len(got.Files[0].Chunks) != 1 || got.Records[recordsKey] != 42 {
 		t.Fatalf("the next launch's source %+v", got)
 	}
 

@@ -66,7 +66,6 @@ class Stream:
         *,
         name: str = "",
         window: int = 256,
-        position: dict[str, int] | None = None,
         reconnect_seconds: float = 120.0,
     ) -> None:
         self.address = address
@@ -76,11 +75,12 @@ class Stream:
         self.window = max(2, window)
         self.reconnect_seconds = reconnect_seconds
         self.position: dict[str, int] = {"rank": rank, "record": 0, "sub": 0}
+        self._session = ""
         self._sock: socket.socket | None = None
         self._reader: Any = None
         self._outstanding = 0
         self._ended = False
-        self._connect(position)
+        self._connect(None)
 
     # -- the connection -----------------------------------------------------
 
@@ -92,6 +92,7 @@ class Stream:
             hello: dict[str, Any] = {"version": PROTOCOL_VERSION, "rank": self.rank, "world": self.world}
             if at is not None:
                 hello["position"] = {"record": int(at["record"]), "sub": int(at.get("sub", 0))}
+                hello["session"] = self._session
             sock.sendall(_frame(_HELLO, json.dumps(hello).encode()))
             reader = sock.makefile("rb", buffering=1 << 20)
             kind, payload = _read_frame(reader)
@@ -107,6 +108,10 @@ class Stream:
         ready = json.loads(payload)
         self._close_socket()
         self._sock, self._reader, self._outstanding = sock, reader, 0
+        if int(ready["world"]) != self.world:
+            sock.close()
+            raise StreamError(f"stream {self.name}: the loader serves {ready['world']} ranks, not {self.world}")
+        self._session = str(ready.get("session", ""))
         self.position = {"rank": self.rank, "record": int(ready["position"]["record"]), "sub": int(ready["position"]["sub"])}
 
     def _target(self) -> tuple[int, Any]:

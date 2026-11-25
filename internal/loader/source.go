@@ -88,8 +88,15 @@ func (s *sourceStream) orderOf(e int64) []int {
 }
 
 // count is the record count of file i, when known.
+// errPastEnd: a position past a stream's end (a stream never stood there).
+var errPastEnd = errors.New("past the stream's end")
+
 func (s *sourceStream) count(i int) (int64, bool) {
-	n, ok := s.spec.Records[s.recordsKey(s.spec.Files[i])]
+	f := s.spec.Files[i]
+	if !f.Identified() || f.AsPublished() != "" {
+		return 0, false // read (and checked), never passed over by a count
+	}
+	n, ok := s.spec.Records[s.recordsKey(f)]
 	return n, ok
 }
 
@@ -157,7 +164,7 @@ func (s *sourceStream) seek(ctx context.Context, n int64) error {
 				return fmt.Errorf("source %s has no records", s.spec.Name)
 			}
 			if s.endEpoch > 0 && s.epoch+1 >= s.endEpoch {
-				return nil // at the end: next says so
+				return fmt.Errorf("%w: source %s has %d records, not %d", errPastEnd, s.spec.Name, s.read, n)
 			}
 			s.epoch, s.file, s.order, emptyEpoch = s.epoch+1, 0, s.orderOf(s.epoch+1), true
 			continue

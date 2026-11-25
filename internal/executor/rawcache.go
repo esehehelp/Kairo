@@ -132,7 +132,7 @@ func (c *rawCache) handed(v *rawView, url string, identity loader.File) {
 	v.wants[url] = want
 	body, err := json.Marshal(v.wants)
 	if err == nil {
-		err = os.WriteFile(filepath.Join(c.dir, ".attempts", v.attempt+".json"), body, 0o600)
+		err = writeFileAtomic(filepath.Join(c.dir, ".attempts", v.attempt+".json"), body)
 	}
 	if err != nil {
 		c.w.Logger.Warn("raw view not kept", "attempt_id", v.attempt, "error", err)
@@ -284,7 +284,7 @@ func (c *rawCache) attach(launch *store.Launch) (string, error) {
 	if !attemptIDName.MatchString(id) {
 		return "", fmt.Errorf("attempt id %q", id)
 	}
-	if err := os.WriteFile(filepath.Join(c.dir, ".attempts", id+".json"), body, 0o600); err != nil {
+	if err := writeFileAtomic(filepath.Join(c.dir, ".attempts", id+".json"), body); err != nil {
 		return "", err
 	}
 	if err := c.openView(id, wants); err != nil {
@@ -441,7 +441,9 @@ func (c *rawCache) handOver(ctx context.Context, v *rawView, want rawWant) (int,
 			return http.StatusOK, loader.EnsureAnswer{File: identity, Fallback: true}
 		}
 		link := filepath.Join(v.dir, identity.SHA256)
+		rawLinks.Lock()
 		err = os.Link(filepath.Join(c.dir, identity.SHA256), link)
+		rawLinks.Unlock()
 		if errors.Is(err, os.ErrNotExist) && again == 0 {
 			continue // evicted since: made ready again
 		}
@@ -539,8 +541,17 @@ func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File,
 	if found {
 		canonical.Name = declared.Name
 		if info, err := os.Stat(filepath.Join(c.dir, canonical.SHA256)); err == nil && info.Mode().IsRegular() && info.Size() == canonical.Size {
-			return canonical, true, c.placed(ctx, canonical)
+			if err := c.placed(ctx, canonical); err != nil && !errors.Is(err, store.ErrRawEvicting) {
+				return loader.File{}, false, err
+			}
+			return canonical, true, nil
 		}
+	} else if identity, ok := c.keptAsPublished(declared); ok {
+		// kept already under another URL: its bytes are what was published
+		if err := c.placed(ctx, identity); err != nil && !errors.Is(err, store.ErrRawEvicting) {
+			return loader.File{}, false, err
+		}
+		return identity, true, nil
 	}
 	size := declared.Size
 	if found {
@@ -561,16 +572,63 @@ func (c *rawCache) make(ctx context.Context, declared loader.File) (loader.File,
 	if err != nil {
 		return loader.File{}, false, err
 	}
-	if err := c.placed(ctx, identity); err != nil {
-		os.Remove(partial)
+	// installed, then placed: a crash between leaves a file the daemon does
+	// not know (made again over it), never a placement without its file;
+	// one there already (fetched for another URL, checked then) stays
+	installed := filepath.Join(c.dir, identity.SHA256)
+	err = os.Link(partial, installed)
+	os.Remove(partial)
+	fresh := err == nil
+	if err != nil && !errors.Is(err, os.ErrExist) {
 		return loader.File{}, false, err
 	}
-	if err := os.Rename(partial, filepath.Join(c.dir, identity.SHA256)); err != nil {
-		os.Remove(partial)
-		return loader.File{}, false, err
+	if err := c.placed(ctx, identity); err != nil {
+		if fresh {
+			removeUnheld(installed)
+		}
+		if !errors.Is(err, store.ErrRawEvicting) {
+			return loader.File{}, false, err
+		}
+		// being evicted as it was made: read from upstream, its identity kept
+		if err := c.retryDaemon(ctx, func() error { return c.w.Store.RawPlaced(ctx, c.w.ID, "", "", identity) }); err != nil {
+			return loader.File{}, false, err
+		}
+		return identity, false, nil
 	}
 	c.w.Logger.Info("raw file kept", "url", identity.URL, "sha256", identity.SHA256, "bytes", identity.Size, "store_id", c.storeID)
 	return identity, true, nil
+}
+
+// removeUnheld removes a raw file no view holds.
+func removeUnheld(path string) {
+	rawLinks.Lock()
+	defer rawLinks.Unlock()
+	if links, err := linkCount(path); err == nil && links == 1 {
+		os.Remove(path)
+	}
+}
+
+// keptAsPublished is the identity of a file kept here under the sha256 the
+// declaration published (fetched for another URL), checked by reading it
+// whole; ok false when there is none, or it is not that.
+func (c *rawCache) keptAsPublished(declared loader.File) (loader.File, bool) {
+	if !sha256Name.MatchString(declared.PublishedSHA256) {
+		return loader.File{}, false
+	}
+	f, err := os.Open(filepath.Join(c.dir, declared.PublishedSHA256))
+	if err != nil {
+		return loader.File{}, false
+	}
+	defer f.Close()
+	id := newIdentifier(loader.DefaultChunkBytes)
+	if _, err := io.Copy(id, f); err != nil {
+		return loader.File{}, false
+	}
+	identity := id.file(declared.Name, declared.URL)
+	if identity.SHA256 != declared.PublishedSHA256 || sameAsDeclared(identity, declared) != nil {
+		return loader.File{}, false
+	}
+	return identity, true
 }
 
 // notKept is a file not kept for want of room: identified (once) when it
@@ -733,7 +791,7 @@ func (c *rawCache) retryDaemon(ctx context.Context, call func() error) error {
 	deadline := time.Now().Add(time.Hour)
 	for {
 		err := call()
-		if err == nil || errors.Is(err, store.ErrRawChanged) || errors.Is(err, store.ErrStreamReportRefused) || time.Now().After(deadline) {
+		if err == nil || errors.Is(err, store.ErrRawChanged) || errors.Is(err, store.ErrStreamReportRefused) || errors.Is(err, store.ErrRawEvicting) || time.Now().After(deadline) {
 			return err
 		}
 		c.w.Logger.Warn("raw cache: the daemon did not answer", "error", err)
@@ -839,12 +897,41 @@ func (c *rawCache) contentLength(ctx context.Context, f loader.File) int64 {
 	return resp.ContentLength
 }
 
+// rawLinks orders handing raw files to views (a link) and evicting them:
+// a file is evicted only while no view holds it.
+var rawLinks sync.Mutex
+
+// writeFileAtomic writes path whole or not at all (a crash leaves the old).
+func writeFileAtomic(path string, body []byte) error {
+	tmp := path + ".new"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(body)
+	if err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil {
+		err = os.Rename(tmp, path)
+	}
+	if err != nil {
+		os.Remove(tmp)
+	}
+	return err
+}
+
 // removeRaw evicts the raw file sha of the store at root (what attempts
 // were handed of it stays in their views until they end).
 func removeRaw(root, sha string) error {
 	if !sha256Name.MatchString(sha) {
 		return fmt.Errorf("%w: raw file %q", errOutsideRoot, sha)
 	}
+	rawLinks.Lock()
+	defer rawLinks.Unlock()
 	// held by attempts' views: removing its name frees nothing
 	if links, err := linkCount(filepath.Join(root, rawDirName, sha)); err == nil && links > 1 {
 		return fmt.Errorf("%w: raw file %s is held by %d attempts", errEvictInUse, sha, links-1)

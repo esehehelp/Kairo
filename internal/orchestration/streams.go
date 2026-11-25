@@ -176,6 +176,15 @@ func normalizeStreams(m *Manifest) error {
 			return fmt.Errorf("a listing of %q, which is no [raws.%s]", name, name)
 		}
 	}
+	byURL := map[string]RawFile{}
+	for name, fs := range files {
+		for _, f := range fs {
+			if other, ok := byURL[f.URL]; ok && (other.SHA256 != f.SHA256 || other.Size != f.Size || other.SizeKnown != f.SizeKnown) {
+				return fmt.Errorf("raw %q: %s is published otherwise in another raw (one URL is one file)", name, f.URL)
+			}
+			byURL[f.URL] = f
+		}
+	}
 	for name, s := range m.Streams {
 		if !streamName.MatchString(name) {
 			return fmt.Errorf("stream name %q: a letter, then letters, digits, '_' or '-' (64 at most)", name)

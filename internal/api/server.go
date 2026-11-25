@@ -93,6 +93,7 @@ var errorCodes = []struct {
 	{"gang_aborted", http.StatusConflict, store.ErrGangAborted},
 	{"executor_live", http.StatusConflict, store.ErrExecutorLive},
 	{"raw_changed", http.StatusConflict, store.ErrRawChanged},
+	{"raw_evicting", http.StatusConflict, store.ErrRawEvicting},
 	{"stream_refused", http.StatusForbidden, store.ErrStreamReportRefused},
 	{"stream_positions", http.StatusConflict, store.ErrStreamPositions},
 	{"gate_closed", http.StatusLocked, store.ErrGateClosed},

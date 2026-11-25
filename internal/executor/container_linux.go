@@ -6,7 +6,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"debug/elf"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -535,7 +537,11 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		if err := os.WriteFile(specPath, body, 0o600); err != nil {
 			return procs, env, err
 		}
-		args := []string{self, "loader", "serve", "--spec", specPath, "--listen", "unix:" + sock}
+		// one session for the attempt: takers come back to a restarted
+		// loader with it, never with a position of another attempt's
+		var session [16]byte
+		_, _ = rand.Read(session[:])
+		args := []string{self, "loader", "serve", "--spec", specPath, "--listen", "unix:" + sock, "--session", hex.EncodeToString(session[:])}
 		if len(s.Positions) > 0 {
 			positions, _ := json.Marshal(s.Positions)
 			p := path.Join(dir, "positions.json")

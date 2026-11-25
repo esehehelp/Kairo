@@ -192,17 +192,49 @@ func TestTheRawCacheHandsAttemptsOnlyCheckedFilesOfTheirOwn(t *testing.T) {
 		t.Fatalf("not kept %+v via %v: %v", got3, origin, err)
 	}
 
-	// evicted: what attempts were handed stays readable in their views
-	if err := removeRaw(root, sha); err != nil {
+	// a file views hold is not evicted (its name gone would free nothing);
+	// one no view holds is
+	held := filepath.Join(root, rawDirName, sha)
+	if links, _ := linkCount(held); links > 1 {
+		if err := removeRaw(root, sha); !errors.Is(err, errEvictInUse) {
+			t.Fatalf("evicting a held file: %v", err)
+		}
+	}
+	unheld := strings.Repeat("e", 64)
+	if err := os.WriteFile(filepath.Join(root, rawDirName, unheld), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := removeRaw(root, unheld); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, rawDirName, unheld)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("an unheld file not evicted: %v", err)
+	}
+
+	// upstream gone: another URL published as the same bytes is handed the
+	// file kept here
+	srv.Close()
+	fourth := loader.File{Name: "raw4.txt", URL: srv.URL + "/raw4.txt", PublishedSHA256: sha}
+	const a4 = "att_00000000000000000000000000000004"
+	view4, err := cache.attach(rawLaunch(a4, fourth))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx4, cancel4 := context.WithTimeout(ctx, 10*time.Second) // upstream gone: never there
+	defer cancel4()
+	if got4, origin, err := loader.NewAgent(view4, loader.HTTPOrigin{}).Resolve(ctx4, fourth); err != nil || got4.SHA256 != sha || origin == (loader.HTTPOrigin{}) {
+		t.Fatalf("kept under another URL, upstream gone: %+v via %v: %v", got4, origin, err)
+	}
+
+	// its name gone anyway (an eviction that came first): what attempts
+	// were handed stays readable in their views, and is handed again from
+	// there, upstream gone
+	if err := os.Remove(held); err != nil {
 		t.Fatal(err)
 	}
 	if kept, err := os.ReadFile(filepath.Join(view1, sha)); err != nil || !bytes.Equal(kept, content) {
 		t.Fatalf("handed over, then evicted: %v", err)
 	}
-
-	// upstream gone: an attempt that holds a file is handed it again from
-	// its view
-	srv.Close()
 	if again, origin, err := agent.Resolve(ctx, file); err != nil || again.SHA256 != sha || origin == (loader.HTTPOrigin{}) {
 		t.Fatalf("held, upstream gone: %+v via %v: %v", again, origin, err)
 	}

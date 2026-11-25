@@ -37,6 +37,13 @@ func (s Spec) check() error {
 	if s.Epochs < 0 {
 		return fmt.Errorf("epochs %d: 0 (no end) or more", s.Epochs)
 	}
+	for _, src := range s.Sources {
+		for _, f := range src.Files {
+			if why := f.AsPublished(); f.Identified() && why != "" {
+				return fmt.Errorf("%w: %s", ErrChanged, why)
+			}
+		}
+	}
 	for i, st := range s.Stages {
 		if len(st.Argv) == 0 {
 			return fmt.Errorf("stage %d has no argv", i)

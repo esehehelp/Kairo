@@ -278,6 +278,7 @@ type identifyingReader struct {
 	inChunk  int64
 	chunks   []string
 	identity *File
+	broken   error
 }
 
 func (r *identifyingReader) Read(p []byte) (int, error) {
@@ -293,6 +294,9 @@ func (r *identifyingReader) Read(p []byte) (int, error) {
 	for {
 		if r.identity != nil {
 			return 0, io.EOF
+		}
+		if r.broken != nil {
+			return 0, r.broken
 		}
 		if r.body == nil {
 			body, err := r.x.Origin.ReadFrom(r.ctx, r.f, r.offset)
@@ -328,6 +332,12 @@ func (r *identifyingReader) Read(p []byte) (int, error) {
 			r.body = nil
 			if r.x.Problem != nil {
 				r.x.Problem(r.f, err)
+			}
+			if r.offset > 0 {
+				// another response from here may be of another version of
+				// the file: what is identified is read in one piece
+				r.broken = fmt.Errorf("%s broke off at byte %d the first time it was read (it is read again from its start): %w", r.f.URL, r.offset, err)
+				return n, nil
 			}
 			failed = true
 			if n > 0 {
@@ -426,12 +436,26 @@ func (d DirOrigin) ReadFrom(_ context.Context, f File, offset int64) (io.ReadClo
 
 func (d DirOrigin) String() string { return d.Root }
 
-// HTTPOrigin reads files from their URL with a range request.
-type HTTPOrigin struct{ Client *http.Client }
+// HTTPOrigin reads files from their URL with a range request; a body that
+// sends nothing for Idle (default 2 minutes) while read is given up.
+type HTTPOrigin struct {
+	Client *http.Client
+	Idle   time.Duration
+}
 
-func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (io.ReadCloser, error) {
+func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (_ io.ReadCloser, err error) {
 	if !strings.HasPrefix(f.URL, "https://") && !strings.HasPrefix(f.URL, "http://") {
 		return nil, fmt.Errorf("file %s has no http(s) URL", f.Name)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+	idle := h.Idle
+	if idle <= 0 {
+		idle = 2 * time.Minute
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, f.URL, nil)
 	if err != nil {
@@ -459,7 +483,7 @@ func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (io.Read
 			resp.Body.Close()
 			return nil, fmt.Errorf("%w: %s has %d bytes, identified as %d", errLength, f.URL, total, f.Size)
 		}
-		return resp.Body, nil
+		return newIdleBody(resp.Body, idle, cancel), nil
 	case resp.StatusCode == http.StatusOK:
 		if f.Identified() && resp.ContentLength >= 0 && resp.ContentLength != f.Size {
 			resp.Body.Close()
@@ -469,13 +493,43 @@ func (h HTTPOrigin) ReadFrom(ctx context.Context, f File, offset int64) (io.Read
 			resp.Body.Close()
 			return nil, err
 		}
-		return resp.Body, nil
+		return newIdleBody(resp.Body, idle, cancel), nil
 	}
 	resp.Body.Close()
 	return nil, fmt.Errorf("%s: %s", f.URL, resp.Status)
 }
 
 func (h HTTPOrigin) String() string { return "upstream" }
+
+// idleBody is a response body given up (its request canceled) when a read
+// of it waits idle for a byte.
+type idleBody struct {
+	body   io.ReadCloser
+	idle   time.Duration
+	cancel context.CancelFunc
+	timer  *time.Timer
+}
+
+func newIdleBody(body io.ReadCloser, idle time.Duration, cancel context.CancelFunc) *idleBody {
+	b := &idleBody{body: body, idle: idle, cancel: cancel, timer: time.AfterFunc(idle, cancel)}
+	b.timer.Stop()
+	return b
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	b.timer.Reset(b.idle)
+	n, err := b.body.Read(p)
+	if !b.timer.Stop() && err != nil {
+		err = fmt.Errorf("nothing came for %s: %w", b.idle, err)
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error {
+	b.timer.Stop()
+	b.cancel()
+	return b.body.Close()
+}
 
 // Identify reads r to its end and makes the identity of a file of that
 // content: its size, sha256 and chunk hashes.

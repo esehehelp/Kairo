@@ -242,13 +242,16 @@ var ErrStreamReportRefused = errors.New("stream report refused")
 // it was read.
 var ErrRawChanged = errors.New("raw data changed")
 
-// leasedStreamFileTx is the declaration of url among the streams of the
+// ErrRawEvicting: a raw file is being evicted from the store it would be
+// placed on.
+var ErrRawEvicting = errors.New("raw file being evicted")
+
+// leasedStreamFileTx is every declaration of url among the streams of the
 // executions leased on executorID (live: reserved to releasing), and how
-// their sources read it (format, field); found is false when none reads it.
-func leasedStreamFileTx(ctx context.Context, q queryer, executorID, url string) (orchestration.RawFile, []RecordsCount, bool, error) {
-	var want orchestration.RawFile
+// their sources read it (format, field); none when none reads it.
+func leasedStreamFileTx(ctx context.Context, q queryer, executorID, url string) ([]orchestration.RawFile, []RecordsCount, error) {
+	var wants []orchestration.RawFile
 	var readings []RecordsCount
-	found := false
 	err := eachRow(ctx, q, `SELECT e.streams_json FROM leases l JOIN execution_requests e ON e.id=l.execution_id
 		WHERE l.executor_id=$1 AND l.state IN('reserved','prepared','active','releasing') AND e.streams_json IS NOT NULL`, []any{executorID}, func(rows *sql.Rows) error {
 		var body string
@@ -263,7 +266,7 @@ func leasedStreamFileTx(ctx context.Context, q queryer, executorID, url string) 
 			for _, src := range d.Stream.Sources {
 				for _, f := range d.Files[src.Raw] {
 					if f.URL == url {
-						want, found = f, true
+						wants = append(wants, f)
 						readings = append(readings, RecordsCount{URL: url, Format: src.Format, Field: src.Field})
 					}
 				}
@@ -271,17 +274,17 @@ func leasedStreamFileTx(ctx context.Context, q queryer, executorID, url string) 
 		}
 		return nil
 	})
-	return want, readings, found, err
+	return wants, readings, err
 }
 
 // RawIdentity is what url was found to be the first time it was read, for
 // the agent of executorID (whose leased executions' streams read it).
 func (s *Store) RawIdentity(ctx context.Context, executorID, url string) (loader.File, bool, error) {
-	_, _, found, err := leasedStreamFileTx(ctx, s.db, executorID, url)
+	wants, _, err := leasedStreamFileTx(ctx, s.db, executorID, url)
 	if err != nil {
 		return loader.File{}, false, err
 	}
-	if !found {
+	if len(wants) == 0 {
 		return loader.File{}, false, fmt.Errorf("%w: %s is no file of a stream an execution leased on %s reads", ErrStreamReportRefused, url, executorID)
 	}
 	f := loader.File{URL: url}
@@ -319,10 +322,11 @@ func (s *Store) RawRecords(ctx context.Context, executorID string, r RecordsCoun
 		return err
 	}
 	defer tx.Rollback()
-	want, readings, found, err := leasedStreamFileTx(ctx, tx, executorID, r.URL)
+	wants, readings, err := leasedStreamFileTx(ctx, tx, executorID, r.URL)
 	if err != nil {
 		return err
 	}
+	found := len(wants) > 0
 	read := false
 	for _, x := range readings {
 		read = read || x.Format == r.Format && x.Field == r.Field
@@ -338,7 +342,7 @@ func (s *Store) RawRecords(ctx context.Context, executorID string, r RecordsCoun
 	if err != nil {
 		return err
 	}
-	key, err := loader.CountKey(r.Format, r.Field, want.Name)
+	key, err := loader.CountKey(r.Format, r.Field, wants[0].Name)
 	if err != nil {
 		return err
 	}
@@ -381,18 +385,29 @@ func (s *Store) RawPlaced(ctx context.Context, executorID, storeID, root string,
 	if !served {
 		return fmt.Errorf("%w: executor %s serves no volatile store %s at %s", ErrStreamReportRefused, executorID, storeID, root)
 	}
-	want, _, found, err := leasedStreamFileTx(ctx, tx, executorID, f.URL)
+	wants, _, err := leasedStreamFileTx(ctx, tx, executorID, f.URL)
 	if err != nil {
 		return err
 	}
-	if !found {
+	if len(wants) == 0 {
 		return fmt.Errorf("%w: %s is no file of a stream an execution leased on %s reads", ErrStreamReportRefused, f.URL, executorID)
 	}
-	if err := keepIdentityTx(ctx, tx, want, f, ""); err != nil {
+	if err := keepIdentityTx(ctx, tx, wants, f, ""); err != nil {
 		return err
 	}
 	if storeID == "" {
 		return tx.Commit()
+	}
+	// a file being evicted is not placed again: the agent's eviction may
+	// remove it any moment (one already there is handed as it is: a link to
+	// it keeps it)
+	var state string
+	err = tx.QueryRowContext(ctx, `SELECT state FROM raw_placements WHERE store_id=$1 AND sha256=$2 FOR UPDATE`, storeID, f.SHA256).Scan(&state)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if state == "evicting" {
+		return fmt.Errorf("%w: %s on %s", ErrRawEvicting, f.SHA256, storeID)
 	}
 	t := now()
 	if _, err := tx.ExecContext(ctx, `INSERT INTO raw_placements(store_id,root,sha256,executor_id,bytes,state,created_at,last_used_at) VALUES($1,$2,$3,$4,$5,'ready',$6,$7)
@@ -404,9 +419,10 @@ func (s *Store) RawPlaced(ctx context.Context, executorID, storeID, root string,
 }
 
 // keepIdentityTx records f as what its URL was found to be (declared as
-// want), unless another identity of it stands (ErrRawChanged), or f is not
-// what was published of it.
-func keepIdentityTx(ctx context.Context, tx *sql.Tx, want orchestration.RawFile, f loader.File, attemptID string) error {
+// wants), unless another identity of it stands (ErrRawChanged), or f is
+// not what any declaration published of it: each declaration is checked
+// against it by its own readers.
+func keepIdentityTx(ctx context.Context, tx *sql.Tx, wants []orchestration.RawFile, f loader.File, attemptID string) error {
 	if f.Size < 0 || f.ChunkBytes < 1 || !sha256Hex.MatchString(f.SHA256) || int64(len(f.Chunks)) != (f.Size+f.ChunkBytes-1)/f.ChunkBytes {
 		return fmt.Errorf("identity of %s: a size, a sha256 and a hash per chunk", f.URL)
 	}
@@ -415,8 +431,12 @@ func keepIdentityTx(ctx context.Context, tx *sql.Tx, want orchestration.RawFile,
 			return fmt.Errorf("identity of %s: a chunk hash is not a sha256", f.URL)
 		}
 	}
-	if want.SHA256 != "" && want.SHA256 != f.SHA256 || want.Size > 0 && want.Size != f.Size {
-		return fmt.Errorf("%w: %s read as %s (%d bytes), published as %s (%d bytes)", ErrRawChanged, f.URL, f.SHA256, f.Size, want.SHA256, want.Size)
+	accepted := len(wants) == 0
+	for _, want := range wants {
+		accepted = accepted || (want.SHA256 == "" || want.SHA256 == f.SHA256) && (!want.SizeKnown || want.Size == f.Size)
+	}
+	if !accepted {
+		return fmt.Errorf("%w: %s read as %s (%d bytes), published otherwise (as %s, %d bytes)", ErrRawChanged, f.URL, f.SHA256, f.Size, wants[0].SHA256, wants[0].Size)
 	}
 	chunks, _ := json.Marshal(f.Chunks)
 	var size, chunkBytes int64

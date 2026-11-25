@@ -481,7 +481,7 @@ func TestATakerComesBackWhereItStands(t *testing.T) {
 		t.Fatal(err)
 	}
 	go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}, World: 1}).Serve(ctx, ln)
-	take := func(at *Position, n int) ([]string, Position) {
+	take := func(at *Resume, n int) ([]string, Resume) {
 		c, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, at)
 		if err != nil {
 			t.Fatal(err)
@@ -496,17 +496,21 @@ func TestATakerComesBackWhereItStands(t *testing.T) {
 			}
 			got = append(got, fmt.Sprintf("%d.%d:%s", c.Position.Record, c.Position.Sub, item))
 		}
-		return got, c.Position
+		return got, *c.Resume()
 	}
 	first, at := take(nil, 10)
 	second, at2 := take(&at, 10)
 	if !reflect.DeepEqual(append(first, second...), full[:20]) {
 		t.Fatalf("taken in two %v %v\nwant %v", first, second, full[:20])
 	}
-	back := Position{Record: 5}
+	back := Resume{Session: at.Session, Position: Position{Record: 5}}
 	third, _ := take(&back, 5)
-	if !reflect.DeepEqual(third, full[5:10]) || at2.Record != 20 {
+	if !reflect.DeepEqual(third, full[5:10]) || at2.Position.Record != 20 {
 		t.Fatalf("back at 5: %v want %v", third, full[5:10])
+	}
+	// a first hello does not say where it starts
+	if _, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, &Resume{Position: Position{Record: 5}}); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("a position without the session: %v", err)
 	}
 }
 
@@ -629,7 +633,7 @@ func TestAStreamEndsAtItsLastEpochAndSaysSoAgain(t *testing.T) {
 		}
 		n++
 	}
-	at := c.Position
+	at := c.Resume()
 	c.Close()
 	if n != 38 {
 		t.Fatalf("%d records of one epoch, want 38", n)
@@ -641,7 +645,7 @@ func TestAStreamEndsAtItsLastEpochAndSaysSoAgain(t *testing.T) {
 		}
 	}
 	origin.mu.Unlock()
-	again, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, &at)
+	again, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 1, at)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -703,18 +707,30 @@ func TestPositionsBehindTheStartOrPastTheEndAreRefused(t *testing.T) {
 	cancel()
 	cancel, addr = serve([]Position{{Record: 10}})
 	defer cancel()
-	if _, err := Dial(context.Background(), "tcp", addr, 0, 1, &Position{Record: 5}); !errors.Is(err, ErrStreamFailed) {
-		t.Fatalf("behind the start: %v", err)
-	}
 	c, err = Dial(context.Background(), "tcp", addr, 0, 1, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
 	if c.Position.Record != 10 {
 		t.Fatalf("started at %+v", c.Position)
 	}
 	if _, err := c.Next(); err != nil {
 		t.Fatal(err)
+	}
+	session := c.Session
+	c.Close()
+	if _, err := Dial(context.Background(), "tcp", addr, 0, 1, &Resume{Session: session, Position: Position{Record: 5}}); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("behind the start: %v", err)
+	}
+	// past the end, a primary source of known counts: refused at its seek
+	cancel2, addr2 := serve([]Position{{Record: 39}})
+	defer cancel2()
+	c, err = Dial(context.Background(), "tcp", addr2, 0, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	if _, err := c.Next(); !errors.Is(err, ErrStreamFailed) {
+		t.Fatalf("past the end at 39 of 38: %v", err)
 	}
 }
