@@ -403,7 +403,7 @@ ca_file = "/etc/kairo/ca.pem"
 
 残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`、`[bench]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
 
-- **Executor の実行形態**: すべての Executor は Attempt をイメージのコンテナで実行します。種別（kind）は `incus`・`pct`（Linux）と `wslc`（Windows）だけです（[コンテナ実行](#コンテナ実行)を参照）。ホストで直接実行する種別（以前の `linux`・`windows` など）や WSL の種別（`wsl2`）を宣言する設定は拒否されます。
+- **Executor の実行形態**: すべての Executor は Attempt をイメージのコンテナで実行します。種別（kind）は `incus`（Linux）と `wslc`（Windows）だけです（[コンテナ実行](#コンテナ実行)を参照）。ホストで直接実行する種別（以前の `linux`・`windows` など）、Proxmox のコンテナの種別（以前の `pct`）、WSL の種別（`wsl2`）を宣言する設定は拒否されます。
 - **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。
 - **相対パスの基準**: `log_directory`（および `source_directory`）に相対パスを指定した場合、デーモンまたはエージェントの起動時の作業ディレクトリを基準に 1 度だけ解決され、Attempt には絶対パスが渡されます。
 - **接続要件**: エージェントは `insecure_http = true` を指定しない限り `http://` の URL を拒否します。ホストのデバイスコントローラ（`kairo controller`。[ハードウェア設定](#ハードウェア設定)を参照）も同じ方法で接続します。
@@ -668,7 +668,7 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 
 実装はランタイムごとに次のとおりです。
 
-- **Incus・pct（Linux）**: コンテナの init（`__kairo-container-init`）が、コンテナのマウント名前空間の中で閉じ込めます。上記の 3 ディレクトリ、`/dev/shm`、および `/proc` をそれぞれ自身にバインドマウントし、さらに `scratch` 配下の `tmp` ディレクトリを `/tmp` の上にバインドマウントします。そのうえで `/` から再帰的にすべてのマウントを読み取り専用にし（`mount_setattr`）、上記のマウント先だけを再び書き込み可能に戻してから `argv` を起動します。デバイスはそのまま利用可能です。閉じ込められない場合は、理由を stderr に出力して終了コード `126` で終了します。
+- **Incus（Linux）**: コンテナの init（`__kairo-container-init`）が、コンテナのマウント名前空間の中で閉じ込めます。上記の 3 ディレクトリ、`/dev/shm`、および `/proc` をそれぞれ自身にバインドマウントし、さらに `scratch` 配下の `tmp` ディレクトリを `/tmp` の上にバインドマウントします。そのうえで `/` から再帰的にすべてのマウントを読み取り専用にし（`mount_setattr`）、上記のマウント先だけを再び書き込み可能に戻してから `argv` を起動します。デバイスはそのまま利用可能です。閉じ込められない場合は、理由を stderr に出力して終了コード `126` で終了します。
 - **wslc（Windows）**: コンテナの中でマウントを作れない（`CAP_SYS_ADMIN` がない）ため、マウントによる閉じ込めの代わりに、`argv` を一般ユーザー（`1000:1000`）で実行します（[WSL コンテナ Executor](#wsl-コンテナ-executorkind--wslc) を参照）。
 
 #### 配置・バックフィル・プリエンプション
@@ -751,7 +751,7 @@ Executor は 15 秒ごとに、自身が起動した各 Attempt のリソース�
 
 サンプリングはティックと並行して 1 回ずつ実行され、1 回の上限は 15 秒に制限されているため、ティック処理をブロックすることはありません。RAM は Attempt のプロセス群が保持しているメモリ量、書き込みバイト数はプロセス群が書き込んだ量を表し、以前のサンプル値を下回ることはありません。
 
-数値はコンテナのランタイムの統計から取ります（Incus は `incus query` のメモリ使用量で、書き込みバイト数は不明として扱います。pct は `pvesh` の `mem`・`diskwrite`、wslc は `wslc stats`）。コンテナのランナーではなく、コンテナそのものが使った量です。
+数値はコンテナのランタイムの統計から取ります（Incus は `incus query` のメモリ使用量で、書き込みバイト数は不明として扱います。wslc は `wslc stats`）。コンテナのランナーではなく、コンテナそのものが使った量です。
 
 統計が読めない場合、その数値は不明扱いとなり、アドミッション制御は予約量全体を計上します。エージェント再起動後に引き継がれた（adopted）Attempt はエージェント自身が起動したものと同様にサンプリングされますが、見失われた（lost）Attempt はサンプリングされません。
 
@@ -957,7 +957,7 @@ argv = ["python", "-m", "neo_ime.cli", "train", "--config", "configs/x.toml"]
 
 #### Incus Executor の要件と設定
 
-**すべての Task はコンテナで動きます。** image を指定しない Task を含む宣言は `kairo project apply` で拒否され、image を持たない Execution の直接投入（`POST /api/executions`、`kairo execution submit`。`image` にはダイジェスト固定の参照 `registry/repository@sha256:...` を書きます）も拒否されます。どの Executor もコンテナを動かすため、そうした仕事は実行先がなく、待ち続けるだけだからです。イメージを指定した Execution を受け付けるのはコンテナ実行用 Executor のみであり、コンテナ実行用 Executor はそれ以外の Execution を受け付けません。`kind = "incus"`・`kind = "pct"`・`kind = "wslc"` の Executor は属性 `runtime`（値は kind と同じ）を登録し（`labels` に `runtime` を手動指定すると拒否され、`kind` のみが設定できます）、イメージを持つ Execution のセレクタにはイメージ指定に基づいて `"container": true` が自動設定されます（呼び出し元から直接設定することはできません）。
+**すべての Task はコンテナで動きます。** image を指定しない Task を含む宣言は `kairo project apply` で拒否され、image を持たない Execution の直接投入（`POST /api/executions`、`kairo execution submit`。`image` にはダイジェスト固定の参照 `registry/repository@sha256:...` を書きます）も拒否されます。どの Executor もコンテナを動かすため、そうした仕事は実行先がなく、待ち続けるだけだからです。イメージを指定した Execution を受け付けるのはコンテナ実行用 Executor のみであり、コンテナ実行用 Executor はそれ以外の Execution を受け付けません。`kind = "incus"`・`kind = "wslc"` の Executor は属性 `runtime`（値は kind と同じ）を登録し（`labels` に `runtime` を手動指定すると拒否され、`kind` のみが設定できます）、イメージを持つ Execution のセレクタにはイメージ指定に基づいて `"container": true` が自動設定されます（呼び出し元から直接設定することはできません）。
 
 `kind = "incus"` の Executor は Linux 上で動作し、ノード上の他の Executor と並存できます。
 
@@ -972,7 +972,7 @@ labels = { environment = "linux", site = "host-a" }
 
 - **Incus 6.3 以降**: OCI イメージ対応が必要です（Debian 13 の 6.0 LTS には対応がなく、Zabbly パッケージを利用する必要があります）。また、デフォルトプロファイルにストレージプールとネットワークが設定されている必要があります。
 - **GPU 利用時**: ノード上に `nvidia-container-cli`（`libnvidia-container-tools`）とドライバのユーザー空間ファイルが必要です。
-- **コンテナの権限**: ホスト上では、コンテナは非特権です。コンテナの root は、root の `/etc/subuid` の範囲の先頭の ID（既定は 100000）で、Proxmox のコンテナ（pct）と同じです。コンテナが書き込む領域は、起動の前に、その ID の所有にします（pct のランナーと同じです）。そのため、pct と Incus のどちらが書いたものも、もう一方が書き直せます。読み取り専用で渡すもの（データ、Kairo のバイナリ、GPU のドライバ）は、所有者を変えずに渡します。エージェント自身が非特権の LXC の中で動いているとき（入れ子）は、LXC には UID マップが 1 つしかないため、コンテナを特権にします（`security.privileged`。物理ホストから見れば非特権のままです）。
+- **コンテナの権限**: ホスト上では、コンテナは非特権です。コンテナの root は、root の `/etc/subuid` の範囲の先頭の ID（既定は 100000。Proxmox のコンテナと同じ）です。コンテナが書き込む領域は、起動の前に、その ID の所有にします。そのため、以前のコンテナが書いたものも書き直せます。読み取り専用で渡すもの（データ、Kairo のバイナリ、GPU のドライバ）は、所有者を変えずに渡します。エージェント自身が非特権の LXC の中で動いているとき（入れ子）は、LXC には UID マップが 1 つしかないため、コンテナを特権にします（`security.privileged`。物理ホストから見れば非特権のままです）。
 - **AppArmor（Proxmox のホスト）**: Incus が作る AppArmor のプロファイルは ABI を宣言しません。Debian の既定の ABI のままだと、Proxmox のカーネル（7.0）はコンテナの中での UNIX ソケットの作成を拒否します（`failed protocol match`）。`/etc/apparmor/parser.conf` の `policy-features` を、Proxmox の LXC が使う `/etc/apparmor.d/abi/lxc` にします。
 
 Proxmox VE のホストに直接入れる場合の手順です（Debian 13）。VM のための依存を入れないよう、コンテナだけの `incus-base` を使います。
@@ -1007,36 +1007,6 @@ pve-firewall を有効にしているホストでは、**入れる前に** `/etc
 
 Incus は自分の lxcfs（`/var/lib/incus-lxcfs`）を使い、Proxmox の LXC とは別に動きます。Incus が thin pool に作るボリューム（`images_*`、`containers_*`）は、Proxmox の一覧には出ません。
 
-#### Proxmox コンテナ Executor（`kind = "pct"`）
-
-Proxmox VE ホスト上で動くエージェントは、`kind = "pct"` の Executor で、Attempt ごとに専用の Proxmox コンテナを作り、終わったら破棄します。ホスト上に作業用の常設コンテナを置かず、「消してよいか分からないコンテナ」が生まれないようにするためです。Kairo が作るコンテナは次の条件をすべて満たし、それ以外のゲストに Kairo が触れることはありません。
-
-- VMID は **1000〜1999** のみ（空いている最小の番号を使う）。
-- タグ `kairo`、ホスト名 `kairo-<attempt id>`、説明欄にどの Attempt のためのものかを記載。
-
-ランナー（`__kairo-oci-run`。pct のときの動作）は次のとおりです。
-
-1. イメージをダイジェストで取得します（`skopeo copy docker://...@sha256:... oci-archive:`。Proxmox の pull はタグ指定しか受け付けないため）。テンプレートストレージに `kairo-<digest>.tar` として置き、2 回目以降は再利用します。
-2. 非特権コンテナとして作成します（`pct create`）。ルートディスクは Executor のストレージ上に作ります。メモリとコア数はホスト全体を与え、上限をかけません（予約はアドミッションの勘定であり、OS の上限ではありません）。Kairo が渡す領域を `/kairo` 配下にバインドマウントし、GPU はデバイスとして渡します。書き込み可能な領域の所有者は、コンテナの root に対応するホスト上の ID（`/etc/subuid` の root の範囲の先頭。既定は 100000）に変えます。
-3. 作成時にイメージ側の entrypoint が書き込まれるため、作成後に init を Kairo のもの（`__kairo-container-init`）に設定し、`/dev/shm` を広げてから起動します。
-4. 停止を待ち、`/kairo/run/exit` の終了コードを読んでコンテナを破棄します（`pct destroy --purge`）。
-
-ランナーが強制終了されて残ったコンテナは、掃除処理が破棄します。対象は、番号帯の中にあり、タグ `kairo` を持ち、Attempt がもうこのノードで動いていない、停止済みのコンテナだけです。
-
-```toml
-[[executors]]
-id = "host-a-pct"
-kind = "pct"
-labels = { site = "host-a" }
-# 以下は省略時の値
-# pct_storage = "local-lvm"            # ルートディスクを置くストレージ
-# pct_template_storage = "local"       # イメージ（OCI アーカイブ）を置くストレージ
-# pct_net = "name=eth0,bridge=vmbr0,ip=dhcp"  # net0（空文字でネットワークなし）
-# pct_rootfs_gib = 8                   # ルートディスクの大きさ
-```
-
-これらの設定は Executor の `labels` に書きます。必要な環境は、Proxmox VE 9.1 以降（OCI アーカイブからのコンテナ作成）と `skopeo`（Proxmox VE の依存として入っています）です。エージェントはホスト上で root として動かします。
-
 #### WSL コンテナ Executor（`kind = "wslc"`）
 
 Windows 上のエージェントは、`kind = "wslc"` の Executor で、Attempt ごとに WSL のコンテナ（`wslc`、WSL 3 以降に付属）を作り、終わったら削除します。Windows の GPU を Linux の仕事で使うための Executor です（Windows でしか動かない仕事は Kairo の対象外です）。
@@ -1050,7 +1020,7 @@ labels = { site = "host-w" }
 
 - **ランナー**（`__kairo-oci-run`。wslc のときの動作）: イメージをダイジェストで取得し（`wslc pull`）、同じ名前の残りを消してから、`wslc run` を前景で動かして停止を待ち、`/kairo/run/exit` の終了コードを読んでコンテナを削除します。Attempt の停止（CTRL_BREAK）が届くと、`wslc stop` でコンテナを止めます。
 - **init**: エージェントの横に置いた Linux 版のバイナリ `kairo-linux` を `/kairo/bin/kairo` にマウントし、`__kairo-container-init` として動かします（`ops/windows/replace-agent.ps1` が Windows 版と一緒に置きます）。
-- **閉じ込めの代わりに一般ユーザーで動かす**: wslc のコンテナはマウントができない（CAP_SYS_ADMIN がない）ため、init は Incus/pct のような読み取り専用化をしません。代わりにコンテナ全体を uid 1000 で動かします。Kairo が渡す領域は書けますが、イメージのファイルは書けないので、`/kairo` の外に書いたものは黙って消えず、書いた時点で失敗します（`/tmp` だけは書けますが、`TMPDIR` は scratch を指します）。`HOME` は scratch の `home` です。実行時に root を前提とするイメージ（実行中の `pip install` など）は動きません。
+- **閉じ込めの代わりに一般ユーザーで動かす**: wslc のコンテナはマウントができない（CAP_SYS_ADMIN がない）ため、init は Incus のような読み取り専用化をしません。代わりにコンテナ全体を uid 1000 で動かします。Kairo が渡す領域は書けますが、イメージのファイルは書けないので、`/kairo` の外に書いたものは黙って消えず、書いた時点で失敗します（`/tmp` だけは書けますが、`TMPDIR` は scratch を指します）。`HOME` は scratch の `home` です。実行時に root を前提とするイメージ（実行中の `pip install` など）は動きません。
 - **停止**: 他のランタイムと同じく、停止はランナーに届き、ランナーが `wslc stop` でコンテナを止め、init が `argv` のプロセスグループへ SIGTERM を渡します（30 秒後に wslc が強制終了します）。プロセスの生死は、コンテナが動いているかどうかで判断します。
 - **GPU**: `--gpus all` で WSL の GPU（`/dev/dxg` と `/usr/lib/wsl/lib`）を渡し、`CUDA_VISIBLE_DEVICES` に Lease した GPU の UUID を入れます。glibc のイメージに限ります（alpine では wslc の GPU フックが失敗します）。
 - **ネットワーク**: コンテナは wslc のブリッジから外へ出られ、デーモンにも直接届きます。
@@ -1059,7 +1029,7 @@ labels = { site = "host-w" }
 
 #### コンテナの起動・終了ライフサイクルとマウント構成
 
-Attempt のランチャーは shim であり、エージェントのバイナリをランナー（`__kairo-oci-run`）として起動します。ランナーはどのランタイムでも同じで、ランタイムごとの違い（作り方・止め方・消し方・一覧）だけをランタイムの実装（`ociRuntime`：Incus・pct・wslc）が持ちます。後片付け（ランナーが強制終了されて残ったコンテナの削除）、止め方、プロセスの生死の判定、使用量の測り方も共通です（下記）。以前のランナーの引数（`__kairo-incus-run`・`__kairo-pct-run`・`__kairo-wslc-run`）も受け付けます。Incus のときは、ランナーはイメージからインスタンス `kairo-<attempt id>` を作成し（`incus init REMOTE:REPOSITORY@DIGEST`。初回はそのレジストリ用の OCI リモートを追加）、起動して停止を待ち、コンテナが書き出した終了コードを読み取ってインスタンスを削除し、その終了コードで終了します（終了コードが書かれていなかった場合は `-1`）。実行中にエージェントが再起動しても、他の Attempt と同様に引き継がれます（[エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ) を参照）。
+Attempt のランチャーは shim であり、エージェントのバイナリをランナー（`__kairo-oci-run`）として起動します。ランナーはどのランタイムでも同じで、ランタイムごとの違い（作り方・止め方・消し方・一覧）だけをランタイムの実装（`ociRuntime`：Incus・wslc）が持ちます。後片付け（ランナーが強制終了されて残ったコンテナの削除）、止め方、プロセスの生死の判定、使用量の測り方も共通です（下記）。以前のランナーの引数（`__kairo-incus-run`・`__kairo-wslc-run`）も受け付けます。Incus のときは、ランナーはイメージからインスタンス `kairo-<attempt id>` を作成し（`incus init REMOTE:REPOSITORY@DIGEST`。初回はそのレジストリ用の OCI リモートを追加）、起動して停止を待ち、コンテナが書き出した終了コードを読み取ってインスタンスを削除し、その終了コードで終了します（終了コードが書かれていなかった場合は `-1`）。実行中にエージェントが再起動しても、他の Attempt と同様に引き継がれます（[エージェント再起動と引き継ぎ](#エージェント再起動と引き継ぎ) を参照）。
 
 コンテナ内では、読み取り専用でマウントされた同一のバイナリが Incus 自身の init の配下でコンテナ用 init（`__kairo-container-init`）として動作します。
 
@@ -1070,10 +1040,10 @@ Attempt のランチャーは shim であり、エージェントのバイナリ
 
 強制停止、ノード隔離、および終了済み Attempt の残留の終了は、どのランタイムでも同じ経路をとります。
 
-- **穏やかな停止**: エージェントはランナー（shim の下のプロセスグループ。Windows では CTRL_BREAK）にだけ停止を送ります。ランナーはランタイムでコンテナを止め（`incus stop`・`pct shutdown`・`wslc stop`、30 秒の猶予つき）、コンテナの init（`__kairo-container-init`）が `argv` のプロセスグループへ SIGTERM を渡します（lxc が送る停止のシグナル SIGPWR も SIGTERM として渡します）。猶予を過ぎるとランタイムが残りを止めます。ランナーがいない（強制終了された、引き継いだ Attempt でシグナルを送れない）ときは、エージェントがランタイムで直接コンテナを止めます。
-- **強制終了**: エージェントはランタイムでコンテナを即座に止め（`incus stop --force`・`pct stop`・`wslc kill`）、ランナーのプロセスグループも終わらせます。
+- **穏やかな停止**: エージェントはランナー（shim の下のプロセスグループ。Windows では CTRL_BREAK）にだけ停止を送ります。ランナーはランタイムでコンテナを止め（`incus stop`・`wslc stop`、30 秒の猶予つき）、コンテナの init（`__kairo-container-init`）が `argv` のプロセスグループへ SIGTERM を渡します（lxc が送る停止のシグナル SIGPWR も SIGTERM として渡します）。猶予を過ぎるとランタイムが残りを止めます。ランナーがいない（強制終了された、引き継いだ Attempt でシグナルを送れない）ときは、エージェントがランタイムで直接コンテナを止めます。
+- **強制終了**: エージェントはランタイムでコンテナを即座に止め（`incus stop --force`・`wslc kill`）、ランナーのプロセスグループも終わらせます。
 - **生死**: Attempt が登録したプロセスは、コンテナが動いている間は生きているものとして扱います。ランナーのプロセスグループかコンテナのどちらかが動いていれば、Attempt はまだ動いています。ホストから `KAIRO_ATTEMPT_ID` でプロセスを探すことはしません。
-- **使用量**: RAM と書き込んだバイト数は、ランタイムの統計から取ります（Incus は RAM だけで、書き込みは不明として扱います。pct は `pvesh` の `mem`・`diskwrite`、wslc は `wslc stats`）。
+- **使用量**: RAM と書き込んだバイト数は、ランタイムの統計から取ります（Incus は RAM だけで、書き込みは不明として扱います。wslc は `wslc stats`）。
 
 ランナーはコンテナが止まるのを見届けてから削除します。ランナーが強制終了されて残ったコンテナは、動いているかどうかにかかわらず、後述の定期スイープが削除します。
 
@@ -1094,7 +1064,7 @@ Kairo が渡した領域以外に Attempt が書き込んだ内容はインス�
 
 - **環境変数と `/dev/shm`**: コンテナの環境変数は「イメージの環境変数 → 宣言された env → Kairo の環境変数」の順に構築されます。Kairo が渡すパスはすべて上記のコンテナ内パスとなり、その配下を指すパスも書き換えられます（例: 継続時の `KAIRO_CONTINUATION_REF`）。エージェント自身の環境変数はコンテナには渡されません。`/dev/shm` はメモリの最大半分を上限とする tmpfs です（PyTorch のデータローダワーカーがバッチ共有に使用します。ここに書き込まれた分はメモリ使用量となります）。
 - **GPU の受け渡し**: Lease された GPU は UUID から特定されたデバイスノード（`/dev/nvidia<minor>`）および制御デバイスとしてコンテナに渡されます。ドライバのライブラリとプログラム群は `nvidia-container-cli list` が列挙するものをドライババージョンごとに 1 回 `<log dir>/containers/nvidia/<version>` にまとめて配置し（soname 付きでリンク）、`/kairo/nvidia` にマウントします（`lib` を `LD_LIBRARY_PATH` の先頭に、`bin` を `PATH` の末尾に追加）。`CUDA_VISIBLE_DEVICES` には UUID が設定されます。なお、ネストされたコンテナ内では cgroup のデバイスプログラムを読み込めないためデバイスアクセス自体はフェンスされません。その GPU が Attempt の所有物であるのは、Kairo が Lease していることに基づきます。
-- **プロセス帰属・チェックポイント・後始末**: Incus・pct のコンテナ内のプロセスはホストの `/proc` から見え、`KAIRO_ATTEMPT_ID` を持つため、GPU プロセスの帰属が機能します。止め方・生死・使用量はランタイムを通します（上記）。コンテナが公開するチェックポイントはコンテナ内パス（`/kairo/output/...`）を指すためインポートは行われず（[実行中ジョブのチェックポイント保護](#実行中ジョブのチェックポイント保護) を参照）、チェックポイント公開が指示する Run スナップショットによって保持されます。また、Executor は 10 分ごと、およびコンテナ上の Attempt 終了直後に、もはやそこで実行されていない Attempt のインスタンスを削除します（ランナーが強制終了された場合はランナーによる削除が行われないためです）。
+- **プロセス帰属・チェックポイント・後始末**: Incus のコンテナ内のプロセスはホストの `/proc` から見え、`KAIRO_ATTEMPT_ID` を持つため、GPU プロセスの帰属が機能します。止め方・生死・使用量はランタイムを通します（上記）。コンテナが公開するチェックポイントはコンテナ内パス（`/kairo/output/...`）を指すためインポートは行われず（[実行中ジョブのチェックポイント保護](#実行中ジョブのチェックポイント保護) を参照）、チェックポイント公開が指示する Run スナップショットによって保持されます。また、Executor は 10 分ごと、およびコンテナ上の Attempt 終了直後に、もはやそこで実行されていない Attempt のインスタンスを削除します（ランナーが強制終了された場合はランナーによる削除が行われないためです）。
 - **現時点の制約**: Gang 実行には対応しません。実行中コンテナの状態そのものを保持する機能もまだなく、処理の継続はジョブ自身のチェックポイントから再開します。
 
 ### データストア

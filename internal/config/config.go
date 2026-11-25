@@ -287,11 +287,6 @@ type Executor struct {
 // of the attempt's image (executor/container.go), on Linux.
 const KindIncus = "incus"
 
-// KindPCT is an executor that runs every attempt in a Proxmox VE container
-// of the attempt's image, made for it and destroyed after it
-// (executor/container_pct_linux.go), by an agent on the Proxmox host.
-const KindPCT = "pct"
-
 // KindWSLC is an executor that runs every attempt in a WSL container (wslc)
 // of the attempt's image, made for it and removed after it
 // (executor/container_wslc.go), by an agent on Windows.
@@ -299,7 +294,7 @@ const KindWSLC = "wslc"
 
 // containerKinds are the kinds whose executors run containers, and the
 // system their agent runs on: they set the "runtime" attribute.
-var containerKinds = map[string]string{KindIncus: "linux", KindPCT: "linux", KindWSLC: "windows"}
+var containerKinds = map[string]string{KindIncus: "linux", KindWSLC: "windows"}
 
 // Attributes are what the executor registers to be matched by executor
 // selectors: its labels, and "runtime" naming its container runtime when it
@@ -327,7 +322,7 @@ func checkExecutors(executors []Executor) error {
 		}
 		system := containerKinds[e.Kind]
 		if system == "" {
-			return fmt.Errorf("executor %s: kind %q runs no containers; every executor runs its attempts in containers (incus, pct on Linux; wslc on Windows)", e.ID, e.Kind)
+			return fmt.Errorf("executor %s: kind %q runs no containers; every executor runs its attempts in containers (incus on Linux, wslc on Windows)", e.ID, e.Kind)
 		}
 		if runtime.GOOS != system {
 			return fmt.Errorf("executor %s: kind %s runs on %s only", e.ID, e.Kind, system)

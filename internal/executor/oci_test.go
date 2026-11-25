@@ -95,8 +95,8 @@ func TestTheRunnerRunsAndRemovesTheContainer(t *testing.T) {
 	if exit := ociRun(specPath); exit != shimNotStarted {
 		t.Fatalf("an unknown runtime: exit %d", exit)
 	}
-	// a spec from before runtimes were named: Incus, or pct with pct settings
-	if specRuntime(containerSpec{}) != "incus" || specRuntime(containerSpec{PCT: &pctSettings{}}) != "pct" {
+	// a spec from before runtimes were named: Incus
+	if specRuntime(containerSpec{}) != "incus" {
 		t.Fatal("old specs' runtimes")
 	}
 }

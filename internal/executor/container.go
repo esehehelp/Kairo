@@ -11,19 +11,15 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 
 	"kairo/internal/store"
 )
 
-// Containers (README: Containers). An executor of kind incus or pct runs
-// every attempt in a container of the attempt's image (store.Launch.Image,
-// pinned by digest), and nothing else: the planner gives it only executions
-// in an image, and only it takes them (store.selectorMatches). Kind incus
-// makes an Incus instance (container_linux.go); kind pct, run by an agent on
-// a Proxmox VE host, makes a Proxmox container in VMIDs 1000-1999
-// (container_pct_linux.go).
+// Containers (README: Containers). Every executor runs every attempt in a
+// container of the attempt's image (store.Launch.Image, pinned by digest):
+// kind incus makes an Incus instance (container_linux.go), kind wslc a WSL
+// container (container_wslc.go).
 //
 // The attempt's launcher is still its shim (shim.go), which runs this
 // binary as the backend's runner: it makes the container kairo-<attempt id>
@@ -63,7 +59,6 @@ import (
 const (
 	containerRunArg  = "__kairo-incus-run"
 	containerInitArg = "__kairo-container-init"
-	pctRunArg        = "__kairo-pct-run"
 	containerRoot    = "/kairo"
 	containerSpecIn  = "/kairo/run/spec.json"
 	containerExitIn  = "/kairo/run/exit"
@@ -91,8 +86,6 @@ type containerSpec struct {
 	DriverRoot string   `json:"driver_root,omitempty"`
 	// RunDir is the node path of /kairo/run.
 	RunDir string `json:"run_dir"`
-	// PCT is how a Proxmox container is made (kind pct only).
-	PCT *pctSettings `json:"pct,omitempty"`
 
 	// In the container: the argv, its directory and environment (declared,
 	// then Kairo's), the paths it may write and its /tmp.
@@ -141,14 +134,12 @@ const benchDiskDir = ".kairo-bench"
 
 // containerOptions say how a backend's containers take what an attempt is
 // handed: runArg is the runner's argument; dirsOnly mounts directories only
-// (Proxmox bind-mounts no single file): the binary as a directory
+// (a runtime that mounts no single file): the binary as a directory
 // (/kairo/bin) holding a hard link to it (a copy across filesystems), the
-// logs as one (/kairo/log) of hard links to them; pct is what a Proxmox
-// container is made with.
+// logs as one (/kairo/log) of hard links to them.
 type containerOptions struct {
 	runArg   string
 	dirsOnly bool
-	pct      *pctSettings
 	// runtime names the container's runtime (spec.Runtime); vm: it runs in
 	// a VM (ociCaps.vm): its init is the Linux build beside this binary, it
 	// runs as an ordinary user and asks for raw files as files.
@@ -231,7 +222,6 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		AttemptID: id,
 		Image:     launch.Image,
 		RunDir:    runDir,
-		PCT:       opts.pct,
 		Mounts: append(append([]containerMount{
 			binMount,
 			{Source: runDir, Path: containerRoot + "/run"},
@@ -351,43 +341,6 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 	}
 	cmd.Env = append(cmd.Env, "KAIRO_ATTEMPT_ID="+id)
 	return cmd, nil
-}
-
-// pctSettings are what a Proxmox container is made with, from the
-// executor's attributes (pctSettingsOf).
-type pctSettings struct {
-	// Storage holds the containers' root disks (lvmthin: its thin pool);
-	// TemplateStorage the images, as OCI archives.
-	Storage         string `json:"storage"`
-	TemplateStorage string `json:"template_storage"`
-	// Net is the container's net0 (empty: none).
-	Net string `json:"net,omitempty"`
-	// RootfsGiB is the root disk's size.
-	RootfsGiB int `json:"rootfs_gib"`
-}
-
-// pctSettingsOf reads an executor's pct settings from its attributes
-// (pct_storage, pct_template_storage, pct_net, pct_rootfs_gib), with
-// Proxmox's defaults.
-func pctSettingsOf(attrs map[string]string) (*pctSettings, error) {
-	s := &pctSettings{Storage: "local-lvm", TemplateStorage: "local", Net: "name=eth0,bridge=vmbr0,ip=dhcp", RootfsGiB: 8}
-	if v := attrs["pct_storage"]; v != "" {
-		s.Storage = v
-	}
-	if v := attrs["pct_template_storage"]; v != "" {
-		s.TemplateStorage = v
-	}
-	if v, ok := attrs["pct_net"]; ok {
-		s.Net = v
-	}
-	if v := attrs["pct_rootfs_gib"]; v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil || n <= 0 {
-			return nil, fmt.Errorf("pct_rootfs_gib %q is no positive number of GiB", v)
-		}
-		s.RootfsGiB = n
-	}
-	return s, nil
 }
 
 // linkLogs makes dir with hard links stdout and stderr to an attempt's logs,
