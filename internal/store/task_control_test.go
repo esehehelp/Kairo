@@ -568,8 +568,6 @@ func TestAnOldGangTaskIsBlockedNotThePass(t *testing.T) {
 	if _, err := store.testExec(`UPDATE orchestration_tasks SET execution_template_json=jsonb_set(execution_template_json::jsonb,'{gang}','{"size":2}')::text WHERE name='prepare'`); err != nil {
 		t.Fatal(err)
 	}
-	_, err := store.RerunTask(ctx, "orchestrated", "prepare", "tester", "rerun-gang")
-	taskConflictError(t, err, "gangs are no more")
 	// a task of another project is planned in the same pass
 	other := strings.ReplaceAll(orchestrationManifest(), `name = "orchestrated"`, `name = "other"`)
 	if _, err := store.ApplyProject(ctx, projectSpec(t, other)); err != nil {
@@ -582,4 +580,7 @@ func TestAnOldGangTaskIsBlockedNotThePass(t *testing.T) {
 	if others := projectTasks(t, store, "other"); others["prepare"].State != "running" && others["prepare"].State != "pending" {
 		t.Fatalf("the other project's task: %+v", others["prepare"])
 	}
+	// blocked, it is declared again, not rerun
+	_, err := store.RerunTask(ctx, "orchestrated", "prepare", "tester", "rerun-gang")
+	taskConflictError(t, err, "gangs are no more")
 }

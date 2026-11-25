@@ -29,12 +29,13 @@ func TestChownTreeHandsOverOnlyWhatIsNotTheContainers(t *testing.T) {
 		}
 	}
 	write(filepath.Join(root, "a", "host"), 0)
-	write(filepath.Join(root, "a", "b", "mine"), 165534) // a user of the container's
+	write(filepath.Join(root, "a", "b", "mine"), 1500) // a user of the container's
 	write(filepath.Join(outside, "secret"), 0)
 	if err := os.Symlink(outside, filepath.Join(root, "a", "link")); err != nil {
 		t.Fatal(err)
 	}
-	m := idMap{uid: 100000, gid: 100000, uidLen: 65536, gidLen: 65536}
+	// a map the test's own namespace has ids for
+	m := idMap{uid: 1000, gid: 1000, uidLen: 1000, gidLen: 1000}
 	if err := chownTree(root, m); err != nil {
 		t.Fatal(err)
 	}
@@ -46,8 +47,8 @@ func TestChownTreeHandsOverOnlyWhatIsNotTheContainers(t *testing.T) {
 		return st.Uid
 	}
 	for p, want := range map[string]uint32{
-		root: 100000, filepath.Join(root, "a"): 100000, filepath.Join(root, "a", "host"): 100000,
-		filepath.Join(root, "a", "b", "mine"): 165534, filepath.Join(root, "a", "link"): 100000,
+		root: 1000, filepath.Join(root, "a"): 1000, filepath.Join(root, "a", "host"): 1000,
+		filepath.Join(root, "a", "b", "mine"): 1500, filepath.Join(root, "a", "link"): 1000,
 		outside: 0, filepath.Join(outside, "secret"): 0,
 	} {
 		if got := owner(p); got != want {
