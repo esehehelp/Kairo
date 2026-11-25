@@ -12,7 +12,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -34,14 +33,10 @@ func runContainerHelpers(args []string) {
 	if len(args) < 3 {
 		return
 	}
-	switch args[1] {
-	case containerRunArg:
-		os.Exit(containerRun(args[2]))
-	case containerInitArg:
+	if args[1] == containerInitArg {
 		os.Exit(containerInit(args[2]))
-	case pctRunArg:
-		os.Exit(pctRun(args[2]))
 	}
+	runOCIHelper(args)
 }
 
 // incusCommand runs the incus client with stdin (nil: none) and returns
@@ -65,50 +60,59 @@ func incusNotFound(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "not found")
 }
 
-// containerRun is the runner: it makes the attempt's instance, starts it,
-// waits for it to stop and exits with the exit the container wrote (-1 when
-// it wrote none: killed). It deletes the instance (whatever the container
-// wrote outside what Kairo handed it goes with it) and its spec, which holds
-// the attempt's token. What stops an attempt (a force stop, a quarantine)
-// reaches the container's processes directly, as it reaches a host
-// attempt's: they carry its KAIRO_ATTEMPT_ID. The runner only outlives the
-// signal it is sent with them, so as to see the container stop.
-func containerRun(specPath string) int {
-	logf := func(format string, a ...any) {
-		// the container appends to the same log: write at its end
-		_, _ = os.Stderr.Seek(0, io.SeekEnd)
-		fmt.Fprintf(os.Stderr, "kairo container: "+format+"\n", a...)
-	}
-	spec, err := readContainerSpec(specPath)
-	if err != nil {
-		logf("%v", err)
-		return shimNotStarted
-	}
-	if os.Getenv("HOME") == "" {
-		// incus keeps its remotes under HOME; a service may have none
-		_ = os.Setenv("HOME", "/root")
-	}
-	sigs := make(chan os.Signal, 8)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
-	go func() {
-		for range sigs {
-		}
-	}()
-	exit, err := runInstance(context.Background(), spec, logf)
-	if err != nil {
-		logf("%v", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	if _, err := incusCommand(ctx, nil, "delete", "--force", spec.Instance); err != nil && !incusNotFound(err) {
-		logf("instance %s not deleted: %v", spec.Instance, err)
-	}
-	_ = os.Remove(specPath)
-	return exit
+// incusRuntime runs attempts' containers with Incus (oci.go): a container
+// is an instance named by its instance name. What stops an attempt (a force
+// stop, a quarantine) reaches the container's processes directly, as it
+// reaches a host attempt's: they carry its KAIRO_ATTEMPT_ID.
+type incusRuntime struct{}
+
+func (incusRuntime) run(ctx context.Context, spec containerSpec, logf func(string, ...any), made func(string)) (string, int, error) {
+	handle := ""
+	exit, err := runInstance(ctx, spec, logf, func() {
+		handle = spec.Instance
+		made(handle)
+	})
+	return handle, exit, err
 }
 
-// runInstance makes, starts and waits for the attempt's instance.
-func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...any)) (int, error) {
+func (incusRuntime) stop(ctx context.Context, name string) error {
+	_, err := incusCommand(ctx, nil, "stop", name, "--timeout", strconv.Itoa(wslcStopSeconds))
+	return err
+}
+
+// remove deletes an instance (whatever the container wrote outside what
+// Kairo handed it goes with it).
+func (incusRuntime) remove(ctx context.Context, name string) error {
+	if _, err := incusCommand(ctx, nil, "delete", "--force", name); err != nil && !incusNotFound(err) {
+		return err
+	}
+	return nil
+}
+
+func (incusRuntime) containers(ctx context.Context) ([]ociContainer, error) {
+	out, err := incusCommand(ctx, nil, "list", "--format", "json")
+	if err != nil {
+		return nil, err
+	}
+	var instances []struct {
+		Name   string `json:"name"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(out, &instances); err != nil {
+		return nil, err
+	}
+	var list []ociContainer
+	for _, in := range instances {
+		if id, ok := attemptOfInstance(in.Name); ok {
+			list = append(list, ociContainer{attempt: id, running: in.Status != "Stopped", handle: in.Name})
+		}
+	}
+	return list, nil
+}
+
+// runInstance makes, starts and waits for the attempt's instance; made is
+// called once it exists.
+func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...any), made func()) (int, error) {
 	ref, err := imageref.ParsePinned(spec.Image)
 	if err != nil {
 		return shimNotStarted, err
@@ -155,6 +159,7 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 	if _, err := incusCommand(ctx, body, "init", remote+":"+ref.Repository+"@"+ref.Digest, spec.Instance, "--quiet"); err != nil {
 		return shimNotStarted, err
 	}
+	made()
 	if _, err := incusCommand(ctx, nil, "start", spec.Instance); err != nil {
 		return shimNotStarted, err
 	}
@@ -698,36 +703,3 @@ const (
 	containerSweepInterval = 10 * time.Minute
 	containerSweepTimeout  = 5 * time.Minute
 )
-
-func (e *storeWorker) sweepContainers(ctx context.Context) {
-	out, err := incusCommand(ctx, nil, "list", "--format", "json")
-	if err != nil {
-		e.roundProblem(&e.containerSweeps, "", "containers not listed", err)
-		return
-	}
-	var instances []struct {
-		Name   string `json:"name"`
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(out, &instances); err != nil {
-		e.roundProblem(&e.containerSweeps, "", "containers not listed", err)
-		return
-	}
-	e.roundProblem(&e.containerSweeps, "", "", nil)
-	for _, in := range instances {
-		rest, ok := strings.CutPrefix(in.Name, "kairo-att-")
-		if !ok || in.Status != "Stopped" {
-			continue
-		}
-		attempt := "att_" + rest
-		if e.attemptRunsHere(attempt) {
-			continue
-		}
-		if _, err := incusCommand(ctx, nil, "delete", "--force", in.Name); err != nil && !incusNotFound(err) {
-			e.roundProblem(&e.containerSweeps, in.Name, "container not deleted", err)
-			continue
-		}
-		_ = os.RemoveAll(e.containerDir(attempt))
-		e.Logger.Info("container of an attempt no longer running deleted", "instance", in.Name, "attempt_id", attempt)
-	}
-}

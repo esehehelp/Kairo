@@ -12,8 +12,8 @@ import (
 	"kairo/internal/store"
 )
 
-// An executor's backend comes from its kind: Incus runs containers and
-// sweeps their instances; every other kind runs on the host.
+// An executor's backend comes from its kind: a container kind (Incus, pct,
+// wslc) runs containers and sweeps them; every other kind runs on the host.
 func TestTheBackendComesFromTheKind(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	for _, c := range []struct {
@@ -23,7 +23,9 @@ func TestTheBackendComesFromTheKind(t *testing.T) {
 	}{
 		{"linux", nil, "executor.hostBackend"},
 		{"windows", map[string]string{"environment": "windows"}, "executor.hostBackend"},
-		{"incus", nil, "executor.incusBackend"},
+		{"incus", nil, "executor.ociBackend"},
+		{"pct", nil, "executor.ociBackend"},
+		{"wslc", nil, "executor.ociBackend"},
 	} {
 		e := NewLocal("x", nil, t.TempDir(), logger)
 		e.Kind, e.Attributes = c.kind, c.labels
@@ -32,7 +34,7 @@ func TestTheBackendComesFromTheKind(t *testing.T) {
 			t.Errorf("%s %v: backend %s, want %s", c.kind, c.labels, got, c.want)
 		}
 		_, sweeps := b.(instanceSweeper)
-		if sweeps != (c.kind == "incus") {
+		if _, ctr := ociCapsOf(c.kind); sweeps != ctr {
 			t.Errorf("%s: sweeps instances %v", c.kind, sweeps)
 		}
 	}

@@ -2,10 +2,7 @@
 
 package executor
 
-import (
-	"context"
-	"time"
-)
+import "time"
 
 // Containers run on Linux only (container_linux.go).
 func runContainerHelpers([]string) {}
@@ -14,7 +11,3 @@ const (
 	containerSweepInterval = time.Hour
 	containerSweepTimeout  = time.Minute
 )
-
-func (e *storeWorker) sweepContainers(context.Context) {}
-
-func (e *storeWorker) sweepPCT(context.Context) {}

@@ -9,14 +9,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"time"
-
-	"kairo/internal/processidentity"
-	"kairo/internal/store"
 )
 
 // wslc containers (README: Containers). An executor of kind wslc, run by an
@@ -24,9 +19,8 @@ import (
 // image, made for it and removed after it: Linux work with the node's GPUs
 // (--gpus: the WSL GPU) on a Windows host.
 //
-// The runner (wslcRunArg, under the shim as for the other runtimes) pulls
-// the image, runs `wslc run` in the foreground and returns the exit the
-// container's init wrote. The init is the Linux build of this binary
+// The runner (oci.go) has wslcRuntime pull the image and run `wslc run` in
+// the foreground; it returns the exit the container's init wrote. The init is the Linux build of this binary
 // (kairo-linux beside the agent's), mounted at /kairo/bin/kairo. A wslc
 // container cannot mount (no CAP_SYS_ADMIN), so the init does not confine
 // it; the whole container runs as an ordinary user (wslcUser) instead:
@@ -90,43 +84,24 @@ func wslcRunArgs(spec containerSpec) []string {
 	return append(args, spec.Image, containerInitArg, containerSpecIn)
 }
 
-// wslcRun runs an attempt's container (the shim's launcher): it pulls the
-// image, removes a leftover of the same name, runs the container until it
-// stops, removes it and exits with the exit its init wrote.
-func wslcRun(specPath string) int {
-	logf := func(format string, a ...any) {
-		_, _ = os.Stderr.Seek(0, io.SeekEnd)
-		fmt.Fprintf(os.Stderr, "kairo container: "+format+"\n", a...)
-	}
-	spec, err := readContainerSpec(specPath)
-	if err != nil {
-		logf("%v", err)
-		return shimNotStarted
-	}
-	ctx := context.Background()
+// wslcRuntime runs attempts' containers with wslc (oci.go): a container
+// is named by its instance name.
+type wslcRuntime struct{}
+
+// run pulls the image, removes a leftover of the same name and runs the
+// container in the foreground until it stops.
+func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string, ...any), made func(string)) (string, int, error) {
 	logf("container %s of %s", spec.Instance, spec.Image)
 	if _, err := wslcCommand(ctx, "pull", "--quiet", spec.Image); err != nil {
-		logf("%v", err)
-		return shimNotStarted
+		return "", shimNotStarted, err
 	}
 	_, _ = wslcCommand(ctx, "remove", "--force", spec.Instance)
-	run := exec.Command(wslcExe(), wslcRunArgs(spec)...)
-	run.Stdout, run.Stderr = io.Discard, os.Stderr
-	// a stop of the attempt (CTRL_BREAK; SIGTERM elsewhere) stops the
-	// container: its init passes it to the argv
-	sigs := make(chan os.Signal, 4)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	go func() {
-		for range sigs {
-			logf("stopping %s", spec.Instance)
-			stopCtx, cancel := context.WithTimeout(ctx, (wslcStopSeconds+30)*time.Second)
-			_, _ = wslcCommand(stopCtx, "stop", "--time", fmt.Sprint(wslcStopSeconds), spec.Instance)
-			cancel()
-		}
-	}()
+	made(spec.Instance)
 	// wslc sometimes fails a run before it made the container (two runs
 	// started at once): made again, a few times
 	for try := 1; ; try++ {
+		run := exec.Command(wslcExe(), wslcRunArgs(spec)...)
+		run.Stdout, run.Stderr = io.Discard, os.Stderr
 		err := run.Run()
 		if err == nil {
 			break
@@ -136,22 +111,37 @@ func wslcRun(specPath string) int {
 			break
 		}
 		time.Sleep(time.Duration(try) * 3 * time.Second)
-		run = exec.Command(wslcExe(), wslcRunArgs(spec)...)
-		run.Stdout, run.Stderr = io.Discard, os.Stderr
 	}
-	signal.Stop(sigs)
 	exit, ok := readExitFile(filepath.Join(spec.RunDir, "exit"))
 	if !ok {
 		logf("the container stopped without writing its exit")
 		exit = -1
 	}
-	rmCtx, cancel := context.WithTimeout(ctx, 2*time.Minute)
-	defer cancel()
-	if _, err := wslcCommand(rmCtx, "remove", "--force", spec.Instance); err != nil {
-		logf("container %s not removed: %v", spec.Instance, err)
+	return spec.Instance, exit, nil
+}
+
+func (wslcRuntime) stop(ctx context.Context, name string) error {
+	_, err := wslcCommand(ctx, "stop", "--time", fmt.Sprint(wslcStopSeconds), name)
+	return err
+}
+
+func (wslcRuntime) remove(ctx context.Context, name string) error {
+	_, err := wslcCommand(ctx, "remove", "--force", name)
+	return err
+}
+
+func (wslcRuntime) containers(ctx context.Context) ([]ociContainer, error) {
+	list, err := wslcContainers(ctx)
+	if err != nil {
+		return nil, err
 	}
-	_ = os.Remove(specPath)
-	return exit
+	var out []ociContainer
+	for _, c := range list {
+		if id, ok := attemptOfInstance(c.Names); ok {
+			out = append(out, ociContainer{attempt: id, running: c.State == "running", handle: c.Names})
+		}
+	}
+	return out, nil
 }
 
 // wslcRunTries is how many times a run that failed before its container
@@ -170,14 +160,6 @@ func wslcHas(ctx context.Context, name string) bool {
 		}
 	}
 	return false
-}
-
-// runWSLCHelper runs the wslc runner when args name it, and does not return
-// then.
-func runWSLCHelper(args []string) {
-	if len(args) == 3 && args[1] == wslcRunArg {
-		os.Exit(wslcRun(args[2]))
-	}
 }
 
 // wslcContainer is a container as `wslc list --format json` lists it.
@@ -207,64 +189,6 @@ func wslcContainers(ctx context.Context) ([]wslcContainer, error) {
 		list = append(list, c)
 	}
 	return list, s.Err()
-}
-
-// wslcBackend runs every attempt in a wslc container of its image
-// (above), on Windows.
-type wslcBackend struct{ e *Local }
-
-func (b wslcBackend) launcher(launch *store.Launch) (*exec.Cmd, *confinement, error) {
-	cmd, err := b.e.containerCommand(launch, containerOptions{runArg: wslcRunArg, dirsOnly: true, wslc: true})
-	return cmd, nil, err
-}
-
-// liveness: the processes of an attempt in a container are the container's
-// (in the WSL VM, out of sight): alive while it is running.
-func (b wslcBackend) liveness(ctx context.Context, attemptID string, _ int, _ string) (processidentity.Liveness, error) {
-	list, err := wslcContainers(ctx)
-	if err != nil {
-		return processidentity.LivenessUnknown, err
-	}
-	name := containerInstance(attemptID)
-	for _, c := range list {
-		if c.Names == name && c.State == "running" {
-			return processidentity.LivenessAlive, nil
-		}
-	}
-	return processidentity.LivenessAbsent, nil
-}
-
-func (b wslcBackend) ended(attemptID string) {
-	_ = os.RemoveAll(b.e.containerDir(attemptID))
-	b.e.storeWork().sweepSoon()
-}
-
-func (b wslcBackend) sweep(ctx context.Context) { b.e.storeWork().sweepWSLC(ctx) }
-
-// sweepWSLC removes the containers of attempts that no longer run here (a
-// runner killed before it removed its container): stopped ones, and running
-// ones whose attempt is not running.
-func (e *storeWorker) sweepWSLC(ctx context.Context) {
-	ctx, cancel := context.WithTimeout(ctx, containerSweepTimeout)
-	defer cancel()
-	list, err := wslcContainers(ctx)
-	if err != nil {
-		e.roundProblem(&e.containerSweeps, "", "containers not listed", err)
-		return
-	}
-	e.roundProblem(&e.containerSweeps, "", "", nil)
-	for _, c := range list {
-		id, ok := attemptOfInstance(c.Names)
-		if !ok || e.attemptRunsHere(id) {
-			continue
-		}
-		if _, err := wslcCommand(ctx, "remove", "--force", c.Names); err != nil {
-			e.roundProblem(&e.containerSweeps, c.Names, "container not removed", err)
-			continue
-		}
-		_ = os.RemoveAll(e.containerDir(id))
-		e.Logger.Info("container of an attempt no longer running removed", "instance", c.Names, "attempt_id", id, "state", c.State)
-	}
 }
 
 // attemptOfInstance is the attempt of a container named by
