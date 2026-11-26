@@ -39,6 +39,10 @@ type FetchOrder struct {
 	PackSHA256     string     `json:"pack_sha256"`
 	ManifestSHA256 string     `json:"manifest_sha256"`
 	Source         CopySource `json:"source"`
+	// RunID: the object is brought as this run's output directory
+	// (outputlandings.go): unpacked as <root>/outputs/<run id> with its
+	// marker, not as an input.
+	RunID string `json:"run_id,omitempty"`
 }
 
 // FetchMade is an object an executor brought: where it is unpacked and the
@@ -49,6 +53,8 @@ type FetchMade struct {
 	ExecutorID string `json:"executor_id"`
 	Path       string `json:"path"`
 	Bytes      int64  `json:"bytes"`
+	// RunID: brought as this run's output directory (FetchOrder.RunID).
+	RunID string `json:"run_id,omitempty"`
 }
 
 // fetchTokenLife is how long a fetch's token can be used.
@@ -553,6 +559,12 @@ func (s *Store) FetchesToMake(ctx context.Context, executorID string) ([]FetchOr
 		}
 		out = append(out, o)
 	}
+	// runs' output directories to bring here (outputlandings.go)
+	landings, err := landingFetchOrdersTx(ctx, tx, me, executorID, byID)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, landings...)
 	return out, tx.Commit()
 }
 
@@ -565,6 +577,13 @@ func (s *Store) RecordFetch(ctx context.Context, made FetchMade) error {
 		return err
 	}
 	defer tx.Rollback()
+	if made.RunID != "" {
+		// brought as a run's output directory (outputlandings.go)
+		if err := recordLandingTx(ctx, tx, made); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
 	var executorID, root, state string
 	var projectID sql.NullString
 	err = tx.QueryRowContext(ctx, `SELECT p.executor_id,p.root,p.state,d.project_scope_id FROM object_placements p JOIN data_objects d ON d.id=p.object_id

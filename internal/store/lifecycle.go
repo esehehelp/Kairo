@@ -78,8 +78,9 @@ var lifecycle = map[lifecycleRecord]map[string][]string{
 	},
 	recRunOutput: {
 		noRecord:  {"active"},
-		"active":  {"missing", "deleted"},
+		"active":  {"missing", "deleted", "moved"}, // moved: landed on another store (outputlandings.go)
 		"missing": {"active", "deleted"},
+		"moved":   {"active"}, // landed back here (its directory removed since it left)
 		"deleted": {},
 	},
 }

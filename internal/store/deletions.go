@@ -60,6 +60,8 @@ func sourceOwnership(declared []machine.Store, kind, nodeID, storeID, root, path
 		return importOwnership(declared, nodeID, storeID, root, path)
 	case ObjectRunSnapshot:
 		return outputOwnership(declared, nodeID, storeID, root, path, RunOfSnapshot(sourceID))
+	case ObjectOutputMove:
+		return outputOwnership(declared, nodeID, storeID, root, path, runOfMove(sourceID))
 	}
 	return outputOwnership(declared, nodeID, storeID, root, path, sourceID)
 }

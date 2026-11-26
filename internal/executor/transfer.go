@@ -391,6 +391,12 @@ func openMade(r *os.Root, names ...string) (*os.Root, error) {
 // fetch writes the list (whole, again) and the pack (resumed when part of it
 // is there) as .partial files in dir, synced.
 func (e *storeWorker) fetch(ctx context.Context, o store.CopyOrder, served map[string]servedStore, dir *os.Root, packName, listName string) error {
+	return e.fetchAs(ctx, o, served, dir, packName, listName, packName, listName)
+}
+
+// fetchAs is fetch writing the pack and list read as packName and listName
+// under names of its own (localPack, localList).
+func (e *storeWorker) fetchAs(ctx context.Context, o store.CopyOrder, served map[string]servedStore, dir *os.Root, packName, listName, localPack, localList string) error {
 	var open func(name string, offset int64) (io.ReadCloser, int64, error)
 	if o.Source.Local {
 		src, ok := served[o.Source.StoreID]
@@ -414,10 +420,10 @@ func (e *storeWorker) fetch(ctx context.Context, o store.CopyOrder, served map[s
 			return e.fetchRemote(ctx, o, name, offset)
 		}
 	}
-	if err := writeFrom(ctx, dir, listName+partialSuffix, open, listName, false, -1); err != nil {
+	if err := writeFrom(ctx, dir, localList+partialSuffix, open, listName, false, -1); err != nil {
 		return err
 	}
-	return writeFrom(ctx, dir, packName+partialSuffix, open, packName, true, o.PackBytes)
+	return writeFrom(ctx, dir, localPack+partialSuffix, open, packName, true, o.PackBytes)
 }
 
 // writeFrom writes the source file name into partial in dir: from where an

@@ -81,7 +81,7 @@ func TestALostTaskContinuesFromItsLatestCheckpoint(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)
 	ctx := context.Background()
-	lossProject(t, store, true, "/srv/ckpt/step-200")
+	train := lossProject(t, store, true, "/srv/ckpt/step-200")
 	if task := projectTasks(t, store, "orchestrated")["train"]; task.State != "running" {
 		t.Fatalf("train %s while its lost attempt's lease is stale", task.State)
 	}
@@ -102,6 +102,11 @@ func TestALostTaskContinuesFromItsLatestCheckpoint(t *testing.T) {
 	next := launchNext(t, store)
 	if next.Execution.InputContinuationRef == nil || *next.Execution.InputContinuationRef != "/srv/ckpt/step-200" {
 		t.Fatalf("continuation handed: %v", next.Execution.InputContinuationRef)
+	}
+	// it goes on in its run: its output directory, holding the checkpoint
+	// (/kairo/output in a container), is the one its run wrote
+	if next.RunID != train.RunID {
+		t.Fatalf("the continuation after a loss is in run %q, want its run %s", next.RunID, train.RunID)
 	}
 }
 

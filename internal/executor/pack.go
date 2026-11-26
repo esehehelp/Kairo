@@ -86,7 +86,9 @@ type packResult struct {
 // kindOf is the directory kind of an object kind.
 func kindOf(objectKind string) (dirKind, bool) {
 	switch objectKind {
-	case store.ObjectOutput:
+	case store.ObjectOutput, store.ObjectOutputMove:
+		// a move's: the run's output directory, packed to be brought to
+		// another node (store/outputlandings.go)
 		return kindOutput, true
 	case store.ObjectScratch:
 		return kindScratch, true
@@ -830,20 +832,33 @@ func checkTransferPack(s servedStore, o store.PackOrder, res packResult) error {
 
 // dropTransferPack removes the pack made to bring temporal data to another
 // node once nothing waits for it there (o.Drop); its file list, the
-// object's identity, stays.
+// object's identity, stays. A run's output directory packed to move it
+// (o.DropSource) is removed with it once it has landed where it went
+// (store/outputlandings.go): the run's directory is that one now.
 func (e *storeWorker) dropTransferPack(ctx context.Context, o store.PackOrder, s servedStore, served bool) {
 	if !served || s.decl.Root != o.Root {
 		return
 	}
+	if o.DropSource && (!validScratchID(o.SourceID) || e.inUse(kindOutput, o.SourceID)) {
+		return // an attempt of the run runs here: asked again later
+	}
 	err := removePackOnly(s.fs, s.decl.Root, o.ObjectID)
+	if err == nil && o.DropSource {
+		err = s.fs.RemoveKind(ctx, s.decl.Root, kindOutput, kindPath(s.fs, s.decl.Root, kindOutput, o.SourceID), o.SourceID, false)
+	}
 	if err == nil {
-		err = e.Store.RecordPack(ctx, store.PackMade{ObjectID: o.ObjectID, ExecutorID: e.ID, Dropped: true})
+		err = e.Store.RecordPack(ctx, store.PackMade{ObjectID: o.ObjectID, ExecutorID: e.ID, Dropped: true, SourceRemoved: o.DropSource})
 	}
 	if err != nil {
 		e.packProblem(o.ObjectID, "pack made for a move not removed", err)
 		return
 	}
 	e.packProblem(o.ObjectID, "", nil)
+	if o.DropSource {
+		e.forgetOutputSize(o.SourceID)
+		e.Logger.Info("removed a run's output directory moved to another node, with its pack", "object_id", o.ObjectID, "run_id", o.SourceID)
+		return
+	}
 	e.Logger.Info("removed the pack made to bring temporal data to another node", "object_id", o.ObjectID)
 }
 

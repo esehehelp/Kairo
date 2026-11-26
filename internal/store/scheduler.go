@@ -59,7 +59,9 @@ type Launch struct {
 	// it, or the data policy confines every launch now (DataPolicy).
 	Confine bool `json:"confine,omitempty"`
 	// Store: the volatile store this attempt's scratch, output and cache
-	// directories are to go on ("" for the executor's first).
+	// directories are to go on: the one its execution names, else the one
+	// of this node holding its run's output directory (launchStoreTx), else
+	// "" (the executor's first).
 	Store string `json:"store,omitempty"`
 	// Source: the code snapshot the attempt runs in (sources.go), CWD
 	// relative to it.
@@ -113,6 +115,9 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 		}
 	}
 	history := s.runHistory(ctx)
+	// read before the transaction, as the history: a pass must not wait for
+	// a connection while it holds one (passes run concurrently)
+	perf := s.nodePerf(ctx)
 	started := time.Now()
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -126,6 +131,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	if err != nil {
 		return nil, err
 	}
+	m.perf = perf
 	candidates, err := loadPlanCandidates(ctx, tx, m)
 	if err != nil {
 		return nil, err
@@ -142,6 +148,18 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 		switch {
 		case placement.terminal != "":
 			return false, terminalizeAdmissionTx(ctx, tx, c.execution, placement.terminal)
+		case placement.move != nil:
+			// its run's output directory goes to where it is to run first
+			// (outputhome.go)
+			mv := placement.move
+			ordered, err := orderOutputMoveTx(ctx, tx, c.execution.ID, c.execution.ProjectScopeID, mv.home, mv.to, mv.estimate)
+			if err != nil {
+				return false, err
+			}
+			if !ordered {
+				placement.wait = planWait{reason: "output_elsewhere", node: mv.home.nodeID, message: "its run's output directory is on " + mv.home.nodeID + "; " + mv.to + " has no volatile store to bring it to"}
+			}
+			waits[c.execution.ID] = placement.wait
 		case len(placement.slots) == 0:
 			waits[c.execution.ID] = placement.wait
 		case m.onNode(placement.slots[0], caller, c.selectorJSON).id != executorID:
@@ -674,7 +692,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		if launch.Inputs, err = resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON); err != nil {
 			return nil, err
 		}
-		launch.Env, launch.ScratchTmpdir, launch.Confine, launch.Store = env, scratchTmpdir, confine || s.confinesAll(time.Now()), storeID.String
+		launch.Env, launch.ScratchTmpdir, launch.Confine = env, scratchTmpdir, confine || s.confinesAll(time.Now())
+		if launch.Store, err = launchStoreTx(ctx, tx, storeID, launch.RunID, executorID); err != nil {
+			return nil, err
+		}
 		if launch.Source, err = launchSourceTx(ctx, tx, executionID); err != nil {
 			return nil, err
 		}
@@ -739,6 +760,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err != nil {
 		return nil, err
 	}
+	launchStore, err := launchStoreTx(ctx, tx, storeID, runID, executorID)
+	if err != nil {
+		return nil, err
+	}
 	inputs, err := resolveInputsTx(ctx, tx, executionID, projectID, executorID, inputsJSON)
 	if err != nil {
 		return nil, err
@@ -781,7 +806,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		RunID:                runID,
 		Inputs:               inputs,
 		Confine:              confine || s.confinesAll(time.Now()),
-		Store:                storeID.String,
+		Store:                launchStore,
 		Source:               source,
 		Image:                image,
 		Streams:              streams,

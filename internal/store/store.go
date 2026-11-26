@@ -59,6 +59,9 @@ type Store struct {
 	// runs is the run history the planner estimates run times from
 	// (estimate.go).
 	runs runHistoryCache
+	// perf is what hardware benches measured, for the planner's estimate of
+	// where a continuation ends soonest (nodeperf.go).
+	perf perfCache
 	// data is the data policy (scrub.go).
 	data DataPolicy
 }

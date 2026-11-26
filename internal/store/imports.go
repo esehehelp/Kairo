@@ -371,7 +371,9 @@ func (s *Store) DataObjects(ctx context.Context, filter DataObjectFilter) ([]Dat
 	if limit <= 0 {
 		limit = 200
 	}
-	where := `WHERE ($1='' OR p.external_key=$1) AND ($2='' OR d.kind=$2)`
+	// (a run's output directory packed to move it is not data Kairo keeps:
+	// listed only when asked for by its kind, outputlandings.go)
+	where := `WHERE ($1='' OR p.external_key=$1) AND ($2='' AND d.kind<>'output-move' OR d.kind=$2)`
 	args := []any{filter.Project, filter.Kind, limit}
 	if filter.Task != "" || filter.Execution != "" {
 		where += ` AND d.kind='output' AND d.source_id IN (

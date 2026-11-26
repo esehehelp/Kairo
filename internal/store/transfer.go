@@ -70,8 +70,10 @@ func bringTemporalTx(ctx context.Context, tx *sql.Tx, declared []machine.Store, 
 // from.
 func dropTransfersTx(ctx context.Context, tx *sql.Tx, wanted map[string]bool) error {
 	var packed []string
+	// (nor a move's pack while its landing is being brought: outputlandings.go)
 	err := eachRow(ctx, tx, `SELECT d.id FROM data_objects d WHERE d.transfer_state=$1
-		AND NOT EXISTS(SELECT 1 FROM object_placements p WHERE p.object_id=d.id AND p.state='fetching')`, []any{transferPacked}, func(rows *sql.Rows) error {
+		AND NOT EXISTS(SELECT 1 FROM object_placements p WHERE p.object_id=d.id AND p.state='fetching')
+		AND NOT EXISTS(SELECT 1 FROM output_landings l WHERE l.object_id=d.id AND l.state IN `+landingLive+`)`, []any{transferPacked}, func(rows *sql.Rows) error {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			return err
@@ -124,6 +126,9 @@ func recordTransferTx(ctx context.Context, tx *sql.Tx, made PackMade, root strin
 			return err
 		}
 		if err := appendCoordinationEventTx(ctx, tx, "transfer_dropped", project, "object", made.ObjectID, nil, nil); err != nil {
+			return err
+		}
+		if err := moveDroppedTx(ctx, tx, made, project); err != nil {
 			return err
 		}
 		return tx.Commit()
