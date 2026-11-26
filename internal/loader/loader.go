@@ -247,6 +247,11 @@ func (l *Loader) produceRank(ctx context.Context, gen *generation, r int, positi
 		in.Close()
 	}()
 	order := newOrderer(in, l.Spec.Block, l.Spec.Seed)
+	if world > 1 {
+		// its share of each block only (the stream's last block, short,
+		// is read twice: its order is of its length)
+		order.keep = func(g int64) bool { return int(g%world) == r }
+	}
 	if err := order.seek(ctx, pos.Record*world+int64(r)); err != nil {
 		return err
 	}

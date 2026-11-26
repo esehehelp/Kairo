@@ -141,6 +141,10 @@ type orderer struct {
 	t     int // the next of it to give
 	g     int64
 	ended bool
+	// keep, when set, says which outputs are wanted: a block keeps only
+	// their records (the others are given as nil), so that each rank's
+	// producer holds its share of a block, not all of it
+	keep func(g int64) bool
 }
 
 func newOrderer(in *inputs, block int, seed uint64) *orderer {
@@ -166,18 +170,25 @@ func (o *orderer) seek(ctx context.Context, g int64) error {
 	return nil
 }
 
-// fill reads block j's records.
+// fill reads block j's records (those of wanted outputs only, with keep).
+// A block's order is of its length, known once it is read: a short block
+// (the stream's last) is read again, keeping what its own order wants.
 func (o *orderer) fill(ctx context.Context) error {
-	o.recs = o.recs[:0]
-	for int64(len(o.recs)) < o.block {
-		rec, ok, err := o.in.next(ctx)
-		if err != nil {
+	want := o.wanted(int(o.block))
+	if err := o.read(ctx, int(o.block), want); err != nil {
+		return err
+	}
+	if want != nil && len(o.recs) > 0 && int64(len(o.recs)) < o.block {
+		n := len(o.recs)
+		if err := o.in.seek(ctx, o.j*o.block); err != nil {
 			return err
 		}
-		if !ok {
-			break
+		if err := o.read(ctx, n, o.wanted(n)); err != nil {
+			return err
 		}
-		o.recs = append(o.recs, rec)
+		if len(o.recs) != n {
+			return fmt.Errorf("block %d gave %d records, then %d", o.j, n, len(o.recs))
+		}
 	}
 	if o.block > 1 {
 		o.perm = permutation(len(o.recs), seedOf(o.seed, "block", uint64(o.j)))
@@ -186,6 +197,42 @@ func (o *orderer) fill(ctx context.Context) error {
 	}
 	o.t = 0
 	return nil
+}
+
+// read reads up to n records of block j, keeping those want says (all
+// with want nil).
+func (o *orderer) read(ctx context.Context, n int, want []bool) error {
+	o.recs = o.recs[:0]
+	for len(o.recs) < n {
+		rec, ok, err := o.in.next(ctx)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			break
+		}
+		if want != nil && !want[len(o.recs)] {
+			rec = nil
+		}
+		o.recs = append(o.recs, rec)
+	}
+	return nil
+}
+
+// wanted is which inputs of block j, were it n records long, give outputs
+// keep wants (nil: all).
+func (o *orderer) wanted(n int) []bool {
+	if o.keep == nil || o.block <= 1 {
+		return nil
+	}
+	perm := permutation(n, seedOf(o.seed, "block", uint64(o.j)))
+	want := make([]bool, n)
+	for t, i := range perm {
+		if o.keep(o.j*o.block + int64(t)) {
+			want[i] = true
+		}
+	}
+	return want
 }
 
 // next is output g's record; ok false once the stream ended.
