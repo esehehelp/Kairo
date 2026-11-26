@@ -421,7 +421,16 @@ func TestARerunFromACheckpointStartsWithTheOutputHoldingIt(t *testing.T) {
 		PackBytes: 10, ContentBytes: 20, Files: 2, PackSHA256: strings.Repeat("ab", 32), ManifestSHA256: strings.Repeat("cd", 32)}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err = store.RerunTaskWith(ctx, "moves", "train", "tester", "from-7", RerunOptions{FromCheckpoint: "latest"}); err != nil {
+	// the task paused (as pause --force leaves it): the rerun says it waits
+	scope := taskScopeID(t, store, "moves", "training", "train")
+	if _, err = store.PauseScope(ctx, scope, "tester", "pause-before-rerun"); err != nil {
+		t.Fatal(err)
+	}
+	result, err := store.RerunTaskWith(ctx, "moves", "train", "tester", "from-7", RerunOptions{FromCheckpoint: "latest"})
+	if err != nil || len(result.Paused) != 1 || result.Paused[0].Scope != "task" || result.Paused[0].ClosedBy != "tester" {
+		t.Fatalf("rerun of a paused task: %+v %v", result.Paused, err)
+	}
+	if _, err = store.ResumeScope(ctx, scope, "tester"); err != nil {
 		t.Fatal(err)
 	}
 	if err = store.ReconcileProjectTasks(ctx); err != nil {
@@ -430,6 +439,24 @@ func TestARerunFromACheckpointStartsWithTheOutputHoldingIt(t *testing.T) {
 	var rerun string
 	if err = store.db.QueryRow(`SELECT id FROM execution_requests WHERE state='waiting' AND input_continuation_ref='/kairo/output/ckpt/step-7'`).Scan(&rerun); err != nil {
 		t.Fatal(err)
+	}
+	// task show: the checkpoint the first attempt published, and the rerun's
+	// start from it
+	detail, err := store.GetTaskDetail(ctx, "moves", "train")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shown, from bool
+	for _, e := range detail.Executions {
+		for _, a := range e.Attempts {
+			shown = shown || len(a.Checkpoints) == 1 && a.Checkpoints[0].ContinuationRef == "/kairo/output/ckpt/step-7" && a.Checkpoints[0].Kind == "checkpoint"
+		}
+		if e.ExecutionID == rerun {
+			from = e.FromCheckpoint != nil && e.FromCheckpoint.ContinuationRef == "/kairo/output/ckpt/step-7"
+		}
+	}
+	if !shown || !from {
+		t.Fatalf("task show: checkpoint shown %v, rerun from it %v: %+v", shown, from, detail.Executions)
 	}
 	if state, node, storeID, objectID := landingState(t, store, rerun); state != landingBringing || node != "node" || storeID != "a-scratch" || objectID != output {
 		t.Fatalf("landing %s %s %s %s", state, node, storeID, objectID)

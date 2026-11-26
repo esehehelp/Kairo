@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -102,6 +103,9 @@ func renderExecution(w io.Writer, e taskExecution, now time.Time) {
 		fmt.Fprintf(w, "  %-11s %s\n", label+":", fmt.Sprintf(format, args...))
 	}
 	line("id", "%s", e.ExecutionID)
+	if cp := e.FromCheckpoint; cp != nil {
+		line("from", "%s", checkpointText(*cp))
+	}
 	for _, output := range e.Outputs {
 		text := fmt.Sprintf("%s  %s  %s  verified copies: %d", output.ID, output.State, output.Lifecycle, output.Copies)
 		if output.ExecutionID != e.ExecutionID {
@@ -197,6 +201,51 @@ func renderAttempt(w io.Writer, a attemptInfo) {
 		// beside the RAM reserved (resources above): what to declare
 		line("ram", "peak %s seen (sampled every 15 s)", byteSize(*a.RAMPeakBytes))
 	}
+	if n := len(a.Checkpoints); n > 0 {
+		text := checkpointText(a.Checkpoints[n-1])
+		if n > 1 {
+			text += fmt.Sprintf("  (latest of %d)", n)
+		}
+		line("checkpoint", "%s", text)
+	}
+}
+
+// checkpointText is a checkpoint as task show prints it: its reference, the
+// command and its origin, when, and where each stream stood (each rank's
+// record and output within it).
+func checkpointText(cp store.CheckpointView) string {
+	text := cp.ContinuationRef
+	if text == "" {
+		text = "(no reference)"
+	}
+	text += fmt.Sprintf("  %s %s %s", cp.Kind, cp.CommandID, cp.Origin)
+	if t, err := time.Parse(time.RFC3339Nano, cp.At); err == nil {
+		text += " " + longTime(t)
+	}
+	var streams map[string]struct {
+		World     int `json:"world"`
+		Positions []struct {
+			Rank   int   `json:"rank"`
+			Record int64 `json:"record"`
+			Sub    int64 `json:"sub"`
+		} `json:"positions"`
+	}
+	if len(cp.Streams) == 0 || json.Unmarshal(cp.Streams, &streams) != nil {
+		return text
+	}
+	names := make([]string, 0, len(streams))
+	for name := range streams {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		var at []string
+		for _, p := range streams[name].Positions {
+			at = append(at, fmt.Sprintf("rank %d at record %d sub %d", p.Rank, p.Record, p.Sub))
+		}
+		text += fmt.Sprintf("; stream %s (world %d): %s", name, streams[name].World, strings.Join(at, ", "))
+	}
+	return text
 }
 
 // energyText is what an attempt's GPUs used: "GPU 1.23 kWh", "GPU 37.5 Wh

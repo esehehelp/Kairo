@@ -21,6 +21,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -650,8 +651,12 @@ func containerInit(specPath string) int {
 		fmt.Fprintln(stderr, "kairo container: start:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
+	// once the container is being stopped, a loader that ends (the stop
+	// reached it too) is not started again
+	var stopping atomic.Bool
 	go func() {
 		for sig := range sigs {
+			stopping.Store(true)
 			s := sig.(syscall.Signal)
 			if s == syscall.SIGPWR {
 				s = syscall.SIGTERM
@@ -659,7 +664,7 @@ func containerInit(specPath string) int {
 			_ = syscall.Kill(-cmd.Process.Pid, s)
 		}
 	}()
-	exit, sig := reapUntil(cmd.Process.Pid, loaders.restart)
+	exit, sig := reapUntil(cmd.Process.Pid, func(pid int) { loaders.ended(pid, !stopping.Load()) })
 	if sig != 0 {
 		fmt.Fprintf(stderr, "kairo container: %s ended by signal %d (%v)\n", spec.Argv[0], int(sig), sig)
 	}
@@ -756,15 +761,19 @@ func (p *loaderProc) start() error {
 	return nil
 }
 
-// restart starts again the loader whose process pid ended (reaped), up to
-// loaderRestarts times: its readers come back at their positions.
-func (l loaderProcs) restart(pid int) {
+// ended takes the end of a loader's process pid (reaped): with again, it
+// starts it again, up to loaderRestarts times (its readers come back at their
+// positions); without (the container is being stopped), it does not.
+func (l loaderProcs) ended(pid int, again bool) {
 	for _, p := range l {
 		if p.pid != pid {
 			continue
 		}
 		p.pid = 0
 		_ = syscall.Kill(-pid, syscall.SIGKILL) // its stages
+		if !again {
+			return
+		}
 		if p.restarts >= loaderRestarts {
 			fmt.Fprintf(p.logs, "kairo container: the loader of stream %s ended %d times: not started again\n", p.stream, p.restarts+1)
 			return

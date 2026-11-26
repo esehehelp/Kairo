@@ -419,6 +419,24 @@ func taskRerun(args []string) error {
 	for _, name := range result.Unblocked {
 		fmt.Println("unblocked", name)
 	}
+	for _, gate := range result.Paused {
+		text := "the " + gate.Scope + " is paused"
+		if gate.ClosedBy != "" {
+			text += " (by " + gate.ClosedBy + ")"
+		}
+		resume := "kairo task resume " + ref.project + " " + ref.task
+		switch gate.Scope {
+		case "project":
+			resume = "kairo project resume " + ref.project
+		case "queue":
+			queue := ref.queue
+			if queue == "" {
+				queue = "QUEUE"
+			}
+			resume = "kairo queue resume " + ref.project + " " + queue
+		}
+		fmt.Printf("%s: the rerun waits until %s\n", text, resume)
+	}
 	return nil
 }
 

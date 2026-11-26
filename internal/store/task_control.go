@@ -43,6 +43,10 @@ type RerunResult struct {
 	FromCheckpoint *RerunCheckpoint `json:"from_checkpoint,omitempty"`
 	// SourceSnapshot is the snapshot a rerun in another one runs in.
 	SourceSnapshot string `json:"source_snapshot,omitempty"`
+	// Paused are the closed gates of the task's scopes (a pause, or the
+	// pause --force that stopped it): the rerun waits (scope_gate_closed)
+	// until they are opened (kairo task resume, queue or project resume).
+	Paused []TaskGate `json:"paused,omitempty"`
 }
 
 // RerunCheckpoint is the checkpoint a rerun goes on from: the command
@@ -293,6 +297,22 @@ func (s *Store) RerunTaskWith(ctx context.Context, project, name, actor, request
 		return RerunResult{}, err
 	}
 	out := RerunResult{Task: name, State: "pending", Ordinal: ordinal, Unblocked: []string{}, FromCheckpoint: checkpoint, SourceSnapshot: snapshot}
+	// a rerun runs only through its scopes' gates: one left closed (by the
+	// pause --force that stopped the task, say) is told, not opened
+	err = eachRow(ctx, tx, `SELECT s.kind,`+gateCloserColumns+` FROM coordination_scopes s JOIN admission_gates g ON g.scope_id=s.id
+		WHERE s.id IN($1,$2,$3) AND g.state='closed' ORDER BY CASE s.kind WHEN 'project' THEN 0 WHEN 'queue' THEN 1 ELSE 2 END`, []any{task.projectID, task.queueScopeID, task.scopeID}, func(rows *sql.Rows) error {
+		gate := TaskGate{State: "closed"}
+		var closedBy, closedAt sql.NullString
+		if err := rows.Scan(&gate.Scope, &closedBy, &closedAt); err != nil {
+			return err
+		}
+		gate.ClosedBy, gate.ClosedAt = closedBy.String, closedAt.String
+		out.Paused = append(out.Paused, gate)
+		return nil
+	})
+	if err != nil {
+		return RerunResult{}, err
+	}
 	dependents, err := tx.QueryContext(ctx, `WITH RECURSIVE dependents(id) AS (
 	 SELECT task_scope_id FROM orchestration_task_dependencies WHERE dependency_task_scope_id=$1
 	 UNION SELECT d.task_scope_id FROM orchestration_task_dependencies d JOIN dependents ON d.dependency_task_scope_id=dependents.id
