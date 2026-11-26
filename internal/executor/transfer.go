@@ -646,8 +646,10 @@ func (e *storeWorker) copyProblem(objectID, message string, err error) {
 // with "Authorization: Bearer <token>", each request asked of the daemon
 // (store.AuthorizePackRead), which says which store holds the pack; the pack
 // is read from that store as this agent's executors serve it, through
-// handles, with range requests answered. Anything else is 404, and a request
-// the daemon does not authorize 403, saying nothing more.
+// handles, with range requests answered. It hands the raw files its raw
+// caches keep the same way (GET /raw/<sha256>, rawpeers.go). Anything else
+// is 404, and a request the daemon does not authorize 403, saying nothing
+// more.
 type PackServer struct {
 	Store     Coordinator
 	NodeID    string
@@ -760,6 +762,10 @@ func (p *PackServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if runID, ok := strings.CutPrefix(r.URL.Path, bench.PackPathPrefix); ok {
 		p.serveBenchNet(w, r, runID)
+		return
+	}
+	if sha256, ok := strings.CutPrefix(r.URL.Path, rawPeerPrefix); ok {
+		p.serveRaw(w, r, sha256)
 		return
 	}
 	name, ok := strings.CutPrefix(r.URL.Path, "/packs/")

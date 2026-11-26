@@ -220,6 +220,20 @@ func (s *Server) agentOps() []agentOp {
 				f, found, err := s.Store.RawIdentity(ctx, b.ExecutorID, b.URL)
 				return agentops.RawIdentityAnswer{File: f, Found: found}, err
 			}),
+		handle(s, agentops.RawSources,
+			func(ctx context.Context, b agentops.RawIdentityRequest) (string, error) {
+				return s.Store.ExecutorNode(ctx, b.ExecutorID)
+			},
+			func(ctx context.Context, b agentops.RawIdentityRequest) (agentops.RawSourcesAnswer, error) {
+				sources, err := s.Store.RawSources(ctx, b.ExecutorID, b.URL)
+				return agentops.RawSourcesAnswer{Sources: sources}, err
+			}),
+		handle(s, agentops.RawRead,
+			func(_ context.Context, b agentops.RawReadRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.RawReadRequest) (agentops.PackReadAnswer, error) {
+				read, err := s.Store.AuthorizeRawRead(ctx, b.NodeID, b.SHA256, b.Token)
+				return agentops.PackReadAnswer{Read: read}, err
+			}),
 		handle(s, agentops.RawRecords,
 			func(ctx context.Context, b agentops.RawRecordsRequest) (string, error) {
 				return s.Store.ExecutorNode(ctx, b.ExecutorID)
