@@ -142,10 +142,7 @@ func (l *Loader) WriteStatus(ctx context.Context, path string, every, window tim
 	defer tick.Stop()
 	for {
 		st := l.Status()
-		history = append(history, st)
-		for len(history) > 1 && st.At.Sub(history[0].At) > window {
-			history = history[1:]
-		}
+		history = recent(history, st, window)
 		withRates(&st, history[0])
 		if body, err := json.Marshal(st); err == nil {
 			tmp := path + ".tmp"
@@ -159,6 +156,20 @@ func (l *Loader) WriteStatus(ctx context.Context, path string, every, window tim
 		case <-tick.C:
 		}
 	}
+}
+
+// recent is history with st added, of the last window and of st's ranks
+// only: a status from before the first rank came (no ranks) gives no rates,
+// and must not keep the first window's from being taken.
+func recent(history []Status, st Status, window time.Duration) []Status {
+	if len(history) > 0 && history[len(history)-1].World != st.World {
+		history = nil
+	}
+	history = append(history, st)
+	for len(history) > 1 && st.At.Sub(history[0].At) > window {
+		history = history[1:]
+	}
+	return history
 }
 
 // withRates sets st's rates from what changed since before.

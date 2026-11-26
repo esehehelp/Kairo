@@ -972,6 +972,20 @@ func TestStatusRatesAreOverTheWindow(t *testing.T) {
 	if r := now.Ranks[0]; now.WindowSeconds != 10 || r.ItemsPerSecond != 50 || r.BytesPerSecond != 500 || r.StarvedShare != 0.25 {
 		t.Fatalf("rates %+v over %v", r, now.WindowSeconds)
 	}
+	// a status before the first rank came is not what rates are taken from
+	var history []Status
+	for i, world := range []int{0, 0, 1, 1} {
+		history = recent(history, Status{At: at.Add(time.Duration(i) * 5 * time.Second), World: world}, 30*time.Second)
+	}
+	if len(history) != 2 || history[0].World != 1 || !history[0].At.Equal(at.Add(10*time.Second)) {
+		t.Fatalf("history %+v", history)
+	}
+	for i := 4; i < 12; i++ {
+		history = recent(history, Status{At: at.Add(time.Duration(i) * 5 * time.Second), World: 1}, 30*time.Second)
+	}
+	if len(history) != 7 || !history[0].At.Equal(at.Add(25*time.Second)) {
+		t.Fatalf("a window of 30 s: %d, from %v", len(history), history[0].At)
+	}
 	same := Status{At: at, World: 1, Ranks: []RankStatus{{Taken: 1}}}
 	if withRates(&same, same); same.WindowSeconds != 0 || same.Ranks[0].ItemsPerSecond != 0 {
 		t.Fatalf("no time passed: %+v", same)

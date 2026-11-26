@@ -564,7 +564,7 @@ var commandNotes = map[string]string{
 		"CPU cpu-compute, cpu-single, cpu-stream (swept); disk:FS disk-seq-read, disk-seq-write, disk-rand-read,\n" +
 		"disk-rand-read-qd1, disk-rand-write, disk-fsync, disk-sustained; net:NODE net-latency, net-bandwidth-send,\n" +
 		"net-bandwidth-recv. A prefix names a group (--kinds pcie,gemv). The bench waits at the lowest priority\n" +
-		"for the device alone (GPU: the GPU; CPU: the node's whole CPU; disk: the filesystem; net: being rebuilt between the nodes' agents).",
+		"for the device alone (GPU: the GPU; CPU: the node's whole CPU; disk: the filesystem; net: no task, measured between the nodes' agents).",
 	"hardware profile": "A point marked * is the one chosen for the device's max_slowdown: the valid point within it using the\n" +
 		"least energy per unit of work. Drift compares a kind with the device's previous bench, never with a specification.",
 }
