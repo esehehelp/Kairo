@@ -285,6 +285,13 @@ func serve(args []string) error {
 				if err := st.ReconcileNodeQuarantines(ctx); err != nil && ctx.Err() == nil {
 					logger.Error("node quarantine reconciliation failed", "error", err)
 				}
+				// its owner's use of a resource: the work there that can
+				// checkpoint gives way (README: Owner use)
+				if n, err := st.ReconcileOwnerUse(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("owner use reconciliation failed", "error", err)
+				} else if n > 0 {
+					logger.Info("work suspended for its owner's use of a resource", "suspends", n)
+				}
 				select {
 				case <-ctx.Done():
 					return

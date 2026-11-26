@@ -22,8 +22,16 @@ type Host struct {
 	TTL        time.Duration
 	// Meter reads the CPU package power; nil means cpupower.New().
 	Meter cpupower.Meter
+	// Owner tells its owner's use of the node's CPU and RAM (owneruse.go);
+	// nil tells none.
+	Owner *OwnerUse
+	// CPUTimes reads the node's CPU time (nil: readCPUTimes).
+	CPUTimes func() (cpuTimes, error)
 
 	meterOnce sync.Once
+	cpuMu     sync.Mutex
+	cpuPrev   cpuTimes
+	cpuHave   bool
 }
 
 func (p *Host) ID() string { return p.ProviderID }
@@ -50,7 +58,38 @@ func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 		watts := reading.Watts
 		observations[0].Device = &store.DeviceSample{PowerW: &watts}
 	}
-	return Snapshot{Resources: resources, Observations: observations}
+	return Snapshot{Resources: resources, Observations: observations, Claims: p.ownerClaims(resources[0].ID, resources[1].ID, ramTotal, ramFree)}
+}
+
+// ownerClaims are the owner_use claims of the node's CPU and RAM
+// (owneruse.go): the CPU's from this reading of its CPU time and the last.
+func (p *Host) ownerClaims(cpuID, ramID string, ramTotal, ramFree int64) []store.ExternalClaim {
+	if !p.Owner.enabled() {
+		return nil
+	}
+	present, _ := p.Owner.present()
+	var claims []store.ExternalClaim
+	read := p.CPUTimes
+	if read == nil {
+		read = readCPUTimes
+	}
+	if cur, err := read(); err == nil {
+		p.cpuMu.Lock()
+		prev, have := p.cpuPrev, p.cpuHave
+		p.cpuPrev, p.cpuHave = cur, true
+		p.cpuMu.Unlock()
+		if busy, kairo, owner, ok := cpuOwnerUse(prev, cur); have && ok {
+			threshold := p.Owner.cpuThreshold(present)
+			if busy >= ownerCPUBusy && owner*100 >= threshold {
+				claims = append(claims, ownerClaim(cpuID, map[string]any{"source": "observed", "busy_percent": busy * 100, "kairo_percent": kairo * 100,
+					"owner_percent": owner * 100, "threshold_percent": threshold, "owner_present": present}))
+			}
+		}
+	}
+	if floor := p.Owner.ramFloor(ramTotal, present); ramTotal > 0 && ramFree < floor {
+		claims = append(claims, ownerClaim(ramID, map[string]any{"source": "observed", "available_bytes": ramFree, "floor_bytes": floor, "owner_present": present}))
+	}
+	return claims
 }
 
 func (p *Host) Prepare(ctx context.Context, r store.ResourceInstance) error {

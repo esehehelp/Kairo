@@ -45,6 +45,8 @@ type NVIDIA struct {
 	// memory in use beyond it is unattributed activity although graphics
 	// processes show (zero: defaultGraphicsVRAMAllowance, 3 GiB).
 	GraphicsVRAMAllowance int64
+	// Owner tells its owner's use of a GPU (owneruse.go); nil tells none.
+	Owner *OwnerUse
 
 	query atomic.Int32 // the index in nvidiaQueries of the query this driver accepts
 }
@@ -239,7 +241,8 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 	}
 	// pmon exposes the C/G process type. query-compute-apps on WDDM drivers may
 	// include ordinary desktop graphics clients, which must not claim a GPU.
-	processes, processErr := p.run(ctx, "pmon", "-c", "1", "-s", "m")
+	// -s um: each process's SM share (its owner's use, owneruse.go) and memory
+	processes, processErr := p.run(ctx, "pmon", "-c", "1", "-s", "um")
 	if errors.Is(processErr, context.DeadlineExceeded) {
 		// Without the process list the GPUs' claims are unknown: fail the
 		// observation rather than record them as unclaimed.
@@ -248,19 +251,36 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 	seenProcess := map[string]bool{}
 	// graphics: GPUs on which a graphics process was seen (see GraphicsExplainVRAM).
 	graphics := map[string]bool{}
+	// owner: the graphics processes using each GPU's SMs (owneruse.go)
+	owner := map[string][]ownerProcess{}
 	if processErr == nil {
+		cols := pmonColumns{gpu: 0, pid: 1, kind: 2, sm: -1, fb: 3, command: 4}
+		header := false
 		for _, line := range strings.Split(string(processes), "\n") {
-			fields := strings.Fields(line)
-			if len(fields) < 4 || strings.HasPrefix(strings.TrimSpace(line), "#") {
+			if trimmed := strings.TrimSpace(line); strings.HasPrefix(trimmed, "#") {
+				if !header {
+					cols, header = parsePmonHeader(trimmed, cols), true
+				}
 				continue
 			}
-			entry, ok := byIndex[fields[0]]
-			pid, parseErr := strconv.Atoi(fields[1])
-			processType := fields[2]
+			fields := strings.Fields(line)
+			if len(fields) < 4 || len(fields) <= cols.fb || len(fields) <= cols.kind {
+				continue
+			}
+			entry, ok := byIndex[fields[cols.gpu]]
+			pid, parseErr := strconv.Atoi(fields[cols.pid])
+			processType := fields[cols.kind]
 			name := fields[len(fields)-1]
-			fb, _ := strconv.Atoi(fields[3])
+			if cols.command < len(fields) {
+				name = strings.Join(fields[cols.command:], " ")
+			}
+			fb, _ := strconv.Atoi(fields[cols.fb])
 			if ok && parseErr == nil && pid > 0 && strings.Contains(processType, "G") {
 				graphics[entry.uuid] = true
+				// not Kairo's: on Windows its work runs in the wslc VM (vmmem*)
+				if sm, err := strconv.ParseFloat(fieldAt(fields, cols.sm), 64); err == nil && sm > 0 && !strings.HasPrefix(strings.ToLower(name), "vmmem") {
+					owner[entry.uuid] = append(owner[entry.uuid], ownerProcess{PID: pid, Name: name, SM: sm})
+				}
 			}
 			if !ok || parseErr != nil || pid <= 0 || !isComputeProcess(processType, name, fb) {
 				continue
@@ -318,7 +338,56 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 			snap.Claims = append(snap.Claims, store.ExternalClaim{ID: "claim-" + resourceID + "-unattributed", ResourceID: resourceID, ClaimKind: "unattributed_activity", Evidence: evidence})
 		}
 	}
+	if p.Owner.enabled() && len(owner) > 0 {
+		present, _ := p.Owner.present()
+		threshold := p.Owner.gpuThreshold(present)
+		for _, entry := range byIndex {
+			var sum float64
+			for _, o := range owner[entry.uuid] {
+				sum += o.SM
+			}
+			if sum >= threshold {
+				snap.Claims = append(snap.Claims, ownerClaim(entry.resource, map[string]any{"source": "observed", "gpu_uuid": entry.uuid, "sm_percent": sum,
+					"threshold_percent": threshold, "owner_present": present, "processes": topProcesses(owner[entry.uuid])}))
+			}
+		}
+	}
 	return snap, nil
+}
+
+// pmonColumns are where pmon's columns are, by its header.
+type pmonColumns struct{ gpu, pid, kind, sm, fb, command int }
+
+// parsePmonHeader reads the columns from pmon's first header line ("# gpu
+// pid type sm mem ... fb ... command"); a column it does not name keeps
+// def's place.
+func parsePmonHeader(line string, def pmonColumns) pmonColumns {
+	c := def
+	for i, name := range strings.Fields(strings.TrimPrefix(line, "#")) {
+		switch name {
+		case "gpu":
+			c.gpu = i
+		case "pid":
+			c.pid = i
+		case "type":
+			c.kind = i
+		case "sm":
+			c.sm = i
+		case "fb":
+			c.fb = i
+		case "command":
+			c.command = i
+		}
+	}
+	return c
+}
+
+// fieldAt is fields[i], or "" outside them.
+func fieldAt(fields []string, i int) string {
+	if i < 0 || i >= len(fields) {
+		return ""
+	}
+	return fields[i]
 }
 
 // defaultGraphicsVRAMAllowance is the GPU memory graphics processes explain

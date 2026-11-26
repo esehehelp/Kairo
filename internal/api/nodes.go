@@ -123,3 +123,36 @@ func (s *Server) retireNode(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"node": id, "released_leases": released})
 }
+
+// useNodeAsOwner records that the owner of a node uses it (store.UseNodeAsOwner).
+func (s *Server) useNodeAsOwner(w http.ResponseWriter, r *http.Request) {
+	var body store.OwnerUseRequest
+	if err := decodeOptional(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	body.Actor = actorOr(r, body.Actor)
+	uses, err := s.Store.UseNodeAsOwner(r.Context(), r.PathValue("id"), body)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"owner_use": uses})
+}
+
+// ownerDone ends what owner-use set on a node (store.OwnerDone).
+func (s *Server) ownerDone(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Actor string `json:"actor"`
+	}
+	if err := decodeOptional(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	n, err := s.Store.OwnerDone(r.Context(), r.PathValue("id"), actorOr(r, body.Actor))
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"ended": n})
+}

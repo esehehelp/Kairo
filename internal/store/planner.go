@@ -101,6 +101,7 @@ type planGPU struct {
 type planDevice struct {
 	lease                  string // the live lease on any row of the device
 	external, unattributed bool
+	owner                  bool   // its owner uses it (owneruse.go)
 	evidence               string // a foreign process on it, for messages
 }
 
@@ -196,6 +197,9 @@ type planModel struct {
 	// where a run's output directory can be brought (outputhome.go).
 	perf     *nodePerf
 	landable map[string]bool
+	// owners are the nodes whose CPU or RAM their owner uses: the kinds
+	// (owneruse.go)
+	owners map[string][]string
 }
 
 // planOverlay is what the pass has handed out so far: devices placed on or
@@ -387,19 +391,34 @@ func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
 	if err = rows.Err(); err != nil {
 		return err
 	}
-	claims, err := tx.QueryContext(ctx, `SELECT ri.stable_identity,c.claim_kind,c.evidence_json FROM external_claims c JOIN resource_instances ri ON ri.id=c.resource_id
-		WHERE c.cleared_at IS NULL AND ri.kind='gpu' ORDER BY c.first_observed_at`)
+	claims, err := tx.QueryContext(ctx, `SELECT ri.stable_identity,ri.kind,ri.node_id,c.claim_kind,c.evidence_json FROM external_claims c JOIN resource_instances ri ON ri.id=c.resource_id
+		WHERE c.cleared_at IS NULL AND (ri.kind='gpu' OR c.claim_kind=$1) ORDER BY c.first_observed_at`, ClaimOwnerUse)
 	if err != nil {
 		return err
 	}
 	defer claims.Close()
 	for claims.Next() {
-		var identity, claimKind, evidence string
-		if err = claims.Scan(&identity, &claimKind, &evidence); err != nil {
+		var identity, kind, node, claimKind, evidence string
+		if err = claims.Scan(&identity, &kind, &node, &claimKind, &evidence); err != nil {
 			return err
+		}
+		// its owner's use of the node's CPU or RAM keeps work off the node
+		// (owneruse.go)
+		if kind != "gpu" {
+			if m.owners == nil {
+				m.owners = map[string][]string{}
+			}
+			if !slices.Contains(m.owners[node], kind) {
+				m.owners[node] = append(m.owners[node], kind)
+			}
+			continue
 		}
 		device := m.devices[identity]
 		if device == nil {
+			continue
+		}
+		if claimKind == ClaimOwnerUse {
+			device.owner = true
 			continue
 		}
 		if claimKind == "external_process" {
@@ -701,10 +720,14 @@ func (m *planModel) fit(node string, demand planDemand, ov planOverlay, freed fu
 		f.fail("disk_low_watermark", node+": "+strings.Join(low, "; "), false)
 		return f
 	}
+	if kinds := m.owners[node]; len(kinds) != 0 {
+		f.fail("owner_use", node+": its owner is using its "+strings.Join(kinds, " and "), false)
+		return f
+	}
 	taken := map[string]bool{}
 	for _, d := range demand.gpus {
 		var chosen int64
-		var external, unattributed, stale, leased, held, lowMemory bool
+		var external, unattributed, stale, leased, held, lowMemory, owned bool
 		var holders, evidence []string
 		for _, g := range m.gpus[node] {
 			if chosen == d.count {
@@ -726,6 +749,10 @@ func (m *planModel) fit(node string, demand planDemand, ov planOverlay, freed fu
 					continue
 				}
 				released = true
+			}
+			if device.owner {
+				owned = true
+				continue
 			}
 			if device.external {
 				external = true
@@ -764,6 +791,8 @@ func (m *planModel) fit(node string, demand planDemand, ov planOverlay, freed fu
 			need = fmt.Sprintf("%s: GPU %s needed, not usable", node, d.constraints.Device)
 		}
 		switch {
+		case owned:
+			f.fail("owner_use", need+"; its owner is using it", false)
 		case external:
 			f.fail("external_claim", need+"; used by a process Kairo did not start: "+strings.Join(evidence, ", "), d.policy.External == "fail")
 		case unattributed:

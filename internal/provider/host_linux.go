@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -51,4 +52,52 @@ func readMeminfo(path string) (total, available int64, err error) {
 		return 0, 0, fmt.Errorf("%s lacks MemTotal/MemAvailable", path)
 	}
 	return total, available, nil
+}
+
+// readCPUTimes reads the node's CPU time (/proc/stat, in USER_HZ ticks of
+// 1/100 s) and Kairo's: its Incus containers' (cgroup v2
+// lxc.payload.kairo-*), in seconds. Without cgroup v2 Kairo's is unknown.
+func readCPUTimes() (cpuTimes, error) {
+	return readCPUTimesFrom("/proc/stat", "/sys/fs/cgroup")
+}
+
+func readCPUTimesFrom(stat, cgroups string) (cpuTimes, error) {
+	var t cpuTimes
+	body, err := os.ReadFile(stat)
+	if err != nil {
+		return t, err
+	}
+	line, _, _ := strings.Cut(string(body), "\n")
+	fields := strings.Fields(line)
+	if len(fields) < 5 || fields[0] != "cpu" {
+		return t, fmt.Errorf("%s: no cpu line", stat)
+	}
+	for i, f := range fields[1:min(len(fields), 9)] {
+		v, err := strconv.ParseFloat(f, 64)
+		if err != nil {
+			return t, fmt.Errorf("%s: %w", stat, err)
+		}
+		t.total += v / 100
+		if i == 3 || i == 4 { // idle, iowait
+			t.idle += v / 100
+		}
+	}
+	if _, err := os.Stat(filepath.Join(cgroups, "cgroup.controllers")); err != nil {
+		return t, nil // not cgroup v2: Kairo's share unknown
+	}
+	stats, _ := filepath.Glob(filepath.Join(cgroups, "lxc.payload.kairo-*", "cpu.stat"))
+	for _, path := range stats {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			continue // gone meanwhile
+		}
+		for _, l := range strings.Split(string(body), "\n") {
+			if v, ok := strings.CutPrefix(l, "usage_usec "); ok {
+				usec, _ := strconv.ParseFloat(strings.TrimSpace(v), 64)
+				t.kairo += usec / 1e6
+			}
+		}
+	}
+	t.kairoKnown = true
+	return t, nil
 }

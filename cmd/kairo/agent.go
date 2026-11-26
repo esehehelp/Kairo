@@ -73,13 +73,17 @@ func agentCommand(args []string) error {
 
 	providerSet := map[string]provider.Provider{}
 	registered := make([]agentclient.Provider, 0, len(cfg.Providers))
+	// the owner's use of this node's resources (README: Owner use)
+	o := cfg.OwnerUse
+	owner := &provider.OwnerUse{Disabled: o.Disabled, GPUSMPercent: o.GPUSMPercent, GPUSMPercentPresent: o.GPUSMPercentPresent, CPUPercent: o.CPUPercent,
+		CPUPercentPresent: o.CPUPercentPresent, RAMFreeBytes: o.RAMFreeMiB << 20, RAMFreeBytesPresent: o.RAMFreeMiBPresent << 20, InputFile: o.InputFile}
 	for _, p := range cfg.Providers {
 		ttl := time.Duration(p.ObservationTTLSeconds) * time.Second
 		switch p.Kind {
 		case "nvidia":
-			providerSet[p.ID] = &provider.NVIDIA{ProviderID: p.ID, NodeID: cfg.Node.ID, TTL: ttl}
+			providerSet[p.ID] = &provider.NVIDIA{ProviderID: p.ID, NodeID: cfg.Node.ID, TTL: ttl, Owner: owner}
 		case "host":
-			providerSet[p.ID] = &provider.Host{ProviderID: p.ID, NodeID: cfg.Node.ID, TTL: ttl}
+			providerSet[p.ID] = &provider.Host{ProviderID: p.ID, NodeID: cfg.Node.ID, TTL: ttl, Owner: owner}
 		case "filesystem":
 			providerSet[p.ID] = &provider.Filesystem{ProviderID: p.ID, NodeID: cfg.Node.ID, Filesystems: p.Filesystems, TTL: ttl}
 		default:

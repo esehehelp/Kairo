@@ -273,22 +273,28 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 		}
 		observed[o.ResourceID] = !undeclared[o.ResourceID]
 	}
-	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.resource_id FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id WHERE r.provider_id=$1 AND c.cleared_at IS NULL`, providerID)
+	rows, err := tx.QueryContext(ctx, `SELECT c.id,c.resource_id,c.claim_kind,c.last_observed_at FROM external_claims c JOIN resource_instances r ON r.id=c.resource_id WHERE r.provider_id=$1 AND c.cleared_at IS NULL`, providerID)
 	if err != nil {
 		return err
 	}
-	type active struct{ id, resource string }
+	type active struct{ id, resource, kind, last string }
 	var activeClaims []active
 	for rows.Next() {
 		var c active
-		if err := rows.Scan(&c.id, &c.resource); err != nil {
+		if err := rows.Scan(&c.id, &c.resource, &c.kind, &c.last); err != nil {
 			rows.Close()
 			return err
 		}
 		activeClaims = append(activeClaims, c)
 	}
 	rows.Close()
+	now := time.Now().UTC()
 	for _, claim := range activeClaims {
+		// an owner's use holds for a while after it was last seen, and one
+		// set by hand is not a provider's to end (owneruse.go)
+		if claim.kind == ClaimOwnerUse && !ownerUseClearable(claim.id, claim.last, now) {
+			continue
+		}
 		if observed[claim.resource] && !seen[claim.id] {
 			if _, err := tx.ExecContext(ctx, `UPDATE external_claims SET cleared_at=$1 WHERE id=$2 AND cleared_at IS NULL`, t, claim.id); err != nil {
 				return err

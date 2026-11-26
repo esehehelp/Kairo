@@ -260,8 +260,10 @@ func init() {
 				{"snapshot", "[--out DIR]", "write the daemon's database dump, code snapshots, configuration and TLS as one tar (in a control-snapshot attempt: its output directory)", controlSnapshot},
 			},
 		}},
-		{name: "node", summary: "quarantine, release or fence nodes", group: &commandGroup{
+		{name: "node", summary: "quarantine, release or fence nodes; tell Kairo its owner uses one", group: &commandGroup{
 			subs: []command{
+				{"owner-use", "NODE_ID [--gpu UUID]... [--cpu] [--ram] [--for D]", "its owner uses the node (every resource, or those named): nothing is placed there, and the work there that can checkpoint is suspended", nodeOwnerUse},
+				{"owner-done", "NODE_ID", "its owner is done: the node's resources are Kairo's again once nothing else is seen using them", nodeOwnerDone},
 				{"quarantine", "NODE_ID|--all [--reason R]", "suspend or end the work on a node", bind(nodeAction, "quarantine")},
 				{"release", "NODE_ID|--all", "end a node quarantine", bind(nodeAction, "release")},
 				{"quarantine-status", "", "current node quarantines (JSON)", bind(nodeAction, "quarantine-status")},
@@ -278,6 +280,8 @@ func init() {
 			args: "--config DAEMON.toml", help: "run the daemon"},
 		{name: "agent", summary: "run this host as a remote node (--config AGENT.toml)", run: agentCommand,
 			args: "--config AGENT.toml", help: "run this host as a remote node: its providers and executors report to the daemon"},
+		{name: "input-report", summary: "write when the owner last used the keyboard or mouse, for this host's agent (Windows; in the owner's session)", run: inputReport,
+			args: "[--out FILE] [--every D]", help: "write, every few seconds, the owner's last keyboard or mouse input to the file this host's agent reads ([owner_use] input_file): the agent runs in session 0 and cannot see it"},
 		{name: "loader", summary: "streams: raw records in a fixed, resumable order, handed to ranks over a socket (issue #43)", group: &commandGroup{
 			subs: []command{
 				{"serve", "--spec SPEC.json --listen unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--origin http|dir:DIR]", "make a stream for the ranks of an attempt", loaderServe},
