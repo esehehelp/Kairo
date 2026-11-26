@@ -377,7 +377,8 @@ func (s *Store) ListResourceStatus(ctx context.Context) ([]ResourceInstance, err
 	 EXISTS(SELECT 1 FROM external_claims c WHERE c.resource_id IN `+sameDevice("r.id")+` AND c.cleared_at IS NULL),
 	 CASE WHEN r.kind='gpu' THEN COALESCE(
 			(SELECT d.node_id FROM machine_gpus d WHERE d.uuid=r.stable_identity AND d.node_id=r.node_id),
-			(SELECT string_agg(d.node_id,',' ORDER BY d.node_id) FROM machine_gpus d WHERE d.uuid=r.stable_identity)) END
+			(SELECT string_agg(d.node_id,',' ORDER BY d.node_id) FROM machine_gpus d WHERE d.uuid=r.stable_identity)) END,
+	 COALESCE((SELECT NOT n.enabled FROM nodes n WHERE n.id=r.node_id),false)
 	 FROM resource_instances r ORDER BY r.node_id,r.kind,r.id`)
 	if err != nil {
 		return nil, err
@@ -389,7 +390,7 @@ func (s *Store) ListResourceStatus(ctx context.Context) ([]ResourceInstance, err
 		var binding, attrs string
 		var observed, valid sql.NullString
 		var leased, claimed bool
-		if err := rows.Scan(&r.ID, &r.NodeID, &r.ProviderID, &r.Kind, &r.StableIdentity, &binding, &attrs, &r.AdminState, &r.QuarantineReason, &observed, &valid, &leased, &claimed, &r.DeclaredNodeID); err != nil {
+		if err := rows.Scan(&r.ID, &r.NodeID, &r.ProviderID, &r.Kind, &r.StableIdentity, &binding, &attrs, &r.AdminState, &r.QuarantineReason, &observed, &valid, &leased, &claimed, &r.DeclaredNodeID, &r.NodeDisabled); err != nil {
 			return nil, err
 		}
 		r.Binding = json.RawMessage(binding)
