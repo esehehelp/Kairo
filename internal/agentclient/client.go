@@ -229,6 +229,20 @@ func (c *Client) RawIdentity(ctx context.Context, executorID, url string) (loade
 	return out.File, out.Found, err
 }
 
+// RawSources are the other nodes keeping the raw file url was identified
+// as, each with a token for reading it there.
+func (c *Client) RawSources(ctx context.Context, executorID, url string) ([]store.RawSource, error) {
+	out, err := do(ctx, c, agentops.RawSources, agentops.RawIdentityRequest{ExecutorID: executorID, URL: url})
+	return out.Sources, err
+}
+
+// AuthorizeRawRead is where this node keeps the raw file a token was
+// issued to read here.
+func (c *Client) AuthorizeRawRead(ctx context.Context, nodeID, sha256, token string) (store.PackRead, error) {
+	out, err := do(ctx, c, agentops.RawRead, agentops.RawReadRequest{NodeID: nodeID, SHA256: sha256, Token: token})
+	return out.Read, err
+}
+
 // RawRecords records how many records a kept raw file holds.
 func (c *Client) RawRecords(ctx context.Context, executorID string, count store.RecordsCount) error {
 	return done(ctx, c, agentops.RawRecords, agentops.RawRecordsRequest{ExecutorID: executorID, Count: count})

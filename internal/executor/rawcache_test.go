@@ -34,6 +34,10 @@ type fakeRaws struct {
 	refuse     error
 	// refusePlacement refuses placements on a store (identities pass)
 	refusePlacement error
+	// sources are the other nodes keeping a file (rawpeers_test.go); reads
+	// the reads this node's agent serves, by sha256/token
+	sources []store.RawSource
+	reads   map[string]store.PackRead
 }
 
 func (f *fakeRaws) RawIdentity(_ context.Context, _, url string) (loader.File, bool, error) {

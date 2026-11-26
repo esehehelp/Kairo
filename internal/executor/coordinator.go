@@ -65,6 +65,11 @@ type Coordinator interface {
 	// read; RawRecords: how many records a kept one holds, as counted here.
 	RawIdentity(ctx context.Context, executorID, url string) (loader.File, bool, error)
 	RawRecords(ctx context.Context, executorID string, count store.RecordsCount) error
+	// RawSources: the other nodes keeping a raw file, each with a token for
+	// reading it there; AuthorizeRawRead: where this node keeps the raw file
+	// a token was issued to read here (rawpeers.go).
+	RawSources(ctx context.Context, executorID, url string) ([]store.RawSource, error)
+	AuthorizeRawRead(ctx context.Context, nodeID, sha256, token string) (store.PackRead, error)
 	// InputGone: an input's path is not there at launch.
 	InputGone(ctx context.Context, executorID, objectID, path string) error
 	// InputIsFile: an import read in place is a file, not a directory.

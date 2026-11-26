@@ -155,6 +155,41 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 	if _, _, err := store.RawIdentity(ctx, "far-ctr", url); !errors.Is(err, ErrStreamReportRefused) {
 		t.Fatalf("asked by an executor of a node leasing nothing reading it: %v", err)
 	}
+	// another node keeping the file is a source, with a token its agent
+	// takes for that file only, there only, while it keeps it ready
+	if sources, err := store.RawSources(ctx, "ctr", url); err != nil || len(sources) != 0 {
+		t.Fatalf("sources before another node keeps it: %+v %v", sources, err)
+	}
+	if err := store.UpsertExecutor(ctx, Executor{ID: "far-ctr", NodeID: "far", Kind: "incus", Attributes: json.RawMessage(`{"runtime":"incus","pack_addr":"far:7475"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.testExec(`INSERT INTO raw_placements(store_id,root,sha256,executor_id,bytes,state,created_at,last_used_at) VALUES('far-v','/far',$1,'far-ctr',10,'ready','2026-11-26','2026-11-26')`, f.SHA256); err != nil {
+		t.Fatal(err)
+	}
+	sources, err := store.RawSources(ctx, "ctr", url)
+	if err != nil || len(sources) != 1 || sources[0].NodeID != "far" || sources[0].Addr != "far:7475" || sources[0].Token == "" {
+		t.Fatalf("sources %+v %v", sources, err)
+	}
+	if read, err := store.AuthorizeRawRead(ctx, "far", f.SHA256, sources[0].Token); err != nil || read.StoreID != "far-v" || read.Root != "/far" {
+		t.Fatalf("the read at far: %+v %v", read, err)
+	}
+	for _, c := range []struct{ node, sha, token string }{{"node", f.SHA256, sources[0].Token}, {"far", strings.Repeat("e", 64), sources[0].Token}, {"far", f.SHA256, "krr_other"}} {
+		if _, err := store.AuthorizeRawRead(ctx, c.node, c.sha, c.token); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("a read at %s of %s with %s: %v", c.node, c.sha[:8], c.token, err)
+		}
+	}
+	if _, err := store.testExec(`UPDATE raw_placements SET state='evicting' WHERE store_id='far-v'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.AuthorizeRawRead(ctx, "far", f.SHA256, sources[0].Token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a read of a file being evicted: %v", err)
+	}
+	if _, err := store.testExec(`DELETE FROM raw_placements WHERE store_id='far-v'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RawSources(ctx, "far-ctr", url); !errors.Is(err, ErrStreamReportRefused) {
+		t.Fatalf("sources for a node leasing nothing reading it: %v", err)
+	}
 	streams, err := launchStreamsTx(ctx, store.db, launch.Execution.ID)
 	if err != nil {
 		t.Fatal(err)

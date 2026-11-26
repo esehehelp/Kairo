@@ -825,7 +825,9 @@ func (c *rawCache) notKept(ctx context.Context, declared, canonical loader.File,
 	if found {
 		return canonical, false, nil
 	}
-	identity, err := c.identifyInto(ctx, declared, loader.File{}, false, io.Discard)
+	identity, err := c.identifyInto(ctx, declared, loader.File{}, false, io.Discard, func(ctx context.Context, read loader.File) (io.ReadCloser, error) {
+		return c.fetch.Open(ctx, read, 0)
+	})
 	if err != nil {
 		return loader.File{}, false, err
 	}
@@ -835,9 +837,10 @@ func (c *rawCache) notKept(ctx context.Context, declared, canonical loader.File,
 	return identity, false, nil
 }
 
-// fetchInto fetches a file into .partial: the identity of the bytes
-// written, and where they are.
-func (c *rawCache) fetchInto(ctx context.Context, declared, canonical loader.File, found bool, reserved int64) (loader.File, string, error) {
+// readInto reads a file (opened by open) into a new partial of the raw
+// cache, identifying it as it is written; the partial is removed on a
+// failure.
+func (c *rawCache) readInto(ctx context.Context, declared, canonical loader.File, found bool, reserved int64, open func(context.Context, loader.File) (io.ReadCloser, error)) (loader.File, string, error) {
 	var suffix [8]byte
 	_, _ = rand.Read(suffix[:])
 	partial := filepath.Join(c.dir, ".partial", hex.EncodeToString(suffix[:]))
@@ -845,7 +848,7 @@ func (c *rawCache) fetchInto(ctx context.Context, declared, canonical loader.Fil
 	if err != nil {
 		return loader.File{}, "", err
 	}
-	identity, err := c.identifyInto(ctx, declared, canonical, found, &cappedWriter{w: out, room: reserved})
+	identity, err := c.identifyInto(ctx, declared, canonical, found, &cappedWriter{w: out, room: reserved}, open)
 	if err == nil {
 		err = out.Sync()
 	}
@@ -859,18 +862,18 @@ func (c *rawCache) fetchInto(ctx context.Context, declared, canonical loader.Fil
 	return identity, partial, nil
 }
 
-// identifyInto reads a file from upstream into out (checked against the
+// identifyInto reads a file (from upstream, or another node) into out (checked against the
 // identity the daemon has, when found), computing the identity of the bytes
 // it writes: their whole sha256 and each chunk's, compared at the end with
 // the identity found and with what was published of it.
-func (c *rawCache) identifyInto(ctx context.Context, declared, canonical loader.File, found bool, out io.Writer) (loader.File, error) {
+func (c *rawCache) identifyInto(ctx context.Context, declared, canonical loader.File, found bool, out io.Writer, open func(context.Context, loader.File) (io.ReadCloser, error)) (loader.File, error) {
 	read := declared
 	if found {
 		read = canonical
 	} else {
 		read.ChunkBytes, read.Chunks = 0, nil // made as it is read
 	}
-	r, err := c.fetch.Open(ctx, read, 0)
+	r, err := open(ctx, read)
 	if err != nil {
 		return loader.File{}, err
 	}

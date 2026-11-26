@@ -247,6 +247,18 @@ type (
 		File  loader.File `json:"file"`
 		Found bool        `json:"found"`
 	}
+	// RawSourcesAnswer is the other nodes keeping a raw file (asked with a
+	// RawIdentityRequest), each with a token for reading it there.
+	RawSourcesAnswer struct {
+		Sources []store.RawSource `json:"sources"`
+	}
+	// RawReadRequest asks whether a raw file may be read at this node with
+	// token (store.AuthorizeRawRead).
+	RawReadRequest struct {
+		NodeID string `json:"node_id"`
+		SHA256 string `json:"sha256"`
+		Token  string `json:"token"`
+	}
 	// RawRecordsRequest is how many records a kept raw file holds.
 	RawRecordsRequest struct {
 		ExecutorID string             `json:"executor_id"`
@@ -428,6 +440,8 @@ var (
 	KeepIdentity     = Op[KeepIdentityRequest, OK]{Name: "keep-identity", Observe: Refused, MaxBody: MaxIdentityList * 2}
 	RawPlaced        = Op[RawPlacedRequest, OK]{Name: "raw-placed", Observe: Refused, MaxBody: 64 << 20}
 	RawIdentity      = Op[RawIdentityRequest, RawIdentityAnswer]{Name: "raw-identity", Observe: Refused}
+	RawSources       = Op[RawIdentityRequest, RawSourcesAnswer]{Name: "raw-sources", Observe: Refused}
+	RawRead          = Op[RawReadRequest, PackReadAnswer]{Name: "raw-read", Observe: Refused}
 	RawRecords       = Op[RawRecordsRequest, OK]{Name: "raw-records", Observe: Refused}
 	InventoryDurable = Op[InventoryRequest, store.DurableInventory]{Name: "inventory-durable", Observe: Refused}
 	AdoptCopies      = Op[AdoptCopiesRequest, AdoptedAnswer]{Name: "adopt-copies", Observe: Refused}
@@ -491,7 +505,7 @@ var (
 var All = []Named{
 	Register, Observations, ReserveNext, EnsurePreemption, Stores, StoreObservation, AttemptScratch, ScratchToSettle,
 	SettleScratch, RunOutput, PacksToMake, RecordPack, CopiesToMake, RecordDescribed, AbandonPack, InPlaceSources,
-	InputGone, InputIsFile, ClaimShed, KeepIdentity, RawPlaced, RawIdentity, RawRecords, InventoryDurable, AdoptCopies, RecordCopy, FetchesToMake, RecordFetch,
+	InputGone, InputIsFile, ClaimShed, KeepIdentity, RawPlaced, RawIdentity, RawSources, RawRead, RawRecords, InventoryDurable, AdoptCopies, RecordCopy, FetchesToMake, RecordFetch,
 	DeletionsToMake, SettleDeletion, SourcesInUse, EvictionsToMake, SettleEviction, ScrubsToMake, RecordScrub,
 	PackRead, NetBenches, NetBenchStatus, NetBenchStart, NetBenchPoints, NetBenchKind, NetBenchFinish, NetBenchAuthorize, UnlaunchedLeases, ValidateReservation, MarkLeasePrepared, ReleaseReservation, AuthorizeLaunch,
 	ActivateLaunch, SetLogPaths, LogProblem, MarkProcessExited, RecordTerminal, QuiescenceCandidates,
