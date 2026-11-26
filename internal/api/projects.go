@@ -185,3 +185,23 @@ func (s *Server) getCommand(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, command)
 }
+
+// mergeProject merges a project into another (store.MergeProject).
+func (s *Server) mergeProject(w http.ResponseWriter, r *http.Request) {
+	var body store.MergeRequest
+	if err := decodeOptional(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	if s.ObserveOnly && !body.DryRun {
+		writeError(w, errObserveOnly)
+		return
+	}
+	body.From, body.Actor = r.PathValue("project"), actorOr(r, body.Actor)
+	result, err := s.Store.MergeProject(r.Context(), body)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}

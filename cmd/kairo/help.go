@@ -135,6 +135,7 @@ func init() {
 				{"prune", "FILE [--write]", "keep only the tasks of FILE that can still run", projectPrune},
 				{"pause", "PROJECT [--force [--grace D] [--reason R]] [--no-wait]", "pause every task of the project", scope("project", "pause")},
 				{"resume", "PROJECT", "resume the project", scope("project", "resume")},
+				{"merge", "FROM INTO [--rename OLD=NEW]... [--dry-run]", "move everything of project FROM into project INTO, ids unchanged (nothing of FROM may run or wait)", projectMerge},
 			},
 			aliases: map[string]string{
 				"get": "status", "show": "status", "describe": "status", "info": "status",

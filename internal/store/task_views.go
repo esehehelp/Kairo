@@ -282,6 +282,22 @@ type TaskExecutionDetail struct {
 	// Waiting says why an execution that has not started waits, besides its
 	// dependencies.
 	Waiting []WaitReason `json:"waiting,omitempty"`
+	// FromCheckpoint is the checkpoint it goes on from (a continuation, a
+	// rerun from one): where it starts, its streams' positions among it.
+	FromCheckpoint *CheckpointView `json:"from_checkpoint,omitempty"`
+}
+
+// CheckpointView is a checkpoint an attempt published (a command
+// acknowledged checkpointed): the reference it gave and, of an attempt
+// reading streams, where each stood (README: Loader, positions and
+// checkpoints).
+type CheckpointView struct {
+	CommandID       string          `json:"command_id"`
+	Kind            string          `json:"kind"`
+	Origin          string          `json:"origin"`
+	ContinuationRef string          `json:"continuation_ref,omitempty"`
+	Streams         json.RawMessage `json:"streams,omitempty"`
+	At              string          `json:"at"`
 }
 
 // TaskOutput is a run's output from one store, with its verified copies.
@@ -314,6 +330,8 @@ type AttemptDetail struct {
 	// RAMPeakBytes is the most RAM its processes were seen to use (sampled by
 	// its executor every 15 s: a short peak between samples is missed).
 	RAMPeakBytes *int64 `json:"ram_peak_bytes,omitempty"`
+	// Checkpoints are the checkpoints it published, oldest first.
+	Checkpoints []CheckpointView `json:"checkpoints,omitempty"`
 }
 
 // WaitReason is an admission block of the execution, or a closed admission
@@ -378,12 +396,17 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 	if err != nil {
 		return TaskDetail{}, err
 	}
+	checkpoints, byCommand, startsFrom, err := s.taskCheckpoints(ctx, task.scopeID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
 	for _, list := range attempts {
 		for i := range list {
 			list[i].LogProblems = logProblems[list[i].ID]
 			if e, ok := energy[list[i].ID]; ok {
 				list[i].Energy = &e
 			}
+			list[i].Checkpoints = checkpoints[list[i].ID]
 		}
 	}
 	// The task's executions are in its project, queue and task scopes: a
@@ -410,9 +433,48 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 		if execution.State == "waiting" || execution.State == "authorized" {
 			item.Waiting = append(blocks[execution.ExecutionID], closed...)
 		}
+		if cp, ok := byCommand[startsFrom[execution.ExecutionID]]; ok {
+			item.FromCheckpoint = &cp
+		}
 		detail.Executions = append(detail.Executions, item)
 	}
 	return detail, nil
+}
+
+// taskCheckpoints are the checkpoints the attempts of a task's executions
+// published, by attempt and by command, and the checkpoint (its command) each
+// execution goes on from.
+func (s *Store) taskCheckpoints(ctx context.Context, taskScopeID string) (map[string][]CheckpointView, map[string]CheckpointView, map[string]string, error) {
+	byAttempt, byCommand, startsFrom := map[string][]CheckpointView{}, map[string]CheckpointView{}, map[string]string{}
+	err := eachRow(ctx, s.db, `SELECT c.id,c.kind,c.origin,c.attempt_id,c.payload_json,c.updated_at FROM commands c JOIN execution_requests e ON e.id=c.execution_id
+		WHERE e.task_scope_id=$1 AND c.state='checkpointed' ORDER BY c.updated_at,c.id`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		var cp CheckpointView
+		var attemptID, payload string
+		if err := rows.Scan(&cp.CommandID, &cp.Kind, &cp.Origin, &attemptID, &payload, &cp.At); err != nil {
+			return err
+		}
+		var body struct {
+			ContinuationRef string          `json:"continuation_ref"`
+			Streams         json.RawMessage `json:"streams"`
+		}
+		_ = json.Unmarshal([]byte(payload), &body)
+		cp.ContinuationRef, cp.Streams = body.ContinuationRef, body.Streams
+		byAttempt[attemptID] = append(byAttempt[attemptID], cp)
+		byCommand[cp.CommandID] = cp
+		return nil
+	})
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	err = eachRow(ctx, s.db, `SELECT id,input_checkpoint_command_id FROM execution_requests WHERE task_scope_id=$1 AND input_checkpoint_command_id IS NOT NULL`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		var id, command string
+		if err := rows.Scan(&id, &command); err != nil {
+			return err
+		}
+		startsFrom[id] = command
+		return nil
+	})
+	return byAttempt, byCommand, startsFrom, err
 }
 
 // taskOutputs are the outputs of a task's executions; each rank of an old

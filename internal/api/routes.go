@@ -24,6 +24,7 @@ func (s *Server) routes() []route {
 		{"GET", "/api/sources/{id}", roleRead, s.getSource},
 		{"GET", "/api/projects/{project}", roleRead, s.getProject},
 		{"GET", "/api/projects/{project}/tasks/{task}", roleRead, s.getTask},
+		{"POST", "/api/projects/{project}/merge", roleAdmin, s.mergeProject},
 		{"POST", "/api/projects/{project}/tasks/{task}/cancel", roleAdmin, s.cancelTask},
 		{"POST", "/api/projects/{project}/tasks/{task}/rerun", roleAdmin, s.rerunTask},
 		{"POST", "/api/projects/{project}/tasks/{task}/checkpoint", roleAdmin, s.checkpointTask},

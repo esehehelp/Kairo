@@ -65,27 +65,30 @@ type taskExecution struct {
 	Attempts []attemptInfo      `json:"attempts"` // at most one
 	Waiting  []map[string]any   `json:"waiting"`
 	Outputs  []store.TaskOutput `json:"outputs"`
+	// FromCheckpoint: the checkpoint it goes on from.
+	FromCheckpoint *store.CheckpointView `json:"from_checkpoint"`
 }
 
 type attemptInfo struct {
-	ID              string               `json:"id"`
-	State           string               `json:"state"`
-	ExecutorID      string               `json:"executor_id"`
-	NodeID          string               `json:"node_id"`
-	PID             *int                 `json:"pid"`
-	ExitCode        *int                 `json:"exit_code"`
-	ExitSignal      *string              `json:"exit_signal"`
-	Progress        json.RawMessage      `json:"progress"`
-	LastHeartbeatAt *string              `json:"last_heartbeat_at"`
-	ExitedAt        *string              `json:"exited_at"`
-	QuiescedAt      *string              `json:"quiesced_at"`
-	StdoutPath      *string              `json:"stdout_path"`
-	StderrPath      *string              `json:"stderr_path"`
-	StdoutBytes     *int64               `json:"stdout_bytes"`
-	StderrBytes     *int64               `json:"stderr_bytes"`
-	LogProblems     []store.LogProblem   `json:"log_problems"`
-	Energy          *store.AttemptEnergy `json:"energy"`
-	RAMPeakBytes    *int64               `json:"ram_peak_bytes"`
+	ID              string                 `json:"id"`
+	State           string                 `json:"state"`
+	ExecutorID      string                 `json:"executor_id"`
+	NodeID          string                 `json:"node_id"`
+	PID             *int                   `json:"pid"`
+	ExitCode        *int                   `json:"exit_code"`
+	ExitSignal      *string                `json:"exit_signal"`
+	Progress        json.RawMessage        `json:"progress"`
+	LastHeartbeatAt *string                `json:"last_heartbeat_at"`
+	ExitedAt        *string                `json:"exited_at"`
+	QuiescedAt      *string                `json:"quiesced_at"`
+	StdoutPath      *string                `json:"stdout_path"`
+	StderrPath      *string                `json:"stderr_path"`
+	StdoutBytes     *int64                 `json:"stdout_bytes"`
+	StderrBytes     *int64                 `json:"stderr_bytes"`
+	LogProblems     []store.LogProblem     `json:"log_problems"`
+	Energy          *store.AttemptEnergy   `json:"energy"`
+	RAMPeakBytes    *int64                 `json:"ram_peak_bytes"`
+	Checkpoints     []store.CheckpointView `json:"checkpoints"`
 }
 
 // ended reports whether the attempt's process is gone for good.

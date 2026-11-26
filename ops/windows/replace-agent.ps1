@@ -53,4 +53,11 @@ if (Test-Path $linuxNew) {
   Copy-Item $linuxNew $linux
   Log "installed $linuxNew as $linux (the init of wslc containers)"
 }
+# The supervisor's script, current for its next start (the running one is not restarted: it would lose the agent's
+# exit code it watches for, issue #19).
+$supervisor = Join-Path $bin 'supervise-agent.ps1'
+if ((Get-FileHash (Join-Path $PSScriptRoot 'supervise-agent.ps1')).Hash -ne (Get-FileHash $supervisor -ErrorAction SilentlyContinue).Hash) {
+  Copy-Item (Join-Path $PSScriptRoot 'supervise-agent.ps1') $supervisor -Force
+  Log "installed supervise-agent.ps1 (taken up when the supervisor next starts)"
+}
 Log "installed $version as $exe; the supervisor starts it within 15 s"
