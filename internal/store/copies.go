@@ -461,6 +461,11 @@ func (s *Store) AuthorizePackRead(ctx context.Context, nodeID, objectID, token s
 		read.Month = month.String
 	}
 	if errors.Is(err, sql.ErrNoRows) {
+		// a landing's: a run's output brought as another's directory
+		// (outputlandings.go)
+		read, expires, err = authorizeLandingRead(ctx, s.db, nodeID, objectID, token)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
 		return read, ErrNotFound
 	}
 	if err != nil {

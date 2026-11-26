@@ -228,7 +228,7 @@ Task の `depends_on`（およびそれに伴う `task = "T"` 入力）には、
 
 `kairo task rerun` には次のオプションを指定できます（両方を併用して、修正したコードでチェックポイントから再開することも可能です）。
 
-- `--from-checkpoint latest|COMMAND_ID`（チェックポイント対応 Task が対象）: 最初からではなく、その Task が公開したチェックポイント（`latest`、または `checkpointed` 応答済みの suspend / checkpoint コマンドの `COMMAND_ID`、`GET /api/commands/{id}` で確認可能）から再開します。新しい Execution は、チェックポイント付き中断の再開時と同様に、そのチェックポイント参照（`KAIRO_CONTINUATION_REF`）の継続（continuation）として作成されます。参照先がそのノード上のパスであるため、チェックポイントを公開した Attempt のノードへ配置が計画され、CLI には使用されるチェックポイントが出力されます。チェックポイントを一度も公開していない Task や、該当 Task のチェックポイントではないコマンドを指定した場合は拒否されます。
+- `--from-checkpoint latest|COMMAND_ID`（チェックポイント対応 Task が対象）: 最初からではなく、その Task が公開したチェックポイント（`latest`、または `checkpointed` 応答済みの suspend / checkpoint コマンドの `COMMAND_ID`、`GET /api/commands/{id}` で確認可能）から再開します。新しい Execution は、チェックポイント付き中断の再開時と同様に、そのチェックポイント参照（`KAIRO_CONTINUATION_REF`）の継続（continuation）として作成されます。再実行は新しい Run なので、チェックポイントを公開した Run の output（チェックポイントは `/kairo/output` の中にあります）が pack されたあと、その中身をこの Run の output ディレクトリとして持ち込んでから起動します（[Run の output の持ち込み](#run-の-output-の持ち込み)）。配置はチェックポイントを公開した Attempt のノードへ計画され、CLI には使用されるチェックポイントが出力されます。チェックポイントを一度も公開していない Task や、該当 Task のチェックポイントではないコマンドを指定した場合は拒否されます。
 - `--source current|SNAPSHOT`（ソース上で実行する Task が対象）: 宣言時に紐づけられたスナップショットとは別の、同じソースのスナップショット上で実行します。`current` を指定すると、そのソースに対して最新の `project apply` が送信したスナップショットを使用します（コードを修正して同じファイルを再適用しても既存 Task の宣言自体は変わらないため、このオプションで修正を反映させます）。あるいはスナップショット ID を直接指定することもできます。新しい Execution には実行に使用したスナップショットが記録される一方、Task 自体は元のスナップショットに紐づいたまま維持されるため、後続 Task や入力参照は引き続き同じ Task 名を指定できます。デーモンが保持していないスナップショットや別ソースのスナップショットは拒否されます。
 
 `kairo project prune [--write] FILE` は、まだ実行可能な Task とそれらが必要とする依存先 Task を報告します（`--write` を指定すると、残す各 Task のダイジェストを維持したまま `FILE` を書き換えます）。
@@ -651,7 +651,7 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 - **ソース（`source`）**: Task の `[tasks.execution]` に `source = "NAME"` を指定すると、Task 宣言時点で作成されたプロジェクトの `[sources.NAME]` のコードスナップショット内で Attempt を実行します（後述の[コードスナップショット](#コードスナップショット)参照）。`cwd` はスナップショットに対する相対パスとなります（デフォルトは `.`。絶対パスやスナップショット外に出る `cwd` は拒否されます）。設定されている場合のみ Task のダイジェストに含まれますが、スナップショット自体はダイジェストに含まれません。
 - **コンテナイメージ（`image`）**: Task の `[tasks.execution]` に `image = "NAME"` を指定すると、Task 宣言時点でプロジェクトの `[images.NAME]` の参照が指していたダイジェストのコンテナ内で Attempt を実行します（後述の[コンテナ実行](#コンテナ実行)参照）。実行はコンテナを実行する Executor 上で行われ、その種の Executor はコンテナ以外のジョブを実行しません。設定されている場合のみ Task のダイジェストに含まれますが、イメージのダイジェスト自体は含まれません。
 - **再生成可能出力（`regenerable`）**: Task の `[tasks.execution]` に `regenerable = true` を指定すると、その Run が `output` ディレクトリに書き出す内容は Task の再実行によって再生成できることを宣言します（別所に保管されたソースから構築するデータセットなど）。その出力は一時データ（temporal data。[データストア](#データストア)参照）として扱われて durable store へはコピーされず、参照先のノードで必要になった際に Kairo が Task を再実行して再生成することがあります。設定されている場合のみ Execution のダイジェストに含まれます。
-- **ロスト後の自動継続（`continue_after_loss`）**: チェックポイント可能な Task の `[tasks.execution]` に `continue_after_loss = true` を指定すると、Attempt がロストした場合（ノードの電源断やエージェント消失など、理由 `executor_identity_lost`）に Task をブロックせず続行させます。Task は、ロストした Attempt のプロセスが何も動作し得ない状態になるまで（つまり、コマンド未起動またはノード再起動済みでデーモンが自動解放するか、`kairo resource reconcile` によって `stale` な Lease が解放されるまで）`running` を維持します。その後、公開済みの最新チェックポイント（サスペンド時、オペレータによる実行、または `data_protection` チェックポイントコマンドによるもの）から、それを公開したノード上で継続（continuation、理由 `loss_continuation`）として再開します（`kairo task rerun --from-checkpoint latest` と同等の挙動）。チェックポイントが 1 つも公開されていない場合は、この設定がない場合と同様にブロックされます。設定されている場合のみ Task のダイジェストに含まれます。
+- **ロスト後の自動継続（`continue_after_loss`）**: チェックポイント可能な Task の `[tasks.execution]` に `continue_after_loss = true` を指定すると、Attempt がロストした場合（ノードの電源断やエージェント消失など、理由 `executor_identity_lost`）に Task をブロックせず続行させます。Task は、ロストした Attempt のプロセスが何も動作し得ない状態になるまで（つまり、コマンド未起動またはノード再起動済みでデーモンが自動解放するか、`kairo resource reconcile` によって `stale` な Lease が解放されるまで）`running` を維持します。その後、公開済みの最新チェックポイント（サスペンド時、オペレータによる実行、または `data_protection` チェックポイントコマンドによるもの）から、同じ Run の継続（continuation、理由 `loss_continuation`）として、その Run の output ディレクトリがあるノード（チェックポイントはその中にあります。ほかのノードへ移していなければ、チェックポイントを公開したノード）上で再開します。チェックポイントが 1 つも公開されていない場合は、この設定がない場合と同様にブロックされます。設定されている場合のみ Task のダイジェストに含まれます。
 - **ストア指定（`store`）**: `[tasks.execution]`（または Execution マニフェスト）に `store = "ID"` を指定すると、Attempt の `scratch`、Run の `output`、`cache` ディレクトリの配置先となる volatile store（[マシン宣言](#マシン宣言)参照）を明示できます。指定しない場合は Executor が担当する最初のストアが使われます（[データストア](#データストア)参照）が、大容量の出力に余裕のあるストアを選びたい場合などに使用します。この Execution は（Executor セレクタで `node` を直接指定していない限り）指定ストアを持つノードにプランニングされます。そのストアを利用可能な volatile store として担当していない Executor 上での起動は拒否されます（`launch_aborted: store ID is not a usable volatile store executor E serves`）。設定されている場合のみ Execution のダイジェストに含まれます。
 
 #### コンファインメント（`confine`）
@@ -686,6 +686,19 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 
   CPU やディスクの不足は待機対象であり、他ジョブをサスペンドする理由にはなりません。また、候補すべてをサスペンドしてもなお空きが足りない場合（GPU は空くが他ジョブが保持する RAM が足りない場合など）は 1 つもサスペンドせず待機し、候補が保持しているリソースではなくサスペンドしてもなお不足するリソースを待機理由として示します（例: `insufficient_ram: host-a: 28.0 GiB ram needed, 24.0 GiB free even were infer/serve-r3 (priority -100) suspended, so none is suspended for it; and host-a: 1 GPU(s) needed, 0 usable; leased by infer/serve-r3 (priority -100)`）。
 
+#### Run の output ディレクトリと配置
+
+Run の output ディレクトリ（[`output` ディレクトリ](#output-ディレクトリ)）は 1 つのノードのストアにあり、チェックポイントもその中にあります（コンテナの `/kairo/output`）。そのため、Run の Execution は output ディレクトリのあるノードで動くか、先にディレクトリを持ち込んでから動きます（[Run の output の持ち込み](#run-の-output-の持ち込み)）。
+
+- **サスペンド後の継続**: 宣言（Executor ラベル）が許すどのノードでも動けます。プランニングパスは、動けるノードごとに終わる時刻を見積もり、output ディレクトリのあるノードより十分早く終わるノードがあれば、ディレクトリをそこへ移してから動かします。
+  - **始められる時刻**: 今収まるなら今、そうでなければ妨げている Lease が推定どおり終わる時刻（[実行時間の推定](#実行時間の推定)）。推定できないノードは「いつ始まるか分からない」として扱います。
+  - **運ぶ時間**: ディレクトリの大きさ ÷ 2 つのノードの agent 間の帯域。帯域は network ベンチ（`net-bandwidth-send`・`-recv` の小さい方）の実測で、なければ 100 MB/s（1 GbE）とみなします。pack と展開の分として 25% と 30 秒を足します。
+  - **残りの実行時間**: 推定実行時間からそれまでに走った時間を引いたものを、ノードの速さの比で割ります。速さは、GPU を使う仕事は GPU の gemm ベンチ（基準の動作点）、それ以外は CPU の `cpu-compute` ベンチの値です。どちらかのノードが測られていなければ同じ速さとみなし、推定実行時間がなければ始まる時刻と運ぶ時間だけで比べます。
+  - **動かす条件**: 終わる見込みが、ディレクトリのあるノードより 10 分以上、かつそこでかかる時間の 1 割以上早いこと（そこでの終わりが見積もれないときは、見積もれるノードならどこでも）。動かすと決めたら、その Execution は `output_moving` で待ち、ディレクトリが届く見込みの時刻から移る先のノードで必要な資源を確保します（その前に終わる見込みの仕事はそれを使えます）。決めた内容（各ノードの見込み）は持ち込みの記録（`output_landings.estimate_json`）に残り、イベント `output_move_ordered` にも載ります。
+  - **制約**: 移すのは 1 つの継続につき 1 回まで、1 つの Run につき同時に 1 つまでです。ディレクトリのあるノードの agent（その Executor）が生きているときだけ移します（pack するのはその agent です）。
+- **そのほかの Execution**: ノードが落ちた後の継続（`loss_continuation`）、すでに持ち込んだ継続など、output ディレクトリを持つ Run の Execution は、そのノードで動きます。そこに Executor ラベルに合う生きた Executor がなければ `output_elsewhere` で待ちます。
+- **チェックポイントからの再実行**: 持ち込みが終わるまで `output_moving` で待ち、持ち込みを断念したら `output_unavailable` で待ちます。
+
 #### リソース計算・弾性 CPU・ディスクウォーターマーク
 
 - **リソース計算（Accounting）**:
@@ -704,7 +717,7 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 
 待機理由コードは以下のとおりです。
 
-`no_executor` / `not_before` / `inputs_not_ready` / `store_moving` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
+`no_executor` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
 
 ### 実行時間の推定
 
@@ -1046,7 +1059,7 @@ Attempt のランチャーは shim であり、エージェントのバイナリ
 
 ランナーはコンテナが止まるのを見届けてから削除します。ランナーが強制終了されて残ったコンテナは、動いているかどうかにかかわらず、後述の定期スイープが削除します。
 
-Kairo が渡した領域以外に Attempt が書き込んだ内容はインスタンス削除とともに消えます。Kairo が渡す領域は全ノード共通で `/kairo` 配下の同一パスにマウントされるため、継続（continuation）実行時もチェックポイントに記録されたパスでそのまま前回のファイルを参照できます。
+Kairo が渡した領域以外に Attempt が書き込んだ内容はインスタンス削除とともに消えます。Kairo が渡す領域は全ノード共通で `/kairo` 配下の同一パスにマウントされるため、継続（continuation）実行時もチェックポイントに記録されたパスでそのまま前回のファイルを参照できます（別ノードで続けるときは、先にディレクトリを持ち込みます。[Run の output の持ち込み](#run-の-output-の持ち込み)）。
 
 | パス | 内容 |
 |---|---|
@@ -1176,15 +1189,29 @@ Kairo はこのディレクトリを削除せず、現時点では専用クラ�
 
 Run が保持すべき出力データは、scratch が作成されるストアと同じストア上の output ディレクトリ `<root>/outputs/<run id>` に保存されます。このディレクトリには Run ID を記したマーカーファイル `.kairo-output` が置かれ、環境変数 `KAIRO_OUTPUT_DIR` で渡されます。
 
-ここで **Run** とは、ある Execution とそれに続く継続（continuation）のまとまりを指します。具体的には、継続ではない Task の Execution（初回実行、rerun、ノード隔離後の再スタート）とそれに連なる継続群（Run ID は起点となる Execution の ID）、あるいは直接実行（direct execution）が 1 つの Run になります。（以前の Gang の rank 0 以外の rank では、Run ID は `<leader's run>-rank<r>` でした。）
+ここで **Run** とは、ある Execution とそれに続く継続（continuation）のまとまりを指します。具体的には、継続ではない Task の Execution（初回実行、rerun、ノード隔離後の再スタート）とそれに連なる継続群（サスペンド後の継続と、ノードが落ちた後の継続。Run ID は起点となる Execution の ID）、あるいは直接実行（direct execution）が 1 つの Run になります。（以前の Gang の rank 0 以外の rank では、Run ID は `<leader's run>-rank<r>` でした。）
 
-そのストア上で起動される同一 Run のすべての Attempt には同じディレクトリが割り当てられます。最初の Attempt がディレクトリを作成し、継続（continuation）は前の Attempt がそこに書き込んだ内容（チェックポイントなど）をそのまま見つけることができます。一方、再実行（rerun）や別 Task には別のディレクトリが割り当てられるため、ある Run のファイルが別の Run と衝突することはありません。別ノードに配置された継続には、そのノード側で独自のディレクトリが割り当てられます（以前のノードのディレクトリを持ち込む機能は P1c で対応されます）。
+そのストア上で起動される同一 Run のすべての Attempt には同じディレクトリが割り当てられます。最初の Attempt がディレクトリを作成し、継続（continuation）は前の Attempt がそこに書き込んだ内容（チェックポイントなど）をそのまま見つけることができます。一方、再実行（rerun）や別 Task には別のディレクトリが割り当てられるため、ある Run のファイルが別の Run と衝突することはありません。別ノードで動く継続には、先にディレクトリを持ち込みます（[Run の output の持ち込み](#run-の-output-の持ち込み)）。Attempt の scratch・output・cache は、その Run の output ディレクトリがあるそのノードのストアに置かれます（Execution がストアを指定していればそのストア）。
 
 output ディレクトリはデーモンへ記録されます（エージェント操作 `run-output`、`run_outputs` テーブルに run・store・root・path・状態 `active`/`missing`・最後に割り当てられた Attempt・bytes を記録。イベントは初回が `output_created`、以降の各 Attempt が `output_reused`）。記録時の検証ルールは scratch と同様で、その Run で起動しようとしている Attempt のためであること、自ノードの volatile store かつ担当 Executor の名前空間内であること、厳密に `<root>/outputs/<run id>` である必要があります。作成または記録できない場合、Attempt は output ディレクトリなしで起動します。ディレクトリは作成されたものの記録できなかった場合はそのまま残されて集計対象となり、すでにその Run のディレクトリがパッキング済みであるなどの理由で恒久的に拒否された場合は、マーカーしか入っていなければ再び削除されます。
 
 ストア報告では各 output ディレクトリも測定されます（その Run の Attempt がその Executor 上で実行中であれば毎回の報告で測定、それ以外はエージェントプロセスごとに 1 回測定）。全体スキャンで見つからなくなったものは、再び見つかるまで `missing` としてマークされます。
 
 Run が終了すると、output ディレクトリはパッキングされ、durable store へコピーされた後に削除されます（後述）。パッキング開始以降、デーモンはそのディレクトリに対する新規 Attempt の記録を行わなくなります（書き込まれた内容がコピーされないまま削除されてしまうためです）。また、削除されたディレクトリは以降の集計対象外になります。なお、output ディレクトリ機能より古いバージョンのデーモンは Run を割り当てないため、Attempt にも output ディレクトリは渡されません。
+
+#### Run の output の持ち込み
+
+Run の Execution が、その Run の output ディレクトリのないノードで動く前に、ディレクトリをそのノードへ持ち込みます（`output_landings`、`internal/store/outputlandings.go`）。
+
+- **移動（move）**: サスペンド後の継続を別ノードで動かすとき（[Run の output ディレクトリと配置](#run-の-output-ディレクトリと配置)）。
+  1. ディレクトリのある Executor が、ディレクトリ全体を種類 `output-move` のオブジェクトとして pack します（temporal として扱い、durable store へはコピーしません）。
+  2. 移る先のノードの volatile store（Execution が指定したストア、なければ空きの最も多いもの）を担当する Executor が、その pack を元の agent の pack サーバから取り寄せ、ファイル一覧と照合しながら `<root>/inputs/land-<run id>.partial` に展開し、目印（`.kairo-output`）を置いて `<root>/outputs/<run id>` に移します。以後は、それがその Run の output ディレクトリです（`run_outputs` に Attempt なしの `active` として記録）。
+  3. 元のディレクトリは `moved` になり、元の agent が pack と一緒に消します（`moved` → `deleted`）。
+- **チェックポイント（checkpoint）**: チェックポイントからの再実行（`kairo task rerun --from-checkpoint`）は新しい Run なので、チェックポイントを公開した Run の output オブジェクトが pack されたあと、それを同じように（検証済みの durable コピー、またはまだ元にある pack から）取り寄せ、再実行の Run の output ディレクトリとして置きます。
+- **状態**: `waiting`（チェックポイントの Run の output がまだ pack されていない）→ `packing`（移動の pack 中）→ `bringing`（取り寄せ中）→ `placed`（移動: 置いた。元のディレクトリを消すまで）→ `done`。イベントは `output_move_ordered`・`output_move_packed`・`output_landed`・`output_move_done`・`output_landing_ordered` です。
+- **断念**: 指示から 1 時間（大きいものは 50 MB/s で運ぶ時間の 4 倍）以内に置けなかったもの、置く前に Execution が終わったものは断念します（`failed`、イベント `output_landing_failed`）。移動の継続は元のノードで動き、再実行は `output_unavailable` で待ちます。断念した取り寄せの途中のファイル（`<root>/inputs/land-*`）は残ります。
+- **置き場所にあるもの**: 移る先にすでにその Run の目印を持つディレクトリがあれば、そのまま使います。別の Run のものなど、それ以外のものがあれば拒否します。
+- **前回のスナップショットとの関係**: 移った先のディレクトリの Run スナップショットは、そのストアでの最初のものとして全ファイルを pack します。
 
 #### パッキング（Packing）
 
@@ -1570,8 +1597,10 @@ claim 済みの scratch はエージェント再起動後も削除対象とし�
 | | `deleting` | `deleted`、`kept` |
 | | `kept` | `deleted`（durable store へのコピー完了後） |
 | Run output（`run_outputs`） | `-` | `active` |
-| | `active` | `missing`、`deleted` |
+| | `active` | `missing`、`deleted`、`moved`（ほかのストアへ持ち込まれた場合） |
 | | `missing` | `active`（再発見または再作成された場合）、`deleted` |
+| | `moved` | `deleted`（元の agent が消した場合） |
+| | `deleted` | `active`（移した先からまた持ち込まれた場合） |
 
 `packed`、`evicted`、`deleted` は終端状態です。
 

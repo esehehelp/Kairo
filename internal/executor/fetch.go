@@ -69,21 +69,31 @@ func (e *storeWorker) fetchDue(ctx context.Context) {
 		served[s.decl.ID] = s
 	}
 	for _, o := range orders {
+		key, what := o.ObjectID, "input"
+		if o.RunID != "" {
+			key, what = o.ObjectID+"@"+o.RunID, "run's output directory"
+		}
 		s, ok := served[o.StoreID]
-		if !ok || !s.usable || s.decl.Class != machine.StoreVolatile || s.decl.Root != o.Root || !e.due(&e.fetches, o.ObjectID) {
+		if !ok || !s.usable || s.decl.Class != machine.StoreVolatile || s.decl.Root != o.Root || !e.due(&e.fetches, key) {
 			continue
 		}
 		started := time.Now()
-		made, err := e.fetchOne(ctx, s, o, served)
+		var made store.FetchMade
+		var err error
+		if o.RunID != "" {
+			made, err = e.landOne(ctx, s, o, served)
+		} else {
+			made, err = e.fetchOne(ctx, s, o, served)
+		}
 		if err == nil {
 			err = e.Store.RecordFetch(ctx, made)
 		}
 		if err != nil {
-			e.roundProblem(&e.fetches, o.ObjectID, "input not brought here", err)
+			e.roundProblem(&e.fetches, key, what+" not brought here", err)
 			continue
 		}
-		e.roundProblem(&e.fetches, o.ObjectID, "", nil)
-		e.Logger.Info("input brought here", "object_id", o.ObjectID, "store_id", o.StoreID, "path", made.Path, "bytes", made.Bytes,
+		e.roundProblem(&e.fetches, key, "", nil)
+		e.Logger.Info(what+" brought here", "object_id", o.ObjectID, "run_id", o.RunID, "store_id", o.StoreID, "path", made.Path, "bytes", made.Bytes,
 			"local", o.Source.Local, "seconds", time.Since(started).Seconds())
 	}
 }

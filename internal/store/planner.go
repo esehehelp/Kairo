@@ -171,6 +171,9 @@ type planCandidate struct {
 	// endsIn is how long it is expected to run once admitted (0: no
 	// estimate, it may use nothing held for others).
 	endsIn time.Duration
+	// output: where its run's output directory is, and its landing
+	// (outputhome.go); nil when it has neither.
+	output *candidateOutput
 }
 
 type planModel struct {
@@ -188,6 +191,11 @@ type planModel struct {
 	// leaseEnds is when each live lease is expected to give back what it
 	// holds (estimate.go); a lease without one is not expected to.
 	leaseEnds map[string]time.Time
+	// perf is what benches measured of nodes and the paths between them,
+	// and landable the nodes with a volatile store a live executor serves:
+	// where a run's output directory can be brought (outputhome.go).
+	perf     *nodePerf
+	landable map[string]bool
 }
 
 // planOverlay is what the pass has handed out so far: devices placed on or
@@ -880,6 +888,8 @@ type planPlacement struct {
 	terminal string
 	wait     planWait
 	victims  []*planLease
+	// move: its run's output directory is to be moved first (outputhome.go)
+	move *planMove
 }
 
 type planner struct {
@@ -1018,6 +1028,11 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 		if len(options[i]) == 0 {
 			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + "no live executor matches the executor labels"}}, time.Time{}
 		}
+	}
+	// Where its run's output directory is (outputhome.go): it waits for it,
+	// has it moved, or goes where it is.
+	if placement, done := p.planOutput(c, ranks, options); done {
+		return placement, time.Time{}
 	}
 	if c.inputsWait != "" {
 		return planPlacement{wait: planWait{reason: "inputs_not_ready", message: c.inputsWait}}, time.Time{}
@@ -1583,6 +1598,9 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 		return nil, err
 	}
 	if err = loadStoreMoveWaits(ctx, tx, candidates, ids); err != nil {
+		return nil, err
+	}
+	if err = loadCandidateOutputs(ctx, tx, m, candidates, ids); err != nil {
 		return nil, err
 	}
 	demands, err := loadDemandsTx(ctx, tx, ids)

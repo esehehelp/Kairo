@@ -105,7 +105,7 @@ func decodeInputs(body string) ([]datainput.Input, error) {
 func latestRunTx(ctx context.Context, q queryer, projectScopeID, task string) (string, error) {
 	var runID string
 	err := q.QueryRowContext(ctx, `SELECT o.execution_id FROM orchestration_task_executions o JOIN orchestration_tasks t ON t.task_scope_id=o.task_scope_id
-		WHERE t.project_scope_id=$1 AND t.name=$2 AND o.reason<>'continuation' ORDER BY o.execution_ordinal DESC LIMIT 1`, projectScopeID, task).Scan(&runID)
+		WHERE t.project_scope_id=$1 AND t.name=$2 AND o.reason NOT IN('continuation','loss_continuation') ORDER BY o.execution_ordinal DESC LIMIT 1`, projectScopeID, task).Scan(&runID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}

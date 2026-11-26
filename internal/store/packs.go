@@ -56,6 +56,10 @@ type PackOrder struct {
 	Transfer       bool   `json:"transfer,omitempty"`
 	Drop           bool   `json:"drop,omitempty"`
 	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	// DropSource: with Drop, of a run's output directory packed to move it
+	// (an output-move, SourceID its run): the directory, which has landed
+	// where it went (outputlandings.go), is removed too.
+	DropSource bool `json:"drop_source,omitempty"`
 	// Since: a run snapshot (runsnapshots.go) holds the files of its run's
 	// output directory changed after this time (RFC 3339; "" every file).
 	Since string `json:"since,omitempty"`
@@ -84,6 +88,9 @@ type PackMade struct {
 	// pack removed (PackOrder.Drop).
 	Transfer bool `json:"transfer,omitempty"`
 	Dropped  bool `json:"dropped,omitempty"`
+	// SourceRemoved: with Dropped, the directory moved was removed too
+	// (PackOrder.DropSource).
+	SourceRemoved bool `json:"source_removed,omitempty"`
 	// File: what was packed is an imported regular file, alone; it is not
 	// read in place as an input then (inputs.go: an input is a directory).
 	File bool `json:"file,omitempty"`
@@ -123,7 +130,7 @@ func runEndedTx(ctx context.Context, q queryer, runID string) (bool, error) {
 	}
 	var later bool
 	err = q.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM orchestration_task_executions o JOIN orchestration_task_executions b ON b.task_scope_id=o.task_scope_id
-		WHERE b.execution_id=$1 AND o.execution_ordinal>b.execution_ordinal AND o.reason<>'continuation')`, base).Scan(&later)
+		WHERE b.execution_id=$1 AND o.execution_ordinal>b.execution_ordinal AND o.reason NOT IN('continuation','loss_continuation'))`, base).Scan(&later)
 	return later, err
 }
 
@@ -144,9 +151,11 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 		kind, sourceID, storeID, root, path, projectID string
 	}
 	var found []due
+	// (one landed where no attempt has run yet, outputlandings.go, is its
+	// run's from the start: its project is the run's)
 	err = eachRow(ctx, tx, `SELECT o.run_id,o.store_id,o.root,o.path,x.node_id,e.project_scope_id
-		FROM run_outputs o JOIN attempts a ON a.id=o.last_attempt_id JOIN execution_requests e ON e.id=a.execution_id JOIN executors x ON x.id=o.executor_id
-		WHERE o.executor_id=$1 AND o.state='active' AND a.state='quiesced'
+		FROM run_outputs o LEFT JOIN attempts a ON a.id=o.last_attempt_id JOIN execution_requests e ON e.id=COALESCE(a.execution_id,o.run_id) JOIN executors x ON x.id=o.executor_id
+		WHERE o.executor_id=$1 AND o.state='active' AND (a.state='quiesced' OR o.last_attempt_id IS NULL)
 		AND NOT EXISTS(SELECT 1 FROM data_objects d WHERE d.kind='output' AND d.source_id=o.run_id AND d.store_id=o.store_id)
 		ORDER BY o.created_at,o.run_id`, []any{executorID}, func(rows *sql.Rows) error {
 		var d due
@@ -230,6 +239,7 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 	out := []PackOrder{}
 	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,x.node_id,
 		CASE WHEN d.kind='output' THEN (SELECT o.bytes FROM run_outputs o WHERE o.run_id=d.source_id AND o.store_id=d.store_id)
+		WHEN d.kind='output-move' THEN (SELECT o.bytes FROM run_outputs o WHERE o.run_id=split_part(d.source_id,'~',1) AND o.store_id=d.store_id)
 		ELSE (SELECT k.bytes FROM attempt_scratch k WHERE k.attempt_id=d.source_id) END,d.lifecycle,COALESCE(d.snapshot_since,'')
 		FROM data_objects d JOIN executors x ON x.id=d.executor_id WHERE d.executor_id=$1 AND d.state='packing' ORDER BY d.created_at,d.id`, []any{executorID}, func(rows *sql.Rows) error {
 		var o PackOrder
@@ -238,9 +248,13 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 		if err := rows.Scan(&o.ObjectID, &o.Kind, &o.SourceID, &o.StoreID, &o.Root, &o.Path, &nodeID, &bytes, &lifecycle, &o.Since); err != nil {
 			return err
 		}
-		o.Identity = lifecycle == LifecycleTemporal
+		// a move's directory is packed whole (to be brought), not identified
+		o.Identity = lifecycle == LifecycleTemporal && o.Kind != ObjectOutputMove
 		if sourceOwnership(declared, o.Kind, nodeID, o.StoreID, o.Root, o.Path, o.SourceID) != "" {
 			return nil
+		}
+		if o.Kind == ObjectOutputMove {
+			o.SourceID = runOfMove(o.SourceID) // the directory is the run's
 		}
 		if bytes.Valid {
 			o.Bytes = &bytes.Int64
@@ -253,6 +267,7 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 	}
 	// Temporal data to pack for a move, or whose pack for one to remove
 	// (transfer.go), while its directory is still Kairo's there.
+	keepSource := map[string]bool{}
 	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,x.node_id,d.content_bytes,d.transfer_state,d.manifest_sha256
 		FROM data_objects d JOIN executors x ON x.id=d.executor_id
 		WHERE d.executor_id=$1 AND d.lifecycle='temporal' AND d.state='packed' AND d.transfer_state IN('packing','dropping') ORDER BY d.updated_at,d.id`, []any{executorID}, func(rows *sql.Rows) error {
@@ -264,6 +279,20 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 			return err
 		}
 		o.Transfer, o.Drop, o.ManifestSHA256 = transfer == transferPacking, transfer == transferDropping, listSHA.String
+		if o.Kind == ObjectOutputMove {
+			// packed as ordered (the first query), never packed again for
+			// a move: only its pack is removed, with the directory once it
+			// has landed (moveDropsSourceTx, below)
+			if !o.Drop {
+				return nil
+			}
+			o.SourceID = runOfMove(o.SourceID)
+			// the directory goes only as its store's declaration still
+			// makes it the run's there
+			if sourceOwnership(declared, o.Kind, nodeID, o.StoreID, o.Root, o.Path, o.SourceID) != "" {
+				keepSource[o.ObjectID] = true
+			}
+		}
 		if o.Transfer && sourceOwnership(declared, o.Kind, nodeID, o.StoreID, o.Root, o.Path, o.SourceID) != "" {
 			return nil
 		}
@@ -275,6 +304,13 @@ func (s *Store) PacksToMake(ctx context.Context, executorID string) ([]PackOrder
 	})
 	if err != nil {
 		return nil, err
+	}
+	for i := range out {
+		if out[i].Drop && out[i].Kind == ObjectOutputMove && !keepSource[out[i].ObjectID] {
+			if out[i].DropSource, err = moveDropsSourceTx(ctx, tx, out[i].ObjectID); err != nil {
+				return nil, err
+			}
+		}
 	}
 	return out, tx.Commit()
 }
@@ -312,8 +348,10 @@ func (s *Store) RecordPack(ctx context.Context, made PackMade) error {
 			return err
 		}
 	}
-	if made.Identity != (lifecycle == LifecycleTemporal) {
-		return fmt.Errorf("object %s is %s: an identity is recorded for a temporal object, a pack for a durable one", made.ObjectID, lifecycle)
+	// (a run's output directory moved to another node is temporal, and
+	// packed whole: outputlandings.go)
+	if made.Identity != (lifecycle == LifecycleTemporal && kind != ObjectOutputMove) {
+		return fmt.Errorf("object %s is %s: an identity is recorded for a temporal object, a pack for a durable one or a move", made.ObjectID, lifecycle)
 	}
 	if made.Identity {
 		return recordIdentityTx(ctx, tx, made, root, state, kind, sourceID, projectID, listSHA)
@@ -349,6 +387,11 @@ func (s *Store) RecordPack(ctx context.Context, made PackMade) error {
 	if err = appendCoordinationEventTx(ctx, tx, "packed", project, "object", made.ObjectID, nil, map[string]any{"kind": kind, "source_id": sourceID,
 		"pack_bytes": made.PackBytes, "content_bytes": made.ContentBytes, "files": made.Files, "skipped": made.Skipped, "pack_sha256": made.PackSHA256}); err != nil {
 		return err
+	}
+	if kind == ObjectOutputMove {
+		if err = movePackedTx(ctx, tx, made.ObjectID, project); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

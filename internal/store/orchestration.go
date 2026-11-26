@@ -261,6 +261,9 @@ func (s *Store) ReconcileProjectTasks(ctx context.Context) error {
 	if err := s.orderInputFetches(ctx); err != nil {
 		return err
 	}
+	if err := s.reconcileOutputLandings(ctx); err != nil {
+		return err
+	}
 	return s.orderRegenerations(ctx)
 }
 
@@ -584,7 +587,26 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 		}
 	}
 	if reason == "loss_continuation" {
-		if node, _ := trigger["node"].(string); node != "" {
+		node, _ := trigger["node"].(string)
+		// on the node holding its run's output directory now, which holds
+		// the checkpoint (/kairo/output): it may have moved since the
+		// checkpoint was published (outputlandings.go)
+		if pred, _ := trigger["predecessor_execution_id"].(string); pred != "" {
+			runID, err := runIDTx(ctx, tx, pred)
+			if err != nil {
+				return plannedOrchestrationDecision{}, err
+			}
+			declared, err := declaredStores(ctx, tx)
+			if err != nil {
+				return plannedOrchestrationDecision{}, err
+			}
+			if home, ok, err := runOutputHomeTx(ctx, tx, declared, runID); err != nil {
+				return plannedOrchestrationDecision{}, err
+			} else if ok {
+				node = home.nodeID
+			}
+		}
+		if node != "" {
 			if err = pinNodeSpec(&spec, node); err != nil {
 				return plannedOrchestrationDecision{}, err
 			}

@@ -12,12 +12,15 @@ import (
 // A run's output directory is where its attempts write what is to be kept:
 // <root>/outputs/<run id> on a volatile store of the executor launching the
 // attempt, handed to it as KAIRO_OUTPUT_DIR. A run is an execution with the
-// continuations that follow it (runIDTx), so a run suspended and continued on
-// the same store finds what it wrote there before, and a rerun or another
-// Task never writes into another run's directory. It is recorded here
-// (run_outputs) once checked against the store's declaration, and measured
-// by its executor's reports. P1b's later steps pack it, move it to a durable
-// store and delete it; until then it stays where it is.
+// continuations that follow it (runIDTx: after a suspend, and after its
+// attempt was lost), so a run suspended and continued finds what it wrote
+// there before (its checkpoint: /kairo/output in its container), and a rerun
+// or another Task never writes into another run's directory. A continuation
+// planned onto another node has the directory brought there first, and a
+// rerun from a checkpoint the output of the run that published it
+// (outputlandings.go). It is recorded here (run_outputs) once checked against
+// the store's declaration, and measured by its executor's reports. Once the
+// run has ended it is packed, copied to a durable store and deleted.
 
 // RunOutput is a run's output directory as an executor made it (or found it
 // made) for an attempt it is launching.
@@ -32,8 +35,9 @@ type RunOutput struct {
 	Path       string `json:"path"`
 }
 
-// A run starts at the latest execution that is not a continuation, or at
-// the execution itself for direct work. The ranks of a gang (when there were
+// A run starts at the latest execution that is not a continuation (of
+// either kind: reason continuation or loss_continuation), or at the
+// execution itself for direct work. The ranks of a gang (when there were
 // gangs: their rows stay) shared the leader's run but had separate output
 // directories. Keep writes and lookups in step.
 const executionRunJoins = `
@@ -44,7 +48,7 @@ const executionRunJoins = `
 const taskRunStartJoin = `
 	LEFT JOIN LATERAL (
 		SELECT s.execution_id FROM orchestration_task_executions s
-		WHERE s.task_scope_id=o.task_scope_id AND s.execution_ordinal<=o.execution_ordinal AND s.reason<>'continuation'
+		WHERE s.task_scope_id=o.task_scope_id AND s.execution_ordinal<=o.execution_ordinal AND s.reason NOT IN('continuation','loss_continuation')
 		ORDER BY s.execution_ordinal DESC LIMIT 1
 	) run_start ON true`
 
@@ -116,7 +120,8 @@ func (s *Store) RecordRunOutput(ctx context.Context, out RunOutput) error {
 	if runID != out.RunID {
 		return fmt.Errorf("attempt %s runs in run %s, not %s", out.AttemptID, runID, out.RunID)
 	}
-	var existing, lastAttempt, state string
+	var existing, state string
+	var lastAttempt sql.NullString // none yet for a directory landed there (outputlandings.go)
 	err = tx.QueryRowContext(ctx, `SELECT path,last_attempt_id,state FROM run_outputs WHERE run_id=$1 AND store_id=$2`, out.RunID, out.StoreID).Scan(&existing, &lastAttempt, &state)
 	found := err == nil
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -134,8 +139,13 @@ func (s *Store) RecordRunOutput(ctx context.Context, out RunOutput) error {
 	if found && existing != out.Path {
 		return fmt.Errorf("run %s already has output directory %s on store %s", out.RunID, existing, out.StoreID)
 	}
-	if found && lastAttempt == out.AttemptID {
+	if found && lastAttempt.String == out.AttemptID {
 		return tx.Commit()
+	}
+	// moved to another store (outputlandings.go): the run's directory is
+	// there now, not this one, which goes
+	if state == "moved" {
+		return fmt.Errorf("%w: run %s's output directory on %s has moved to another store", ErrStaleEpoch, out.RunID, out.StoreID)
 	}
 	if attemptState != "authorized" {
 		return fmt.Errorf("%w: attempt %s is %s, not about to launch", ErrStaleEpoch, out.AttemptID, attemptState)

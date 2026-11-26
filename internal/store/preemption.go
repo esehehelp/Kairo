@@ -38,6 +38,7 @@ func (s *Store) EnsurePriorityPreemption(ctx context.Context, executorID string)
 	if err != nil {
 		return nil, err
 	}
+	m.perf = s.nodePerf(ctx)
 	candidates, err := loadPlanCandidates(ctx, tx, m)
 	if err != nil {
 		return nil, err
