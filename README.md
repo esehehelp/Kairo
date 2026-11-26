@@ -233,6 +233,17 @@ Task の `depends_on`（およびそれに伴う `task = "T"` 入力）には、
 
 `kairo project prune [--write] FILE` は、まだ実行可能な Task とそれらが必要とする依存先 Task を報告します（`--write` を指定すると、残す各 Task のダイジェストを維持したまま `FILE` を書き換えます）。
 
+#### project の統合（`kairo project merge`）
+
+Task の入力（`task`・`data`・`object`）は同じ project の中しか読めません。1 つの仕事を複数のリポジトリが別々の project として宣言していたときは、`kairo project merge FROM INTO [--rename OLD=NEW]... [--dry-run]` で FROM のすべてを INTO に移せます（`POST /api/projects/FROM/merge`）。
+
+- **移すもの**: Task（スコープと名前、Execution・依存・rerun・判断の履歴ごと）、データオブジェクト、イベント、宣言、ソース。id はどれも変わりません。
+- **queue**: INTO に同じ名前の queue があれば、そこへまとめます。なければ queue ごと移します。
+- **名前のぶつかり**: INTO にも同じ名前の Task があれば、`--rename OLD=NEW` で FROM 側に新しい名前を付けます（付けなければ、ぶつかる名前をすべて挙げて拒否します）。改名した Task の宣言とダイジェストは新しい名前のものに書き換わるので、新しい名前で宣言し直せば同じ Task として扱われます。名前を変えなかった Task も、INTO の名前で宣言し直せば同じ Task です（Task のダイジェストに project 名は入りません）。
+- **同じデータ名**: 両方にある名前を `data = NAME` で読むと、どちらのものでも最も新しいものを読みます（`--dry-run` と結果に出ます）。
+- **拒否される場合**: FROM に走っているか待っている Execution がある、`pending`・`running` の Task がある、または FROM か FROM の queue の gate が閉じている。
+- **FROM の扱い**: 空の project として残ります。各ノードの FROM のキャッシュ（`<store>/cache/<project scope id>`）は移さず、INTO のものがまた作られます。
+
 ### 観測専用モードとリソース・ハードウェア履歴
 
 #### 観測専用モード（`observe_only = true`）
