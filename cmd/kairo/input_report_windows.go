@@ -38,7 +38,7 @@ func inputReport(args []string) error {
 	fs := newFlags("input-report")
 	out := fs.String("out", provider.DefaultInputFile(), "the file to write (the agent's [owner_use] input_file)")
 	every := fs.Duration("every", 5*time.Second, "how often")
-	if _, err := parseFlags(fs, args); err != nil {
+	if _, err := parseFlags(fs, leafArgs(args)); err != nil {
 		return err
 	}
 	if *out == "" {

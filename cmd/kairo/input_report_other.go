@@ -10,7 +10,7 @@ func inputReport(args []string) error {
 	fs := newFlags("input-report")
 	fs.String("out", "", "the file to write (the agent's [owner_use] input_file)")
 	fs.Duration("every", 0, "how often")
-	if _, err := parseFlags(fs, args); err != nil {
+	if _, err := parseFlags(fs, leafArgs(args)); err != nil {
 		return err
 	}
 	return errors.New("input-report runs on Windows only")
