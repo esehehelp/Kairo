@@ -842,3 +842,61 @@ func TestServedRanksAreKeptAcrossALoadersRestart(t *testing.T) {
 	}
 	c1.Close()
 }
+
+// A rank whose taker is there but takes nothing for a while (its queue
+// full: in a DDP run, waiting in an allreduce for the other rank) holds no
+// other rank up: each rank's records are made by a producer of its own. A
+// gap between the ranks in records taken grows without bound as a run goes
+// on (a record gives none or many outputs), so one producer making every
+// rank's records in turn would stall them both once one's queue was full.
+func TestARankTakingNothingHoldsNoOneUp(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Sources = spec.Sources[:1]
+	spec.Epochs = 300 // 38 records each: 5700 per rank, past a rank's queue
+	want := collect(t, spec, dir, 2, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}, World: 2}).Serve(ctx, ln)
+	take := func(c *Client, n int) []string {
+		var got []string
+		for n < 0 || len(got) < n {
+			item, err := c.Next()
+			if err == io.EOF {
+				return got
+			}
+			if err != nil {
+				t.Error(err)
+				return got
+			}
+			got = append(got, fmt.Sprintf("%d.%d:%s", c.Position.Record, c.Position.Sub, item))
+		}
+		return got
+	}
+	c0, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c0.Close()
+	got0 := take(c0, 1) // there, then taking nothing while rank 1 takes all
+	c1, err := Dial(ctx, "tcp", ln.Addr().String(), 1, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	done := make(chan []string, 1)
+	go func() { done <- take(c1, -1) }()
+	var got1 []string
+	select {
+	case got1 = <-done:
+	case <-time.After(2 * time.Minute):
+		t.Fatal("rank 1 held up by rank 0, which takes nothing")
+	}
+	got0 = append(got0, take(c0, -1)...)
+	if !reflect.DeepEqual(got0, want[0]) || !reflect.DeepEqual(got1, want[1]) {
+		t.Fatalf("rank 0 %d items (want %d), rank 1 %d (want %d)", len(got0), len(want[0]), len(got1), len(want[1]))
+	}
+}

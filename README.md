@@ -1842,7 +1842,7 @@ streams = ["mix"]           # → KAIRO_STREAM_MIX
 - **位置と checkpoint**: SDK の `safe_point(..., streams=[train])`（torch の `DistributedAdapter.safe_point(..., streams=[train])` は全 rank の位置を集めます）は、checkpoint を公開するとき、各 stream について rank の数（`world`）、順番の版（`order`、いまは 1）、各 rank の位置を `checkpointed` の payload に `"streams": {NAME: {"world": W, "order": 1, "positions": [...]}}` として入れます。stream を読む Execution の checkpoint は、読むすべての stream について、`world` と `order` があり、順番の版が同じで、rank 0〜W-1 の位置がちょうど 1 つずつ（`rank`・`record`・`sub` をすべて書いたもの。負の値なし、上限内）なければ拒否されます（`safe_point` に stream を渡し忘れると、公開されません）。
 - **続き**: continuation（suspend 後、ロスト後、`rerun --from-checkpoint`）は、続けるもとの checkpoint を、その command で覚えています（`input_checkpoint_command_id`）。Loader は、その command の受理された payload が言う位置から始め、rank の数は payload の `world` に固定されます（別の数で接続した rank は拒否されます）。同じ参照で公開された別の checkpoint の位置が使われることはありません。あるレコードの途中の位置（`sub`）は、そのレコードの出力がそれより少なければ誤りとして stream を止めます（stage が変わったということなので、調整はしません）。stream を読む Task の continuation は、その checkpoint を公開した Execution と同じコードスナップショットとイメージで動きます（stage も位置の一部だからです）。そのため、そうした Task に `rerun --from-checkpoint` と `--source` を同時に指定すると拒否されます。stream を読まない Task の continuation は、前の Execution と同じスナップショットとイメージで動きます（`rerun --source` で替えた Run は、その続きもそのスナップショットです）。
 - **ストリームの終わりと失敗**: 終わり（`end`）と失敗（`error`）は、取り逃した rank が接続し直したときにも、もう一度渡されます。失敗した stream は、巻き戻しで作り直されることはありません。stream の終わりより先の位置（そこに立ったことはありえない）は、終わりとして扱わず、stream のエラーにします。Loader のプロセスが終わったら、コンテナの init が起動し直し（5 回まで。同じセッションで）、各 rank は自分の位置で接続し直します。
-- **メモリ**: 各 rank のために先に作っておく分は、件数（4096 件）とバイト数（`memory_bytes` の 4 分の 1 を rank で分けた分、最低 1 MiB。宣言がなければ rank ごとに 64 MiB）の両方で抑えます。
+- **メモリ**: 各 rank のために先に作っておく分は、件数（4096 件）とバイト数（`memory_bytes` の 4 分の 1 を rank で分けた分、最低 1 MiB。宣言がなければ rank ごとに 64 MiB）の両方で抑えます。生データは rank の数だけ読みます（各 rank の作り手が順番全体を読むため。stage に通すのは自分の rank の分だけです）。
 
 ### 順番
 
@@ -1863,7 +1863,7 @@ stream（`loader.Spec`、JSON）は、source（raw データとその重み・�
 3. **混合**: source の列を重み（`weight`、合計 65536 まで）の滑らかな重み付きラウンドロビンで交互に並べます。乱数は使わず、重みの合計ごとに同じ並びを繰り返すため、どの位置でも各 source の何件目かが計算で分かります。source ごとに epoch を数え、尽きたら次の epoch に進みます。最初の source が `epochs` 回りきったところで stream は終わります（0 なら終わりません）。
 4. **ブロックシャッフル**: `block` 件ずつ (seed, ブロック番号) で並べ替えます。メモリはブロック 1 つ分で済み、どの位置からでも正確に再開できます。
 5. **rank への分割**: 並べた列の g 番目は rank `g mod W` の `g / W` 番目のレコードです。
-6. **stage**: プロジェクトのプロセスです。stdin で長さ付きのレコードを受け取り、レコードごとに 0 件以上の出力（長さ付き）と終わりの印 `ff ff ff ff` を stdout に書きます。`workers` 本を並列に動かし、出力は入力の順に戻します。同じ入力には同じ出力を返すことが条件で、落ちた stage は起動し直して、答えていなかったレコードから渡し直します（続けて 3 回落ちたら stream のエラー）。
+6. **stage**: プロジェクトのプロセスです。stdin で長さ付きのレコードを受け取り、レコードごとに 0 件以上の出力（長さ付き）と終わりの印 `ff ff ff ff` を stdout に書きます。`workers` 本を rank で分けて並列に動かし（rank ごとに `workers` ÷ rank 数、最低 1 本）、出力は入力の順に戻します。同じ入力には同じ出力を返すことが条件で、落ちた stage は起動し直して、答えていなかったレコードから渡し直します（続けて 3 回落ちたら stream のエラー）。
 
 位置は rank ごとの `{rank, record, sub}`（その rank のレコードを `record` 件取り終え、次のレコードの出力を `sub` 件取った）です。再開では、W は変えられません。
 
@@ -1878,7 +1878,7 @@ stream（`loader.Spec`、JSON）は、source（raw データとその重み・�
 - 受け取り側から: `hello`（`{"version":1,"rank":R,"world":W,"position":{"rank":R,"record":K,"sub":S},"session":...}`。`position` と `session` は接続し直すときだけ）、`credit`（あと何件受け取るか）
 - Loader から: `ready`（その rank の開始位置、rank の数、セッション）、`item`（レコード番号、出力番号、そのレコードの最後かどうか、中身）、`skip`（出力のなかったレコード）、`end`、`error`
 
-開始位置は Loader が決めます（checkpoint の位置、なければ最初）。一度でも項目を渡した rank が位置なしで接続し直すと拒否します（先に送って受け取られなかった分が抜ける、または繰り返すおそれがあるためです。rank ごとに stream を 1 つ開いたままにします）。渡した rank と rank の数は `--state DIR`（init は stream ごとの実行ディレクトリを渡します）に残すので、Loader を起動し直しても覚えています（残せなければ stream のエラーです）。位置なしの接続を拒否するかどうかは、前の接続が離れるのを待ってから判断します。位置は自分の rank のものでなければならず（`position` に `rank` を書きます）、SDK の `Stream.rank`・`Stream.world`・`Stream.position` は読み取り専用です（`position` は写しを返します）。接続していない rank の分は、キューに入るだけ先に作り、入らなくなったら捨てて、その rank が戻ったときに作り直します（戻らない rank が他の rank を止めることはありません）。どの rank も接続しておらず、どの rank のキューもいっぱいなら、誰かが戻るまで何も作りません。`hello` に位置を書けるのは、`ready` で受け取ったセッションを添えて接続し直すときだけです。セッションは Attempt ごとに init が決め、Loader を起動し直しても変わりません（`--session` なしなら起動ごとにランダム）。そのため、学習コードが別の Attempt で覚えた位置で始めることはできません。Loader が始めた位置より前へ戻る位置も拒否します。渡したのと違う位置で接続し直した rank があれば、各 rank を渡した位置から作り直します。Python では次のように受け取ります。
+開始位置は Loader が決めます（checkpoint の位置、なければ最初）。一度でも項目を渡した rank が位置なしで接続し直すと拒否します（先に送って受け取られなかった分が抜ける、または繰り返すおそれがあるためです。rank ごとに stream を 1 つ開いたままにします）。渡した rank と rank の数は `--state DIR`（init は stream ごとの実行ディレクトリを渡します）に残すので、Loader を起動し直しても覚えています（残せなければ stream のエラーです）。位置なしの接続を拒否するかどうかは、前の接続が離れるのを待ってから判断します。位置は自分の rank のものでなければならず（`position` に `rank` を書きます）、SDK の `Stream.rank`・`Stream.world`・`Stream.position` は読み取り専用です（`position` は写しを返します）。rank ごとの項目は、その rank の作り手（producer）が作ります。どの rank の作り手も順番全体を読み、自分の rank のレコード（g mod W = r）だけを stage に通して、自分の rank のキューにだけ入れます。そのため、受け取っていない rank や遅い rank（DDP で allreduce に待たされているなど）のキューが満杯になっても、待つのはその rank の作り手だけで、他の rank を止めることはありません。2 つの rank が同じ件数を受け取っても、そのために要るレコード数は違い（1 レコードの出力は 0 件にも多数にもなります）、その差は走るほど広がるので、1 つの作り手が全 rank の分を順に作ると、どちらかのキューが満杯になった時点で両方が止まってしまうからです。どの rank も接続しておらず、どの rank のキューもいっぱいなら、誰かが戻るまで何も作りません。`hello` に位置を書けるのは、`ready` で受け取ったセッションを添えて接続し直すときだけです。セッションは Attempt ごとに init が決め、Loader を起動し直しても変わりません（`--session` なしなら起動ごとにランダム）。そのため、学習コードが別の Attempt で覚えた位置で始めることはできません。Loader が始めた位置より前へ戻る位置も拒否します。渡したのと違う位置で接続し直した rank があれば、各 rank を渡した位置から作り直します。Python では次のように受け取ります。
 
 ```python
 from kairo_sdk import streams
