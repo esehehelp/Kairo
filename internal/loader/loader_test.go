@@ -991,3 +991,55 @@ func TestStatusRatesAreOverTheWindow(t *testing.T) {
 		t.Fatalf("no time passed: %+v", same)
 	}
 }
+
+// Each rank's records are those of the one order whose g mod W is its rank,
+// in order, for any W, the last block short; and each rank's producer holds
+// its share of a block, not all of it.
+func TestEachRankHasItsShareOfTheOneOrder(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Block = 16 // 101 records: the last block short
+	payload := func(it string) string { return it[strings.Index(it, ":")+1:] }
+	one := collect(t, spec, dir, 1, nil)[0]
+	if len(one)%16 == 0 {
+		t.Fatalf("%d records: no short block", len(one))
+	}
+	for _, w := range []int{2, 3} {
+		got := collect(t, spec, dir, w, nil)
+		for r := range got {
+			var want, have []string
+			for g := r; g < len(one); g += w {
+				want = append(want, payload(one[g]))
+			}
+			for _, it := range got[r] {
+				have = append(have, payload(it))
+			}
+			if !reflect.DeepEqual(have, want) {
+				t.Fatalf("W %d rank %d: %v\nwant %v", w, r, have, want)
+			}
+		}
+	}
+	in, err := newInputs(spec, &Fetcher{Origin: DirOrigin{dir}}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer in.Close()
+	o := newOrderer(in, spec.Block, spec.Seed)
+	o.keep = func(g int64) bool { return g%2 == 1 }
+	for _, g := range []int64{0, 96} { // a whole block, the short last one
+		if err := o.seek(context.Background(), g); err != nil {
+			t.Fatal(err)
+		}
+		held, want := 0, 0
+		for k, rec := range o.recs {
+			if rec != nil {
+				held++
+			}
+			if (g+int64(k))%2 == 1 {
+				want++
+			}
+		}
+		if held != want || len(o.recs) == 0 {
+			t.Fatalf("block of %d from %d: %d records held, want %d", len(o.recs), g, held, want)
+		}
+	}
+}
