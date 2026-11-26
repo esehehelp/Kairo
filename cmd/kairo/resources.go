@@ -19,11 +19,15 @@ type resourceStatus struct {
 	Resources      []api.ResourceStatusEntry `json:"resources"`
 	ExternalClaims []store.ExternalClaim     `json:"external_claims"`
 	UndeclaredGPUs []store.UndeclaredGPU     `json:"undeclared_gpus"`
+	// hiddenResources of hiddenNodes disabled nodes were left out (--all
+	// shows them)
+	hiddenResources, hiddenNodes int
 }
 
 // printResources prints `kairo resource status` (and the end of `kairo
-// doctor`): a table, or the daemon's response with asJSON.
-func printResources(client *apiClient, asJSON bool) error {
+// doctor`): a table (the resources of disabled nodes with all only), or the
+// daemon's response with asJSON.
+func printResources(client *apiClient, asJSON, all bool) error {
 	payload, err := client.call(http.MethodGet, "/api/resources", nil)
 	if err != nil {
 		return err
@@ -36,7 +40,36 @@ func printResources(client *apiClient, asJSON bool) error {
 	if err := json.Unmarshal(payload, &status); err != nil {
 		return fmt.Errorf("decode resource status: %w", err)
 	}
+	if !all {
+		status = withoutDisabledNodes(status)
+	}
 	return renderResources(os.Stdout, status)
+}
+
+// withoutDisabledNodes leaves out of s the resources of disabled nodes, the
+// claims on them and the GPUs reported by them, saying how many it left out.
+func withoutDisabledNodes(s resourceStatus) resourceStatus {
+	out := resourceStatus{ExternalClaims: []store.ExternalClaim{}, UndeclaredGPUs: []store.UndeclaredGPU{}}
+	hidden, nodes := map[string]bool{}, map[string]bool{}
+	for _, r := range s.Resources {
+		if r.NodeDisabled {
+			hidden[r.ID], nodes[r.NodeID] = true, true
+			continue
+		}
+		out.Resources = append(out.Resources, r)
+	}
+	for _, c := range s.ExternalClaims {
+		if !hidden[c.ResourceID] {
+			out.ExternalClaims = append(out.ExternalClaims, c)
+		}
+	}
+	for _, gpu := range s.UndeclaredGPUs {
+		if !nodes[gpu.NodeID] {
+			out.UndeclaredGPUs = append(out.UndeclaredGPUs, gpu)
+		}
+	}
+	out.hiddenResources, out.hiddenNodes = len(hidden), len(nodes)
+	return out
 }
 
 // kindOrder is how the table lists the resources of a node.
@@ -82,6 +115,9 @@ func renderResources(w io.Writer, s resourceStatus) error {
 		if err := writeTable(w, rows); err != nil {
 			return err
 		}
+	}
+	if s.hiddenResources > 0 {
+		fmt.Fprintf(w, "(%d resources of %d disabled nodes not shown: --all)\n", s.hiddenResources, s.hiddenNodes)
 	}
 	if len(s.ExternalClaims) > 0 {
 		names := map[string]string{}

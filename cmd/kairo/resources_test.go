@@ -62,3 +62,35 @@ func TestResourceStatusIsATableByNodeAndJSONOnRequest(t *testing.T) {
 		t.Fatalf("--json: %v\n%s", err, out)
 	}
 }
+
+// The resources of a disabled node (retired, replaced) are left out of the
+// table, with its claims and the GPUs it reported, and said to be; --all
+// shows them.
+func TestResourceStatusLeavesOutDisabledNodes(t *testing.T) {
+	payload := `{"resources":[
+ {"id":"live-gpu","node_id":"live","provider_id":"nv","kind":"gpu","stable_identity":"GPU-live","admin_state":"enabled","derived_state":"available","total_bytes":1073741824,"free_bytes":1073741824,"utilization":0},
+ {"id":"gone-gpu","node_id":"gone","provider_id":"nv","kind":"gpu","stable_identity":"GPU-gone","admin_state":"enabled","derived_state":"undeclared","total_bytes":1073741824,"free_bytes":1073741824,"utilization":99,"node_disabled":true},
+ {"id":"gone-ram","node_id":"gone","provider_id":"host","kind":"ram","stable_identity":"physical-memory","admin_state":"enabled","derived_state":"stale","total_bytes":1073741824,"node_disabled":true}
+],
+"external_claims":[{"id":"claim-1","resource_id":"gone-gpu","claim_kind":"external_process","evidence":{"pid":"1"},"first_observed_at":"2026-11-24T01:02:03Z","last_observed_at":"2026-11-24T01:05:03Z"}],
+"undeclared_gpus":[{"uuid":"GPU-gone","node_id":"gone","provider_id":"nv","first_observed_at":"2026-11-24T01:02:03Z","last_observed_at":"2026-11-24T01:05:03Z"}]}`
+	server := fakeAPI(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer server.Close()
+	out, err := captureStdout(t, func() error { return run([]string{"resource", "status", "--api", server.URL}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "GPU-live") || strings.Contains(out, "gone") || strings.Contains(out, "external claims") || !strings.Contains(out, "(2 resources of 1 disabled nodes not shown: --all)") {
+		t.Fatalf("status:\n%s", out)
+	}
+	out, err = captureStdout(t, func() error { return run([]string{"resource", "status", "--all", "--api", server.URL}) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "GPU-gone") || !strings.Contains(out, "external claims") || !strings.Contains(out, "on gone") || strings.Contains(out, "not shown") {
+		t.Fatalf("status --all:\n%s", out)
+	}
+}

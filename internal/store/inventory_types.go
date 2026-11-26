@@ -35,6 +35,9 @@ type ResourceInstance struct {
 	DeclaredNodeID        *string  `json:"declared_node_id,omitempty"`
 	DerivedState          string   `json:"derived_state"`
 	ObservationAgeSeconds *float64 `json:"observation_age_seconds,omitempty"`
+	// NodeDisabled: its node is disabled (retired, or replaced): nothing is
+	// placed there, and what was last observed of it is old.
+	NodeDisabled bool `json:"node_disabled,omitempty"`
 }
 
 type Observation struct {
