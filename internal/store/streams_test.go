@@ -66,6 +66,28 @@ func TestATaskIsLaunchedWithItsStreams(t *testing.T) {
 	if len(launch.Streams) != 1 {
 		t.Fatalf("streams %+v", launch.Streams)
 	}
+	// what its loader says is kept, the last of each stream, and task show
+	// has it; a stream it does not read is refused
+	said := loader.Status{World: 2, Ranks: []loader.RankStatus{{Rank: 0, Position: loader.Position{Record: 7}, Taker: true, Taken: 70}, {Rank: 1}}}
+	for _, taken := range []int64{70, 90} {
+		said.Ranks[0].Taken = taken
+		if err := store.RecordAttemptStreams(ctx, launch.Attempt.ID, []AttemptStream{{Stream: "mix-1", Status: said}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := store.RecordAttemptStreams(ctx, launch.Attempt.ID, []AttemptStream{{Stream: "other", Status: said}}); !errors.Is(err, ErrStreamReportRefused) {
+		t.Fatalf("a stream it does not read: %v", err)
+	}
+	if err := store.RecordAttemptStreams(ctx, "att_none", []AttemptStream{{Stream: "mix-1", Status: said}}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("no such attempt: %v", err)
+	}
+	detail, err := store.GetTaskDetail(ctx, "streamed", "train")
+	if err != nil || len(detail.Executions) != 1 || len(detail.Executions[0].Attempts) != 1 {
+		t.Fatalf("detail %+v %v", detail.Executions, err)
+	}
+	if got := detail.Executions[0].Attempts[0].Streams; len(got) != 1 || got[0].Stream != "mix-1" || got[0].Status.World != 2 || got[0].Status.Ranks[0].Taken != 90 || got[0].ObservedAt == "" {
+		t.Fatalf("streams shown %+v", got)
+	}
 	s := launch.Streams[0]
 	src := s.Spec.Sources[0]
 	if s.Name != "mix-1" || s.Env != "KAIRO_STREAM_MIX_1" || s.Spec.Seed != 9 || s.Spec.Block != 64 || s.Spec.Epochs != 1 || len(s.Positions) != 0 ||

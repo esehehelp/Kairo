@@ -208,6 +208,60 @@ func renderAttempt(w io.Writer, a attemptInfo) {
 		}
 		line("checkpoint", "%s", text)
 	}
+	for _, st := range a.Streams {
+		for _, text := range streamText(st) {
+			line("stream", "%s", text)
+		}
+	}
+}
+
+// streamText is what a stream's loader said last, as task show prints it: a
+// line for the stream (its ranks, when it was said, its failure) and one per
+// rank: where it stands, how fast it is handed over, what is made ahead for
+// it, the share of the time its taker asked with nothing made (the training
+// waiting for data), and where its sources are read.
+func streamText(st store.AttemptStream) []string {
+	s := st.Status
+	head := fmt.Sprintf("%s: %d ranks", st.Stream, s.World)
+	if s.World == 0 {
+		head = st.Stream + ": no rank came yet"
+	}
+	if t, err := time.Parse(time.RFC3339Nano, st.ObservedAt); err == nil {
+		head += ", said " + longTime(t)
+	}
+	if s.WindowSeconds > 0 {
+		head += fmt.Sprintf(" (rates over %.0f s)", s.WindowSeconds)
+	}
+	if s.Error != "" {
+		head += "; failed: " + s.Error
+	}
+	out := []string{head}
+	for _, r := range s.Ranks {
+		text := fmt.Sprintf("  rank %d at record %d sub %d", r.Rank, r.Position.Record, r.Position.Sub)
+		switch {
+		case r.Ended:
+			text += ", ended"
+		case !r.Taker:
+			text += ", no taker"
+		}
+		text += fmt.Sprintf("; %.0f items/s %s/s; made ahead %d items (%s)", r.ItemsPerSecond, byteSize(int64(r.BytesPerSecond)), r.Queued, byteSize(r.QueuedBytes))
+		if s.WindowSeconds > 0 {
+			text += fmt.Sprintf("; waited for data %.0f%%", r.StarvedShare*100)
+		}
+		var reading []string
+		for _, at := range r.Reading {
+			where := fmt.Sprintf("%s epoch %d", at.Source, at.Epoch)
+			if at.File != "" {
+				where += " " + at.File
+			}
+			reading = append(reading, where)
+		}
+		if len(reading) > 0 {
+			text += "; reading " + strings.Join(reading, ", ")
+		}
+		out = append(out, text)
+	}
+	return out
 }
 
 // checkpointText is a checkpoint as task show prints it: its reference, the

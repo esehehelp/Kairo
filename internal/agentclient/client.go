@@ -459,6 +459,10 @@ func (c *Client) RecordAttemptUsage(ctx context.Context, attemptID string, ramBy
 	return done(ctx, c, agentops.AttemptUsed, agentops.AttemptUsage{AttemptID: attemptID, RAMBytes: ramBytes, DiskWrittenBytes: diskWrittenBytes})
 }
 
+func (c *Client) RecordAttemptStreams(ctx context.Context, attemptID string, streams []store.AttemptStream) error {
+	return done(ctx, c, agentops.AttemptStreamsSaid, agentops.AttemptStreams{AttemptID: attemptID, Streams: streams})
+}
+
 // RegisterController records that node's device controller started (kairo
 // controller); a node not known yet is created, a known one left as it is.
 func (c *Client) RegisterController(ctx context.Context, node store.Node, version string) error {

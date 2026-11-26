@@ -9,13 +9,14 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"time"
 
 	"kairo/internal/loader"
 )
 
 // loaderServe: kairo loader serve --spec SPEC.json --listen
 // unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--session S] [--origin
-// http|dir:DIR].
+// http|dir:DIR] [--status FILE].
 func loaderServe(args []string) error {
 	fs := newFlags("loader serve")
 	specPath := fs.String("spec", "", "the stream: sources with their files identified, seed, block, epochs, stages (JSON)")
@@ -26,6 +27,7 @@ func loaderServe(args []string) error {
 	rawRequests := fs.String("raw-requests", "", "with --raw: ask the node's agent through files in this directory, not its socket (a container in a VM)")
 	state := fs.String("state", "", "a directory keeping which ranks were served across this loader's restarts")
 	origin := fs.String("origin", "http", "where files are read: http (each file's URL) or dir:DIR (files by name under DIR)")
+	statusPath := fs.String("status", "", "a file the stream's status is written to every 5 s (where each rank stands, what is made ahead, rates): the node's agent reports it")
 	rawDir := fs.String("raw", "", "the node's raw cache for this attempt (its directory, with the agent's socket): every file made ready, checked and identified there before it is read; without it, files are read from --origin, one never read before identified as it is read")
 	if _, err := parseFlags(fs, args); err != nil {
 		return err
@@ -86,9 +88,19 @@ func loaderServe(args []string) error {
 	l := &loader.Loader{Spec: spec, Fetch: fetch, StateDir: *state, Identified: func(_ int, f loader.File) {
 		fmt.Fprintf(os.Stderr, "kairo loader: %s identified: %d bytes, sha256 %s\n", f.Name, f.Size, f.SHA256)
 	}}
+	if *statusPath != "" {
+		go l.WriteStatus(ctx, *statusPath, loaderStatusEvery, loaderStatusWindow)
+	}
 	fmt.Fprintf(os.Stderr, "kairo loader: listening on %s\n", *listen)
 	return (&loader.Server{Loader: l, Positions: positions, World: *world, Session: *session}).Serve(ctx, ln)
 }
+
+const (
+	// loaderStatusEvery spaces the status file's writes; loaderStatusWindow
+	// is what its rates are over.
+	loaderStatusEvery  = 5 * time.Second
+	loaderStatusWindow = 30 * time.Second
+)
 
 // loaderIdentify prints the identity of files (local paths or URLs): what
 // a stream's spec lists of each.
