@@ -115,6 +115,9 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 		}
 	}
 	history := s.runHistory(ctx)
+	// read before the transaction, as the history: a pass must not wait for
+	// a connection while it holds one (passes run concurrently)
+	perf := s.nodePerf(ctx)
 	started := time.Now()
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -128,7 +131,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	if err != nil {
 		return nil, err
 	}
-	m.perf = s.nodePerf(ctx)
+	m.perf = perf
 	candidates, err := loadPlanCandidates(ctx, tx, m)
 	if err != nil {
 		return nil, err

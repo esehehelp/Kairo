@@ -26,6 +26,7 @@ func (s *Store) EnsurePriorityPreemption(ctx context.Context, executorID string)
 		return nil, err
 	}
 	history := s.runHistory(ctx)
+	perf := s.nodePerf(ctx) // before the transaction (ReserveNext)
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return nil, err
@@ -38,7 +39,7 @@ func (s *Store) EnsurePriorityPreemption(ctx context.Context, executorID string)
 	if err != nil {
 		return nil, err
 	}
-	m.perf = s.nodePerf(ctx)
+	m.perf = perf
 	candidates, err := loadPlanCandidates(ctx, tx, m)
 	if err != nil {
 		return nil, err

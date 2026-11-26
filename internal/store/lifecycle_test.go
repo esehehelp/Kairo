@@ -18,7 +18,7 @@ func TestTheDataLifecycleWalks(t *testing.T) {
 		recCopy:      {"copying", "verified"},
 		recPlacement: {"fetching", "ready", "evicting"},
 		recScratch:   {"active", "kept", "deleted", "missing", "deleting"},
-		recRunOutput: {"active", "missing", "deleted"},
+		recRunOutput: {"active", "missing", "deleted", "moved"},
 	}
 	for r, states := range lifecycle {
 		want, ok := allowed[r]

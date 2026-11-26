@@ -335,7 +335,7 @@ func TestAContinuationMovesWithItsRunsOutputToWhereItEndsSooner(t *testing.T) {
 	if err = store.RecordPack(ctx, PackMade{ObjectID: objectID, ExecutorID: "executor", Dropped: true, SourceRemoved: true}); err != nil {
 		t.Fatal(err)
 	}
-	if state, _ := runOutputRow(t, store, runID, "a-scratch"); state != "deleted" {
+	if state, _ := runOutputRow(t, store, runID, "a-scratch"); state != "moved" {
 		t.Fatalf("left behind after its removal: %s", state)
 	}
 	if state, _, _, _ := landingState(t, store, continuation); state != landingDone {

@@ -249,10 +249,18 @@ func (p *planner) planOutput(c *planCandidate, ranks []planRank, options [][]pla
 				message: fmt.Sprintf("its run's output directory (%s) is to be brought from %s to %s, where it is expected to end sooner", formatBytes(h.bytes), h.nodeID, est.To)}}, true
 		}
 	}
+	// on its node, by the executor that made it when that one may run it
+	// (it serves the store the directory is on)
 	var here []planExecutor
 	for _, e := range options[0] {
 		if e.nodeID == h.nodeID {
 			here = append(here, e)
+		}
+	}
+	for _, e := range here {
+		if e.id == h.executorID {
+			here = []planExecutor{e}
+			break
 		}
 	}
 	if len(here) == 0 {

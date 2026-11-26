@@ -80,8 +80,8 @@ var lifecycle = map[lifecycleRecord]map[string][]string{
 		noRecord:  {"active"},
 		"active":  {"missing", "deleted", "moved"}, // moved: landed on another store (outputlandings.go)
 		"missing": {"active", "deleted"},
-		"moved":   {"deleted"}, // removed where it was, with the move's pack
-		"deleted": {"active"},  // a run moved away and brought back (landed again)
+		"moved":   {"active"}, // landed back here (its directory removed since it left)
+		"deleted": {},
 	},
 }
 

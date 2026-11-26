@@ -1206,7 +1206,7 @@ Run の Execution が、その Run の output ディレクトリのないノー�
 - **移動（move）**: サスペンド後の継続を別ノードで動かすとき（[Run の output ディレクトリと配置](#run-の-output-ディレクトリと配置)）。
   1. ディレクトリのある Executor が、ディレクトリ全体を種類 `output-move` のオブジェクトとして pack します（temporal として扱い、durable store へはコピーしません）。
   2. 移る先のノードの volatile store（Execution が指定したストア、なければ空きの最も多いもの）を担当する Executor が、その pack を元の agent の pack サーバから取り寄せ、ファイル一覧と照合しながら `<root>/inputs/land-<run id>.partial` に展開し、目印（`.kairo-output`）を置いて `<root>/outputs/<run id>` に移します。以後は、それがその Run の output ディレクトリです（`run_outputs` に Attempt なしの `active` として記録）。
-  3. 元のディレクトリは `moved` になり、元の agent が pack と一緒に消します（`moved` → `deleted`）。
+  3. 元のディレクトリは `moved` になり、元の agent が pack と一緒に消します（記録は `moved` のまま残り、Run がまたそのストアへ持ち込まれれば `active` に戻ります）。
 - **チェックポイント（checkpoint）**: チェックポイントからの再実行（`kairo task rerun --from-checkpoint`）は新しい Run なので、チェックポイントを公開した Run の output オブジェクトが pack されたあと、それを同じように（検証済みの durable コピー、またはまだ元にある pack から）取り寄せ、再実行の Run の output ディレクトリとして置きます。
 - **状態**: `waiting`（チェックポイントの Run の output がまだ pack されていない）→ `packing`（移動の pack 中）→ `bringing`（取り寄せ中）→ `placed`（移動: 置いた。元のディレクトリを消すまで）→ `done`。イベントは `output_move_ordered`・`output_move_packed`・`output_landed`・`output_move_done`・`output_landing_ordered` です。
 - **断念**: 指示から 1 時間（大きいものは 50 MB/s で運ぶ時間の 4 倍）以内に置けなかったもの、置く前に Execution が終わったものは断念します（`failed`、イベント `output_landing_failed`）。移動の継続は元のノードで動き、再実行は `output_unavailable` で待ちます。断念した取り寄せの途中のファイル（`<root>/inputs/land-*`）は残ります。
@@ -1597,10 +1597,9 @@ claim 済みの scratch はエージェント再起動後も削除対象とし�
 | | `deleting` | `deleted`、`kept` |
 | | `kept` | `deleted`（durable store へのコピー完了後） |
 | Run output（`run_outputs`） | `-` | `active` |
-| | `active` | `missing`、`deleted`、`moved`（ほかのストアへ持ち込まれた場合） |
+| | `active` | `missing`、`deleted`、`moved`（ほかのストアへ持ち込まれた場合。ディレクトリは元の agent が消します） |
 | | `missing` | `active`（再発見または再作成された場合）、`deleted` |
-| | `moved` | `deleted`（元の agent が消した場合） |
-| | `deleted` | `active`（移した先からまた持ち込まれた場合） |
+| | `moved` | `active`（移した先からまた持ち込まれた場合） |
 
 `packed`、`evicted`、`deleted` は終端状態です。
 

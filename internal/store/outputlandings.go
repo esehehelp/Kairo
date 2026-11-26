@@ -27,7 +27,8 @@ import (
 //     transfer_state is its pack's), and the executor of the store it goes
 //     to fetches the pack, checks it against its file list and unpacks it as
 //     <root>/outputs/<run id> there (placed). From then on that is the run's
-//     directory: the one it left is moved (run_outputs), and the agent there
+//     directory: the one it left is moved (run_outputs; moved it stays, and
+//     active again should the run land back there), and the agent there
 //     removes it with the pack (done).
 //   - checkpoint: a rerun from a checkpoint (task rerun --from-checkpoint)
 //     is a run of its own, and its checkpoint is in the output of the run
@@ -363,7 +364,8 @@ func recordLandingTx(ctx context.Context, tx *sql.Tx, made FetchMade) error {
 	case err != nil:
 		return err
 	default:
-		// the run left this store before (moved away, removed since)
+		// the run moved away from this store before (its directory removed
+		// since: a move is made only once the run's last one is done)
 		if err := checkTransition(recRunOutput, existing, "active"); err != nil {
 			return err
 		}
@@ -401,8 +403,8 @@ func moveDropsSourceTx(ctx context.Context, q queryer, objectID string) (bool, e
 }
 
 // moveDroppedTx records a move's pack removed (recordTransferTx), and with
-// it the directory it moved (made.SourceRemoved): that is deleted, and the
-// move done.
+// it the directory it moved (made.SourceRemoved): that holds nothing now
+// (it stays moved), and the move is done.
 func moveDroppedTx(ctx context.Context, tx *sql.Tx, made PackMade, project *string) error {
 	if !made.SourceRemoved {
 		return nil
@@ -412,10 +414,7 @@ func moveDroppedTx(ctx context.Context, tx *sql.Tx, made PackMade, project *stri
 		return err
 	}
 	runID, t := runOfMove(sourceID), now()
-	if err := checkRowsTransitionTx(ctx, tx, recRunOutput, "run_outputs", "run_id=$1 AND store_id=$2 AND state='moved'", "deleted", runID, storeID); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `UPDATE run_outputs SET state='deleted',bytes=0,updated_at=$1 WHERE run_id=$2 AND store_id=$3 AND state='moved'`, t, runID, storeID); err != nil {
+	if _, err := tx.ExecContext(ctx, `UPDATE run_outputs SET bytes=0,updated_at=$1 WHERE run_id=$2 AND store_id=$3 AND state='moved'`, t, runID, storeID); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE output_landings SET state=$1,updated_at=$2 WHERE object_id=$3 AND state=$4`, landingDone, t, made.ObjectID, landingPlaced); err != nil {
@@ -425,20 +424,31 @@ func moveDroppedTx(ctx context.Context, tx *sql.Tx, made PackMade, project *stri
 }
 
 // launchStoreTx is the store an attempt's scratch, output and cache go on:
-// the one its execution names, else the store of the launching executor's
-// node holding its run's output directory (landed there, or written there
-// by an earlier attempt), else "" (the executor's first).
+// the one its execution names, else the store holding its run's output
+// directory (landed there, or written there by an earlier attempt) when the
+// launching executor serves it, else "" (the executor's first).
 func launchStoreTx(ctx context.Context, q queryer, named sql.NullString, runID, executorID string) (string, error) {
 	if named.Valid && named.String != "" {
 		return named.String, nil
 	}
-	var storeID string
-	err := q.QueryRowContext(ctx, `SELECT o.store_id FROM run_outputs o JOIN executors x ON x.id=o.executor_id JOIN executors me ON me.id=$2 AND me.node_id=x.node_id
-		WHERE o.run_id=$1 AND o.state='active' ORDER BY o.updated_at DESC LIMIT 1`, runID, executorID).Scan(&storeID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
+	declared, err := declaredStores(ctx, q)
+	if err != nil {
+		return "", err
 	}
-	return storeID, err
+	home, ok, err := runOutputHomeTx(ctx, q, declared, runID)
+	if err != nil || !ok {
+		return "", err
+	}
+	me, err := executorInfoTx(ctx, q, executorID)
+	if err != nil {
+		return "", err
+	}
+	for _, d := range declared {
+		if d.ID == home.storeID && d.Class == machine.StoreVolatile && me.serves(d, executorID) {
+			return d.ID, nil
+		}
+	}
+	return "", nil
 }
 
 // reconcileOutputLandings makes the landings of reruns from a checkpoint,
