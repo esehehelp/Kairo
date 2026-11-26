@@ -37,7 +37,8 @@ type Host struct {
 func (p *Host) ID() string { return p.ProviderID }
 
 // snapshot is the node's cpu and ram as observed now, the cpu with the CPU
-// package power when the meter has a reading.
+// package power when the meter has a reading, the ram with the floor its
+// owner keeps free now (evidence floor_bytes: admission leaves it free).
 func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 	t := time.Now().UTC()
 	ttl := p.TTL
@@ -48,7 +49,12 @@ func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 	cpuTotal := int64(runtime.NumCPU() * 1000)
 	empty := json.RawMessage(`{}`)
 	resources := []store.ResourceInstance{{ID: p.NodeID + "-cpu", NodeID: p.NodeID, ProviderID: p.ProviderID, Kind: "cpu", StableIdentity: "logical-cpu", Binding: empty, Attributes: empty, AdminState: "enabled"}, {ID: p.NodeID + "-ram", NodeID: p.NodeID, ProviderID: p.ProviderID, Kind: "ram", StableIdentity: "physical-memory", Binding: empty, Attributes: empty, AdminState: "enabled"}}
-	observations := []store.Observation{{ResourceID: resources[0].ID, ObservedAt: stamp, ValidUntil: valid, TotalBytes: &cpuTotal, FreeBytes: &cpuTotal, Evidence: empty}, {ResourceID: resources[1].ID, ObservedAt: stamp, ValidUntil: valid, TotalBytes: &ramTotal, FreeBytes: &ramFree, Evidence: empty}}
+	ramEvidence := empty
+	if p.Owner.enabled() && ramTotal > 0 {
+		present, _ := p.Owner.present()
+		ramEvidence, _ = json.Marshal(map[string]int64{"floor_bytes": p.Owner.ramFloor(ramTotal, present)})
+	}
+	observations := []store.Observation{{ResourceID: resources[0].ID, ObservedAt: stamp, ValidUntil: valid, TotalBytes: &cpuTotal, FreeBytes: &cpuTotal, Evidence: empty}, {ResourceID: resources[1].ID, ObservedAt: stamp, ValidUntil: valid, TotalBytes: &ramTotal, FreeBytes: &ramFree, Evidence: ramEvidence}}
 	p.meterOnce.Do(func() {
 		if p.Meter == nil {
 			p.Meter = cpupower.New()

@@ -258,6 +258,31 @@ func TestPlannerCountsUsedRAMOnce(t *testing.T) {
 	c.expectReserved("exec-a", next)
 }
 
+// What its owner keeps free of a node's RAM (the floor its provider reports
+// with the RAM) is not counted as free: work that would take the node under
+// it waits, saying so, instead of being placed and suspended at once for
+// its owner; work that leaves it is placed.
+func TestPlannerLeavesTheOwnersRAMFloorFree(t *testing.T) {
+	c := newPlanCluster(t)
+	c.node("a", 0, 16000, 64, 500)
+	time.Sleep(2 * time.Millisecond)
+	stamp := time.Now().UTC()
+	total, free := 64*gib, 5*gib
+	if err := c.store.RecordObservation(c.ctx, Observation{ResourceID: "a-ram", ObservedAt: stamp.Format(time.RFC3339Nano), ValidUntil: stamp.Add(time.Minute).Format(time.RFC3339Nano),
+		TotalBytes: &total, FreeBytes: &free, Evidence: json.RawMessage(`{"floor_bytes":3221225472}`)}); err != nil {
+		t.Fatal(err)
+	}
+	big := c.submit(planSpec("big", "p1", 0, 0, 1000, 3))
+	if r := c.reserve("exec-a"); r != nil {
+		t.Fatalf("reserved %s under its owner's floor", r.Execution.ClientRequestID)
+	}
+	if w := c.wait(big.ID); w.Reason != "insufficient_ram" || !strings.Contains(w.Message, "2.0 GiB free (3.0 GiB kept free for its owner)") {
+		t.Fatalf("big waits for %+v", w)
+	}
+	small := c.submit(planSpec("small", "p2", 0, 0, 1000, 1))
+	c.expectReserved("exec-a", small)
+}
+
 // Preemption is not for GPUs alone: RAM a lower-priority cooperative
 // execution holds is reclaimed for a waiting one.
 func TestPlannerPreemptsForCapacity(t *testing.T) {

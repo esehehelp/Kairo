@@ -110,6 +110,11 @@ type capKey struct{ node, kind, filesystem string }
 type planCapacity struct {
 	resourceID  string
 	total, free sql.NullInt64
+	// floor is what the node's owner keeps free of its RAM (its provider's
+	// evidence floor_bytes, owneruse.go): not counted as free, so that what
+	// is placed does not take the node under it and is not suspended at
+	// once for its owner
+	floor int64
 }
 
 type planLease struct {
@@ -344,7 +349,7 @@ func (m *planModel) loadExecutors(ctx context.Context, tx *sql.Tx, callerID stri
 
 func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT ri.id,ri.node_id,ri.kind,ri.stable_identity,o.valid_until,o.total_bytes,o.free_bytes,
-		ri.kind<>'gpu' OR `+declaredGPUFilter+`
+		ri.kind<>'gpu' OR `+declaredGPUFilter+`,CASE WHEN ri.kind='ram' THEN o.evidence_json END
 		FROM resource_instances ri
 		LEFT JOIN resource_observations o ON o.id=(SELECT id FROM resource_observations WHERE resource_id=ri.id ORDER BY id DESC LIMIT 1)
 		WHERE ri.admin_state='enabled' AND ri.kind IN('gpu','cpu','ram','disk') ORDER BY ri.id`)
@@ -357,7 +362,8 @@ func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
 		var valid sql.NullString
 		var total, free sql.NullInt64
 		var declared bool
-		if err = rows.Scan(&resourceID, &nodeID, &kind, &identity, &valid, &total, &free, &declared); err != nil {
+		var evidence sql.NullString
+		if err = rows.Scan(&resourceID, &nodeID, &kind, &identity, &valid, &total, &free, &declared, &evidence); err != nil {
 			return err
 		}
 		fresh := false
@@ -383,7 +389,16 @@ func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
 		if _, seen := m.capacity[key]; seen || !fresh {
 			continue
 		}
-		m.capacity[key] = planCapacity{resourceID: resourceID, total: total, free: free}
+		row := planCapacity{resourceID: resourceID, total: total, free: free}
+		if evidence.Valid {
+			var e struct {
+				FloorBytes int64 `json:"floor_bytes"`
+			}
+			if json.Unmarshal([]byte(evidence.String), &e) == nil && e.FloorBytes > 0 {
+				row.floor = e.FloorBytes
+			}
+		}
+		m.capacity[key] = row
 		if kind != "disk" && total.Valid {
 			m.totals[kind] += float64(total.Int64)
 		}
@@ -704,7 +719,9 @@ func (m *planModel) available(key capKey, c planCapacity, freed func(string) boo
 		if !c.total.Valid || !c.free.Valid {
 			return 0, false
 		}
-		return min(c.total.Int64-reserved, min(c.total.Int64, c.free.Int64+reclaimed)-outstanding), true
+		// what is free now, less its owner's floor, holds what reservations
+		// have still to take and what is placed now
+		return min(c.total.Int64-reserved, min(c.total.Int64, c.free.Int64+reclaimed)-outstanding-c.floor), true
 	default:
 		return c.free.Int64 - outstanding, c.free.Valid
 	}
@@ -844,6 +861,8 @@ func (m *planModel) fit(node string, demand planDemand, ov planOverlay, freed fu
 		have := max(0, available-floor)
 		if c.kind == "cpu" {
 			f.fail("insufficient_cpu", fmt.Sprintf("%s: %s CPU needed, %s free", node, formatMillis(c.quantity), formatMillis(have)), false)
+		} else if c.kind == "ram" && row.floor > 0 {
+			f.fail("insufficient_ram", fmt.Sprintf("%s: %s ram needed, %s free (%s kept free for its owner)", node, formatBytes(c.quantity), formatBytes(have), formatBytes(row.floor)), false)
 		} else {
 			f.fail("insufficient_"+c.kind, fmt.Sprintf("%s: %s %s needed, %s free", node, formatBytes(c.quantity), name, formatBytes(have)), false)
 		}

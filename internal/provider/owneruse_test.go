@@ -168,6 +168,16 @@ func TestTheNodesCPUAndRAMAreItsOwnersWhenTaken(t *testing.T) {
 	if got := claimsOf(base, at(100, 50, 0), 4<<30); len(got) != 0 {
 		t.Fatalf("4 GiB available: %+v", got)
 	}
+	// the floor goes with the RAM's observation (admission leaves it free);
+	// none without owner use
+	h.CPUTimes = func() (cpuTimes, error) { return base, nil }
+	if ev := string(h.snapshot(64<<30, 32<<30).Observations[1].Evidence); ev != `{"floor_bytes":3435973836}` {
+		t.Fatalf("the RAM's evidence: %s", ev)
+	}
+	h.Owner = &OwnerUse{Disabled: true}
+	if ev := string(h.snapshot(64<<30, 32<<30).Observations[1].Evidence); ev != `{}` {
+		t.Fatalf("without owner use: %s", ev)
+	}
 }
 
 type noMeter struct{}
