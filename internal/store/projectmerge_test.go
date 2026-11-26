@@ -108,7 +108,7 @@ func TestAProjectMergesIntoAnother(t *testing.T) {
 	// declared again in into, under their names there, they are the same
 	// tasks (the renamed one under its new name)
 	again, err := store.ApplyProject(ctx, projectSpec(t, mergeManifest("into", [2]string{"shared-from", "data"}, [2]string{"mine", "extra"})))
-	if err != nil || !again.Idempotent {
+	if err != nil || len(again.Created) != 0 || again.Unchanged != 2 {
 		t.Fatalf("declared again: %+v %v", again, err)
 	}
 }
