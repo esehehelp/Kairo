@@ -72,8 +72,8 @@ func (c *rawCache) openAtPeer(ctx context.Context, src store.RawSource, sha256 s
 
 // fetchInto reads a file into a partial of the raw cache: from another node
 // keeping it when one does (a file identified before), else from upstream.
-// A node whose bytes are not the file's is passed over; running out of the
-// room held for it is not (upstream would not fit either).
+// A node whose bytes are not the file's (or more than it) is passed over;
+// a disk full is not (upstream would not fit either).
 func (c *rawCache) fetchInto(ctx context.Context, declared, canonical loader.File, found bool, reserved int64) (loader.File, string, error) {
 	if found {
 		for _, src := range c.rawSources(ctx, declared.URL) {
@@ -84,7 +84,7 @@ func (c *rawCache) fetchInto(ctx context.Context, declared, canonical loader.Fil
 				c.w.Logger.Info("raw file read from another node", "url", declared.URL, "node_id", src.NodeID, "bytes", identity.Size)
 				return identity, partial, nil
 			}
-			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, errPastReserved) || ctx.Err() != nil {
+			if errors.Is(err, syscall.ENOSPC) || ctx.Err() != nil {
 				return loader.File{}, "", err
 			}
 			c.w.Logger.Warn("raw file not read from another node", "url", declared.URL, "node_id", src.NodeID, "error", err)
@@ -114,19 +114,19 @@ func (p *PackServer) serveRaw(w http.ResponseWriter, r *http.Request, sha256 str
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
-	var dir string
+	var root string
 	for _, e := range p.Executors {
 		for _, s := range e.storeWork().servedStores() {
 			if _, isLocal := s.fs.(localStoreFS); isLocal && s.usable && s.decl.ID == read.StoreID && s.decl.Root == read.Root {
-				dir = filepath.Join(s.decl.Root, rawDirName)
+				root = s.decl.Root
 			}
 		}
 	}
-	if dir == "" {
+	if root == "" {
 		http.Error(w, "the raw file's store is not served here", http.StatusNotFound)
 		return
 	}
-	f, err := os.Open(filepath.Join(dir, sha256))
+	f, err := openRawFile(root, sha256)
 	if err != nil {
 		p.warn(sha256, "raw file not opened", "error", err)
 		http.NotFound(w, r)
@@ -134,10 +134,45 @@ func (p *PackServer) serveRaw(w http.ResponseWriter, r *http.Request, sha256 str
 	}
 	defer f.Close()
 	fi, err := f.Stat()
-	if err != nil || !fi.Mode().IsRegular() {
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	http.ServeContent(w, r, sha256, fi.ModTime(), f)
+}
+
+// openRawFile opens the raw file sha256 of the raw cache under root: a
+// regular file in <root>/raw, reached through no link (as packs are).
+func openRawFile(root, sha256 string) (*os.File, error) {
+	if !sha256Name.MatchString(sha256) {
+		return nil, fmt.Errorf("%w: raw file %q", errOutsideRoot, sha256)
+	}
+	r, err := openDirPath(filepath.Clean(root), false)
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	dir, err := openPlainDir(r, rawDirName)
+	if err != nil {
+		return nil, err
+	}
+	defer dir.Close()
+	fi, err := dir.Lstat(sha256)
+	if err != nil {
+		return nil, err
+	}
+	if isLink(fi) || !fi.Mode().IsRegular() {
+		return nil, fmt.Errorf("%w: %s is not a regular file", errScratchLink, sha256)
+	}
+	f, err := dir.OpenFile(sha256, os.O_RDONLY|markerOpenFlags, 0)
+	if err != nil {
+		return nil, err
+	}
+	opened, err := f.Stat()
+	if err != nil || !opened.Mode().IsRegular() || !os.SameFile(fi, opened) {
+		f.Close()
+		return nil, fmt.Errorf("%w: %s", errRaced, sha256)
+	}
+	return f, nil
 }

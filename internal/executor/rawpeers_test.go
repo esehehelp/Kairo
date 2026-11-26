@@ -57,7 +57,8 @@ func keepingNode(t *testing.T, sha256, token string, body []byte) *httptest.Serv
 // A raw file identified before and kept on another node is read from that
 // node's agent (its transfer endpoint, with the token the daemon issued),
 // not from upstream; a node refusing the token, or giving other bytes, is
-// passed over; with none giving it right, upstream is read.
+// passed over, as is one giving more than it; with none giving it right,
+// upstream is read.
 func TestARawFileComesFromAnotherNodeKeepingIt(t *testing.T) {
 	content := bytes.Repeat([]byte("kept on another node\n"), 20000)
 	identity, err := loader.Identify(bytes.NewReader(content), "raw.txt", loader.DefaultChunkBytes)
@@ -78,14 +79,17 @@ func TestARawFileComesFromAnotherNodeKeepingIt(t *testing.T) {
 	other := bytes.Clone(content)
 	other[100] = 'X'
 	wrong := keepingNode(t, identity.SHA256, "wrong", other)
+	long := keepingNode(t, identity.SHA256, "long", append(bytes.Clone(content), "more"...))
 	addr := func(s *httptest.Server) string { return strings.TrimPrefix(s.URL, "https://") }
 	// the two nodes' agents share the test servers' CA: one client trusts both
 	pool := good.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs
 	pool.AddCert(wrong.Certificate())
+	pool.AddCert(long.Certificate())
 
 	fake := &fakeRaws{identities: map[string]loader.File{identity.URL: identity}, counts: map[string]int64{}, sources: []store.RawSource{
 		{NodeID: "refusing", Addr: addr(good), Token: "not-issued"},
 		{NodeID: "wrong", Addr: addr(wrong), Token: "wrong"},
+		{NodeID: "long", Addr: addr(long), Token: "long"},
 		{NodeID: "far", Addr: addr(good), Token: "good"},
 	}}
 	var logs bytes.Buffer
@@ -110,7 +114,7 @@ func TestARawFileComesFromAnotherNodeKeepingIt(t *testing.T) {
 	if !kept || got.SHA256 != identity.SHA256 || readErr != nil || !bytes.Equal(body, content) || upstreamGets.Load() != 0 {
 		t.Fatalf("kept %v %+v, upstream read %d times: %v\n%s", kept, got, upstreamGets.Load(), readErr, logs.String())
 	}
-	if !strings.Contains(logs.String(), "raw file read from another node") || !strings.Contains(logs.String(), "node_id=wrong") {
+	if !strings.Contains(logs.String(), "raw file read from another node") || !strings.Contains(logs.String(), "node_id=wrong") || !strings.Contains(logs.String(), "node_id=long") {
 		t.Fatalf("logs:\n%s", logs.String())
 	}
 	entries, _ := os.ReadDir(filepath.Join(root, rawDirName, ".partial"))
@@ -123,7 +127,7 @@ func TestARawFileComesFromAnotherNodeKeepingIt(t *testing.T) {
 		t.Fatal(err)
 	}
 	fake.mu.Lock()
-	fake.sources = fake.sources[:2]
+	fake.sources = fake.sources[:3]
 	fake.mu.Unlock()
 	got, kept, path, err = cache.make(ctx, loader.File{Name: "raw.txt", URL: identity.URL})
 	if err != nil {
