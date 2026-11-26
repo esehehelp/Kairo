@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"time"
 )
 
 func nodeAction(action string, args []string) error {
@@ -116,4 +117,58 @@ func nodeFence(args []string) error {
 	}
 	return client.print(http.MethodPost, "/api/nodes/"+url.PathEscape(positional[0])+"/fence",
 		map[string]any{"actor": *actor, "reason": *reason, "confirm_agent_gone": true})
+}
+
+// nodeOwnerUse tells Kairo that the owner of a node uses it (POST
+// /api/nodes/ID/owner-use, README: Owner use): every resource the node
+// reports, or the GPUs, CPU and RAM named, until owner-done or --for has
+// passed.
+func nodeOwnerUse(args []string) error {
+	fs := newFlags("node owner-use")
+	api := apiFlag(fs)
+	actor := fs.String("actor", defaultActor(), "who acts")
+	var gpus stringList
+	fs.Var(&gpus, "gpu", "a GPU (UUID) of the node its owner uses (repeatable)")
+	cpu := fs.Bool("cpu", false, "its owner uses the node's CPU")
+	ram := fs.Bool("ram", false, "its owner uses the node's RAM")
+	until := fs.Duration("for", 0, "for this long (0: until owner-done)")
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 1 {
+		return usageError("node owner-use takes exactly one NODE_ID")
+	}
+	if *until < 0 {
+		return usageError("--for must not be negative")
+	}
+	body := map[string]any{"actor": *actor, "gpus": []string(gpus), "cpu": *cpu, "ram": *ram}
+	if *until > 0 {
+		body["until"] = time.Now().Add(*until).UTC().Format(time.RFC3339Nano)
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	return client.print(http.MethodPost, "/api/nodes/"+url.PathEscape(positional[0])+"/owner-use", body)
+}
+
+// nodeOwnerDone ends what owner-use set on a node (DELETE
+// /api/nodes/ID/owner-use).
+func nodeOwnerDone(args []string) error {
+	fs := newFlags("node owner-done")
+	api := apiFlag(fs)
+	actor := fs.String("actor", defaultActor(), "who acts")
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 1 {
+		return usageError("node owner-done takes exactly one NODE_ID")
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	return client.print(http.MethodDelete, "/api/nodes/"+url.PathEscape(positional[0])+"/owner-use", map[string]string{"actor": *actor})
 }

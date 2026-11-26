@@ -289,6 +289,23 @@ GPU 上の外部利用は次の基準で分類されます。
 - **`unattributed_activity`**: 説明のつく計算プロセスが存在しないにもかかわらず、1 GiB を超える GPU メモリが使用されている場合（Linux では別コンテナ上のワークロードがこの状態として観測されます）。
 - **Windows の例外**: Windows 上でグラフィックスプロセス（`nvidia-smi pmon` で `G` または `C+G` として現れるコンポジタ、ブラウザ、ディスプレイ接続 GPU のデスクトップなど）が表示されている GPU のメモリ使用量は、WDDM がプロセスごとのメモリ使用量を報告せず切り分けができないため、それらのプロセスによるものとして扱い `unattributed_activity` には計上しません。
 
+#### 所有者の使用（owner use）
+
+Kairo が使うマシンには持ち主がいます（デスクトップの GPU でゲームをする、ホストで手作業をする、など）。HTCondor の「持ち主が戻ったら譲る」と同じ考えを、資源ごとに、checkpoint を活かして全ノードで行います（issue #21）。持ち主の使用は、その資源への種類 `owner_use` の claim です。
+
+- **見つけ方（観測）**: ノードの provider が、Kairo の仕事ではないものによる使用を見つけて報告します。しきい値はエージェント設定の `[owner_use]` で変えられます。
+  - **GPU**: 描画のプロセス（`nvidia-smi pmon -s um` の型 `G` / `C+G`。Windows で Kairo の仕事を動かす WSL の VM（`vmmem*`）は除く）が使う SM の割合の合計が `gpu_sm_percent`（既定 30%）以上。
+  - **CPU**: コアの 90% 以上が使われていて、そのうち Kairo のコンテナ以外の分（全体から、Linux では Incus のインスタンス `kairo-*` の cgroup、Windows では wslc の VM の `vmmemwslc*` の CPU 時間を引いた分）が `cpu_percent`（既定 50%）以上。Kairo の分を読めないノードでは報告しません（Kairo 自身の仕事を持ち主の使用と取り違えないため）。
+  - **RAM**: 使える量が `ram_free_mib`（既定は 2 GiB とメモリの 5% の大きい方）を下回った。
+  - **持ち主がキーボードの前にいる**: 直近 10 分以内にキーボードかマウスの入力があれば、各しきい値を `*_present` の値（既定: GPU 10%、CPU 25%、RAM は 4 GiB とメモリの 10% の大きい方）に下げます。入力だけでは何も譲りません。Windows では、エージェントが入力を見られないセッション 0 で動くため、持ち主のセッションで `kairo input-report` を動かし、最後の入力時刻を `%LOCALAPPDATA%\kairo\input.json`（`input_file`）に書かせます（`ops/windows/install-input-report.ps1` がログオン時に動くタスク `kairo-input-report` として登録します）。2 分以上書かれていない記録は「いない」とみなします。
+- **手動**: `kairo node owner-use NODE [--gpu UUID]... [--cpu] [--ram] [--for D]` で、そのノードの全資源（または指定したもの）を持ち主が使うと伝えます。`kairo node owner-done NODE` か `--for` の期限まで続きます。
+- **譲り方**: 持ち主の使用がある資源には、新しい仕事を置きません（待機理由 `owner_use`。CPU か RAM なら、そのノードに置きません）。今使われている（手動のもの、または 90 秒以内に観測されたもの）間は、その資源を持つ仕事のうち checkpoint できるもの（`checkpointable` かつ `preemptible`）にサスペンドを送ります（origin `owner_use`）。
+  - GPU は、その GPU を持つ仕事すべて。
+  - CPU と RAM は、それを最も多く持つ仕事から 1 つずつ（前のサスペンドが終わってから、使用がまだ続いていれば次）。手動のものは全部。
+  - 続き（continuation）は、ほかのノードへ移るか（[Run の output ディレクトリと配置](#run-の-output-ディレクトリと配置)）、その資源が空くのを待ちます。
+  - checkpoint できない仕事は最後まで走ります（issue #44）。
+- **戻り方**: 観測された使用は、最後に観測されてから 10 分たつと終わります（ゲームのメニューやビルドの合間ですぐ戻らないため）。
+
 ## CLI からの Task 監視とログ確認
 
 すべてのコマンドグループは `help`、`--help`、`-h` に対応しています（例: `kairo task --help`、`kairo task wait --help`）。サブコマンドを打ち間違えた場合は候補が提示されます。なお、ProjectSpec で宣言された Task に対する `task` 系コマンドでは `QUEUE` を省略できます。
@@ -401,7 +418,7 @@ ca_file = "/etc/kairo/ca.pem"
 # attempt_api_url = "https://192.0.2.12:7474"  # このノード上の Attempt に渡す KAIRO_API_URL
 ```
 
-残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[bench]` は拒否されます（ベンチマークはコンテナで走り、使うプログラムは Kairo が決めます）。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
+`[owner_use]` は、このノードの持ち主の使用の見つけ方です（[所有者の使用](#所有者の使用owner-use)。既定で有効、`disabled = true` で無効。しきい値 `gpu_sm_percent`・`cpu_percent`・`ram_free_mib` と、持ち主がキーボードの前にいるときの `*_present`、`input_file`）。残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[bench]` は拒否されます（ベンチマークはコンテナで走り、使うプログラムは Kairo が決めます）。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
 
 - **Executor の実行形態**: すべての Executor は Attempt をイメージのコンテナで実行します。種別（kind）は `incus`（Linux）と `wslc`（Windows）だけです（[コンテナ実行](#コンテナ実行)を参照）。ホストで直接実行する種別（以前の `linux`・`windows` など）、Proxmox のコンテナの種別（以前の `pct`）、WSL の種別（`wsl2`）を宣言する設定は拒否されます。
 - **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。
@@ -717,7 +734,7 @@ Run の output ディレクトリ（[`output` ディレクトリ](#output-ディ
 
 待機理由コードは以下のとおりです。
 
-`no_executor` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
+`no_executor` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `owner_use` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
 
 ### 実行時間の推定
 

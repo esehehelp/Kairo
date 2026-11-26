@@ -500,6 +500,25 @@ type Agent struct {
 	Executors                  []Executor `toml:"executors"`
 	Providers                  []Provider `toml:"providers"`
 	Packs                      Packs      `toml:"packs"`
+	// OwnerUse: how this node's providers tell its owner's use of a
+	// resource (README: Owner use).
+	OwnerUse OwnerUse `toml:"owner_use"`
+}
+
+// OwnerUse is an agent's [owner_use]: on unless disabled; a threshold left
+// zero takes its default (provider.OwnerUse). The *_present ones apply while
+// the owner is at the keyboard (input within 10 minutes, as input_file has
+// it: on Windows %LOCALAPPDATA%/kairo/input.json by default, written by
+// kairo input-report in the owner's session).
+type OwnerUse struct {
+	Disabled            bool    `toml:"disabled"`
+	GPUSMPercent        float64 `toml:"gpu_sm_percent"`
+	GPUSMPercentPresent float64 `toml:"gpu_sm_percent_present"`
+	CPUPercent          float64 `toml:"cpu_percent"`
+	CPUPercentPresent   float64 `toml:"cpu_percent_present"`
+	RAMFreeMiB          int64   `toml:"ram_free_mib"`
+	RAMFreeMiBPresent   int64   `toml:"ram_free_mib_present"`
+	InputFile           string  `toml:"input_file"`
 }
 
 // Packs is this agent's pack server, from which other agents fetch the packs
@@ -551,6 +570,10 @@ func LoadAgent(path string) (Agent, error) {
 	}
 	if a.ObservationIntervalSeconds == 0 {
 		a.ObservationIntervalSeconds = 5
+	}
+	if o := a.OwnerUse; o.GPUSMPercent < 0 || o.GPUSMPercentPresent < 0 || o.CPUPercent < 0 || o.CPUPercentPresent < 0 || o.RAMFreeMiB < 0 || o.RAMFreeMiBPresent < 0 ||
+		o.GPUSMPercent > 100 || o.GPUSMPercentPresent > 100 || o.CPUPercent > 100 || o.CPUPercentPresent > 100 {
+		return a, errors.New("owner_use: thresholds are percentages (0-100) and MiB, not negative")
 	}
 	if p := a.Packs; p.Listen != "" || p.Addr != "" || p.CertFile != "" || p.KeyFile != "" {
 		if p.Listen == "" || p.Addr == "" || p.CertFile == "" || p.KeyFile == "" {
