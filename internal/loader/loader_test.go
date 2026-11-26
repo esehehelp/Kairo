@@ -6,6 +6,7 @@ import (
 	"compress/gzip"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -898,5 +899,81 @@ func TestARankTakingNothingHoldsNoOneUp(t *testing.T) {
 	got0 = append(got0, take(c0, -1)...)
 	if !reflect.DeepEqual(got0, want[0]) || !reflect.DeepEqual(got1, want[1]) {
 		t.Fatalf("rank 0 %d items (want %d), rank 1 %d (want %d)", len(got0), len(want[0]), len(got1), len(want[1]))
+	}
+}
+
+// A loader tells where each rank stands, what it has made ahead for it and
+// what it handed over (Status), and writes it to a file with rates.
+func TestALoaderTellsWhereEachRankStands(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Sources = spec.Sources[:1]
+	spec.Epochs = 300 // longer than the test takes
+	l := &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go (&Server{Loader: l, World: 2}).Serve(ctx, ln)
+	if st := l.Status(); st.World != 0 || len(st.Ranks) != 0 {
+		t.Fatalf("before a rank came: %+v", st)
+	}
+	path := filepath.Join(t.TempDir(), "status.json")
+	wctx, wcancel := context.WithCancel(ctx)
+	defer wcancel()
+	go l.WriteStatus(wctx, path, 20*time.Millisecond, time.Second)
+	c0, err := Dial(ctx, "tcp", ln.Addr().String(), 0, 2, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c0.Close()
+	for range 10 {
+		if _, err := c0.Next(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var st Status
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		st = l.Status()
+		if len(st.Ranks) == 2 && st.Ranks[0].Taken >= 10 && len(st.Ranks[0].Reading) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("status %+v", st)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	r0, r1 := st.Ranks[0], st.Ranks[1]
+	if st.World != 2 || !r0.Taker || r1.Taker || r0.TakenBytes == 0 || r0.Position == (Position{}) || r1.Taken != 0 ||
+		r0.QueueItems != rankQueue || r0.BudgetBytes == 0 || r0.Ended || r0.Reading[0].Source != spec.Sources[0].Name || r0.Reading[0].File == "" || r1.Queued == 0 || r1.QueuedBytes == 0 {
+		t.Fatalf("status %+v", st)
+	}
+	var written Status
+	for deadline := time.Now().Add(10 * time.Second); ; {
+		body, err := os.ReadFile(path)
+		if err == nil && json.Unmarshal(body, &written) == nil && written.World == 2 && written.WindowSeconds > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("written %s %v", body, err)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// Rates are what changed over the window: items and bytes handed over per
+// second, and the share of it a taker asked with nothing to hand.
+func TestStatusRatesAreOverTheWindow(t *testing.T) {
+	at := time.Date(2026, 11, 26, 0, 0, 0, 0, time.UTC)
+	before := Status{At: at, World: 1, Ranks: []RankStatus{{Taken: 100, TakenBytes: 1000, StarvedSeconds: 1}}}
+	now := Status{At: at.Add(10 * time.Second), World: 1, Ranks: []RankStatus{{Taken: 600, TakenBytes: 6000, StarvedSeconds: 3.5}}}
+	withRates(&now, before)
+	if r := now.Ranks[0]; now.WindowSeconds != 10 || r.ItemsPerSecond != 50 || r.BytesPerSecond != 500 || r.StarvedShare != 0.25 {
+		t.Fatalf("rates %+v over %v", r, now.WindowSeconds)
+	}
+	same := Status{At: at, World: 1, Ranks: []RankStatus{{Taken: 1}}}
+	if withRates(&same, same); same.WindowSeconds != 0 || same.Ranks[0].ItemsPerSecond != 0 {
+		t.Fatalf("no time passed: %+v", same)
 	}
 }

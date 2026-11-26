@@ -185,6 +185,11 @@ type (
 		RAMBytes         *int64 `json:"ram_bytes"`
 		DiskWrittenBytes *int64 `json:"disk_written_bytes"`
 	}
+	// AttemptStreams is what the loaders of an attempt's streams said last.
+	AttemptStreams struct {
+		AttemptID string                `json:"attempt_id"`
+		Streams   []store.AttemptStream `json:"streams"`
+	}
 )
 
 // Stores and data.
@@ -463,6 +468,7 @@ var (
 	ForceStopOrders      = Op[ExecutorRequest, ForceStopOrdersAnswer]{Name: "force-stop-orders", Observe: Empty, Empty: ForceStopOrdersAnswer{Orders: []store.ForceStopOrder{}}}
 	ForceStopAcked       = Op[ForceStopAck, OK]{Name: "force-stop-ack", Observe: Refused}
 	AttemptUsed          = Op[AttemptUsage, OK]{Name: "attempt-usage", Observe: Allowed}
+	AttemptStreamsSaid   = Op[AttemptStreams, OK]{Name: "attempt-streams", Observe: Allowed}
 )
 
 // The operations of device controllers, for the controller's own node.
@@ -489,6 +495,6 @@ var All = []Named{
 	DeletionsToMake, SettleDeletion, SourcesInUse, EvictionsToMake, SettleEviction, ScrubsToMake, RecordScrub,
 	PackRead, NetBenches, NetBenchStatus, NetBenchStart, NetBenchPoints, NetBenchKind, NetBenchFinish, NetBenchAuthorize, UnlaunchedLeases, ValidateReservation, MarkLeasePrepared, ReleaseReservation, AuthorizeLaunch,
 	ActivateLaunch, SetLogPaths, LogProblem, MarkProcessExited, RecordTerminal, QuiescenceCandidates,
-	FinalizeQuiescence, QuarantineTerms, QuarantineTerminated, ForceStopOrders, ForceStopAcked, AttemptUsed,
+	FinalizeQuiescence, QuarantineTerms, QuarantineTerminated, ForceStopOrders, ForceStopAcked, AttemptUsed, AttemptStreamsSaid,
 	ControllerRegister, DeviceSettings, DeviceReport, TrimsToMake, RecordTrim, DeviceSamples,
 }

@@ -67,6 +67,7 @@ type Loader struct {
 	gen       *generation
 	stopped   bool
 	hard      error
+	counters  []rankCounters // per rank, over the loader's life (Status)
 
 	outputs, bytes atomic.Int64
 }
@@ -82,9 +83,13 @@ type generation struct {
 	cancel context.CancelFunc
 	ctx    context.Context
 	queues []chan item
-	// budgets bound the bytes made ahead for each rank
-	budgets []*semaphore.Weighted
-	budget  int64
+	// budgets bound the bytes made ahead for each rank; queuedBytes is
+	// what each has taken of its budget now
+	budgets     []*semaphore.Weighted
+	budget      int64
+	queuedBytes []atomic.Int64
+	// reading is where each rank's producer reads its sources now (Status)
+	reading []atomic.Pointer[[]SourceAt]
 	// done[r] closes once rank r's producer is done; last[r] is what rank r
 	// is handed then, once its queue is empty (handed again to one that
 	// comes back): the end, or the stream's failure (of any rank's)
@@ -111,6 +116,7 @@ func (l *Loader) Start(ctx context.Context, world int, positions []Position) err
 	}
 	l.world = world
 	l.present, l.served = make([]bool, world), make([]bool, world)
+	l.counters = make([]rankCounters, world)
 	if l.StateDir != "" {
 		// the ranks it was started for, and those served, kept across restarts
 		if kept := l.keptWorldLocked(); kept != 0 && kept != world {
@@ -184,7 +190,8 @@ func (l *Loader) startLocked(parent context.Context) {
 		return
 	}
 	ctx, cancel := context.WithCancel(parent)
-	gen := &generation{cancel: cancel, ctx: ctx, queues: make([]chan item, l.world), done: make([]chan struct{}, l.world), last: make([]*item, l.world), budget: l.rankBudget()}
+	gen := &generation{cancel: cancel, ctx: ctx, queues: make([]chan item, l.world), done: make([]chan struct{}, l.world), last: make([]*item, l.world), budget: l.rankBudget(),
+		queuedBytes: make([]atomic.Int64, l.world), reading: make([]atomic.Pointer[[]SourceAt], l.world)}
 	for r := range gen.queues {
 		gen.queues[r], gen.done[r] = make(chan item, rankQueue), make(chan struct{})
 		gen.budgets = append(gen.budgets, semaphore.NewWeighted(gen.budget))
@@ -255,11 +262,16 @@ func (l *Loader) produceRank(ctx context.Context, gen *generation, r int, positi
 	go func() {
 		defer close(orderDone)
 		defer close(groups)
+		var at []SourceAt
 		for {
 			g, rec, ok, err := order.next(ctx)
 			if err != nil || !ok {
 				orderErr <- err
 				return
+			}
+			if now := in.reading(at); now != nil {
+				at = now
+				gen.reading[r].Store(&now)
 			}
 			if int(g%world) != r || g/world < pos.Record {
 				continue // another rank's, or taken before
@@ -329,11 +341,13 @@ func (l *Loader) put(ctx context.Context, gen *generation, r int, it item) error
 	if err := gen.budgets[r].Acquire(ctx, cost); err != nil {
 		return err
 	}
+	gen.queuedBytes[r].Add(cost)
 	select {
 	case gen.queues[r] <- it:
 		return nil
 	case <-ctx.Done():
 		gen.budgets[r].Release(cost)
+		gen.queuedBytes[r].Add(-cost)
 		return ctx.Err()
 	}
 }
@@ -400,10 +414,19 @@ var ErrRankTaken = errors.New("rank taken")
 // current now; ok false when none came in time.
 func (l *Loader) take(r int, wait time.Duration) (item, bool) {
 	l.mu.Lock()
-	gen := l.gen
+	gen, counters := l.gen, l.counters
 	l.mu.Unlock()
 	if gen == nil {
 		return item{}, false
+	}
+	select {
+	case it := <-gen.queues[r]:
+		return l.took(gen, r, it)
+	default:
+	}
+	// asked with nothing made: the taker waits for the loader
+	if r < len(counters) {
+		defer func(start time.Time) { counters[r].starved.Add(int64(time.Since(start))) }(time.Now())
 	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
@@ -433,9 +456,14 @@ func (l *Loader) take(r int, wait time.Duration) (item, bool) {
 func (l *Loader) took(gen *generation, r int, it item) (item, bool) {
 	if gen.budgets != nil && !it.end && it.err == nil {
 		gen.budgets[r].Release(gen.cost(it))
+		gen.queuedBytes[r].Add(-gen.cost(it))
 	}
 	l.mu.Lock()
 	current := l.gen == gen
+	if current && !it.end && it.err == nil && !it.skip && r < len(l.counters) {
+		l.counters[r].taken.Add(1)
+		l.counters[r].takenBytes.Add(int64(len(it.data)))
+	}
 	if current && !it.end && it.err == nil && !l.served[r] {
 		l.served[r] = true
 		if l.StateDir != "" {

@@ -102,6 +102,11 @@ func (e *Local) sampleUsage(ctx context.Context) {
 			if err := e.Store.RecordAttemptUsage(ctx, t.attemptID, s.ram, s.written); err != nil && !errors.Is(err, store.ErrNotFound) {
 				e.Logger.Warn("attempt usage not recorded", "attempt_id", t.attemptID, "error", err)
 			}
+			if streams := e.streamStatuses(t.attemptID); len(streams) > 0 {
+				if err := e.Store.RecordAttemptStreams(ctx, t.attemptID, streams); err != nil && !errors.Is(err, store.ErrNotFound) {
+					e.Logger.Warn("attempt streams not recorded", "attempt_id", t.attemptID, "error", err)
+				}
+			}
 		}
 	}()
 }

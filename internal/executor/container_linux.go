@@ -788,7 +788,8 @@ func (l loaderProcs) ended(pid int, again bool) {
 }
 
 // startLoaders starts a loader (kairo loader serve) for each stream the
-// argv reads, its spec, positions and socket in /kairo/run/streams/<name>,
+// argv reads, its spec, positions, socket and status (StreamStatusFile, read
+// by the agent from the node's side) in /kairo/run/streams/<name>,
 // its stages run from the argv's directory, what it learns reported to the
 // daemon as the attempt; the environment the argv gets has each stream's
 // socket (KAIRO_STREAM_<NAME>).
@@ -824,7 +825,8 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		// loader with it, never with a position of another attempt's
 		var session [16]byte
 		_, _ = rand.Read(session[:])
-		args := []string{self, "loader", "serve", "--spec", specPath, "--listen", "unix:" + sock, "--session", hex.EncodeToString(session[:]), "--state", filepath.Dir(specPath)}
+		args := []string{self, "loader", "serve", "--spec", specPath, "--listen", "unix:" + sock, "--session", hex.EncodeToString(session[:]), "--state", filepath.Dir(specPath),
+			"--status", path.Join(dir, StreamStatusFile)}
 		if len(s.Positions) > 0 {
 			positions, _ := json.Marshal(s.Positions)
 			p := path.Join(dir, "positions.json")

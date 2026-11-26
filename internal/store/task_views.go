@@ -332,6 +332,8 @@ type AttemptDetail struct {
 	RAMPeakBytes *int64 `json:"ram_peak_bytes,omitempty"`
 	// Checkpoints are the checkpoints it published, oldest first.
 	Checkpoints []CheckpointView `json:"checkpoints,omitempty"`
+	// Streams are what the loaders of its streams said last.
+	Streams []AttemptStream `json:"streams,omitempty"`
 }
 
 // WaitReason is an admission block of the execution, or a closed admission
@@ -400,6 +402,10 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 	if err != nil {
 		return TaskDetail{}, err
 	}
+	streams, err := s.taskAttemptStreams(ctx, task.scopeID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
 	for _, list := range attempts {
 		for i := range list {
 			list[i].LogProblems = logProblems[list[i].ID]
@@ -407,6 +413,7 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 				list[i].Energy = &e
 			}
 			list[i].Checkpoints = checkpoints[list[i].ID]
+			list[i].Streams = streams[list[i].ID]
 		}
 	}
 	// The task's executions are in its project, queue and task scopes: a

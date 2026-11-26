@@ -35,6 +35,9 @@ type Coordinator interface {
 	ForceStopOrders(ctx context.Context, executorID string) ([]store.ForceStopOrder, error)
 	AckForceStop(ctx context.Context, attemptID, phase string, detail json.RawMessage) error
 	RecordAttemptUsage(ctx context.Context, attemptID string, ramBytes, diskWrittenBytes *int64) error
+	// RecordAttemptStreams: what the loaders of an attempt's streams said
+	// last (streamstatus.go).
+	RecordAttemptStreams(ctx context.Context, attemptID string, streams []store.AttemptStream) error
 	NodeStores(ctx context.Context, nodeID string) ([]machine.Store, error)
 	RecordStoreObservation(ctx context.Context, obs store.StoreObservation) error
 	RecordAttemptScratch(ctx context.Context, scratch store.AttemptScratch) error

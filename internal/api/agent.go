@@ -456,6 +456,13 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentops.AttemptUsage) (agentops.OK, error) {
 				return recorded(s.Store.RecordAttemptUsage(ctx, b.AttemptID, b.RAMBytes, b.DiskWrittenBytes))
 			}),
+		handle(s, agentops.AttemptStreamsSaid,
+			func(ctx context.Context, b agentops.AttemptStreams) (string, error) {
+				return s.Store.AttemptNode(ctx, b.AttemptID)
+			},
+			func(ctx context.Context, b agentops.AttemptStreams) (agentops.OK, error) {
+				return recorded(s.Store.RecordAttemptStreams(ctx, b.AttemptID, b.Streams))
+			}),
 	}
 }
 

@@ -1794,7 +1794,6 @@ Task は宣言した stream を読みます（Windows の GPU は wslc のコン
 
 - raw キャッシュの LAN での共有（いまは各ノードが上流から 1 回ずつ取り寄せます）と、メモリでの保持
 - data object（`object = ...`）の source、非公開の Hugging Face ファイルの取得
-- 状態表示（`task show`）
 
 ### 宣言（`[raws]`・`[streams]`）
 
@@ -1836,7 +1835,7 @@ streams = ["mix"]           # → KAIRO_STREAM_MIX
 
 ### 起動、識別、位置
 
-- **起動**: Attempt のコンテナの中で、本体より先に stream ごとに `kairo loader serve` が起動します。spec と位置は `/kairo/run/streams/<名前>/`、ソケットは同じ場所の `socket` です。ソケットができてから本体が `KAIRO_STREAM_<NAME>=unix:...` 付きで起動し、本体が終わると Loader（とその stage）も終わります。stage は Task の image とソースで、Task の `cwd` から動きます。Loader のログは Attempt の stderr に出ます。
+- **起動**: Attempt のコンテナの中で、本体より先に stream ごとに `kairo loader serve` が起動します。spec と位置は `/kairo/run/streams/<名前>/`、ソケットは同じ場所の `socket`、状態は `status.json` です（[状態](#状態task-show)）。ソケットができてから本体が `KAIRO_STREAM_<NAME>=unix:...` 付きで起動し、本体が終わると Loader（とその stage）も終わります。stage は Task の image とソースで、Task の `cwd` から動きます。Loader のログは Attempt の stderr に出ます。
 - **公開値**: Hugging Face の一覧が示す sha256 とサイズ（サイズ 0 も示された値として扱います）は、識別情報とは別にファイルの宣言に残ります。公開値と識別情報が食い違うファイルを含む stream は、始まった時点で `raw data changed` で止まります。そのファイルのレコード数を使って読み飛ばすこともしません。デーモンは、受け取った一覧のファイルがパターンに合うこと、名前順に 1 度ずつ並ぶことを確かめます。
 - **識別**: ファイルの識別情報とレコード数は、raw キャッシュの agent が計算して記録します（上記。テーブル `raw_identities`・`raw_records`）。レコード数は、その Attempt の窓口のリンクを読み、識別情報と照合しながら数えたものだけを記録します。受け付けるのは、その Executor に Lease のある Execution の stream が読むファイルのものだけです。URL ごとに最初の識別情報が残り、公開済みの値と違うもの、すでにあるものと少しでも違うもの（サイズ、sha256、チャンク）は `raw data changed` です。レコード数は、区切り・実際の圧縮・フィールドごとに残します。以後の起動では、どのチャンクもこれと照合され、長さが違えば（短くても長くても）変わったものとして扱います。
 - **位置と checkpoint**: SDK の `safe_point(..., streams=[train])`（torch の `DistributedAdapter.safe_point(..., streams=[train])` は全 rank の位置を集めます）は、checkpoint を公開するとき、各 stream について rank の数（`world`）、順番の版（`order`、いまは 1）、各 rank の位置を `checkpointed` の payload に `"streams": {NAME: {"world": W, "order": 1, "positions": [...]}}` として入れます。stream を読む Execution の checkpoint は、読むすべての stream について、`world` と `order` があり、順番の版が同じで、rank 0〜W-1 の位置がちょうど 1 つずつ（`rank`・`record`・`sub` をすべて書いたもの。負の値なし、上限内）なければ拒否されます（`safe_point` に stream を渡し忘れると、公開されません）。
@@ -1873,7 +1872,7 @@ stream（`loader.Spec`、JSON）は、source（raw データとその重み・�
 
 ### 受け渡し
 
-`kairo loader serve --spec SPEC.json --listen unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--session S] [--state DIR] [--origin http|dir:DIR]` が stream を作ります。各 rank は 1 本の接続でつながります。フレームは「4 バイトのリトルエンディアンの長さ、種別 1 バイト、中身」です。
+`kairo loader serve --spec SPEC.json --listen unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--session S] [--state DIR] [--origin http|dir:DIR] [--status FILE]` が stream を作ります。各 rank は 1 本の接続でつながります。フレームは「4 バイトのリトルエンディアンの長さ、種別 1 バイト、中身」です。
 
 - 受け取り側から: `hello`（`{"version":1,"rank":R,"world":W,"position":{"rank":R,"record":K,"sub":S},"session":...}`。`position` と `session` は接続し直すときだけ）、`credit`（あと何件受け取るか）
 - Loader から: `ready`（その rank の開始位置、rank の数、セッション）、`item`（レコード番号、出力番号、そのレコードの最後かどうか、中身）、`skip`（出力のなかったレコード）、`end`、`error`
@@ -1889,6 +1888,23 @@ with streams.open("mix-v9") as train:   # KAIRO_STREAM_MIX_V9、RANK、WORLD_SIZ
 ```
 
 接続が切れたら、その位置で自動的に接続し直します。torch では `streams.dataset(name, decode)` が IterableDataset を返します（1 つの rank は 1 つのプロセスで受け取るため、`num_workers=0` で使います）。
+
+### 状態（`task show`）
+
+Loader は 5 秒ごとに、stream の状態を `--status FILE`（init は `/kairo/run/streams/<名前>/status.json`）に書きます（丸ごと置き換えます）。agent は 15 秒ごとの使用量の測定のときに、ノード側からこのファイルを読み、デーモンに送ります（エージェント操作 `attempt-streams`。テーブル `attempt_streams` に、Attempt と stream ごとに最後の 1 つを残します。その Attempt が読まない stream の報告は拒否します）。`kairo task show` は Attempt ごとに次を出します（`--json` では `attempts[].streams`）。
+
+```
+  stream:     wiki: 2 ranks, said 2026-11-26 21:30:05 (rates over 30 s)
+  stream:       rank 0 at record 1234 sub 5; 850 items/s 2.0 MiB/s; made ahead 4096 items (3.0 MiB); waited for data 0%; reading wiki epoch 0 part-3.jsonl.zst
+  stream:       rank 1 at record 1233 sub 0; 850 items/s 2.0 MiB/s; made ahead 3900 items (2.9 MiB); waited for data 0%; reading wiki epoch 0 part-3.jsonl.zst
+```
+
+- **位置**: その rank にまだ渡していない次の位置です（checkpoint の位置と同じ形）。受け取っているプロセスがなければ `no taker`、その rank のレコードをすべて作り終えていれば `ended` と出ます。
+- **速さ**: 直近 30 秒に渡した件数とバイト数です。
+- **made ahead**: 作って、まだ渡していない分です（上限は rank ごとに 4096 件と、[メモリ](#起動識別位置)のバイト数）。いつも上限近くなら、Loader は学習より先を走っています。
+- **waited for data**: 直近 30 秒のうち、受け取り側が項目を求めているのに、作ったものがなかった時間の割合です。高ければ、学習はデータを待っています（Loader の stage や取り寄せが遅い）。受け取り側（SDK）が先読みのために求めている分も含むので、学習が実際に止まっている時間の上限です。
+- **reading**: その rank の作り手が、いま読んでいる各 source の epoch とファイルです（渡した位置より、作り置きと stage の中にある分だけ先です）。
+- 失敗した stream は、その理由も出ます。
 
 ## Worker SDK
 

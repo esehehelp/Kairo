@@ -89,6 +89,7 @@ type attemptInfo struct {
 	Energy          *store.AttemptEnergy   `json:"energy"`
 	RAMPeakBytes    *int64                 `json:"ram_peak_bytes"`
 	Checkpoints     []store.CheckpointView `json:"checkpoints"`
+	Streams         []store.AttemptStream  `json:"streams"`
 }
 
 // ended reports whether the attempt's process is gone for good.
