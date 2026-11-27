@@ -547,13 +547,8 @@ func normalizeExecution(value *Execution) error {
 	if value.Regenerable && value.Gang != nil {
 		return errors.New("regenerable is for a single execution, not a gang")
 	}
-	if value.ContinueAfterLoss && (!value.Checkpointable || value.Gang != nil) {
-		return errors.New("continue_after_loss is for a checkpointable single execution (it goes on from a checkpoint), not a gang")
-	}
-	// a gang goes on from a checkpoint only once its whole gang can make
-	// one together and resume where it is readable (issue #47, phase 4)
-	if value.Gang != nil && value.Checkpointable {
-		return errors.New("a gang is not checkpointable yet: it runs to completion (remove checkpointable)")
+	if value.ContinueAfterLoss && !value.Checkpointable {
+		return errors.New("continue_after_loss is for a checkpointable execution (it goes on from a checkpoint)")
 	}
 
 	if value.Executor.Labels == nil {

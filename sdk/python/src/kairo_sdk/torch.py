@@ -23,6 +23,19 @@ from .runtime import (
 _log = logging.getLogger("kairo_sdk.torch")
 
 
+def _gang_env() -> tuple[int, int, bool] | None:
+    """``(member, members, first)`` in a Kairo gang's member (one container of
+    several, ``KAIRO_GANG_SIZE`` of 2 or more), ``first`` for the member's
+    first process (``LOCAL_RANK`` 0, or unset: one process per member);
+    ``None`` outside a gang."""
+    size = int(os.environ.get("KAIRO_GANG_SIZE") or 0)
+    if size < 2:
+        return None
+    member = int(os.environ.get("KAIRO_GANG_RANK") or 0)
+    first = int(os.environ.get("LOCAL_RANK") or 0) == 0
+    return member, size, first
+
+
 class DistributedAdapter:
     """Rank-0 control-plane I/O with all-rank checkpoint coordination.
 
@@ -31,6 +44,16 @@ class DistributedAdapter:
     outage cannot strand peer ranks in a collective. Checkpoint failures are
     instead raised on every rank because continuing with an incomplete
     checkpoint would make a suspend acknowledgement unsafe.
+
+    In a gang (several containers on several nodes, each its own attempt:
+    ``KAIRO_GANG_SIZE``), each member's first process (``LOCAL_RANK`` 0)
+    registers its member's processes and polls its own attempt; the gang
+    acts on a suspend, or a checkpoint, only once every member holds one, so
+    that every rank checkpoints at the same step. Each member then publishes
+    its own part, its first process's ``continuation_ref`` (a path in its
+    own container: save there on each member's first process), with the
+    round it belongs to; Kairo goes on only from a round every member
+    published (issue #47).
     """
 
     def __init__(self, session: AttemptSession) -> None:
@@ -42,6 +65,12 @@ class DistributedAdapter:
         # Rank 0: a ``checkpointed`` acknowledgement whose answer did not
         # arrive, (command id, kind, payload), sent again before anything else.
         self._pending_publication: tuple[str, str, dict[str, Any]] | None = None
+        # In a gang: (member, members, first process); on a member's first
+        # process the commands it holds by kind until every member holds one,
+        # and whether its part of a suspend is published.
+        self._gang = _gang_env()
+        self._gang_commands: dict[str, dict[str, Any]] = {}
+        self._gang_suspend_published = False
 
     @staticmethod
     def _distribution():
@@ -52,6 +81,9 @@ class DistributedAdapter:
     def start(self) -> None:
         """Register every rank, then start the rank-0 background heartbeat."""
         if self._registered:
+            return
+        if self._gang is not None:
+            self._gang_start()
             return
         dist, distributed = self._distribution()
         rank = dist.get_rank() if distributed else 0
@@ -89,6 +121,10 @@ class DistributedAdapter:
         self._registered = True
 
     def close(self) -> None:
+        if self._gang is not None:
+            if self._gang[2]:
+                self.session.close()
+            return
         dist, distributed = self._distribution()
         rank = dist.get_rank() if distributed else 0
         if rank == 0:
@@ -152,6 +188,8 @@ class DistributedAdapter:
         outage cannot strand peer ranks in a collective.
         """
         self.start()
+        if self._gang is not None:
+            return self._gang_safe_point(checkpoint, progress)
         dist, distributed = self._distribution()
         rank = dist.get_rank() if distributed else 0
 
@@ -344,6 +382,194 @@ class DistributedAdapter:
                 return message
         message["stop"] = stop_requested()
         return message
+
+
+    # -- gangs: a member per container, each its own attempt ------------------
+
+    def _gang_start(self) -> None:
+        """Every member's first process registers its member's processes
+        with its own attempt and starts its heartbeat."""
+        dist, distributed = self._distribution()
+        if not distributed:
+            raise RuntimeError("a gang's DistributedAdapter needs torch.distributed initialized across every member")
+        member, members, first = self._gang
+        world = dist.get_world_size()
+        local = {"rank": dist.get_rank(), "pid": os.getpid(), "identity": _current_process_identity(), "member": member, "first": first}
+        registrations: list[Any] = [None] * world
+        dist.all_gather_object(registrations, local)
+        firsts = sorted(item["member"] for item in registrations if item["first"])
+        error: str | None = None
+        if firsts != list(range(members)):
+            error = f"a gang of {members} members needs one first process (LOCAL_RANK 0) in each, found members {firsts}"
+        elif first:
+            try:
+                for item in registrations:
+                    if item["member"] == member:
+                        self.session.register_process(rank=item["rank"], pid=item["pid"], process_identity=item["identity"])
+            except BaseException as exc:
+                self.session.last_control_error = exc
+                error = f"member {member}: Kairo process registration failed: {exc}"
+        errors_by_rank: list[Any] = [None] * world
+        dist.all_gather_object(errors_by_rank, error)
+        failures = list(dict.fromkeys(e for e in errors_by_rank if e))
+        if failures:
+            raise RuntimeError("; ".join(failures))
+        if first:
+            self.session.start()
+        self._registered = True
+
+    def _gang_poll(self, progress: dict[str, Any] | None) -> dict[str, Any]:
+        """On a member's first process: send again a publication whose answer
+        did not come, poll, and hold the commands received; what this member
+        says to the others."""
+        session = self.session
+        member = self._gang[0]
+        state: dict[str, Any] = {"member": member, "suspend": None, "checkpoint": None, "stop": False,
+                                 "terminal": None, "published": self._gang_suspend_published, "pending": False}
+        if progress is not None:
+            session.set_progress(progress)
+        if session._terminal_error is not None:
+            state["terminal"] = _terminal_message(session)
+            return state
+        if self._pending_publication is not None:
+            command_id, kind, payload = self._pending_publication
+            status = self._try_ack(command_id, "checkpointed", payload)
+            if status == "terminal":
+                state["terminal"] = _terminal_message(session)
+                return state
+            if status == "failed" and self._unanswered():
+                state["pending"] = True
+                return state
+            self._pending_publication = None
+            if status == "ok" and kind == "suspend":
+                self._gang_suspend_published = state["published"] = True
+            self._gang_commands.pop(kind, None)
+        now = time.monotonic()
+        if now - session._last_poll >= session.poll_interval_seconds:
+            session._last_poll = now
+            try:
+                commands = session.poll_commands()
+                session.last_control_error = None
+            except (AttemptRetired, AttemptFenced):
+                state["terminal"] = _terminal_message(session)
+                return state
+            except BaseException as exc:
+                session.last_control_error = exc
+                commands = []
+            for raw in commands:
+                kind = str(raw.get("kind") or "")
+                if kind not in ("suspend", "checkpoint"):
+                    continue
+                command_id = str(raw["id"])
+                held = self._gang_commands.get(kind)
+                if held is not None and held["command_id"] == command_id:
+                    continue
+                status = self._try_ack(command_id, "accepted")
+                if status == "ok":
+                    status = self._try_ack(command_id, "checkpointing")
+                if status == "terminal":
+                    state["terminal"] = _terminal_message(session)
+                    return state
+                if status == "gone":
+                    continue
+                self._gang_commands[kind] = {
+                    "command_id": command_id,
+                    "kind": kind,
+                    "reason": str(raw.get("reason") or ""),
+                    "delivery_count": int(raw.get("delivery_count") or 0),
+                }
+        state["suspend"] = self._gang_commands.get("suspend")
+        state["checkpoint"] = self._gang_commands.get("checkpoint")
+        state["stop"] = stop_requested()
+        return state
+
+    def _gang_safe_point(self, checkpoint, progress: dict[str, Any] | None) -> bool:
+        dist, _ = self._distribution()
+        member, members, first = self._gang
+        rank, world = dist.get_rank(), dist.get_world_size()
+        gathered: list[Any] = [None] * world
+        dist.all_gather_object(gathered, self._gang_poll(progress) if first else None)
+        said = {state["member"]: state for state in gathered if state is not None}
+        for state in said.values():
+            _raise_terminal(self.session, state["terminal"])
+        if all(said[m]["published"] for m in range(members)):
+            # every member's part of the suspend is published: every rank stops
+            self.session.suspend_handled = True
+            return True
+        if any(state["published"] or state["pending"] for state in said.values()):
+            return False  # a member's part still to be published: the others wait for it
+        suspends = [said[m]["suspend"] for m in range(members)]
+        checkpoints = [said[m]["checkpoint"] for m in range(members)]
+        if all(suspends):
+            commands = suspends
+        elif all(checkpoints):
+            commands = checkpoints
+        elif any(state["stop"] for state in said.values()):
+            return self._checkpoint_for_stop_signal(checkpoint, dist, True, rank)
+        else:
+            return False  # not every member holds one yet (it is on its way to them)
+        kind = commands[0]["kind"]
+        round_id = hashlib.sha256("|".join(c["command_id"] for c in commands).encode()).hexdigest()[:16]
+        context = CommandContext(execution_id=self.session.execution_id, attempt_id=self.session.attempt_id, **commands[member])
+        result = None
+        local_error: str | None = None
+        try:
+            result = normalize_suspend_result(checkpoint(context))
+        except BaseException as exc:
+            local_error = f"member {member} rank {rank} checkpoint failed: {type(exc).__name__}: {exc}"
+        errors_by_rank: list[Any] = [None] * world
+        dist.all_gather_object(errors_by_rank, local_error)
+        failures = [e for e in errors_by_rank if e is not None]
+        if failures:
+            reason = "; ".join(failures)
+            if first:
+                self._try_ack(context.command_id, "rejected", {"reason": reason})
+                self._gang_commands.pop(kind, None)
+            if kind == "checkpoint":
+                self.session.last_checkpoint_error = RuntimeError(reason)
+                _log.warning("Kairo gang checkpoint failed; every rank carries on: %s", reason)
+                return False
+            raise RuntimeError(reason)
+        dist.barrier()
+        outcome: dict[str, Any] | None = None
+        if first:
+            outcome = {"member": member, "ok": False, "no_continuation": False, "terminal": None}
+            assert result is not None
+            if not result.continuation_ref:
+                self._try_ack(context.command_id, "rejected", {"reason": "no continuation_ref on the member's first process"})
+                outcome["no_continuation"] = True
+                self._gang_commands.pop(kind, None)
+            else:
+                payload = suspend_payload(result, {})
+                payload["gang"] = {"round": round_id, "rank": member, "size": members}
+                status = self._try_ack(context.command_id, "checkpointed", payload)
+                outcome["ok"] = status == "ok"
+                if status == "terminal":
+                    outcome["terminal"] = _terminal_message(self.session)
+                elif status == "failed" and self._unanswered():
+                    self._pending_publication = (context.command_id, kind, payload)
+                elif kind == "suspend" and outcome["ok"]:
+                    self._gang_suspend_published = True
+                if self._pending_publication is None:
+                    self._gang_commands.pop(kind, None)
+        outcomes: list[Any] = [None] * world
+        dist.all_gather_object(outcomes, outcome)
+        by_member = {o["member"]: o for o in outcomes if o is not None}
+        for o in by_member.values():
+            _raise_terminal(self.session, o["terminal"])
+        if any(o["no_continuation"] for o in by_member.values()):
+            message = f"a member's first process returned no continuation_ref for the gang's {kind}"
+            if kind == "checkpoint":
+                self.session.last_checkpoint_error = NoContinuationError(message)
+                _log.warning("Kairo gang checkpoint published nothing; every rank carries on")
+                return False
+            raise NoContinuationError(message)
+        if kind == "checkpoint":
+            return False
+        if all(by_member[m]["ok"] for m in range(members)):
+            self.session.suspend_handled = True
+            return True
+        return False  # a member's part goes again at the next safe point
 
 
 def _raise_rank_errors(errors) -> None:

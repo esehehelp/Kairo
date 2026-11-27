@@ -241,7 +241,8 @@ func (p *planner) planOutput(c *planCandidate, ranks []planRank, options [][]pla
 	if h == nil {
 		return planPlacement{}, false
 	}
-	if _, live := p.m.executor(h.executorID); live && o.reason == "continuation" && o.landing == nil && !o.runBusy {
+	// (a gang's members each go where their own output is: no move)
+	if _, live := p.m.executor(h.executorID); live && c.gangID == "" && o.reason == "continuation" && o.landing == nil && !o.runBusy {
 		if est, ok := p.chooseNode(c, ranks, options, *h); ok {
 			move := &planMove{to: est.To, home: *h, estimate: est}
 			p.holdForLanding(c, ranks, &landingView{node: est.To, bytes: h.bytes, created: p.m.stamp, fromRun: h.runID}, h.nodeID)

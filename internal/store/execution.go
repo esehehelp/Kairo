@@ -319,6 +319,10 @@ func rankSpec(spec ExecutionSpec, rank int) ExecutionSpec {
 		if r.Capacity != nil {
 			out.Capacity = *r.Capacity
 		}
+		if r.InputContinuationRef != nil {
+			out.InputContinuationRef = r.InputContinuationRef
+			out.InputCheckpointCommand = r.InputCheckpointCommand
+		}
 		out.Env = envspec.Merge(spec.Env, r.Env)
 	}
 	return out

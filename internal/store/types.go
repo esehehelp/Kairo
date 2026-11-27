@@ -135,8 +135,8 @@ type ExecutionSpec struct {
 // execution's.
 type GangSpec struct {
 	Size int `json:"size"`
-	// Port is the rendezvous port on rank 0's interconnect address; 0 picks a
-	// free one in 29500-29999 on that node at placement.
+	// Port is the rendezvous port on member 0's address on the generation's
+	// segment; 0: GangDefaultPort.
 	Port  int        `json:"port,omitempty"`
 	Ranks []GangRank `json:"ranks,omitempty"`
 }
@@ -152,6 +152,11 @@ type GangRank struct {
 	// existing gang digests do not change.
 	Exclusive *[]ExclusiveRequest `json:"exclusive,omitempty"`
 	Capacity  *CapacityRequest    `json:"capacity,omitempty"`
+	// InputContinuationRef and InputCheckpointCommand: of a gang's
+	// continuation, the checkpoint this member goes on from (its own, of the
+	// round the whole gang published: gangcheckpoint.go).
+	InputContinuationRef   *string `json:"input_continuation_ref,omitempty"`
+	InputCheckpointCommand string  `json:"input_checkpoint_command,omitempty"`
 }
 
 // GangLaunch is what one rank of a placed gang is told at launch: its rank and

@@ -369,6 +369,23 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			}
 			continue
 		}
+		// A checkpointable gang that suspended, or lost a member, goes on
+		// only from a checkpoint every member published (gangcheckpoint.go).
+		if gang.gang {
+			var template orchestration.Execution
+			if err := json.Unmarshal([]byte(task.template), &template); err != nil {
+				return err
+			}
+			if template.Checkpointable {
+				handled, err := gangContinuationTx(ctx, tx, task, current, template)
+				if err != nil {
+					return err
+				}
+				if handled {
+					continue
+				}
+			}
+		}
 		// A lost attempt of a task declared continue_after_loss: once nothing of
 		// it can run any more (its lease released: by the daemon after a reboot
 		// or a launch cut short, or by kairo resource reconcile), the task goes
@@ -634,6 +651,11 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 				return plannedOrchestrationDecision{}, err
 			}
 		}
+	}
+	// a gang's continuation: each member from its own part of the round, on
+	// the node of its run's output directory (gangcheckpoint.go)
+	if err = applyGangContinuation(&spec, trigger); err != nil {
+		return plannedOrchestrationDecision{}, err
 	}
 	if err = pinInputNodeTx(ctx, tx, task.project, &spec); err != nil {
 		return plannedOrchestrationDecision{}, err

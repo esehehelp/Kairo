@@ -383,6 +383,9 @@ func (s *Store) ReconcileGangs(ctx context.Context) error {
 	if err := s.reconcileLaunchedGangs(ctx); err != nil {
 		return err
 	}
+	if err := s.propagateGangCheckpoints(ctx); err != nil {
+		return err
+	}
 	return s.removeEndedGangSegments(ctx)
 }
 
@@ -396,8 +399,8 @@ const endedGangSegments = `SELECT s.vni FROM fabric_segments s WHERE s.purpose='
 // ended: their nodes take the devices down at their next sync (once no
 // container is on them).
 func (s *Store) removeEndedGangSegments(ctx context.Context) error {
-	var any bool
-	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(`+endedGangSegments+`)`).Scan(&any); err != nil || !any {
+	var found bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(`+endedGangSegments+`)`).Scan(&found); err != nil || !found {
 		return err
 	}
 	tx, err := s.beginWrite(ctx)

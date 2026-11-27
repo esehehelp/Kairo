@@ -82,6 +82,13 @@ func gangProject(t *testing.T, store *Store, checkpointable bool) {
 	if checkpointable {
 		cp = "true"
 	}
+	gangProjectDeclared(t, store, cp, "")
+}
+
+// gangProjectDeclared is gangProject with checkpointable (and preemptible)
+// set to cp and the lines extra added to [tasks.execution].
+func gangProjectDeclared(t *testing.T, store *Store, cp, extra string) {
+	t.Helper()
 	parsed := projectSpec(t, `schema_version = 1
 [project]
 name = "gangs"
@@ -96,6 +103,7 @@ argv = ["wsl-train", "--config", "x.toml"]
 cwd = "/mnt/d/Dev/example-app"
 checkpointable = `+cp+`
 preemptible = `+cp+`
+`+extra+`
 [tasks.execution.executor]
 labels = { environment = "windows" }
 [[tasks.execution.exclusive]]
