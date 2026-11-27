@@ -196,9 +196,10 @@ func freeOn(ctx context.Context, s servedStore) int64 {
 
 // unpackChecked unpacks the pack packName (in dir) into into, checking each
 // regular file against the file list listName and that every file listed is
-// there, and returns the bytes unpacked. With execBits (a code snapshot) a
-// file packed executable, or one beginning with "#!" (a pack made on Windows
-// has no execute bits), is made executable (0755). Reserved Windows names
+// there, and returns the bytes unpacked. A file packed executable is made
+// executable (0755: whoever the attempt runs as, as it was where it was
+// made); with execBits (a code snapshot), so is one beginning with "#!" (a
+// pack made on Windows has no execute bits). Reserved Windows names
 // os.Root cannot create are checked but not written, and listed in skipped.
 func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string, into *os.Root, execBits bool, skipped *[]string) (int64, error) {
 	listFile, err := dir.Open(listName)
@@ -324,7 +325,7 @@ func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string,
 				*skipped = append(*skipped, name)
 				continue
 			}
-			if execBits && (h.Mode&0o111 != 0 || bytes.HasPrefix(head.b, []byte("#!"))) {
+			if h.Mode&0o111 != 0 || execBits && bytes.HasPrefix(head.b, []byte("#!")) {
 				if err := into.Chmod(local, 0o755); err != nil {
 					return total, err
 				}
