@@ -93,7 +93,7 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 		}
 	}
 	if m.router == nil {
-		m.router = m.link.router(m.RouterName, m.KeyFile)
+		m.router = m.link.router(m.RouterName, m.NodeID, m.KeyFile)
 	}
 	if m.router == nil {
 		return fmt.Errorf("FRR cannot run on this node")

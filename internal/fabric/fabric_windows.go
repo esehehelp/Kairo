@@ -339,18 +339,20 @@ func (v *vmLink) removeSegment(ctx context.Context, names string, vni int) error
 
 // vmRouter is FRR in the VM (docker, on the VM's network: dockerRouter).
 type vmRouter struct {
-	v    *vmLink
-	name string
+	v              *vmLink
+	name, hostname string
 }
 
-func (v *vmLink) router(name, _ string) router { return vmRouter{v: v, name: name} }
+func (v *vmLink) router(name, hostname, _ string) router {
+	return vmRouter{v: v, name: name, hostname: hostname}
+}
 
 func (r vmRouter) apply(ctx context.Context, files map[string]string) error {
 	b, err := json.Marshal(files)
 	if err != nil {
 		return err
 	}
-	_, err = r.v.do(ctx, b, "router-apply", r.name)
+	_, err = r.v.do(ctx, b, "router-apply", r.name, r.hostname)
 	return err
 }
 

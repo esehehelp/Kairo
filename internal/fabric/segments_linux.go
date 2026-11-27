@@ -137,12 +137,16 @@ func writeFiles(dir string, files map[string]string) (bool, error) {
 // host's network namespace (lxc.namespace.share.net) and has no NIC of its
 // own, its /etc/frr a directory of the agent's.
 type incusRouter struct {
-	name, dir string
+	name, hostname, dir string
 }
 
-func (nlLink) router(name, keyFile string) router {
-	return incusRouter{name: name, dir: filepath.Join(filepath.Dir(keyFile), "frr")}
+func (nlLink) router(name, hostname, keyFile string) router {
+	return incusRouter{name: name, hostname: hostname, dir: filepath.Join(filepath.Dir(keyFile), "frr")}
 }
+
+// routerSpec is what a router's container is made from: another (a new
+// image, another hostname) makes it again.
+func routerSpec(hostname string) string { return FRRDigest + " " + hostname }
 
 // frrRemote is the Incus remote FRR's image comes from.
 const frrRemote = "kairo-quay-io"
@@ -176,6 +180,14 @@ func (r incusRouter) apply(ctx context.Context, files map[string]string) error {
 	if err != nil {
 		return err
 	}
+	if state != "" {
+		if spec, _ := incus(ctx, "config", "get", r.name, "user.kairo.spec"); strings.TrimSpace(string(spec)) != routerSpec(r.hostname) {
+			if _, err := incus(ctx, "delete", "--force", r.name); err != nil {
+				return err
+			}
+			state = ""
+		}
+	}
 	switch {
 	case state == "":
 		if out, _ := incus(ctx, "remote", "list", "-f", "csv"); !strings.Contains("\n"+string(out), "\n"+frrRemote+",") {
@@ -185,7 +197,8 @@ func (r incusRouter) apply(ctx context.Context, files map[string]string) error {
 		}
 		image := frrRemote + ":" + strings.TrimPrefix(FRRRepository, "quay.io/") + "@" + FRRDigest
 		if _, err := incus(ctx, "init", image, r.name, "--quiet", "-c", "security.privileged=true",
-			"-c", "raw.lxc=lxc.namespace.share.net=1", "-c", "boot.autostart=true"); err != nil {
+			"-c", "raw.lxc=lxc.namespace.share.net=1\nlxc.uts.name="+r.hostname, "-c", "boot.autostart=true",
+			"-c", "user.kairo.spec="+routerSpec(r.hostname)); err != nil {
 			return err
 		}
 		if _, err := incus(ctx, "config", "device", "add", r.name, "eth0", "none"); err != nil {
@@ -222,7 +235,7 @@ func (r incusRouter) show(ctx context.Context, command string) ([]byte, error) {
 // privileged: in a wslc VM (the fabric-link command, for the Windows
 // agent), where dockerd runs.
 type dockerRouter struct {
-	name, dir string
+	name, hostname, dir string
 }
 
 func docker(ctx context.Context, args ...string) ([]byte, error) { return run(ctx, "docker", args...) }
@@ -232,13 +245,19 @@ func (r dockerRouter) apply(ctx context.Context, files map[string]string) error 
 	if err != nil {
 		return err
 	}
-	out, err := docker(ctx, "inspect", "-f", "{{.State.Running}}", r.name)
+	out, err := docker(ctx, "inspect", "-f", "{{.State.Running}} {{index .Config.Labels \"kairo.spec\"}}", r.name)
+	if err == nil && !strings.HasSuffix(strings.TrimSpace(string(out)), " "+routerSpec(r.hostname)) {
+		if _, err := docker(ctx, "rm", "-f", r.name); err != nil {
+			return err
+		}
+		out, err = nil, errors.New("made again")
+	}
 	switch {
 	case err != nil:
-		_, err = docker(ctx, "run", "-d", "--name", r.name, "--network", "host", "--privileged", "--restart", "always",
-			"-v", r.dir+":/etc/frr", FRRRepository+"@"+FRRDigest)
+		_, err = docker(ctx, "run", "-d", "--name", r.name, "--hostname", r.hostname, "--network", "host", "--privileged",
+			"--restart", "always", "--label", "kairo.spec="+routerSpec(r.hostname), "-v", r.dir+":/etc/frr", FRRRepository+"@"+FRRDigest)
 		return err
-	case strings.TrimSpace(string(out)) != "true":
+	case !strings.HasPrefix(string(out), "true "):
 		_, err = docker(ctx, "start", r.name)
 		return err
 	case changed:

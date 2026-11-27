@@ -29,7 +29,7 @@ import (
 //	segments NAMES                   [vni…] of the VXLAN devices named with NAMES
 //	segment-ensure NAMES VNI MTU LOCAL PORT   the VXLAN device on the bridge docker made
 //	segment-remove NAMES VNI         the VXLAN device (the bridge is the network's)
-//	router-apply NAME                FRR (docker) with the files on stdin ({name: content})
+//	router-apply NAME HOSTNAME       FRR (docker) with the files on stdin ({name: content})
 //	router-remove NAME
 //	router-show NAME COMMAND         vtysh -c COMMAND
 func LinkCommand(ctx context.Context, args []string, stdout io.Writer) error {
@@ -142,6 +142,10 @@ func LinkCommand(ctx context.Context, args []string, stdout io.Writer) error {
 		r := dockerRouter{name: args[1], dir: vmRouterDir + "/" + args[1]}
 		switch args[0] {
 		case "router-apply":
+			if err := need(2); err != nil {
+				return err
+			}
+			r.hostname = args[2]
 			var files map[string]string
 			if err := json.NewDecoder(os.Stdin).Decode(&files); err != nil {
 				return fmt.Errorf("router-apply: FRR's files on stdin: %w", err)

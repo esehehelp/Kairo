@@ -35,4 +35,4 @@ func (noLink) ensureSegment(context.Context, string, store.FabricSegment, string
 	return errUnsupported
 }
 func (noLink) removeSegment(context.Context, string, int) error { return errUnsupported }
-func (noLink) router(string, string) router                     { return nil }
+func (noLink) router(string, string, string) router             { return nil }

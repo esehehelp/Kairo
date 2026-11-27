@@ -116,9 +116,10 @@ type link interface {
 	segments(ctx context.Context, names string) ([]int, error)
 	ensureSegment(ctx context.Context, names string, seg store.FabricSegment, local string, port int) error
 	removeSegment(ctx context.Context, names string, vni int) error
-	// router is FRR named name, its files beside keyFile where it keeps
-	// them there.
-	router(name, keyFile string) router
+	// router is FRR in a container named name, with hostname (FRR says it
+	// to its peers: an empty one is refused), its files beside keyFile
+	// where it keeps them there.
+	router(name, hostname, keyFile string) router
 }
 
 func (m *Manager) now() time.Time {

@@ -68,7 +68,7 @@ func (f *fakeLink) removeSegment(_ context.Context, _ string, vni int) error {
 	return nil
 }
 
-func (f *fakeLink) router(string, string) router { return &f.frr }
+func (f *fakeLink) router(string, string, string) router { return &f.frr }
 
 // fakeRouter keeps the files FRR was last given.
 type fakeRouter struct {
