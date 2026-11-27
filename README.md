@@ -1824,6 +1824,7 @@ shuffle = { seed = 7, block = 65536, files = true }
 stages  = [ { argv = ["bin/normalize"], workers = 8 } ]
 epochs  = 1                 # 最初の source の周回数（既定 1、0 で終わりなし）
 memory_bytes = 4294967296   # Loader が持つ分。Task の RAM に足される
+weight_by = "input"         # 重みが何の割合か: 読むレコード（"input"、既定）か stage の出力（"output"）
 
 [tasks.execution]
 image = "py"
@@ -1881,13 +1882,23 @@ stream（`loader.Spec`、JSON）は、source（raw データとその重み・�
 
 位置は rank ごとの `{rank, record, sub}`（その rank のレコードを `record` 件取り終え、次のレコードの出力を `sub` 件取った）です。再開では、W は変えられません。
 
+#### 出力で重みを付ける（`weight_by = "output"`）
+
+既定の重みは、読むレコード（文書）の割合です。1 件の文書から stage が出す出力の数がソースやファイルで大きく違うとき（文書から行を切り出す読み付けなど）、出力の割合は読んだファイル次第で動きます。`weight_by = "output"` では、重みは stage が出す出力の割合になります（stage が必要です）。手順 3〜5 は次のように替わります。
+
+- **rank ごと**: 各 rank は、各 source のレコードのうち `i mod W = rank` のものを、自分だけで混ぜます（全体で 1 つの列はありません）。
+- **chunk**: rank ごとに 1,024 件ずつ（chunk）選びます。1 件ずつ、それまでに出たと見込まれる出力のうち、自分の重みの割合にいちばん足りない source を選びます（同点は宣言順）。見込みは、chunk の 2 つ前までに実際に出た出力に、1 つ前の chunk の分を「その source の 1 件あたりの出力の実績」（まだなければ 1 件）で見積もって足したものです。こうして chunk c は、chunk c−1 がまだ stage を通っている間に選べます。stage は止まらず、並びは宣言だけで決まります（stage が同じ入力に同じ出力を返す限り）。計算は整数だけで行うので、どのマシンでも同じです。
+- **シャッフル**: `block` が 2 以上なら、chunk の中の 1,024 件を (seed, rank, chunk) で並べ替えてから stage に通します（`block` の大きさは使いません。chunk より大きなブロックの並べ替えとは両立しないためです）。行の単位でよく混ぜるには、学習側でバッファして混ぜます。
+- **出力のない source**: 出力を出さない文書が続く source は、足りない分が埋まらないので選ばれ続けます（その間、ほかの source の出力は来ません）。宣言どおりの割合を守るためです。
+- **位置と続き**: 位置の形（`record` は、その rank が選んだレコードの番号）、checkpoint、SDK は同じです。位置から並びを計算で戻せないので、Loader は各 chunk の始まり（その rank が各 source から取った件数と、それまでの出力の件数）を、その chunk のどのレコードを渡すよりも前に、Run の output の `.kairo-streams/<stream>/rank-<r>.jsonl` に書き足します（`kairo loader serve --order-state DIR`。init が渡します）。続き（どのノードでも。output は Run について移ります）は、位置のある chunk の始まりを読み、1 つ前の chunk を stage に通し直して出力を数え（渡しはしません）、位置の chunk を初めから作って、位置より前は数えるだけにします。stage をやり直すのは、多くて chunk 2 つ分です。output からこの記録が消えると、途中からは始められません。
+
 ### 取得と照合
 
 各ファイルは、サイズ、sha256、チャンク（既定 4 MiB）ごとの sha256 で識別します（`kairo loader identify PATH|URL...` がこの一覧を JSON で出します）。どのチャンクも照合してから使います。取得元の失敗は 1 秒から 5 分まで間隔を延ばしながら取り直し、その間、受け取り側は待ちます。照合に合わないチャンクはもう一度取り、2 度合わなければ `raw data changed` で stream を止めます。ファイルを最後まで読むとレコード数が分かり、それがあれば途中から始めるときにそのファイルを読まずに飛ばせます。
 
 ### 受け渡し
 
-`kairo loader serve --spec SPEC.json --listen unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--session S] [--state DIR] [--origin http|dir:DIR] [--status FILE]` が stream を作ります。各 rank は 1 本の接続でつながります。フレームは「4 バイトのリトルエンディアンの長さ、種別 1 バイト、中身」です。
+`kairo loader serve --spec SPEC.json --listen unix:PATH|tcp:HOST:PORT [--world N] [--positions POSITIONS.json] [--session S] [--state DIR] [--order-state DIR] [--origin http|dir:DIR] [--status FILE]` が stream を作ります。各 rank は 1 本の接続でつながります。フレームは「4 バイトのリトルエンディアンの長さ、種別 1 バイト、中身」です。
 
 - 受け取り側から: `hello`（`{"version":1,"rank":R,"world":W,"position":{"rank":R,"record":K,"sub":S},"session":...}`。`position` と `session` は接続し直すときだけ）、`credit`（あと何件受け取るか）
 - Loader から: `ready`（その rank の開始位置、rank の数、セッション）、`item`（レコード番号、出力番号、そのレコードの最後かどうか、中身）、`skip`（出力のなかったレコード）、`end`、`error`

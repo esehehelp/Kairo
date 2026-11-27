@@ -26,6 +26,7 @@ func loaderServe(args []string) error {
 	session := fs.String("session", "", "the session takers come back with (the same across this loader's restarts; none: a random one)")
 	rawRequests := fs.String("raw-requests", "", "with --raw: ask the node's agent through files in this directory, not its socket (a container in a VM)")
 	state := fs.String("state", "", "a directory keeping which ranks were served across this loader's restarts")
+	orderState := fs.String("order-state", "", "a directory where a stream weighted by output keeps where each rank's chunks begin (the run's output: a continuation starts from it)")
 	origin := fs.String("origin", "http", "where files are read: http (each file's URL) or dir:DIR (files by name under DIR)")
 	statusPath := fs.String("status", "", "a file the stream's status is written to every 5 s (where each rank stands, what is made ahead, rates): the node's agent reports it")
 	rawDir := fs.String("raw", "", "the node's raw cache for this attempt (its directory, with the agent's socket): every file made ready, checked and identified there before it is read; without it, files are read from --origin, one never read before identified as it is read")
@@ -85,7 +86,7 @@ func loaderServe(args []string) error {
 		}
 		fetch.Resolve = agent.Resolve
 	}
-	l := &loader.Loader{Spec: spec, Fetch: fetch, StateDir: *state, Identified: func(_ int, f loader.File) {
+	l := &loader.Loader{Spec: spec, Fetch: fetch, StateDir: *state, OrderState: *orderState, Identified: func(_ int, f loader.File) {
 		fmt.Fprintf(os.Stderr, "kairo loader: %s identified: %d bytes, sha256 %s\n", f.Name, f.Size, f.SHA256)
 	}}
 	if *statusPath != "" {

@@ -20,6 +20,11 @@ import (
 // the stream's directory under /kairo/run/streams.
 const StreamStatusFile = "status.json"
 
+// StreamOrderStateDir is the directory of the run's output where a stream
+// weighted by output keeps where each rank's chunks begin (a directory per
+// stream): a continuation, on any node, reads it there.
+const StreamOrderStateDir = ".kairo-streams"
+
 // streamStatusLimit bounds a status file read.
 const streamStatusLimit = 1 << 20
 

@@ -51,6 +51,9 @@ type Stream struct {
 	Epochs *int64 `toml:"epochs" json:"epochs"`
 	// MemoryBytes is added to the task's RAM: what the loader holds.
 	MemoryBytes int64 `toml:"memory_bytes" json:"memory_bytes,omitempty"`
+	// WeightBy is what the sources' weights are shares of: the records read
+	// ("input", the default, kept as "") or what the stages give ("output").
+	WeightBy string `toml:"weight_by" json:"weight_by,omitempty"`
 }
 
 type StreamSource struct {
@@ -208,6 +211,21 @@ func normalizeStreams(m *Manifest) error {
 		}
 		if s.Shuffle.Block < 0 || s.Shuffle.Block > 1<<24 {
 			return fmt.Errorf("stream %q: shuffle block %d (0 to %d)", name, s.Shuffle.Block, 1<<24)
+		}
+		switch s.WeightBy {
+		case "", "input":
+			s.WeightBy = "" // the default, kept as none: a declaration's digest stays
+		case "output":
+			if len(s.Stages) == 0 {
+				return fmt.Errorf("stream %q: weight_by = \"output\" weighs what the stages give, and it has none", name)
+			}
+			for i, src := range s.Sources {
+				if src.Weight > 1_000_000 {
+					return fmt.Errorf("stream %q source %d: weight %d (1 to 1000000)", name, i, src.Weight)
+				}
+			}
+		default:
+			return fmt.Errorf("stream %q: weight_by %q (input or output)", name, s.WeightBy)
 		}
 		for i, st := range s.Stages {
 			if len(st.Argv) == 0 || st.Workers < 0 || st.Workers > 256 {

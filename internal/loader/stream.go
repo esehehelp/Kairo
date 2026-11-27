@@ -22,7 +22,13 @@ type Spec struct {
 	// a quarter of it, shared by the ranks, bounds what is made ahead for
 	// them (0: 64 MiB a rank).
 	MemoryBytes int64 `json:"memory_bytes,omitempty"`
+	// WeightBy is what the weights are shares of: the records read ("" or
+	// "input"), or what the stages give ("output": outputmix.go).
+	WeightBy string `json:"weight_by,omitempty"`
 }
+
+// WeightByOutput: a stream whose weights are shares of what its stages give.
+const WeightByOutput = "output"
 
 // maxBlock bounds the records shuffled together (each kept in memory).
 const maxBlock = 1 << 24
@@ -36,6 +42,17 @@ func (s Spec) check() error {
 	}
 	if s.Epochs < 0 {
 		return fmt.Errorf("epochs %d: 0 (no end) or more", s.Epochs)
+	}
+	switch s.WeightBy {
+	case "", "input":
+	case WeightByOutput:
+		for _, src := range s.Sources {
+			if src.Weight < 0 || src.Weight > maxOutputWeight {
+				return fmt.Errorf("source %s: weight %d (1 to %d)", src.Name, src.Weight, maxOutputWeight)
+			}
+		}
+	default:
+		return fmt.Errorf("weight_by %q: input or output", s.WeightBy)
 	}
 	for _, src := range s.Sources {
 		for _, f := range src.Files {
