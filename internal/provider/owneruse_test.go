@@ -123,8 +123,9 @@ func TestAGPUIsItsOwnersWhileGraphicsUseItsSMs(t *testing.T) {
 // so is not Kairo's: busy less Kairo's containers' share at least the
 // threshold, and the cores at least 90% busy. Without Kairo's share the CPU
 // is never its owner's (Kairo's own work would be taken for it). The RAM is
-// its owner's when less is available than the floor.
-func TestTheNodesCPUAndRAMAreItsOwnersWhenTaken(t *testing.T) {
+// never its owner's (who took it is not known): its observation tells the
+// floor and since when less than it is available.
+func TestTheNodesCPUIsItsOwnersWhenTaken(t *testing.T) {
 	readings := []cpuTimes{}
 	next := 0
 	h := &Host{ProviderID: "h", NodeID: "n", Owner: &OwnerUse{}, Meter: noMeter{}, CPUTimes: func() (cpuTimes, error) {
@@ -161,18 +162,34 @@ func TestTheNodesCPUAndRAMAreItsOwnersWhenTaken(t *testing.T) {
 	if got := claimsOf(base, unknown, 32<<30); len(got) != 0 {
 		t.Fatalf("Kairo's share unknown: %+v", got)
 	}
-	// RAM: the floor of 64 GiB is the larger of 2 GiB and 5%: 3.2 GiB
-	if got := claimsOf(base, at(100, 50, 0), 3<<30); len(got) != 1 || got[0].ResourceID != "n-ram" {
+	// RAM: the floor of 64 GiB is the larger of 2 GiB and 5%: 3.2 GiB; under
+	// it, no claim
+	if got := claimsOf(base, at(100, 50, 0), 3<<30); len(got) != 0 {
 		t.Fatalf("3 GiB available: %+v", got)
 	}
-	if got := claimsOf(base, at(100, 50, 0), 4<<30); len(got) != 0 {
-		t.Fatalf("4 GiB available: %+v", got)
-	}
-	// the floor goes with the RAM's observation (admission leaves it free);
-	// none without owner use
+	// the floor goes with the RAM's observation (admission leaves it free),
+	// and under it, since when (the first observation under it); none
+	// without owner use
 	h.CPUTimes = func() (cpuTimes, error) { return base, nil }
 	if ev := string(h.snapshot(64<<30, 32<<30).Observations[1].Evidence); ev != `{"floor_bytes":3435973836}` {
 		t.Fatalf("the RAM's evidence: %s", ev)
+	}
+	var first, second struct {
+		Floor int64  `json:"floor_bytes"`
+		Since string `json:"under_floor_since"`
+	}
+	_ = json.Unmarshal(h.snapshot(64<<30, 3<<30).Observations[1].Evidence, &first)
+	time.Sleep(time.Millisecond)
+	_ = json.Unmarshal(h.snapshot(64<<30, 3<<30).Observations[1].Evidence, &second)
+	if first.Floor != 3435973836 || first.Since == "" || second.Since != first.Since {
+		t.Fatalf("under the floor: %+v then %+v", first, second)
+	}
+	if ev := string(h.snapshot(64<<30, 4<<30).Observations[1].Evidence); ev != `{"floor_bytes":3435973836}` {
+		t.Fatalf("over the floor again: %s", ev)
+	}
+	_ = json.Unmarshal(h.snapshot(64<<30, 3<<30).Observations[1].Evidence, &second)
+	if second.Since == first.Since {
+		t.Fatalf("under the floor again: still since %s", second.Since)
 	}
 	h.Owner = &OwnerUse{Disabled: true}
 	if ev := string(h.snapshot(64<<30, 32<<30).Observations[1].Evidence); ev != `{}` {

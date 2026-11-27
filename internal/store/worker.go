@@ -312,7 +312,7 @@ func (s *Store) AckCommand(ctx context.Context, attemptID, leaseID string, epoch
 }
 
 func (s *Store) EnqueueSuspend(ctx context.Context, attemptID, origin, reason string) (string, error) {
-	if origin != "scope_pause" && origin != "priority_preemption" && origin != "node_quarantine" && origin != ClaimOwnerUse {
+	if origin != "scope_pause" && origin != "priority_preemption" && origin != "node_quarantine" && origin != ClaimOwnerUse && origin != OriginMemoryPressure {
 		return "", errors.New("invalid suspend origin")
 	}
 	tx, err := s.beginWrite(ctx)

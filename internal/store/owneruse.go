@@ -17,7 +17,9 @@ import (
 // Kairo's work. It is a claim of kind owner_use on the resource:
 //
 //   - observed: the node's providers report it while they see the owner's
-//     use (provider/owneruse.go); it is held ownerUseHold after it was last
+//     use of a GPU or the CPU (provider/owneruse.go; the RAM's they do not
+//     report: less of it available says nothing of who took it, and is
+//     memory pressure, memorypressure.go); it is held ownerUseHold after it was last
 //     seen, so that Kairo comes back only once the resource has been free
 //     for a while (a game in its menu, a build between steps);
 //   - manual: kairo node owner-use sets it on every resource of a node, or
@@ -162,6 +164,12 @@ func (s *Store) OwnerDone(ctx context.Context, node, actor string) (int, error) 
 	return int(n), tx.Commit()
 }
 
+// yieldableAttempt: running work that can checkpoint (checkpointable and
+// preemptible), with no suspend asked of it yet (a, l, e: its attempt, lease
+// and execution request).
+const yieldableAttempt = `l.state='active' AND a.state='running' AND e.checkpointable AND e.preemptible
+	AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state<>'rejected')`
+
 // ownerUseClearable reports whether an owner_use claim a provider did not
 // report now ends: never one set by hand, an observed one once the hold
 // since it was last seen is over.
@@ -204,9 +212,6 @@ func (s *Store) ReconcileOwnerUse(ctx context.Context) (int, error) {
 	if err != nil || len(uses) == 0 {
 		return 0, err
 	}
-	// running work that can checkpoint, with no suspend asked of it yet
-	const yieldable = `l.state='active' AND a.state='running' AND e.checkpointable AND e.preemptible
-		AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state<>'rejected')`
 	asked := 0
 	seen := map[string]bool{}
 	for _, u := range uses {
@@ -214,7 +219,7 @@ func (s *Store) ReconcileOwnerUse(ctx context.Context) (int, error) {
 		switch u.kind {
 		case "gpu":
 			err = eachRow(ctx, s.db, `SELECT DISTINCT a.id FROM lease_items li JOIN leases l ON l.id=li.lease_id JOIN attempts a ON a.id=l.attempt_id JOIN execution_requests e ON e.id=a.execution_id
-				WHERE li.resource_id IN `+sameDevice("$1")+` AND `+yieldable+` ORDER BY a.id`, []any{u.resource}, func(rows *sql.Rows) error {
+				WHERE li.resource_id IN `+sameDevice("$1")+` AND `+yieldableAttempt+` ORDER BY a.id`, []any{u.resource}, func(rows *sql.Rows) error {
 				var id string
 				if err := rows.Scan(&id); err != nil {
 					return err
@@ -236,7 +241,7 @@ func (s *Store) ReconcileOwnerUse(ctx context.Context) (int, error) {
 			}
 			err = eachRow(ctx, s.db, `SELECT a.id FROM lease_items li JOIN leases l ON l.id=li.lease_id JOIN attempts a ON a.id=l.attempt_id JOIN execution_requests e ON e.id=a.execution_id
 				JOIN executors x ON x.id=l.executor_id LEFT JOIN attempt_usage u ON u.attempt_id=a.id
-				WHERE x.node_id=$1 AND li.kind=$2 AND `+yieldable+`
+				WHERE x.node_id=$1 AND li.kind=$2 AND `+yieldableAttempt+`
 				ORDER BY CASE WHEN $2='ram' THEN COALESCE(u.ram_bytes,li.quantity) ELSE li.quantity END DESC,a.id`, []any{u.node, u.kind}, func(rows *sql.Rows) error {
 				var id string
 				if err := rows.Scan(&id); err != nil {
