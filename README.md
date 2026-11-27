@@ -50,7 +50,7 @@ Task は永続的な論理オブジェクトであり、一連のイミュータ
   - [ノード隔離](#ノード隔離)
   - [ノードフェンス](#ノードフェンス)
   - [強制停止](#強制停止)
-  - [Gang（廃止）](#gang廃止)
+  - [Gang](#gang)
 - [Loader（ストリーム）](#loaderストリーム)
 - [Worker SDK](#worker-sdk)
   - [管理対象 Attempt に渡される環境変数](#管理対象-attempt-に渡される環境変数)
@@ -346,7 +346,7 @@ Kairo が使うマシンには持ち主がいます（デスクトップの GPU 
 
 ## fabric（全ノードの網、作成中：issue #47）
 
-LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノードも含めて、全ノードを 1 つの WireGuard の網に載せ、その上に BGP EVPN と VXLAN の L2 のセグメントを張ります。WAN の側で DDP や gang を動かすための土台で、いまは第 2 段階（FRR とセグメント）までできています。ブランチ `feat/wan-fabric` で作り、試験用のインストールで試しています。
+LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノードも含めて、全ノードを 1 つの WireGuard の網に載せ、その上に BGP EVPN と VXLAN の L2 のセグメントを張ります。WAN の側で DDP や gang を動かすための土台で、いまは第 3 段階（gang：世代ごとのセグメント、メンバーの NIC、起動の関門）までできています。ブランチ `feat/wan-fabric` で作り、試験用のインストールで試しています。
 
 - **アドレス**: 各ノードには、デーモンの `[fabric] prefix`（IPv4 のネットワーク）から、最初に名乗ったときに 1 つのアドレスを与えます（その時点で空いている最も小さいもの）。以後は、回線や場所が変わっても変えません（テーブル `fabric_nodes`、イベント `fabric_joined`）。prefix を変えて既存のノードのアドレスが外れると、そのノードは拒否されます。
 - **鍵**: 各ノードは自分の WireGuard の鍵を作って持ちます（`key_file`、既定は agent の設定の横の `fabric.key`。0600）。秘密鍵はノードの外に出ません。デーモンが持つのは、公開鍵、待ち受けのポート、ノードが「ここで届く」と言うエンドポイント（`host:port`、優先順）だけです。
@@ -374,8 +374,10 @@ LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノー�
   - エージェントは、自分のセグメントごとに、ブリッジと VXLAN のデバイスを作ります（名前は `[fabric] names`（既定 `kf`）＋ `b`／`v` ＋ VNI）。VXLAN は fabric のアドレスから、`[fabric] vxlan_port`（デーモン、既定 4789）で出します。学習はせず（どこに MAC があるかは EVPN が言う）、ARP も EVPN の情報から答えます。ブリッジと VXLAN には IPv6 を付けないので、セグメントからホストには届きません。セグメントから外れたノードは、デバイスを外します。
   - Windows では、セグメントのブリッジは wslc のネットワーク（`<names>-seg-<VNI>`、`--internal`、ブリッジにアドレスなし）のものです。コンテナは、そのネットワークに入ることでセグメントに載ります。
   - 同じホストに別のインストールのエージェントがあるときは、`names` と `vxlan_port` を別にします。
-  - いまは手で作ります: `kairo fabric segment-add [--mtu N] NODE...`、`kairo fabric segment-remove VNI...`（`POST /api/fabric/segments`、`DELETE /api/fabric/segments/{vni}`、admin）。gang は、自分の世代ごとのセグメントを持つようにします（第 3 段階）。`kairo fabric list` がセグメントも出します。
-- **これから**: gang（世代ごとのセグメント、メンバーの NIC、`MASTER_ADDR`、2 拠点の DDP）、分断の扱い、配置と出入り（issue #47 の段階 3〜5）。
+  - 手でも作れます: `kairo fabric segment-add [--mtu N] NODE...`、`kairo fabric segment-remove VNI...`（`POST /api/fabric/segments`、`DELETE /api/fabric/segments/{vni}`、admin）。gang は世代ごとに自分のセグメントを持ちます（[Gang](#gang)。VNI は 100000 から、手では消せません）。`kairo fabric list` がセグメントも出します。
+  - gang のメンバーの起動のときは、エージェントが同期を待たずにセグメントをノードに作ります。同期で教わったセグメントにないものは外しますが、起動のために作ったものは 10 分残し、コンテナが載っている（ブリッジに VXLAN 以外のポートがある）ものは外しません。
+  - Windows のセグメントのネットワークは、ゲートウェイをサブネットの最後のホストにします（docker は、ゲートウェイのアドレスをコンテナに渡さないため。gang のメンバーは最初のホストから使います）。
+- **これから**: 分断の扱いと gang 全体の checkpoint、配置と出入り（issue #47 の段階 4、5）。
 
 ## 認証と TLS
 
@@ -792,7 +794,7 @@ Run の output ディレクトリ（[`output` ディレクトリ](#output-ディ
 
 待機理由コードは以下のとおりです。
 
-`no_executor` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `owner_use` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
+`no_executor` / `no_fabric` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `owner_use` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
 
 ### 実行時間の推定
 
@@ -1264,7 +1266,7 @@ Kairo はこのディレクトリを削除せず、現時点では専用クラ�
 
 Run が保持すべき出力データは、scratch が作成されるストアと同じストア上の output ディレクトリ `<root>/outputs/<run id>` に保存されます。このディレクトリには Run ID を記したマーカーファイル `.kairo-output` が置かれ、環境変数 `KAIRO_OUTPUT_DIR` で渡されます。
 
-ここで **Run** とは、ある Execution とそれに続く継続（continuation）のまとまりを指します。具体的には、継続ではない Task の Execution（初回実行、rerun、ノード隔離後の再スタート）とそれに連なる継続群（サスペンド後の継続と、ノードが落ちた後の継続。Run ID は起点となる Execution の ID）、あるいは直接実行（direct execution）が 1 つの Run になります。（以前の Gang の rank 0 以外の rank では、Run ID は `<leader's run>-rank<r>` でした。）
+ここで **Run** とは、ある Execution とそれに続く継続（continuation）のまとまりを指します。具体的には、継続ではない Task の Execution（初回実行、rerun、ノード隔離後の再スタート）とそれに連なる継続群（サスペンド後の継続と、ノードが落ちた後の継続。Run ID は起点となる Execution の ID）、あるいは直接実行（direct execution）が 1 つの Run になります。（[Gang](#gang) の rank 0 以外のメンバーでは、Run ID は `<leader's run>-rank<r>` です。各メンバーは自分の output を持ちます。）
 
 そのストア上で起動される同一 Run のすべての Attempt には同じディレクトリが割り当てられます。最初の Attempt がディレクトリを作成し、継続（continuation）は前の Attempt がそこに書き込んだ内容（チェックポイントなど）をそのまま見つけることができます。一方、再実行（rerun）や別 Task には別のディレクトリが割り当てられるため、ある Run のファイルが別の Run と衝突することはありません。別ノードで動く継続には、先にディレクトリを持ち込みます（[Run の output の持ち込み](#run-の-output-の持ち込み)）。Attempt の scratch・output・cache は、その Run の output ディレクトリがあるそのノードのストアに置かれます（Execution がストアを指定していればそのストア）。
 
@@ -1494,7 +1496,7 @@ durable store が保管するのは、作り直せないもの（学習の結果
 
 - **表示内容**: 種別（kind）、プロジェクト、名前、ノード、状態（`packing`、`packed`、`abandoned`）、ファイル数、コンテンツおよび pack のバイト数、検証済みコピー数（およびそのうち 1 つのパス）、ソースの状態（`present`、`deleting`、`deleted`、`kept`、`evicting`、`evicted` とその理由）。
 - **`--task`（クエリパラメータ `task`）**: 指定した Task 名の全 Run の output を選択します。特定プロジェクトに絞るには `--project` を併用します。
-- **`--execution`（クエリパラメータ `execution`）**: 指定した Execution が属する Run の output を選択します。継続（continuation）の Execution であってもその Run 全体が対象になります（以前の Gang の leader を指定した場合は、各 rank の output も含まれます）。
+- **`--execution`（クエリパラメータ `execution`）**: 指定した Execution が属する Run の output を選択します。継続（continuation）の Execution であってもその Run 全体が対象になります（Gang の leader を指定した場合は、各メンバーの output も含まれます）。
 - これらのフィルタは `--json` 指定時にも適用されます。
 
 #### Run スナップショット
@@ -1829,9 +1831,27 @@ GPU クロック、電力上限、プロセッサ設定の変更には、デー�
 - `force_stop_not_picked_up`: Executor はポーリングしているにもかかわらず強制停止指示を取得していない状態（対象ノードのエージェントログを確認してください）。
 - `executor_unreachable`: Executor との通信が確認できていない状態。
 
-### Gang（廃止）
+### Gang
 
-複数のノードにまたがって 1 つの Task を rank ごとに走らせる Gang（`[tasks.execution.gang]`）は、なくなりました（2026-11、すべての実行をコンテナ 1 つにそろえたため）。Gang を宣言する Task は `kairo project apply` で理由つきで拒否されます。過去の Gang の実行の記録はデータベースに残りますが、rank ごとの表示（`task show` の `gang`、`task logs --rank`）はありません。
+1 つの Task を、別々のノードの複数のコンテナ（メンバー）で一緒に走らせます（複数ノードの DDP など）。メンバーは fabric のセグメントの上で互いに届きます（[fabric](#fabric全ノードの網作成中issue-47)）。ブランチ `feat/wan-fabric` の機能です（issue #47 の第 3 段階）。
+
+```toml
+[tasks.execution.gang]
+size = 2                         # メンバーの数（2〜253）。メンバーごとに Execution 1 つ、コンテナ 1 つ
+port = 29500                     # 省略可: メンバー 0 のランデブーのポート（既定 29500）
+[[tasks.execution.gang.ranks]]   # 省略可: メンバーごとの上書き（argv、cwd、executor、env、exclusive、capacity）
+rank = 1
+executor = { node = "pve1" }
+```
+
+- **確保**: メンバー（rank 0〜size−1）は、fabric で経路を持つ（FRR を動かす）別々のノードに、1 つのトランザクションでまとめて置かれます（全部か、何もなしか）。デーモンに `[fabric] segment_prefix` がなければ置かれません（待機理由 `no_fabric`）。各メンバーの Lease は、そのノードの Executor が次にポーリングしたときに渡されます。
+- **世代のセグメント**: 置くたびに（世代ごとに）、メンバーのノードだけのセグメントを作ります。VNI は 100000 からの通し番号で、前の世代のものは二度と使いません（遅れて戻った古い世代のメンバーは、新しい世代に届きません）。サブネットは `segment_prefix` の /24 で、VNI の示す所から順に空いているものを選びます（終わった世代のサブネットは、ほかが埋まるまで使いません）。メンバー r のアドレスは、その r+1 番目のホストです。世代が終わる（すべての Lease が解放される、または置いたのを取りやめる）とセグメントを消し、各ノードはコンテナがいなくなってからデバイスを外します。
+- **起動の関門**: すべてのメンバーの Lease が準備できるまで、どのメンバーも起動しません（2 分以内にそろわなければ、置いたのを取りやめ、新しい世代として置き直します）。起動のとき、エージェントはセグメントをノードに作り、コンテナに 2 つめの NIC を付けます（Incus: セグメントのブリッジにつないだ `gang0`、wslc: セグメントのネットワークにアドレスつきでつなぐ）。コンテナの init は、その NIC にアドレスを付け（rtnetlink。Attempt に特権は渡さず、イメージに `ip` は要りません）、ほかのすべてのメンバーに届き、ほかのすべてのメンバーから届くまで待ってから（最長 30 分。各メンバーのイメージの取得の差もここで吸収します）、argv を起動します。待ちきれなかったメンバーは exit 124 で終わります。
+- **環境変数**: `MASTER_ADDR`（メンバー 0 のアドレス）、`MASTER_PORT`、`RANK`・`WORLD_SIZE`・`NODE_RANK`（メンバーの数え方。1 メンバー 1 プロセスのとき用）、torchrun の `PET_NNODES`・`PET_NODE_RANK`・`PET_MASTER_ADDR`・`PET_MASTER_PORT`、`NCCL_SOCKET_IFNAME`・`GLOO_SOCKET_IFNAME`（セグメントの NIC）、`KAIRO_GANG_ID`・`KAIRO_GANG_RANK`・`KAIRO_GANG_SIZE`・`KAIRO_GANG_ADDRESS`。`python -m torch.distributed.run --nproc-per-node N train.py` は、そのままで全メンバーにまたがります（`RANK` などは torchrun がワーカーごとに付け直します）。
+- **一蓮托生**: 起動したメンバーの 1 つが 0 以外で終わる（かロストする）と、走っているほかのメンバーを止めます。Task が成功するのは、すべてのメンバーが 0 で終わったときだけです。あるメンバーの起動が失敗した（ほかは起動していた）ときは、最初から走らせ直します（続けて 3 回まで。その次は失敗）。
+- **まだないもの**: checkpoint（gang は `checkpointable` にできません。gang 全体の checkpoint は第 4 段階）、stream、`store`、`regenerable`。
+- **見る**: `kairo task show` が各メンバーのノード・アドレス・セグメントを、`kairo task logs --rank R` がメンバー R のログを出します。
+- **試験（2026-11-28、試験用のインストール）**: wslc（Windows）と Incus（pve1）の 2 メンバーで、TCP の 64 MiB が 1.03 秒、往復 0.98 ms。wslc・Incus（pve1）・Incus（pve0）の 3 メンバー × 2 プロセスの DDP（gloo、6 rank）で、全 rank のパラメータが一致。メンバー 0 の exit 3 で Windows のメンバーが止められ、Task は失敗（exit 3）。
 
 ## Loader（ストリーム）
 
@@ -1987,8 +2007,9 @@ Kairo が管理する Attempt には、以下の環境変数が渡されます�
 - **配置・リソース割り当て**: `KAIRO_NODE_ID`、`KAIRO_EXECUTOR_ID`、`KAIRO_RESOURCE_IDS`、`KAIRO_RESOURCE_BINDINGS`、および `CUDA_VISIBLE_DEVICES`（Lease された GPU の UUID が設定され、インデックス番号は決して使用されません）
 - **再開時**: `KAIRO_CONTINUATION_REF`
 - **volatile store**: Executor がvolatile store（[データストア](#データストア)を参照）を提供している場合は `KAIRO_SCRATCH` と `KAIRO_OUTPUT_DIR`
+- **gang のメンバー**: `MASTER_ADDR`、`MASTER_PORT`、`NODE_RANK`、`PET_*`、`NCCL_SOCKET_IFNAME`、`GLOO_SOCKET_IFNAME`、`KAIRO_GANG_*` など（[Gang](#gang)）
 
-SDK は、Attempt を Linux のコンテナで動くものとして扱います（プロセスの身元は `/proc/<pid>/stat` から読みます）。Python SDK の `DistributedAdapter` は、1 つの Attempt の中の torch の分散（1 つのコンテナの中の DDP）を協調させます。rank 0 だけがポーリングと応答を行い、チェックポイントは全 rank がそろって作ります。`local_continuation` は、Kairo が渡した継続の参照をそのまま返します（全 rank が同じコンテナのファイルを見るため、別ノードへの受け渡しはありません。相対パスは各 rank の作業ディレクトリから読まれるので、rank ごとに作業ディレクトリを変えるなら絶対パスで公開します）。Gang 用の補助（`GangContext`、rank ごとの Attempt）はなくなりました。
+SDK は、Attempt を Linux のコンテナで動くものとして扱います（プロセスの身元は `/proc/<pid>/stat` から読みます）。Python SDK の `DistributedAdapter` は、1 つの Attempt の中の torch の分散（1 つのコンテナの中の DDP）を協調させます。rank 0 だけがポーリングと応答を行い、チェックポイントは全 rank がそろって作ります。`local_continuation` は、Kairo が渡した継続の参照をそのまま返します（全 rank が同じコンテナのファイルを見るため、別ノードへの受け渡しはありません。相対パスは各 rank の作業ディレクトリから読まれるので、rank ごとに作業ディレクトリを変えるなら絶対パスで公開します）。[Gang](#gang) のメンバーはそれぞれ別の Attempt で、gang は checkpoint を作れないので、`DistributedAdapter` で止めることはまだできません。
 
 ### セーフポイントの挙動と Python・Rust SDK
 
@@ -2055,7 +2076,7 @@ controller.run_forever()
 4. プロジェクトが選択した短時間・高優先度の Execution によって協調的プリエンプション（cooperative preemption）を発動できること。オーケストレーション対象のジョブを再開するかどうかはバージョン管理された Task ポリシーが決定し、Execution API を直接利用するユーザーにはプロジェクト管理コントローラの選択肢が残されていること。
 5. 同一 Command が再送されても、チェックポイントの公開処理が破損しないこと。
 6. 静的な Task DAG では、すべての依存先が成功した後にのみ対象ノード（Task）が投入され、リプレイを行っても 1 つのポリシー判定に対して重複した Execution が作成されないこと。
-7. （廃止）2 GPU の DDP Execution は all-or-nothing の Gang Lease を取得し、Lease 解放前にすべての rank が静止（`quiesced`）すること。Gang はなくなりました（[Gang（廃止）](#gang廃止)）。
+7. 複数ノードの DDP（[Gang](#gang)）は、メンバーの Execution をまとめて（all-or-nothing で）確保し、すべてのメンバーが互いに届いてから起動し、1 つが失敗したら残りも止めること。
 
 クラウドのプロビジョニング、上記 4 種類以外のロール、サービスの監視・常駐管理（service supervision）、cron / フェアシェアスケジューリング、および CPU / RAM の厳格な強制制限（hard enforcement）は、このパイロットの対象外です。
 
