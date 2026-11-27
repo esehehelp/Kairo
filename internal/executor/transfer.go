@@ -671,6 +671,11 @@ type PackServer struct {
 	// NoBench refuses network benches (an observe-only agent runs no work
 	// and serves none).
 	NoBench bool
+	// FabricPeer reports whether a request's address is on the fabric
+	// (nil: none is): only such a peer is served a sample (GET
+	// /fabric/sample), which times the link from this node to it.
+	FabricPeer func(host string) bool
+	samples    int
 
 	mu         sync.Mutex
 	warned     map[string]time.Time
@@ -769,6 +774,11 @@ type bufferedConn struct {
 func (c *bufferedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
 
 func (p *PackServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// a sample a peer fetches, or sends (fabricsample.go)
+	if r.URL.Path == FabricSamplePath {
+		p.serveFabricSample(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return

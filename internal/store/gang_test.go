@@ -28,7 +28,7 @@ func setupGangInventory(t *testing.T, store *Store) {
 		if err := store.UpsertNode(ctx, Node{ID: n.node, Name: n.node, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.SyncFabric(ctx, n.node, FabricPlan{Prefix: "10.66.0.0/16"}, FabricSelf{PublicKey: fabricKey(byte('a' + i)), ListenPort: 51820, Routing: true}); err != nil {
+		if _, err := store.SyncFabric(ctx, n.node, FabricPlan{Prefix: "10.66.0.0/16"}, FabricSelf{PublicKey: fabricKey(byte('a' + i)), ListenPort: 51820, ProbePort: 7485, Routing: true}); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.UpsertExecutor(ctx, Executor{ID: n.executor, NodeID: n.node, Kind: "local", Attributes: json.RawMessage(n.attrs), Enabled: true}); err != nil {
@@ -82,12 +82,12 @@ func gangProject(t *testing.T, store *Store, checkpointable bool) {
 	if checkpointable {
 		cp = "true"
 	}
-	gangProjectDeclared(t, store, cp, "")
+	gangProjectDeclared(t, store, cp, "", "")
 }
 
 // gangProjectDeclared is gangProject with checkpointable (and preemptible)
 // set to cp and the lines extra added to [tasks.execution].
-func gangProjectDeclared(t *testing.T, store *Store, cp, extra string) {
+func gangProjectDeclared(t *testing.T, store *Store, cp, extra, gangExtra string) {
 	t.Helper()
 	parsed := projectSpec(t, `schema_version = 1
 [project]
@@ -111,6 +111,7 @@ kind = "gpu"
 count = 1
 [tasks.execution.gang]
 size = 2
+`+gangExtra+`
 [[tasks.execution.gang.ranks]]
 rank = 1
 argv = ["linux-train", "--config", "x.toml"]

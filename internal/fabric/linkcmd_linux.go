@@ -26,6 +26,8 @@ import (
 //	underlay                         {"interface", "address", "mtu"} of the default route
 //	set-mtu INTERFACE MTU
 //	probe HOST:PORT                  {"rtt_ms"} (null: no connect)
+//	sample URL                       {"bytes", "seconds"} of fetching a peer's sample (sample.go)
+//	send URL                         {"bytes", "seconds"} of sending a peer a sample
 //	segments NAMES                   [vni…] of the VXLAN devices named with NAMES
 //	segment-ensure NAMES VNI MTU LOCAL PORT   the VXLAN device on the bridge docker made
 //	segment-remove NAMES VNI         the VXLAN device (the bridge is the network's)
@@ -106,6 +108,15 @@ func LinkCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return err
 		}
 		return say(vmProbe{RTTMillis: probe(ctx, args[1])})
+	case "sample", "send":
+		if err := need(1); err != nil {
+			return err
+		}
+		bytes, took, err := sampleHTTP(ctx, args[1], args[0] == "send")
+		if err != nil {
+			return err
+		}
+		return say(vmSample{Bytes: bytes, Seconds: took.Seconds()})
 	case "segments":
 		if err := need(1); err != nil {
 			return err

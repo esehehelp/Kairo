@@ -779,8 +779,11 @@ type AgentFabric struct {
 	// (issue #47 phase 2); Names prefixes the segments' devices (default
 	// "kf": kfb10000, kfv10000; another installation on the same host needs
 	// its own).
-	Routing    *bool    `toml:"routing"`
-	Names      string   `toml:"names"`
+	Routing *bool  `toml:"routing"`
+	Names   string `toml:"names"`
+	// Metered says the node's uplink is paid by the byte (a mobile line): a
+	// gang spans its links only when it says it may (issue #47 phase 5).
+	Metered    bool     `toml:"metered"`
 	Interface  string   `toml:"interface"`
 	ListenPort int      `toml:"listen_port"`
 	KeyFile    string   `toml:"key_file"`

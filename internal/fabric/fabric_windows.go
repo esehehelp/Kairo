@@ -235,6 +235,24 @@ func (v *vmLink) probeFrom(ctx context.Context, addr string) *float64 {
 	return p.RTTMillis
 }
 
+// sampleFrom fetches a peer's sample (or sends it one) from the VM, where
+// the fabric is.
+func (v *vmLink) sampleFrom(ctx context.Context, url string, send bool) (int64, time.Duration, error) {
+	op := "sample"
+	if send {
+		op = "send"
+	}
+	out, err := v.do(ctx, nil, op, url)
+	if err != nil {
+		return 0, 0, err
+	}
+	var s vmSample
+	if err := json.Unmarshal(out, &s); err != nil {
+		return 0, 0, fmt.Errorf("sample: %w", err)
+	}
+	return s.Bytes, time.Duration(s.Seconds * float64(time.Second)), nil
+}
+
 // LinkCommand: the fabric-link command is Linux's (linkcmd_linux.go), run
 // in the VM.
 func LinkCommand(context.Context, []string, io.Writer) error {

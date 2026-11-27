@@ -180,6 +180,12 @@ type Gang struct {
 	Size  int        `toml:"size" json:"size"`
 	Port  int        `toml:"port" json:"port,omitempty"`
 	Ranks []GangRank `toml:"ranks" json:"ranks,omitempty"`
+	// What its members' links must be: a round trip of at most max_rtt_ms,
+	// at least min_mib_per_second each way, metered ones allowed or not
+	// (store/fabric_evidence.go). Absent from the JSON when unset.
+	MaxRTTMillis    float64 `toml:"max_rtt_ms" json:"max_rtt_ms,omitempty"`
+	MinMiBPerSecond float64 `toml:"min_mib_per_second" json:"min_mib_per_second,omitempty"`
+	Metered         bool    `toml:"metered" json:"metered,omitempty"`
 }
 
 type GangRank struct {
@@ -675,6 +681,9 @@ func normalizeGang(gang *Gang) error {
 	}
 	if gang.Port != 0 && (gang.Port < 1024 || gang.Port > 65535) {
 		return errors.New("gang port must be 1024-65535 or 0")
+	}
+	if gang.MaxRTTMillis < 0 || gang.MinMiBPerSecond < 0 {
+		return errors.New("a gang's max_rtt_ms and min_mib_per_second are positive (or 0: any)")
 	}
 	seen := map[int]bool{}
 	for i := range gang.Ranks {

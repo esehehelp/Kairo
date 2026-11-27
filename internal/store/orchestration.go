@@ -706,7 +706,7 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 		spec.StartBy = string(template.StartBy)
 	}
 	if template.Gang != nil {
-		gang := GangSpec{Size: template.Gang.Size, Port: template.Gang.Port}
+		gang := GangSpec{Size: template.Gang.Size, Port: template.Gang.Port, MaxRTTMillis: template.Gang.MaxRTTMillis, MinMiBPerSecond: template.Gang.MinMiBPerSecond, Metered: template.Gang.Metered}
 		for _, r := range template.Gang.Ranks {
 			rank := GangRank{Rank: r.Rank, Argv: r.Argv, CWD: r.CWD, Env: r.Env}
 			if r.Executor != nil {

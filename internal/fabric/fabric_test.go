@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,8 @@ type fakeLink struct {
 	segs       map[int]string // VNI: "local:port mtu M"
 	inUse      map[int]bool   // a container is on it
 	frr        fakeRouter
+	sampleMu   sync.Mutex
+	samples    []string
 }
 
 func (f *fakeLink) ensure(_ context.Context, _, address string, _ int, _ string, _ int) error {
@@ -73,6 +76,18 @@ func (f *fakeLink) removeSegment(_ context.Context, _ string, vni int) error {
 }
 
 func (f *fakeLink) router(string, string, string) router { return &f.frr }
+
+// sampleFrom: every sample is 32 MiB in half a second; the URLs asked are
+// kept.
+func (f *fakeLink) sampleFrom(_ context.Context, url string, send bool) (int64, time.Duration, error) {
+	f.sampleMu.Lock()
+	defer f.sampleMu.Unlock()
+	if send {
+		url = "send " + url
+	}
+	f.samples = append(f.samples, url)
+	return 32 << 20, 500 * time.Millisecond, nil
+}
 
 // fakeRouter keeps the files FRR was last given.
 type fakeRouter struct {
@@ -352,5 +367,81 @@ func TestASegmentPutUpForALaunchIsKept(t *testing.T) {
 	}
 	if _, on := link.segs[100000]; on {
 		t.Fatal("a segment no view has, kept")
+	}
+}
+
+// A node asked for the bandwidth of a link to it fetches a sample from the
+// peer over the fabric and reports it as a transfer received; not again
+// for the same ask.
+func TestANodeAskedToMeasureALinkFetchesASample(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "fabric.key")
+	view := store.FabricView{Address: "10.66.0.4", Prefix: "10.66.0.0/16",
+		Peers:   []store.FabricNode{{NodeID: "b", Address: "10.66.0.2", PublicKey: "pk-b", ListenPort: 51820, ProbePort: 7485}},
+		Measure: []store.FabricMeasure{{Node: "b", Address: "10.66.0.2", Port: 7485}}}
+	link := &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}}
+	var reports []store.FabricLinksReport
+	m := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: link,
+		Sync:   func(context.Context, store.FabricSelf) (store.FabricView, error) { return view, nil },
+		Report: func(_ context.Context, r store.FabricLinksReport) error { reports = append(reports, r); return nil }}
+	ctx := context.Background()
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Once(ctx); err != nil { // asked again: not sampled again
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		m.mu.Lock()
+		n := len(m.received)
+		m.mu.Unlock()
+		if n > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := m.report(ctx); err != nil {
+		t.Fatal(err)
+	}
+	link.sampleMu.Lock()
+	samples := append([]string(nil), link.samples...)
+	link.sampleMu.Unlock()
+	if len(samples) != 1 || samples[0] != "https://10.66.0.2:7485/fabric/sample" {
+		t.Fatalf("samples %v", samples)
+	}
+	if len(reports) != 1 || len(reports[0].Received) != 1 || reports[0].Received[0].From != "b" || reports[0].Received[0].Bytes != 32<<20 || reports[0].Received[0].Seconds != 0.5 {
+		t.Fatalf("reports %+v", reports)
+	}
+}
+
+// A node asked to time a link from it to a peer whose endpoint serves
+// samples (its own does not) sends the peer one, and reports it sent.
+func TestANodeSendsASampleWhenItServesNone(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "fabric.key")
+	view := store.FabricView{Address: "10.66.0.4", Prefix: "10.66.0.0/16",
+		Peers:   []store.FabricNode{{NodeID: "b", Address: "10.66.0.2", PublicKey: "pk-b", ListenPort: 51820, ProbePort: 7485}},
+		Measure: []store.FabricMeasure{{Node: "b", Address: "10.66.0.2", Port: 7485, Send: true}}}
+	link := &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}}
+	var reports []store.FabricLinksReport
+	m := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: link,
+		Sync:   func(context.Context, store.FabricSelf) (store.FabricView, error) { return view, nil },
+		Report: func(_ context.Context, r store.FabricLinksReport) error { reports = append(reports, r); return nil }}
+	ctx := context.Background()
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; {
+		m.mu.Lock()
+		n := len(m.sent)
+		m.mu.Unlock()
+		if n > 0 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := m.report(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(reports) != 1 || len(reports[0].Sent) != 1 || reports[0].Sent[0].From != "b" || len(reports[0].Received) != 0 {
+		t.Fatalf("reports %+v", reports)
 	}
 }

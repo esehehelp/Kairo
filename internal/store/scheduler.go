@@ -195,6 +195,10 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 	if err != nil {
 		return nil, err
 	}
+	// links a gang waits for a measurement of are asked for a sample
+	if err = saveMeasureRequestsTx(ctx, tx, p.measure); err != nil {
+		return nil, err
+	}
 	// A pass cut short by a reservation has seen only the executions ahead of
 	// it: their reasons are kept, the others' left as they were.
 	complete := reservation == nil && !gangPlaced

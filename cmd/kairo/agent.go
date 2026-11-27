@@ -135,6 +135,7 @@ func agentCommand(args []string) error {
 			prefix = executor.DefaultContainerPrefix
 		}
 		fab.Routing, fab.NodeID, fab.Names, fab.RouterName = cfg.Fabric.FabricRouting(), cfg.Node.ID, cfg.Fabric.Names, prefix+"frr"
+		fab.Metered = cfg.Fabric.Metered
 		// what fetches from other agents took measures the links
 		executor.TransferObserved = fab.Received
 		// back on the fabric as it was last, before the daemon is asked
@@ -269,7 +270,12 @@ func agentCommand(args []string) error {
 		if err != nil {
 			return fmt.Errorf("packs certificate: %w", err)
 		}
-		server := executor.PackHTTPServer(cfg.Packs.Listen, cert, &executor.PackServer{Store: client, NodeID: cfg.Node.ID, Executors: running, Logger: logger, NoBench: cfg.ObserveOnly})
+		packs := &executor.PackServer{Store: client, NodeID: cfg.Node.ID, Executors: running, Logger: logger, NoBench: cfg.ObserveOnly}
+		if fab != nil {
+			// a peer on the fabric may time the link from this node
+			packs.FabricPeer = fab.OnFabric
+		}
+		server := executor.PackHTTPServer(cfg.Packs.Listen, cert, packs)
 		go func() {
 			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("pack server: %w", err)

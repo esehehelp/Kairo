@@ -46,6 +46,9 @@ type FabricSelf struct {
 	// Routing: this node runs FRR (an agent's: fabric_segments.go), so it
 	// may be a route reflector and carries segments.
 	Routing bool `json:"routing,omitempty"`
+	// Metered: this node's uplink is paid by the byte (a mobile line): a
+	// gang spans its links only when it says it may (fabric_evidence.go).
+	Metered bool `json:"metered,omitempty"`
 }
 
 // FabricNode is a node on the fabric.
@@ -86,6 +89,9 @@ type FabricView struct {
 	// Segments are the segments it is on (fabric_segments.go).
 	Routing  *FabricRouting  `json:"routing,omitempty"`
 	Segments []FabricSegment `json:"segments,omitempty"`
+	// Measure are the peers this node is asked to fetch a sample from, for
+	// the bandwidth of their links to it (fabric_evidence.go).
+	Measure []FabricMeasure `json:"measure,omitempty"`
 }
 
 // ParseFabricPrefix checks a fabric prefix: an IPv4 network of at least 4
@@ -164,8 +170,8 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID string, plan FabricPlan, 
 		if address, err = freeFabricAddressTx(ctx, tx, p); err != nil {
 			return FabricView{}, err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO fabric_nodes(node_id,address,public_key,listen_port,endpoints_json,probe_port,relay_from,relay_to,routing,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
-			nodeID, address, self.PublicKey, self.ListenPort, string(endpoints), nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo), self.Routing, t, t); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO fabric_nodes(node_id,address,public_key,listen_port,endpoints_json,probe_port,relay_from,relay_to,routing,metered,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+			nodeID, address, self.PublicKey, self.ListenPort, string(endpoints), nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo), self.Routing, self.Metered, t, t); err != nil {
 			return FabricView{}, err
 		}
 		if err := appendCoordinationEventTx(ctx, tx, "fabric_joined", nil, "node", nodeID, nil, map[string]any{"address": address}); err != nil {
@@ -189,10 +195,10 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID string, plan FabricPlan, 
 				return FabricView{}, err
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE fabric_nodes SET public_key=$1,listen_port=$2,endpoints_json=$3,probe_port=$6,relay_from=$7,relay_to=$8,routing=$9,updated_at=$4 WHERE node_id=$5
+		if _, err := tx.ExecContext(ctx, `UPDATE fabric_nodes SET public_key=$1,listen_port=$2,endpoints_json=$3,probe_port=$6,relay_from=$7,relay_to=$8,routing=$9,metered=$10,updated_at=$4 WHERE node_id=$5
 			AND (public_key IS DISTINCT FROM $1 OR listen_port IS DISTINCT FROM $2 OR endpoints_json<>$3 OR probe_port IS DISTINCT FROM $6
-			OR relay_from IS DISTINCT FROM $7 OR relay_to IS DISTINCT FROM $8 OR routing<>$9)`,
-			self.PublicKey, self.ListenPort, string(endpoints), t, nodeID, nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo), self.Routing); err != nil {
+			OR relay_from IS DISTINCT FROM $7 OR relay_to IS DISTINCT FROM $8 OR routing<>$9 OR metered<>$10)`,
+			self.PublicKey, self.ListenPort, string(endpoints), t, nodeID, nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo), self.Routing, self.Metered); err != nil {
 			return FabricView{}, err
 		}
 	}
@@ -224,6 +230,9 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID string, plan FabricPlan, 
 		if view.Segments, err = segmentsOfTx(ctx, tx, nodeID); err != nil {
 			return FabricView{}, err
 		}
+	}
+	if view.Measure, err = measureRequestsTx(ctx, tx, nodeID); err != nil {
+		return FabricView{}, err
 	}
 	return view, tx.Commit()
 }
@@ -405,6 +414,9 @@ type FabricReceived struct {
 
 // FabricLinksReport is what a node says of its links.
 type FabricLinksReport struct {
+	// Sent are samples this node sent to a peer (From: that peer): the
+	// bandwidth of the link from this node to it (fabric_evidence.go).
+	Sent     []FabricReceived `json:"sent,omitempty"`
 	Peers    []FabricPeerSeen `json:"peers"`
 	Received []FabricReceived `json:"received,omitempty"`
 }
@@ -490,6 +502,16 @@ func (s *Store) RecordFabricLinks(ctx context.Context, nodeID string, report Fab
 		// the link from the sender to this node, as the sender reports its path
 		if _, err := tx.ExecContext(ctx, `UPDATE fabric_links SET bytes_per_second=CASE WHEN bytes_per_second IS NULL THEN $1 ELSE (bytes_per_second+$1)/2 END,
 			bandwidth_at=$2 WHERE src_node=$3 AND dst_node=$4`, rate, t, r.From, nodeID); err != nil {
+			return err
+		}
+	}
+	for _, s := range report.Sent {
+		if s.Bytes < minBandwidthSample || s.Seconds <= 0 || s.From == nodeID {
+			continue
+		}
+		// the link from this node to the peer it sent to
+		if _, err := tx.ExecContext(ctx, `UPDATE fabric_links SET bytes_per_second=CASE WHEN bytes_per_second IS NULL THEN $1 ELSE (bytes_per_second+$1)/2 END,
+			bandwidth_at=$2 WHERE src_node=$3 AND dst_node=$4`, float64(s.Bytes)/s.Seconds, t, nodeID, s.From); err != nil {
 			return err
 		}
 	}

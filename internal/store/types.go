@@ -139,6 +139,13 @@ type GangSpec struct {
 	// segment; 0: GangDefaultPort.
 	Port  int        `json:"port,omitempty"`
 	Ranks []GangRank `json:"ranks,omitempty"`
+	// What the members' links must be (fabric_evidence.go): a round trip of
+	// at most MaxRTTMillis, at least MinMiBPerSecond each way (0: either
+	// way, any), and none metered unless Metered. Absent from the JSON when
+	// unset, so gang digests do not change.
+	MaxRTTMillis    float64 `json:"max_rtt_ms,omitempty"`
+	MinMiBPerSecond float64 `json:"min_mib_per_second,omitempty"`
+	Metered         bool    `json:"metered,omitempty"`
 }
 
 type GangRank struct {

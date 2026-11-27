@@ -66,6 +66,9 @@ type Manager struct {
 	NodeID     string
 	Names      string
 	RouterName string
+	// Metered: this node's uplink is paid by the byte (a gang spans its
+	// links only when it says it may).
+	Metered bool
 	// Sync says what this node is and returns its address and peers.
 	Sync func(ctx context.Context, self store.FabricSelf) (store.FabricView, error)
 	// Report says how this node sees its links (nil: not said).
@@ -89,6 +92,10 @@ type Manager struct {
 	// launches); launched: when each segment was put here for a launch
 	segMu    sync.Mutex
 	launched map[int]time.Time
+	// sampled: when each peer was last sampled (sample.go); sent: the
+	// samples sent to peers, to report
+	sampled map[string]time.Time
+	sent    []store.FabricReceived
 }
 
 // peerState is which of a peer's endpoints is tried, since when.
@@ -236,7 +243,7 @@ func (m *Manager) Once(ctx context.Context) error {
 		m.public = public
 	}
 	view, err := m.Sync(ctx, store.FabricSelf{PublicKey: m.public, ListenPort: m.ListenPort, Endpoints: m.Endpoints, ProbePort: m.ProbePort,
-		RelayFrom: m.RelayFrom, RelayTo: m.RelayTo, Routing: m.Routing})
+		RelayFrom: m.RelayFrom, RelayTo: m.RelayTo, Routing: m.Routing, Metered: m.Metered})
 	if err != nil {
 		return fmt.Errorf("fabric: %w", err)
 	}
@@ -281,6 +288,8 @@ func (m *Manager) apply(ctx context.Context, view store.FabricView) error {
 	}
 	m.relays.mu.Unlock()
 	m.relays.set(view.Relays, m.logger().Info)
+	// the links the daemon asks a measurement of
+	m.sampleAsked(view.Measure)
 	// the segments and FRR come after WireGuard: a failure there leaves the
 	// node on the fabric, and is tried again at the next sync
 	if err := m.applyRouting(ctx, view); err != nil {
@@ -413,10 +422,10 @@ func (m *Manager) report(ctx context.Context) error {
 	}
 	m.mu.Lock()
 	peers := append([]store.FabricNode(nil), m.view.Peers...)
-	received := m.received
-	m.received = nil
+	received, sent := m.received, m.sent
+	m.received, m.sent = nil, nil
 	m.mu.Unlock()
-	report := store.FabricLinksReport{Peers: []store.FabricPeerSeen{}, Received: received}
+	report := store.FabricLinksReport{Peers: []store.FabricPeerSeen{}, Received: received, Sent: sent}
 	for _, p := range peers {
 		seen := current[p.PublicKey]
 		peer := store.FabricPeerSeen{Node: p.NodeID, Path: store.FabricPathDirect, Endpoint: seen.endpoint}
@@ -440,6 +449,7 @@ func (m *Manager) report(ctx context.Context) error {
 		// told again with the next report
 		m.mu.Lock()
 		m.received = append(received, m.received...)
+		m.sent = append(sent, m.sent...)
 		m.mu.Unlock()
 		return err
 	}

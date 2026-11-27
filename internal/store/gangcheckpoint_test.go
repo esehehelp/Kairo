@@ -154,7 +154,7 @@ func TestAGangThatLostAMemberGoesOnFromItsLatestCompleteRound(t *testing.T) {
 		t.Run(fmt.Sprint("published=", published), func(t *testing.T) {
 			store := openCoordinationStore(t)
 			setupGangInventory(t, store)
-			gangProjectDeclared(t, store, "true", "continue_after_loss = true")
+			gangProjectDeclared(t, store, "true", "continue_after_loss = true", "")
 			ctx := context.Background()
 			rank0, rank1 := launchGang(t, store)
 			if published {

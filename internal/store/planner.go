@@ -172,10 +172,12 @@ type planRank struct {
 
 type planCandidate struct {
 	executionCandidate
-	label     string
-	demand    planDemand
-	gangID    string
-	ranks     []planRank
+	label  string
+	demand planDemand
+	gangID string
+	ranks  []planRank
+	// links: what the gang says its members' links must be (nil: any)
+	links     *gangLinks
 	submitted time.Time
 	// inputsWait: why it is not admitted yet for its inputs (inputs.go);
 	// empty when it has none, or each is where it is planned.
@@ -219,6 +221,10 @@ type planModel struct {
 	// with the other within handshakeFresh: fabricPair)
 	routing map[string]bool
 	reach   map[[2]string]bool
+	// links: what was measured of each directed link between them;
+	// metered: the nodes whose uplink is (fabric_evidence.go)
+	links   map[[2]string]linkEvidence
+	metered map[string]bool
 }
 
 // planOverlay is what the pass has handed out so far: devices placed on or
@@ -391,7 +397,10 @@ func (m *planModel) loadExecutors(ctx context.Context, tx *sql.Tx, callerID stri
 	for pair, n := range ways {
 		m.reach[pair] = n == 2 // both ways
 	}
-	return err
+	if err != nil {
+		return err
+	}
+	return m.loadLinkEvidence(ctx, tx)
 }
 
 func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
@@ -1000,6 +1009,12 @@ type planner struct {
 	// anyReach: assign places a gang's members whether or not their nodes
 	// reach each other (to tell a partition from want of room)
 	anyReach bool
+	// want: what the gang being placed says its members' links must be;
+	// missing: the links assign found no measurement of; measure: the links
+	// to ask a sample of (fabric_evidence.go)
+	want    *gangLinks
+	missing map[[2]string]bool
+	measure map[[2]string]bool
 }
 
 // reachesAll reports whether node reaches every node of others on the
@@ -1012,6 +1027,16 @@ func (p *planner) reachesAll(node string, others map[string]bool) bool {
 	for other := range others {
 		if !p.m.reach[fabricPair(node, other)] {
 			return false
+		}
+		if p.want != nil {
+			if v := p.m.linkMeets(node, other, p.want); !v.met {
+				for _, l := range v.missing {
+					if p.missing != nil {
+						p.missing[l] = true
+					}
+				}
+				return false
+			}
 		}
 	}
 	return true
@@ -1026,7 +1051,7 @@ func fabricPair(a, b string) [2]string {
 }
 
 func newPlanner(m *planModel, preempt bool) *planner {
-	p := &planner{m: m, ov: newOverlay(), preempt: preempt, victims: map[string]bool{}, usage: map[string]map[string]float64{}}
+	p := &planner{m: m, ov: newOverlay(), preempt: preempt, victims: map[string]bool{}, usage: map[string]map[string]float64{}, measure: map[[2]string]bool{}}
 	for _, l := range m.leases {
 		p.account(l.projectID, "gpu", float64(len(l.devices)))
 		for key, quantity := range l.capacity {
@@ -1148,6 +1173,9 @@ func (p *planner) place(c *planCandidate) planPlacement {
 // decide is place without the deadline note; start is when the candidate is
 // expected to start when it waits (zero: not known).
 func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
+	// a gang's members' links must be what it says (fabric_evidence.go)
+	p.want = c.links
+	defer func() { p.want = nil }()
 	ranks := c.ranks
 	if c.gangID == "" {
 		ranks = []planRank{{rank: 0, candidate: c.executionCandidate, demand: c.demand}}
@@ -1201,7 +1229,25 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 		}
 	}
 	// Where it would go once the leases in its way end, if anywhere.
+	p.missing = map[[2]string]bool{}
 	target, transient := p.assign(ranks, options, newOverlay(), allFreed)
+	if !transient && len(ranks) > 1 && p.want != nil {
+		// would it fit on nodes that reach each other but for what it says
+		// its links must be: the measurements are missing, or short of it
+		missing, want := p.missing, p.want
+		p.want = nil
+		_, fits := p.assign(ranks, options, newOverlay(), allFreed)
+		p.want = want
+		if fits {
+			if len(missing) > 0 {
+				for l := range missing {
+					p.measure[l] = true
+				}
+				return planPlacement{wait: planWait{reason: "fabric_unmeasured", message: "no measurement yet says the links between the nodes that could hold its members are " + want.describe() + "; samples of them are asked for"}}, time.Time{}
+			}
+			return planPlacement{wait: planWait{reason: "fabric_links_short", message: "the links between the nodes that could hold its members are measured short of " + want.describe()}}, time.Time{}
+		}
+	}
 	if !transient && len(ranks) > 1 {
 		// members that would fit but on nodes that do not all reach each
 		// other on the fabric now (a partition): it waits, placed across none
@@ -1764,6 +1810,27 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 		if err != nil {
 			return nil, err
 		}
+	}
+	// what each gang says its members' links must be (fabric_evidence.go)
+	links := map[string]*gangLinks{}
+	if len(gangIDs) > 0 {
+		err = eachRow(ctx, tx, `SELECT id,COALESCE(max_rtt_ms,0),COALESCE(min_bytes_per_second,0),metered FROM execution_gangs WHERE id=ANY($1::text[])`, []any{gangIDs}, func(rows *sql.Rows) error {
+			var id string
+			var l gangLinks
+			if err := rows.Scan(&id, &l.maxRTT, &l.minBytes, &l.metered); err != nil {
+				return err
+			}
+			if !l.any() {
+				links[id] = &l
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, c := range candidates {
+		c.links = links[c.gangID]
 	}
 	ids := make([]string, 0, len(candidates))
 	for _, c := range candidates {

@@ -27,6 +27,12 @@ type vmProbe struct {
 	RTTMillis *float64 `json:"rtt_ms"`
 }
 
+// vmSample is what the link command says of a sample it fetched.
+type vmSample struct {
+	Bytes   int64   `json:"bytes"`
+	Seconds float64 `json:"seconds"`
+}
+
 // prober is a link whose round trips are timed where it is (the wslc VM),
 // not from this process.
 type prober interface {

@@ -247,6 +247,9 @@ func normalizeGangSpec(gang GangSpec) (GangSpec, error) {
 	if gang.Port != 0 && (gang.Port < 1024 || gang.Port > 65535) {
 		return GangSpec{}, errors.New("gang port must be 1024-65535 or 0")
 	}
+	if gang.MaxRTTMillis < 0 || gang.MinMiBPerSecond < 0 {
+		return GangSpec{}, errors.New("a gang's max_rtt_ms and min_mib_per_second are positive (or 0: any)")
+	}
 	seen := map[int]bool{}
 	for i := range gang.Ranks {
 		r := &gang.Ranks[i]
@@ -455,7 +458,15 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 		// Members carry the leader's request ID and digest with their rank, so a
 		// resubmitted gang is idempotent through its leader alone.
 		gangID, stamp := id.New("gng"), now()
-		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_gangs(id,leader_execution_id,size,port,created_at) VALUES($1,$2,$3,$4,$5)`, gangID, executionID, spec.Gang.Size, spec.Gang.Port, stamp); err != nil {
+		var maxRTT, minBytes any
+		if spec.Gang.MaxRTTMillis > 0 {
+			maxRTT = spec.Gang.MaxRTTMillis
+		}
+		if spec.Gang.MinMiBPerSecond > 0 {
+			minBytes = spec.Gang.MinMiBPerSecond * (1 << 20)
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_gangs(id,leader_execution_id,size,port,max_rtt_ms,min_bytes_per_second,metered,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
+			gangID, executionID, spec.Gang.Size, spec.Gang.Port, maxRTT, minBytes, spec.Gang.Metered, stamp); err != nil {
 			return "", false, err
 		}
 		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_members(gang_id,rank,execution_id) VALUES($1,0,$2)`, gangID, executionID); err != nil {
