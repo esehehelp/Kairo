@@ -439,7 +439,7 @@ ca_file = "/etc/kairo/ca.pem"
 `[owner_use]` は、このノードの持ち主の使用の見つけ方です（[所有者の使用](#所有者の使用owner-use)。既定で有効、`disabled = true` で無効。しきい値 `gpu_sm_percent`・`cpu_percent`・`ram_free_mib` と、持ち主がキーボードの前にいるときの `*_present`、`input_file`）。残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[bench]` は拒否されます（ベンチマークはコンテナで走り、使うプログラムは Kairo が決めます）。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
 
 - **Executor の実行形態**: すべての Executor は Attempt をイメージのコンテナで実行します。種別（kind）は `incus`（Linux）と `wslc`（Windows）だけです（[コンテナ実行](#コンテナ実行)を参照）。ホストで直接実行する種別（以前の `linux`・`windows` など）、Proxmox のコンテナの種別（以前の `pct`）、WSL の種別（`wsl2`）を宣言する設定は拒否されます。
-- **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。
+- **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。そのノードの無効な Executor が書いたデータに残っている仕事（pack、durable に写した後の元の削除、運ぶための pack、kept scratch、output の移動）は、エージェントが登録するたびに、そのストアをいま提供する Executor へ引き継がれます（イベント `data_handed_over`）。仕事は Executor ごとに探されるので、別の Executor に置き換えて退役させた Executor（コンテナへ移したホストの Executor など）のデータが、いつまでも待たないためです。
 - **相対パスの基準**: `log_directory`（および `source_directory`）に相対パスを指定した場合、デーモンまたはエージェントの起動時の作業ディレクトリを基準に 1 度だけ解決され、Attempt には絶対パスが渡されます。
 - **接続要件**: エージェントは `insecure_http = true` を指定しない限り `http://` の URL を拒否します。ホストのデバイスコントローラ（`kairo controller`。[ハードウェア設定](#ハードウェア設定)を参照）も同じ方法で接続します。
 
