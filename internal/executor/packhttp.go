@@ -37,5 +37,5 @@ func PackHTTPServer(addr string, cert tls.Certificate, handler http.Handler) *ht
 	serverTLS.Certificates = []tls.Certificate{cert}
 	serverTLS.NextProtos = []string{"http/1.1"}
 	return &http.Server{Addr: addr, TLSConfig: serverTLS, ReadHeaderTimeout: 30 * time.Second, IdleTimeout: 2 * time.Minute, Handler: handler,
-		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){}}
+		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){}, ErrorLog: tlsutil.ServerErrorLog()}
 }

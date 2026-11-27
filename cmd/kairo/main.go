@@ -188,6 +188,7 @@ func serve(args []string) error {
 		Addr:              daemonConfig.Listen,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ErrorLog:          tlsutil.ServerErrorLog(),
 	}
 	// With TLS the CA must be one attempts can be given (KAIRO_API_CA, by
 	// their agents) to verify the daemon they report to.
