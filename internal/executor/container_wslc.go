@@ -272,9 +272,10 @@ func wslcContainers(ctx context.Context) ([]wslcContainer, error) {
 }
 
 // attemptOfInstance is the attempt of a container named by
-// containerInstance.
+// containerInstance (with this agent's prefix: another installation's is
+// none of its).
 func attemptOfInstance(name string) (string, bool) {
-	rest, ok := strings.CutPrefix(name, "kairo-att-")
+	rest, ok := strings.CutPrefix(name, ContainerPrefix+"att-")
 	if !ok || rest == "" || strings.ContainsAny(rest, "-_") {
 		return "", false
 	}

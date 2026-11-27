@@ -150,6 +150,13 @@ func agentCommand(args []string) error {
 	// Packs are fetched from other agents over HTTPS (HTTP/1.1), trusting the
 	// daemon's CA (executor.PackHTTPClient).
 	packClient := executor.PackHTTPClient(tlsConfig)
+	// this installation's containers (another's on this host are none of its)
+	if cfg.ContainerPrefix != "" {
+		if err := executor.ValidContainerPrefix(cfg.ContainerPrefix); err != nil {
+			return err
+		}
+		executor.ContainerPrefix = cfg.ContainerPrefix
+	}
 	var running []*executor.Local
 	for _, configured := range cfg.Executors {
 		if configured.Enabled != nil && !*configured.Enabled {

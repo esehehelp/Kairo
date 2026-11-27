@@ -503,6 +503,10 @@ type Agent struct {
 	// OwnerUse: how this node's providers tell its owner's use of a
 	// resource (README: Owner use).
 	OwnerUse OwnerUse `toml:"owner_use"`
+	// ContainerPrefix begins the names of the containers this agent makes
+	// for attempts (default kairo-): another installation's agent on the
+	// same host takes another (executor.ContainerPrefix).
+	ContainerPrefix string `toml:"container_prefix"`
 }
 
 // OwnerUse is an agent's [owner_use]: on unless disabled; a threshold left

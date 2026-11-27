@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -177,10 +178,33 @@ func attemptAccount(passwd, group string) (name, passwdLine, groupLine string) {
 	return name, passwdLine, groupLine
 }
 
-// containerInstance is the Incus instance name of an attempt (letters,
-// digits and dashes).
+// DefaultContainerPrefix begins the name of an attempt's container unless
+// the agent's configuration says otherwise (container_prefix).
+const DefaultContainerPrefix = "kairo-"
+
+// ContainerPrefix begins the name of every container this agent makes for an
+// attempt (set once, as the agent starts): an installation's own, so that
+// two installations' agents on one host (production and a test one) never
+// take each other's containers for leftovers to remove, or adopt them. A
+// prefix beginning kairo- keeps the containers counted as Kairo's work by
+// any installation's providers (their cgroups, lxc.payload.kairo-*).
+var ContainerPrefix = DefaultContainerPrefix
+
+var containerPrefixPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}-$`)
+
+// ValidContainerPrefix says why p cannot begin containers' names (nil: it
+// can): lower-case letters, digits and dashes, a letter first, a dash last.
+func ValidContainerPrefix(p string) error {
+	if !containerPrefixPattern.MatchString(p) {
+		return fmt.Errorf("container prefix %q: a lower-case letter, then letters, digits or dashes, ending in a dash (32 at most)", p)
+	}
+	return nil
+}
+
+// containerInstance is the name of an attempt's container (Incus instance,
+// wslc container): letters, digits and dashes.
 func containerInstance(attemptID string) string {
-	return "kairo-" + strings.ReplaceAll(attemptID, "_", "-")
+	return ContainerPrefix + strings.ReplaceAll(attemptID, "_", "-")
 }
 
 // containerDir is where the executor keeps what an attempt's container is
