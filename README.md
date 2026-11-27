@@ -1841,7 +1841,7 @@ size = 2                         # メンバーの数（2〜253）。メンバ�
 port = 29500                     # 省略可: メンバー 0 のランデブーのポート（既定 29500）
 [[tasks.execution.gang.ranks]]   # 省略可: メンバーごとの上書き（argv、cwd、executor、env、exclusive、capacity）
 rank = 1
-executor = { node = "pve1" }
+executor = { node = "node-b" }
 ```
 
 - **確保**: メンバー（rank 0〜size−1）は、fabric で経路を持つ（FRR を動かす）別々のノードに、1 つのトランザクションでまとめて置かれます（全部か、何もなしか）。デーモンに `[fabric] segment_prefix` がなければ置かれません（待機理由 `no_fabric`）。各メンバーの Lease は、そのノードの Executor が次にポーリングしたときに渡されます。
@@ -1851,7 +1851,7 @@ executor = { node = "pve1" }
 - **一蓮托生**: 起動したメンバーの 1 つが 0 以外で終わる（かロストする）と、走っているほかのメンバーを止めます。Task が成功するのは、すべてのメンバーが 0 で終わったときだけです。あるメンバーの起動が失敗した（ほかは起動していた）ときは、最初から走らせ直します（続けて 3 回まで。その次は失敗）。
 - **まだないもの**: checkpoint（gang は `checkpointable` にできません。gang 全体の checkpoint は第 4 段階）、stream、`store`、`regenerable`。
 - **見る**: `kairo task show` が各メンバーのノード・アドレス・セグメントを、`kairo task logs --rank R` がメンバー R のログを出します。
-- **試験（2026-11-28、試験用のインストール）**: wslc（Windows）と Incus（pve1）の 2 メンバーで、TCP の 64 MiB が 1.03 秒、往復 0.98 ms。wslc・Incus（pve1）・Incus（pve0）の 3 メンバー × 2 プロセスの DDP（gloo、6 rank）で、全 rank のパラメータが一致。メンバー 0 の exit 3 で Windows のメンバーが止められ、Task は失敗（exit 3）。
+- **試験（2026-11-28、試験用のインストール）**: wslc（Windows）と Incus（Linux）の 2 メンバーで、TCP の 64 MiB が 1.03 秒、往復 0.98 ms（1 GbE の LAN）。wslc と 2 台の Incus の 3 メンバー × 2 プロセスの DDP（gloo、6 rank）で、全 rank のパラメータが一致。メンバー 0 の exit 3 で Windows のメンバーが止められ、Task は失敗（exit 3）。
 
 ## Loader（ストリーム）
 
