@@ -172,4 +172,13 @@ func TestAPairWithNoPathIsGivenARelay(t *testing.T) {
 	if pr := peer(a, "r"); pr.RelayEndpoint != "" {
 		t.Fatalf("a's view of r: %+v", pr)
 	}
+	// b is elsewhere now: its pairs try a direct path again
+	selves["b"] = FabricSelf{PublicKey: fabricKey('b'), ListenPort: 51820, Endpoints: []string{"192.0.2.77:51820"}}
+	view("b")
+	if pb := peer(view("a"), "b"); pb.RelayEndpoint != "" {
+		t.Fatalf("still relayed after b moved: %+v", pb)
+	}
+	if r = view("r"); len(r.Relays) != 0 {
+		t.Fatalf("r still relays: %+v", r.Relays)
+	}
 }

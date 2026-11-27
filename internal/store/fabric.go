@@ -168,6 +168,18 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID, prefix string, self Fabr
 		if a, perr := netip.ParseAddr(address); perr != nil || !p.Contains(a) {
 			return FabricView{}, fmt.Errorf("%w: node %s has address %s, outside the fabric's prefix %s (a node's address is never changed)", ErrFabric, nodeID, address, prefix)
 		}
+		// a node elsewhere now (other endpoints, or port): its pairs try a
+		// direct path again, and are relayed again if it fails
+		var wasEndpoints string
+		var wasPort sql.NullInt64
+		if err := tx.QueryRowContext(ctx, `SELECT endpoints_json,listen_port FROM fabric_nodes WHERE node_id=$1`, nodeID).Scan(&wasEndpoints, &wasPort); err != nil {
+			return FabricView{}, err
+		}
+		if wasEndpoints != string(endpoints) || int(wasPort.Int64) != self.ListenPort {
+			if err := unrelayTx(ctx, tx, `node_a=$1 OR node_b=$1`, nodeID); err != nil {
+				return FabricView{}, err
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `UPDATE fabric_nodes SET public_key=$1,listen_port=$2,endpoints_json=$3,probe_port=$6,relay_from=$7,relay_to=$8,updated_at=$4 WHERE node_id=$5
 			AND (public_key IS DISTINCT FROM $1 OR listen_port IS DISTINCT FROM $2 OR endpoints_json<>$3 OR probe_port IS DISTINCT FROM $6
 			OR relay_from IS DISTINCT FROM $7 OR relay_to IS DISTINCT FROM $8)`,
@@ -405,6 +417,11 @@ func (s *Store) RecordFabricLinks(ctx context.Context, nodeID string, report Fab
 	}
 	defer tx.Rollback()
 	t := now()
+	// a relay given a day ago is given up: its pair tries a direct path again
+	// (a firewall opened since), and is relayed again if it fails
+	if err := unrelayTx(ctx, tx, `created_at::timestamptz<$1::timestamptz`, time.Now().Add(-relayTried).UTC().Format(time.RFC3339Nano)); err != nil {
+		return err
+	}
 	known := func(node string) (bool, error) {
 		var ok bool
 		err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM fabric_nodes WHERE node_id=$1)`, node).Scan(&ok)
@@ -557,4 +574,31 @@ func relayPairTx(ctx context.Context, tx *sql.Tx, x, y string) error {
 		return appendCoordinationEventTx(ctx, tx, "fabric_relayed", nil, "node", a, nil, map[string]any{"a": a, "b": b, "relay": c.node, "port_a": free[0], "port_b": free[1]})
 	}
 	return nil // no relay: the pair waits for one
+}
+
+// relayTried: a relay is given up after this long, so that its pair tries
+// a direct path again.
+const relayTried = 24 * time.Hour
+
+// unrelayTx gives up the relays where says (with arg), each recorded (event
+// fabric_unrelayed).
+func unrelayTx(ctx context.Context, tx *sql.Tx, where string, arg any) error {
+	var gone [][3]string
+	err := eachRow(ctx, tx, `DELETE FROM fabric_relays WHERE `+where+` RETURNING node_a,node_b,relay_node`, []any{arg}, func(rows *sql.Rows) error {
+		var g [3]string
+		if err := rows.Scan(&g[0], &g[1], &g[2]); err != nil {
+			return err
+		}
+		gone = append(gone, g)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, g := range gone {
+		if err := appendCoordinationEventTx(ctx, tx, "fabric_unrelayed", nil, "node", g[0], nil, map[string]any{"a": g[0], "b": g[1], "relay": g[2]}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
