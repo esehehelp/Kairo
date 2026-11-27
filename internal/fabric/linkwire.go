@@ -6,6 +6,9 @@ import "context"
 // a link's work for another process: the Windows agent's, in its wslc VM.
 const LinkArg = "__kairo-fabric-link"
 
+// vmRouterDir holds, in a wslc VM, each FRR's /etc/frr (by its name).
+const vmRouterDir = "/var/lib/kairo/fabric/frr"
+
 // What `kairo __kairo-fabric-link` says (linkcmd_linux.go) and the Windows agent
 // reads (fabric_windows.go).
 

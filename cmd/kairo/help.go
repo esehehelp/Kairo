@@ -221,7 +221,9 @@ func init() {
 		}},
 		{name: "fabric", summary: "the network every node is on (issue #47): its prefix, and each node's address, key and endpoints", group: &commandGroup{
 			subs: []command{
-				{"list", "[--json]", "the fabric's prefix and its nodes: address, public key, port, endpoints", fabricList},
+				{"list", "[--json]", "the fabric's prefix and its nodes: address, public key, port, endpoints; its links and segments", fabricList},
+				{"segment-add", "[--mtu N] [--json] NODE...", "a segment (an L2 network over VXLAN, EVPN) made by hand on those nodes; gangs get their own", fabricSegmentAdd},
+				{"segment-remove", "VNI...", "remove segments: their nodes take down the bridge and VXLAN device", fabricSegmentRemove},
 			},
 			aliases: map[string]string{"ls": "list", "show": "list", "status": "list"},
 		}},

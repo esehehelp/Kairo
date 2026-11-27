@@ -9,13 +9,15 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 )
 
-// LinkCommand is `kairo __kairo-fabric-link OP ARGS…` (LinkArg): the link's work done by this
-// process for another (the Windows agent, in its wslc VM: fabric_windows.go).
-// What it reads (a key) is on standard input; what it says is JSON.
+// LinkCommand is `kairo __kairo-fabric-link OP ARGS…` (LinkArg): the
+// link's work done by this process for another (the Windows agent, in its
+// wslc VM: fabric_windows.go). What it reads (a key, FRR's files) is on
+// standard input; what it says is JSON.
 //
 //	ensure NAME ADDRESS BITS PORT    the interface, its key on stdin
 //	peers NAME                       {key: {"handshake_unix", "endpoint"}}
@@ -24,6 +26,12 @@ import (
 //	underlay                         {"interface", "address", "mtu"} of the default route
 //	set-mtu INTERFACE MTU
 //	probe HOST:PORT                  {"rtt_ms"} (null: no connect)
+//	segments NAMES                   [vni…] of the VXLAN devices named with NAMES
+//	segment-ensure NAMES VNI MTU LOCAL PORT   the VXLAN device on the bridge docker made
+//	segment-remove NAMES VNI         the VXLAN device (the bridge is the network's)
+//	router-apply NAME                FRR (docker) with the files on stdin ({name: content})
+//	router-remove NAME
+//	router-show NAME COMMAND         vtysh -c COMMAND
 func LinkCommand(ctx context.Context, args []string, stdout io.Writer) error {
 	if len(args) == 0 {
 		return errors.New("fabric-link: no operation")
@@ -98,6 +106,60 @@ func LinkCommand(ctx context.Context, args []string, stdout io.Writer) error {
 			return err
 		}
 		return say(vmProbe{RTTMillis: probe(ctx, args[1])})
+	case "segments":
+		if err := need(1); err != nil {
+			return err
+		}
+		vnis, err := linuxSegments(ctx, args[1])
+		if err != nil {
+			return err
+		}
+		return say(append([]int{}, vnis...))
+	case "segment-ensure":
+		if err := need(5); err != nil {
+			return err
+		}
+		vni, err1 := strconv.Atoi(args[2])
+		mtu, err2 := strconv.Atoi(args[3])
+		port, err3 := strconv.Atoi(args[5])
+		if err := errors.Join(err1, err2, err3); err != nil {
+			return err
+		}
+		return linuxEnsureSegment(ctx, args[1], vni, mtu, args[4], port)
+	case "segment-remove":
+		if err := need(2); err != nil {
+			return err
+		}
+		vni, err := strconv.Atoi(args[2])
+		if err != nil {
+			return err
+		}
+		return linuxRemoveSegment(ctx, args[1], vni, false)
+	case "router-apply", "router-remove", "router-show":
+		if err := need(1); err != nil {
+			return err
+		}
+		r := dockerRouter{name: args[1], dir: vmRouterDir + "/" + args[1]}
+		switch args[0] {
+		case "router-apply":
+			var files map[string]string
+			if err := json.NewDecoder(os.Stdin).Decode(&files); err != nil {
+				return fmt.Errorf("router-apply: FRR's files on stdin: %w", err)
+			}
+			return r.apply(ctx, files)
+		case "router-remove":
+			return r.remove(ctx)
+		default:
+			if err := need(2); err != nil {
+				return err
+			}
+			out, err := r.show(ctx, args[2])
+			if err != nil {
+				return err
+			}
+			_, err = stdout.Write(out)
+			return err
+		}
 	}
 	return fmt.Errorf("fabric-link: unknown operation %q", args[0])
 }

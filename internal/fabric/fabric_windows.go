@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/windows"
+
+	"kairo/internal/store"
 )
 
 // On Windows, attempts run in wslc containers (container_wslc.go), so the
@@ -234,4 +237,128 @@ func (v *vmLink) probeFrom(ctx context.Context, addr string) *float64 {
 // in the VM.
 func LinkCommand(context.Context, []string, io.Writer) error {
 	return errors.New("fabric-link runs on Linux (in the wslc VM, kairo-linux)")
+}
+
+// wslcCommand runs wslc.exe args (a pipe for its standard input, as wslc
+// needs one).
+func wslcCommand(ctx context.Context, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, wslcExe(), args...)
+	cmd.Stdin = strings.NewReader("")
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	var out, errOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errOut
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("wslc %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(errOut.String()+" "+out.String()))
+	}
+	return out.Bytes(), nil
+}
+
+// wslcNetworks are the names of the session's networks.
+func wslcNetworks(ctx context.Context) ([]string, error) {
+	out, err := wslcCommand(ctx, "network", "list")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for i, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		f := strings.Fields(line)
+		if i == 0 || len(f) < 2 {
+			continue // the header
+		}
+		names = append(names, f[1])
+	}
+	return names, nil
+}
+
+// On a wslc node a segment's bridge is a wslc network's (a container joins
+// the network to be on the segment): made with that bridge's name, no
+// address on it (inhibit_ipv4: the VM is not on the segment), internal
+// (nothing routed out of it). The VXLAN device is made in the VM and put
+// on that bridge.
+
+func (v *vmLink) segments(ctx context.Context, names string) ([]int, error) {
+	out, err := v.do(ctx, nil, "segments", names)
+	if err != nil {
+		return nil, err
+	}
+	var vnis []int
+	if err := json.Unmarshal(out, &vnis); err != nil {
+		return nil, fmt.Errorf("segments: %w", err)
+	}
+	have := map[int]bool{}
+	for _, vni := range vnis {
+		have[vni] = true
+	}
+	// networks whose VXLAN device is gone (a VM made anew, a removal half
+	// done) are segments here too
+	nets, err := wslcNetworks(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range nets {
+		if s, ok := strings.CutPrefix(n, names+"-seg-"); ok {
+			if vni, err := strconv.Atoi(s); err == nil && !have[vni] {
+				have[vni] = true
+				vnis = append(vnis, vni)
+			}
+		}
+	}
+	return vnis, nil
+}
+
+func (v *vmLink) ensureSegment(ctx context.Context, names string, seg store.FabricSegment, local string, port int) error {
+	network := SegmentNetwork(names, seg.VNI)
+	bridge, _ := segmentDevices(names, seg.VNI)
+	nets, err := wslcNetworks(ctx)
+	if err != nil {
+		return err
+	}
+	if !slices.Contains(nets, network) {
+		if _, err := wslcCommand(ctx, "network", "create", "-d", "bridge", "-o", "com.docker.network.bridge.name="+bridge,
+			"-o", "com.docker.network.driver.mtu="+strconv.Itoa(seg.MTU), "-o", "com.docker.network.bridge.inhibit_ipv4=true",
+			"--internal", "--subnet", seg.Subnet, network); err != nil {
+			return err
+		}
+	}
+	_, err = v.do(ctx, nil, "segment-ensure", names, strconv.Itoa(seg.VNI), strconv.Itoa(seg.MTU), local, strconv.Itoa(port))
+	return err
+}
+
+func (v *vmLink) removeSegment(ctx context.Context, names string, vni int) error {
+	if _, err := v.do(ctx, nil, "segment-remove", names, strconv.Itoa(vni)); err != nil {
+		return err
+	}
+	network := SegmentNetwork(names, vni)
+	nets, err := wslcNetworks(ctx)
+	if err != nil || !slices.Contains(nets, network) {
+		return err
+	}
+	_, err = wslcCommand(ctx, "network", "remove", network)
+	return err
+}
+
+// vmRouter is FRR in the VM (docker, on the VM's network: dockerRouter).
+type vmRouter struct {
+	v    *vmLink
+	name string
+}
+
+func (v *vmLink) router(name, _ string) router { return vmRouter{v: v, name: name} }
+
+func (r vmRouter) apply(ctx context.Context, files map[string]string) error {
+	b, err := json.Marshal(files)
+	if err != nil {
+		return err
+	}
+	_, err = r.v.do(ctx, b, "router-apply", r.name)
+	return err
+}
+
+func (r vmRouter) remove(ctx context.Context) error {
+	_, err := r.v.do(ctx, nil, "router-remove", r.name)
+	return err
+}
+
+func (r vmRouter) show(ctx context.Context, command string) ([]byte, error) {
+	return r.v.do(ctx, nil, "router-show", r.name, command)
 }

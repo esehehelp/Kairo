@@ -60,6 +60,8 @@ func (s *Server) routes() []route {
 		{"POST", "/api/machines", roleAdmin, s.applyMachines},
 		{"GET", "/api/stores", roleRead, s.storeStatus},
 		{"GET", "/api/fabric", roleRead, s.fabricStatus},
+		{"POST", "/api/fabric/segments", roleAdmin, s.createFabricSegment},
+		{"DELETE", "/api/fabric/segments/{vni}", roleAdmin, s.deleteFabricSegment},
 		{"GET", "/api/data/objects", roleRead, s.listDataObjects},
 		{"GET", "/api/data/objects/{id}/placement", roleRead, s.getDataPlacement},
 		{"POST", "/api/data/imports", roleAdmin, s.importData},

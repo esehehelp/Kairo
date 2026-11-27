@@ -127,6 +127,13 @@ func agentCommand(args []string) error {
 		if fab.RelayFrom, fab.RelayTo, err = config.ParseRelayPorts(cfg.Fabric.RelayPorts); err != nil {
 			return err
 		}
+		// FRR and the segments (issue #47 phase 2), FRR's container named as
+		// this installation's containers are
+		prefix := cfg.ContainerPrefix
+		if prefix == "" {
+			prefix = executor.DefaultContainerPrefix
+		}
+		fab.Routing, fab.NodeID, fab.Names, fab.RouterName = cfg.Fabric.FabricRouting(), cfg.Node.ID, cfg.Fabric.Names, prefix+"frr"
 		// what fetches from other agents took measures the links
 		executor.TransferObserved = fab.Received
 		// back on the fabric as it was last, before the daemon is asked

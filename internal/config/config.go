@@ -583,6 +583,9 @@ func LoadAgent(path string) (Agent, error) {
 				return a, err
 			}
 		}
+		if n := a.Fabric.Names; n != "" && !validFabricNames(n) {
+			return a, fmt.Errorf("fabric.names %q: 1 to 5 lowercase letters or digits, a letter first", n)
+		}
 	}
 	if a.LogDirectory == "" {
 		a.LogDirectory = "local/attempts-agent"
@@ -739,7 +742,13 @@ func LoadController(path string) (Controller, error) {
 // (the other fields as AgentFabric's), so that nodes reach the daemon at
 // its fabric address.
 type DaemonFabric struct {
-	Prefix     string   `toml:"prefix"`
+	Prefix string `toml:"prefix"`
+	// ASN and VXLANPort are how the fabric's routing runs (0: a private
+	// 4-byte ASN, 4789); SegmentPrefix is where segments' /24 subnets are
+	// taken from ("": no segments). Issue #47, phase 2.
+	ASN           uint32 `toml:"asn"`
+	VXLANPort     int    `toml:"vxlan_port"`
+	SegmentPrefix string `toml:"segment_prefix"`
 	Join       bool     `toml:"join"`
 	RelayPorts string   `toml:"relay_ports"`
 	Interface  string   `toml:"interface"`
@@ -765,7 +774,13 @@ type AgentFabric struct {
 	// RelayPorts ("FROM-TO") are the UDP ports this node offers to relay
 	// other nodes' WireGuard datagrams when they reach each other on no
 	// direct path (a node with a public endpoint; "": it relays none).
-	RelayPorts string   `toml:"relay_ports"`
+	RelayPorts string `toml:"relay_ports"`
+	// Routing (default true) runs FRR on the node and carries segments
+	// (issue #47 phase 2); Names prefixes the segments' devices (default
+	// "kf": kfb10000, kfv10000; another installation on the same host needs
+	// its own).
+	Routing    *bool    `toml:"routing"`
+	Names      string   `toml:"names"`
 	Interface  string   `toml:"interface"`
 	ListenPort int      `toml:"listen_port"`
 	KeyFile    string   `toml:"key_file"`
@@ -786,3 +801,20 @@ func ParseRelayPorts(s string) (int, int, error) {
 	}
 	return a, b, nil
 }
+
+// validFabricNames: a segment's devices are named NAMES + "b"/"v" + its VNI
+// (up to 8 digits), within an interface name's 15 characters.
+func validFabricNames(n string) bool {
+	if len(n) < 1 || len(n) > 5 || n[0] < 'a' || n[0] > 'z' {
+		return false
+	}
+	for _, c := range n {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// FabricRouting says whether an agent on the fabric runs FRR (default yes).
+func (f AgentFabric) FabricRouting() bool { return f.Routing == nil || *f.Routing }

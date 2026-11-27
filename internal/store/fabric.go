@@ -43,6 +43,9 @@ type FabricSelf struct {
 	// public endpoint.
 	RelayFrom int `json:"relay_from,omitempty"`
 	RelayTo   int `json:"relay_to,omitempty"`
+	// Routing: this node runs FRR (an agent's: fabric_segments.go), so it
+	// may be a route reflector and carries segments.
+	Routing bool `json:"routing,omitempty"`
 }
 
 // FabricNode is a node on the fabric.
@@ -79,6 +82,10 @@ type FabricView struct {
 	Peers   []FabricNode `json:"peers"`
 	// Relays are the pairs this node relays.
 	Relays []FabricRelay `json:"relays,omitempty"`
+	// Routing is how this node's FRR runs (nil: it runs none), and
+	// Segments are the segments it is on (fabric_segments.go).
+	Routing  *FabricRouting  `json:"routing,omitempty"`
+	Segments []FabricSegment `json:"segments,omitempty"`
 }
 
 // ParseFabricPrefix checks a fabric prefix: an IPv4 network of at least 4
@@ -123,7 +130,9 @@ func checkFabricSelf(self FabricSelf) error {
 // SyncFabric records what node says of itself on the fabric (its address
 // given the first time, from prefix: the lowest free host address) and
 // tells it where it is and who its peers are.
-func (s *Store) SyncFabric(ctx context.Context, nodeID, prefix string, self FabricSelf) (FabricView, error) {
+func (s *Store) SyncFabric(ctx context.Context, nodeID string, plan FabricPlan, self FabricSelf) (FabricView, error) {
+	plan = plan.withDefaults()
+	prefix := plan.Prefix
 	p, err := ParseFabricPrefix(prefix)
 	if err != nil {
 		return FabricView{}, err
@@ -155,8 +164,8 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID, prefix string, self Fabr
 		if address, err = freeFabricAddressTx(ctx, tx, p); err != nil {
 			return FabricView{}, err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO fabric_nodes(node_id,address,public_key,listen_port,endpoints_json,probe_port,relay_from,relay_to,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-			nodeID, address, self.PublicKey, self.ListenPort, string(endpoints), nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo), t, t); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO fabric_nodes(node_id,address,public_key,listen_port,endpoints_json,probe_port,relay_from,relay_to,routing,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+			nodeID, address, self.PublicKey, self.ListenPort, string(endpoints), nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo), self.Routing, t, t); err != nil {
 			return FabricView{}, err
 		}
 		if err := appendCoordinationEventTx(ctx, tx, "fabric_joined", nil, "node", nodeID, nil, map[string]any{"address": address}); err != nil {
@@ -180,10 +189,10 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID, prefix string, self Fabr
 				return FabricView{}, err
 			}
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE fabric_nodes SET public_key=$1,listen_port=$2,endpoints_json=$3,probe_port=$6,relay_from=$7,relay_to=$8,updated_at=$4 WHERE node_id=$5
+		if _, err := tx.ExecContext(ctx, `UPDATE fabric_nodes SET public_key=$1,listen_port=$2,endpoints_json=$3,probe_port=$6,relay_from=$7,relay_to=$8,routing=$9,updated_at=$4 WHERE node_id=$5
 			AND (public_key IS DISTINCT FROM $1 OR listen_port IS DISTINCT FROM $2 OR endpoints_json<>$3 OR probe_port IS DISTINCT FROM $6
-			OR relay_from IS DISTINCT FROM $7 OR relay_to IS DISTINCT FROM $8)`,
-			self.PublicKey, self.ListenPort, string(endpoints), t, nodeID, nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo)); err != nil {
+			OR relay_from IS DISTINCT FROM $7 OR relay_to IS DISTINCT FROM $8 OR routing<>$9)`,
+			self.PublicKey, self.ListenPort, string(endpoints), t, nodeID, nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo), self.Routing); err != nil {
 			return FabricView{}, err
 		}
 	}
@@ -207,6 +216,14 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID, prefix string, self Fabr
 	}
 	if view.Relays, err = relaysOfTx(ctx, tx, nodeID); err != nil {
 		return FabricView{}, err
+	}
+	if view.Routing, err = routingTx(ctx, tx, nodeID, plan); err != nil {
+		return FabricView{}, err
+	}
+	if view.Routing != nil {
+		if view.Segments, err = segmentsOfTx(ctx, tx, nodeID); err != nil {
+			return FabricView{}, err
+		}
 	}
 	return view, tx.Commit()
 }

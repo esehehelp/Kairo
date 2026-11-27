@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"io"
+
+	"kairo/internal/store"
 )
 
 // errUnsupported: the fabric's interface is made on Linux only for now
@@ -27,3 +29,10 @@ func (noLink) removePeer(context.Context, string, string) error              { r
 
 // LinkCommand: the fabric-link command is Linux's (linkcmd_linux.go).
 func LinkCommand(context.Context, []string, io.Writer) error { return errUnsupported }
+
+func (noLink) segments(context.Context, string) ([]int, error) { return nil, errUnsupported }
+func (noLink) ensureSegment(context.Context, string, store.FabricSegment, string, int) error {
+	return errUnsupported
+}
+func (noLink) removeSegment(context.Context, string, int) error { return errUnsupported }
+func (noLink) router(string, string) router                     { return nil }

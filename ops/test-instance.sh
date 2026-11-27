@@ -219,7 +219,7 @@ listen = "0.0.0.0:7485"
 $(if [ -z "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then echo "addr = \"$addr:7485\""; fi)
 cert_file = "/etc/kairo-test/pack-host.pem"
 key_file = "/etc/kairo-test/pack-host-key.pem"
-$(if [ -n "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then printf '\n[fabric]\nenabled = true\ninterface = "kairo-t0"\nlisten_port = %s\nkey_file = "/etc/kairo-test/fabric.key"\nendpoints = ["%s:%s"]\n' "${KAIRO_TEST_FABRIC_PORT:-51821}" "$addr" "${KAIRO_TEST_FABRIC_PORT:-51821}"; fi)
+$(if [ -n "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then printf '\n[fabric]\nenabled = true\ninterface = "kairo-t0"\nnames = "tf"\nlisten_port = %s\nkey_file = "/etc/kairo-test/fabric.key"\nendpoints = ["%s:%s"]\n' "${KAIRO_TEST_FABRIC_PORT:-51821}" "$addr" "${KAIRO_TEST_FABRIC_PORT:-51821}"; fi)
 $(if [ -n "$bootstrap_url" ]; then printf 'bootstrap_url = "%s"\n' "$bootstrap_url"; fi)
 
 [[executors]]
@@ -304,7 +304,7 @@ listen = ":7486"
 addr = "$lan:7486"
 cert_file = "$(w "$conf/pack.pem")"
 key_file = "$(w "$conf/pack-key.pem")"
-$(if [ -n "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then printf '\n[fabric]\nenabled = true\ninterface = "kairo-t0"\nlisten_port = %s\nkey_file = "%s"\nendpoints = []\n' "${KAIRO_TEST_FABRIC_PORT:-51821}" "$(w "$conf/fabric.key")"; fi)
+$(if [ -n "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then printf '\n[fabric]\nenabled = true\ninterface = "kairo-t0"\nnames = "tf"\nlisten_port = %s\nkey_file = "%s"\nendpoints = []\n' "${KAIRO_TEST_FABRIC_PORT:-51821}" "$(w "$conf/fabric.key")"; fi)
 
 [[executors]]
 id = "$test_node-wslc"

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"text/tabwriter"
@@ -40,15 +41,94 @@ func fabricList(args []string) error {
 		return err
 	}
 	var body struct {
-		Prefix string             `json:"prefix"`
-		Nodes  []store.FabricNode `json:"nodes"`
-		Links  []store.FabricLink `json:"links"`
+		Prefix   string                `json:"prefix"`
+		Nodes    []store.FabricNode    `json:"nodes"`
+		Links    []store.FabricLink    `json:"links"`
+		Segments []store.FabricSegment `json:"segments"`
 	}
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return fmt.Errorf("decode the fabric: %w", err)
 	}
 	fmt.Print(formatFabric(body.Prefix, body.Nodes))
 	fmt.Print(formatFabricLinks(body.Links))
+	fmt.Print(formatFabricSegments(body.Segments))
+	return nil
+}
+
+// formatFabricSegments is a line a segment: its VNI, subnet, MTU and nodes.
+func formatFabricSegments(segments []store.FabricSegment) string {
+	if len(segments) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\nsegments:\n")
+	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "VNI\tSUBNET\tMTU\tPURPOSE\tNODES\tCREATED")
+	for _, s := range segments {
+		fmt.Fprintf(w, "%d\t%s\t%d\t%s\t%s\t%s\n", s.VNI, s.Subnet, s.MTU, s.Purpose, strings.Join(s.Nodes, ","), shortStamp(&s.Created))
+	}
+	w.Flush()
+	return b.String()
+}
+
+// fabricSegmentAdd: kairo fabric segment-add NODE... [--mtu N] [--json]: a
+// segment made by hand on those nodes (gangs get their own).
+func fabricSegmentAdd(args []string) error {
+	fs := newFlags("fabric segment-add")
+	api := apiFlag(fs)
+	mtu := fs.Int("mtu", 0, "the segment's MTU (default 1370: the fabric's less VXLAN's)")
+	asJSON := fs.Bool("json", false, "print the daemon's response")
+	nodes, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(nodes) == 0 {
+		return usageError("fabric segment-add needs the nodes it is on")
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	payload, err := client.call(http.MethodPost, "/api/fabric/segments", map[string]any{"nodes": nodes, "mtu": *mtu})
+	if routeMissing(err) {
+		return fmt.Errorf("the daemon does not make segments: %s", olderDaemonHint())
+	}
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		_, err = os.Stdout.Write(payload)
+		return err
+	}
+	var seg store.FabricSegment
+	if err := json.Unmarshal(payload, &seg); err != nil {
+		return fmt.Errorf("decode the segment: %w", err)
+	}
+	fmt.Printf("segment %d: %s, MTU %d, on %s\n", seg.VNI, seg.Subnet, seg.MTU, strings.Join(seg.Nodes, ", "))
+	return nil
+}
+
+// fabricSegmentRemove: kairo fabric segment-remove VNI...
+func fabricSegmentRemove(args []string) error {
+	fs := newFlags("fabric segment-remove")
+	api := apiFlag(fs)
+	vnis, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(vnis) == 0 {
+		return usageError("fabric segment-remove needs VNIs")
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	for _, vni := range vnis {
+		if _, err := client.call(http.MethodDelete, "/api/fabric/segments/"+url.PathEscape(vni), nil); err != nil {
+			return err
+		}
+		fmt.Printf("segment %s removed\n", vni)
+	}
 	return nil
 }
 

@@ -58,6 +58,13 @@ type Manager struct {
 	// RelayFrom and RelayTo are the UDP ports this node offers to relay
 	// other nodes' datagrams (0: none; relay.go).
 	RelayFrom, RelayTo int
+	// Routing: this node runs FRR and carries segments (an agent's:
+	// segments.go). NodeID names it to FRR, Names prefixes its segments'
+	// devices ("": DefaultNames) and RouterName is FRR's container.
+	Routing    bool
+	NodeID     string
+	Names      string
+	RouterName string
 	// Sync says what this node is and returns its address and peers.
 	Sync func(ctx context.Context, self store.FabricSelf) (store.FabricView, error)
 	// Report says how this node sees its links (nil: not said).
@@ -76,6 +83,7 @@ type Manager struct {
 	received []store.FabricReceived
 	reported time.Time
 	relays   relays
+	router   router // FRR (segments.go), made the first time it is needed
 }
 
 // peerState is which of a peer's endpoints is tried, since when.
@@ -102,6 +110,15 @@ type link interface {
 	// leaves the one it has: none, or where WireGuard last heard it from).
 	setPeer(ctx context.Context, name, publicKey, address, endpoint string) error
 	removePeer(ctx context.Context, name, publicKey string) error
+	// segments are the VNIs of the segments made here (their devices named
+	// with names); ensureSegment makes one (its VXLAN from local, on port),
+	// removeSegment takes one down.
+	segments(ctx context.Context, names string) ([]int, error)
+	ensureSegment(ctx context.Context, names string, seg store.FabricSegment, local string, port int) error
+	removeSegment(ctx context.Context, names string, vni int) error
+	// router is FRR named name, its files beside keyFile where it keeps
+	// them there.
+	router(name, keyFile string) router
 }
 
 func (m *Manager) now() time.Time {
@@ -199,7 +216,7 @@ func (m *Manager) Once(ctx context.Context) error {
 		m.public = public
 	}
 	view, err := m.Sync(ctx, store.FabricSelf{PublicKey: m.public, ListenPort: m.ListenPort, Endpoints: m.Endpoints, ProbePort: m.ProbePort,
-		RelayFrom: m.RelayFrom, RelayTo: m.RelayTo})
+		RelayFrom: m.RelayFrom, RelayTo: m.RelayTo, Routing: m.Routing})
 	if err != nil {
 		return fmt.Errorf("fabric: %w", err)
 	}
@@ -244,6 +261,11 @@ func (m *Manager) apply(ctx context.Context, view store.FabricView) error {
 	}
 	m.relays.mu.Unlock()
 	m.relays.set(view.Relays, m.logger().Info)
+	// the segments and FRR come after WireGuard: a failure there leaves the
+	// node on the fabric, and is tried again at the next sync
+	if err := m.applyRouting(ctx, view); err != nil {
+		m.logger().Warn("fabric routing not applied", "error", err)
+	}
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -26,16 +27,16 @@ func TestANodesFabricAddressIsGivenOnceAndKept(t *testing.T) {
 		}
 	}
 	const prefix = "10.209.0.0/16"
-	a, err := store.SyncFabric(ctx, "a", prefix, FabricSelf{PublicKey: fabricKey('a'), ListenPort: 51820, Endpoints: []string{"192.0.2.1:51820"}})
+	a, err := store.SyncFabric(ctx, "a", FabricPlan{Prefix: prefix}, FabricSelf{PublicKey: fabricKey('a'), ListenPort: 51820, Endpoints: []string{"192.0.2.1:51820"}})
 	if err != nil || a.Address != "10.209.0.1" || a.Prefix != prefix || len(a.Peers) != 0 {
 		t.Fatalf("a: %+v %v", a, err)
 	}
-	b, err := store.SyncFabric(ctx, "b", prefix, FabricSelf{PublicKey: fabricKey('b'), ListenPort: 51820, Endpoints: []string{"192.0.2.2:51820", "203.0.113.2:51820"}})
+	b, err := store.SyncFabric(ctx, "b", FabricPlan{Prefix: prefix}, FabricSelf{PublicKey: fabricKey('b'), ListenPort: 51820, Endpoints: []string{"192.0.2.2:51820", "203.0.113.2:51820"}})
 	if err != nil || b.Address != "10.209.0.2" || len(b.Peers) != 1 || b.Peers[0].NodeID != "a" || b.Peers[0].Address != "10.209.0.1" {
 		t.Fatalf("b: %+v %v", b, err)
 	}
 	// a says it is elsewhere now: same address, b's endpoints in its view
-	a, err = store.SyncFabric(ctx, "a", prefix, FabricSelf{PublicKey: fabricKey('a'), ListenPort: 51821, Endpoints: []string{"198.51.100.1:51821"}})
+	a, err = store.SyncFabric(ctx, "a", FabricPlan{Prefix: prefix}, FabricSelf{PublicKey: fabricKey('a'), ListenPort: 51821, Endpoints: []string{"198.51.100.1:51821"}})
 	if err != nil || a.Address != "10.209.0.1" || len(a.Peers) != 1 || len(a.Peers[0].Endpoints) != 2 {
 		t.Fatalf("a again: %+v %v", a, err)
 	}
@@ -48,11 +49,11 @@ func TestANodesFabricAddressIsGivenOnceAndKept(t *testing.T) {
 		{PublicKey: fabricKey('a'), ListenPort: 0},
 		{PublicKey: fabricKey('a'), ListenPort: 51820, Endpoints: []string{"no-port"}},
 	} {
-		if _, err := store.SyncFabric(ctx, "a", prefix, bad); !errors.Is(err, ErrFabric) {
+		if _, err := store.SyncFabric(ctx, "a", FabricPlan{Prefix: prefix}, bad); !errors.Is(err, ErrFabric) {
 			t.Fatalf("%+v: %v", bad, err)
 		}
 	}
-	if _, err := store.SyncFabric(ctx, "a", "10.210.0.0/16", FabricSelf{PublicKey: fabricKey('a'), ListenPort: 51820}); !errors.Is(err, ErrFabric) {
+	if _, err := store.SyncFabric(ctx, "a", FabricPlan{Prefix: "10.210.0.0/16"}, FabricSelf{PublicKey: fabricKey('a'), ListenPort: 51820}); !errors.Is(err, ErrFabric) {
 		t.Fatalf("a prefix without a's address: %v", err)
 	}
 	if _, err := ParseFabricPrefix("10.209.0.1/16"); err == nil {
@@ -71,7 +72,7 @@ func TestDirectedLinksAreMeasuredByTransfersAndForgottenWithTheirPath(t *testing
 		if err := store.UpsertNode(ctx, Node{ID: id, Name: id, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.SyncFabric(ctx, id, "10.209.0.0/16", FabricSelf{PublicKey: fabricKey(id[0]), ListenPort: 51820, ProbePort: 7475}); err != nil {
+		if _, err := store.SyncFabric(ctx, id, FabricPlan{Prefix: "10.209.0.0/16"}, FabricSelf{PublicKey: fabricKey(id[0]), ListenPort: 51820, ProbePort: 7475}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -124,7 +125,7 @@ func TestAPairWithNoPathIsGivenARelay(t *testing.T) {
 		if err := store.UpsertNode(ctx, Node{ID: id, Name: id, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.SyncFabric(ctx, id, prefix, selves[id]); err != nil {
+		if _, err := store.SyncFabric(ctx, id, FabricPlan{Prefix: prefix}, selves[id]); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -144,7 +145,7 @@ func TestAPairWithNoPathIsGivenARelay(t *testing.T) {
 	}
 	view := func(node string) FabricView {
 		t.Helper()
-		v, err := store.SyncFabric(ctx, node, prefix, selves[node])
+		v, err := store.SyncFabric(ctx, node, FabricPlan{Prefix: prefix}, selves[node])
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -180,5 +181,104 @@ func TestAPairWithNoPathIsGivenARelay(t *testing.T) {
 	}
 	if r = view("r"); len(r.Relays) != 0 {
 		t.Fatalf("r still relays: %+v", r.Relays)
+	}
+}
+
+// A node that runs FRR is told the fabric's ASN, VXLAN port and route
+// reflectors: the first nodes that run FRR and report their links, those
+// with endpoints first; a node that runs none is told no routing. Segments
+// are made on nodes that run FRR, each its own VNI and /24, and each node is
+// told the ones it is on.
+func TestRoutingNodesAreToldTheReflectorsAndTheirSegments(t *testing.T) {
+	store := openCoordinationStore(t)
+	ctx := context.Background()
+	plan := FabricPlan{Prefix: "10.209.0.0/16", VXLANPort: 4790}
+	selves := map[string]FabricSelf{
+		"a": {PublicKey: fabricKey('a'), ListenPort: 51820, Endpoints: []string{"192.0.2.1:51820"}, Routing: true},
+		"b": {PublicKey: fabricKey('b'), ListenPort: 51820, Routing: true},
+		"c": {PublicKey: fabricKey('c'), ListenPort: 51820, Routing: true},
+		"d": {PublicKey: fabricKey('d'), ListenPort: 51820, Endpoints: []string{"192.0.2.4:51820"}},
+	}
+	ids := []string{"a", "b", "c", "d"}
+	for _, id := range ids {
+		if err := store.UpsertNode(ctx, Node{ID: id, Name: id, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.SyncFabric(ctx, id, plan, selves[id]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view := func(id string) FabricView {
+		t.Helper()
+		v, err := store.SyncFabric(ctx, id, plan, selves[id])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	address := map[string]string{}
+	for _, id := range ids {
+		address[id] = view(id).Address
+	}
+	// no node reported yet: no reflector
+	if r := view("b").Routing; r == nil || len(r.Reflectors) != 0 || r.ASN != DefaultFabricASN || r.VXLANPort != 4790 {
+		t.Fatalf("before any report: %+v", r)
+	}
+	for _, id := range ids {
+		var peers []FabricPeerSeen
+		for _, other := range ids {
+			if other != id {
+				peers = append(peers, FabricPeerSeen{Node: other, Path: FabricPathDirect})
+			}
+		}
+		if err := store.RecordFabricLinks(ctx, id, FabricLinksReport{Peers: peers}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, c := view("b"), view("c")
+	if r := b.Routing; r == nil || !r.Reflector || !slices.Equal(r.Reflectors, []string{address["a"], address["b"]}) {
+		t.Fatalf("b's routing: %+v", r)
+	}
+	if r := c.Routing; r == nil || r.Reflector || !slices.Equal(r.Reflectors, []string{address["a"], address["b"]}) {
+		t.Fatalf("c's routing: %+v", r)
+	}
+	if view("d").Routing != nil {
+		t.Fatal("a node without FRR was told routing")
+	}
+	// segments
+	if _, err := store.CreateFabricSegment(ctx, "10.210.0.0/16", []string{"b", "d"}, 0); !errors.Is(err, ErrFabric) {
+		t.Fatalf("a segment on a node without FRR: %v", err)
+	}
+	s1, err := store.CreateFabricSegment(ctx, "10.210.0.0/16", []string{"c", "b"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := store.CreateFabricSegment(ctx, "10.210.0.0/16", []string{"c"}, 1400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s1.VNI != 10000 || s1.Subnet != "10.210.0.0/24" || s1.MTU != DefaultSegmentMTU || s2.VNI != 10001 || s2.Subnet != "10.210.1.0/24" || s2.MTU != 1400 {
+		t.Fatalf("segments %+v %+v", s1, s2)
+	}
+	if segs := view("c").Segments; len(segs) != 2 || segs[0].VNI != 10000 || segs[1].VNI != 10001 {
+		t.Fatalf("c's segments: %+v", segs)
+	}
+	if segs := view("a").Segments; len(segs) != 0 {
+		t.Fatalf("a's segments: %+v", segs)
+	}
+	if err := store.DeleteFabricSegment(ctx, 10000); err != nil {
+		t.Fatal(err)
+	}
+	if segs := view("b").Segments; len(segs) != 0 {
+		t.Fatalf("b's segments after the removal: %+v", segs)
+	}
+	listed, err := store.FabricSegments(ctx)
+	if err != nil || len(listed) != 1 || listed[0].VNI != 10001 || !slices.Equal(listed[0].Nodes, []string{"c"}) {
+		t.Fatalf("listed %+v %v", listed, err)
+	}
+	// the freed VNI and subnet are given again
+	s3, err := store.CreateFabricSegment(ctx, "10.210.0.0/16", []string{"b"}, 0)
+	if err != nil || s3.VNI != 10000 || s3.Subnet != "10.210.0.0/24" {
+		t.Fatalf("again: %+v %v", s3, err)
 	}
 }

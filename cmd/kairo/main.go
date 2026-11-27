@@ -147,7 +147,7 @@ func serve(args []string) error {
 		}
 		fab := &fabric.Manager{Interface: iface, ListenPort: port, KeyFile: keyFile, Endpoints: f.Endpoints, Logger: logger,
 			Sync: func(ctx context.Context, self store.FabricSelf) (store.FabricView, error) {
-				return st.SyncFabric(ctx, daemonConfig.Node.ID, f.Prefix, self)
+				return st.SyncFabric(ctx, daemonConfig.Node.ID, store.FabricPlan{Prefix: f.Prefix, ASN: f.ASN, VXLANPort: f.VXLANPort}, self)
 			},
 			Report: func(ctx context.Context, report store.FabricLinksReport) error {
 				return st.RecordFabricLinks(ctx, daemonConfig.Node.ID, report)
@@ -181,7 +181,8 @@ func serve(args []string) error {
 		}
 	}
 	handler := (&api.Server{Store: st, ObserveOnly: daemonConfig.ObserveOnly, LogDirectory: daemonConfig.LogDirectory, SourceDirectory: daemonConfig.SourceDirectory, Logger: logger,
-		FabricPrefix: daemonConfig.Fabric.Prefix,
+		FabricPrefix: daemonConfig.Fabric.Prefix, FabricASN: daemonConfig.Fabric.ASN, FabricVXLANPort: daemonConfig.Fabric.VXLANPort,
+		FabricSegmentPrefix: daemonConfig.Fabric.SegmentPrefix,
 		DumpDatabase: func(ctx context.Context, w io.Writer) error { return pgDumpTo(ctx, pgDump, dsn, w) }, ControlFiles: controlFiles}).Handler()
 	server := &http.Server{
 		Addr:              daemonConfig.Listen,

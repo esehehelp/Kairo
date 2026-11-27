@@ -2,9 +2,11 @@ package fabric
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,6 +18,8 @@ type fakeLink struct {
 	address    string
 	handshakes map[string]time.Time
 	endpoints  map[string]string
+	segs       map[int]string // VNI: "local:port mtu M"
+	frr        fakeRouter
 }
 
 func (f *fakeLink) ensure(_ context.Context, _, address string, _ int, _ string, _ int) error {
@@ -42,6 +46,49 @@ func (f *fakeLink) removePeer(_ context.Context, _, key string) error {
 	delete(f.endpoints, key)
 	return nil
 }
+
+func (f *fakeLink) segments(context.Context, string) ([]int, error) {
+	var out []int
+	for vni := range f.segs {
+		out = append(out, vni)
+	}
+	return out, nil
+}
+
+func (f *fakeLink) ensureSegment(_ context.Context, _ string, seg store.FabricSegment, local string, port int) error {
+	if f.segs == nil {
+		f.segs = map[int]string{}
+	}
+	f.segs[seg.VNI] = fmt.Sprintf("%s:%d mtu %d", local, port, seg.MTU)
+	return nil
+}
+
+func (f *fakeLink) removeSegment(_ context.Context, _ string, vni int) error {
+	delete(f.segs, vni)
+	return nil
+}
+
+func (f *fakeLink) router(string, string) router { return &f.frr }
+
+// fakeRouter keeps the files FRR was last given.
+type fakeRouter struct {
+	files   map[string]string
+	applied int
+	removed bool
+}
+
+func (r *fakeRouter) apply(_ context.Context, files map[string]string) error {
+	r.files, r.removed = files, false
+	r.applied++
+	return nil
+}
+
+func (r *fakeRouter) remove(context.Context) error {
+	r.files, r.removed = nil, true
+	return nil
+}
+
+func (r *fakeRouter) show(context.Context, string) ([]byte, error) { return nil, nil }
 
 // A node's key is made once and kept (its public key the same at every
 // start), its address kept beside it. A peer is put at its first endpoint;
@@ -181,5 +228,74 @@ func TestLinksAreSaidWithWhatWasReceived(t *testing.T) {
 	// said once
 	if err := m.report(context.Background()); err != nil || len(said[1].Received) != 0 {
 		t.Fatalf("again: %+v %v", said, err)
+	}
+}
+
+// A node that routes is given its segments (each a VXLAN from its fabric
+// address on the fabric's VXLAN port) and FRR's files: iBGP in the fabric's
+// ASN to the reflectors over the fabric, EVPN for every local VNI; a
+// reflector listens to the whole fabric. A segment no longer its is taken
+// down; a node told it routes no more has FRR taken away.
+func TestARoutingNodeIsGivenItsSegmentsAndFRR(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "fabric.key")
+	routing := &store.FabricRouting{ASN: 4200000000, VXLANPort: 4790, Reflectors: []string{"10.209.0.1", "10.209.0.2"}}
+	view := store.FabricView{Address: "10.209.0.4", Prefix: "10.209.0.0/16", Peers: []store.FabricNode{},
+		Routing:  routing,
+		Segments: []store.FabricSegment{{VNI: 10000, Subnet: "10.210.0.0/24", MTU: 1370}, {VNI: 10001, Subnet: "10.210.1.0/24", MTU: 1370}}}
+	var said store.FabricSelf
+	link := &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}}
+	m := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: link, Routing: true, NodeID: "w", RouterName: "kairo-frr",
+		Sync: func(_ context.Context, self store.FabricSelf) (store.FabricView, error) {
+			said = self
+			return view, nil
+		}}
+	ctx := context.Background()
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !said.Routing {
+		t.Fatal("the node did not say it routes")
+	}
+	if link.segs[10000] != "10.209.0.4:4790 mtu 1370" || len(link.segs) != 2 {
+		t.Fatalf("segments %v", link.segs)
+	}
+	conf := link.frr.files["frr.conf"]
+	for _, want := range []string{"router bgp 4200000000\n", " bgp router-id 10.209.0.4\n", " neighbor 10.209.0.1 peer-group fabric\n",
+		" neighbor 10.209.0.2 peer-group fabric\n", " neighbor fabric update-source 10.209.0.4\n", "  advertise-all-vni\n", " neighbor fabric bfd\n"} {
+		if !strings.Contains(conf, want) {
+			t.Fatalf("frr.conf lacks %q:\n%s", want, conf)
+		}
+	}
+	if strings.Contains(conf, "listen range") || strings.Contains(conf, "route-reflector-client") {
+		t.Fatalf("a client listens or reflects:\n%s", conf)
+	}
+	if !strings.Contains(link.frr.files["daemons"], "-l 10.209.0.4") {
+		t.Fatalf("bgpd listens beyond the fabric address:\n%s", link.frr.files["daemons"])
+	}
+	// it becomes a reflector; segment 10001 is no longer its
+	routing.Reflector, routing.Reflectors = true, []string{"10.209.0.1", "10.209.0.4"}
+	view.Segments = view.Segments[:1]
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	conf = link.frr.files["frr.conf"]
+	if _, on := link.segs[10001]; on || len(link.segs) != 1 {
+		t.Fatalf("segments %v", link.segs)
+	}
+	for _, want := range []string{" bgp listen range 10.209.0.0/16 peer-group fabric\n", "  neighbor fabric route-reflector-client\n", " neighbor 10.209.0.1 peer-group fabric\n"} {
+		if !strings.Contains(conf, want) {
+			t.Fatalf("a reflector's frr.conf lacks %q:\n%s", want, conf)
+		}
+	}
+	if strings.Contains(conf, "neighbor 10.209.0.4 ") {
+		t.Fatalf("a reflector names itself:\n%s", conf)
+	}
+	// it routes no more
+	view.Routing = nil
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if !link.frr.removed {
+		t.Fatal("FRR kept on a node that routes no more")
 	}
 }

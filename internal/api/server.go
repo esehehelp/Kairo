@@ -32,8 +32,13 @@ type Server struct {
 	Store       *store.Store
 	ObserveOnly bool
 	// FabricPrefix is the fabric's network (the daemon's [fabric] prefix;
-	// "": no fabric).
-	FabricPrefix string
+	// "": no fabric), FabricASN and FabricVXLANPort how its routing runs
+	// (0: the defaults), FabricSegmentPrefix where segments' subnets are
+	// taken from ("": no segments).
+	FabricPrefix        string
+	FabricASN           uint32
+	FabricVXLANPort     int
+	FabricSegmentPrefix string
 	// LogDirectory receives attempt logs shipped by node agents.
 	LogDirectory string
 	// SourceDirectory keeps code snapshots (sources.go; "": none kept).

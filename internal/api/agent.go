@@ -476,7 +476,7 @@ func (s *Server) agentOps() []agentOp {
 				if s.FabricPrefix == "" {
 					return store.FabricView{}, fmt.Errorf("%w: the daemon has no [fabric] prefix", store.ErrFabric)
 				}
-				return s.Store.SyncFabric(ctx, b.NodeID, s.FabricPrefix, b.FabricSelf)
+				return s.Store.SyncFabric(ctx, b.NodeID, store.FabricPlan{Prefix: s.FabricPrefix, ASN: s.FabricASN, VXLANPort: s.FabricVXLANPort}, b.FabricSelf)
 			}),
 		handle(s, agentops.FabricLinksSaid,
 			func(_ context.Context, b agentops.FabricLinksRequest) (string, error) { return b.NodeID, nil },
