@@ -135,7 +135,13 @@ func serve(args []string) error {
 	} else {
 		controlFiles = append([]string{*configPath}, controlFiles...)
 	}
+	if daemonConfig.Fabric.Prefix != "" {
+		if _, err := store.ParseFabricPrefix(daemonConfig.Fabric.Prefix); err != nil {
+			return err
+		}
+	}
 	handler := (&api.Server{Store: st, ObserveOnly: daemonConfig.ObserveOnly, LogDirectory: daemonConfig.LogDirectory, SourceDirectory: daemonConfig.SourceDirectory, Logger: logger,
+		FabricPrefix: daemonConfig.Fabric.Prefix,
 		DumpDatabase: func(ctx context.Context, w io.Writer) error { return pgDumpTo(ctx, pgDump, dsn, w) }, ControlFiles: controlFiles}).Handler()
 	server := &http.Server{
 		Addr:              daemonConfig.Listen,

@@ -483,6 +483,9 @@ var (
 	ForceStopAcked       = Op[ForceStopAck, OK]{Name: "force-stop-ack", Observe: Refused}
 	AttemptUsed          = Op[AttemptUsage, OK]{Name: "attempt-usage", Observe: Allowed}
 	AttemptStreamsSaid   = Op[AttemptStreams, OK]{Name: "attempt-streams", Observe: Allowed}
+	// FabricSync: a node says what it is on the fabric and is told its
+	// address and peers (store/fabric.go).
+	FabricSync = Op[FabricSyncRequest, store.FabricView]{Name: "fabric", Observe: Allowed}
 )
 
 // The operations of device controllers, for the controller's own node.
@@ -509,6 +512,12 @@ var All = []Named{
 	DeletionsToMake, SettleDeletion, SourcesInUse, EvictionsToMake, SettleEviction, ScrubsToMake, RecordScrub,
 	PackRead, NetBenches, NetBenchStatus, NetBenchStart, NetBenchPoints, NetBenchKind, NetBenchFinish, NetBenchAuthorize, UnlaunchedLeases, ValidateReservation, MarkLeasePrepared, ReleaseReservation, AuthorizeLaunch,
 	ActivateLaunch, SetLogPaths, LogProblem, MarkProcessExited, RecordTerminal, QuiescenceCandidates,
-	FinalizeQuiescence, QuarantineTerms, QuarantineTerminated, ForceStopOrders, ForceStopAcked, AttemptUsed, AttemptStreamsSaid,
+	FinalizeQuiescence, QuarantineTerms, QuarantineTerminated, ForceStopOrders, ForceStopAcked, AttemptUsed, AttemptStreamsSaid, FabricSync,
 	ControllerRegister, DeviceSettings, DeviceReport, TrimsToMake, RecordTrim, DeviceSamples,
+}
+
+// FabricSyncRequest is what a node says of itself on the fabric.
+type FabricSyncRequest struct {
+	NodeID string `json:"node_id"`
+	store.FabricSelf
 }

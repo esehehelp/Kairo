@@ -219,6 +219,12 @@ func init() {
 			},
 			aliases: map[string]string{"show": "status", "ls": "status", "list": "status", "get": "status"},
 		}},
+		{name: "fabric", summary: "the network every node is on (issue #47): its prefix, and each node's address, key and endpoints", group: &commandGroup{
+			subs: []command{
+				{"list", "[--json]", "the fabric's prefix and its nodes: address, public key, port, endpoints", fabricList},
+			},
+			aliases: map[string]string{"ls": "list", "show": "list", "status": "list"},
+		}},
 		{name: "data", summary: "what Kairo keeps: packed outputs, kept scratch and imported directories, and their durable copies", group: &commandGroup{
 			note: "An import packs directories of a node (outside every store) onto its volatile store and copies them to a durable store; with --delete-source each is deleted once its copy is verified.",
 			subs: []command{

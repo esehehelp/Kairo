@@ -31,6 +31,9 @@ const APIVersion = 1
 type Server struct {
 	Store       *store.Store
 	ObserveOnly bool
+	// FabricPrefix is the fabric's network (the daemon's [fabric] prefix;
+	// "": no fabric).
+	FabricPrefix string
 	// LogDirectory receives attempt logs shipped by node agents.
 	LogDirectory string
 	// SourceDirectory keeps code snapshots (sources.go; "": none kept).
@@ -94,6 +97,7 @@ var errorCodes = []struct {
 	{"raw_evicting", http.StatusConflict, store.ErrRawEvicting},
 	{"stream_refused", http.StatusForbidden, store.ErrStreamReportRefused},
 	{"stream_positions", http.StatusConflict, store.ErrStreamPositions},
+	{"fabric", http.StatusConflict, store.ErrFabric},
 	{"gate_closed", http.StatusLocked, store.ErrGateClosed},
 	{"observe_only", http.StatusLocked, errObserveOnly},
 }

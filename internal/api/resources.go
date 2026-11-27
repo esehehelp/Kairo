@@ -124,3 +124,13 @@ func (s *Server) reconcileResource(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
+
+// fabricStatus is GET /api/fabric: the fabric's prefix and its nodes.
+func (s *Server) fabricStatus(w http.ResponseWriter, r *http.Request) {
+	nodes, err := s.Store.FabricNodes(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"prefix": s.FabricPrefix, "nodes": nodes})
+}

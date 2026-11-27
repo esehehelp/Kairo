@@ -28,6 +28,9 @@ type Config struct {
 	// SourceDirectory keeps the code snapshots kairo project apply sends
 	// (api/sources.go; default: sources beside log_directory).
 	SourceDirectory string `toml:"source_directory"`
+	// Fabric is the network every node is on (issue #47; store/fabric.go):
+	// without a prefix there is none.
+	Fabric DaemonFabric `toml:"fabric"`
 	// ControlSnapshotMinutes: how often the control plane is snapshotted
 	// into the durable store (README: Kairo keeps itself); 0: every 60,
 	// negative: never.
@@ -507,6 +510,8 @@ type Agent struct {
 	// for attempts (default kairo-): another installation's agent on the
 	// same host takes another (executor.ContainerPrefix).
 	ContainerPrefix string `toml:"container_prefix"`
+	// Fabric puts this node on the fabric (issue #47).
+	Fabric AgentFabric `toml:"fabric"`
 }
 
 // OwnerUse is an agent's [owner_use]: on unless disabled; a threshold left
@@ -560,6 +565,17 @@ func LoadAgent(path string) (Agent, error) {
 	for _, u := range []string{a.ServerURL, a.AttemptAPIURL} {
 		if err = checkNodeURL(u, a.InsecureHTTP); err != nil {
 			return a, err
+		}
+	}
+	if a.Fabric.Enabled {
+		if a.Fabric.Interface == "" {
+			a.Fabric.Interface = "kairo0"
+		}
+		if a.Fabric.ListenPort == 0 {
+			a.Fabric.ListenPort = 51820
+		}
+		if a.Fabric.KeyFile == "" {
+			a.Fabric.KeyFile = filepath.Join(filepath.Dir(path), "fabric.key")
 		}
 	}
 	if a.LogDirectory == "" {
@@ -699,4 +715,25 @@ func LoadController(path string) (Controller, error) {
 		c.StateFile = strings.TrimSuffix(path, filepath.Ext(path)) + ".state.json"
 	}
 	return c, nil
+}
+
+// DaemonFabric is the daemon's [fabric]: Prefix is the IPv4 network the
+// nodes' fabric addresses are given from (each node's once, for good).
+type DaemonFabric struct {
+	Prefix string `toml:"prefix"`
+}
+
+// AgentFabric is an agent's [fabric] (issue #47): when Enabled, the agent
+// puts its node on the fabric, a WireGuard interface (Interface, default
+// kairo0) listening on ListenPort (default 51820), with its key in KeyFile
+// (default fabric.key beside the agent's configuration; made the first
+// time), and says its peers may reach it at Endpoints ("host:port", in its
+// order of preference). Its transfer endpoint is then advertised at its
+// fabric address (pack_addr), unless [packs] addr says otherwise.
+type AgentFabric struct {
+	Enabled    bool     `toml:"enabled"`
+	Interface  string   `toml:"interface"`
+	ListenPort int      `toml:"listen_port"`
+	KeyFile    string   `toml:"key_file"`
+	Endpoints  []string `toml:"endpoints"`
 }

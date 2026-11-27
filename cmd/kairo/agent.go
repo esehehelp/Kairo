@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"kairo/internal/agentclient"
 	"kairo/internal/config"
 	"kairo/internal/executor"
+	"kairo/internal/fabric"
 	"kairo/internal/provider"
 	"kairo/internal/store"
 	"kairo/internal/tlsutil"
@@ -91,6 +93,28 @@ func agentCommand(args []string) error {
 		}
 		registered = append(registered, agentclient.Provider{ID: p.ID, Kind: p.Kind})
 	}
+	// The fabric (issue #47): the node's fixed address there, known from a
+	// run before (or from the daemon now, once the node is known to it),
+	// names its transfer endpoint unless [packs] addr says otherwise.
+	var fab *fabric.Manager
+	packAddr := cfg.Packs.Addr
+	if cfg.Fabric.Enabled {
+		fab = &fabric.Manager{Interface: cfg.Fabric.Interface, ListenPort: cfg.Fabric.ListenPort, KeyFile: cfg.Fabric.KeyFile, Endpoints: cfg.Fabric.Endpoints, Logger: logger,
+			Sync: func(ctx context.Context, self store.FabricSelf) (store.FabricView, error) {
+				return client.SyncFabric(ctx, cfg.Node.ID, self)
+			}}
+		address := fabric.KnownAddress(cfg.Fabric.KeyFile)
+		if err := fab.Once(ctx); err != nil {
+			logger.Warn("fabric not set up before registration (set up after it)", "error", err)
+		} else {
+			address = fab.Address()
+		}
+		if packAddr == "" && address != "" && cfg.Packs.Listen != "" {
+			if _, port, err := net.SplitHostPort(cfg.Packs.Listen); err == nil {
+				packAddr = net.JoinHostPort(address, port)
+			}
+		}
+	}
 	executors := make([]store.Executor, 0, len(cfg.Executors))
 	for _, e := range cfg.Executors {
 		labels, err := e.Attributes()
@@ -99,9 +123,9 @@ func agentCommand(args []string) error {
 		}
 		// Executors advertise this agent's pack server: other agents fetch
 		// from it the packs they make.
-		if cfg.Packs.Addr != "" {
+		if packAddr != "" {
 			if _, ok := labels["pack_addr"]; !ok {
-				labels["pack_addr"] = cfg.Packs.Addr
+				labels["pack_addr"] = packAddr
 			}
 		}
 		attrs, _ := json.Marshal(labels)
@@ -139,6 +163,11 @@ func agentCommand(args []string) error {
 		}
 	}
 	logger.Info("agent registered", "node_id", cfg.Node.ID, "server", cfg.ServerURL, "executors", len(executors))
+	if fab != nil {
+		// kept on the fabric from now on (its address, if given only now,
+		// names the transfer endpoint from the next start)
+		go fab.Run(ctx)
+	}
 
 	errCh := make(chan error, 2+len(cfg.Executors))
 	shipper := &agentclient.LogShipper{Client: client, Dir: cfg.LogDirectory}

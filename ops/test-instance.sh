@@ -5,6 +5,7 @@
 #   bash ops/test-instance.sh create          make the container (DHCP), PostgreSQL, the database, the TLS and config
 #   bash ops/test-instance.sh deploy SHA      put the build of SHA (ops/build.sh) in it and (re)start the daemon
 #   bash ops/test-instance.sh env             print the environment the CLI talks to the test daemon with
+#   bash ops/test-instance.sh config          push <kairo config>/test/kairo.toml (edited by hand) and restart the daemon
 #   bash ops/test-instance.sh agent NODE SHA  a test agent on NODE's host (a KAIRO_NODES node reached by ssh), beside
 #                                             its production agent: node NODE-t, service kairo-test-agent, /srv/kairo-test,
 #                                             transfer port 7485, containers kairo-t-*, CPU and RAM only (no GPU)
@@ -13,6 +14,8 @@
 #   KAIRO_TEST_VMID=N               the container's id
 #   KAIRO_TEST_TEMPLATE=STORAGE:vztmpl/debian-13-standard_...tar.zst
 #   KAIRO_TEST_ROOTFS=STORAGE:GB    (default local-lvm:8)
+#   KAIRO_TEST_FABRIC_PREFIX=a.b.c.d/n  the test fabric's network (issue #47; none: no fabric)
+#   KAIRO_TEST_FABRIC_PORT=N            the test agents' WireGuard port (default 51821)
 #   KAIRO_TEST_BRIDGE=BRIDGE        (default vmbr0)
 # What the CLI needs (CA, operator token) is kept in <kairo config>/test/; the CA's key stays there and never goes to
 # the container.
@@ -69,6 +72,9 @@ labels = { site = "test" }
 [data]
 confine_from = "$(date -Iseconds)"
 CONFIG
+  if [ -n "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then
+    printf '\n[fabric]\nprefix = "%s"\n' "$KAIRO_TEST_FABRIC_PREFIX"
+  fi
 }
 
 daemon_unit() {
@@ -148,10 +154,24 @@ agent)
   test_node=$node-t
   # its node token, from the test daemon's database
   token=$(inside "cd /srv/kairo && umask 077 && bin/kairo token create --config kairo.toml --name $test_node --role node --node $test_node --force --out /tmp/node.token >/dev/null && cat /tmp/node.token && rm /tmp/node.token")
-  # its transfer endpoint's certificate, from the test CA (issued aside: the daemon's stays)
+  # its fabric address, once the test daemon gave it one (the agent's first start with a fabric)
+  win=$(build_of "$sha" windows)
+  fabric_addr=
+  if [ -n "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then
+    eval "$(bash "$0" env)"
+    fabric_addr=$("$win" fabric list --json 2>/dev/null | python -c "import json,sys
+for n in json.load(sys.stdin).get('nodes') or []:
+    if n['node_id'] == '$test_node': print(n['address'])" || true)
+  fi
+  # its transfer endpoint's certificate, from the test CA (issued aside: the daemon's stays), for its LAN address
+  # and its fabric address
   work=$(mktemp -d)
   cp "$test_dir/tls/ca.pem" "$test_dir/tls/ca-key.pem" "$work/"
-  kairo tls issue --dir "$work" --host "$addr" >/dev/null
+  if [ -n "$fabric_addr" ]; then
+    kairo tls issue --dir "$work" --host "$addr" --host "$fabric_addr" >/dev/null
+  else
+    kairo tls issue --dir "$work" --host "$addr" >/dev/null
+  fi
   cat >"$work/agent.toml" <<CONFIG
 # Kairo's test installation (ops/test-instance.sh): a test agent beside this host's production agent.
 server_url = "https://$(cat "$test_dir/address"):7474"
@@ -176,10 +196,11 @@ kind = "filesystem"
 filesystems = ["/"]
 
 [packs]
-listen = "$addr:7485"
-addr = "$addr:7485"
+listen = "0.0.0.0:7485"
+$(if [ -z "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then echo "addr = \"$addr:7485\""; fi)
 cert_file = "/etc/kairo-test/pack-host.pem"
 key_file = "/etc/kairo-test/pack-host-key.pem"
+$(if [ -n "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then printf '\n[fabric]\nenabled = true\ninterface = "kairo-t0"\nlisten_port = %s\nkey_file = "/etc/kairo-test/fabric.key"\nendpoints = ["%s:%s"]\n' "${KAIRO_TEST_FABRIC_PORT:-51821}" "$addr" "${KAIRO_TEST_FABRIC_PORT:-51821}"; fi)
 
 [[executors]]
 id = "$test_node-incus"
@@ -214,11 +235,16 @@ UNIT
   ssh -n -o BatchMode=yes "$host" "set -e; chmod 600 /srv/kairo-test/agent.toml /etc/kairo-test/pack-host-key.pem; cd /srv/kairo-test/bin; chmod 755 kairo.new; ./kairo.new version | head -1; mv kairo.new kairo; systemctl daemon-reload; systemctl enable kairo-test-agent >/dev/null 2>&1; systemctl restart kairo-test-agent; sleep 5; systemctl is-active kairo-test-agent"
   say "test agent $test_node on $node's host: $sha"
   ;;
+config)
+  push "$test_dir/kairo.toml" /srv/kairo/kairo.toml
+  inside "systemctl restart kairo-daemon; sleep 4; systemctl is-active kairo-daemon"
+  say "test daemon's config pushed"
+  ;;
 env)
   printf 'export KAIRO_API=https://%s:7474\nexport KAIRO_TOKEN_FILE=%s\nexport KAIRO_CA_FILE=%s\n' "$(cat "$test_dir/address")" "$test_dir/token" "$test_dir/tls/ca.pem"
   ;;
 *)
-  echo "usage: ops/test-instance.sh create | deploy SHA | agent NODE SHA | env" >&2
+  echo "usage: ops/test-instance.sh create | deploy SHA | agent NODE SHA | config | env" >&2
   exit 2
   ;;
 esac
