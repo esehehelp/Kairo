@@ -203,7 +203,7 @@ KillMode=process
 [Install]
 WantedBy=multi-user.target
 UNIT
-  ssh -o BatchMode=yes "$host" "mkdir -p /srv/kairo-test/bin /srv/kairo-test/attempts /srv/kairo-test-store /etc/kairo-test && chmod 700 /etc/kairo-test"
+  ssh -o BatchMode=yes "$host" "mkdir -p /srv/kairo-test/bin /srv/kairo-test/attempts /srv/kairo-test-store /srv/kairo-test-durable /etc/kairo-test && chmod 700 /etc/kairo-test"
   scp -q -o BatchMode=yes "$test_dir/tls/ca.pem" "$host:/etc/kairo-test/ca.pem"
   scp -q -o BatchMode=yes "$work/server.pem" "$host:/etc/kairo-test/pack-host.pem"
   scp -q -o BatchMode=yes "$work/server-key.pem" "$host:/etc/kairo-test/pack-host-key.pem"
