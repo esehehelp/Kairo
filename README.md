@@ -377,7 +377,8 @@ LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノー�
   - 手でも作れます: `kairo fabric segment-add [--mtu N] NODE...`、`kairo fabric segment-remove VNI...`（`POST /api/fabric/segments`、`DELETE /api/fabric/segments/{vni}`、admin）。gang は世代ごとに自分のセグメントを持ちます（[Gang](#gang)。VNI は 100000 から、手では消せません）。`kairo fabric list` がセグメントも出します。
   - gang のメンバーの起動のときは、エージェントが同期を待たずにセグメントをノードに作ります。同期で教わったセグメントにないものは外しますが、起動のために作ったものは 10 分残し、コンテナが載っている（ブリッジに VXLAN 以外のポートがある）ものは外しません。
   - Windows のセグメントのネットワークは、ゲートウェイをサブネットの最後のホストにします（docker は、ゲートウェイのアドレスをコンテナに渡さないため。gang のメンバーは最初のホストから使います）。
-- **これから**: 配置と出入り（issue #47 の段階 5）。コンテナを LAN に直接つなぐホスト（Incus の NIC を LAN のブリッジに置く Proxmox など）では、Attempt から fabric のアドレスに届かないので、デーモンの LAN のアドレスを `attempt_api_url` で渡しています（WAN のノードには、ホストを通って fabric に出る経路が要ります）。
+- **コンテナからデーモンへ**: Attempt に渡す API の URL（`attempt_api_url`、既定は `server_url`）が fabric のアドレスなら、Incus のコンテナには、その API へのプロキシのデバイスを付けます。コンテナの中で API のポートを待ち受け、ホストから fabric を通ってつなぎます。コンテナの init は、デーモンの fabric のアドレスを lo に付けるので、URL も TLS の名前もそのままです。コンテナを LAN に直接つなぐホスト（Incus の NIC を LAN のブリッジに置く Proxmox など）では、コンテナから fabric への経路がなく、ホストに転送を許すと、ほかの網にも通じてしまうためです。wslc のコンテナは VM を通って届きます。
+- **これから**: 配置と出入り（issue #47 の段階 5）。
 
 ## 認証と TLS
 
