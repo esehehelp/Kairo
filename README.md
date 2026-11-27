@@ -346,7 +346,7 @@ Kairo が使うマシンには持ち主がいます（デスクトップの GPU 
 
 ## fabric（全ノードの網、作成中：issue #47）
 
-LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノードも含めて、全ノードを 1 つの WireGuard の網に載せ、その上に BGP EVPN と VXLAN の L2 のセグメントを張ります。WAN の側で DDP や gang を動かすための土台で、いまは第 3 段階（gang：世代ごとのセグメント、メンバーの NIC、起動の関門）までできています。ブランチ `feat/wan-fabric` で作り、試験用のインストールで試しています。
+LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノードも含めて、全ノードを 1 つの WireGuard の網に載せ、その上に BGP EVPN と VXLAN の L2 のセグメントを張ります。WAN の側で DDP や gang を動かすための土台で、いまは第 4 段階の一部（gang：世代ごとのセグメント、メンバーの NIC、起動の関門、分断をまたがない配置、gang 全体の checkpoint）までできています。ブランチ `feat/wan-fabric` で作り、試験用のインストールで試しています。
 
 - **アドレス**: 各ノードには、デーモンの `[fabric] prefix`（IPv4 のネットワーク）から、最初に名乗ったときに 1 つのアドレスを与えます（その時点で空いている最も小さいもの）。以後は、回線や場所が変わっても変えません（テーブル `fabric_nodes`、イベント `fabric_joined`）。prefix を変えて既存のノードのアドレスが外れると、そのノードは拒否されます。
 - **鍵**: 各ノードは自分の WireGuard の鍵を作って持ちます（`key_file`、既定は agent の設定の横の `fabric.key`。0600）。秘密鍵はノードの外に出ません。デーモンが持つのは、公開鍵、待ち受けのポート、ノードが「ここで届く」と言うエンドポイント（`host:port`、優先順）だけです。
@@ -377,7 +377,7 @@ LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノー�
   - 手でも作れます: `kairo fabric segment-add [--mtu N] NODE...`、`kairo fabric segment-remove VNI...`（`POST /api/fabric/segments`、`DELETE /api/fabric/segments/{vni}`、admin）。gang は世代ごとに自分のセグメントを持ちます（[Gang](#gang)。VNI は 100000 から、手では消せません）。`kairo fabric list` がセグメントも出します。
   - gang のメンバーの起動のときは、エージェントが同期を待たずにセグメントをノードに作ります。同期で教わったセグメントにないものは外しますが、起動のために作ったものは 10 分残し、コンテナが載っている（ブリッジに VXLAN 以外のポートがある）ものは外しません。
   - Windows のセグメントのネットワークは、ゲートウェイをサブネットの最後のホストにします（docker は、ゲートウェイのアドレスをコンテナに渡さないため。gang のメンバーは最初のホストから使います）。
-- **これから**: 分断の扱いと gang 全体の checkpoint、配置と出入り（issue #47 の段階 4、5）。
+- **これから**: 配置と出入り（issue #47 の段階 5）。コンテナを LAN に直接つなぐホスト（Incus の NIC を LAN のブリッジに置く Proxmox など）では、Attempt から fabric のアドレスに届かないので、デーモンの LAN のアドレスを `attempt_api_url` で渡しています（WAN のノードには、ホストを通って fabric に出る経路が要ります）。
 
 ## 認証と TLS
 
@@ -794,7 +794,7 @@ Run の output ディレクトリ（[`output` ディレクトリ](#output-ディ
 
 待機理由コードは以下のとおりです。
 
-`no_executor` / `no_fabric` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `owner_use` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
+`no_executor` / `no_fabric` / `fabric_partitioned` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `owner_use` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
 
 ### 実行時間の推定
 
@@ -1844,14 +1844,19 @@ rank = 1
 executor = { node = "node-b" }
 ```
 
-- **確保**: メンバー（rank 0〜size−1）は、fabric で経路を持つ（FRR を動かす）別々のノードに、1 つのトランザクションでまとめて置かれます（全部か、何もなしか）。デーモンに `[fabric] segment_prefix` がなければ置かれません（待機理由 `no_fabric`）。各メンバーの Lease は、そのノードの Executor が次にポーリングしたときに渡されます。
+- **確保**: メンバー（rank 0〜size−1）は、fabric で経路を持つ（FRR を動かす）別々のノードに、1 つのトランザクションでまとめて置かれます（全部か、何もなしか）。置くのは、互いに fabric で届くノードの組だけです（どの 2 つも、直近 3 分以内の握手を双方向に報告している）。分断があって、置ける組がそれをまたぐしかなければ、待ちます（待機理由 `fabric_partitioned`）。デーモンに `[fabric] segment_prefix` がなければ置かれません（待機理由 `no_fabric`）。各メンバーの Lease は、そのノードの Executor が次にポーリングしたときに渡されます。
 - **世代のセグメント**: 置くたびに（世代ごとに）、メンバーのノードだけのセグメントを作ります。VNI は 100000 からの通し番号で、前の世代のものは二度と使いません（遅れて戻った古い世代のメンバーは、新しい世代に届きません）。サブネットは `segment_prefix` の /24 で、VNI の示す所から順に空いているものを選びます（終わった世代のサブネットは、ほかが埋まるまで使いません）。メンバー r のアドレスは、その r+1 番目のホストです。世代が終わる（すべての Lease が解放される、または置いたのを取りやめる）とセグメントを消し、各ノードはコンテナがいなくなってからデバイスを外します。
 - **起動の関門**: すべてのメンバーの Lease が準備できるまで、どのメンバーも起動しません（2 分以内にそろわなければ、置いたのを取りやめ、新しい世代として置き直します）。起動のとき、エージェントはセグメントをノードに作り、コンテナに 2 つめの NIC を付けます（Incus: セグメントのブリッジにつないだ `gang0`、wslc: セグメントのネットワークにアドレスつきでつなぐ）。コンテナの init は、その NIC にアドレスを付け（rtnetlink。Attempt に特権は渡さず、イメージに `ip` は要りません）、ほかのすべてのメンバーに届き、ほかのすべてのメンバーから届くまで待ってから（最長 30 分。各メンバーのイメージの取得の差もここで吸収します）、argv を起動します。待ちきれなかったメンバーは exit 124 で終わります。
 - **環境変数**: `MASTER_ADDR`（メンバー 0 のアドレス）、`MASTER_PORT`、`RANK`・`WORLD_SIZE`・`NODE_RANK`（メンバーの数え方。1 メンバー 1 プロセスのとき用）、torchrun の `PET_NNODES`・`PET_NODE_RANK`・`PET_MASTER_ADDR`・`PET_MASTER_PORT`、`NCCL_SOCKET_IFNAME`・`GLOO_SOCKET_IFNAME`（セグメントの NIC）、`KAIRO_GANG_ID`・`KAIRO_GANG_RANK`・`KAIRO_GANG_SIZE`・`KAIRO_GANG_ADDRESS`。`python -m torch.distributed.run --nproc-per-node N train.py` は、そのままで全メンバーにまたがります（`RANK` などは torchrun がワーカーごとに付け直します）。
 - **一蓮托生**: 起動したメンバーの 1 つが 0 以外で終わる（かロストする）と、走っているほかのメンバーを止めます。Task が成功するのは、すべてのメンバーが 0 で終わったときだけです。あるメンバーの起動が失敗した（ほかは起動していた）ときは、最初から走らせ直します（続けて 3 回まで。その次は失敗）。
-- **まだないもの**: checkpoint（gang は `checkpointable` にできません。gang 全体の checkpoint は第 4 段階）、stream、`store`、`regenerable`。
+- **gang 全体の checkpoint**: gang は `checkpointable`（と `continue_after_loss`）にできます。checkpoint は、すべてのメンバーが同じステップで作ったときだけ gang のものです。
+  - Python SDK の `DistributedAdapter` は、gang の中では、各メンバーの最初のプロセス（`LOCAL_RANK` 0）が自分のメンバーのプロセスを登録し、自分の Attempt をポーリングします。suspend か checkpoint を、すべてのメンバーが受け取ってから、全 rank がそろって checkpoint を作ります（各 safe point で全 rank が状態を集めます）。各メンバーは自分の部分（最初のプロセスの `continuation_ref`。自分のコンテナの中のパスなので、各メンバーの最初のプロセスで保存します）を、ラウンドを添えて公開します（payload の `"gang": {"round", "rank", "size"}`）。suspend は、すべてのメンバーの部分が公開されてから全 rank で終わります。
+  - デーモンは、あるメンバーが受け取ったコマンド（suspend、`kairo task checkpoint`、データ保護の checkpoint）を、走っているほかのメンバーにも渡します。
+  - suspend した gang は、すべてのメンバーが部分を公開したラウンドから続きます。各メンバーは自分の部分から、自分の Run の output ディレクトリのあるノードで続きます（gang の output は動かしません）。suspend の部分がそろわなかったときは、すべてのメンバーがそろえた最新のラウンド（なければ、その世代が始まったラウンド）から続き、それもなければ失敗です。
+  - `continue_after_loss` の gang は、メンバーがロストしたら、すべての Lease が解放されてから、そろった最新のラウンドから続きます。なければブロックされます。
+- **まだないもの**: stream、`store`、`regenerable`。
 - **見る**: `kairo task show` が各メンバーのノード・アドレス・セグメントを、`kairo task logs --rank R` がメンバー R のログを出します。
-- **試験（2026-11-28、試験用のインストール）**: wslc（Windows）と Incus（Linux）の 2 メンバーで、TCP の 64 MiB が 1.03 秒、往復 0.98 ms（1 GbE の LAN）。wslc と 2 台の Incus の 3 メンバー × 2 プロセスの DDP（gloo、6 rank）で、全 rank のパラメータが一致。メンバー 0 の exit 3 で Windows のメンバーが止められ、Task は失敗（exit 3）。
+- **試験（2026-11-28、試験用のインストール）**: wslc（Windows）と Incus（Linux）の 2 メンバーで、TCP の 64 MiB が 1.03 秒、往復 0.98 ms（1 GbE の LAN）。wslc と 2 台の Incus の 3 メンバー × 2 プロセスの DDP（gloo、6 rank）で、全 rank のパラメータが一致。メンバー 0 の exit 3 で Windows のメンバーが止められ、Task は失敗（exit 3）。checkpointable な gang（wslc と Incus、各 2 プロセス、SDK）で、`kairo task checkpoint` が両メンバーとも同じステップ（12）で公開され、`kairo task pause` で両メンバーが同じステップ（41）で止まり、`resume` の後、各メンバーが自分の checkpoint からステップ 42 で続いて、最後に全 rank のパラメータが一致。Linux のメンバーをロストさせると（shim を exit なしで落とし、コンテナを消す）、Lease の解放の後、そろった最新のラウンド（ステップ 7）から両メンバーが続き、最後まで走った。
 
 ## Loader（ストリーム）
 
@@ -2009,7 +2014,7 @@ Kairo が管理する Attempt には、以下の環境変数が渡されます�
 - **volatile store**: Executor がvolatile store（[データストア](#データストア)を参照）を提供している場合は `KAIRO_SCRATCH` と `KAIRO_OUTPUT_DIR`
 - **gang のメンバー**: `MASTER_ADDR`、`MASTER_PORT`、`NODE_RANK`、`PET_*`、`NCCL_SOCKET_IFNAME`、`GLOO_SOCKET_IFNAME`、`KAIRO_GANG_*` など（[Gang](#gang)）
 
-SDK は、Attempt を Linux のコンテナで動くものとして扱います（プロセスの身元は `/proc/<pid>/stat` から読みます）。Python SDK の `DistributedAdapter` は、1 つの Attempt の中の torch の分散（1 つのコンテナの中の DDP）を協調させます。rank 0 だけがポーリングと応答を行い、チェックポイントは全 rank がそろって作ります。`local_continuation` は、Kairo が渡した継続の参照をそのまま返します（全 rank が同じコンテナのファイルを見るため、別ノードへの受け渡しはありません。相対パスは各 rank の作業ディレクトリから読まれるので、rank ごとに作業ディレクトリを変えるなら絶対パスで公開します）。[Gang](#gang) のメンバーはそれぞれ別の Attempt で、gang は checkpoint を作れないので、`DistributedAdapter` で止めることはまだできません。
+SDK は、Attempt を Linux のコンテナで動くものとして扱います（プロセスの身元は `/proc/<pid>/stat` から読みます）。Python SDK の `DistributedAdapter` は、1 つの Attempt の中の torch の分散（1 つのコンテナの中の DDP）を協調させます。rank 0 だけがポーリングと応答を行い、チェックポイントは全 rank がそろって作ります。`local_continuation` は、Kairo が渡した継続の参照をそのまま返します（全 rank が同じコンテナのファイルを見るため、別ノードへの受け渡しはありません。相対パスは各 rank の作業ディレクトリから読まれるので、rank ごとに作業ディレクトリを変えるなら絶対パスで公開します）。[Gang](#gang) では、メンバーごとに別の Attempt で、`DistributedAdapter` は gang 全体で checkpoint をそろえます（[Gang](#gang) の「gang 全体の checkpoint」）。`DistributedAdapter` は torch の object の集団通信を使うので、numpy が要ります。
 
 ### セーフポイントの挙動と Python・Rust SDK
 
