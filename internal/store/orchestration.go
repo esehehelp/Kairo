@@ -415,8 +415,14 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		}
 		succeeded := current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "")
 		// A gang rank failed to launch after other ranks had started: the gang
-		// never ran as a whole, so run it again from the start.
-		if gang.gang && gang.launchAborted && !succeeded {
+		// never ran as a whole, so run it again from the start; not again
+		// after gangRestartsInARow such restarts (a launch that fails each
+		// time: the task fails as its last execution did).
+		restarts, err := gangRestartsInARowTx(ctx, tx, task.taskScopeID)
+		if err != nil {
+			return err
+		}
+		if gang.gang && gang.launchAborted && !succeeded && restarts < gangRestartsInARow {
 			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "gang_launch"}
 			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "gang_restart", trigger, nil); err != nil {
 				return err
@@ -814,4 +820,28 @@ func convertCapacity(value orchestration.CapacityRequest) CapacityRequest {
 		disks[i] = DiskRequest(disk)
 	}
 	return CapacityRequest{CPUMillis: value.CPUMillis, CPUMillisMin: value.CPUMillisMin, RAMBytes: value.RAMBytes, Strength: value.Strength, Disks: disks}
+}
+
+// gangRestartsInARow bounds the gang restarts of a task one after another.
+const gangRestartsInARow = 3
+
+// gangRestartsInARowTx counts the gang restarts the task's latest executions
+// were, one after another.
+func gangRestartsInARowTx(ctx context.Context, tx *sql.Tx, taskScopeID string) (int, error) {
+	n, stop := 0, false
+	err := eachRow(ctx, tx, `SELECT reason FROM orchestration_decisions WHERE task_scope_id=$1 ORDER BY execution_ordinal DESC LIMIT $2`,
+		[]any{taskScopeID, gangRestartsInARow}, func(rows *sql.Rows) error {
+			var reason string
+			if err := rows.Scan(&reason); err != nil {
+				return err
+			}
+			if reason != "gang_restart" {
+				stop = true
+			}
+			if !stop {
+				n++
+			}
+			return nil
+		})
+	return n, err
 }
