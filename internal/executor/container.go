@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -238,6 +239,9 @@ type containerOptions struct {
 func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*exec.Cmd, error) {
 	if launch.Image == "" {
 		return nil, fmt.Errorf("executor %s runs attempts in containers: the execution names no image", e.ID)
+	}
+	if launch.Gang != nil {
+		return nil, errors.New("a gang does not run in an image yet")
 	}
 	id := launch.Attempt.ID
 	env := e.attemptEnv(launch)

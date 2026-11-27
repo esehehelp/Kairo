@@ -17,7 +17,7 @@ type UnlaunchedLease struct {
 }
 
 // ListUnlaunchedLeases returns executorID's unlaunched leases created more
-// than olderThan ago. An
+// than olderThan ago, except gang rank leases not delivered to it yet. An
 // executor works through its reservations one at a time within a tick, so
 // between ticks any such lease it does not hold in memory is one whose
 // answer it never received (a ReserveNext or AuthorizeLaunch response lost
@@ -30,6 +30,7 @@ func (s *Store) ListUnlaunchedLeases(ctx context.Context, executorID string, old
 		WHERE l.executor_id=$1 AND l.state IN('reserved','prepared','revocation_requested')
 		AND (l.attempt_id IS NULL OR a.state='authorized')
 		AND (l.created_at)::timestamptz<($2)::timestamptz
+		AND NOT EXISTS(SELECT 1 FROM gang_placement_leases gpl WHERE gpl.lease_id=l.id AND gpl.delivered_at IS NULL)
 		ORDER BY l.created_at,l.id`, executorID, cutoff)
 	if err != nil {
 		return nil, err

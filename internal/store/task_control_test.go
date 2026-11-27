@@ -167,6 +167,19 @@ func TestCancelWithdrawsAnAuthorizedExecutionAndRevokesItsLease(t *testing.T) {
 	}
 }
 
+func TestCancelWithdrawsEveryGangRank(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupGangInventory(t, store)
+	gangProject(t, store, false)
+	result, err := store.CancelTask(context.Background(), "gangs", "ddp", "tester", false)
+	if err != nil || len(result.Withdrawn) != 2 {
+		t.Fatalf("cancel: %+v %v", result, err)
+	}
+	if task := gangTaskState(t, store); task.State != "cancelled" {
+		t.Fatalf("task: %+v", task)
+	}
+}
+
 // The reconciler reads a planned decision, then submits it; a cancel can land
 // on either side of the submission. A cancel committed first abandons the
 // decision, which is then never submitted; a cancel committed after finds the
@@ -354,6 +367,39 @@ func TestRerunRefusesLiveTasks(t *testing.T) {
 	taskConflictError(t, err, "execution "+manual.ID+" of orchestrated/work/prepare is not terminal (waiting)")
 }
 
+func TestRerunOfAFailedGangRunsTheWholeGangAgain(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupGangInventory(t, store)
+	gangProject(t, store, false)
+	rank0, rank1 := launchGang(t, store)
+	finishGangRank(t, store, rank0, 3)
+	finishGangRank(t, store, rank1, 0)
+	if task := gangTaskState(t, store); task.State != "failed" {
+		t.Fatalf("gang: %+v", task)
+	}
+	if _, err := store.RerunTask(context.Background(), "gangs", "ddp", "tester", ""); err != nil {
+		t.Fatal(err)
+	}
+	task := gangTaskState(t, store)
+	if task.State != "running" || len(task.Executions) != 2 || task.Executions[1].Reason != "rerun" {
+		t.Fatalf("gang: %+v", task)
+	}
+	detail, err := store.GetTaskDetail(context.Background(), "gangs", "ddp")
+	if err != nil || len(detail.Executions) != 2 {
+		t.Fatalf("detail: %+v %v", detail, err)
+	}
+	old := detail.Executions[0]
+	if len(old.Gang) != 2 || old.Gang[1].NodeID == nil || *old.Gang[1].NodeID != "node-b" || old.Gang[0].AttemptID == nil {
+		t.Fatalf("old gang: %+v", old.Gang)
+	}
+	if fresh := detail.Executions[1]; len(fresh.Gang) != 2 || fresh.Gang[0].State != "waiting" || len(fresh.Attempts) != 0 {
+		t.Fatalf("new gang: %+v", fresh)
+	}
+	if len(old.Attempts) != 1 || old.Attempts[0].NodeID == nil || *old.Attempts[0].NodeID != "node-a" {
+		t.Fatalf("leader attempt: %+v", old.Attempts)
+	}
+}
+
 func TestProjectStatusFilters(t *testing.T) {
 	store := openCoordinationStore(t)
 	cpuProject(t, store)
@@ -454,7 +500,7 @@ func TestTaskDetail(t *testing.T) {
 	if attempt.NodeID == nil || *attempt.NodeID != "node" || attempt.StdoutPath == nil || *attempt.StdoutPath != "logs/a.stdout.log" || !strings.Contains(string(attempt.Progress), "loss") {
 		t.Fatalf("attempt: %+v", attempt)
 	}
-	if execution.Waiting != nil {
+	if execution.Waiting != nil || execution.Gang != nil {
 		t.Fatalf("a started execution waits: %+v", execution)
 	}
 	if attempt.LogProblems != nil || detail.Paused != nil {
@@ -552,35 +598,4 @@ func TestTaskDetail(t *testing.T) {
 	if _, err = store.GetTaskDetail(ctx, "orchestrated", "missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("unknown task: %v", err)
 	}
-}
-
-// A task declared with a gang before gangs were gone makes no execution
-// now: its rerun is refused, and the orchestration pass blocks it with the
-// reason instead of failing for every other task.
-func TestAnOldGangTaskIsBlockedNotThePass(t *testing.T) {
-	store := openCoordinationStore(t)
-	setupSchedulerInventory(t, store)
-	ctx := context.Background()
-	if _, err := store.ApplyProject(ctx, projectSpec(t, orchestrationManifest())); err != nil {
-		t.Fatal(err)
-	}
-	// prepare was declared as a gang (before gangs were refused)
-	if _, err := store.testExec(`UPDATE orchestration_tasks SET execution_template_json=jsonb_set(execution_template_json::jsonb,'{gang}','{"size":2}')::text WHERE name='prepare'`); err != nil {
-		t.Fatal(err)
-	}
-	// a task of another project is planned in the same pass
-	other := strings.ReplaceAll(orchestrationManifest(), `name = "orchestrated"`, `name = "other"`)
-	if _, err := store.ApplyProject(ctx, projectSpec(t, other)); err != nil {
-		t.Fatal(err)
-	}
-	tasks := projectTasks(t, store, "orchestrated")
-	if tasks["prepare"].State != "blocked" || !strings.Contains(string(tasks["prepare"].Result), "gangs are no more") {
-		t.Fatalf("the gang task: %+v", tasks["prepare"])
-	}
-	if others := projectTasks(t, store, "other"); others["prepare"].State != "running" && others["prepare"].State != "pending" {
-		t.Fatalf("the other project's task: %+v", others["prepare"])
-	}
-	// blocked, it is declared again, not rerun
-	_, err := store.RerunTask(ctx, "orchestrated", "prepare", "tester", "rerun-gang")
-	taskConflictError(t, err, "gangs are no more")
 }

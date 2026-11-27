@@ -103,11 +103,9 @@ type Execution struct {
 	Executor       ExecutorSelector   `toml:"executor" json:"executor"`
 	Exclusive      []ExclusiveRequest `toml:"exclusive" json:"exclusive"`
 	Capacity       CapacityRequest    `toml:"capacity" json:"capacity"`
-	// Gang was [tasks.execution.gang], ranks on distinct nodes: there are no
-	// gangs any more (every execution is one container), and a declaration
-	// with one is refused. Absent from the JSON when unset, so task digests
-	// do not change.
-	Gang any `toml:"gang" json:"gang,omitempty"`
+	// Gang runs the task as Size ranks on distinct nodes (store/gang.go).
+	// Absent from the JSON when unset, so existing task digests do not change.
+	Gang *Gang `toml:"gang" json:"gang,omitempty"`
 	// Env is [tasks.execution.env], added to the attempt's environment (see
 	// envspec.Validate for what is allowed). Absent from the JSON when empty.
 	Env map[string]string `toml:"env" json:"env,omitempty"`
@@ -171,6 +169,30 @@ type Execution struct {
 	// (store/orchestration.go). Checkpointable only, not a gang. Absent from
 	// the JSON when false.
 	ContinueAfterLoss bool `toml:"continue_after_loss" json:"continue_after_loss,omitempty"`
+}
+
+// Gang is [tasks.execution.gang]: size, an optional rendezvous port, and
+// [[tasks.execution.gang.ranks]] overriding argv, cwd, executor labels,
+// exclusive or capacity of a rank; a rank's env is merged over the task's (the
+// rank's value wins).
+type Gang struct {
+	Size  int        `toml:"size" json:"size"`
+	Port  int        `toml:"port" json:"port,omitempty"`
+	Ranks []GangRank `toml:"ranks" json:"ranks,omitempty"`
+}
+
+type GangRank struct {
+	Rank     int               `toml:"rank" json:"rank"`
+	Argv     []string          `toml:"argv" json:"argv,omitempty"`
+	CWD      string            `toml:"cwd" json:"cwd,omitempty"`
+	Executor *ExecutorSelector `toml:"executor" json:"executor,omitempty"`
+	Env      map[string]string `toml:"env" json:"env,omitempty"`
+	// Exclusive ([[tasks.execution.gang.ranks.exclusive]], or `exclusive = []`
+	// for no GPU) and Capacity ([tasks.execution.gang.ranks.capacity]) replace
+	// the task's for this rank when given. Absent from the JSON when unset, so
+	// existing task digests do not change.
+	Exclusive *[]ExclusiveRequest `toml:"exclusive" json:"exclusive,omitempty"`
+	Capacity  *CapacityRequest    `toml:"capacity" json:"capacity,omitempty"`
 }
 
 type ExecutorSelector struct {
@@ -263,12 +285,8 @@ func Decode(source []byte) (Manifest, error) {
 	if err != nil {
 		return Manifest{}, fmt.Errorf("parse TOML: %w", err)
 	}
-	for _, key := range metadata.Undecoded() {
-		// a gang's keys: the gang is refused, saying so, by Normalize
-		if strings.HasPrefix(key.String(), "tasks.execution.gang.") {
-			continue
-		}
-		return Manifest{}, fmt.Errorf("unknown project declaration field %q", key.String())
+	if undecoded := metadata.Undecoded(); len(undecoded) != 0 {
+		return Manifest{}, fmt.Errorf("unknown project declaration field %q", undecoded[0].String())
 	}
 	return manifest, nil
 }
@@ -346,6 +364,9 @@ func Normalize(manifest Manifest) (Validated, error) {
 			if _, ok := manifest.Images[task.Execution.Image]; !ok {
 				return Validated{}, fmt.Errorf("task %q runs in image %q, which is no [images.%s]", task.Name, task.Execution.Image, task.Execution.Image)
 			}
+			if task.Execution.Gang != nil {
+				return Validated{}, fmt.Errorf("task %q: a gang does not run in an image yet", task.Name)
+			}
 			if task.Execution.Source == "" && !path.IsAbs(strings.TrimSpace(task.Execution.CWD)) {
 				return Validated{}, fmt.Errorf("task %q runs in image %q without a source: its cwd %q must be an absolute path in the image", task.Name, task.Execution.Image, task.Execution.CWD)
 			}
@@ -362,6 +383,9 @@ func Normalize(manifest Manifest) (Validated, error) {
 				return Validated{}, fmt.Errorf("task %q runs in source %q: its cwd %q must be a directory of the snapshot (relative)", task.Name, task.Execution.Source, task.Execution.CWD)
 			}
 			task.Execution.CWD = cwd
+			if task.Execution.Gang != nil {
+				return Validated{}, fmt.Errorf("task %q: a gang does not run in a source yet", task.Name)
+			}
 		}
 		task.Name = strings.TrimSpace(task.Name)
 		task.Queue = strings.TrimSpace(task.Queue)
@@ -520,12 +544,15 @@ func normalizeExecution(value *Execution) error {
 	if err := datainput.Validate(value.Inputs, true); err != nil {
 		return err
 	}
-	if value.Gang != nil {
-		return errors.New("gangs are no more: every execution runs as one container (remove [tasks.execution.gang])")
-	}
 	value.Store = strings.TrimSpace(value.Store)
-	if value.ContinueAfterLoss && !value.Checkpointable {
-		return errors.New("continue_after_loss is for a checkpointable execution (it goes on from a checkpoint)")
+	if value.Store != "" && value.Gang != nil {
+		return errors.New("store is for a single execution, not a gang (its ranks are on distinct nodes)")
+	}
+	if value.Regenerable && value.Gang != nil {
+		return errors.New("regenerable is for a single execution, not a gang")
+	}
+	if value.ContinueAfterLoss && (!value.Checkpointable || value.Gang != nil) {
+		return errors.New("continue_after_loss is for a checkpointable single execution (it goes on from a checkpoint), not a gang")
 	}
 	if value.Executor.Labels == nil {
 		value.Executor.Labels = map[string]string{}
@@ -538,8 +565,30 @@ func normalizeExecution(value *Execution) error {
 	if err = normalizeCapacity(&value.Capacity); err != nil {
 		return err
 	}
-	if value.Env, err = envspec.Normalize(value.Env, len(value.Exclusive) != 0); err != nil {
+	if value.Gang != nil {
+		if err = normalizeGang(value.Gang); err != nil {
+			return err
+		}
+	}
+	// The task's env reaches every rank, so it is checked against a GPU any rank
+	// leases; a rank's env against its own.
+	anyGPU := len(value.Exclusive) != 0
+	if value.Gang != nil {
+		anyGPU = false
+		for rank := 0; rank < value.Gang.Size; rank++ {
+			anyGPU = anyGPU || len(rankExclusive(value, rank)) != 0
+		}
+	}
+	if value.Env, err = envspec.Normalize(value.Env, anyGPU); err != nil {
 		return err
+	}
+	if value.Gang != nil {
+		for i := range value.Gang.Ranks {
+			r := &value.Gang.Ranks[i]
+			if r.Env, err = envspec.Normalize(r.Env, len(rankExclusive(value, r.Rank)) != 0); err != nil {
+				return fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+		}
 	}
 	return nil
 }
@@ -602,6 +651,66 @@ func normalizeCapacity(capacity *CapacityRequest) error {
 			return fmt.Errorf("disk request %d is invalid", i)
 		}
 	}
+	return nil
+}
+
+// rankExclusive is the exclusive request one rank of the task makes: its own
+// when it gives one, the task's otherwise.
+func rankExclusive(value *Execution, rank int) []ExclusiveRequest {
+	if value.Gang != nil {
+		for _, r := range value.Gang.Ranks {
+			if r.Rank == rank && r.Exclusive != nil {
+				return *r.Exclusive
+			}
+		}
+	}
+	return value.Exclusive
+}
+
+// normalizeGang checks a gang and puts its rank overrides in rank order with
+// normalized requests. Rank envs are checked by normalizeExecution, which knows
+// each rank's resources.
+func normalizeGang(gang *Gang) error {
+	if gang.Size < 2 {
+		return errors.New("gang size must be at least 2")
+	}
+	if gang.Port != 0 && (gang.Port < 1024 || gang.Port > 65535) {
+		return errors.New("gang port must be 1024-65535 or 0")
+	}
+	seen := map[int]bool{}
+	for i := range gang.Ranks {
+		r := &gang.Ranks[i]
+		if r.Rank < 0 || r.Rank >= gang.Size {
+			return fmt.Errorf("gang rank override %d is outside 0..%d", r.Rank, gang.Size-1)
+		}
+		if seen[r.Rank] {
+			return fmt.Errorf("gang rank %d is overridden twice", r.Rank)
+		}
+		seen[r.Rank] = true
+		r.CWD = strings.TrimSpace(r.CWD)
+		if len(r.Argv) != 0 && strings.TrimSpace(r.Argv[0]) == "" {
+			return fmt.Errorf("gang rank %d has an empty argv", r.Rank)
+		}
+		if r.Executor != nil {
+			if r.Executor.Labels == nil {
+				r.Executor.Labels = map[string]string{}
+			}
+			r.Executor.Node = strings.TrimSpace(r.Executor.Node)
+		}
+		if r.Exclusive != nil {
+			exclusive, err := normalizeExclusive(*r.Exclusive)
+			if err != nil {
+				return fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+			r.Exclusive = &exclusive
+		}
+		if r.Capacity != nil {
+			if err := normalizeCapacity(r.Capacity); err != nil {
+				return fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+		}
+	}
+	sort.Slice(gang.Ranks, func(i, j int) bool { return gang.Ranks[i].Rank < gang.Ranks[j].Rank })
 	return nil
 }
 

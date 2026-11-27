@@ -97,6 +97,8 @@ var errorCodes = []struct {
 	{"machine_conflict", http.StatusConflict, store.ErrMachineConflict},
 	{"device_setting_conflict", http.StatusConflict, store.ErrDeviceSettingConflict},
 	{"bench_conflict", http.StatusConflict, store.ErrBenchConflict},
+	{"gang_not_ready", http.StatusConflict, store.ErrGangNotReady},
+	{"gang_aborted", http.StatusConflict, store.ErrGangAborted},
 	{"executor_live", http.StatusConflict, store.ErrExecutorLive},
 	{"raw_changed", http.StatusConflict, store.ErrRawChanged},
 	{"raw_evicting", http.StatusConflict, store.ErrRawEvicting},

@@ -125,7 +125,7 @@ func serve(args []string) error {
 	}
 	st.SetDataPolicy(store.DataPolicy{ScrubInterval: scrubEvery, ScrubBytesPerDay: daemonConfig.Data.ScrubBytesPerDay, ConfineFrom: confineFrom, RunSnapshotInterval: runSnapshotEvery})
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	// The external-command helper (internal/extcmd) logs through the default.
+	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
 	slog.SetDefault(logger)
 	attributes, _ := json.Marshal(config.NodeAttributes(daemonConfig.Node.Labels))
 	if err := st.UpsertNode(context.Background(), store.Node{ID: daemonConfig.Node.ID, Name: daemonConfig.Node.Name, OS: daemonConfig.Node.OS, Architecture: daemonConfig.Node.Architecture, Attributes: attributes, Enabled: true}); err != nil {
@@ -346,6 +346,12 @@ func serve(args []string) error {
 					logger.Error("memory pressure reconciliation failed", "error", err)
 				} else if n > 0 {
 					logger.Info("work suspended for its node's memory pressure", "suspends", n)
+				}
+				// gangs: a placement not prepared in time is given up, the
+				// members of a launched one share one fate, and the segment
+				// of a generation that ended is taken away
+				if err := st.ReconcileGangs(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("gang reconciliation failed", "error", err)
 				}
 				select {
 				case <-ctx.Done():

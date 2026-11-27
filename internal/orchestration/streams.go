@@ -264,6 +264,9 @@ func normalizeStreams(m *Manifest) error {
 			if ex.Image == "" {
 				return fmt.Errorf("task %q reads stream %q: a stream's loader runs in the task's container (an image)", m.Tasks[i].Name, name)
 			}
+			if ex.Gang != nil {
+				return fmt.Errorf("task %q: a gang does not read streams yet", m.Tasks[i].Name)
+			}
 			decl := StreamDecl{Name: name, Stream: s, Files: map[string][]RawFile{}}
 			for _, src := range s.Sources {
 				decl.Files[src.Raw] = files[src.Raw]

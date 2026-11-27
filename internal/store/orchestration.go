@@ -318,16 +318,21 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			if err != nil {
 				return err
 			}
-			if err := planOrBlock(ctx, tx, task, *task.rerunOrdinal, "rerun", trigger, continuation); err != nil {
+			if err := planTaskExecution(ctx, tx, task, *task.rerunOrdinal, "rerun", trigger, continuation); err != nil {
 				return err
 			}
 			continue
 		}
 		if err != nil {
-			if err := planOrBlock(ctx, tx, task, 0, "initial", map[string]any{"dependencies_succeeded": true}, nil); err != nil {
+			if err := planTaskExecution(ctx, tx, task, 0, "initial", map[string]any{"dependencies_succeeded": true}, nil); err != nil {
 				return err
 			}
 			continue
+		}
+		// A gang is read as a whole: terminal only when every rank is, and so on.
+		gang, err := gangAggregateTx(ctx, tx, &current)
+		if err != nil {
+			return err
 		}
 		if current.ExecutionState != "terminal" {
 			if err := updateTaskState(ctx, tx, task.taskScopeID, "running", nil); err != nil {
@@ -335,7 +340,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			}
 			continue
 		}
-		// A forced pause ended this execution: the task
+		// A forced pause ended this execution (or a rank of its gang): the task
 		// is stopped once nothing of it holds resources. No continuation or
 		// restart is planned, whatever the exit or checkpoint.
 		stopped, err := forceStoppedTx(ctx, tx, current.ExecutionID)
@@ -369,7 +374,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		// or a launch cut short, or by kairo resource reconcile), the task goes
 		// on from its latest published checkpoint, on the node that published
 		// it (the reference is a path there); with none it is blocked as any.
-		if current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" {
+		if !gang.gang && current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" {
 			var template orchestration.Execution
 			if err := json.Unmarshal([]byte(task.template), &template); err != nil {
 				return err
@@ -387,7 +392,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 				}
 				if found {
 					trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "attempt_lost", "command_id": checkpoint.commandID, "continuation_ref": checkpoint.ref, "node": checkpoint.node}
-					if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "loss_continuation", trigger, &checkpoint.ref); err != nil {
+					if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "loss_continuation", trigger, &checkpoint.ref); err != nil {
 						return err
 					}
 					continue
@@ -409,15 +414,27 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			continue
 		}
 		succeeded := current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "")
+		// A gang rank failed to launch after other ranks had started: the gang
+		// never ran as a whole, so run it again from the start.
+		if gang.gang && gang.launchAborted && !succeeded {
+			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "gang_launch"}
+			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "gang_restart", trigger, nil); err != nil {
+				return err
+			}
+			continue
+		}
 		// A node quarantine terminated this attempt (it could not checkpoint):
-		// run the task again from the start instead of failing it.
-		terminated, err := quarantineTerminatedTx(ctx, tx, *current.AttemptID)
-		if err != nil {
-			return err
+		// run the task again from the start instead of failing it. For a gang,
+		// any rank terminated by a quarantine counts.
+		terminated := gang.quarantined
+		if !gang.gang {
+			if terminated, err = quarantineTerminatedTx(ctx, tx, *current.AttemptID); err != nil {
+				return err
+			}
 		}
 		if terminated && !succeeded {
 			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "node_quarantine"}
-			if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, nil); err != nil {
+			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, nil); err != nil {
 				return err
 			}
 			continue
@@ -428,7 +445,7 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 		}
 		if err == nil && commandState == "checkpointed" && current.ContinuationRef != nil {
 			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "command_id": commandID, "origin": commandOrigin, "continuation_ref": *current.ContinuationRef}
-			if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "continuation", trigger, current.ContinuationRef); err != nil {
+			if err := planTaskExecution(ctx, tx, task, current.Ordinal+1, "continuation", trigger, current.ContinuationRef); err != nil {
 				return err
 			}
 			continue
@@ -580,7 +597,7 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 		if err != nil {
 			return plannedOrchestrationDecision{}, err
 		}
-		if node != "" {
+		if node != "" && spec.Gang == nil {
 			if err = pinNodeSpec(&spec, node); err != nil {
 				return plannedOrchestrationDecision{}, err
 			}
@@ -606,7 +623,7 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 				node = home.nodeID
 			}
 		}
-		if node != "" {
+		if node != "" && spec.Gang == nil {
 			if err = pinNodeSpec(&spec, node); err != nil {
 				return plannedOrchestrationDecision{}, err
 			}
@@ -623,32 +640,8 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	return plannedOrchestrationDecision{DecisionKey: decisionKey, TaskScopeID: task.taskScopeID, Ordinal: ordinal, Reason: reason, Spec: spec}, err
 }
 
-// unrunnableTask: a task's declaration makes no execution Kairo runs now
-// (a gang, declared before gangs were gone). The orchestration pass blocks
-// such a task with the reason; a rerun of it is refused.
-type unrunnableTask struct{ reason string }
-
-func (e unrunnableTask) Error() string { return e.reason }
-
-const gangsAreNoMore = "the task declares a gang: gangs are no more (every execution runs as one container); declare it again without one"
-
-// planOrBlock plans the task's next execution (planTaskExecution); a task
-// whose declaration makes none Kairo runs now is blocked with the reason,
-// so that it does not fail the pass that plans every other task.
-func planOrBlock(ctx context.Context, tx *sql.Tx, task orchestrationTaskRow, ordinal int, reason string, trigger map[string]any, continuation *string) error {
-	err := planTaskExecution(ctx, tx, task, ordinal, reason, trigger, continuation)
-	var u unrunnableTask
-	if errors.As(err, &u) {
-		return updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": u.reason})
-	}
-	return err
-}
-
 // taskExecutionSpec is the execution a task's template declares.
 func taskExecutionSpec(scope ScopePath, template orchestration.Execution, clientRequestID string, continuation *string) (ExecutionSpec, error) {
-	if template.Gang != nil {
-		return ExecutionSpec{}, unrunnableTask{gangsAreNoMore}
-	}
 	executor, err := json.Marshal(template.Executor)
 	if err != nil {
 		return ExecutionSpec{}, err
@@ -683,6 +676,27 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 	// long ago, so a start_by says nothing of it.
 	if continuation == nil {
 		spec.StartBy = string(template.StartBy)
+	}
+	if template.Gang != nil {
+		gang := GangSpec{Size: template.Gang.Size, Port: template.Gang.Port}
+		for _, r := range template.Gang.Ranks {
+			rank := GangRank{Rank: r.Rank, Argv: r.Argv, CWD: r.CWD, Env: r.Env}
+			if r.Executor != nil {
+				if rank.ExecutorSelector, err = json.Marshal(r.Executor); err != nil {
+					return ExecutionSpec{}, err
+				}
+			}
+			if r.Exclusive != nil {
+				exclusive := convertExclusive(*r.Exclusive)
+				rank.Exclusive = &exclusive
+			}
+			if r.Capacity != nil {
+				capacity := convertCapacity(*r.Capacity)
+				rank.Capacity = &capacity
+			}
+			gang.Ranks = append(gang.Ranks, rank)
+		}
+		spec.Gang = &gang
 	}
 	return spec, nil
 }

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"kairo/internal/datainput"
@@ -39,6 +40,9 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		return ExecutionSpec{}, nil, "", err
 	}
 	spec.Store = strings.TrimSpace(spec.Store)
+	if spec.Store != "" && spec.Gang != nil {
+		return ExecutionSpec{}, nil, "", errors.New("store is for a single execution, not a gang")
+	}
 	if len(spec.ExecutorSelector) == 0 {
 		spec.ExecutorSelector = json.RawMessage(`{}`)
 	}
@@ -54,6 +58,9 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		ref, err := imageref.ParsePinned(spec.Image)
 		if err != nil {
 			return ExecutionSpec{}, nil, "", err
+		}
+		if spec.Gang != nil {
+			return ExecutionSpec{}, nil, "", errors.New("image is for a single execution, not a gang (yet)")
 		}
 		spec.Image = ref.Pinned()
 		selector["container"] = true
@@ -72,8 +79,25 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 	if spec.InputContinuationRef != nil && *spec.InputContinuationRef == "" {
 		spec.InputContinuationRef = nil
 	}
-	if spec.Env, err = envspec.Normalize(spec.Env, len(spec.Exclusive) != 0); err != nil {
+	if spec.Gang != nil {
+		gang, err := normalizeGangSpec(*spec.Gang)
+		if err != nil {
+			return ExecutionSpec{}, nil, "", err
+		}
+		spec.Gang = &gang
+	}
+	// The execution's env reaches every rank, so it is checked against a GPU
+	// any rank leases; a rank's env against its own.
+	if spec.Env, err = envspec.Normalize(spec.Env, anyRankLeasesGPU(spec)); err != nil {
 		return ExecutionSpec{}, nil, "", err
+	}
+	if spec.Gang != nil {
+		for i := range spec.Gang.Ranks {
+			r := &spec.Gang.Ranks[i]
+			if r.Env, err = envspec.Normalize(r.Env, len(rankSpec(spec, r.Rank).Exclusive) != 0); err != nil {
+				return ExecutionSpec{}, nil, "", fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+		}
 	}
 	if spec.NotBefore, err = instant.Normalize(spec.NotBefore); err != nil {
 		return ExecutionSpec{}, nil, "", fmt.Errorf("not_before: %w", err)
@@ -87,10 +111,9 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 	if err = instant.CheckOrder(spec.NotBefore, spec.StartBy, spec.FinishBy); err != nil {
 		return ExecutionSpec{}, nil, "", err
 	}
-	// Env, ScratchTmpdir and the times are left out of the digest when
+	// Gang, Env, ScratchTmpdir and the times are left out of the digest when
 	// absent, so an execution without them keeps the digest it had before
-	// they existed (and a gang, when there were gangs, was left out the
-	// same way).
+	// they existed.
 	digestValue := struct {
 		Scope                ScopePath
 		Argv                 []string
@@ -102,6 +125,7 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		InputContinuationRef *string
 		Exclusive            []ExclusiveRequest
 		Capacity             CapacityRequest
+		Gang                 *GangSpec                  `json:",omitempty"`
 		Env                  map[string]string          `json:",omitempty"`
 		ScratchTmpdir        bool                       `json:",omitempty"`
 		NotBefore            string                     `json:",omitempty"`
@@ -115,7 +139,7 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		Image                string                     `json:",omitempty"`
 		Streams              []orchestration.StreamDecl `json:",omitempty"`
 		InputCheckpoint      string                     `json:",omitempty"`
-	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy, spec.Inputs, spec.Confine, spec.Store, spec.Regenerable, spec.SourceSnapshot, spec.Image, spec.Streams, spec.InputCheckpointCommand}
+	}{spec.Scope, spec.Argv, spec.CWD, spec.ExecutorSelector, spec.Priority, spec.Checkpointable, spec.Preemptible, spec.InputContinuationRef, spec.Exclusive, spec.Capacity, spec.Gang, spec.Env, spec.ScratchTmpdir, spec.NotBefore, spec.StartBy, spec.FinishBy, spec.Inputs, spec.Confine, spec.Store, spec.Regenerable, spec.SourceSnapshot, spec.Image, spec.Streams, spec.InputCheckpointCommand}
 	normalized, err := json.Marshal(digestValue)
 	if err != nil {
 		return ExecutionSpec{}, nil, "", err
@@ -183,6 +207,107 @@ func normalizeCapacity(c *CapacityRequest) error {
 	return nil
 }
 
+// anyRankLeasesGPU reports whether the execution, or any rank of its gang,
+// asks for an exclusive GPU.
+func anyRankLeasesGPU(spec ExecutionSpec) bool {
+	if spec.Gang == nil {
+		return len(spec.Exclusive) != 0
+	}
+	for rank := 0; rank < spec.Gang.Size; rank++ {
+		if len(rankSpec(spec, rank).Exclusive) != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// normalizeGangSpec checks a gang and puts its rank overrides in rank order with
+// canonical selectors and requests. Rank envs are checked by the caller, which
+// knows each rank's resources.
+func normalizeGangSpec(gang GangSpec) (GangSpec, error) {
+	if gang.Size < 2 {
+		return GangSpec{}, errors.New("gang size must be at least 2")
+	}
+	if gang.Port != 0 && (gang.Port < 1024 || gang.Port > 65535) {
+		return GangSpec{}, errors.New("gang port must be 1024-65535 or 0")
+	}
+	seen := map[int]bool{}
+	for i := range gang.Ranks {
+		r := &gang.Ranks[i]
+		if r.Rank < 0 || r.Rank >= gang.Size {
+			return GangSpec{}, fmt.Errorf("gang rank override %d is outside 0..%d", r.Rank, gang.Size-1)
+		}
+		if seen[r.Rank] {
+			return GangSpec{}, fmt.Errorf("gang rank %d is overridden twice", r.Rank)
+		}
+		seen[r.Rank] = true
+		r.CWD = strings.TrimSpace(r.CWD)
+		if len(r.Argv) != 0 && strings.TrimSpace(r.Argv[0]) == "" {
+			return GangSpec{}, fmt.Errorf("gang rank %d has an empty argv", r.Rank)
+		}
+		if len(r.ExecutorSelector) != 0 {
+			var selector map[string]any
+			if json.Unmarshal(r.ExecutorSelector, &selector) != nil || selector == nil {
+				return GangSpec{}, fmt.Errorf("gang rank %d executor selector must be a JSON object", r.Rank)
+			}
+			canonical, err := json.Marshal(selector)
+			if err != nil {
+				return GangSpec{}, err
+			}
+			r.ExecutorSelector = canonical
+		}
+		if r.Exclusive != nil {
+			exclusive, err := normalizeExclusive(*r.Exclusive)
+			if err != nil {
+				return GangSpec{}, fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+			r.Exclusive = &exclusive
+		}
+		if r.Capacity != nil {
+			capacity := *r.Capacity
+			if err := normalizeCapacity(&capacity); err != nil {
+				return GangSpec{}, fmt.Errorf("gang rank %d: %w", r.Rank, err)
+			}
+			r.Capacity = &capacity
+		}
+	}
+	sort.Slice(gang.Ranks, func(i, j int) bool { return gang.Ranks[i].Rank < gang.Ranks[j].Rank })
+	if gang.Ranks == nil {
+		gang.Ranks = []GangRank{}
+	}
+	return gang, nil
+}
+
+// rankSpec is the execution of one gang rank: the gang's spec with that rank's
+// overrides applied (its exclusive and capacity replace the gang's) and its env
+// merged over the gang's.
+func rankSpec(spec ExecutionSpec, rank int) ExecutionSpec {
+	out := spec
+	out.Gang = nil
+	for _, r := range spec.Gang.Ranks {
+		if r.Rank != rank {
+			continue
+		}
+		if len(r.Argv) != 0 {
+			out.Argv = r.Argv
+		}
+		if r.CWD != "" {
+			out.CWD = r.CWD
+		}
+		if len(r.ExecutorSelector) != 0 {
+			out.ExecutorSelector = r.ExecutorSelector
+		}
+		if r.Exclusive != nil {
+			out.Exclusive = *r.Exclusive
+		}
+		if r.Capacity != nil {
+			out.Capacity = *r.Capacity
+		}
+		out.Env = envspec.Merge(spec.Env, r.Env)
+	}
+	return out
+}
+
 func stringIn(value string, options ...string) bool {
 	for _, option := range options {
 		if value == option {
@@ -213,7 +338,7 @@ func (s *Store) SubmitExecution(ctx context.Context, input ExecutionSpec) (Execu
 	return execution, idempotent, err
 }
 
-// submitExecutionTx inserts a normalized execution, or
+// submitExecutionTx inserts a normalized execution (every rank of a gang), or
 // finds the one already submitted with its client request ID and digest
 // (idempotent).
 func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, digest string) (string, bool, error) {
@@ -268,8 +393,8 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 		}
 		var streamsJSON *string
 		if len(spec.Streams) != 0 {
-			if spec.Image == "" {
-				return "", errors.New("an execution reads streams in a container (an image)")
+			if spec.Image == "" || spec.Gang != nil {
+				return "", errors.New("an execution reads streams in a container (an image), not in a gang")
 			}
 			body, err := json.Marshal(spec.Streams)
 			if err != nil {
@@ -296,12 +421,35 @@ func submitExecutionTx(ctx context.Context, tx *sql.Tx, spec ExecutionSpec, dige
 		}
 		return executionID, appendCoordinationEventTx(ctx, tx, "execution_submitted", &scopes.Project.ID, "execution", executionID, nil, map[string]any{"client_request_id": clientRequestID, "spec_digest": digest})
 	}
-	if err = pinInputNodeTx(ctx, tx, spec.Scope.Project, &spec); err != nil {
+	leaderSpec := spec
+	if spec.Gang != nil {
+		leaderSpec = rankSpec(spec, 0)
+	} else if err = pinInputNodeTx(ctx, tx, spec.Scope.Project, &leaderSpec); err != nil {
 		return "", false, err
 	}
-	executionID, err := insert(spec, spec.ClientRequestID, digest)
+	executionID, err := insert(leaderSpec, spec.ClientRequestID, digest)
 	if err != nil {
 		return "", false, err
+	}
+	if spec.Gang != nil {
+		// Members carry the leader's request ID and digest with their rank, so a
+		// resubmitted gang is idempotent through its leader alone.
+		gangID, stamp := id.New("gng"), now()
+		if _, err = tx.ExecContext(ctx, `INSERT INTO execution_gangs(id,leader_execution_id,size,port,created_at) VALUES($1,$2,$3,$4,$5)`, gangID, executionID, spec.Gang.Size, spec.Gang.Port, stamp); err != nil {
+			return "", false, err
+		}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_members(gang_id,rank,execution_id) VALUES($1,0,$2)`, gangID, executionID); err != nil {
+			return "", false, err
+		}
+		for rank := 1; rank < spec.Gang.Size; rank++ {
+			memberID, err := insert(rankSpec(spec, rank), fmt.Sprintf("%s#rank%d", spec.ClientRequestID, rank), fmt.Sprintf("%s#rank%d", digest, rank))
+			if err != nil {
+				return "", false, err
+			}
+			if _, err = tx.ExecContext(ctx, `INSERT INTO gang_members(gang_id,rank,execution_id) VALUES($1,$2,$3)`, gangID, rank, memberID); err != nil {
+				return "", false, err
+			}
+		}
 	}
 	return executionID, false, nil
 }

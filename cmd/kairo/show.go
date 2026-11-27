@@ -51,6 +51,13 @@ func renderTask(w io.Writer, project string, t *taskDetail, now time.Time) {
 		if r := resourceSummary(e); r != "" {
 			line("resources", "%s", r)
 		}
+		if g := e.Gang; g != nil {
+			text := fmt.Sprintf("size %d", g.Size)
+			if g.Port != 0 {
+				text += fmt.Sprintf(", port %d", g.Port)
+			}
+			line("gang", "%s", text)
+		}
 		if len(e.Env) > 0 {
 			line("env", "%s", keyValues(e.Env))
 		}
@@ -146,6 +153,19 @@ func renderExecution(w io.Writer, e taskExecution, now time.Time) {
 		if p := progressText(e.Progress); p != "" {
 			line("progress", "%s", p)
 		}
+	}
+	for _, r := range e.Gang {
+		text := fmt.Sprintf("rank %d %s %s", r.Rank, r.ExecutionID, r.State)
+		if r.AttemptID != nil {
+			text += " " + *r.AttemptID
+		}
+		if r.NodeID != nil {
+			text += " node " + *r.NodeID
+		}
+		if r.ExecutorID != nil {
+			text += " executor " + *r.ExecutorID
+		}
+		line("gang", "%s", text)
 	}
 	for _, reason := range e.Waiting {
 		line("waiting", "%s", waitingText(reason))
