@@ -98,7 +98,8 @@ type link interface {
 	ensure(ctx context.Context, name, address string, bits int, keyFile string, port int) error
 	// peers are the interface's peers, by public key.
 	peers(ctx context.Context, name string) (map[string]peerSeen, error)
-	// setPeer sets a peer: its address (/32) and the endpoint tried.
+	// setPeer sets a peer: its address (/32) and the endpoint tried (""
+	// leaves the one it has: none, or where WireGuard last heard it from).
 	setPeer(ctx context.Context, name, publicKey, address, endpoint string) error
 	removePeer(ctx context.Context, name, publicKey string) error
 }
@@ -273,9 +274,6 @@ func (m *Manager) setPeers(ctx context.Context, peers []store.FabricNode) error 
 	for _, peer := range peers {
 		want[peer.PublicKey] = true
 		endpoints := endpointsOf(peer)
-		if len(endpoints) == 0 {
-			continue // it says it is reached nowhere: it reaches out itself
-		}
 		m.mu.Lock()
 		st, ok := m.peers[peer.PublicKey]
 		if !ok {
@@ -284,10 +282,16 @@ func (m *Manager) setPeers(ctx context.Context, peers []store.FabricNode) error 
 		}
 		seen, on := current[peer.PublicKey]
 		reached := on && !seen.handshake.IsZero() && t.Sub(seen.handshake) < handshakeFresh
-		if !reached && ok && t.Sub(st.since) >= endpointTrial {
-			st.endpoint, st.since = (st.endpoint+1)%len(endpoints), t
+		// a peer reached is left where WireGuard hears it (a NAT's mapping,
+		// a relay); one reached nowhere it says (none: it reaches out
+		// itself, behind a NAT) is still a peer, so its handshakes are taken
+		endpoint := ""
+		if !reached && len(endpoints) > 0 {
+			if ok && t.Sub(st.since) >= endpointTrial {
+				st.endpoint, st.since = (st.endpoint+1)%len(endpoints), t
+			}
+			endpoint = endpoints[st.endpoint%len(endpoints)]
 		}
-		endpoint := endpoints[st.endpoint%len(endpoints)]
 		m.mu.Unlock()
 		if err := m.link.setPeer(ctx, m.Interface, peer.PublicKey, peer.Address, endpoint); err != nil {
 			return err
@@ -381,7 +385,12 @@ func (m *Manager) report(ctx context.Context) error {
 			peer.HandshakeAt = seen.handshake.UTC().Format(time.RFC3339Nano)
 		}
 		if p.ProbePort > 0 && !seen.handshake.IsZero() {
-			peer.RTTMillis = probe(ctx, net.JoinHostPort(p.Address, fmt.Sprint(p.ProbePort)))
+			addr := net.JoinHostPort(p.Address, fmt.Sprint(p.ProbePort))
+			if pr, ok := m.link.(prober); ok {
+				peer.RTTMillis = pr.probeFrom(ctx, addr)
+			} else {
+				peer.RTTMillis = probe(ctx, addr)
+			}
 		}
 		report.Peers = append(report.Peers, peer)
 	}

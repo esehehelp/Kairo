@@ -604,8 +604,9 @@ func LoadAgent(path string) (Agent, error) {
 	if p := a.Packs; p.Listen != "" || p.Addr != "" || p.CertFile != "" || p.KeyFile != "" {
 		// on the fabric, addr may be left out: the node's fabric address
 		// names the endpoint (issue #47)
-		if p.Listen == "" || p.Addr == "" && !a.Fabric.Enabled || p.CertFile == "" || p.KeyFile == "" {
-			return a, errors.New("packs needs listen, addr, cert_file and key_file together (addr may be left out on the fabric)")
+		// (not on Windows: the fabric is in the wslc VM, not the agent's)
+		if p.Listen == "" || p.Addr == "" && (!a.Fabric.Enabled || runtime.GOOS == "windows") || p.CertFile == "" || p.KeyFile == "" {
+			return a, errors.New("packs needs listen, addr, cert_file and key_file together (addr may be left out on the fabric, but for Windows)")
 		}
 		if p.Addr != "" {
 			if _, port, err := net.SplitHostPort(p.Addr); err != nil || port == "" {

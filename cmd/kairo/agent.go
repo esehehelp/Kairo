@@ -137,7 +137,9 @@ func agentCommand(args []string) error {
 		} else {
 			address = fab.Address()
 		}
-		if packAddr == "" && address != "" && cfg.Packs.Listen != "" {
+		// on Windows the fabric is in the wslc VM: the agent's transfer
+		// endpoint is off it ([packs] addr)
+		if packAddr == "" && address != "" && cfg.Packs.Listen != "" && fabric.HostOnFabric() {
 			if _, port, err := net.SplitHostPort(cfg.Packs.Listen); err == nil {
 				packAddr = net.JoinHostPort(address, port)
 			}

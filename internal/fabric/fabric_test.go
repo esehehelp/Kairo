@@ -32,7 +32,9 @@ func (f *fakeLink) peers(context.Context, string) (map[string]peerSeen, error) {
 }
 
 func (f *fakeLink) setPeer(_ context.Context, _, key, _, endpoint string) error {
-	f.endpoints[key] = endpoint
+	if _, on := f.endpoints[key]; !on || endpoint != "" {
+		f.endpoints[key] = endpoint // "" keeps where it is heard from, as WireGuard does
+	}
 	return nil
 }
 
@@ -84,6 +86,25 @@ func TestTheFabricKeepsPeersAtAnEndpointThatAnswers(t *testing.T) {
 	if link.endpoints["KB"] != "203.0.113.2:51820" || link.endpoints["KC"] != "192.0.2.3:51820" {
 		t.Fatalf("after the trial: %v", link.endpoints)
 	}
+	// c is heard from elsewhere (a NAT's mapping): it is left there while
+	// it answers
+	link.endpoints["KC"] = "198.51.100.3:40000"
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if link.endpoints["KC"] != "198.51.100.3:40000" {
+		t.Fatalf("an answering peer was moved: %v", link.endpoints)
+	}
+	// d says no endpoint (it reaches out itself): still a peer, so that its
+	// handshakes are taken
+	view.Peers = append(view.Peers, store.FabricNode{NodeID: "d", Address: "10.209.0.4", PublicKey: "KD"})
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if e, on := link.endpoints["KD"]; !on || e != "" {
+		t.Fatalf("a peer with no endpoint: %q %v", e, on)
+	}
+	view.Peers = view.Peers[:2]
 	// c is no longer a peer
 	view.Peers = view.Peers[:1]
 	if err := m.Once(ctx); err != nil {

@@ -10,6 +10,11 @@
 #   bash ops/test-instance.sh agent NODE SHA  a test agent on NODE's host (a KAIRO_NODES node reached by ssh), beside
 #                                             its production agent: node NODE-t, service kairo-test-agent, /srv/kairo-test,
 #                                             transfer port 7485, containers kairo-t-*, CPU and RAM only (no GPU)
+#   bash ops/test-instance.sh winagent SHA    a test agent on this Windows machine, run in the foreground (start it in the
+#                                             background): node windows-t, not elevated, so its wslc containers (kairo-t-*)
+#                                             are in this user's wslc session, apart from production's; transfer port 7486,
+#                                             CPU and RAM only; on the fabric from its wslc VM, with no endpoints (the VM
+#                                             takes no connection from outside: it reaches out to its peers)
 # site.env (ops/site.sh) says where:
 #   KAIRO_TEST_PVE_HOST=root@HOST   the Proxmox host
 #   KAIRO_TEST_VMID=N               the container's id
@@ -249,6 +254,65 @@ UNIT
   rm -rf "$work"
   ssh -n -o BatchMode=yes "$host" "set -e; chmod 600 /srv/kairo-test/agent.toml /etc/kairo-test/pack-host-key.pem; cd /srv/kairo-test/bin; chmod 755 kairo.new; ./kairo.new version | head -1; mv kairo.new kairo; systemctl daemon-reload; systemctl enable kairo-test-agent >/dev/null 2>&1; systemctl restart kairo-test-agent; sleep 5; systemctl is-active kairo-test-agent"
   say "test agent $test_node on $node's host: $sha"
+  ;;
+winagent)
+  sha=${2:?usage: ops/test-instance.sh winagent SHA}
+  exe=$(build_of "$sha" windows)
+  linux=$(build_of "$sha" linux)
+  [ -f "$exe" ] && [ -f "$linux" ] || { echo "the builds of $sha are missing (bash ops/build.sh)" >&2; exit 1; }
+  test_node=windows-t
+  home=$(cygpath -u "$LOCALAPPDATA")/kairo/test-agent
+  conf=$test_dir/$test_node
+  mkdir -p "$home/bin" "$home/attempts" "$conf"
+  # the agent (and kairo-linux beside it: the wslc containers' init, and the fabric's work in the wslc VM)
+  cp "$exe" "$home/bin/kairo.exe"
+  cp "$linux" "$home/bin/kairo-linux"
+  token=$(inside "cd /srv/kairo && umask 077 && { bin/kairo token revoke --config kairo.toml $test_node >/dev/null 2>&1 || true; } && bin/kairo token create --config kairo.toml --name $test_node --role node --node $test_node --out /tmp/node.token >/dev/null && cat /tmp/node.token && rm /tmp/node.token")
+  lan=$(powershell.exe -NoProfile -Command "(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { \$_.PrefixOrigin -in 'Dhcp','Manual' -and \$_.InterfaceAlias -notmatch 'vEthernet|Tailscale|Loopback' } | Select-Object -First 1).IPAddress" | tr -d '\r')
+  [ -n "$lan" ] || { echo "no LAN address found" >&2; exit 1; }
+  if [ ! -f "$conf/pack.pem" ]; then
+    work=$(mktemp -d)
+    cp "$test_dir/tls/ca.pem" "$test_dir/tls/ca-key.pem" "$work/"
+    kairo tls issue --dir "$work" --host "$lan" >/dev/null
+    cp "$work/server.pem" "$conf/pack.pem"
+    cp "$work/server-key.pem" "$conf/pack-key.pem"
+    rm -rf "$work"
+  fi
+  w() { cygpath -m "$1"; }
+  cat >"$conf/agent.toml" <<CONFIG
+# Kairo's test installation (ops/test-instance.sh winagent): a test agent on this Windows machine, not elevated.
+server_url = "https://$(cat "$test_dir/address"):7474"
+token = "$token"
+ca_file = "$(w "$test_dir/tls/ca.pem")"
+log_directory = "$(w "$home/attempts")"
+observation_interval_seconds = 5
+container_prefix = "kairo-t-"
+
+[node]
+id = "$test_node"
+name = "$test_node"
+os = "windows"
+architecture = "amd64"
+labels = { site = "test" }
+
+[[providers]]
+id = "$test_node-host"
+kind = "host"
+
+[packs]
+listen = ":7486"
+addr = "$lan:7486"
+cert_file = "$(w "$conf/pack.pem")"
+key_file = "$(w "$conf/pack-key.pem")"
+$(if [ -n "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then printf '\n[fabric]\nenabled = true\ninterface = "kairo-t0"\nlisten_port = %s\nkey_file = "%s"\nendpoints = []\n' "${KAIRO_TEST_FABRIC_PORT:-51821}" "$(w "$conf/fabric.key")"; fi)
+
+[[executors]]
+id = "$test_node-wslc"
+kind = "wslc"
+labels = { site = "test" }
+CONFIG
+  say "test agent $test_node: $sha (foreground; stop it to end it)"
+  exec "$home/bin/kairo.exe" agent --config "$(w "$conf/agent.toml")"
   ;;
 tls)
   sha=${2:?usage: ops/test-instance.sh tls SHA}

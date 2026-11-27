@@ -31,6 +31,14 @@ import (
 func main() {
 	// A Windows force stop runs this binary as a short-lived CTRL_BREAK helper.
 	executor.RunHelper(os.Args)
+	// The Windows agent's fabric work in its wslc VM (fabric_windows.go).
+	if len(os.Args) > 1 && os.Args[1] == fabric.LinkArg {
+		if err := fabric.LinkCommand(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "kairo:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if err := run(os.Args[1:]); err != nil {
 		reportError(os.Stderr, err)
 		os.Exit(exitCode(err))
