@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"time"
 
 	"kairo/internal/id"
 	"kairo/internal/orchestration"
@@ -33,15 +34,15 @@ type gangPart struct {
 	ref       string
 	commandID string
 	kind      string
-	at        string
+	at        time.Time
 }
 
 // gangRound is a round of a generation: its members' parts.
 type gangRound struct {
 	id      string
 	parts   map[int]gangPart
-	at      string // the latest part's
-	suspend bool   // every part is a suspend's
+	at      time.Time // the latest part's
+	suspend bool      // every part is a suspend's
 }
 
 // gangGeneration is the generation led by an execution: its members (by
@@ -93,10 +94,11 @@ func gangGenerationTx(ctx context.Context, tx *sql.Tx, leaderID string) (*gangGe
 		}
 		err = eachRow(ctx, tx, `SELECT id,kind,payload_json,updated_at FROM commands WHERE attempt_id=$1 AND state='checkpointed'`, []any{m.attemptID}, func(rows *sql.Rows) error {
 			var p gangPart
-			var payload string
-			if err := rows.Scan(&p.commandID, &p.kind, &payload, &p.at); err != nil {
+			var payload, at string
+			if err := rows.Scan(&p.commandID, &p.kind, &payload, &at); err != nil {
 				return err
 			}
+			p.at, _ = time.Parse(time.RFC3339Nano, at)
 			var body struct {
 				ContinuationRef string `json:"continuation_ref"`
 				Gang            struct {
@@ -113,10 +115,10 @@ func gangGenerationTx(ctx context.Context, tx *sql.Tx, leaderID string) (*gangGe
 				r = &gangRound{id: body.Gang.Round, parts: map[int]gangPart{}, suspend: true}
 				g.rounds[body.Gang.Round] = r
 			}
-			if old, ok := r.parts[m.rank]; !ok || old.at < p.at {
+			if old, ok := r.parts[m.rank]; !ok || old.at.Before(p.at) {
 				r.parts[m.rank] = p
 			}
-			if p.at > r.at {
+			if p.at.After(r.at) {
 				r.at = p.at
 			}
 			r.suspend = r.suspend && p.kind == "suspend"
@@ -138,7 +140,7 @@ func (g *gangGeneration) latestComplete() *gangRound {
 			rounds = append(rounds, r)
 		}
 	}
-	sort.Slice(rounds, func(i, j int) bool { return rounds[i].at > rounds[j].at })
+	sort.Slice(rounds, func(i, j int) bool { return rounds[i].at.After(rounds[j].at) })
 	if len(rounds) == 0 {
 		return nil
 	}

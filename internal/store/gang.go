@@ -46,8 +46,8 @@ import (
 )
 
 // GangPrepareTimeout is how long a placement may wait for every rank to be
-// prepared before it is aborted.
-const GangPrepareTimeout = 2 * time.Minute
+// prepared before it is aborted (its members' inputs may come over a WAN).
+const GangPrepareTimeout = 10 * time.Minute
 
 // GangDefaultPort is the rendezvous port on member 0's address unless the
 // gang names one (each generation has a segment of its own: nothing else
@@ -188,6 +188,12 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 		nodes = append(nodes, slot.executor.nodeID)
 	}
 	seg, err := createSegmentTx(ctx, tx, segmentPrefix, nodes, 0, "gang")
+	if errors.Is(err, ErrFabric) {
+		// no segment for it now (every subnet taken, a node off the
+		// fabric since the pass read it): it waits, the pass goes on
+		slog.Default().Warn("gang not placed: no segment for its generation", "gang_id", gangID, "error", err)
+		return abandon()
+	}
 	if err != nil {
 		_, _ = abandon()
 		return false, err

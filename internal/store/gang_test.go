@@ -399,7 +399,7 @@ func TestGangAbortNamesEachRankExecutorDeliveryAndLastPoll(t *testing.T) {
 	if err = store.ReconcileGangs(ctx); err != nil {
 		t.Fatal(err)
 	}
-	want := "not every rank was prepared within 2m0s: " +
+	want := "not every rank was prepared within 10m0s: " +
 		"rank 0 on executor exec-a: lease reserved, delivered=false, executor last_seen_at=none; " +
 		"rank 1 on executor exec-b: lease prepared, delivered=true, executor last_seen_at=2026-10-06T19:23:00Z"
 	var reason string
@@ -501,5 +501,23 @@ func TestAGangInAnImageRunsEveryMemberInAContainer(t *testing.T) {
 	}
 	if members != 2 {
 		t.Fatalf("%d members", members)
+	}
+}
+
+// A gang with no segment to be had (every subnet of the prefix taken) waits:
+// the pass, and every other execution's reservation, goes on.
+func TestAGangWithNoSegmentToBeHadWaits(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupGangInventory(t, store)
+	store.policy.GangSegmentPrefix = "10.67.0.0/24"
+	ctx := context.Background()
+	if _, err := store.CreateFabricSegment(ctx, "10.67.0.0/24", []string{"node-a"}, 0); err != nil {
+		t.Fatal(err)
+	}
+	gangProject(t, store, false)
+	for _, executor := range []string{"exec-a", "exec-b"} {
+		if r, err := store.ReserveNext(ctx, executor); err != nil || r != nil {
+			t.Fatalf("%s: %+v %v", executor, r, err)
+		}
 	}
 }
