@@ -47,8 +47,17 @@ type NVIDIA struct {
 	GraphicsVRAMAllowance int64
 	// Owner tells its owner's use of a GPU (owneruse.go); nil tells none.
 	Owner *OwnerUse
+	// KairoVRAM reads the GPU memory Kairo's work holds where nvidia-smi
+	// shows no process for it, by the GPU's PCI address (pciAddress): on
+	// Windows, the wslc VM where Kairo's containers run (GPU
+	// paravirtualization: the host's nvidia-smi lists none of the VM's
+	// processes, only the memory they hold). That memory is Kairo's, not
+	// unattributed activity. nil means the wslc VM's on Windows, none
+	// elsewhere.
+	KairoVRAM func() (map[string]int64, error)
 
 	query atomic.Int32 // the index in nvidiaQueries of the query this driver accepts
+	vm    wslcVRAM
 }
 
 func (p *NVIDIA) ID() string { return p.ProviderID }
@@ -87,10 +96,10 @@ var nvidiaInventoryFields = []string{"uuid", "index", "memory.total", "memory.fr
 var nvidiaQueries = [][]string{
 	append(slices.Clone(nvidiaInventoryFields), "power.draw.average", "power.draw", "enforced.power.limit", "power.default_limit", "power.min_limit", "power.max_limit",
 		"clocks.sm", "clocks.mem", "clocks.max.sm", "clocks.max.mem", "pstate", "clocks_event_reasons.active",
-		"pcie.link.gen.gpucurrent", "pcie.link.gen.max", "pcie.link.width.current", "pcie.link.width.max", "utilization.memory", "fan.speed"),
+		"pcie.link.gen.gpucurrent", "pcie.link.gen.max", "pcie.link.width.current", "pcie.link.width.max", "utilization.memory", "fan.speed", "pci.bus_id"),
 	append(slices.Clone(nvidiaInventoryFields), "power.draw", "enforced.power.limit", "power.default_limit", "power.min_limit", "power.max_limit",
 		"clocks.sm", "clocks.mem", "clocks.max.sm", "clocks.max.mem", "pstate", "clocks_throttle_reasons.active",
-		"pcie.link.gen.current", "pcie.link.gen.max", "pcie.link.width.current", "pcie.link.width.max", "utilization.memory", "fan.speed"),
+		"pcie.link.gen.current", "pcie.link.gen.max", "pcie.link.width.current", "pcie.link.width.max", "utilization.memory", "fan.speed", "pci.bus_id"),
 	nvidiaInventoryFields,
 }
 
@@ -171,6 +180,36 @@ func nvidiaInt(gpu map[string]string, fields ...string) *int64 {
 	return nil
 }
 
+// pciAddress is a GPU's PCI address as Kairo matches it across sources:
+// "bus:device.function" in lower-case hexadecimal, without the domain.
+func pciAddress(bus, device, function uint64) string {
+	return fmt.Sprintf("%02x:%02x.%x", bus, device, function)
+}
+
+// nvidiaPCIAddress is pciAddress of nvidia-smi's pci.bus_id
+// ("00000000:2B:00.0").
+func nvidiaPCIAddress(gpu map[string]string) (string, bool) {
+	v, ok := nvidiaValue(gpu, "pci.bus_id")
+	if !ok {
+		return "", false
+	}
+	parts := strings.Split(v, ":")
+	if len(parts) < 2 {
+		return "", false
+	}
+	device, function, ok := strings.Cut(parts[len(parts)-1], ".")
+	if !ok {
+		return "", false
+	}
+	b, err1 := strconv.ParseUint(parts[len(parts)-2], 16, 8)
+	d, err2 := strconv.ParseUint(device, 16, 8)
+	f, err3 := strconv.ParseUint(function, 16, 8)
+	if err1 != nil || err2 != nil || err3 != nil {
+		return "", false
+	}
+	return pciAddress(b, d, f), true
+}
+
 // deviceSample is a GPU's power and operating point; nil when the query had
 // none of it (the inventory alone).
 func deviceSample(gpu map[string]string) *store.DeviceSample {
@@ -216,6 +255,15 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 	snap := Snapshot{}
 	byIndex := map[string]struct{ uuid, resource string }{}
 	used := map[string]int64{}
+	// kairo: what Kairo's work holds of each GPU without a process nvidia-smi
+	// shows (KairoVRAM); none when it cannot be read (the memory then stays
+	// unattributed: fail closed)
+	kairo := map[string]int64{}
+	readKairo := p.KairoVRAM
+	if readKairo == nil {
+		readKairo = p.vm.read
+	}
+	kairoByAddress, _ := readKairo()
 	for _, gpu := range gpus {
 		uuid, index := gpu["uuid"], gpu["index"]
 		total, err := strconv.ParseInt(gpu["memory.total"], 10, 64)
@@ -231,11 +279,17 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		resourceID := "gpu-" + strings.ToLower(strings.ReplaceAll(uuid, "GPU-", ""))
 		byIndex[index] = struct{ uuid, resource string }{uuid, resourceID}
 		used[uuid] = total - free
+		if address, ok := nvidiaPCIAddress(gpu); ok && kairoByAddress[address] > 0 {
+			kairo[uuid] = kairoByAddress[address]
+		}
 		binding, _ := json.Marshal(map[string]string{"cuda_index": index, "uuid": uuid})
 		attrs, _ := json.Marshal(map[string]any{"uuid": uuid})
 		snap.Resources = append(snap.Resources, store.ResourceInstance{ID: resourceID, NodeID: p.NodeID, ProviderID: p.ProviderID, Kind: "gpu", StableIdentity: uuid, Binding: binding, Attributes: attrs, AdminState: "enabled"})
 		stamp, valid := t.Format(time.RFC3339Nano), t.Add(ttl).Format(time.RFC3339Nano)
 		evidence, _ := json.Marshal(map[string]string{"source": "nvidia-smi"})
+		if kairo[uuid] > 0 {
+			evidence, _ = json.Marshal(map[string]any{"source": "nvidia-smi", "kairo_vm_bytes": kairo[uuid]})
+		}
 		snap.Observations = append(snap.Observations, store.Observation{ResourceID: resourceID, ObservedAt: stamp, ValidUntil: valid, TotalBytes: &total, FreeBytes: &free,
 			Utilization: nvidiaFloat(gpu, "utilization.gpu"), TemperatureC: nvidiaFloat(gpu, "temperature.gpu"), Evidence: evidence, Device: deviceSample(gpu)})
 	}
@@ -322,9 +376,11 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		// Exclusive scheduling must fail closed even while a compute process is
 		// between kernels (and therefore reports 0% utilization). Operators can
 		// explicitly allow unattributed activity in the manifest when desired.
-		// Graphics processes explain a desktop's share of memory, not more:
+		// What Kairo's work holds in the wslc VM is Kairo's (KairoVRAM).
+		// Graphics processes explain a desktop's share of the rest, not more:
 		// beyond the allowance the memory is someone's work (a game, a
 		// D3D/Vulkan compute job) that pmon shows only as graphics.
+		bytes -= min(bytes, kairo[uuid])
 		explained := graphics[uuid] && p.graphicsExplainVRAM() && bytes <= p.graphicsVRAMAllowance()
 		if bytes > 1024*1024*1024 && !seenProcess[uuid] && !explained {
 			resourceID := ""
@@ -334,7 +390,11 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 					break
 				}
 			}
-			evidence, _ := json.Marshal(map[string]any{"used_memory_bytes": bytes, "gpu_uuid": uuid, "reason": "significant_vram_without_attributed_process"})
+			detail := map[string]any{"used_memory_bytes": bytes, "gpu_uuid": uuid, "reason": "significant_vram_without_attributed_process"}
+			if kairo[uuid] > 0 {
+				detail["kairo_vm_bytes"] = kairo[uuid]
+			}
+			evidence, _ := json.Marshal(detail)
 			snap.Claims = append(snap.Claims, store.ExternalClaim{ID: "claim-" + resourceID + "-unattributed", ResourceID: resourceID, ClaimKind: "unattributed_activity", Evidence: evidence})
 		}
 	}
