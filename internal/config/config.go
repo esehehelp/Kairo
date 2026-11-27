@@ -746,15 +746,15 @@ type DaemonFabric struct {
 	// ASN and VXLANPort are how the fabric's routing runs (0: a private
 	// 4-byte ASN, 4789); SegmentPrefix is where segments' /24 subnets are
 	// taken from ("": no segments). Issue #47, phase 2.
-	ASN           uint32 `toml:"asn"`
-	VXLANPort     int    `toml:"vxlan_port"`
-	SegmentPrefix string `toml:"segment_prefix"`
-	Join       bool     `toml:"join"`
-	RelayPorts string   `toml:"relay_ports"`
-	Interface  string   `toml:"interface"`
-	ListenPort int      `toml:"listen_port"`
-	KeyFile    string   `toml:"key_file"`
-	Endpoints  []string `toml:"endpoints"`
+	ASN           uint32   `toml:"asn"`
+	VXLANPort     int      `toml:"vxlan_port"`
+	SegmentPrefix string   `toml:"segment_prefix"`
+	Join          bool     `toml:"join"`
+	RelayPorts    string   `toml:"relay_ports"`
+	Interface     string   `toml:"interface"`
+	ListenPort    int      `toml:"listen_port"`
+	KeyFile       string   `toml:"key_file"`
+	Endpoints     []string `toml:"endpoints"`
 }
 
 // AgentFabric is an agent's [fabric] (issue #47): when Enabled, the agent

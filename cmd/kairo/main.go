@@ -183,7 +183,7 @@ func serve(args []string) error {
 	handler := (&api.Server{Store: st, ObserveOnly: daemonConfig.ObserveOnly, LogDirectory: daemonConfig.LogDirectory, SourceDirectory: daemonConfig.SourceDirectory, Logger: logger,
 		FabricPrefix: daemonConfig.Fabric.Prefix, FabricASN: daemonConfig.Fabric.ASN, FabricVXLANPort: daemonConfig.Fabric.VXLANPort,
 		FabricSegmentPrefix: daemonConfig.Fabric.SegmentPrefix,
-		DumpDatabase: func(ctx context.Context, w io.Writer) error { return pgDumpTo(ctx, pgDump, dsn, w) }, ControlFiles: controlFiles}).Handler()
+		DumpDatabase:        func(ctx context.Context, w io.Writer) error { return pgDumpTo(ctx, pgDump, dsn, w) }, ControlFiles: controlFiles}).Handler()
 	server := &http.Server{
 		Addr:              daemonConfig.Listen,
 		Handler:           handler,

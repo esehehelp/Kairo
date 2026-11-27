@@ -278,4 +278,3 @@ func (r dockerRouter) remove(ctx context.Context) error {
 func (r dockerRouter) show(ctx context.Context, command string) ([]byte, error) {
 	return docker(ctx, "exec", r.name, "vtysh", "-c", command)
 }
-
