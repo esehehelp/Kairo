@@ -419,7 +419,7 @@ func TestANodeSendsASampleWhenItServesNone(t *testing.T) {
 	keyFile := filepath.Join(t.TempDir(), "fabric.key")
 	view := store.FabricView{Address: "10.66.0.4", Prefix: "10.66.0.0/16",
 		Peers:   []store.FabricNode{{NodeID: "b", Address: "10.66.0.2", PublicKey: "pk-b", ListenPort: 51820, ProbePort: 7485}},
-		Measure: []store.FabricMeasure{{Node: "b", Address: "10.66.0.2", Port: 7485, Send: true}}}
+		Measure: []store.FabricMeasure{{Node: "b", Address: "10.66.0.2", Port: 7485}, {Node: "b", Address: "10.66.0.2", Port: 7485, Send: true}}}
 	link := &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}}
 	var reports []store.FabricLinksReport
 	m := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: link,
@@ -431,9 +431,9 @@ func TestANodeSendsASampleWhenItServesNone(t *testing.T) {
 	}
 	for deadline := time.Now().Add(5 * time.Second); ; {
 		m.mu.Lock()
-		n := len(m.sent)
+		n := len(m.sent) + len(m.received)
 		m.mu.Unlock()
-		if n > 0 || time.Now().After(deadline) {
+		if n == 2 || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -441,7 +441,8 @@ func TestANodeSendsASampleWhenItServesNone(t *testing.T) {
 	if err := m.report(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if len(reports) != 1 || len(reports[0].Sent) != 1 || reports[0].Sent[0].From != "b" || len(reports[0].Received) != 0 {
+	// both ways with the one peer
+	if len(reports) != 1 || len(reports[0].Sent) != 1 || reports[0].Sent[0].From != "b" || len(reports[0].Received) != 1 {
 		t.Fatalf("reports %+v", reports)
 	}
 }

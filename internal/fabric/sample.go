@@ -90,15 +90,21 @@ func (sampleBytes) Read(p []byte) (int, error) {
 // sampled lately, in the background.
 func (m *Manager) sampleAsked(measure []store.FabricMeasure) {
 	for _, s := range measure {
+		// by peer and way: a node times both ways with a peer that serves
+		// samples when it serves none
+		key := s.Node
+		if s.Send {
+			key += " send"
+		}
 		m.mu.Lock()
 		if m.sampled == nil {
 			m.sampled = map[string]time.Time{}
 		}
-		if at, ok := m.sampled[s.Node]; ok && m.now().Sub(at) < sampleAgain {
+		if at, ok := m.sampled[key]; ok && m.now().Sub(at) < sampleAgain {
 			m.mu.Unlock()
 			continue
 		}
-		m.sampled[s.Node] = m.now()
+		m.sampled[key] = m.now()
 		m.mu.Unlock()
 		addr := net.JoinHostPort(s.Address, strconv.Itoa(s.Port))
 		url := "https://" + addr + samplePath
