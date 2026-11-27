@@ -4,7 +4,8 @@
 #
 # The Linux checks run in a container of the golang image (pinned at apply) on the Linux CI node (@CI_LINUX_NODE@, of
 # site @CI_LINUX_SITE@: site.env; a Proxmox host's pct executor: one container per check, destroyed after it), from the
-# commit's tree as a code snapshot (source kairo, at /kairo/src) copied into the scratch. They start their own test
+# commit's tree as a code snapshot (source kairo, at /kairo/src) copied into the scratch (made writable: the snapshot
+# is read-only, and the attempt's user is no root to write past that). They start their own test
 # PostgreSQL 17 (ci/check.sh start-pg) and run as the attempt's ordinary user (README: Confinement; as nobody on an
 # agent from before issue #46, whose attempts ran as root). The tests that need root (linux-root) run on GitHub's CI
 # only. Nothing of a check outlives it but its logs and the caches.
@@ -47,7 +48,7 @@ name = "@SHA@-linux"
 image = "go"
 source = "kairo"
 cwd = "."
-argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; cp -a /kairo/src/. \"$d\"; as=; if [ \"$(id -u)\" = 0 ]; then chown -R 65534:65534 \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; as=\"setpriv --reuid=65534 --regid=65534 --clear-groups\"; fi; cd \"$d\"; bash ci/check.sh start-pg; $as env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux"]
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; cp -a /kairo/src/. \"$d\"; chmod -R u+w \"$d\"; as=; if [ \"$(id -u)\" = 0 ]; then chown -R 65534:65534 \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; as=\"setpriv --reuid=65534 --regid=65534 --clear-groups\"; fi; cd \"$d\"; bash ci/check.sh start-pg; $as env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux"]
 [tasks.execution.executor]
 labels = { site = "@CI_LINUX_SITE@" }
 node = "@CI_LINUX_NODE@"
@@ -62,7 +63,7 @@ name = "@SHA@-linux-race"
 image = "go"
 source = "kairo"
 cwd = "."
-argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; cp -a /kairo/src/. \"$d\"; as=; if [ \"$(id -u)\" = 0 ]; then chown -R 65534:65534 \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; as=\"setpriv --reuid=65534 --regid=65534 --clear-groups\"; fi; cd \"$d\"; bash ci/check.sh start-pg; $as env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux-race"]
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; t=$KAIRO_SCRATCH/tmp-ci; c=$KAIRO_CACHE_DIR; mkdir -p \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; cp -a /kairo/src/. \"$d\"; chmod -R u+w \"$d\"; as=; if [ \"$(id -u)\" = 0 ]; then chown -R 65534:65534 \"$d\" \"$t\" \"$c/ci-build\" \"$c/ci-mod\"; as=\"setpriv --reuid=65534 --regid=65534 --clear-groups\"; fi; cd \"$d\"; bash ci/check.sh start-pg; $as env HOME=\"$t\" TMPDIR=\"$t\" GOCACHE=\"$c/ci-build\" GOMODCACHE=\"$c/ci-mod\" bash ci/check.sh linux-race"]
 [tasks.execution.executor]
 labels = { site = "@CI_LINUX_SITE@" }
 node = "@CI_LINUX_NODE@"
@@ -77,7 +78,7 @@ name = "@SHA@-sdk-python"
 image = "uv"
 source = "kairo"
 cwd = "."
-argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; mkdir -p \"$d\"; cp -a /kairo/src/. \"$d\"; cd \"$d\"; UV_CACHE_DIR=\"$KAIRO_CACHE_DIR/uv\" bash ci/check.sh sdk-python"]
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; mkdir -p \"$d\"; cp -a /kairo/src/. \"$d\"; chmod -R u+w \"$d\"; cd \"$d\"; UV_CACHE_DIR=\"$KAIRO_CACHE_DIR/uv\" bash ci/check.sh sdk-python"]
 [tasks.execution.executor]
 labels = { site = "@CI_LINUX_SITE@" }
 node = "@CI_LINUX_NODE@"
@@ -92,7 +93,7 @@ name = "@SHA@-sdk-rust"
 image = "rust"
 source = "kairo"
 cwd = "."
-argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; mkdir -p \"$d\"; cp -a /kairo/src/. \"$d\"; cd \"$d\"; CARGO_HOME=\"$KAIRO_CACHE_DIR/cargo-home\" CARGO_TARGET_DIR=\"$KAIRO_CACHE_DIR/cargo-target\" PATH=\"/usr/local/cargo/bin:$PATH\" bash ci/check.sh sdk-rust"]
+argv = ["bash", "-c", "set -e; d=$KAIRO_SCRATCH/src; mkdir -p \"$d\"; cp -a /kairo/src/. \"$d\"; chmod -R u+w \"$d\"; cd \"$d\"; CARGO_HOME=\"$KAIRO_CACHE_DIR/cargo-home\" CARGO_TARGET_DIR=\"$KAIRO_CACHE_DIR/cargo-target\" PATH=\"/usr/local/cargo/bin:$PATH\" bash ci/check.sh sdk-rust"]
 [tasks.execution.executor]
 labels = { site = "@CI_LINUX_SITE@" }
 node = "@CI_LINUX_NODE@"
