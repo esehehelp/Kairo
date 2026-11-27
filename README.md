@@ -346,7 +346,7 @@ Kairo が使うマシンには持ち主がいます（デスクトップの GPU 
 
 ## fabric（全ノードの網、作成中：issue #47）
 
-LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノードも含めて、全ノードを 1 つの WireGuard の網に載せ、その上に BGP EVPN と VXLAN の L2 のセグメントを張ります。WAN の側で DDP や gang を動かすための土台で、いまは第 4 段階の一部（gang：世代ごとのセグメント、メンバーの NIC、起動の関門、分断をまたがない配置、gang 全体の checkpoint）までできています。ブランチ `feat/wan-fabric` で作り、試験用のインストールで試しています。
+LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノードも含めて、全ノードを 1 つの WireGuard の網に載せ、その上に BGP EVPN と VXLAN の L2 のセグメントを張ります。WAN の側で DDP や gang を動かすための土台で、いまは第 5 段階の一部（gang：世代ごとのセグメント、メンバーの NIC、起動の関門、分断をまたがない配置、gang 全体の checkpoint、回線の実測にもとづく配置）までできています。ブランチ `feat/wan-fabric` で作り、試験用のインストールで試しています。
 
 - **アドレス**: 各ノードには、デーモンの `[fabric] prefix`（IPv4 のネットワーク）から、最初に名乗ったときに 1 つのアドレスを与えます（その時点で空いている最も小さいもの）。以後は、回線や場所が変わっても変えません（テーブル `fabric_nodes`、イベント `fabric_joined`）。prefix を変えて既存のノードのアドレスが外れると、そのノードは拒否されます。
 - **鍵**: 各ノードは自分の WireGuard の鍵を作って持ちます（`key_file`、既定は agent の設定の横の `fabric.key`。0600）。秘密鍵はノードの外に出ません。デーモンが持つのは、公開鍵、待ち受けのポート、ノードが「ここで届く」と言うエンドポイント（`host:port`、優先順）だけです。
@@ -378,7 +378,9 @@ LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノー�
   - gang のメンバーの起動のときは、エージェントが同期を待たずにセグメントをノードに作ります。同期で教わったセグメントにないものは外しますが、起動のために作ったものは 10 分残し、コンテナが載っている（ブリッジに VXLAN 以外のポートがある）ものは外しません。
   - Windows のセグメントのネットワークは、ゲートウェイをサブネットの最後のホストにします（docker は、ゲートウェイのアドレスをコンテナに渡さないため。gang のメンバーは最初のホストから使います）。
 - **コンテナからデーモンへ**: Attempt に渡す API の URL（`attempt_api_url`、既定は `server_url`）が fabric のアドレスなら、Incus のコンテナには、その API へのプロキシのデバイスを付けます。コンテナの中で API のポートを待ち受け、ホストから fabric を通ってつなぎます。コンテナの init は、デーモンの fabric のアドレスを lo に付けるので、URL も TLS の名前もそのままです。コンテナを LAN に直接つなぐホスト（Incus の NIC を LAN のブリッジに置く Proxmox など）では、コンテナから fabric への経路がなく、ホストに転送を許すと、ほかの網にも通じてしまうためです。wslc のコンテナは VM を通って届きます。
-- **これから**: 配置と出入り（issue #47 の段階 5）。
+- **回線の実測**: リンクの帯域を測ってほしいと言われたノード（デーモンの `FabricView` の `measure`。[Gang](#gang) の配置が実測を待つとき）は、相手の転送の口から 32 MiB の試料を fabric 越しに取り寄せて時間を測り、受け取った転送として報告します（`GET /fabric/sample`。fabric のアドレスから来た相手にだけ返します）。転送の口が fabric にないノード（Windows）は、相手に試料を送って（`POST`）自分から相手への向きも測ります。Windows では、どちらも wslc の VM の中で行います。
+- **従量課金の回線**: エージェントの `[fabric] metered = true` は、そのノードの上り回線が量で課金されることを言います。gang は、そう言わない限り、そのノードの回線をまたぎません。
+- **これから**: ノードの出入り（spot、持ち歩く端末）、サイトごとの複製の方針（issue #47 の段階 5 の残り）。
 
 ## 認証と TLS
 
@@ -795,7 +797,7 @@ Run の output ディレクトリ（[`output` ディレクトリ](#output-ディ
 
 待機理由コードは以下のとおりです。
 
-`no_executor` / `no_fabric` / `fabric_partitioned` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `owner_use` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
+`no_executor` / `no_fabric` / `fabric_partitioned` / `fabric_unmeasured` / `fabric_links_short` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `owner_use` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
 
 ### 実行時間の推定
 
@@ -1840,12 +1842,16 @@ GPU クロック、電力上限、プロセッサ設定の変更には、デー�
 [tasks.execution.gang]
 size = 2                         # メンバーの数（2〜253）。メンバーごとに Execution 1 つ、コンテナ 1 つ
 port = 29500                     # 省略可: メンバー 0 のランデブーのポート（既定 29500）
+max_rtt_ms = 5                   # 省略可: メンバーのノードの間の往復の上限
+min_mib_per_second = 50          # 省略可: メンバーのノードの間の帯域の下限（向きごと）
+metered = false                  # 省略可: 従量課金の回線をまたいでよいか（既定 false）
 [[tasks.execution.gang.ranks]]   # 省略可: メンバーごとの上書き（argv、cwd、executor、env、exclusive、capacity）
 rank = 1
 executor = { node = "node-b" }
 ```
 
-- **確保**: メンバー（rank 0〜size−1）は、fabric で経路を持つ（FRR を動かす）別々のノードに、1 つのトランザクションでまとめて置かれます（全部か、何もなしか）。置くのは、互いに fabric で届くノードの組だけです（どの 2 つも、直近 3 分以内の握手を双方向に報告している）。分断があって、置ける組がそれをまたぐしかなければ、待ちます（待機理由 `fabric_partitioned`）。デーモンに `[fabric] segment_prefix` がなければ置かれません（待機理由 `no_fabric`）。各メンバーの Lease は、そのノードの Executor が次にポーリングしたときに渡されます。
+- **確保**: メンバー（rank 0〜size−1）は、fabric で経路を持つ（FRR を動かす）別々のノードに、1 つのトランザクションでまとめて置かれます（全部か、何もなしか）。置くのは、互いに fabric で届くノードの組だけです（どの 2 つも、直近 3 分以内の握手を双方向に報告している）。分断があって、置ける組がそれをまたぐしかなければ、待ちます（待機理由 `fabric_partitioned`）。
+- **回線の条件**: `max_rtt_ms`・`min_mib_per_second`・`metered` を書いた gang は、どの 2 つのメンバーのノードの間も、実測がそれを満たすときだけ置かれます（往復はプローブの値で 10 分以内のもの、どちらの向きでも。帯域は転送か試料の値で、向きごとに）。実測がなければ推測せずに待ち（`fabric_unmeasured`）、その回線の実測を頼みます（[fabric](#fabric全ノードの網作成中issue-47) の「回線の実測」）。実測が満たさなければ待ちます（`fabric_links_short`）。デーモンに `[fabric] segment_prefix` がなければ置かれません（待機理由 `no_fabric`）。各メンバーの Lease は、そのノードの Executor が次にポーリングしたときに渡されます。
 - **世代のセグメント**: 置くたびに（世代ごとに）、メンバーのノードだけのセグメントを作ります。VNI は 100000 からの通し番号で、前の世代のものは二度と使いません（遅れて戻った古い世代のメンバーは、新しい世代に届きません）。サブネットは `segment_prefix` の /24 で、VNI の示す所から順に空いているものを選びます（終わった世代のサブネットは、ほかが埋まるまで使いません）。メンバー r のアドレスは、その r+1 番目のホストです。世代が終わる（すべての Lease が解放される、または置いたのを取りやめる）とセグメントを消し、各ノードはコンテナがいなくなってからデバイスを外します。
 - **起動の関門**: すべてのメンバーの Lease が準備できるまで、どのメンバーも起動しません（2 分以内にそろわなければ、置いたのを取りやめ、新しい世代として置き直します）。起動のとき、エージェントはセグメントをノードに作り、コンテナに 2 つめの NIC を付けます（Incus: セグメントのブリッジにつないだ `gang0`、wslc: セグメントのネットワークにアドレスつきでつなぐ）。コンテナの init は、その NIC にアドレスを付け（rtnetlink。Attempt に特権は渡さず、イメージに `ip` は要りません）、ほかのすべてのメンバーに届き、ほかのすべてのメンバーから届くまで待ってから（最長 30 分。各メンバーのイメージの取得の差もここで吸収します）、argv を起動します。待ちきれなかったメンバーは exit 124 で終わります。
 - **環境変数**: `MASTER_ADDR`（メンバー 0 のアドレス）、`MASTER_PORT`、`RANK`・`WORLD_SIZE`・`NODE_RANK`（メンバーの数え方。1 メンバー 1 プロセスのとき用）、torchrun の `PET_NNODES`・`PET_NODE_RANK`・`PET_MASTER_ADDR`・`PET_MASTER_PORT`、`NCCL_SOCKET_IFNAME`・`GLOO_SOCKET_IFNAME`（セグメントの NIC）、`KAIRO_GANG_ID`・`KAIRO_GANG_RANK`・`KAIRO_GANG_SIZE`・`KAIRO_GANG_ADDRESS`。`python -m torch.distributed.run --nproc-per-node N train.py` は、そのままで全メンバーにまたがります（`RANK` などは torchrun がワーカーごとに付け直します）。
@@ -1857,7 +1863,7 @@ executor = { node = "node-b" }
   - `continue_after_loss` の gang は、メンバーがロストしたら、すべての Lease が解放されてから、そろった最新のラウンドから続きます。なければブロックされます。
 - **まだないもの**: stream、`store`、`regenerable`。
 - **見る**: `kairo task show` が各メンバーのノード・アドレス・セグメントを、`kairo task logs --rank R` がメンバー R のログを出します。
-- **試験（2026-11-28、試験用のインストール）**: wslc（Windows）と Incus（Linux）の 2 メンバーで、TCP の 64 MiB が 1.03 秒、往復 0.98 ms（1 GbE の LAN）。wslc と 2 台の Incus の 3 メンバー × 2 プロセスの DDP（gloo、6 rank）で、全 rank のパラメータが一致。メンバー 0 の exit 3 で Windows のメンバーが止められ、Task は失敗（exit 3）。checkpointable な gang（wslc と Incus、各 2 プロセス、SDK）で、`kairo task checkpoint` が両メンバーとも同じステップ（12）で公開され、`kairo task pause` で両メンバーが同じステップ（41）で止まり、`resume` の後、各メンバーが自分の checkpoint からステップ 42 で続いて、最後に全 rank のパラメータが一致。Linux のメンバーをロストさせると（shim を exit なしで落とし、コンテナを消す）、Lease の解放の後、そろった最新のラウンド（ステップ 7）から両メンバーが続き、最後まで走った。
+- **試験（2026-11-28、試験用のインストール）**: wslc（Windows）と Incus（Linux）の 2 メンバーで、TCP の 64 MiB が 1.03 秒、往復 0.98 ms（1 GbE の LAN）。wslc と 2 台の Incus の 3 メンバー × 2 プロセスの DDP（gloo、6 rank）で、全 rank のパラメータが一致。メンバー 0 の exit 3 で Windows のメンバーが止められ、Task は失敗（exit 3）。checkpointable な gang（wslc と Incus、各 2 プロセス、SDK）で、`kairo task checkpoint` が両メンバーとも同じステップ（12）で公開され、`kairo task pause` で両メンバーが同じステップ（41）で止まり、`resume` の後、各メンバーが自分の checkpoint からステップ 42 で続いて、最後に全 rank のパラメータが一致。Linux のメンバーをロストさせると（shim を exit なしで落とし、コンテナを消す）、Lease の解放の後、そろった最新のラウンド（ステップ 7）から両メンバーが続き、最後まで走った。`max_rtt_ms = 5`・`min_mib_per_second = 20` の gang は、Windows との回線に帯域の実測がない間は `fabric_unmeasured` で待ち、Windows のノードが VM から試料を取り寄せ（68 MiB/s）、送って（103 MiB/s）両向きが測れたところで置かれた。
 
 ## Loader（ストリーム）
 
