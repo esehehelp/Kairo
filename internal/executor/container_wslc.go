@@ -24,17 +24,18 @@ import (
 // the foreground; it returns the exit the container's init wrote. The init is the Linux build of this binary
 // (kairo-linux beside the agent's), mounted at /kairo/bin/kairo. A wslc
 // container cannot mount (no CAP_SYS_ADMIN), so the init does not confine
-// it; the whole container runs as an ordinary user (wslcUser) instead:
-// what Kairo hands it is writable, the image's files are not, so what an
-// attempt writes outside /kairo fails rather than vanishing with the
-// container (only /tmp, temporary by intent, stays writable). Its
+// it: it starts as root (wslcUser), and the argv runs as the ordinary user
+// every container's does (containerUID), to whom what Kairo hands it is
+// writable and the image's files are not, so what an attempt writes outside
+// /kairo fails rather than vanishing with the container (only /tmp,
+// temporary by intent, stays writable). Its
 // processes live in the WSL VM, out of the agent's sight: a stop of the
 // attempt reaches the runner, which stops the container (its init passes
 // the signal to the argv), and the container's state stands for its
 // processes' liveness.
 const (
 	wslcRunArg = "__kairo-wslc-run"
-	wslcUser   = "1000:1000"
+	wslcUser   = "0:0"
 	// wslcShm caps the container's /dev/shm (a tmpfs: only what is
 	// written there is memory)
 	wslcShm = "16g"

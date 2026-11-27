@@ -5,12 +5,13 @@ import (
 	"testing"
 )
 
-// A wslc container runs the image's init as an ordinary user, with the
-// mounts Kairo hands it and the GPU when the attempt leased one.
-func TestWSLCRunsTheInitAsAnOrdinaryUser(t *testing.T) {
+// A wslc container runs Kairo's init as root (it names the attempt's user
+// and starts the argv as it), with the mounts Kairo hands it and the GPU
+// when the attempt leased one.
+func TestWSLCRunsTheInitAsRoot(t *testing.T) {
 	spec := containerSpec{Instance: "kairo-att-0123", AttemptID: "att_0123", Image: "docker.io/library/python@sha256:abc",
 		GPUs: []string{"GPU-1"}, Mounts: []containerMount{{Source: `C:\k\run`, Path: "/kairo/run"}, {Source: `C:\k\src`, Path: "/kairo/src", ReadOnly: true}}}
-	want := []string{"run", "--name", "kairo-att-0123", "--user", "1000:1000", "--entrypoint", "/kairo/bin/kairo",
+	want := []string{"run", "--name", "kairo-att-0123", "--user", "0:0", "--entrypoint", "/kairo/bin/kairo",
 		"--label", "kairo.attempt=att_0123", "--stop-signal", "SIGTERM", "--stop-timeout", "30", "--shm-size", "16g", "--pull", "never",
 		"--gpus", "all", "--volume", `C:\k\run:/kairo/run`, "--volume", `C:\k\src:/kairo/src:ro`,
 		"docker.io/library/python@sha256:abc", containerInitArg, containerSpecIn}

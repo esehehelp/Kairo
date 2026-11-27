@@ -7,9 +7,11 @@ import (
 	"testing"
 )
 
-// chownTree hands the container what an id outside its map owns, leaves
-// what one of its ids owns, and follows no link out of the tree.
-func TestChownTreeHandsOverOnlyWhatIsNotTheContainers(t *testing.T) {
+// chownTree hands the container's attempt user all of the tree: what an id
+// outside its map owns, what the container's root or another of its users
+// owns (written by attempts that ran as root or switched user); it follows
+// no link out of the tree.
+func TestChownTreeHandsTheAttemptUserAllOfTheTree(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("needs root to change owners")
 	}
@@ -20,6 +22,9 @@ func TestChownTreeHandsOverOnlyWhatIsNotTheContainers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// a map the test's own namespace has ids for: the container's root is
+	// 100000, its attempt user 101000
+	m := idMap{uid: 100000, gid: 100000, uidLen: 65536, gidLen: 65536}
 	write := func(p string, uid int) {
 		if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 			t.Fatal(err)
@@ -29,14 +34,13 @@ func TestChownTreeHandsOverOnlyWhatIsNotTheContainers(t *testing.T) {
 		}
 	}
 	write(filepath.Join(root, "a", "host"), 0)
-	write(filepath.Join(root, "a", "b", "mine"), 1500) // a user of the container's
+	write(filepath.Join(root, "a", "root"), 100000)      // an attempt that ran as root
+	write(filepath.Join(root, "a", "b", "mine"), 165534) // a user an attempt switched to (nobody)
 	write(filepath.Join(outside, "secret"), 0)
 	if err := os.Symlink(outside, filepath.Join(root, "a", "link")); err != nil {
 		t.Fatal(err)
 	}
-	// a map the test's own namespace has ids for
-	m := idMap{uid: 1000, gid: 1000, uidLen: 1000, gidLen: 1000}
-	if err := chownTree(root, m); err != nil {
+	if err := chownTree(root, m.toAttemptUser); err != nil {
 		t.Fatal(err)
 	}
 	owner := func(p string) uint32 {
@@ -47,24 +51,31 @@ func TestChownTreeHandsOverOnlyWhatIsNotTheContainers(t *testing.T) {
 		return st.Uid
 	}
 	for p, want := range map[string]uint32{
-		root: 1000, filepath.Join(root, "a"): 1000, filepath.Join(root, "a", "host"): 1000,
-		filepath.Join(root, "a", "b", "mine"): 1500, filepath.Join(root, "a", "link"): 1000,
+		root: 101000, filepath.Join(root, "a"): 101000, filepath.Join(root, "a", "host"): 101000, filepath.Join(root, "a", "root"): 101000,
+		filepath.Join(root, "a", "b", "mine"): 101000, filepath.Join(root, "a", "link"): 101000,
 		outside: 0, filepath.Join(outside, "secret"): 0,
 	} {
 		if got := owner(p); got != want {
 			t.Errorf("%s: uid %d, want %d", p, got, want)
 		}
 	}
-	if err := chownTree(filepath.Join(base, "missing"), m); err != nil {
+	if err := chownTree(filepath.Join(base, "missing"), m.toAttemptUser); err != nil {
 		t.Fatalf("a missing tree: %v", err)
 	}
 	// a file (an attempt's log, mounted writable) is handed over itself
 	log := filepath.Join(base, "att.stdout.log")
 	write(log, 0)
-	if err := chownTree(log, m); err != nil {
+	if err := chownTree(log, m.toAttemptUser); err != nil {
 		t.Fatalf("a file: %v", err)
 	}
-	if got := owner(log); got != 1000 {
+	if got := owner(log); got != 101000 {
 		t.Fatalf("the log: uid %d", got)
+	}
+	// in a container whose runner hands it nothing, all of it
+	if err := chownTree(filepath.Join(root, "a", "b"), toAttemptUserHere); err != nil {
+		t.Fatal(err)
+	}
+	if got := owner(filepath.Join(root, "a", "b", "mine")); got != containerUID {
+		t.Fatalf("handed here: uid %d", got)
 	}
 }

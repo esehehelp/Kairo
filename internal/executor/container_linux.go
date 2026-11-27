@@ -12,6 +12,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -148,8 +149,9 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 	}
 	// On a host the container is unprivileged: its root is the first of
 	// root's subordinate ids (as a Proxmox container's), and what it
-	// writes to is handed to that id before it starts, so that what earlier
-	// containers on the node wrote it can write again. Nested in
+	// writes to is handed to its attempt user (containerUID) before it
+	// starts, so that what earlier containers on the node wrote it can write
+	// again. Nested in
 	// an unprivileged container (a Proxmox LXC) it cannot have a uid map of
 	// its own and is privileged instead: the outer container's root,
 	// unprivileged on the host.
@@ -195,7 +197,7 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 		}
 		for _, m := range spec.Mounts {
 			if !m.ReadOnly {
-				if err := chownTree(m.Source, ids); err != nil {
+				if err := chownTree(m.Source, ids.toAttemptUser); err != nil {
 					return shimNotStarted, fmt.Errorf("hand %s to the container: %w", m.Source, err)
 				}
 			}
@@ -284,20 +286,18 @@ func instanceIDMap(ctx context.Context, instance string) (idMap, error) {
 			m.gid, m.gidLen = e.Hostid, e.Range
 		}
 	}
-	if m.uidLen == 0 || m.gidLen == 0 {
-		return idMap{}, fmt.Errorf("instance %s: no map of its root's uid and gid", instance)
+	if m.uidLen <= containerUID || m.gidLen <= containerGID {
+		return idMap{}, fmt.Errorf("instance %s: no map of its root's and its attempt user's uid and gid", instance)
 	}
 	return m, nil
 }
 
-// chownTree hands root and all under it to the container: what an id
-// outside its map owns (the host's, as what an agent wrote) goes to its
-// root; what one of its ids owns stays (a user an attempt switched to keeps
-// what it wrote, while another attempt runs). It walks by descriptors and
+// chownTree hands root and all under it to the owners to gives them
+// (idMap.toAttemptUser, toAttemptUserHere). It walks by descriptors and
 // follows no link, so that a tree a running container changes cannot lead
 // it outside root. root may be a file (an attempt's log), handed over
 // itself. What is not there is no error.
-func chownTree(root string, m idMap) error {
+func chownTree(root string, to ownerFor) error {
 	var lst unix.Stat_t
 	if err := unix.Lstat(root, &lst); err != nil {
 		if errors.Is(err, unix.ENOENT) {
@@ -307,7 +307,7 @@ func chownTree(root string, m idMap) error {
 	}
 	if lst.Mode&unix.S_IFMT != unix.S_IFDIR {
 		// a file (an attempt's log): itself, a link's own owner
-		if err := m.hand(lst, func(uid, gid int) error {
+		if err := hand(lst, to, func(uid, gid int) error {
 			return unix.Fchownat(unix.AT_FDCWD, root, uid, gid, unix.AT_SYMLINK_NOFOLLOW)
 		}); err != nil {
 			return &os.PathError{Op: "chown", Path: root, Err: err}
@@ -323,15 +323,15 @@ func chownTree(root string, m idMap) error {
 		_ = unix.Close(fd)
 		return &os.PathError{Op: "stat", Path: root, Err: err}
 	}
-	if err := m.hand(st, func(uid, gid int) error { return unix.Fchown(fd, uid, gid) }); err != nil {
+	if err := hand(st, to, func(uid, gid int) error { return unix.Fchown(fd, uid, gid) }); err != nil {
 		_ = unix.Close(fd)
 		return &os.PathError{Op: "chown", Path: root, Err: err}
 	}
-	return chownDir(fd, root, m)
+	return chownDir(fd, root, to)
 }
 
 // chownDir is chownTree under the directory fd (which it closes).
-func chownDir(fd int, dir string, m idMap) error {
+func chownDir(fd int, dir string, to ownerFor) error {
 	f := os.NewFile(uintptr(fd), dir)
 	defer f.Close()
 	names, err := f.Readdirnames(-1)
@@ -348,7 +348,7 @@ func chownDir(fd int, dir string, m idMap) error {
 			return &os.PathError{Op: "stat", Path: p, Err: err}
 		}
 		// a link's own owner, never its target's
-		if err := m.hand(st, func(uid, gid int) error { return unix.Fchownat(fd, name, uid, gid, unix.AT_SYMLINK_NOFOLLOW) }); err != nil && !errors.Is(err, unix.ENOENT) {
+		if err := hand(st, to, func(uid, gid int) error { return unix.Fchownat(fd, name, uid, gid, unix.AT_SYMLINK_NOFOLLOW) }); err != nil && !errors.Is(err, unix.ENOENT) {
 			return &os.PathError{Op: "chown", Path: p, Err: err}
 		}
 		if st.Mode&unix.S_IFMT != unix.S_IFDIR {
@@ -363,27 +363,54 @@ func chownDir(fd int, dir string, m idMap) error {
 			}
 			return &os.PathError{Op: "open", Path: p, Err: err}
 		}
-		if err := chownDir(child, p, m); err != nil {
+		if err := chownDir(child, p, to); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// hand changes what st describes to the container's root's uid and gid,
-// each where an id outside the map owns it.
-func (m idMap) hand(st unix.Stat_t, chown func(uid, gid int) error) error {
-	uid, gid := -1, -1
-	if !m.ownsUID(st.Uid) {
-		uid = int(m.uid)
-	}
-	if !m.ownsGID(st.Gid) {
-		gid = int(m.gid)
-	}
+// ownerFor is the uid and gid what st describes goes to, each -1 where it
+// stays.
+type ownerFor func(st unix.Stat_t) (uid, gid int)
+
+// hand changes what st describes to the owner to gives it.
+func hand(st unix.Stat_t, to ownerFor, chown func(uid, gid int) error) error {
+	uid, gid := to(st)
 	if uid == -1 && gid == -1 {
 		return nil
 	}
 	return chown(uid, gid)
+}
+
+// toAttemptUser gives the container's attempt user (containerUID,
+// containerGID: its ids on the host, by the map) all of it: what an id
+// outside the map owns (the host's, as what an agent wrote), and what the
+// container's root or another of its users owns (what attempts wrote while
+// they ran as root or switched to a user of their own, before issue #46:
+// handed once). Every attempt now runs as that user.
+func (m idMap) toAttemptUser(st unix.Stat_t) (int, int) {
+	uid, gid := -1, -1
+	if st.Uid != m.uid+containerUID {
+		uid = int(m.uid + containerUID)
+	}
+	if st.Gid != m.gid+containerGID {
+		gid = int(m.gid + containerGID)
+	}
+	return uid, gid
+}
+
+// toAttemptUserHere gives the attempt user all of it, in a container whose
+// runner hands it nothing (wslc, or one nested in a Proxmox container).
+func toAttemptUserHere(st unix.Stat_t) (int, int) {
+	uid, gid := -1, -1
+	if st.Uid != containerUID {
+		uid = containerUID
+	}
+	if st.Gid != containerGID {
+		gid = containerGID
+	}
+	return uid, gid
 }
 
 // inUserNamespace reports whether this process runs in a user namespace
@@ -450,11 +477,12 @@ func gpuDevices(uuids []string, driverRoot string) (map[string]map[string]string
 			return nil, "", fmt.Errorf("GPU %s is not on this node", u)
 		}
 		dev := "/dev/nvidia" + minor
-		devices[fmt.Sprintf("kairo-gpu-%d", i)] = map[string]string{"type": "unix-char", "source": dev, "path": dev}
+		// the attempt user opens them (Incus makes them 0660 root's)
+		devices[fmt.Sprintf("kairo-gpu-%d", i)] = map[string]string{"type": "unix-char", "source": dev, "path": dev, "mode": "0666"}
 	}
 	for _, name := range []string{"nvidiactl", "nvidia-uvm", "nvidia-uvm-tools"} {
 		if _, err := os.Stat("/dev/" + name); err == nil {
-			devices["kairo-"+name] = map[string]string{"type": "unix-char", "source": "/dev/" + name, "path": "/dev/" + name}
+			devices["kairo-"+name] = map[string]string{"type": "unix-char", "source": "/dev/" + name, "path": "/dev/" + name, "mode": "0666"}
 		}
 	}
 	dir, err := driverDir(driverRoot)
@@ -598,31 +626,48 @@ func devName(soname string) string {
 	return ""
 }
 
-// containerInit runs under Incus's init, the container's first process: it
-// confines the container, starts the attempt's argv in its own process
-// group, reaps whatever ends in the container and, once the argv has
-// exited, writes its exit and exits with it (which stops the container and
-// ends whatever still runs there). A signal that stops the attempt reaches
-// the argv directly (runInstance); the init outlives it.
+// containerInit runs under Incus's init, the container's first process, as
+// the container's root: it names the attempt's user (containerUID) in the
+// image, confines the container, hands the user what Kairo lets the attempt
+// write, starts the attempt's argv as that user in its own process group,
+// reaps whatever ends in the container and, once the argv has exited,
+// writes its exit and exits with it (which stops the container and ends
+// whatever still runs there). A signal that stops the attempt reaches the
+// argv directly (runInstance); the init outlives it.
 func containerInit(specPath string) int {
 	spec, err := readContainerSpec(specPath)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "kairo container:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
-	// a wslc container cannot mount: it runs as an ordinary user instead,
-	// to whom the image's files are read-only (container_wslc.go)
+	stdout, stderr := openContainerLog(containerStdout, os.Stdout), openContainerLog(containerStderr, os.Stderr)
+	// named while the image can still be written (before the confinement)
+	user := nameAttemptUser(stderr)
+	// a wslc container cannot mount: only its user keeps the argv off the
+	// image's files (container_wslc.go)
 	if spec.Runtime != "wslc" {
 		if err := confineMounts(spec.Writable, spec.Tmp); err != nil {
-			fmt.Fprintln(os.Stderr, "kairo container: confine:", err)
+			fmt.Fprintln(stderr, "kairo container: confine:", err)
 			return writeShimExit(containerExitIn, shimNotConfined)
 		}
 	}
-	stdout, stderr := openContainerLog(containerStdout, os.Stdout), openContainerLog(containerStderr, os.Stderr)
+	// what Kairo lets the attempt write is its user's: the runner hands it
+	// on a host (runInstance); here, where it could not (wslc, or nested in
+	// a Proxmox container)
+	for _, p := range spec.Writable {
+		var st unix.Stat_t
+		if unix.Stat(p, &st) == nil && st.Uid == containerUID && st.Gid == containerGID {
+			continue
+		}
+		if err := chownTree(p, toAttemptUserHere); err != nil {
+			fmt.Fprintf(stderr, "kairo container: hand %s to the attempt's user: %v\n", p, err)
+		}
+	}
 	if !waitForNetwork("/sys/class/net", "/proc/net/route", "/proc/net/ipv6_route", networkWait) {
 		fmt.Fprintln(stderr, "kairo container: no default route after", networkWait, "(starting without one)")
 	}
 	env := containerEnv(os.Environ(), spec.Env, len(spec.GPUs) > 0)
+	env = replaceEnv(replaceEnv(env, "USER", user), "LOGNAME", user)
 	// argv[0] is looked up on the attempt's PATH
 	_ = os.Setenv("PATH", containerEnvValue(env, "PATH"))
 	argv0, err := exec.LookPath(spec.Argv[0])
@@ -640,7 +685,7 @@ func containerInit(specPath string) int {
 	defer endTheRest()
 	defer stopLoaders(loaders)
 	cmd := &exec.Cmd{Path: argv0, Args: spec.Argv, Dir: spec.CWD, Env: env, Stdout: stdout, Stderr: stderr,
-		SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
+		SysProcAttr: &syscall.SysProcAttr{Setpgid: true, Credential: attemptCredential()}}
 	// caught, not ignored: the argv starts with the default dispositions.
 	// A stop of the container comes to this init (its runtime stops it: the
 	// runner asks it to), which passes it on to the argv's group; lxc's halt
@@ -669,6 +714,43 @@ func containerInit(specPath string) int {
 		fmt.Fprintf(stderr, "kairo container: %s ended by signal %d (%v)\n", spec.Argv[0], int(sig), sig)
 	}
 	return writeShimExit(containerExitIn, exit)
+}
+
+// attemptCredential is the attempt user's: its uid and gid, no other group.
+func attemptCredential() *syscall.Credential {
+	return &syscall.Credential{Uid: containerUID, Gid: containerGID, Groups: []uint32{}}
+}
+
+// nameAttemptUser gives the attempt's user (containerUID) a name in the
+// image (attemptAccount: /etc/passwd and /etc/group), so that what asks for
+// it (getpass, pwd, id -un, git, ssh) finds one, and returns it. Where the
+// image's files cannot be written it keeps none, told on logs: the name is
+// still the environment's (USER, LOGNAME).
+func nameAttemptUser(logs io.Writer) string {
+	passwd, _ := os.ReadFile("/etc/passwd")
+	group, _ := os.ReadFile("/etc/group")
+	name, passwdLine, groupLine := attemptAccount(string(passwd), string(group))
+	add := func(p string, body []byte, line string) {
+		if line == "" {
+			return
+		}
+		if len(body) > 0 && body[len(body)-1] != '\n' {
+			line = "\n" + line
+		}
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+		if err == nil {
+			_, err = f.WriteString(line + "\n")
+			if cerr := f.Close(); err == nil {
+				err = cerr
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(logs, "kairo container: name the attempt's user in %s: %v\n", p, err)
+		}
+	}
+	add("/etc/passwd", passwd, passwdLine)
+	add("/etc/group", group, groupLine)
+	return name
 }
 
 // containerRestGrace is how long what the argv left running in the
@@ -740,11 +822,13 @@ const loaderRestarts = 5
 
 // loaderProc is a stream's loader: how it is started, and its process.
 type loaderProc struct {
-	stream   string
-	args     []string
-	dir      string
-	env      []string
-	logs     *os.File
+	stream string
+	args   []string
+	dir    string
+	env    []string
+	logs   *os.File
+	// as is the user it runs as (the attempt's); nil: this process's
+	as       *syscall.Credential
 	pid      int
 	restarts int
 }
@@ -753,11 +837,22 @@ type loaderProc struct {
 type loaderProcs []*loaderProc
 
 func (p *loaderProc) start() error {
-	cmd := &exec.Cmd{Path: p.args[0], Args: p.args, Dir: p.dir, Env: p.env, Stdout: p.logs, Stderr: p.logs, SysProcAttr: &syscall.SysProcAttr{Setpgid: true}}
+	cmd := &exec.Cmd{Path: p.args[0], Args: p.args, Dir: p.dir, Env: p.env, Stdout: p.logs, Stderr: p.logs, SysProcAttr: &syscall.SysProcAttr{Setpgid: true, Credential: p.as}}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	p.pid = cmd.Process.Pid
+	return nil
+}
+
+// ownedByAttempt hands the attempt user what the init made for it (a
+// stream's directory and files), each path itself.
+func ownedByAttempt(paths ...string) error {
+	for _, p := range paths {
+		if err := os.Lchown(p, containerUID, containerGID); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -803,7 +898,8 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 	}
 	var procs loaderProcs
 	for _, s := range spec.Streams {
-		dir := path.Join(containerRoot, "run", "streams", s.Name)
+		streams := path.Join(containerRoot, "run", "streams")
+		dir := path.Join(streams, s.Name)
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return procs, env, err
 		}
@@ -834,6 +930,14 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 				return procs, env, err
 			}
 			args = append(args, "--positions", p, "--world", strconv.Itoa(s.World))
+			if err := ownedByAttempt(p); err != nil {
+				return procs, env, err
+			}
+		}
+		// the loader runs as the attempt's user: its state, socket and status
+		// are written there
+		if err := ownedByAttempt(streams, dir, specPath); err != nil {
+			return procs, env, err
 		}
 		if spec.RawDir != "" {
 			args = append(args, "--raw", spec.RawDir)
@@ -841,7 +945,7 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		if spec.RawRequests != "" {
 			args = append(args, "--raw-requests", spec.RawRequests)
 		}
-		p := &loaderProc{stream: s.Name, args: args, dir: spec.CWD, env: env, logs: logs}
+		p := &loaderProc{stream: s.Name, args: args, dir: spec.CWD, env: env, logs: logs, as: attemptCredential()}
 		if err := p.start(); err != nil {
 			return procs, env, fmt.Errorf("stream %s: start its loader: %w", s.Name, err)
 		}
