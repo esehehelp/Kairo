@@ -63,9 +63,13 @@ labels = { environment = "windows" }
 		t.Fatal(err)
 	}
 	object := imported[0].ObjectID
+	var writer string
+	if err := store.db.QueryRowContext(ctx, `SELECT executor_id FROM data_objects WHERE id=$1`, object).Scan(&writer); err != nil {
+		t.Fatal(err)
+	}
 	list := "path\tbytes\tsha256\tmtime_ns\nshard-0.bin\t4\t" + strings.Repeat("ab", 32) + "\t1\n"
 	sum := sha256.Sum256([]byte(list))
-	if err = store.RecordPack(ctx, PackMade{ObjectID: object, ExecutorID: "win-exec", ManifestPath: "D:/kairo/packs/" + object + ".tar.zst.files.tsv",
+	if err = store.RecordPack(ctx, PackMade{ObjectID: object, ExecutorID: writer, ManifestPath: "D:/kairo/packs/" + object + ".tar.zst.files.tsv",
 		ContentBytes: 4, Files: 1, ManifestSHA256: hex.EncodeToString(sum[:]), Identity: true, Manifest: list}); err != nil {
 		t.Fatal(err)
 	}
@@ -80,12 +84,12 @@ labels = { environment = "windows" }
 	if err := store.ReconcileProjectTasks(ctx); err != nil {
 		t.Fatal(err)
 	}
-	// win-exec retired for a container executor before it packed the move
+	// the writer retired for a container executor before it packed the move
 	if err := store.UpsertExecutor(ctx, Executor{ID: "win-wslc", NodeID: "node", Kind: "wslc", Attributes: json.RawMessage(`{"environment":"linux","pack_addr":"192.0.2.12:7475"}`), Enabled: true}); err != nil {
 		t.Fatal(err)
 	}
 	gone, err := store.UndeclareExecutors(ctx, "node", []string{"win-wslc"})
-	if err != nil || !slices.Contains(gone, "win-exec") {
+	if err != nil || !slices.Contains(gone, writer) {
 		t.Fatalf("undeclared %v %v", gone, err)
 	}
 	var owner string
