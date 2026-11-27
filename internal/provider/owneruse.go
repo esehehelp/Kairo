@@ -14,8 +14,8 @@ import (
 )
 
 // OwnerUse is how a node's providers tell that its owner uses one of its
-// resources (README: Owner use; issue #21): a GPU, the node's CPU or its
-// RAM taken by something that is not Kairo's work. The provider reports it
+// resources (README: Owner use; issue #21): a GPU or the node's CPU taken
+// by something that is not Kairo's work. The provider reports it
 // as a claim of kind owner_use on the resource; the daemon then places
 // nothing on it, suspends the checkpointable work holding it, and keeps off
 // it until it has been free for a while.
@@ -29,7 +29,10 @@ import (
 //     Incus instances kairo-*, on Windows the wslc VM's vmmemwslc*
 //     processes) at least CPUPercent. Not reported where Kairo's share
 //     cannot be read (it would be taken for its owner's).
-//   - RAM: less available than RAMFreeBytes.
+//   - RAM: no claim. The floor (RAMFreeBytes) is kept free: admission
+//     leaves it free, and while less is available for a while the daemon
+//     suspends work on the node (memory pressure, issue #45), whatever
+//     took it (the owner, a kernel leak, Kairo's own work).
 //
 // Its owner at the keyboard (input within ownerPresence, Windows: as the
 // input reporter in the owner's session writes it, InputFile) makes each

@@ -862,7 +862,7 @@ func (m *planModel) fit(node string, demand planDemand, ov planOverlay, freed fu
 		if c.kind == "cpu" {
 			f.fail("insufficient_cpu", fmt.Sprintf("%s: %s CPU needed, %s free", node, formatMillis(c.quantity), formatMillis(have)), false)
 		} else if c.kind == "ram" && row.floor > 0 {
-			f.fail("insufficient_ram", fmt.Sprintf("%s: %s ram needed, %s free (%s kept free for its owner)", node, formatBytes(c.quantity), formatBytes(have), formatBytes(row.floor)), false)
+			f.fail("insufficient_ram", fmt.Sprintf("%s: %s ram needed, %s free (%s kept free on the node)", node, formatBytes(c.quantity), formatBytes(have), formatBytes(row.floor)), false)
 		} else {
 			f.fail("insufficient_"+c.kind, fmt.Sprintf("%s: %s %s needed, %s free", node, formatBytes(c.quantity), name, formatBytes(have)), false)
 		}

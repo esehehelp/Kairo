@@ -276,7 +276,7 @@ func TestPlannerLeavesTheOwnersRAMFloorFree(t *testing.T) {
 	if r := c.reserve("exec-a"); r != nil {
 		t.Fatalf("reserved %s under its owner's floor", r.Execution.ClientRequestID)
 	}
-	if w := c.wait(big.ID); w.Reason != "insufficient_ram" || !strings.Contains(w.Message, "2.0 GiB free (3.0 GiB kept free for its owner)") {
+	if w := c.wait(big.ID); w.Reason != "insufficient_ram" || !strings.Contains(w.Message, "2.0 GiB free (3.0 GiB kept free on the node)") {
 		t.Fatalf("big waits for %+v", w)
 	}
 	small := c.submit(planSpec("small", "p2", 0, 0, 1000, 1))

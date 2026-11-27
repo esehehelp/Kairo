@@ -32,13 +32,18 @@ type Host struct {
 	cpuMu     sync.Mutex
 	cpuPrev   cpuTimes
 	cpuHave   bool
+	// ramUnder is when the RAM available went under the floor (zero: it is
+	// not under it)
+	ramUnder time.Time
 }
 
 func (p *Host) ID() string { return p.ProviderID }
 
 // snapshot is the node's cpu and ram as observed now, the cpu with the CPU
-// package power when the meter has a reading, the ram with the floor its
-// owner keeps free now (evidence floor_bytes: admission leaves it free).
+// package power when the meter has a reading, the ram with the floor kept
+// free for its owner now (evidence floor_bytes: admission leaves it free)
+// and, while less than that is available, since when (under_floor_since:
+// the daemon then suspends work on the node, store/memorypressure.go).
 func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 	t := time.Now().UTC()
 	ttl := p.TTL
@@ -52,7 +57,19 @@ func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 	ramEvidence := empty
 	if p.Owner.enabled() && ramTotal > 0 {
 		present, _ := p.Owner.present()
-		ramEvidence, _ = json.Marshal(map[string]int64{"floor_bytes": p.Owner.ramFloor(ramTotal, present)})
+		floor := p.Owner.ramFloor(ramTotal, present)
+		evidence := map[string]any{"floor_bytes": floor}
+		p.cpuMu.Lock()
+		if ramFree >= floor {
+			p.ramUnder = time.Time{}
+		} else {
+			if p.ramUnder.IsZero() {
+				p.ramUnder = t
+			}
+			evidence["under_floor_since"] = p.ramUnder.Format(time.RFC3339Nano)
+		}
+		p.cpuMu.Unlock()
+		ramEvidence, _ = json.Marshal(evidence)
 	}
 	observations := []store.Observation{{ResourceID: resources[0].ID, ObservedAt: stamp, ValidUntil: valid, TotalBytes: &cpuTotal, FreeBytes: &cpuTotal, Evidence: empty}, {ResourceID: resources[1].ID, ObservedAt: stamp, ValidUntil: valid, TotalBytes: &ramTotal, FreeBytes: &ramFree, Evidence: ramEvidence}}
 	p.meterOnce.Do(func() {
@@ -64,12 +81,14 @@ func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 		watts := reading.Watts
 		observations[0].Device = &store.DeviceSample{PowerW: &watts}
 	}
-	return Snapshot{Resources: resources, Observations: observations, Claims: p.ownerClaims(resources[0].ID, resources[1].ID, ramTotal, ramFree)}
+	return Snapshot{Resources: resources, Observations: observations, Claims: p.ownerClaims(resources[0].ID)}
 }
 
-// ownerClaims are the owner_use claims of the node's CPU and RAM
-// (owneruse.go): the CPU's from this reading of its CPU time and the last.
-func (p *Host) ownerClaims(cpuID, ramID string, ramTotal, ramFree int64) []store.ExternalClaim {
+// ownerClaims are the owner_use claims of the node's CPU (owneruse.go),
+// from this reading of its CPU time and the last. Its RAM has none: less
+// available than the floor says nothing of who took it (issue #45), and is
+// told with the RAM's observation instead (snapshot).
+func (p *Host) ownerClaims(cpuID string) []store.ExternalClaim {
 	if !p.Owner.enabled() {
 		return nil
 	}
@@ -91,9 +110,6 @@ func (p *Host) ownerClaims(cpuID, ramID string, ramTotal, ramFree int64) []store
 					"owner_percent": owner * 100, "threshold_percent": threshold, "owner_present": present}))
 			}
 		}
-	}
-	if floor := p.Owner.ramFloor(ramTotal, present); ramTotal > 0 && ramFree < floor {
-		claims = append(claims, ownerClaim(ramID, map[string]any{"source": "observed", "available_bytes": ramFree, "floor_bytes": floor, "owner_present": present}))
 	}
 	return claims
 }

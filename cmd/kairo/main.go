@@ -292,6 +292,13 @@ func serve(args []string) error {
 				} else if n > 0 {
 					logger.Info("work suspended for its owner's use of a resource", "suspends", n)
 				}
+				// a node short of RAM for a while: its work that can
+				// checkpoint gives it back, one attempt at a time
+				if n, err := st.ReconcileMemoryPressure(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("memory pressure reconciliation failed", "error", err)
+				} else if n > 0 {
+					logger.Info("work suspended for its node's memory pressure", "suspends", n)
+				}
 				select {
 				case <-ctx.Done():
 					return
