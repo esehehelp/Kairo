@@ -294,12 +294,14 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 	}
 	spec.Runtime = opts.runtime
 	// the ordinary user it runs as (containerUID) has no home in the image:
-	// one in the scratch
-	home := filepath.Join(scratch, "home")
-	if err := os.MkdirAll(home, 0o777); err != nil {
-		return nil, err
+	// one in the scratch, unless the execution declares its own
+	if _, declared := launch.Env["HOME"]; !declared {
+		home := filepath.Join(scratch, "home")
+		if err := os.MkdirAll(home, 0o777); err != nil {
+			return nil, err
+		}
+		env = setEnv(env, "HOME", home)
 	}
-	env = setEnv(env, "HOME", home)
 	paths := map[string]string{scratch: containerRoot + "/scratch", output: containerRoot + "/output"}
 	if cache != "" {
 		spec.Mounts = append(spec.Mounts, containerMount{Source: cache, Path: containerRoot + "/cache"})

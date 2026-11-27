@@ -54,9 +54,11 @@ func (c *planCluster) suspendsOf(origin string) []string {
 }
 
 // A node under its RAM floor for a while gets RAM back from its work that
-// can checkpoint, the attempt holding the most first and one at a time; a
-// short dip, or an observation no longer valid, gives nothing back. It is no
-// owner's use: no claim, and nothing more is held off the node.
+// can checkpoint, the attempt holding the most first and one at a time: the
+// next only once the last has ended and the node is seen under its floor
+// after that. A short dip, or an observation no longer valid, gives nothing
+// back. It is no owner's use: no claim, and nothing more is held off the
+// node.
 func TestANodeShortOfRAMGetsItBackFromItsBiggestWorkFirst(t *testing.T) {
 	c := newPlanCluster(t)
 	c.node("a", 0, 8000, 32, 100)
@@ -91,10 +93,24 @@ func TestANodeShortOfRAMGetsItBackFromItsBiggestWorkFirst(t *testing.T) {
 	if err := c.store.db.QueryRow(`SELECT reason FROM commands WHERE origin=$1`, OriginMemoryPressure).Scan(&reason); err != nil || reason == "" {
 		t.Fatalf("reason %q %v", reason, err)
 	}
-	// the first checkpointed, the node still under its floor: the next
+	// the first checkpointed but still running: its RAM is not back yet
 	if _, err := c.store.testExec(`UPDATE commands SET state='checkpointed' WHERE origin=$1`, OriginMemoryPressure); err != nil {
 		t.Fatal(err)
 	}
+	if n := c.reconcilePressure(); n != 0 {
+		t.Fatalf("the first not ended: %d suspends", n)
+	}
+	// ended, but the node not observed since
+	ended := time.Now()
+	if _, err := c.store.testExec(`UPDATE attempts SET state='quiesced',exited_at=$1 WHERE id=(SELECT attempt_id FROM commands WHERE origin=$2)`,
+		ended.UTC().Format(time.RFC3339Nano), OriginMemoryPressure); err != nil {
+		t.Fatal(err)
+	}
+	if n := c.reconcilePressure(); n != 0 {
+		t.Fatalf("the first's end not seen: %d suspends", n)
+	}
+	// seen after its end, still under its floor: the next
+	c.ramSeen("a", 2*gib, now.Add(-time.Minute), ended.Add(time.Second))
 	c.reconcilePressure()
 	if got := c.suspendsOf(OriginMemoryPressure); len(got) != 2 || got[1] != small.ID {
 		t.Fatalf("suspends %v, then %s", got, small.ID)

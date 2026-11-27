@@ -120,16 +120,27 @@ func (w *wslcVRAM) read() (map[string]int64, error) {
 }
 
 // wslcVMProcesses are the wslc VM's processes that can hold GPU memory: its
-// vmmemwslc* process and that one's parent, the VM's worker (vmwp), from the
-// system's process list (a VM's processes cannot be opened).
+// vmmemwslc* process and that one's parent when it is the VM's worker
+// (vmwp.exe: a parent that ended may have left its pid to another process),
+// from the system's process list (a VM's processes cannot be opened).
 func wslcVMProcesses() map[uint32]bool {
-	out := map[uint32]bool{}
+	names := map[uint32]string{}
+	parents := map[uint32]uint32{}
 	eachSystemProcess(func(p *windows.SYSTEM_PROCESS_INFORMATION) {
-		if strings.HasPrefix(strings.ToLower(p.ImageName.String()), "vmmemwslc") {
-			out[uint32(p.UniqueProcessID)] = true
-			out[uint32(p.InheritedFromUniqueProcessID)] = true
-		}
+		pid := uint32(p.UniqueProcessID)
+		names[pid] = strings.ToLower(p.ImageName.String())
+		parents[pid] = uint32(p.InheritedFromUniqueProcessID)
 	})
+	out := map[uint32]bool{}
+	for pid, name := range names {
+		if !strings.HasPrefix(name, "vmmemwslc") {
+			continue
+		}
+		out[pid] = true
+		if parent := parents[pid]; names[parent] == "vmwp.exe" {
+			out[parent] = true
+		}
+	}
 	return out
 }
 

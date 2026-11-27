@@ -322,7 +322,7 @@ Kairo が使うマシンには持ち主がいます（デスクトップの GPU 
 - **RAM の下限**: 持ち主のために、RAM の一部を空けておきます。下限は `ram_free_mib`（既定は 2 GiB とメモリの 5% の大きい方。持ち主がいるときは `ram_free_mib_present`）です。
   - provider は RAM の観測に、そのときの下限を添えます（evidence の `floor_bytes`）。
   - **新しい仕事**: アドミッションは、観測された空きからこの下限を引いた分だけを空きとして数えます。置けばノードが下限を割る仕事は `insufficient_ram` で待ちます（理由に「kept free on the node」と出ます）。予約の側（総量から予約を引いた分）には下限を引かないので、予約で埋まっているノードで置ける量は変わりません。
-  - **メモリ不足（memory pressure）**: それでも使える量が下限を割ることがあります（仕事が予約より大きく育つ、持ち主のアプリやカーネルの漏れが RAM を取る、など）。そのとき provider は、割り始めた時刻を観測に添えます（evidence の `under_floor_since`）。割った状態が 30 秒続くと、デーモンはそのノードの仕事のうち checkpoint できるものを、RAM を最も多く持つものから 1 つずつサスペンドします（origin `memory_pressure`。前のサスペンドが終わり、まだ下限を割っていれば次）。原因が何であれ、Kairo が返せるのは自分の仕事の分だけだからです。持ち主の使用の claim は付けず、10 分の保持もないので、空きが戻ればアドミッションの勘定どおりにまた置かれます。
+  - **メモリ不足（memory pressure）**: それでも使える量が下限を割ることがあります（仕事が予約より大きく育つ、持ち主のアプリやカーネルの漏れが RAM を取る、など）。そのとき provider は、割り始めた時刻を観測に添えます（evidence の `under_floor_since`）。割った状態が 30 秒続くと、デーモンはそのノードの仕事のうち checkpoint できるものを、RAM を最も多く持つものから 1 つずつサスペンドします（origin `memory_pressure`）。次を止めるのは、前に止めた仕事が終わり、その後の観測でもまだ下限を割っているときだけです（返した RAM がまだ観測に表れていないうちに、止めすぎないため）。原因が何であれ、Kairo が返せるのは自分の仕事の分だけだからです。持ち主の使用の claim は付けず、10 分の保持もないので、空きが戻ればアドミッションの勘定どおりにまた置かれます。
 
 ## CLI からの Task 監視とログ確認
 
@@ -708,7 +708,7 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 
 どのランタイムでも、`argv` は同じ一般ユーザー（uid・gid `1000`）で動きます（issue #46）。プロジェクトから見て、Incus と wslc の違いはありません。
 
-- **名前**: コンテナの init は root で始まり、閉じ込める前に、イメージの `/etc/passwd` と `/etc/group` に uid `1000` の行を足します。イメージにすでに uid `1000` の名前があれば（`ubuntu` など）、それを使います。なければ `kairo`（ホームは `/kairo/scratch/home`）です。`USER` と `LOGNAME` にその名前を、`HOME` に scratch の `home` を入れます。`getpass.getuser()`、`pwd.getpwuid()`、`id -un`、git、ssh が動きます。イメージのファイルに書けない場合は、名前は環境変数だけになります（stderr に出ます）。
+- **名前**: コンテナの init は root で始まり、閉じ込める前に、イメージの `/etc/passwd` と `/etc/group` に uid `1000` の行を足します。イメージにすでに uid `1000` の名前があれば（`ubuntu` など）、それを使います。なければ `kairo`（ホームは `/kairo/scratch/home`）です。`USER` と `LOGNAME` にその名前を、`HOME` に scratch の `home` を入れます（Execution が env で `HOME` を宣言していれば、そちらを使います）。`getpass.getuser()`、`pwd.getpwuid()`、`id -un`、git、ssh が動きます。イメージのファイルに書けない場合は、名前は環境変数だけになります（stderr に出ます）。
 - **書ける場所**: Kairo が渡す書き込み先（`scratch`・`output`・`cache` など）は、そのユーザーのものにします。Incus では、ランナーがホストの側で、コンテナの外の id とコンテナの root が持つものを渡します（root で動いていた以前の Attempt が書いたキャッシュは、最初の 1 回で渡ります）。wslc（と、Proxmox のコンテナの中に入れ子になった Incus）では、init がコンテナの中で渡します。stream の Loader も同じユーザーで動きます。
 - **GPU**: Incus に渡す NVIDIA のデバイスは、そのユーザーが開けるよう `0666` にします。
 - 実行時に root を前提とするイメージ（実行中の `pip install` でイメージに書くなど）は動きません。
