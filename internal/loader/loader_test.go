@@ -260,13 +260,20 @@ func testData(t *testing.T) (Spec, string) {
 // collect takes every rank's items from a loader made from positions.
 func collect(t *testing.T, spec Spec, dir string, world int, positions []Position) [][]string {
 	t.Helper()
+	return collectKeeping(t, spec, dir, world, positions, "")
+}
+
+// collectKeeping is collect with the loader's order state kept in
+// orderState (a stream weighted by output).
+func collectKeeping(t *testing.T, spec Spec, dir string, world int, positions []Position, orderState string) [][]string {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}, Positions: positions, World: world}
+	srv := &Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}, OrderState: orderState}, Positions: positions, World: world}
 	go srv.Serve(ctx, ln)
 	out := make([][]string, world)
 	var wg sync.WaitGroup
@@ -358,8 +365,9 @@ func TestAStreamIsTheSameFromAnyPosition(t *testing.T) {
 
 // The test binary is a stage when KAIRO_LOADER_TEST_STAGE is set: each
 // record's outputs are it in upper case, twice if it ends in 7, none if it
-// ends in 3; after KAIRO_LOADER_TEST_CRASH_AFTER records it fails once
-// (the file KAIRO_LOADER_TEST_CRASHED marks that it did).
+// ends in 3 (a record beginning with b: KAIRO_LOADER_TEST_B_GIVES times, when
+// set); after KAIRO_LOADER_TEST_CRASH_AFTER records it fails once (the file
+// KAIRO_LOADER_TEST_CRASHED marks that it did).
 func TestMain(m *testing.M) {
 	if os.Getenv("KAIRO_LOADER_TEST_STAGE") != "" {
 		os.Exit(testStage())
@@ -368,8 +376,9 @@ func TestMain(m *testing.M) {
 }
 
 func testStage() int {
-	crashAfter := -1
+	crashAfter, bGives := -1, -1
 	fmt.Sscan(os.Getenv("KAIRO_LOADER_TEST_CRASH_AFTER"), &crashAfter)
+	fmt.Sscan(os.Getenv("KAIRO_LOADER_TEST_B_GIVES"), &bGives)
 	marker := os.Getenv("KAIRO_LOADER_TEST_CRASHED")
 	if _, err := os.Stat(marker); marker == "" || err == nil {
 		crashAfter = -1
@@ -396,6 +405,10 @@ func testStage() int {
 		}
 		up := bytes.ToUpper(rec)
 		switch {
+		case bGives >= 0 && bytes.HasPrefix(rec, []byte("b")):
+			for range bGives {
+				emit(up)
+			}
 		case bytes.HasSuffix(rec, []byte("3")):
 		case bytes.HasSuffix(rec, []byte("7")):
 			emit(up)

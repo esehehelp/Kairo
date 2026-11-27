@@ -922,7 +922,7 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		var session [16]byte
 		_, _ = rand.Read(session[:])
 		args := []string{self, "loader", "serve", "--spec", specPath, "--listen", "unix:" + sock, "--session", hex.EncodeToString(session[:]), "--state", filepath.Dir(specPath),
-			"--status", path.Join(dir, StreamStatusFile)}
+			"--status", path.Join(dir, StreamStatusFile), "--order-state", path.Join(containerRoot, "output", StreamOrderStateDir, s.Name)}
 		if len(s.Positions) > 0 {
 			positions, _ := json.Marshal(s.Positions)
 			p := path.Join(dir, "positions.json")

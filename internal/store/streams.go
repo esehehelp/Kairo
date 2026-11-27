@@ -184,7 +184,7 @@ func launchStreamsTx(ctx context.Context, q queryer, executionID string) ([]Laun
 // the identity it was found to have (none yet: identified as it is read) and
 // its record count, when learned.
 func loaderSpecTx(ctx context.Context, q queryer, d orchestration.StreamDecl) (loader.Spec, error) {
-	spec := loader.Spec{Seed: d.Stream.Shuffle.Seed, Block: d.Stream.Shuffle.Block, ShuffleFiles: d.Stream.Shuffle.Files, MemoryBytes: d.Stream.MemoryBytes}
+	spec := loader.Spec{Seed: d.Stream.Shuffle.Seed, Block: d.Stream.Shuffle.Block, ShuffleFiles: d.Stream.Shuffle.Files, MemoryBytes: d.Stream.MemoryBytes, WeightBy: d.Stream.WeightBy}
 	if d.Stream.Epochs != nil {
 		spec.Epochs = *d.Stream.Epochs
 	}

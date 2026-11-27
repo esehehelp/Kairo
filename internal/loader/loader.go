@@ -57,6 +57,10 @@ type Loader struct {
 	// StateDir, when set, keeps which ranks were served across the
 	// loader's restarts (a file served-<rank> each).
 	StateDir string
+	// OrderState is where a stream weighted by output keeps where each
+	// rank's chunks begin (outputmix.go): the run's output, so that a
+	// continuation finds it.
+	OrderState string
 
 	mu        sync.Mutex
 	world     int
@@ -227,6 +231,9 @@ func (l *Loader) startLocked(parent context.Context) {
 // itself (every rank reads the raw records; only its own go through the
 // stages), and it waits for its own rank's room only.
 func (l *Loader) produceRank(ctx context.Context, gen *generation, r int, positions []Position) error {
+	if l.Spec.WeightBy == WeightByOutput {
+		return l.produceRankByOutput(ctx, gen, r, positions)
+	}
 	world := int64(len(positions))
 	pos := positions[r]
 	in, err := newInputs(l.Spec, l.Fetch, l.Learned, l.Identified)
