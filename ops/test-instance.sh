@@ -153,7 +153,8 @@ agent)
   [ -f "$linux" ] || { echo "$linux is missing (bash ops/build.sh)" >&2; exit 1; }
   test_node=$node-t
   # its node token, from the test daemon's database
-  token=$(inside "cd /srv/kairo && umask 077 && bin/kairo token create --config kairo.toml --name $test_node --role node --node $test_node --force --out /tmp/node.token >/dev/null && cat /tmp/node.token && rm /tmp/node.token")
+  # (a token it had before is revoked: the agent is given a new one)
+  token=$(inside "cd /srv/kairo && umask 077 && { bin/kairo token revoke --config kairo.toml $test_node >/dev/null 2>&1 || true; } && bin/kairo token create --config kairo.toml --name $test_node --role node --node $test_node --out /tmp/node.token >/dev/null && cat /tmp/node.token && rm /tmp/node.token")
   # its fabric address, once the test daemon gave it one (the agent's first start with a fabric)
   win=$(build_of "$sha" windows)
   fabric_addr=

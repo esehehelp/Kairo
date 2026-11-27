@@ -596,11 +596,20 @@ func LoadAgent(path string) (Agent, error) {
 		return a, errors.New("owner_use: thresholds are percentages (0-100) and MiB, not negative")
 	}
 	if p := a.Packs; p.Listen != "" || p.Addr != "" || p.CertFile != "" || p.KeyFile != "" {
-		if p.Listen == "" || p.Addr == "" || p.CertFile == "" || p.KeyFile == "" {
-			return a, errors.New("packs needs listen, addr, cert_file and key_file together")
+		// on the fabric, addr may be left out: the node's fabric address
+		// names the endpoint (issue #47)
+		if p.Listen == "" || p.Addr == "" && !a.Fabric.Enabled || p.CertFile == "" || p.KeyFile == "" {
+			return a, errors.New("packs needs listen, addr, cert_file and key_file together (addr may be left out on the fabric)")
 		}
-		if _, port, err := net.SplitHostPort(p.Addr); err != nil || port == "" {
-			return a, fmt.Errorf("packs.addr %q is not host:port", p.Addr)
+		if p.Addr != "" {
+			if _, port, err := net.SplitHostPort(p.Addr); err != nil || port == "" {
+				return a, fmt.Errorf("packs.addr %q is not host:port", p.Addr)
+			}
+		}
+		if p.Addr == "" {
+			if _, port, err := net.SplitHostPort(p.Listen); err != nil || port == "" {
+				return a, fmt.Errorf("packs.listen %q is not host:port (its port names the endpoint at the fabric address)", p.Listen)
+			}
 		}
 	}
 	if a.Node.OS == "" {
