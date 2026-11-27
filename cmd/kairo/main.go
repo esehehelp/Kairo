@@ -12,11 +12,13 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 
 	"kairo/internal/api"
 	"kairo/internal/config"
+	"kairo/internal/fabric"
 	"kairo/internal/executor"
 	"kairo/internal/hwpolicy"
 	"kairo/internal/secfile"
@@ -120,6 +122,25 @@ func serve(args []string) error {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// the daemon's own node on the fabric (issue #47), synced with the
+	// store itself
+	if f := daemonConfig.Fabric; f.Prefix != "" && f.Join {
+		keyFile, iface, port := f.KeyFile, f.Interface, f.ListenPort
+		if keyFile == "" {
+			keyFile = filepath.Join(filepath.Dir(*configPath), "fabric.key")
+		}
+		if iface == "" {
+			iface = fabric.DefaultInterface
+		}
+		if port == 0 {
+			port = fabric.DefaultListenPort
+		}
+		fab := &fabric.Manager{Interface: iface, ListenPort: port, KeyFile: keyFile, Endpoints: f.Endpoints, Logger: logger,
+			Sync: func(ctx context.Context, self store.FabricSelf) (store.FabricView, error) {
+				return st.SyncFabric(ctx, daemonConfig.Node.ID, f.Prefix, self)
+			}}
+		go fab.Run(ctx)
+	}
 	defer stop()
 	pgDump := daemonConfig.PGDump
 	if pgDump == "" {

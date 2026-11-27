@@ -728,8 +728,16 @@ func LoadController(path string) (Controller, error) {
 
 // DaemonFabric is the daemon's [fabric]: Prefix is the IPv4 network the
 // nodes' fabric addresses are given from (each node's once, for good).
+// With Join the daemon's own node is on the fabric too, as an agent's is
+// (the other fields as AgentFabric's), so that nodes reach the daemon at
+// its fabric address.
 type DaemonFabric struct {
-	Prefix string `toml:"prefix"`
+	Prefix     string   `toml:"prefix"`
+	Join       bool     `toml:"join"`
+	Interface  string   `toml:"interface"`
+	ListenPort int      `toml:"listen_port"`
+	KeyFile    string   `toml:"key_file"`
+	Endpoints  []string `toml:"endpoints"`
 }
 
 // AgentFabric is an agent's [fabric] (issue #47): when Enabled, the agent
