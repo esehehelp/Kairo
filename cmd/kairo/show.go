@@ -165,6 +165,12 @@ func renderExecution(w io.Writer, e taskExecution, now time.Time) {
 		if r.ExecutorID != nil {
 			text += " executor " + *r.ExecutorID
 		}
+		if r.Address != "" {
+			text += " at " + r.Address
+			if r.VNI != nil {
+				text += fmt.Sprintf(" (segment %d)", *r.VNI)
+			}
+		}
 		line("gang", "%s", text)
 	}
 	for _, reason := range e.Waiting {

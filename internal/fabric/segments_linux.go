@@ -96,6 +96,15 @@ func (nlLink) removeSegment(ctx context.Context, names string, vni int) error {
 
 func linuxRemoveSegment(ctx context.Context, names string, vni int, bridgeToo bool) error {
 	bridge, vxlan := segmentDevices(names, vni)
+	// not while a container is on it (a port of the bridge besides the
+	// VXLAN device: its NIC's veth)
+	if ports, err := os.ReadDir("/sys/class/net/" + bridge + "/brif"); err == nil {
+		for _, p := range ports {
+			if p.Name() != vxlan {
+				return errSegmentInUse
+			}
+		}
+	}
 	if _, err := run(ctx, "ip", "link", "show", "dev", vxlan); err == nil {
 		if _, err := run(ctx, "ip", "link", "del", "dev", vxlan); err != nil {
 			return err

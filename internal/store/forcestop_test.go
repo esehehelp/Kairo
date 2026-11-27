@@ -346,7 +346,7 @@ func TestForceStopNotPickedUpIsReported(t *testing.T) {
 func TestForcePauseStopsEveryGangRank(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupGangInventory(t, store)
-	gangProject(t, store, true)
+	gangProject(t, store, false)
 	ctx := context.Background()
 	rank0, rank1 := launchGang(t, store)
 	scope := taskScopeID(t, store, "gangs", "training", "ddp")

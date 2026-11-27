@@ -344,6 +344,10 @@ type TaskGangRank struct {
 	AttemptID   *string `json:"attempt_id,omitempty"`
 	ExecutorID  *string `json:"executor_id,omitempty"`
 	NodeID      *string `json:"node_id,omitempty"`
+	// Address is the member's on its latest placement's segment (CIDR),
+	// VNI that segment's.
+	Address string `json:"address,omitempty"`
+	VNI     *int   `json:"vni,omitempty"`
 }
 
 // WaitReason is an admission block of the execution, or a closed admission
@@ -561,12 +565,16 @@ func (s *Store) taskAttemptDetails(ctx context.Context, taskScopeID string) (map
 // leader.
 func (s *Store) taskGangRanks(ctx context.Context, taskScopeID string) (map[string][]TaskGangRank, error) {
 	out := map[string][]TaskGangRank{}
-	err := eachRow(ctx, s.db, `SELECT g.leader_execution_id,m.rank,m.execution_id,e.state,a.id,COALESCE(a.executor_id,l.executor_id),x.node_id
+	err := eachRow(ctx, s.db, `SELECT g.leader_execution_id,m.rank,m.execution_id,e.state,a.id,COALESCE(a.executor_id,l.executor_id),x.node_id,
+		COALESCE(p.address,''),p.vni
 		FROM orchestration_task_executions te JOIN execution_gangs g ON g.leader_execution_id=te.execution_id JOIN gang_members m ON m.gang_id=g.id JOIN execution_requests e ON e.id=m.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+`
-		LEFT JOIN executors x ON x.id=COALESCE(a.executor_id,l.executor_id) WHERE te.task_scope_id=$1 ORDER BY m.rank`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		LEFT JOIN executors x ON x.id=COALESCE(a.executor_id,l.executor_id)
+		LEFT JOIN LATERAL (SELECT gpl.address,gp.vni FROM gang_placement_leases gpl JOIN gang_placements gp ON gp.id=gpl.placement_id
+			WHERE gpl.execution_id=e.id ORDER BY gp.created_at DESC LIMIT 1) p ON true
+		WHERE te.task_scope_id=$1 ORDER BY m.rank`, []any{taskScopeID}, func(rows *sql.Rows) error {
 		var leaderID string
 		var r TaskGangRank
-		if err := rows.Scan(&leaderID, &r.Rank, &r.ExecutionID, &r.State, &r.AttemptID, &r.ExecutorID, &r.NodeID); err != nil {
+		if err := rows.Scan(&leaderID, &r.Rank, &r.ExecutionID, &r.State, &r.AttemptID, &r.ExecutorID, &r.NodeID, &r.Address, &r.VNI); err != nil {
 			return err
 		}
 		out[leaderID] = append(out[leaderID], r)

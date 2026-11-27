@@ -68,6 +68,10 @@ type SchedulingPolicy struct {
 	// capped at 5% of its size: a node with a filesystem under it admits
 	// nothing, and no admission may take a filesystem under it. 0 disables it.
 	DiskMinFreeBytes int64
+	// GangSegmentPrefix is where the segments of gangs' generations take
+	// their subnets (the daemon's [fabric] segment_prefix): without it no
+	// gang is placed (its members meet on a segment of the fabric).
+	GangSegmentPrefix string
 }
 
 // DefaultDiskMinFreeBytes is the default filesystem watermark (5 GiB).
@@ -75,6 +79,9 @@ const DefaultDiskMinFreeBytes = 5 << 30
 
 // SetSchedulingPolicy replaces the admission settings.
 func (s *Store) SetSchedulingPolicy(p SchedulingPolicy) { s.policy = p }
+
+// SchedulingPolicy is the admission settings in force.
+func (s *Store) SchedulingPolicy() SchedulingPolicy { return s.policy }
 
 const (
 	// executorLiveWindow: an executor not seen for this long gets no
@@ -89,10 +96,6 @@ const liveLeaseStates = `('reserved','prepared','active','releasing','stale','re
 
 type planExecutor struct {
 	id, nodeID, attributes, nodeAttributes string
-}
-
-func (e planExecutor) gang() gangExecutor {
-	return gangExecutor{id: e.id, nodeID: e.nodeID, attributes: e.attributes, nodeAttributes: e.nodeAttributes}
 }
 
 type planGPU struct {
@@ -211,6 +214,8 @@ type planModel struct {
 	// owners are the nodes whose CPU or RAM their owner uses: the kinds
 	// (owneruse.go)
 	owners map[string][]string
+	// routing: the nodes that route on the fabric (run FRR)
+	routing map[string]bool
 }
 
 // planOverlay is what the pass has handed out so far: devices placed on or
@@ -350,7 +355,20 @@ func (m *planModel) loadExecutors(ctx context.Context, tx *sql.Tx, callerID stri
 		}
 		m.executors = append(m.executors, e)
 	}
-	return rows.Err()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	// the nodes that route on the fabric: a gang's members go there only
+	m.routing = map[string]bool{}
+	return eachRow(ctx, tx, `SELECT node_id FROM fabric_nodes WHERE routing`, nil, func(rows *sql.Rows) error {
+		var node string
+		if err := rows.Scan(&node); err != nil {
+			return err
+		}
+		m.routing[node] = true
+		return nil
+	})
 }
 
 func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
@@ -613,8 +631,7 @@ func (m *planModel) executor(executorID string) (planExecutor, bool) {
 // node and matches the selector (executors of one node share its resources),
 // else the one the pass chose.
 func (m *planModel) onNode(slot planSlot, caller planExecutor, selector string) planExecutor {
-	if caller.id != "" && caller.nodeID == slot.executor.nodeID && selectorMatches(selector, caller.nodeID, caller.attributes) &&
-		(slot.rank != 0 || slot.executor.gang().attribute("interconnect_addr") == "" || caller.gang().attribute("interconnect_addr") != "") {
+	if caller.id != "" && caller.nodeID == slot.executor.nodeID && selectorMatches(selector, caller.nodeID, caller.attributes) {
 		return caller
 	}
 	return slot.executor
@@ -1050,15 +1067,17 @@ func (p *planner) order(candidates []*planCandidate, visit func(*planCandidate) 
 	return nil
 }
 
-// slotsFor lists, per node, the executor a demand would run on there.
-func (p *planner) slotsFor(selector string, leader bool) []planExecutor {
+// slotsFor lists, per node, the executor a demand would run on there (a
+// gang member's: only on a node that routes on the fabric, where its
+// generation's segment can be).
+func (p *planner) slotsFor(selector string, gang bool) []planExecutor {
 	var slots []planExecutor
 	seen := map[string]bool{}
 	for _, e := range p.m.executors {
 		if seen[e.nodeID] || !selectorMatches(selector, e.nodeID, e.attributes) {
 			continue
 		}
-		if leader && e.gang().attribute("interconnect_addr") == "" {
+		if gang && !p.m.routing[e.nodeID] {
 			continue
 		}
 		seen[e.nodeID] = true
@@ -1084,11 +1103,18 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 	if c.gangID == "" {
 		ranks = []planRank{{rank: 0, candidate: c.executionCandidate, demand: c.demand}}
 	}
+	if c.gangID != "" && p.m.policy.GangSegmentPrefix == "" {
+		return planPlacement{wait: planWait{reason: "no_fabric", message: "a gang's members meet on a segment of the fabric: the daemon has no [fabric] segment_prefix"}}, time.Time{}
+	}
 	options := make([][]planExecutor, len(ranks))
 	for i, r := range ranks {
-		options[i] = p.slotsFor(r.candidate.selectorJSON, c.gangID != "" && r.rank == 0)
+		options[i] = p.slotsFor(r.candidate.selectorJSON, c.gangID != "")
 		if len(options[i]) == 0 {
-			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + "no live executor matches the executor labels"}}, time.Time{}
+			message := "no live executor matches the executor labels"
+			if c.gangID != "" {
+				message = "no live executor on a node that routes on the fabric (runs FRR) matches the executor labels"
+			}
+			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + message}}, time.Time{}
 		}
 	}
 	// Where its run's output directory is (outputhome.go): it waits for it,

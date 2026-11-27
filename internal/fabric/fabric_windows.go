@@ -326,6 +326,9 @@ func (v *vmLink) ensureSegment(ctx context.Context, names string, seg store.Fabr
 
 func (v *vmLink) removeSegment(ctx context.Context, names string, vni int) error {
 	if _, err := v.do(ctx, nil, "segment-remove", names, strconv.Itoa(vni)); err != nil {
+		if strings.Contains(err.Error(), errSegmentInUse.Error()) {
+			return errSegmentInUse
+		}
 		return err
 	}
 	network := SegmentNetwork(names, vni)
@@ -364,3 +367,7 @@ func (r vmRouter) remove(ctx context.Context) error {
 func (r vmRouter) show(ctx context.Context, command string) ([]byte, error) {
 	return r.v.do(ctx, nil, "router-show", r.name, command)
 }
+
+// segmentDevice is what a container joins segment vni by: its wslc
+// network.
+func segmentDevice(names string, vni int) string { return SegmentNetwork(names, vni) }

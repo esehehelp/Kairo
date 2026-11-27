@@ -2,13 +2,53 @@ package fabric
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"kairo/internal/store"
 )
+
+// errSegmentInUse: a segment is not taken down while a container is on it
+// (a port of its bridge other than its VXLAN device); it is at a later sync.
+var errSegmentInUse = errors.New("a container is on the segment")
+
+// launchedSegmentKept: a segment put on the node for a launch
+// (EnsureSegment) is not taken down for this long by a sync whose view
+// does not have it yet (one asked for before the gang was placed).
+const launchedSegmentKept = 10 * time.Minute
+
+func (m *Manager) names() string {
+	if m.Names == "" {
+		return DefaultNames
+	}
+	return m.Names
+}
+
+// EnsureSegment puts seg on this node now, its devices (on Windows its
+// network too), for a gang member's launch, before a sync would; it
+// returns the device a container joins it by (segmentDevice).
+func (m *Manager) EnsureSegment(ctx context.Context, seg store.FabricSegment) (string, error) {
+	m.mu.Lock()
+	view, address := m.view, m.address
+	m.mu.Unlock()
+	if !m.Routing || view.Routing == nil || address == "" || m.link == nil {
+		return "", errors.New("this node carries no segments yet (not on the fabric, or not told to route)")
+	}
+	m.segMu.Lock()
+	defer m.segMu.Unlock()
+	if err := m.link.ensureSegment(ctx, m.names(), seg, address, view.Routing.VXLANPort); err != nil {
+		return "", err
+	}
+	if m.launched == nil {
+		m.launched = map[int]time.Time{}
+	}
+	m.launched[seg.VNI] = m.now()
+	return segmentDevice(m.names(), seg.VNI), nil
+}
 
 // Segments and routing (issue #47, phase 2). A segment is an L2 network
 // over VXLAN: on each of its nodes a bridge with a VXLAN device as a port,
@@ -63,10 +103,7 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 	if !m.Routing {
 		return nil
 	}
-	names := m.Names
-	if names == "" {
-		names = DefaultNames
-	}
+	names := m.names()
 	r := view.Routing
 	if r == nil {
 		if m.router != nil {
@@ -74,6 +111,8 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 		}
 		return nil
 	}
+	m.segMu.Lock()
+	defer m.segMu.Unlock()
 	want := map[int]bool{}
 	for _, seg := range view.Segments {
 		want[seg.VNI] = true
@@ -86,10 +125,19 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 		return err
 	}
 	for _, vni := range have {
-		if !want[vni] {
-			if err := m.link.removeSegment(ctx, names, vni); err != nil {
-				m.logger().Warn("segment not taken down (taken down at a later sync)", "vni", vni, "error", err)
-			}
+		if want[vni] {
+			continue
+		}
+		if at, ok := m.launched[vni]; ok && m.now().Sub(at) < launchedSegmentKept {
+			continue
+		}
+		delete(m.launched, vni)
+		err := m.link.removeSegment(ctx, names, vni)
+		switch {
+		case errors.Is(err, errSegmentInUse):
+			m.logger().Debug("segment kept while a container is on it", "vni", vni)
+		case err != nil:
+			m.logger().Warn("segment not taken down (taken down at a later sync)", "vni", vni, "error", err)
 		}
 	}
 	if m.router == nil {

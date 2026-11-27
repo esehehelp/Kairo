@@ -19,6 +19,7 @@ type fakeLink struct {
 	handshakes map[string]time.Time
 	endpoints  map[string]string
 	segs       map[int]string // VNI: "local:port mtu M"
+	inUse      map[int]bool   // a container is on it
 	frr        fakeRouter
 }
 
@@ -64,6 +65,9 @@ func (f *fakeLink) ensureSegment(_ context.Context, _ string, seg store.FabricSe
 }
 
 func (f *fakeLink) removeSegment(_ context.Context, _ string, vni int) error {
+	if f.inUse[vni] {
+		return errSegmentInUse
+	}
 	delete(f.segs, vni)
 	return nil
 }
@@ -297,5 +301,56 @@ func TestARoutingNodeIsGivenItsSegmentsAndFRR(t *testing.T) {
 	}
 	if !link.frr.removed {
 		t.Fatal("FRR kept on a node that routes no more")
+	}
+}
+
+// A gang member's segment is put on the node at its launch, before a sync
+// would: a sync whose view does not have it yet leaves it a while, and none
+// takes it down while a container is on it.
+func TestASegmentPutUpForALaunchIsKept(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "fabric.key")
+	view := store.FabricView{Address: "10.209.0.4", Prefix: "10.209.0.0/16", Peers: []store.FabricNode{},
+		Routing: &store.FabricRouting{ASN: 4200000000, VXLANPort: 4790}}
+	link := &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}, inUse: map[int]bool{}}
+	now := time.Date(2026, 11, 28, 2, 0, 0, 0, time.UTC)
+	m := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: link, NodeID: "w", RouterName: "kairo-frr", Names: "tf",
+		Sync: func(context.Context, store.FabricSelf) (store.FabricView, error) { return view, nil },
+		Now:  func() time.Time { return now }}
+	ctx := context.Background()
+	if _, err := m.EnsureSegment(ctx, store.FabricSegment{VNI: 100000, Subnet: "10.210.0.0/24", MTU: 1370}); err == nil {
+		t.Fatal("a segment on a node that does not route")
+	}
+	m.Routing = true
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	device, err := m.EnsureSegment(ctx, store.FabricSegment{VNI: 100000, Subnet: "10.210.0.0/24", MTU: 1370})
+	if err != nil || device != segmentDevice("tf", 100000) || link.segs[100000] != "10.209.0.4:4790 mtu 1370" {
+		t.Fatalf("ensured %q %v: %v", device, err, link.segs)
+	}
+	// a sync that does not have it yet
+	now = now.Add(time.Minute)
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, on := link.segs[100000]; !on {
+		t.Fatal("a launch's segment taken down by a stale sync")
+	}
+	// later, with a container on it
+	now = now.Add(launchedSegmentKept)
+	link.inUse[100000] = true
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, on := link.segs[100000]; !on {
+		t.Fatal("a segment taken down under a container")
+	}
+	// the container gone
+	delete(link.inUse, 100000)
+	if err := m.Once(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, on := link.segs[100000]; on {
+		t.Fatal("a segment no view has, kept")
 	}
 }

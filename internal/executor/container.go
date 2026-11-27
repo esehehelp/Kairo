@@ -110,6 +110,23 @@ type containerSpec struct {
 	// and whose processes the agent cannot reach (the init passes a stop on
 	// to the argv).
 	Runtime string `json:"runtime,omitempty"`
+	// Gang: of a gang member, its generation's segment (container_gang.go).
+	Gang *containerGang `json:"gang,omitempty"`
+}
+
+// containerGang is a gang member's place on its generation's segment: the
+// node's device the container's second NIC is on (Incus: the segment's
+// bridge, its NIC gangNIC; wslc: the segment's network, which the runner
+// connects the container to with Address), the segment's MTU, this
+// member's address and every member's (CIDR, in rank order), its rank and
+// the placement (what members say to each other at the barrier).
+type containerGang struct {
+	Device    string   `json:"device"`
+	MTU       int      `json:"mtu"`
+	Address   string   `json:"address"`
+	Members   []string `json:"members"`
+	Rank      int      `json:"rank"`
+	Placement string   `json:"placement"`
 }
 
 // containerMount is a node path mounted in the container.
@@ -321,6 +338,19 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		Streams:  launch.Streams,
 	}
 	spec.Runtime = opts.runtime
+	if g := launch.Gang; g != nil {
+		// its generation's segment on this node, before the container joins it
+		if e.Segments == nil || g.VNI == 0 {
+			return nil, fmt.Errorf("a gang member: node %s carries no fabric segments (an agent on the fabric that routes)", e.NodeID)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), segmentWait)
+		device, err := e.Segments(ctx, store.FabricSegment{VNI: g.VNI, Subnet: g.Subnet, MTU: g.MTU})
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("the gang's segment %d on this node: %w", g.VNI, err)
+		}
+		spec.Gang = &containerGang{Device: device, MTU: g.MTU, Address: g.Address, Members: g.Addresses, Rank: g.Rank, Placement: g.PlacementID}
+	}
 	// the ordinary user it runs as (containerUID) has no home in the image:
 	// one in the scratch, unless the execution declares its own
 	if _, declared := launch.Env["HOME"]; !declared {

@@ -84,6 +84,10 @@ type Manager struct {
 	reported time.Time
 	relays   relays
 	router   router // FRR (segments.go), made the first time it is needed
+	// segMu keeps segments made and taken down one at a time (a sync and
+	// launches); launched: when each segment was put here for a launch
+	segMu    sync.Mutex
+	launched map[int]time.Time
 }
 
 // peerState is which of a peer's endpoints is tried, since when.

@@ -36,3 +36,8 @@ func (noLink) ensureSegment(context.Context, string, store.FabricSegment, string
 }
 func (noLink) removeSegment(context.Context, string, int) error { return errUnsupported }
 func (noLink) router(string, string, string) router             { return nil }
+
+func segmentDevice(names string, vni int) string {
+	bridge, _ := segmentDevices(names, vni)
+	return bridge
+}

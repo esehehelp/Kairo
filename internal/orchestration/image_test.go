@@ -56,11 +56,15 @@ func TestATaskRunsInADeclaredImage(t *testing.T) {
 		{`image = "py"`, `image = "other"`, "which is no [images.other]"},
 		{`ref = "python:3.12-slim"`, `ref = "Python"`, "repository element"},
 		{"source = \"code\"\n", "cwd = \"work\"\n", "must be an absolute path in the image"},
-		{`image = "py"`, "image = \"py\"\n[tasks.execution.gang]\nsize = 2", "a gang does not run in an image"},
+		{`image = "py"`, "image = \"py\"\ncheckpointable = true\n[tasks.execution.gang]\nsize = 2", "a gang is not checkpointable yet"},
 	} {
 		if _, err := Parse([]byte(strings.Replace(imageManifest, bad.from, bad.to, 1))); err == nil || !strings.Contains(err.Error(), bad.want) {
 			t.Fatalf("%s: %v", bad.to, err)
 		}
+	}
+	// a gang runs in an image, in a source
+	if _, err := Parse([]byte(strings.Replace(imageManifest, `image = "py"`, "image = \"py\"\n[tasks.execution.gang]\nsize = 2", 1))); err != nil {
+		t.Fatalf("a gang in an image: %v", err)
 	}
 	// without a source, an absolute cwd in the image
 	if _, err := Parse([]byte(strings.Replace(imageManifest, "source = \"code\"\n", "cwd = \"/work\"\n", 1))); err != nil {

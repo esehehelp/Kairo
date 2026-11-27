@@ -138,3 +138,10 @@ func (nlLink) removePeer(ctx context.Context, name, publicKey string) error {
 	}
 	return configure(name, wgtypes.Config{Peers: []wgtypes.PeerConfig{{PublicKey: key, Remove: true}}})
 }
+
+// segmentDevice is what a container joins segment vni by: its bridge (an
+// Incus bridged NIC's parent).
+func segmentDevice(names string, vni int) string {
+	bridge, _ := segmentDevices(names, vni)
+	return bridge
+}

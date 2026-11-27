@@ -8,9 +8,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +46,12 @@ type Local struct {
 	StallThreshold      time.Duration
 	Providers           map[string]provider.Provider
 	lastObservation     time.Time
+	// Segments puts a segment of the fabric on this node (its bridge and
+	// VXLAN device; on Windows, in the wslc VM, its network too) and names
+	// the device a container joins it by: a gang member's container is on
+	// its generation's segment. Nil: this node carries none (not on the
+	// fabric, or it does not route), and a gang member fails to launch here.
+	Segments func(ctx context.Context, seg store.FabricSegment) (string, error)
 
 	// Attempt logs (logspace.go): the free space the log directory's
 	// filesystem must have for a launch (zero: DefaultMinLogFreeBytes), how
@@ -508,21 +516,30 @@ func (e *Local) retryPendingGangRanks(ctx context.Context) error {
 	return nil
 }
 
-// gangEnv tells a gang rank where it stands: Kairo's names and the ones
-// torch.distributed reads; the interconnect interface (this executor's or
-// node's "interconnect_ifname" label) pins NCCL / gloo to the direct link.
+// gangEnv tells a gang member where it stands: Kairo's names, and the ones
+// torch.distributed and torchrun read (PET_*: torchrun's --nnodes,
+// --node-rank, --master-addr and --master-port, so that `torchrun
+// --nproc-per-node N train.py` needs no more). RANK and WORLD_SIZE count
+// members, for one process each (torchrun sets its workers' own). The
+// container's init adds NCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME, the
+// interface on the segment.
 func (e *Local) gangEnv(gang *store.GangLaunch) []string {
 	if gang == nil {
 		return nil
 	}
+	rank, size := strconv.Itoa(gang.Rank), strconv.Itoa(gang.Size)
+	port := strconv.Itoa(gang.MasterPort)
 	env := []string{
-		"KAIRO_GANG_ID=" + gang.GangID, fmt.Sprintf("KAIRO_GANG_RANK=%d", gang.Rank), fmt.Sprintf("KAIRO_GANG_SIZE=%d", gang.Size),
-		"KAIRO_GANG_MASTER_ADDR=" + gang.MasterAddr, fmt.Sprintf("KAIRO_GANG_MASTER_PORT=%d", gang.MasterPort),
-		fmt.Sprintf("RANK=%d", gang.Rank), fmt.Sprintf("WORLD_SIZE=%d", gang.Size), "LOCAL_RANK=0", "LOCAL_WORLD_SIZE=1",
-		"MASTER_ADDR=" + gang.MasterAddr, fmt.Sprintf("MASTER_PORT=%d", gang.MasterPort),
+		"KAIRO_GANG_ID=" + gang.GangID, "KAIRO_GANG_RANK=" + rank, "KAIRO_GANG_SIZE=" + size,
+		"KAIRO_GANG_MASTER_ADDR=" + gang.MasterAddr, "KAIRO_GANG_MASTER_PORT=" + port,
+		"RANK=" + rank, "WORLD_SIZE=" + size, "LOCAL_RANK=0", "LOCAL_WORLD_SIZE=1", "NODE_RANK=" + rank,
+		"MASTER_ADDR=" + gang.MasterAddr, "MASTER_PORT=" + port,
+		"PET_NNODES=" + size, "PET_NODE_RANK=" + rank, "PET_MASTER_ADDR=" + gang.MasterAddr, "PET_MASTER_PORT=" + port,
 	}
-	if ifname := e.Attributes["interconnect_ifname"]; ifname != "" {
-		env = append(env, "NCCL_SOCKET_IFNAME="+ifname, "GLOO_SOCKET_IFNAME="+ifname)
+	if gang.Address != "" {
+		if p, err := netip.ParsePrefix(gang.Address); err == nil {
+			env = append(env, "KAIRO_GANG_ADDRESS="+p.Addr().String())
+		}
 	}
 	return env
 }

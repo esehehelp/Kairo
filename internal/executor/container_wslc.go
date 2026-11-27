@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,6 +105,11 @@ func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string
 		logf("asked to stop before %s started: not started", spec.Instance)
 		return "", exitStoppedBeforeStart, nil
 	}
+	// a gang member: connected to its generation's segment once it exists
+	// (its init waits for the address)
+	if spec.Gang != nil {
+		go wslcJoinSegment(ctx, spec, logf)
+	}
 	// wslc sometimes fails a run before it made the container (two runs
 	// started at once): made again, a few times
 	for try := 1; ; try++ {
@@ -131,6 +137,28 @@ func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string
 		exit = -1
 	}
 	return spec.Instance, exit, nil
+}
+
+// wslcJoinSegment connects spec's container, once wslc has it, to its
+// gang's segment network with its address there.
+func wslcJoinSegment(ctx context.Context, spec containerSpec, logf func(string, ...any)) {
+	address, err := netip.ParsePrefix(spec.Gang.Address)
+	if err != nil {
+		logf("gang address %q: %v", spec.Gang.Address, err)
+		return
+	}
+	for deadline := time.Now().Add(gangAddressWait); !wslcHas(ctx, spec.Instance); {
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			logf("container %s not made in %s: not connected to segment network %s", spec.Instance, gangAddressWait, spec.Gang.Device)
+			return
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	if _, err := wslcCommand(ctx, "network", "connect", "--ip", address.Addr().String(), spec.Gang.Device, spec.Instance); err != nil {
+		logf("connect %s to segment network %s: %v", spec.Instance, spec.Gang.Device, err)
+		return
+	}
+	logf("%s connected to segment network %s as %s", spec.Instance, spec.Gang.Device, address.Addr())
 }
 
 // wslcRunning: wslc has a container named name running.

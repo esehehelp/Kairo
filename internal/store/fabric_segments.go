@@ -16,8 +16,8 @@ import (
 // runs FRR (FabricSelf.Routing) speaks iBGP over the fabric to the route
 // reflectors, with EVPN carrying where each segment's MACs are: the agent
 // makes a segment's bridge and VXLAN device, FRR advertises them and learns
-// the others'. A segment is made by hand for now (kairo fabric segment-add);
-// gangs get their own, one per generation (phase 3).
+// the others'. A segment is made by hand (kairo fabric segment-add), or for
+// a gang's generation, its own (gang.go, phase 3).
 
 // FabricPlan is how the daemon runs the fabric ([fabric] in its config).
 type FabricPlan struct {
@@ -70,6 +70,7 @@ const (
 	fabricReflectors   = 2
 	reflectorLiveness  = 10 * time.Minute
 	firstSegmentVNI    = 10000
+	firstGangVNI       = 100000 // the sequence fabric_gang_vni starts there
 	segmentSubnetBits  = 24
 	DefaultSegmentMTU  = 1370 // the fabric's MTU (1420) less VXLAN's 50
 	minimumSegmentMTU  = 1280 // Incus refuses a NIC under it
@@ -125,6 +126,24 @@ func segmentsOfTx(ctx context.Context, tx *sql.Tx, nodeID string) ([]FabricSegme
 // FRR): the lowest free VNI from 10000, the lowest free /24 of
 // segmentPrefix, and mtu (0: the default).
 func (s *Store) CreateFabricSegment(ctx context.Context, segmentPrefix string, nodes []string, mtu int) (FabricSegment, error) {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return FabricSegment{}, err
+	}
+	defer tx.Rollback()
+	seg, err := createSegmentTx(ctx, tx, segmentPrefix, nodes, mtu, "manual")
+	if err != nil {
+		return FabricSegment{}, err
+	}
+	return seg, tx.Commit()
+}
+
+// createSegmentTx makes a segment of purpose on nodes: a manual one the
+// lowest free VNI from 10000, a gang's the next of a sequence from 100000
+// (never one an earlier generation had: a member of it that comes back
+// late reaches no one of the new one); the lowest free /24 of
+// segmentPrefix; mtu (0: the default).
+func createSegmentTx(ctx context.Context, tx *sql.Tx, segmentPrefix string, nodes []string, mtu int, purpose string) (FabricSegment, error) {
 	p, err := netip.ParsePrefix(segmentPrefix)
 	if err != nil || !p.Addr().Is4() || p.Masked() != p || p.Bits() > segmentSubnetBits {
 		return FabricSegment{}, fmt.Errorf("%w: segment prefix %q: an IPv4 network of /%d or more (the daemon's [fabric] segment_prefix)", ErrFabric, segmentPrefix, segmentSubnetBits)
@@ -135,16 +154,12 @@ func (s *Store) CreateFabricSegment(ctx context.Context, segmentPrefix string, n
 	if mtu < minimumSegmentMTU || mtu > maximumSegmentMTUs {
 		return FabricSegment{}, fmt.Errorf("%w: segment MTU %d (from %d to %d)", ErrFabric, mtu, minimumSegmentMTU, maximumSegmentMTUs)
 	}
+	nodes = slices.Clone(nodes)
 	slices.Sort(nodes)
 	nodes = slices.Compact(nodes)
 	if len(nodes) == 0 {
 		return FabricSegment{}, fmt.Errorf("%w: a segment needs nodes", ErrFabric)
 	}
-	tx, err := s.beginWrite(ctx)
-	if err != nil {
-		return FabricSegment{}, err
-	}
-	defer tx.Rollback()
 	for _, n := range nodes {
 		var routing bool
 		err := tx.QueryRowContext(ctx, `SELECT routing FROM fabric_nodes WHERE node_id=$1`, n).Scan(&routing)
@@ -172,13 +187,26 @@ func (s *Store) CreateFabricSegment(ctx context.Context, segmentPrefix string, n
 	if err != nil {
 		return FabricSegment{}, err
 	}
-	seg := FabricSegment{VNI: firstSegmentVNI, MTU: mtu, Purpose: "manual", Nodes: nodes, Created: now()}
+	seg := FabricSegment{VNI: firstSegmentVNI, MTU: mtu, Purpose: purpose, Nodes: nodes, Created: now()}
+	if purpose == "gang" {
+		if err := tx.QueryRowContext(ctx, `SELECT nextval('fabric_gang_vni')`).Scan(&seg.VNI); err != nil {
+			return FabricSegment{}, err
+		}
+	}
 	for usedVNI[seg.VNI] {
 		seg.VNI++
 	}
 	base := p.Addr().As4()
 	count := 1 << (segmentSubnetBits - p.Bits())
-	for i := 0; i < count; i++ {
+	// a gang's from where its VNI says, on: the subnet a generation that
+	// ended had is taken again only after the prefix's others (a node may
+	// still have its network a while, and a wslc VM refuses two that overlap)
+	start := 0
+	if purpose == "gang" {
+		start = (seg.VNI - firstGangVNI) % count
+	}
+	for j := 0; j < count; j++ {
+		i := (start + j) % count
 		a := base
 		a[1] += byte(i >> 8)
 		a[2] += byte(i)
@@ -199,31 +227,44 @@ func (s *Store) CreateFabricSegment(ctx context.Context, segmentPrefix string, n
 			return FabricSegment{}, err
 		}
 	}
-	if err := appendCoordinationEventTx(ctx, tx, "fabric_segment_created", nil, "fabric_segment", strconv.Itoa(seg.VNI), nil, map[string]any{"vni": seg.VNI, "subnet": seg.Subnet, "mtu": seg.MTU, "nodes": nodes}); err != nil {
+	if err := appendCoordinationEventTx(ctx, tx, "fabric_segment_created", nil, "fabric_segment", strconv.Itoa(seg.VNI), nil, map[string]any{"vni": seg.VNI, "subnet": seg.Subnet, "mtu": seg.MTU, "nodes": nodes, "purpose": purpose}); err != nil {
 		return FabricSegment{}, err
 	}
-	return seg, tx.Commit()
+	return seg, nil
 }
 
-// DeleteFabricSegment removes segment vni: its nodes take down its bridge
-// and VXLAN device at their next sync.
+// DeleteFabricSegment removes segment vni (one made by hand: a gang's goes
+// with its generation): its nodes take down its bridge and VXLAN device at
+// their next sync.
 func (s *Store) DeleteFabricSegment(ctx context.Context, vni int) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `DELETE FROM fabric_segments WHERE vni=$1`, vni)
+	var purpose string
+	err = tx.QueryRowContext(ctx, `SELECT purpose FROM fabric_segments WHERE vni=$1`, vni).Scan(&purpose)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fmt.Errorf("%w: segment %d", ErrNotFound, vni)
+	}
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("%w: segment %d", ErrNotFound, vni)
+	if purpose != "manual" {
+		return fmt.Errorf("%w: segment %d is a gang's: it goes when its generation ends", ErrFabric, vni)
 	}
-	if err := appendCoordinationEventTx(ctx, tx, "fabric_segment_deleted", nil, "fabric_segment", strconv.Itoa(vni), nil, map[string]any{"vni": vni}); err != nil {
+	if err := deleteSegmentTx(ctx, tx, vni); err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// deleteSegmentTx removes segment vni.
+func deleteSegmentTx(ctx context.Context, tx *sql.Tx, vni int) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM fabric_segments WHERE vni=$1`, vni); err != nil {
+		return err
+	}
+	return appendCoordinationEventTx(ctx, tx, "fabric_segment_deleted", nil, "fabric_segment", strconv.Itoa(vni), nil, map[string]any{"vni": vni})
 }
 
 // FabricSegments are the fabric's segments with their nodes.

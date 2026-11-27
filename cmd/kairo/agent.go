@@ -243,6 +243,10 @@ func agentCommand(args []string) error {
 		exec.MinLogFreeBytes = int64(cfg.LogMinFreeMiB) << 20
 		exec.FlushLogs = shipper.ShipAttempt
 		exec.Providers = providerSet
+		if fab != nil && fab.Routing {
+			// a gang member's container is on its generation's segment
+			exec.Segments = fab.EnsureSegment
+		}
 		exec.Adopt(records, adopted)
 		go func() {
 			if err := exec.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

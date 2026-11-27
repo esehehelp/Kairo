@@ -108,9 +108,14 @@ func serve(args []string) error {
 		return fmt.Errorf("open the database: %w", err)
 	}
 	defer st.Close()
+	policy := st.SchedulingPolicy()
 	if daemonConfig.Scheduler.DiskMinFreeBytes != nil {
-		st.SetSchedulingPolicy(store.SchedulingPolicy{DiskMinFreeBytes: *daemonConfig.Scheduler.DiskMinFreeBytes})
+		policy.DiskMinFreeBytes = *daemonConfig.Scheduler.DiskMinFreeBytes
 	}
+	// gangs' generations take their segments' subnets there (none: no gang
+	// is placed)
+	policy.GangSegmentPrefix = daemonConfig.Fabric.SegmentPrefix
+	st.SetSchedulingPolicy(policy)
 	scrubEvery, err := daemonConfig.Data.ScrubEvery()
 	if err != nil {
 		return err

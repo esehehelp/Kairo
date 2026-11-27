@@ -11,16 +11,24 @@ import (
 	"time"
 )
 
-// setupGangInventory: two nodes with one GPU each, a Windows (WSL) one whose
-// interconnect address makes it a rank-0 host and a Linux one.
+// gangSegmentPrefix is where the tests' gangs' segments take their subnets.
+const gangSegmentPrefix = "10.210.0.0/16"
+
+// setupGangInventory: two nodes with one GPU each, a Windows one and a Linux
+// one, both on the fabric and routing (where a gang's members may go), the
+// daemon giving gangs segments of gangSegmentPrefix.
 func setupGangInventory(t *testing.T, store *Store) {
 	t.Helper()
 	ctx := context.Background()
-	for _, n := range []struct{ node, executor, attrs, gpu string }{
-		{"node-a", "exec-a", `{"environment":"windows","interconnect_addr":"10.77.10.2"}`, "gpu-a"},
-		{"node-b", "exec-b", `{"environment":"linux","interconnect_addr":"10.77.10.1"}`, "gpu-b"},
+	store.policy.GangSegmentPrefix = gangSegmentPrefix
+	for i, n := range []struct{ node, executor, attrs, gpu string }{
+		{"node-a", "exec-a", `{"environment":"windows"}`, "gpu-a"},
+		{"node-b", "exec-b", `{"environment":"linux"}`, "gpu-b"},
 	} {
 		if err := store.UpsertNode(ctx, Node{ID: n.node, Name: n.node, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.SyncFabric(ctx, n.node, FabricPlan{Prefix: "10.209.0.0/16"}, FabricSelf{PublicKey: fabricKey(byte('a' + i)), ListenPort: 51820, Routing: true}); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.UpsertExecutor(ctx, Executor{ID: n.executor, NodeID: n.node, Kind: "local", Attributes: json.RawMessage(n.attrs), Enabled: true}); err != nil {
@@ -174,8 +182,21 @@ func TestGangPlacesRanksOnDistinctNodesAndLaunchesThemTogether(t *testing.T) {
 	ctx := context.Background()
 	rank0, rank1 := launchGang(t, store)
 	a, b := rank0.launch, rank1.launch
-	if a.Gang.MasterAddr != "10.77.10.2" || a.Gang.MasterPort != gangPortFirst || b.Gang.MasterAddr != a.Gang.MasterAddr || a.Gang.Size != 2 {
+	if a.Gang.MasterAddr != "10.210.0.1" || a.Gang.MasterPort != GangDefaultPort || b.Gang.MasterAddr != a.Gang.MasterAddr || a.Gang.Size != 2 {
 		t.Fatalf("rendezvous: %+v / %+v", a.Gang, b.Gang)
+	}
+	// the generation's segment: a VNI of its own, an address each, on both
+	// nodes
+	if a.Gang.VNI != firstGangVNI || b.Gang.VNI != a.Gang.VNI || a.Gang.Subnet != "10.210.0.0/24" || a.Gang.MTU != DefaultSegmentMTU ||
+		a.Gang.Address != "10.210.0.1/24" || b.Gang.Address != "10.210.0.2/24" || strings.Join(b.Gang.Addresses, ",") != "10.210.0.1/24,10.210.0.2/24" {
+		t.Fatalf("segment: %+v / %+v", a.Gang, b.Gang)
+	}
+	segments, err := store.FabricSegments(ctx)
+	if err != nil || len(segments) != 1 || segments[0].VNI != a.Gang.VNI || segments[0].Purpose != "gang" || strings.Join(segments[0].Nodes, ",") != "node-a,node-b" {
+		t.Fatalf("segments: %+v %v", segments, err)
+	}
+	if err := store.DeleteFabricSegment(ctx, a.Gang.VNI); err == nil {
+		t.Fatal("a gang's segment removed by hand")
 	}
 	if a.Argv[0] != "wsl-train" || b.Argv[0] != "linux-train" || b.CWD != "/srv/example-app" {
 		t.Fatalf("rank overrides: %v %s / %v %s", a.Argv, a.CWD, b.Argv, b.CWD)
@@ -200,9 +221,96 @@ func TestGangPlacesRanksOnDistinctNodesAndLaunchesThemTogether(t *testing.T) {
 	if task := gangTaskState(t, store); task.State != "running" {
 		t.Fatalf("task finished with one rank still running: %+v", task)
 	}
+	if err := store.ReconcileGangs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if segments, _ := store.FabricSegments(ctx); len(segments) != 1 {
+		t.Fatalf("the segment went while a member runs: %+v", segments)
+	}
 	finishGangRank(t, store, rank0, 0)
 	if task := gangTaskState(t, store); task.State != "succeeded" {
 		t.Fatalf("task after both ranks exited 0: %+v", task)
+	}
+	// the generation ended: its segment goes
+	if err := store.ReconcileGangs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if segments, err := store.FabricSegments(ctx); err != nil || len(segments) != 0 {
+		t.Fatalf("the segment of an ended generation: %+v %v", segments, err)
+	}
+}
+
+// A gang's members go only to nodes that route on the fabric, and none
+// without the daemon's segment prefix.
+func TestGangWaitsForTheFabric(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupGangInventory(t, store)
+	gangProject(t, store, false)
+	ctx := context.Background()
+	wait := func(reason string) {
+		t.Helper()
+		if r, err := store.ReserveNext(ctx, "exec-a"); err != nil || r != nil {
+			t.Fatalf("placed: %+v %v", r, err)
+		}
+		var got, message string
+		if err := store.db.QueryRow(`SELECT w.reason_code,w.detail_json FROM admission_waits w JOIN gang_members m ON m.execution_id=w.execution_id WHERE m.rank=0`).Scan(&got, &message); err != nil || got != reason {
+			t.Fatalf("wait %q %q (%v), want %s", got, message, err, reason)
+		}
+	}
+	store.policy.GangSegmentPrefix = ""
+	wait("no_fabric")
+	store.policy.GangSegmentPrefix = gangSegmentPrefix
+	if _, err := store.testExec(`UPDATE fabric_nodes SET routing=false WHERE node_id='node-b'`); err != nil {
+		t.Fatal(err)
+	}
+	wait("no_executor")
+	if _, err := store.testExec(`UPDATE fabric_nodes SET routing=true WHERE node_id='node-b'`); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := store.ReserveNext(ctx, "exec-a"); err != nil || r == nil || r.Gang == nil {
+		t.Fatalf("not placed on the fabric: %+v %v", r, err)
+	}
+}
+
+// Each generation's segment has a VNI no earlier one had, and a subnet
+// further on.
+func TestEachGangGenerationHasANewSegment(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupGangInventory(t, store)
+	gangProject(t, store, false)
+	ctx := context.Background()
+	rb, err := store.ReserveNext(ctx, "exec-b")
+	if err != nil || rb == nil || rb.Gang == nil {
+		t.Fatalf("reserve: %+v %v", rb, err)
+	}
+	first, _, err := gangLaunchTx(ctx, store.db, rb.Lease.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// it is never prepared: aborted, and placed again
+	if _, err = store.testExec(`UPDATE gang_placements SET created_at=$1`, time.Now().UTC().Add(-2*GangPrepareTimeout).Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ReconcileGangs(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if segments, _ := store.FabricSegments(ctx); len(segments) != 0 {
+		t.Fatalf("an aborted generation's segment: %+v", segments)
+	}
+	refreshGangGPUs(t, store)
+	if err = store.ReleaseReservation(ctx, rb.Lease.ID, rb.Lease.CoordinationEpoch, "gang aborted"); err != nil {
+		t.Fatal(err)
+	}
+	ra, err := store.ReserveNext(ctx, "exec-a")
+	if err != nil || ra == nil || ra.Gang == nil {
+		t.Fatalf("placed again: %+v %v", ra, err)
+	}
+	second, _, err := gangLaunchTx(ctx, store.db, ra.Lease.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.VNI <= first.VNI || second.Subnet == first.Subnet || second.PlacementID == first.PlacementID {
+		t.Fatalf("generations: %+v then %+v", first, second)
 	}
 }
 
@@ -305,27 +413,6 @@ func TestGangPlacementNotPreparedInTimeIsAbortedAndPlacedAgain(t *testing.T) {
 	}
 	if r, err := store.ReserveNext(ctx, "exec-a"); err != nil || r == nil || r.Gang == nil || r.Gang.Rank != 0 {
 		t.Fatalf("gang not placed again: %+v %v", r, err)
-	}
-}
-
-func TestGangSuspendOfOneRankReachesEveryRank(t *testing.T) {
-	store := openCoordinationStore(t)
-	setupGangInventory(t, store)
-	gangProject(t, store, true)
-	ctx := context.Background()
-	rank0, rank1 := launchGang(t, store)
-	if _, err := store.EnqueueSuspend(ctx, rank1.launch.Attempt.ID, "node_quarantine", "node node-b quarantined"); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.ReconcileGangs(ctx); err != nil {
-		t.Fatal(err)
-	}
-	commands, err := store.PollCommands(ctx, rank0.launch.Attempt.ID, rank0.launch.Lease.ID, rank0.launch.Lease.CoordinationEpoch)
-	if err != nil || len(commands) != 1 || commands[0].Origin != "node_quarantine" {
-		t.Fatalf("rank 0 commands: %+v %v", commands, err)
-	}
-	if terms, _ := store.ListQuarantineTerminations(ctx, "exec-a"); len(terms) != 0 {
-		t.Fatalf("suspending gang terminated: %+v", terms)
 	}
 }
 

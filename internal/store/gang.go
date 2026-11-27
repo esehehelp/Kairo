@@ -1,27 +1,34 @@
 package store
 
-// Gang executions: one logical execution run as Size processes on distinct
-// nodes (multi-node training, a pipeline-parallel inference server).
+// Gang executions: one logical execution run as Size containers on distinct
+// nodes (multi-node training, a pipeline-parallel inference server), which
+// meet on a segment of the fabric (issue #47, phase 3).
 //
-// A gang is Size ordinary execution requests, one per rank, created together
-// by SubmitExecution; rank 0 (the leader) is the one orchestration tracks. The
-// coordination added on top of the one-execution machinery is:
+// A gang is Size ordinary execution requests, one per rank (a member: one
+// container, in which torchrun may start several processes), created
+// together by SubmitExecution; rank 0 (the leader) is the one orchestration
+// tracks. The coordination added on top of the one-execution machinery is:
 //
 //   - placement: when an executor considers the leader, every rank is placed on
-//     a distinct node in one transaction (all leases or none). A rank's lease
-//     for another executor waits in gang_placement_leases until that executor
-//     asks ReserveNext, which hands it over before reserving anything else.
+//     a distinct node that routes on the fabric, in one transaction (all
+//     leases or none), with the generation's segment: a VNI no generation had
+//     before, a subnet, an address per member. A rank's lease for another
+//     executor waits in gang_placement_leases until that executor asks
+//     ReserveNext, which hands it over before reserving anything else.
 //   - launch barrier: AuthorizeLaunch issues no rank's launch until every
 //     rank's lease is prepared (ErrGangNotReady); the executor keeps its
 //     prepared reservation meanwhile. A placement that is not prepared in time,
 //     or loses a lease before launch, is aborted (ErrGangAborted) and every rank
 //     goes back to waiting.
-//   - rendezvous: each rank is launched with its rank, the gang size and rank
-//     0's interconnect address and port (GangLaunch).
+//   - rendezvous: each rank is launched with its rank, the gang size, its
+//     address on the segment and rank 0's, and the port (GangLaunch). Its
+//     container is on the segment, and its init starts the argv only once it
+//     reached every other member there and every other member reached it.
 //   - one fate: when a launched rank stops other than by a clean exit or a
 //     checkpoint, the ranks still running are terminated; a suspend command to
 //     one rank is sent to every rank (ReconcileGangs).
 //   - outcome: orchestration reads the gang as a whole (gangAggregateTx).
+//   - the segment goes when its generation has ended (ReconcileGangs).
 
 import (
 	"context"
@@ -30,6 +37,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -41,27 +49,10 @@ import (
 // prepared before it is aborted.
 const GangPrepareTimeout = 2 * time.Minute
 
-const (
-	gangPortFirst = 29500
-	gangPortLast  = 29999
-)
-
-type gangExecutor struct {
-	id, nodeID, attributes string
-	nodeAttributes         string
-}
-
-func (g gangExecutor) attribute(key string) string {
-	for _, raw := range []string{g.attributes, g.nodeAttributes} {
-		var values map[string]any
-		if json.Unmarshal([]byte(raw), &values) == nil {
-			if v, ok := values[key]; ok && fmt.Sprint(v) != "" {
-				return fmt.Sprint(v)
-			}
-		}
-	}
-	return ""
-}
+// GangDefaultPort is the rendezvous port on member 0's address unless the
+// gang names one (each generation has a segment of its own: nothing else
+// listens there).
+const GangDefaultPort = 29500
 
 type gangMember struct {
 	rank      int
@@ -127,15 +118,19 @@ func gangMembersTx(ctx context.Context, tx *sql.Tx, gangID string) ([]gangMember
 	return members, nil
 }
 
-// freeGangPortTx picks the lowest rendezvous port no live placement on the
-// node uses (0 if all are taken).
-// placeGangTx reserves every rank of the gang on the executor the planning
-// pass chose for it, all or none (a savepoint is rolled back when a rank
-// cannot be reserved). It reports whether the gang was placed.
-func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlot) (bool, error) {
+// placeGangTx reserves every member of the gang on the executor the
+// planning pass chose for it, all or none (a savepoint is rolled back when a
+// member cannot be reserved), and makes the generation's segment on their
+// nodes: a new VNI and subnet, an address for each member (rank r the
+// subnet's host r+1). Member 0's address is the rendezvous (MASTER_ADDR).
+// It reports whether the gang was placed.
+func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlot, segmentPrefix string) (bool, error) {
 	var size, port int
 	if err := tx.QueryRowContext(ctx, `SELECT size,port FROM execution_gangs WHERE id=$1`, gangID).Scan(&size, &port); err != nil {
 		return false, err
+	}
+	if port == 0 {
+		port = GangDefaultPort
 	}
 	members, err := gangMembersTx(ctx, tx, gangID)
 	if err != nil {
@@ -171,9 +166,10 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 	type assignment struct {
 		rank                 int
 		leaseID, executionID string
-		executor             gangExecutor
+		executor             planExecutor
 	}
 	var placed []assignment
+	nodes := make([]string, 0, len(members))
 	for _, m := range members {
 		slot := byRank[m.rank]
 		reservation, err := writeReservationTx(ctx, tx, slot.executor.id, m.candidate, slot.fit)
@@ -184,32 +180,36 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 		if reservation == nil {
 			return abandon()
 		}
-		placed = append(placed, assignment{rank: m.rank, leaseID: reservation.Lease.ID, executionID: m.candidate.execution.ID, executor: slot.executor.gang()})
+		placed = append(placed, assignment{rank: m.rank, leaseID: reservation.Lease.ID, executionID: m.candidate.execution.ID, executor: slot.executor})
+		nodes = append(nodes, slot.executor.nodeID)
 	}
-	master := placed[0].executor
-	if port == 0 {
-		port, err = freeGangPortTx(ctx, tx, master.nodeID)
-		if err != nil {
-			_, _ = abandon()
-			return false, err
-		}
-		if port == 0 {
-			return abandon()
-		}
+	seg, err := createSegmentTx(ctx, tx, segmentPrefix, nodes, 0, "gang")
+	if err != nil {
+		_, _ = abandon()
+		return false, err
 	}
+	subnet := netip.MustParsePrefix(seg.Subnet)
+	address := func(rank int) netip.Prefix {
+		a := subnet.Addr().As4()
+		a[3] += byte(rank + 1)
+		return netip.PrefixFrom(netip.AddrFrom4(a), subnet.Bits())
+	}
+	master := address(0).Addr().String()
 	placementID, stamp := id.New("gpl"), now()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placements(id,gang_id,state,master_addr,master_port,master_node_id,created_at,updated_at) VALUES($1,$2,'placed',$3,$4,$5,$6,$7)`, placementID, gangID, master.attribute("interconnect_addr"), port, master.nodeID, stamp, stamp); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placements(id,gang_id,state,master_addr,master_port,master_node_id,vni,subnet,mtu,created_at,updated_at) VALUES($1,$2,'placed',$3,$4,$5,$6,$7,$8,$9,$10)`,
+		placementID, gangID, master, port, placed[0].executor.nodeID, seg.VNI, seg.Subnet, seg.MTU, stamp, stamp); err != nil {
 		_, _ = abandon()
 		return false, err
 	}
 	for _, a := range placed {
-		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placement_leases(placement_id,rank,lease_id,execution_id,executor_id,node_id) VALUES($1,$2,$3,$4,$5,$6)`, placementID, a.rank, a.leaseID, a.executionID, a.executor.id, a.executor.nodeID); err != nil {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placement_leases(placement_id,rank,lease_id,execution_id,executor_id,node_id,address) VALUES($1,$2,$3,$4,$5,$6,$7)`,
+			placementID, a.rank, a.leaseID, a.executionID, a.executor.id, a.executor.nodeID, address(a.rank).String()); err != nil {
 			_, _ = abandon()
 			return false, err
 		}
 	}
 	leader := members[0].candidate.execution
-	if err = appendCoordinationEventTx(ctx, tx, "gang_placed", &leader.ProjectScopeID, "gang", gangID, nil, map[string]any{"placement_id": placementID, "master_addr": master.attribute("interconnect_addr"), "master_port": port}); err != nil {
+	if err = appendCoordinationEventTx(ctx, tx, "gang_placed", &leader.ProjectScopeID, "gang", gangID, nil, map[string]any{"placement_id": placementID, "master_addr": master, "master_port": port, "vni": seg.VNI, "subnet": seg.Subnet}); err != nil {
 		_, _ = abandon()
 		return false, err
 	}
@@ -219,47 +219,31 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 	return true, nil
 }
 
-func freeGangPortTx(ctx context.Context, tx *sql.Tx, nodeID string) (int, error) {
-	rows, err := tx.QueryContext(ctx, `SELECT gp.master_port FROM gang_placements gp WHERE gp.master_node_id=$1 AND gp.state IN('placed','launched')
-		AND EXISTS(SELECT 1 FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=gp.id AND l.state!='released')`, nodeID)
-	if err != nil {
-		return 0, err
-	}
-	defer rows.Close()
-	used := map[int]bool{}
-	for rows.Next() {
-		var p int
-		if err = rows.Scan(&p); err != nil {
-			return 0, err
-		}
-		used[p] = true
-	}
-	if err = rows.Err(); err != nil {
-		return 0, err
-	}
-	for p := gangPortFirst; p <= gangPortLast; p++ {
-		if !used[p] {
-			return p, nil
-		}
-	}
-	return 0, nil
-}
-
 // gangLaunchTx is the gang information of a placed lease (nil for a lease that
 // is not a gang rank's).
 func gangLaunchTx(ctx context.Context, q queryer, leaseID string) (*GangLaunch, string, error) {
 	var g GangLaunch
 	var state string
-	err := q.QueryRowContext(ctx, `SELECT gp.gang_id,gp.id,gpl.rank,eg.size,gp.master_addr,gp.master_port,gp.state
+	var vni sql.NullInt64
+	err := q.QueryRowContext(ctx, `SELECT gp.gang_id,gp.id,gpl.rank,eg.size,gp.master_addr,gp.master_port,gp.state,gp.vni,gp.subnet,gp.mtu,gpl.address
 		FROM gang_placement_leases gpl JOIN gang_placements gp ON gp.id=gpl.placement_id JOIN execution_gangs eg ON eg.id=gp.gang_id
-		WHERE gpl.lease_id=$1`, leaseID).Scan(&g.GangID, &g.PlacementID, &g.Rank, &g.Size, &g.MasterAddr, &g.MasterPort, &state)
+		WHERE gpl.lease_id=$1`, leaseID).Scan(&g.GangID, &g.PlacementID, &g.Rank, &g.Size, &g.MasterAddr, &g.MasterPort, &state, &vni, &g.Subnet, &g.MTU, &g.Address)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, "", nil
 	}
 	if err != nil {
 		return nil, "", err
 	}
-	return &g, state, nil
+	g.VNI = int(vni.Int64)
+	err = eachRow(ctx, q, `SELECT address FROM gang_placement_leases WHERE placement_id=$1 ORDER BY rank`, []any{g.PlacementID}, func(rows *sql.Rows) error {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			return err
+		}
+		g.Addresses = append(g.Addresses, a)
+		return nil
+	})
+	return &g, state, err
 }
 
 // deliverGangLease hands executorID the oldest gang rank lease placed for it
@@ -392,7 +376,48 @@ func (s *Store) ReconcileGangs(ctx context.Context) error {
 	if err := s.abortStalePlacements(ctx); err != nil {
 		return err
 	}
-	return s.reconcileLaunchedGangs(ctx)
+	if err := s.reconcileLaunchedGangs(ctx); err != nil {
+		return err
+	}
+	return s.removeEndedGangSegments(ctx)
+}
+
+// endedGangSegments selects the segments of generations that ended: no
+// placement still placed or launched with a lease not released has the VNI.
+const endedGangSegments = `SELECT s.vni FROM fabric_segments s WHERE s.purpose='gang' AND NOT EXISTS(
+	SELECT 1 FROM gang_placements gp WHERE gp.vni=s.vni AND gp.state IN('placed','launched')
+	AND EXISTS(SELECT 1 FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=gp.id AND l.state!='released'))`
+
+// removeEndedGangSegments takes away the segments of generations that
+// ended: their nodes take the devices down at their next sync (once no
+// container is on them).
+func (s *Store) removeEndedGangSegments(ctx context.Context) error {
+	var any bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(`+endedGangSegments+`)`).Scan(&any); err != nil || !any {
+		return err
+	}
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var vnis []int
+	if err := eachRow(ctx, tx, endedGangSegments, nil, func(rows *sql.Rows) error {
+		var vni int
+		if err := rows.Scan(&vni); err != nil {
+			return err
+		}
+		vnis = append(vnis, vni)
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, vni := range vnis {
+		if err := deleteSegmentTx(ctx, tx, vni); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 func (s *Store) abortStalePlacements(ctx context.Context) error {

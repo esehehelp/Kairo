@@ -103,7 +103,8 @@ type Execution struct {
 	Executor       ExecutorSelector   `toml:"executor" json:"executor"`
 	Exclusive      []ExclusiveRequest `toml:"exclusive" json:"exclusive"`
 	Capacity       CapacityRequest    `toml:"capacity" json:"capacity"`
-	// Gang runs the task as Size ranks on distinct nodes (store/gang.go).
+	// Gang runs the task as Size members, one container each on distinct
+	// nodes, which meet on a segment of the fabric (store/gang.go).
 	// Absent from the JSON when unset, so existing task digests do not change.
 	Gang *Gang `toml:"gang" json:"gang,omitempty"`
 	// Env is [tasks.execution.env], added to the attempt's environment (see
@@ -364,9 +365,7 @@ func Normalize(manifest Manifest) (Validated, error) {
 			if _, ok := manifest.Images[task.Execution.Image]; !ok {
 				return Validated{}, fmt.Errorf("task %q runs in image %q, which is no [images.%s]", task.Name, task.Execution.Image, task.Execution.Image)
 			}
-			if task.Execution.Gang != nil {
-				return Validated{}, fmt.Errorf("task %q: a gang does not run in an image yet", task.Name)
-			}
+
 			if task.Execution.Source == "" && !path.IsAbs(strings.TrimSpace(task.Execution.CWD)) {
 				return Validated{}, fmt.Errorf("task %q runs in image %q without a source: its cwd %q must be an absolute path in the image", task.Name, task.Execution.Image, task.Execution.CWD)
 			}
@@ -383,9 +382,6 @@ func Normalize(manifest Manifest) (Validated, error) {
 				return Validated{}, fmt.Errorf("task %q runs in source %q: its cwd %q must be a directory of the snapshot (relative)", task.Name, task.Execution.Source, task.Execution.CWD)
 			}
 			task.Execution.CWD = cwd
-			if task.Execution.Gang != nil {
-				return Validated{}, fmt.Errorf("task %q: a gang does not run in a source yet", task.Name)
-			}
 		}
 		task.Name = strings.TrimSpace(task.Name)
 		task.Queue = strings.TrimSpace(task.Queue)
@@ -554,6 +550,12 @@ func normalizeExecution(value *Execution) error {
 	if value.ContinueAfterLoss && (!value.Checkpointable || value.Gang != nil) {
 		return errors.New("continue_after_loss is for a checkpointable single execution (it goes on from a checkpoint), not a gang")
 	}
+	// a gang goes on from a checkpoint only once its whole gang can make
+	// one together and resume where it is readable (issue #47, phase 4)
+	if value.Gang != nil && value.Checkpointable {
+		return errors.New("a gang is not checkpointable yet: it runs to completion (remove checkpointable)")
+	}
+
 	if value.Executor.Labels == nil {
 		value.Executor.Labels = map[string]string{}
 	}

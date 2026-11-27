@@ -177,7 +177,7 @@ func (s *Store) ReserveNext(ctx context.Context, executorID string) (*Reservatio
 			for i, slot := range placement.slots {
 				placement.slots[i].executor = m.onNode(slot, caller, c.ranks[i].candidate.selectorJSON)
 			}
-			placed, placeErr := placeGangTx(ctx, tx, c.gangID, placement.slots)
+			placed, placeErr := placeGangTx(ctx, tx, c.gangID, placement.slots, m.policy.GangSegmentPrefix)
 			if placeErr != nil || placed {
 				gangPlaced = placed
 				return true, placeErr

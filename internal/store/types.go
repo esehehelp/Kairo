@@ -163,6 +163,13 @@ type GangLaunch struct {
 	Size        int    `json:"size"`
 	MasterAddr  string `json:"master_addr"`
 	MasterPort  int    `json:"master_port"`
+	// The generation's segment (fabric): its VNI, subnet and MTU, this
+	// member's address on it (CIDR) and every member's, in rank order.
+	VNI       int      `json:"vni,omitempty"`
+	Subnet    string   `json:"subnet,omitempty"`
+	MTU       int      `json:"mtu,omitempty"`
+	Address   string   `json:"address,omitempty"`
+	Addresses []string `json:"addresses,omitempty"`
 }
 
 type ExecutionRequest struct {
