@@ -59,9 +59,6 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		if err != nil {
 			return ExecutionSpec{}, nil, "", err
 		}
-		if spec.Gang != nil {
-			return ExecutionSpec{}, nil, "", errors.New("image is for a single execution, not a gang (yet)")
-		}
 		spec.Image = ref.Pinned()
 		selector["container"] = true
 	}
@@ -83,6 +80,25 @@ func normalizeExecutionSpec(spec ExecutionSpec) (ExecutionSpec, []byte, string, 
 		gang, err := normalizeGangSpec(*spec.Gang)
 		if err != nil {
 			return ExecutionSpec{}, nil, "", err
+		}
+		// a rank's own selector says whether it runs in a container as
+		// the execution's does (from the image, never from the caller)
+		for i := range gang.Ranks {
+			r := &gang.Ranks[i]
+			if len(r.ExecutorSelector) == 0 {
+				continue
+			}
+			var selector map[string]any
+			if err := json.Unmarshal(r.ExecutorSelector, &selector); err != nil {
+				return ExecutionSpec{}, nil, "", err
+			}
+			delete(selector, "container")
+			if spec.Image != "" {
+				selector["container"] = true
+			}
+			if r.ExecutorSelector, err = json.Marshal(selector); err != nil {
+				return ExecutionSpec{}, nil, "", err
+			}
 		}
 		spec.Gang = &gang
 	}

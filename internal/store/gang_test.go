@@ -436,3 +436,40 @@ func TestGangSpecIsValidatedAndDigestOnlyChangesWithAGang(t *testing.T) {
 		}
 	}
 }
+
+// A gang runs in an image: every member's execution has it, and every
+// member's selector (its own one too) asks for an executor that runs
+// containers.
+func TestAGangInAnImageRunsEveryMemberInAContainer(t *testing.T) {
+	store := openCoordinationStore(t)
+	ctx := context.Background()
+	spec := schedulerExecutionSpec("gang-image")
+	spec.Checkpointable, spec.Preemptible = false, false
+	spec.Image = testImagePin
+	spec.Gang = &GangSpec{Size: 2, Ranks: []GangRank{{Rank: 1, ExecutorSelector: json.RawMessage(`{"node":"pve1-t","container":false}`)}}}
+	leader, _, err := store.SubmitExecution(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := store.db.Query(`SELECT m.rank,e.executor_selector_json,COALESCE(e.image_ref,'') FROM gang_members m JOIN execution_requests e ON e.id=m.execution_id
+		JOIN execution_gangs g ON g.id=m.gang_id WHERE g.leader_execution_id=$1 ORDER BY m.rank`, leader.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	members := 0
+	for rows.Next() {
+		var rank int
+		var selector, image string
+		if err := rows.Scan(&rank, &selector, &image); err != nil {
+			t.Fatal(err)
+		}
+		members++
+		if image != testImagePin || !strings.Contains(selector, `"container":true`) || (rank == 1) != strings.Contains(selector, `"node":"pve1-t"`) {
+			t.Fatalf("member %d: selector %s, image %q", rank, selector, image)
+		}
+	}
+	if members != 2 {
+		t.Fatalf("%d members", members)
+	}
+}
