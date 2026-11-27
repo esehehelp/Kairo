@@ -214,8 +214,11 @@ type planModel struct {
 	// owners are the nodes whose CPU or RAM their owner uses: the kinds
 	// (owneruse.go)
 	owners map[string][]string
-	// routing: the nodes that route on the fabric (run FRR)
+	// routing: the nodes that route on the fabric (run FRR); reach: the
+	// pairs of them that reach each other now (each reported a handshake
+	// with the other within handshakeFresh: fabricPair)
 	routing map[string]bool
+	reach   map[[2]string]bool
 }
 
 // planOverlay is what the pass has handed out so far: devices placed on or
@@ -359,16 +362,36 @@ func (m *planModel) loadExecutors(ctx context.Context, tx *sql.Tx, callerID stri
 		return err
 	}
 	rows.Close()
-	// the nodes that route on the fabric: a gang's members go there only
-	m.routing = map[string]bool{}
-	return eachRow(ctx, tx, `SELECT node_id FROM fabric_nodes WHERE routing`, nil, func(rows *sql.Rows) error {
+	// the nodes that route on the fabric: a gang's members go there only,
+	// and only to ones that reach each other
+	m.routing, m.reach = map[string]bool{}, map[[2]string]bool{}
+	if err := eachRow(ctx, tx, `SELECT node_id FROM fabric_nodes WHERE routing`, nil, func(rows *sql.Rows) error {
 		var node string
 		if err := rows.Scan(&node); err != nil {
 			return err
 		}
 		m.routing[node] = true
 		return nil
+	}); err != nil {
+		return err
+	}
+	ways := map[[2]string]int{}
+	err = eachRow(ctx, tx, `SELECT l.src_node,l.dst_node,l.handshake_at FROM fabric_links l
+		JOIN fabric_nodes a ON a.node_id=l.src_node AND a.routing JOIN fabric_nodes b ON b.node_id=l.dst_node AND b.routing
+		WHERE l.handshake_at IS NOT NULL`, nil, func(rows *sql.Rows) error {
+		var src, dst, at string
+		if err := rows.Scan(&src, &dst, &at); err != nil {
+			return err
+		}
+		if t, err := time.Parse(time.RFC3339Nano, at); err == nil && m.stamp.Sub(t) < handshakeFresh {
+			ways[fabricPair(src, dst)]++
+		}
+		return nil
 	})
+	for pair, n := range ways {
+		m.reach[pair] = n == 2 // both ways
+	}
+	return err
 }
 
 func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
@@ -974,6 +997,32 @@ type planner struct {
 	usage   map[string]map[string]float64 // project -> kind -> held
 	// holds are what waiting executions hold (place), apart from ov.
 	holds []planHold
+	// anyReach: assign places a gang's members whether or not their nodes
+	// reach each other (to tell a partition from want of room)
+	anyReach bool
+}
+
+// reachesAll reports whether node reaches every node of others on the
+// fabric now (a gang's members go only to nodes that all do: issue #47,
+// partitions). One node alone reaches all.
+func (p *planner) reachesAll(node string, others map[string]bool) bool {
+	if p.anyReach {
+		return true
+	}
+	for other := range others {
+		if !p.m.reach[fabricPair(node, other)] {
+			return false
+		}
+	}
+	return true
+}
+
+// fabricPair is the key of the pair a, b in planModel.reach.
+func fabricPair(a, b string) [2]string {
+	if b < a {
+		a, b = b, a
+	}
+	return [2]string{a, b}
 }
 
 func newPlanner(m *planModel, preempt bool) *planner {
@@ -1153,6 +1202,16 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 	}
 	// Where it would go once the leases in its way end, if anywhere.
 	target, transient := p.assign(ranks, options, newOverlay(), allFreed)
+	if !transient && len(ranks) > 1 {
+		// members that would fit but on nodes that do not all reach each
+		// other on the fabric now (a partition): it waits, placed across none
+		p.anyReach = true
+		_, fits := p.assign(ranks, options, newOverlay(), allFreed)
+		p.anyReach = false
+		if fits {
+			return planPlacement{wait: planWait{reason: "fabric_partitioned", message: "the nodes that could hold its members do not all reach each other on the fabric now (no fresh handshake both ways)"}}, time.Time{}
+		}
+	}
 	if !transient {
 		f := p.m.fit(options[0][0].nodeID, ranks[0].demand, ov, noneFreed)
 		if f.ok || f.reason == "held_for_higher_priority" || f.reason == "gpu_leased" {
@@ -1477,7 +1536,7 @@ func (p *planner) assign(ranks []planRank, options [][]planExecutor, ov planOver
 		i := order[depth]
 		var fits []planSlot
 		for _, e := range options[i] {
-			if used[e.nodeID] {
+			if used[e.nodeID] || !p.reachesAll(e.nodeID, used) {
 				continue
 			}
 			if f := p.m.fit(e.nodeID, ranks[i].demand, ov, freed); f.ok {

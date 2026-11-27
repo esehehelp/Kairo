@@ -42,7 +42,24 @@ func setupGangInventory(t *testing.T, store *Store) {
 		}
 		declareTestGPU(t, store, n.gpu, n.node)
 	}
+	reachGangNodes(t, store, true)
 	refreshGangGPUs(t, store)
+}
+
+// reachGangNodes has node-a and node-b report a handshake with each other
+// now (they reach each other on the fabric), or their latest ten minutes
+// ago (a partition).
+func reachGangNodes(t *testing.T, store *Store, reach bool) {
+	t.Helper()
+	at := time.Now().UTC()
+	if !reach {
+		at = at.Add(-10 * time.Minute)
+	}
+	for _, pair := range [][2]string{{"node-a", "node-b"}, {"node-b", "node-a"}} {
+		if err := store.RecordFabricLinks(context.Background(), pair[0], FabricLinksReport{Peers: []FabricPeerSeen{{Node: pair[1], Path: FabricPathDirect, HandshakeAt: at.Format(time.RFC3339Nano)}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func refreshGangGPUs(t *testing.T, store *Store) {
@@ -267,6 +284,10 @@ func TestGangWaitsForTheFabric(t *testing.T) {
 	if _, err := store.testExec(`UPDATE fabric_nodes SET routing=true WHERE node_id='node-b'`); err != nil {
 		t.Fatal(err)
 	}
+	// a partition: the nodes do not reach each other
+	reachGangNodes(t, store, false)
+	wait("fabric_partitioned")
+	reachGangNodes(t, store, true)
 	if r, err := store.ReserveNext(ctx, "exec-a"); err != nil || r == nil || r.Gang == nil {
 		t.Fatalf("not placed on the fabric: %+v %v", r, err)
 	}
