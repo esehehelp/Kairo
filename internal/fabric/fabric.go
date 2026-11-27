@@ -55,6 +55,9 @@ type Manager struct {
 	// ProbePort is where peers time a TCP connect to this node (its
 	// transfer endpoint's port; 0: none).
 	ProbePort int
+	// RelayFrom and RelayTo are the UDP ports this node offers to relay
+	// other nodes' datagrams (0: none; relay.go).
+	RelayFrom, RelayTo int
 	// Sync says what this node is and returns its address and peers.
 	Sync func(ctx context.Context, self store.FabricSelf) (store.FabricView, error)
 	// Report says how this node sees its links (nil: not said).
@@ -72,6 +75,7 @@ type Manager struct {
 	view     store.FabricView      // the last one applied
 	received []store.FabricReceived
 	reported time.Time
+	relays   relays
 }
 
 // peerState is which of a peer's endpoints is tried, since when.
@@ -193,7 +197,8 @@ func (m *Manager) Once(ctx context.Context) error {
 		}
 		m.public = public
 	}
-	view, err := m.Sync(ctx, store.FabricSelf{PublicKey: m.public, ListenPort: m.ListenPort, Endpoints: m.Endpoints, ProbePort: m.ProbePort})
+	view, err := m.Sync(ctx, store.FabricSelf{PublicKey: m.public, ListenPort: m.ListenPort, Endpoints: m.Endpoints, ProbePort: m.ProbePort,
+		RelayFrom: m.RelayFrom, RelayTo: m.RelayTo})
 	if err != nil {
 		return fmt.Errorf("fabric: %w", err)
 	}
@@ -229,7 +234,26 @@ func (m *Manager) apply(ctx context.Context, view store.FabricView) error {
 	if err := m.link.ensure(ctx, m.Interface, view.Address, p.Bits(), m.KeyFile, m.ListenPort); err != nil {
 		return fmt.Errorf("fabric interface %s: %w", m.Interface, err)
 	}
-	return m.setPeers(ctx, view.Peers)
+	if err := m.setPeers(ctx, view.Peers); err != nil {
+		return err
+	}
+	m.relays.mu.Lock()
+	if m.relays.ctx == nil {
+		m.relays.ctx = context.Background()
+	}
+	m.relays.mu.Unlock()
+	m.relays.set(view.Relays, m.logger().Info)
+	return nil
+}
+
+// endpointsOf are where peer is tried, in order: its endpoints, then the
+// relay this node reaches it through, if any.
+func endpointsOf(peer store.FabricNode) []string {
+	out := append([]string(nil), peer.Endpoints...)
+	if peer.RelayEndpoint != "" {
+		out = append(out, peer.RelayEndpoint)
+	}
+	return out
 }
 
 // setPeers puts peers on the interface, each at the endpoint tried now, and
@@ -248,7 +272,8 @@ func (m *Manager) setPeers(ctx context.Context, peers []store.FabricNode) error 
 	want := map[string]bool{}
 	for _, peer := range peers {
 		want[peer.PublicKey] = true
-		if len(peer.Endpoints) == 0 {
+		endpoints := endpointsOf(peer)
+		if len(endpoints) == 0 {
 			continue // it says it is reached nowhere: it reaches out itself
 		}
 		m.mu.Lock()
@@ -260,9 +285,9 @@ func (m *Manager) setPeers(ctx context.Context, peers []store.FabricNode) error 
 		seen, on := current[peer.PublicKey]
 		reached := on && !seen.handshake.IsZero() && t.Sub(seen.handshake) < handshakeFresh
 		if !reached && ok && t.Sub(st.since) >= endpointTrial {
-			st.endpoint, st.since = (st.endpoint+1)%len(peer.Endpoints), t
+			st.endpoint, st.since = (st.endpoint+1)%len(endpoints), t
 		}
-		endpoint := peer.Endpoints[st.endpoint%len(peer.Endpoints)]
+		endpoint := endpoints[st.endpoint%len(endpoints)]
 		m.mu.Unlock()
 		if err := m.link.setPeer(ctx, m.Interface, peer.PublicKey, peer.Address, endpoint); err != nil {
 			return err
@@ -349,6 +374,9 @@ func (m *Manager) report(ctx context.Context) error {
 	for _, p := range peers {
 		seen := current[p.PublicKey]
 		peer := store.FabricPeerSeen{Node: p.NodeID, Path: store.FabricPathDirect, Endpoint: seen.endpoint}
+		if p.RelayEndpoint != "" && seen.endpoint == p.RelayEndpoint {
+			peer.Path = store.FabricPathRelay
+		}
 		if !seen.handshake.IsZero() {
 			peer.HandshakeAt = seen.handshake.UTC().Format(time.RFC3339Nano)
 		}
@@ -372,6 +400,10 @@ func (m *Manager) report(ctx context.Context) error {
 func (m *Manager) Run(ctx context.Context) {
 	ticker := time.NewTicker(syncEvery)
 	defer ticker.Stop()
+	m.relays.mu.Lock()
+	m.relays.ctx = ctx
+	m.relays.mu.Unlock()
+	defer m.relays.set(nil, m.logger().Info)
 	for {
 		if err := m.Once(ctx); err != nil && ctx.Err() == nil {
 			m.logger().Warn("fabric sync failed", "error", err)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fabricKey(b byte) string {
@@ -101,5 +102,74 @@ func TestDirectedLinksAreMeasuredByTransfersAndForgottenWithTheirPath(t *testing
 	}
 	if err := store.RecordFabricLinks(ctx, "a", FabricLinksReport{Peers: []FabricPeerSeen{{Node: "b", Path: "sideways"}}}); !errors.Is(err, ErrFabric) {
 		t.Fatalf("an unknown path: %v", err)
+	}
+}
+
+// A pair whose link has had no fresh handshake two reports running is
+// given a relay: a node offering relay ports that has fresh handshakes with
+// both. Each side then reaches the other at the relay's endpoint and its
+// own side's port, tried after its endpoints; the relay is told the pair
+// with the hosts it sees each side at. A node is also handed the endpoints
+// its other peers see a peer at.
+func TestAPairWithNoPathIsGivenARelay(t *testing.T) {
+	store := openCoordinationStore(t)
+	ctx := context.Background()
+	const prefix = "10.209.0.0/16"
+	selves := map[string]FabricSelf{
+		"a": {PublicKey: fabricKey('a'), ListenPort: 51820},
+		"b": {PublicKey: fabricKey('b'), ListenPort: 51820},
+		"r": {PublicKey: fabricKey('r'), ListenPort: 51820, Endpoints: []string{"203.0.113.9:51820"}, RelayFrom: 41000, RelayTo: 41010},
+	}
+	for _, id := range []string{"a", "b", "r"} {
+		if err := store.UpsertNode(ctx, Node{ID: id, Name: id, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.SyncFabric(ctx, id, prefix, selves[id]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh := time.Now().UTC().Format(time.RFC3339Nano)
+	// r reaches both (seeing them at their NAT mappings)
+	if err := store.RecordFabricLinks(ctx, "r", FabricLinksReport{Peers: []FabricPeerSeen{
+		{Node: "a", Path: FabricPathDirect, Endpoint: "198.51.100.1:3001", HandshakeAt: fresh},
+		{Node: "b", Path: FabricPathDirect, Endpoint: "198.51.100.2:3002", HandshakeAt: fresh},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// a reaches b on no path, twice
+	for range 2 {
+		if err := store.RecordFabricLinks(ctx, "a", FabricLinksReport{Peers: []FabricPeerSeen{{Node: "b", Path: FabricPathDirect}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view := func(node string) FabricView {
+		t.Helper()
+		v, err := store.SyncFabric(ctx, node, prefix, selves[node])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	peer := func(v FabricView, id string) FabricNode {
+		for _, p := range v.Peers {
+			if p.NodeID == id {
+				return p
+			}
+		}
+		t.Fatalf("no peer %s in %+v", id, v)
+		return FabricNode{}
+	}
+	a, b, r := view("a"), view("b"), view("r")
+	if pb := peer(a, "b"); pb.RelayEndpoint != "203.0.113.9:41000" || len(pb.Endpoints) != 1 || pb.Endpoints[0] != "198.51.100.2:3002" {
+		t.Fatalf("a's view of b: %+v", pb)
+	}
+	if pa := peer(b, "a"); pa.RelayEndpoint != "203.0.113.9:41001" {
+		t.Fatalf("b's view of a: %+v", pa)
+	}
+	if len(r.Relays) != 1 || r.Relays[0].PortA != 41000 || r.Relays[0].PortB != 41001 || r.Relays[0].HostA != "198.51.100.1" || r.Relays[0].HostB != "198.51.100.2" {
+		t.Fatalf("r's relays: %+v", r.Relays)
+	}
+	if pr := peer(a, "r"); pr.RelayEndpoint != "" {
+		t.Fatalf("a's view of r: %+v", pr)
 	}
 }

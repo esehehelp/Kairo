@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"strconv"
+	"time"
 )
 
 // The fabric (issue #47): every node is on one WireGuard network, at an
@@ -37,6 +38,11 @@ type FabricSelf struct {
 	// ProbePort is where peers time a TCP connect to this node at its
 	// fabric address (its transfer endpoint's port; 0: none).
 	ProbePort int `json:"probe_port,omitempty"`
+	// RelayFrom and RelayTo are the UDP ports this node offers for relaying
+	// other nodes' WireGuard datagrams (0: it relays none): a node with a
+	// public endpoint.
+	RelayFrom int `json:"relay_from,omitempty"`
+	RelayTo   int `json:"relay_to,omitempty"`
 }
 
 // FabricNode is a node on the fabric.
@@ -47,7 +53,22 @@ type FabricNode struct {
 	ListenPort int      `json:"listen_port,omitempty"`
 	Endpoints  []string `json:"endpoints"`
 	ProbePort  int      `json:"probe_port,omitempty"`
-	UpdatedAt  string   `json:"updated_at"`
+	// RelayEndpoint, in a view, is where this node reaches the peer through
+	// a relay ("": none), tried after its endpoints.
+	RelayEndpoint string `json:"relay_endpoint,omitempty"`
+	UpdatedAt     string `json:"updated_at"`
+}
+
+// FabricRelay is a pair a node relays: the side of each node's datagrams
+// (its port) and the address each is seen at ("": not yet), so that only
+// its datagrams are taken for its side.
+type FabricRelay struct {
+	A     string `json:"a"`
+	B     string `json:"b"`
+	PortA int    `json:"port_a"`
+	PortB int    `json:"port_b"`
+	HostA string `json:"host_a,omitempty"`
+	HostB string `json:"host_b,omitempty"`
 }
 
 // FabricView is what a node is told: its address, the fabric's prefix, and
@@ -56,6 +77,8 @@ type FabricView struct {
 	Address string       `json:"address"`
 	Prefix  string       `json:"prefix"`
 	Peers   []FabricNode `json:"peers"`
+	// Relays are the pairs this node relays.
+	Relays []FabricRelay `json:"relays,omitempty"`
 }
 
 // ParseFabricPrefix checks a fabric prefix: an IPv4 network of at least 4
@@ -78,6 +101,11 @@ func checkFabricSelf(self FabricSelf) error {
 	}
 	if self.ProbePort < 0 || self.ProbePort > 65535 {
 		return fmt.Errorf("%w: probe port %d", ErrFabric, self.ProbePort)
+	}
+	if self.RelayFrom != 0 || self.RelayTo != 0 {
+		if self.RelayFrom < 1024 || self.RelayTo > 65535 || self.RelayFrom+1 > self.RelayTo {
+			return fmt.Errorf("%w: relay ports %d-%d (two or more, from 1024)", ErrFabric, self.RelayFrom, self.RelayTo)
+		}
 	}
 	if len(self.Endpoints) > maxFabricEndpoints {
 		return fmt.Errorf("%w: %d endpoints, at most %d", ErrFabric, len(self.Endpoints), maxFabricEndpoints)
@@ -127,8 +155,8 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID, prefix string, self Fabr
 		if address, err = freeFabricAddressTx(ctx, tx, p); err != nil {
 			return FabricView{}, err
 		}
-		if _, err := tx.ExecContext(ctx, `INSERT INTO fabric_nodes(node_id,address,public_key,listen_port,endpoints_json,probe_port,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8)`,
-			nodeID, address, self.PublicKey, self.ListenPort, string(endpoints), nullablePort(self.ProbePort), t, t); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO fabric_nodes(node_id,address,public_key,listen_port,endpoints_json,probe_port,relay_from,relay_to,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+			nodeID, address, self.PublicKey, self.ListenPort, string(endpoints), nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo), t, t); err != nil {
 			return FabricView{}, err
 		}
 		if err := appendCoordinationEventTx(ctx, tx, "fabric_joined", nil, "node", nodeID, nil, map[string]any{"address": address}); err != nil {
@@ -140,9 +168,10 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID, prefix string, self Fabr
 		if a, perr := netip.ParseAddr(address); perr != nil || !p.Contains(a) {
 			return FabricView{}, fmt.Errorf("%w: node %s has address %s, outside the fabric's prefix %s (a node's address is never changed)", ErrFabric, nodeID, address, prefix)
 		}
-		if _, err := tx.ExecContext(ctx, `UPDATE fabric_nodes SET public_key=$1,listen_port=$2,endpoints_json=$3,probe_port=$6,updated_at=$4 WHERE node_id=$5
-			AND (public_key IS DISTINCT FROM $1 OR listen_port IS DISTINCT FROM $2 OR endpoints_json<>$3 OR probe_port IS DISTINCT FROM $6)`,
-			self.PublicKey, self.ListenPort, string(endpoints), t, nodeID, nullablePort(self.ProbePort)); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE fabric_nodes SET public_key=$1,listen_port=$2,endpoints_json=$3,probe_port=$6,relay_from=$7,relay_to=$8,updated_at=$4 WHERE node_id=$5
+			AND (public_key IS DISTINCT FROM $1 OR listen_port IS DISTINCT FROM $2 OR endpoints_json<>$3 OR probe_port IS DISTINCT FROM $6
+			OR relay_from IS DISTINCT FROM $7 OR relay_to IS DISTINCT FROM $8)`,
+			self.PublicKey, self.ListenPort, string(endpoints), t, nodeID, nullablePort(self.ProbePort), nullablePort(self.RelayFrom), nullablePort(self.RelayTo)); err != nil {
 			return FabricView{}, err
 		}
 	}
@@ -159,7 +188,99 @@ func (s *Store) SyncFabric(ctx context.Context, nodeID, prefix string, self Fabr
 	if err != nil {
 		return FabricView{}, err
 	}
+	for i := range view.Peers {
+		if err := peerPathsTx(ctx, tx, nodeID, &view.Peers[i]); err != nil {
+			return FabricView{}, err
+		}
+	}
+	if view.Relays, err = relaysOfTx(ctx, tx, nodeID); err != nil {
+		return FabricView{}, err
+	}
 	return view, tx.Commit()
+}
+
+// observedFresh: an endpoint a node was seen at (by a peer's handshake)
+// this recently is handed to the node's other peers.
+const observedFresh = 10 * time.Minute
+
+// peerPathsTx adds to peer's endpoints those its other peers see it at now
+// (behind a NAT, its mapping: a peer that sends there punches through), and
+// the relay endpoint self reaches it through, if a relay was given the pair.
+func peerPathsTx(ctx context.Context, tx *sql.Tx, self string, peer *FabricNode) error {
+	have := map[string]bool{}
+	for _, e := range peer.Endpoints {
+		have[e] = true
+	}
+	since := time.Now().Add(-observedFresh).UTC().Format(time.RFC3339Nano)
+	err := eachRow(ctx, tx, `SELECT DISTINCT endpoint FROM fabric_links WHERE dst_node=$1 AND src_node<>$2 AND path='direct' AND endpoint<>''
+		AND handshake_at IS NOT NULL AND handshake_at::timestamptz>$3::timestamptz ORDER BY endpoint`, []any{peer.NodeID, self, since}, func(rows *sql.Rows) error {
+		var e string
+		if err := rows.Scan(&e); err != nil {
+			return err
+		}
+		if !have[e] && len(peer.Endpoints) < maxFabricEndpoints {
+			have[e] = true
+			peer.Endpoints = append(peer.Endpoints, e)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	a, b := self, peer.NodeID
+	if b < a {
+		a, b = b, a
+	}
+	var relay string
+	var portA, portB int
+	err = tx.QueryRowContext(ctx, `SELECT relay_node,port_a,port_b FROM fabric_relays WHERE node_a=$1 AND node_b=$2`, a, b).Scan(&relay, &portA, &portB)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var endpoints string
+	if err := tx.QueryRowContext(ctx, `SELECT endpoints_json FROM fabric_nodes WHERE node_id=$1`, relay).Scan(&endpoints); err != nil {
+		return err
+	}
+	var relayEndpoints []string
+	if err := json.Unmarshal([]byte(endpoints), &relayEndpoints); err != nil || len(relayEndpoints) == 0 {
+		return err
+	}
+	host, _, err := net.SplitHostPort(relayEndpoints[0])
+	if err != nil {
+		return nil
+	}
+	port := portA
+	if self == b {
+		port = portB
+	}
+	peer.RelayEndpoint = net.JoinHostPort(host, strconv.Itoa(port))
+	return nil
+}
+
+// relaysOfTx are the pairs node relays, with where it sees each side.
+func relaysOfTx(ctx context.Context, tx *sql.Tx, node string) ([]FabricRelay, error) {
+	var out []FabricRelay
+	err := eachRow(ctx, tx, `SELECT r.node_a,r.node_b,r.port_a,r.port_b,
+		COALESCE((SELECT endpoint FROM fabric_links WHERE src_node=$1 AND dst_node=r.node_a),''),COALESCE((SELECT endpoint FROM fabric_links WHERE src_node=$1 AND dst_node=r.node_b),'')
+		FROM fabric_relays r WHERE r.relay_node=$1 ORDER BY r.node_a,r.node_b`, []any{node}, func(rows *sql.Rows) error {
+		var r FabricRelay
+		var ea, eb string
+		if err := rows.Scan(&r.A, &r.B, &r.PortA, &r.PortB, &ea, &eb); err != nil {
+			return err
+		}
+		if h, _, err := net.SplitHostPort(ea); err == nil {
+			r.HostA = h
+		}
+		if h, _, err := net.SplitHostPort(eb); err == nil {
+			r.HostB = h
+		}
+		out = append(out, r)
+		return nil
+	})
+	return out, err
 }
 
 // freeFabricAddressTx is prefix's lowest host address no node has (its
@@ -298,6 +419,17 @@ func (s *Store) RecordFabricLinks(ctx context.Context, nodeID string, report Fab
 		} else if !ok || p.Node == nodeID {
 			continue
 		}
+		// no path to the peer, as at the report before: a relay for the pair
+		var before sql.NullString
+		var had bool
+		if err := tx.QueryRowContext(ctx, `SELECT handshake_at,true FROM fabric_links WHERE src_node=$1 AND dst_node=$2`, nodeID, p.Node).Scan(&before, &had); err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if had && !freshHandshake(before.String) && !freshHandshake(p.HandshakeAt) {
+			if err := relayPairTx(ctx, tx, nodeID, p.Node); err != nil {
+				return err
+			}
+		}
 		var handshake any
 		if p.HandshakeAt != "" {
 			handshake = p.HandshakeAt
@@ -354,4 +486,75 @@ func (s *Store) FabricLinks(ctx context.Context) ([]FabricLink, error) {
 			return nil
 		})
 	return out, err
+}
+
+// handshakeFresh: a link whose latest handshake is this recent is up.
+const handshakeFresh = 3 * time.Minute
+
+func freshHandshake(at string) bool {
+	t, err := time.Parse(time.RFC3339Nano, at)
+	return err == nil && time.Since(t) < handshakeFresh
+}
+
+// relayPairTx gives the pair x, y a relay when it has none: the first node
+// (by id) that offers relay ports, is neither, and has a fresh handshake
+// with both; the two lowest of its ports no pair has.
+func relayPairTx(ctx context.Context, tx *sql.Tx, x, y string) error {
+	a, b := x, y
+	if b < a {
+		a, b = b, a
+	}
+	var exists bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM fabric_relays WHERE node_a=$1 AND node_b=$2)`, a, b).Scan(&exists); err != nil || exists {
+		return err
+	}
+	since := time.Now().Add(-handshakeFresh).UTC().Format(time.RFC3339Nano)
+	type candidate struct {
+		node     string
+		from, to int
+	}
+	var candidates []candidate
+	err := eachRow(ctx, tx, `SELECT f.node_id,f.relay_from,f.relay_to FROM fabric_nodes f JOIN nodes n ON n.id=f.node_id
+		WHERE n.enabled AND f.relay_from IS NOT NULL AND f.relay_to IS NOT NULL AND f.node_id NOT IN($1,$2)
+		AND EXISTS(SELECT 1 FROM fabric_links l WHERE l.src_node=f.node_id AND l.dst_node=$1 AND l.handshake_at IS NOT NULL AND l.handshake_at::timestamptz>$3::timestamptz)
+		AND EXISTS(SELECT 1 FROM fabric_links l WHERE l.src_node=f.node_id AND l.dst_node=$2 AND l.handshake_at IS NOT NULL AND l.handshake_at::timestamptz>$3::timestamptz)
+		ORDER BY f.node_id`, []any{a, b, since}, func(rows *sql.Rows) error {
+		var c candidate
+		if err := rows.Scan(&c.node, &c.from, &c.to); err != nil {
+			return err
+		}
+		candidates = append(candidates, c)
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	for _, c := range candidates {
+		used := map[int]bool{}
+		err := eachRow(ctx, tx, `SELECT port_a,port_b FROM fabric_relays WHERE relay_node=$1`, []any{c.node}, func(rows *sql.Rows) error {
+			var pa, pb int
+			if err := rows.Scan(&pa, &pb); err != nil {
+				return err
+			}
+			used[pa], used[pb] = true, true
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		var free []int
+		for port := c.from; port <= c.to && len(free) < 2; port++ {
+			if !used[port] {
+				free = append(free, port)
+			}
+		}
+		if len(free) < 2 {
+			continue // its ports all taken
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO fabric_relays(node_a,node_b,relay_node,port_a,port_b,created_at) VALUES($1,$2,$3,$4,$5,$6)`, a, b, c.node, free[0], free[1], now()); err != nil {
+			return err
+		}
+		return appendCoordinationEventTx(ctx, tx, "fabric_relayed", nil, "node", a, nil, map[string]any{"a": a, "b": b, "relay": c.node, "port_a": free[0], "port_b": free[1]})
+	}
+	return nil // no relay: the pair waits for one
 }

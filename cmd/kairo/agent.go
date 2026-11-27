@@ -122,6 +122,9 @@ func agentCommand(args []string) error {
 		if _, port, err := net.SplitHostPort(cfg.Packs.Listen); err == nil {
 			fab.ProbePort, _ = strconv.Atoi(port)
 		}
+		if fab.RelayFrom, fab.RelayTo, err = config.ParseRelayPorts(cfg.Fabric.RelayPorts); err != nil {
+			return err
+		}
 		// what fetches from other agents took measures the links
 		executor.TransferObserved = fab.Received
 		// back on the fabric as it was last, before the daemon is asked

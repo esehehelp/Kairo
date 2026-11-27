@@ -147,6 +147,9 @@ func serve(args []string) error {
 		if _, port, err := net.SplitHostPort(daemonConfig.Listen); err == nil {
 			fab.ProbePort, _ = strconv.Atoi(port)
 		}
+		if fab.RelayFrom, fab.RelayTo, err = config.ParseRelayPorts(f.RelayPorts); err != nil {
+			return err
+		}
 		go fab.Run(ctx)
 	}
 	defer stop()

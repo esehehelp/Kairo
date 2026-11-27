@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -739,6 +740,7 @@ func LoadController(path string) (Controller, error) {
 type DaemonFabric struct {
 	Prefix     string   `toml:"prefix"`
 	Join       bool     `toml:"join"`
+	RelayPorts string   `toml:"relay_ports"`
 	Interface  string   `toml:"interface"`
 	ListenPort int      `toml:"listen_port"`
 	KeyFile    string   `toml:"key_file"`
@@ -758,9 +760,28 @@ type AgentFabric struct {
 	// public address): a node that is not on the fabric yet (its first
 	// start, or every peer moved) says what it is there, while server_url
 	// names the daemon's fabric address.
-	BootstrapURL string   `toml:"bootstrap_url"`
-	Interface    string   `toml:"interface"`
-	ListenPort   int      `toml:"listen_port"`
-	KeyFile      string   `toml:"key_file"`
-	Endpoints    []string `toml:"endpoints"`
+	BootstrapURL string `toml:"bootstrap_url"`
+	// RelayPorts ("FROM-TO") are the UDP ports this node offers to relay
+	// other nodes' WireGuard datagrams when they reach each other on no
+	// direct path (a node with a public endpoint; "": it relays none).
+	RelayPorts string   `toml:"relay_ports"`
+	Interface  string   `toml:"interface"`
+	ListenPort int      `toml:"listen_port"`
+	KeyFile    string   `toml:"key_file"`
+	Endpoints  []string `toml:"endpoints"`
+}
+
+// ParseRelayPorts reads relay_ports ("FROM-TO", two or more ports from
+// 1024): (0, 0) for "".
+func ParseRelayPorts(s string) (int, int, error) {
+	if s == "" {
+		return 0, 0, nil
+	}
+	from, to, ok := strings.Cut(s, "-")
+	a, err1 := strconv.Atoi(strings.TrimSpace(from))
+	b, err2 := strconv.Atoi(strings.TrimSpace(to))
+	if !ok || err1 != nil || err2 != nil || a < 1024 || b > 65535 || a+1 > b {
+		return 0, 0, fmt.Errorf("relay_ports %q: FROM-TO, two or more ports from 1024", s)
+	}
+	return a, b, nil
 }
