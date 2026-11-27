@@ -111,6 +111,11 @@ type containerSpec struct {
 	Runtime string `json:"runtime,omitempty"`
 	// Gang: of a gang member, its generation's segment (container_gang.go).
 	Gang *containerGang `json:"gang,omitempty"`
+	// APIProxy: the daemon's API on the fabric (ip:port), which the
+	// container reaches through its runtime's proxy at that very address
+	// (Incus: a proxy device listening in the container, connecting from
+	// the host; the init puts the address on lo).
+	APIProxy string `json:"api_proxy,omitempty"`
 }
 
 // containerGang is a gang member's place on its generation's segment: the
@@ -334,6 +339,9 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		Streams:  launch.Streams,
 	}
 	spec.Runtime = opts.runtime
+	if e.APIProxy != "" && opts.runtime == "incus" {
+		spec.APIProxy = e.APIProxy
+	}
 	if g := launch.Gang; g != nil {
 		// its generation's segment on this node, before the container joins it
 		if e.Segments == nil || g.VNI == 0 {

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -246,6 +247,15 @@ func agentCommand(args []string) error {
 		if fab != nil && fab.Routing {
 			// a gang member's container is on its generation's segment
 			exec.Segments = fab.EnsureSegment
+		}
+		// the daemon's API at a fabric address: containers reach it through
+		// their host (one bridged onto the LAN has no route into the fabric)
+		if u, err := url.Parse(cfg.AttemptAPIURL); err == nil && fab != nil && fabric.HostOnFabric() && fab.OnFabric(u.Hostname()) {
+			port := u.Port()
+			if port == "" {
+				port = "443"
+			}
+			exec.APIProxy = net.JoinHostPort(u.Hostname(), port)
 		}
 		exec.Adopt(records, adopted)
 		go func() {

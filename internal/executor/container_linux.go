@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -169,6 +170,14 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 			devices[name] = d
 		}
 		devices["kairo-nvidia"] = map[string]string{"type": "disk", "source": driver, "path": containerNVIDIA, "readonly": "true"}
+	}
+	if spec.APIProxy != "" {
+		// the daemon's API on the fabric, through the host: listening in
+		// the container (on the port; the init puts the address on lo),
+		// connecting from the host
+		if _, port, err := net.SplitHostPort(spec.APIProxy); err == nil {
+			devices["kairo-api"] = map[string]string{"type": "proxy", "bind": "instance", "listen": "tcp:0.0.0.0:" + port, "connect": "tcp:" + spec.APIProxy}
+		}
 	}
 	if g := spec.Gang; g != nil {
 		// a gang member: a second NIC on its generation's segment (its
@@ -670,6 +679,13 @@ func containerInit(specPath string) int {
 	}
 	if !waitForNetwork("/sys/class/net", "/proc/net/route", "/proc/net/ipv6_route", networkWait) {
 		fmt.Fprintln(stderr, "kairo container: no default route after", networkWait, "(starting without one)")
+	}
+	// the daemon's API on the fabric, at its own address, through the
+	// proxy device listening on every address of the container
+	if spec.APIProxy != "" {
+		if err := apiOnLoopback(spec.APIProxy); err != nil {
+			fmt.Fprintln(stderr, "kairo container: the daemon's API through the host:", err)
+		}
 	}
 	// caught, not ignored: the argv starts with the default dispositions.
 	// A stop of the container comes to this init (its runtime stops it: the

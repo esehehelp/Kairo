@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -145,6 +146,20 @@ func (m *Manager) Address() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.address
+}
+
+// OnFabric reports whether host (an IPv4 address) is in the fabric's
+// prefix as this node was last told it.
+func (m *Manager) OnFabric(host string) bool {
+	m.mu.Lock()
+	prefix := m.view.Prefix
+	m.mu.Unlock()
+	p, err := store.ParseFabricPrefix(prefix)
+	if err != nil {
+		return false
+	}
+	a, err := netip.ParseAddr(host)
+	return err == nil && p.Contains(a)
 }
 
 // KnownAddress is the address this node was given before (kept beside its

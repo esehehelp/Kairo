@@ -52,6 +52,12 @@ type Local struct {
 	// its generation's segment. Nil: this node carries none (not on the
 	// fabric, or it does not route), and a gang member fails to launch here.
 	Segments func(ctx context.Context, seg store.FabricSegment) (string, error)
+	// APIProxy is the daemon's API on the fabric (host:port of APIURL) when
+	// APIURL names a fabric address: an Incus container reaches it through
+	// a proxy device its host connects from (a container bridged onto the
+	// LAN has no route into the fabric), at the same address, so its URL and
+	// TLS name stay. "" for none.
+	APIProxy string
 
 	// Attempt logs (logspace.go): the free space the log directory's
 	// filesystem must have for a launch (zero: DefaultMinLogFreeBytes), how

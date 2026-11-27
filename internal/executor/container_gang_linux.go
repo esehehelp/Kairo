@@ -269,3 +269,25 @@ func netlinkRequest(kind uint16, flags uint16, body []byte) error {
 		}
 	}
 }
+
+// apiOnLoopback puts the host of hostPort (the daemon's address on the
+// fabric) on the container's lo, so that what is sent there reaches the
+// proxy device listening on every address of the container.
+func apiOnLoopback(hostPort string) error {
+	host, _, err := net.SplitHostPort(hostPort)
+	if err != nil {
+		return err
+	}
+	a, err := netip.ParseAddr(host)
+	if err != nil || !a.Is4() {
+		return fmt.Errorf("%q is no IPv4 address", host)
+	}
+	lo, err := net.InterfaceByName("lo")
+	if err != nil {
+		return err
+	}
+	if err := addAddress(lo.Index, netip.PrefixFrom(a, 32)); err != nil && !errors.Is(err, unix.EEXIST) {
+		return err
+	}
+	return setLinkUp(lo.Index)
+}

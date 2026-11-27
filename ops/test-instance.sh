@@ -196,9 +196,6 @@ agent)
   cat >"$work/agent.toml" <<CONFIG
 # Kairo's test installation (ops/test-instance.sh): a test agent beside this host's production agent.
 server_url = "$server_url"
-# attempts reach the daemon at its LAN address: a host whose containers are bridged onto the LAN gives them no
-# route into the fabric (issue #47: still to do)
-attempt_api_url = "https://$(cat "$test_dir/address"):7474"
 token = "$token"
 ca_file = "/etc/kairo-test/ca.pem"
 log_directory = "/srv/kairo-test/attempts"
