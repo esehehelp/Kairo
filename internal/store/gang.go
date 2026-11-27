@@ -54,6 +54,10 @@ const GangPrepareTimeout = 2 * time.Minute
 // listens there).
 const GangDefaultPort = 29500
 
+// MaxGangSize: the members' addresses are hosts 1 on of the segment's /24,
+// the last host left out (a wslc network's gateway).
+const MaxGangSize = 253
+
 type gangMember struct {
 	rank      int
 	candidate executionCandidate

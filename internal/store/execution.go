@@ -241,8 +241,8 @@ func anyRankLeasesGPU(spec ExecutionSpec) bool {
 // canonical selectors and requests. Rank envs are checked by the caller, which
 // knows each rank's resources.
 func normalizeGangSpec(gang GangSpec) (GangSpec, error) {
-	if gang.Size < 2 {
-		return GangSpec{}, errors.New("gang size must be at least 2")
+	if gang.Size < 2 || gang.Size > MaxGangSize {
+		return GangSpec{}, fmt.Errorf("gang size must be from 2 to %d", MaxGangSize)
 	}
 	if gang.Port != 0 && (gang.Port < 1024 || gang.Port > 65535) {
 		return GangSpec{}, errors.New("gang port must be 1024-65535 or 0")

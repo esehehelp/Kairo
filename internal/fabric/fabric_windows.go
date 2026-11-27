@@ -6,12 +6,14 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -314,9 +316,20 @@ func (v *vmLink) ensureSegment(ctx context.Context, names string, seg store.Fabr
 		return err
 	}
 	if !slices.Contains(nets, network) {
+		// docker keeps a gateway address out of what it hands containers
+		// (the first host unless told): the subnet's last, so that gang
+		// members have theirs from the first on (store/gang.go)
+		subnet, err := netip.ParsePrefix(seg.Subnet)
+		if err != nil || !subnet.Addr().Is4() || subnet.Bits() > 30 {
+			return fmt.Errorf("segment %d subnet %q", seg.VNI, seg.Subnet)
+		}
+		last := subnet.Masked().Addr().As4()
+		hosts := uint32(1)<<(32-subnet.Bits()) - 2
+		n := binary.BigEndian.Uint32(last[:]) + hosts
+		binary.BigEndian.PutUint32(last[:], n)
 		if _, err := wslcCommand(ctx, "network", "create", "-d", "bridge", "-o", "com.docker.network.bridge.name="+bridge,
 			"-o", "com.docker.network.driver.mtu="+strconv.Itoa(seg.MTU), "-o", "com.docker.network.bridge.inhibit_ipv4=true",
-			"--internal", "--subnet", seg.Subnet, network); err != nil {
+			"--internal", "--subnet", seg.Subnet, "--gateway", netip.AddrFrom4(last).String(), network); err != nil {
 			return err
 		}
 	}

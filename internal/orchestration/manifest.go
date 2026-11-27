@@ -673,8 +673,10 @@ func rankExclusive(value *Execution, rank int) []ExclusiveRequest {
 // normalized requests. Rank envs are checked by normalizeExecution, which knows
 // each rank's resources.
 func normalizeGang(gang *Gang) error {
-	if gang.Size < 2 {
-		return errors.New("gang size must be at least 2")
+	// its members' addresses are hosts 1 on of their segment's /24 (the
+	// last one is a wslc network's gateway)
+	if gang.Size < 2 || gang.Size > 253 {
+		return errors.New("gang size must be from 2 to 253")
 	}
 	if gang.Port != 0 && (gang.Port < 1024 || gang.Port > 65535) {
 		return errors.New("gang port must be 1024-65535 or 0")

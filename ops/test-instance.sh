@@ -14,7 +14,9 @@
 #                                             background): node windows-t, not elevated, so its wslc containers (kairo-t-*)
 #                                             are in this user's wslc session, apart from production's; transfer port 7486,
 #                                             CPU and RAM only; on the fabric from its wslc VM, with no endpoints (the VM
-#                                             takes no connection from outside: it reaches out to its peers)
+#                                             takes no connection from outside: it reaches out to its peers); C: is its
+#                                             disk, for the volatile store the test machines.toml declares under
+#                                             %LOCALAPPDATA%/kairo/test-agent/store
 # site.env (ops/site.sh) says where:
 #   KAIRO_TEST_PVE_HOST=root@HOST   the Proxmox host
 #   KAIRO_TEST_VMID=N               the container's id
@@ -298,6 +300,13 @@ labels = { site = "test" }
 [[providers]]
 id = "$test_node-host"
 kind = "host"
+
+# C:, for a volatile store under $(w "$home")/store (declared in the test machines.toml): a container's
+# scratch and output
+[[providers]]
+id = "$test_node-filesystem"
+kind = "filesystem"
+filesystems = ["C:"]
 
 [packs]
 listen = ":7486"
