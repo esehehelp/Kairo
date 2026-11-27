@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"kairo/internal/store"
@@ -103,8 +104,9 @@ type containerSpec struct {
 	RawRequests string               `json:"raw_requests,omitempty"`
 	// Runtime is the container's runtime when it matters to the init:
 	// "wslc", whose containers cannot mount (the init does not confine them:
-	// they run as an ordinary user) and whose processes the agent cannot
-	// reach (the init passes a stop on to the argv).
+	// only the ordinary user the argv runs as keeps it off the image's files)
+	// and whose processes the agent cannot reach (the init passes a stop on
+	// to the argv).
 	Runtime string `json:"runtime,omitempty"`
 }
 
@@ -113,6 +115,66 @@ type containerMount struct {
 	Source   string `json:"source"`
 	Path     string `json:"path"`
 	ReadOnly bool   `json:"read_only,omitempty"`
+}
+
+// containerUID and containerGID are the ordinary user every attempt runs as
+// in a container, on every runtime (issue #46): the container's init starts
+// as root, gives the user a name in the image (attemptAccount), hands it what
+// Kairo lets the attempt write and starts the argv (and its streams'
+// loaders) as it. containerHome is its home, in the attempt's scratch.
+const (
+	containerUID  = 1000
+	containerGID  = 1000
+	containerHome = containerRoot + "/scratch/home"
+)
+
+// containerUserName is the attempt user's name when the image has none for
+// its uid.
+const containerUserName = "kairo"
+
+// attemptAccount is the attempt user's name in an image whose /etc/passwd
+// and /etc/group are passwd and group: the image's own for its uid, else
+// containerUserName (kairo-attempt if the image uses that name for another
+// id), with the lines to add to each file ("" when it has one already).
+func attemptAccount(passwd, group string) (name, passwdLine, groupLine string) {
+	names := map[string]bool{}
+	for line := range strings.SplitSeq(passwd, "\n") {
+		f := strings.Split(line, ":")
+		if len(f) < 3 {
+			continue
+		}
+		if f[2] == strconv.Itoa(containerUID) && name == "" {
+			name = f[0]
+		}
+		names[f[0]] = true
+	}
+	groupNames := map[string]bool{}
+	hasGroup := false
+	for line := range strings.SplitSeq(group, "\n") {
+		f := strings.Split(line, ":")
+		if len(f) < 3 {
+			continue
+		}
+		if f[2] == strconv.Itoa(containerGID) {
+			hasGroup = true
+		}
+		groupNames[f[0]] = true
+	}
+	if name == "" {
+		name = containerUserName
+		if names[name] {
+			name = containerUserName + "-attempt"
+		}
+		passwdLine = fmt.Sprintf("%s:x:%d:%d:Kairo attempt:%s:/bin/sh", name, containerUID, containerGID, containerHome)
+	}
+	if !hasGroup {
+		g := name
+		if groupNames[g] {
+			g = containerUserName + "-attempt"
+		}
+		groupLine = fmt.Sprintf("%s:x:%d:", g, containerGID)
+	}
+	return name, passwdLine, groupLine
 }
 
 // containerInstance is the Incus instance name of an attempt (letters,
@@ -140,8 +202,8 @@ type containerOptions struct {
 	runArg   string
 	dirsOnly bool
 	// runtime names the container's runtime (spec.Runtime); vm: it runs in
-	// a VM (ociCaps.vm): its init is the Linux build beside this binary, it
-	// runs as an ordinary user and asks for raw files as files.
+	// a VM (ociCaps.vm): its init is the Linux build beside this binary and
+	// it asks for raw files as files.
 	runtime string
 	vm      bool
 }
@@ -231,15 +293,13 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		Streams:  launch.Streams,
 	}
 	spec.Runtime = opts.runtime
-	if opts.vm {
-		// the ordinary user it runs as has no home in the image: one in
-		// the scratch
-		home := filepath.Join(scratch, "home")
-		if err := os.MkdirAll(home, 0o777); err != nil {
-			return nil, err
-		}
-		env = setEnv(env, "HOME", home)
+	// the ordinary user it runs as (containerUID) has no home in the image:
+	// one in the scratch
+	home := filepath.Join(scratch, "home")
+	if err := os.MkdirAll(home, 0o777); err != nil {
+		return nil, err
 	}
+	env = setEnv(env, "HOME", home)
 	paths := map[string]string{scratch: containerRoot + "/scratch", output: containerRoot + "/output"}
 	if cache != "" {
 		spec.Mounts = append(spec.Mounts, containerMount{Source: cache, Path: containerRoot + "/cache"})

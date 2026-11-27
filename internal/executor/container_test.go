@@ -112,3 +112,25 @@ func TestFindOCIRemote(t *testing.T) {
 		}
 	}
 }
+
+// The attempt's user is the image's own for its uid when it has one; else
+// kairo (kairo-attempt where the image uses that name for another id), with
+// the lines its passwd and group lack.
+func TestTheAttemptUserIsNamedInTheImage(t *testing.T) {
+	base := "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n"
+	groups := "root:x:0:\nnogroup:x:65534:\n"
+	for _, tc := range []struct {
+		name, passwd, group, want, wantPasswd, wantGroup string
+	}{
+		{"none", base, groups, "kairo", "kairo:x:1000:1000:Kairo attempt:/kairo/scratch/home:/bin/sh", "kairo:x:1000:"},
+		{"the image's", base + "ubuntu:x:1000:1000:Ubuntu:/home/ubuntu:/bin/bash\n", groups + "ubuntu:x:1000:\n", "ubuntu", "", ""},
+		{"its name taken", base + "kairo:x:999:999::/:/bin/sh", groups + "kairo:x:999:", "kairo-attempt",
+			"kairo-attempt:x:1000:1000:Kairo attempt:/kairo/scratch/home:/bin/sh", "kairo-attempt:x:1000:"},
+		{"no files", "", "", "kairo", "kairo:x:1000:1000:Kairo attempt:/kairo/scratch/home:/bin/sh", "kairo:x:1000:"},
+	} {
+		name, passwd, group := attemptAccount(tc.passwd, tc.group)
+		if name != tc.want || passwd != tc.wantPasswd || group != tc.wantGroup {
+			t.Errorf("%s: %q %q %q", tc.name, name, passwd, group)
+		}
+	}
+}

@@ -4,9 +4,11 @@
 # installation). The check is the first argument:
 #   linux       gofmt, go vet (Linux and Windows), go test   (the Linux CI node, as an unprivileged user)
 #   linux-race  go test -race                               (the Linux CI node, as an unprivileged user)
-#   linux-root  the executor and process tests as root      (the Linux CI node)
-#   start-pg    start a test PostgreSQL 17 on 127.0.0.1:55432 when none is reachable (as root, in a check's container):
-#               portable binaries kept in KAIRO_CACHE_DIR, the data in KAIRO_SCRATCH, run as nobody
+#   linux-root  the executor and process tests as root      (GitHub's runner, with sudo: Kairo's attempts run as an
+#               ordinary user, README: Confinement)
+#   start-pg    start a test PostgreSQL 17 on 127.0.0.1:55432 when none is reachable (in a check's container):
+#               portable binaries kept in KAIRO_CACHE_DIR, the data in KAIRO_SCRATCH, run as the check's user (as
+#               nobody when that is root, which PostgreSQL refuses)
 #   windows     go vet, go test                             (GitHub's Windows runner)
 #   sdk-python  the Python SDK's tests                      (the CI node, in a uv image)
 #   sdk-rust    the Rust SDK's tests                        (the CI node, in a Rust image)
@@ -30,7 +32,8 @@ pg_reachable() {
 }
 # start_pg starts the test server a check's container has none of: PostgreSQL 17 from the portable builds of
 # io.zonky.test (Maven Central; checked by sha256), unpacked once into the project's cache, its data in the scratch,
-# trusting local connections (role kairo, database kairo), fsync off, run as nobody (PostgreSQL refuses root).
+# trusting local connections (role kairo, database kairo), fsync off, run as the check's user, or as nobody when that
+# is root (PostgreSQL refuses root).
 pg_version=17.12.0
 pg_sha256=7a8951dc117490f2d4161600836c8b1055306aff86e0a472aad55457651e5cbd
 start_pg() {
@@ -57,9 +60,13 @@ PY
   step "start PostgreSQL $pg_version"
   local data=$scratch/pgdata
   mkdir -p "$data"
-  chown 65534:65534 "$data"
+  if [ "$(id -u)" = 0 ]; then
+    chown 65534:65534 "$data"
+    as_nobody() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
+  else
+    as_nobody() { "$@"; }
+  fi
   chmod 700 "$data"
-  as_nobody() { setpriv --reuid=65534 --regid=65534 --clear-groups "$@"; }
   as_nobody "$pg/bin/initdb" -D "$data" -U kairo --auth=trust -E UTF8 >/dev/null
   # the portable build has no createdb: the database is made in single-user mode, before the server starts
   echo "CREATE DATABASE kairo;" | as_nobody "$pg/bin/postgres" --single -D "$data" postgres >/dev/null

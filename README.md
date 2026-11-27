@@ -704,7 +704,14 @@ Attempt のランチャーは shim です。これは Executor の `kairo` バ�
 実装はランタイムごとに次のとおりです。
 
 - **Incus（Linux）**: コンテナの init（`__kairo-container-init`）が、コンテナのマウント名前空間の中で閉じ込めます。上記の 3 ディレクトリ、`/dev/shm`、および `/proc` をそれぞれ自身にバインドマウントし、さらに `scratch` 配下の `tmp` ディレクトリを `/tmp` の上にバインドマウントします。そのうえで `/` から再帰的にすべてのマウントを読み取り専用にし（`mount_setattr`）、上記のマウント先だけを再び書き込み可能に戻してから `argv` を起動します。デバイスはそのまま利用可能です。閉じ込められない場合は、理由を stderr に出力して終了コード `126` で終了します。
-- **wslc（Windows）**: コンテナの中でマウントを作れない（`CAP_SYS_ADMIN` がない）ため、マウントによる閉じ込めの代わりに、`argv` を一般ユーザー（`1000:1000`）で実行します（[WSL コンテナ Executor](#wsl-コンテナ-executorkind--wslc) を参照）。
+- **wslc（Windows）**: コンテナの中でマウントを作れない（`CAP_SYS_ADMIN` がない）ため、マウントによる閉じ込めはしません。イメージのファイルに書けないのは、`argv` を一般ユーザーで動かすことによります（[WSL コンテナ Executor](#wsl-コンテナ-executorkind--wslc) を参照）。
+
+どのランタイムでも、`argv` は同じ一般ユーザー（uid・gid `1000`）で動きます（issue #46）。プロジェクトから見て、Incus と wslc の違いはありません。
+
+- **名前**: コンテナの init は root で始まり、閉じ込める前に、イメージの `/etc/passwd` と `/etc/group` に uid `1000` の行を足します。イメージにすでに uid `1000` の名前があれば（`ubuntu` など）、それを使います。なければ `kairo`（ホームは `/kairo/scratch/home`）です。`USER` と `LOGNAME` にその名前を、`HOME` に scratch の `home` を入れます。`getpass.getuser()`、`pwd.getpwuid()`、`id -un`、git、ssh が動きます。イメージのファイルに書けない場合は、名前は環境変数だけになります（stderr に出ます）。
+- **書ける場所**: Kairo が渡す書き込み先（`scratch`・`output`・`cache` など）は、そのユーザーのものにします。Incus では、ランナーがホストの側で、コンテナの外の id とコンテナの root が持つものを渡します（root で動いていた以前の Attempt が書いたキャッシュは、最初の 1 回で渡ります）。wslc（と、Proxmox のコンテナの中に入れ子になった Incus）では、init がコンテナの中で渡します。stream の Loader も同じユーザーで動きます。
+- **GPU**: Incus に渡す NVIDIA のデバイスは、そのユーザーが開けるよう `0666` にします。
+- 実行時に root を前提とするイメージ（実行中の `pip install` でイメージに書くなど）は動きません。
 
 #### 配置・バックフィル・プリエンプション
 
@@ -1019,7 +1026,7 @@ labels = { environment = "linux", site = "host-a" }
 
 - **Incus 6.3 以降**: OCI イメージ対応が必要です（Debian 13 の 6.0 LTS には対応がなく、Zabbly パッケージを利用する必要があります）。また、デフォルトプロファイルにストレージプールとネットワークが設定されている必要があります。
 - **GPU 利用時**: ノード上に `nvidia-container-cli`（`libnvidia-container-tools`）とドライバのユーザー空間ファイルが必要です。
-- **コンテナの権限**: ホスト上では、コンテナは非特権です。コンテナの root は、root の `/etc/subuid` の範囲の先頭の ID（既定は 100000。Proxmox のコンテナと同じ）です。コンテナが書き込む領域は、起動の前に、コンテナの ID の範囲（root から 65536 個。uid と gid はそれぞれのマップから読みます）の外の ID が持つもの（ホストやエージェントが書いたもの）だけを、コンテナの root の所有にします。範囲の中の ID が持つもの（attempt が切り替えた利用者が書いたもの）はそのままにするので、同じキャッシュを使う別の attempt が走っていても、その持ち物は変わりません。たどるときはディレクトリを記述子で開き、リンクは一切たどりません（走っているコンテナがリンクを置いても、領域の外には及びません）。読み取り専用で渡すもの（データ、Kairo のバイナリ、GPU のドライバ）は、所有者を変えずに渡します。エージェント自身が非特権の LXC の中で動いているとき（入れ子）は、LXC には UID マップが 1 つしかないため、コンテナを特権にします（`security.privileged`。物理ホストから見れば非特権のままです）。
+- **コンテナの権限**: ホスト上では、コンテナは非特権です。コンテナの root は、root の `/etc/subuid` の範囲の先頭の ID（既定は 100000。Proxmox のコンテナと同じ）です。コンテナが書き込む領域は、起動の前に、コンテナの ID の範囲（root から 65536 個。uid と gid はそれぞれのマップから読みます）の外の ID が持つもの（ホストやエージェントが書いたもの）と、コンテナの root やほかの利用者が持つもの（root で動いていた以前の attempt や、それが切り替えた利用者が書いたもの）を、すべて attempt の利用者（コンテナの uid・gid `1000`）の所有にします。どの attempt もその利用者で動くので、渡すのは最初の 1 回だけです。たどるときはディレクトリを記述子で開き、リンクは一切たどりません（走っているコンテナがリンクを置いても、領域の外には及びません）。読み取り専用で渡すもの（データ、Kairo のバイナリ、GPU のドライバ）は、所有者を変えずに渡します。エージェント自身が非特権の LXC の中で動いているとき（入れ子）は、LXC には UID マップが 1 つしかないため、コンテナを特権にします（`security.privileged`。物理ホストから見れば非特権のままです）。
 - **AppArmor（Proxmox のホスト）**: Incus が作る AppArmor のプロファイルは ABI を宣言しません。Debian の既定の ABI のままだと、Proxmox のカーネル（7.0）はコンテナの中での UNIX ソケットの作成を拒否します（`failed protocol match`）。`/etc/apparmor/parser.conf` の `policy-features` を、Proxmox の LXC が使う `/etc/apparmor.d/abi/lxc` にします。
 
 Proxmox VE のホストに直接入れる場合の手順です（Debian 13）。VM のための依存を入れないよう、コンテナだけの `incus-base` を使います。
@@ -1067,7 +1074,7 @@ labels = { site = "host-w" }
 
 - **ランナー**（`__kairo-oci-run`。wslc のときの動作）: イメージをダイジェストで取得し（`wslc pull`）、同じ名前の残りを消してから、`wslc run` を前景で動かして停止を待ち、`/kairo/run/exit` の終了コードを読んでコンテナを削除します。Attempt の停止（CTRL_BREAK）が届くと、`wslc stop` でコンテナを止めます。
 - **init**: エージェントの横に置いた Linux 版のバイナリ `kairo-linux` を `/kairo/bin/kairo` にマウントし、`__kairo-container-init` として動かします（`ops/windows/replace-agent.ps1` が Windows 版と一緒に置きます）。
-- **閉じ込めの代わりに一般ユーザーで動かす**: wslc のコンテナはマウントができない（CAP_SYS_ADMIN がない）ため、init は Incus のような読み取り専用化をしません。代わりにコンテナ全体を uid 1000 で動かします。Kairo が渡す領域は書けますが、イメージのファイルは書けないので、`/kairo` の外に書いたものは黙って消えず、書いた時点で失敗します（`/tmp` だけは書けますが、`TMPDIR` は scratch を指します）。`HOME` は scratch の `home` です。実行時に root を前提とするイメージ（実行中の `pip install` など）は動きません。
+- **閉じ込めの代わりに一般ユーザーで動かす**: wslc のコンテナはマウントができない（CAP_SYS_ADMIN がない）ため、init は Incus のような読み取り専用化をしません。init は root で始まり（`--user 0:0`）、`argv` はどのランタイムとも同じ一般ユーザー（uid `1000`、[コンファインメント](#アドミッション制御とプランニング) の下を参照）で動きます。Kairo が渡す領域は書けますが、イメージのファイルは書けないので、`/kairo` の外に書いたものは黙って消えず、書いた時点で失敗します（`/tmp` だけは書けますが、`TMPDIR` は scratch を指します）。`HOME` は scratch の `home` です。実行時に root を前提とするイメージ（実行中の `pip install` など）は動きません。
 - **停止**: 他のランタイムと同じく、停止はランナーに届き、ランナーが `wslc stop` でコンテナを止め、init が `argv` のプロセスグループへ SIGTERM を渡します（30 秒後に wslc が強制終了します）。プロセスの生死は、コンテナが動いているかどうかで判断します。
 - **GPU**: `--gpus all` で WSL の GPU（`/dev/dxg` と `/usr/lib/wsl/lib`）を渡し、`CUDA_VISIBLE_DEVICES` に Lease した GPU の UUID を入れます。glibc のイメージに限ります（alpine では wslc の GPU フックが失敗します）。
 - **ネットワーク**: コンテナは wslc のブリッジから外へ出られ、デーモンにも直接届きます。
@@ -2363,8 +2370,8 @@ CI_LINUX_SITE=host-b        # そのノードの site ラベル
 
 各 Task はスナップショット（`/kairo/src`）を自身の `scratch`（`KAIRO_SCRATCH`）にコピーし、そこから `ci/check.sh CHECK` を実行します（チェック内容もそのコミット時点のものです）。Go・`uv`・`cargo` のキャッシュはプロジェクトのキャッシュディレクトリ（`KAIRO_CACHE_DIR`）に置きます。
 
-- `<sha>-linux`（`gofmt`、Linux / Windows 向け `go vet`、`go test`）と `<sha>-linux-race`: golang のイメージで、テスト用の PostgreSQL 17 を自分で立て（`ci/check.sh start-pg`）、非特権ユーザー（nobody）で実行します。
-- `<sha>-linux-root`: Executor・プロセス・Provider のテストを `root` で実行します。
+- `<sha>-linux`（`gofmt`、Linux / Windows 向け `go vet`、`go test`）と `<sha>-linux-race`: golang のイメージで、テスト用の PostgreSQL 17 を自分で立て（`ci/check.sh start-pg`）、Attempt の一般ユーザーで実行します（[コンファインメント](#アドミッション制御とプランニング)。issue #46 より前の、Attempt を root で動かす agent では nobody に切り替えます）。
+- Executor・プロセス・Provider のテストを `root` で実行するチェック（`linux-root`）は、GitHub の CI だけで（`sudo` で）実行します。Kairo の Attempt は root では動かないためです。
 - `<sha>-sdk-python`・`<sha>-sdk-rust`: uv のイメージと Rust のイメージで、各 SDK のテストを実行します。
 - Windows 向けのビルドとテスト（`windows`）は GitHub の CI だけで実行します。Kairo は Windows ネイティブの仕事を動かさないためです（Windows では wslc のコンテナで Linux の仕事を動かします）。
 
