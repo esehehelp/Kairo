@@ -1564,6 +1564,9 @@ func rankPrefix(c *planCandidate, r planRank) string {
 	return fmt.Sprintf("rank %d: ", r.rank)
 }
 
+// assignBudget bounds the nodes assign tries for one placement.
+const assignBudget = 20000
+
 // assign puts every rank on a distinct node (all or nothing), each on the
 // best node left for it, trying the most constrained rank first.
 func (p *planner) assign(ranks []planRank, options [][]planExecutor, ov planOverlay, freed func(string) bool) ([]planSlot, bool) {
@@ -1573,6 +1576,19 @@ func (p *planner) assign(ranks []planRank, options [][]planExecutor, ov planOver
 	}
 	sort.SliceStable(order, func(a, b int) bool { return len(options[order[a]]) < len(options[order[b]]) })
 	slots := make([]planSlot, len(ranks))
+	// every rank on a node of its own: not when the nodes are fewer
+	nodes := map[string]bool{}
+	for _, opts := range options {
+		for _, e := range opts {
+			nodes[e.nodeID] = true
+		}
+	}
+	if len(nodes) < len(ranks) {
+		return slots, false
+	}
+	// the search is bounded (it runs under the decision lock): a gang it
+	// gives up on waits, as one that does not fit
+	budget := assignBudget
 	used := map[string]bool{}
 	var walk func(int, planOverlay) bool
 	walk = func(depth int, ov planOverlay) bool {
@@ -1582,6 +1598,9 @@ func (p *planner) assign(ranks []planRank, options [][]planExecutor, ov planOver
 		i := order[depth]
 		var fits []planSlot
 		for _, e := range options[i] {
+			if budget--; budget < 0 {
+				return false
+			}
 			if used[e.nodeID] || !p.reachesAll(e.nodeID, used) {
 				continue
 			}

@@ -187,8 +187,26 @@ func createSegmentTx(ctx context.Context, tx *sql.Tx, segmentPrefix string, node
 	if err != nil {
 		return FabricSegment{}, err
 	}
+	base := p.Addr().As4()
+	count := 1 << (segmentSubnetBits - p.Bits())
+	// the subnet from start on that no segment has ("": none)
+	free := func(start int) string {
+		for j := 0; j < count; j++ {
+			i := (start + j) % count
+			a := base
+			a[1] += byte(i >> 8)
+			a[2] += byte(i)
+			subnet := netip.PrefixFrom(netip.AddrFrom4(a), segmentSubnetBits).Masked().String()
+			if !usedSubnet[subnet] && p.Contains(netip.AddrFrom4(a)) {
+				return subnet
+			}
+		}
+		return ""
+	}
 	seg := FabricSegment{VNI: firstSegmentVNI, MTU: mtu, Purpose: purpose, Nodes: nodes, Created: now()}
-	if purpose == "gang" {
+	// a VNI from the sequence only when there is a subnet to go with it (a
+	// sequence's values are spent even when the transaction is rolled back)
+	if purpose == "gang" && free(0) != "" {
 		if err := tx.QueryRowContext(ctx, `SELECT nextval('fabric_gang_vni')`).Scan(&seg.VNI); err != nil {
 			return FabricSegment{}, err
 		}
@@ -196,8 +214,6 @@ func createSegmentTx(ctx context.Context, tx *sql.Tx, segmentPrefix string, node
 	for usedVNI[seg.VNI] {
 		seg.VNI++
 	}
-	base := p.Addr().As4()
-	count := 1 << (segmentSubnetBits - p.Bits())
 	// a gang's from where its VNI says, on: the subnet a generation that
 	// ended had is taken again only after the prefix's others (a node may
 	// still have its network a while, and a wslc VM refuses two that overlap)
@@ -205,17 +221,7 @@ func createSegmentTx(ctx context.Context, tx *sql.Tx, segmentPrefix string, node
 	if purpose == "gang" {
 		start = (seg.VNI - firstGangVNI) % count
 	}
-	for j := 0; j < count; j++ {
-		i := (start + j) % count
-		a := base
-		a[1] += byte(i >> 8)
-		a[2] += byte(i)
-		subnet := netip.PrefixFrom(netip.AddrFrom4(a), segmentSubnetBits).Masked().String()
-		if !usedSubnet[subnet] && p.Contains(netip.AddrFrom4(a)) {
-			seg.Subnet = subnet
-			break
-		}
-	}
+	seg.Subnet = free(start)
 	if seg.Subnet == "" {
 		return FabricSegment{}, fmt.Errorf("%w: every /%d of %s is a segment's", ErrFabric, segmentSubnetBits, segmentPrefix)
 	}

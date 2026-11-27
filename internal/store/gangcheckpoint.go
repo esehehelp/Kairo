@@ -160,11 +160,12 @@ func (g *gangGeneration) inherited() *gangRound {
 	return r
 }
 
-// gangContinuationTx decides a terminal checkpointable gang whose members
-// published (or should have published) checkpoints: it plans the
-// continuation from a complete round, or blocks or fails the task, and
-// reports whether it did; false leaves the task to the ordinary rules (no
-// member suspended, nor was lost).
+// gangContinuationTx decides a terminal gang that lost a member, or (a
+// checkpointable one) whose members published, or should have published,
+// checkpoints: it plans the continuation from a complete round, or blocks
+// or fails the task, and reports whether it did; false leaves the task to
+// the ordinary rules (no member suspended, nor was lost). A gang never goes
+// on from its leader's checkpoint alone.
 func gangContinuationTx(ctx context.Context, tx *sql.Tx, task orchestrationTaskRow, current currentTaskExecution, template orchestration.Execution) (bool, error) {
 	g, err := gangGenerationTx(ctx, tx, current.ExecutionID)
 	if err != nil || g.size == 0 {
@@ -182,8 +183,10 @@ func gangContinuationTx(ctx context.Context, tx *sql.Tx, task orchestrationTaskR
 	}
 	released := current.LeaseState != nil && *current.LeaseState == "released"
 	if lost {
-		if !template.ContinueAfterLoss {
-			return false, nil // blocked as a lost attempt
+		if !template.Checkpointable || !template.ContinueAfterLoss {
+			// read from every member (a lost one's attempt may be
+			// reconciled already: its execution still says so)
+			return true, updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "attempt identity lost (a gang member)", "execution_id": current.ExecutionID})
 		}
 		if !released {
 			return true, updateTaskState(ctx, tx, task.taskScopeID, "running", map[string]any{"reason": "a gang member lost: the gang goes on from its latest gang-wide checkpoint once every lease is released", "execution_id": current.ExecutionID})
@@ -196,6 +199,9 @@ func gangContinuationTx(ctx context.Context, tx *sql.Tx, task orchestrationTaskR
 			return true, updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "a gang member lost; no checkpoint every member published", "execution_id": current.ExecutionID})
 		}
 		return true, planGangContinuation(ctx, tx, task, current, g, round, "loss_continuation", "attempt_lost")
+	}
+	if !template.Checkpointable {
+		return false, nil
 	}
 	// a suspend: once every member is quiesced and released
 	if current.AttemptState == nil || *current.AttemptState != "quiesced" || !released {
@@ -307,7 +313,7 @@ func applyGangContinuation(spec *ExecutionSpec, trigger map[string]any) error {
 // (an operator's, or a data protection one): the gang checkpoints only once
 // every member holds one.
 func (s *Store) propagateGangCheckpoints(ctx context.Context) error {
-	const live = `SELECT gpl.placement_id,c.origin,c.reason,gpl.rank FROM gang_placements gp JOIN gang_placement_leases gpl ON gpl.placement_id=gp.id
+	const live = `SELECT gpl.placement_id,c.origin,c.reason,gpl.rank,c.created_at FROM gang_placements gp JOIN gang_placement_leases gpl ON gpl.placement_id=gp.id
 		JOIN leases l ON l.id=gpl.lease_id JOIN commands c ON c.attempt_id=l.attempt_id
 		WHERE gp.state='launched' AND c.kind='checkpoint' AND c.state IN('pending','accepted','checkpointing')`
 	var found bool
@@ -320,14 +326,14 @@ func (s *Store) propagateGangCheckpoints(ctx context.Context) error {
 	}
 	defer tx.Rollback()
 	type source struct {
-		origin, reason string
-		rank           int
+		origin, reason, created string
+		rank                    int
 	}
 	sources := map[string]source{}
 	if err := eachRow(ctx, tx, live+` ORDER BY c.created_at`, nil, func(rows *sql.Rows) error {
 		var placement string
 		var s source
-		if err := rows.Scan(&placement, &s.origin, &s.reason, &s.rank); err != nil {
+		if err := rows.Scan(&placement, &s.origin, &s.reason, &s.rank, &s.created); err != nil {
 			return err
 		}
 		if _, ok := sources[placement]; !ok {
@@ -348,8 +354,12 @@ func (s *Store) propagateGangCheckpoints(ctx context.Context) error {
 			JOIN leases l ON l.id=gpl.lease_id AND l.state='active' JOIN attempts a ON a.id=l.attempt_id AND a.state='running'
 			JOIN execution_requests e ON e.id=gpl.execution_id AND e.checkpointable
 			WHERE gpl.placement_id=$1 AND NOT EXISTS(SELECT 1 FROM commands c WHERE c.attempt_id=a.id AND
-				((c.kind='checkpoint' AND c.state IN('pending','accepted','checkpointing')) OR (c.kind='suspend' AND c.state!='rejected')))`,
-			[]any{placement}, func(rows *sql.Rows) error {
+				((c.kind='checkpoint' AND (c.state IN('pending','accepted','checkpointing') OR c.created_at::timestamptz>=$2::timestamptz-interval '1 minute'))
+				OR (c.kind='suspend' AND c.state!='rejected')))`,
+			// (one given a checkpoint about when the source was, published or
+			// not, has had its part of that round: the commands of a round are
+			// made in one pass, a second apart at most; it is given no other)
+			[]any{placement, src.created}, func(rows *sql.Rows) error {
 				var t target
 				if err := rows.Scan(&t.executionID, &t.attemptID, &t.leaseID, &t.epoch, &t.rank); err != nil {
 					return err

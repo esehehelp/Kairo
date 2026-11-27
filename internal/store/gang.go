@@ -562,7 +562,9 @@ type gangRankState struct {
 	checkpointable          bool
 	command                 sql.NullString // origin of the rank's live or checkpointed suspend
 	commandReason           sql.NullString
+	commandState            sql.NullString // and its state: checkpointed when the rank published its part
 	terminated              bool
+	executionState          string
 }
 
 func (s *Store) reconcileLaunchedGangs(ctx context.Context) error {
@@ -598,15 +600,23 @@ func (s *Store) reconcileLaunchedGangs(ctx context.Context) error {
 			if stopped != "" {
 				continue
 			}
+			published := r.commandState.String == "checkpointed"
 			switch {
 			case !r.attemptID.Valid:
-				// between the barrier and its own launch, unless its lease is gone
+				// between the barrier and its own launch, unless its lease is gone:
+				// then it never runs in this generation, which ends (the gang is
+				// restarted as a launch that failed: gang_restart)
 				if r.leaseState == "released" || r.leaseState == "stale" || r.leaseState == "revocation_requested" {
 					stopped = fmt.Sprintf("rank %d lost its lease before launch", r.rank)
+					if err := s.abortUnlaunchedMember(ctx, r, stopped); err != nil {
+						return err
+					}
 				}
 			case r.attemptState.String == "lost":
 				stopped = fmt.Sprintf("rank %d lost its executor", r.rank)
-			case (r.attemptState.String == "exited" || r.attemptState.String == "quiesced") && !r.command.Valid && (!r.exitCode.Valid || r.exitCode.Int64 != 0):
+			case (r.attemptState.String == "exited" || r.attemptState.String == "quiesced") && !published && (!r.exitCode.Valid || r.exitCode.Int64 != 0):
+				// (a rank that took a suspend and ended without publishing its
+				// part stopped as much as one that took none)
 				stopped = fmt.Sprintf("rank %d stopped (exit %v)", r.rank, nullableInt(r.exitCode))
 			}
 		}
@@ -616,7 +626,9 @@ func (s *Store) reconcileLaunchedGangs(ctx context.Context) error {
 				continue
 			}
 			switch {
-			case stopped != "" && !r.terminated && !(r.command.Valid && r.attemptState.String == "quiescing"):
+			// a rank that published its part of a suspend ends by itself; one
+			// that only took the suspend may wait for a peer that is gone
+			case stopped != "" && !r.terminated && r.commandState.String != "checkpointed":
 				if err := s.requestGangTermination(ctx, r, p.gangID, stopped); err != nil {
 					return err
 				}
@@ -630,6 +642,37 @@ func (s *Store) reconcileLaunchedGangs(ctx context.Context) error {
 	return nil
 }
 
+// abortUnlaunchedMember ends, as a launch that failed, the execution of a
+// member of a launched generation that lost its lease before it was
+// launched: it is never placed alone, and the gang, once every member has
+// ended, is restarted (gang_restart, bounded).
+func (s *Store) abortUnlaunchedMember(ctx context.Context, r gangRankState, reason string) error {
+	if r.executionState != "waiting" {
+		return nil
+	}
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := now()
+	res, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause=$1,terminal_at=$2 WHERE id=$3 AND state='waiting'`,
+		"launch_aborted: "+reason, stamp, r.executionID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		projectID, err := executionProjectIDTx(ctx, tx, r.executionID)
+		if err != nil {
+			return err
+		}
+		if err := appendCoordinationEventTx(ctx, tx, "execution_terminal", &projectID, "execution", r.executionID, nil, map[string]string{"cause": "launch_aborted: " + reason}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
 func nullableInt(v sql.NullInt64) any {
 	if v.Valid {
 		return v.Int64
@@ -638,9 +681,10 @@ func nullableInt(v sql.NullInt64) any {
 }
 
 func (s *Store) gangRankStates(ctx context.Context, placementID string) ([]gangRankState, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT gpl.rank,gpl.execution_id,gpl.executor_id,l.state,a.id,a.state,a.exit_code,e.checkpointable,
+	rows, err := s.db.QueryContext(ctx, `SELECT gpl.rank,gpl.execution_id,gpl.executor_id,l.state,a.id,a.state,a.exit_code,e.checkpointable,e.state,
 		(SELECT c.origin FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
 		(SELECT c.reason FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
+		(SELECT c.state FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
 		EXISTS(SELECT 1 FROM gang_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM force_stops t WHERE t.attempt_id=a.id)
 		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id JOIN execution_requests e ON e.id=gpl.execution_id
 		LEFT JOIN attempts a ON a.id=l.attempt_id
@@ -652,7 +696,7 @@ func (s *Store) gangRankStates(ctx context.Context, placementID string) ([]gangR
 	var out []gangRankState
 	for rows.Next() {
 		var r gangRankState
-		if err = rows.Scan(&r.rank, &r.executionID, &r.executorID, &r.leaseState, &r.attemptID, &r.attemptState, &r.exitCode, &r.checkpointable, &r.command, &r.commandReason, &r.terminated); err != nil {
+		if err = rows.Scan(&r.rank, &r.executionID, &r.executorID, &r.leaseState, &r.attemptID, &r.attemptState, &r.exitCode, &r.checkpointable, &r.executionState, &r.command, &r.commandReason, &r.commandState, &r.terminated); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -724,8 +768,10 @@ func gangAggregateTx(ctx context.Context, tx *sql.Tx, current *currentTaskExecut
 		}
 		allTerminal = allTerminal && state == "terminal"
 		if !attemptID.Valid {
+			// a member that ended without an attempt (its launch aborted,
+			// withdrawn) has nothing running: as quiesced
 			anyNoAttempt = true
-			allQuiesced = false
+			allQuiesced = allQuiesced && state == "terminal"
 		} else {
 			allQuiesced = allQuiesced && attemptState.String == "quiesced"
 			anyLost = anyLost || attemptState.String == "lost"

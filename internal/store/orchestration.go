@@ -369,21 +369,19 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 			}
 			continue
 		}
-		// A checkpointable gang that suspended, or lost a member, goes on
-		// only from a checkpoint every member published (gangcheckpoint.go).
+		// A gang that suspended, or lost a member, goes on only from a
+		// checkpoint every member published, or is blocked (gangcheckpoint.go).
 		if gang.gang {
 			var template orchestration.Execution
 			if err := json.Unmarshal([]byte(task.template), &template); err != nil {
 				return err
 			}
-			if template.Checkpointable {
-				handled, err := gangContinuationTx(ctx, tx, task, current, template)
-				if err != nil {
-					return err
-				}
-				if handled {
-					continue
-				}
+			handled, err := gangContinuationTx(ctx, tx, task, current, template)
+			if err != nil {
+				return err
+			}
+			if handled {
+				continue
 			}
 		}
 		// A lost attempt of a task declared continue_after_loss: once nothing of

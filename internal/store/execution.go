@@ -686,8 +686,29 @@ func (s *Store) WithdrawExecution(ctx context.Context, executionID string) error
 		return err
 	}
 	defer tx.Rollback()
-	if _, err = withdrawExecutionTx(ctx, tx, executionID); err != nil {
+	// a gang's member is withdrawn with every other member (none is placed
+	// alone): all of them, or none when one has started
+	ids := []string{executionID}
+	if gangID, _, _, err := gangOfExecutionTx(ctx, tx, executionID); err != nil {
 		return err
+	} else if gangID != "" {
+		ids = nil
+		err := eachRow(ctx, tx, `SELECT execution_id FROM gang_members WHERE gang_id=$1 ORDER BY rank`, []any{gangID}, func(rows *sql.Rows) error {
+			var id string
+			if err := rows.Scan(&id); err != nil {
+				return err
+			}
+			ids = append(ids, id)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	for _, id := range ids {
+		if _, err = withdrawExecutionTx(ctx, tx, id); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

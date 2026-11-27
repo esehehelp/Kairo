@@ -273,6 +273,11 @@ func (s *Store) RerunTaskWith(ctx context.Context, project, name, actor, request
 		if !template.Checkpointable {
 			return RerunResult{}, taskConflict{fmt.Sprintf("task %s is not a checkpointable single execution; it is not rerun from a checkpoint", name)}
 		}
+		// a gang's checkpoint is a round every member published its part
+		// of, each member going on from its own: not one reference for all
+		if template.Gang != nil {
+			return RerunResult{}, taskConflict{fmt.Sprintf("task %s is a gang: it is not rerun from a checkpoint (a gang goes on from one when it is suspended, or lost a member with continue_after_loss)", name)}
+		}
 		commandID := from
 		if from == "latest" {
 			commandID = ""
