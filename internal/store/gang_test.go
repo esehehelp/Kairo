@@ -12,7 +12,7 @@ import (
 )
 
 // gangSegmentPrefix is where the tests' gangs' segments take their subnets.
-const gangSegmentPrefix = "10.210.0.0/16"
+const gangSegmentPrefix = "10.67.0.0/16"
 
 // setupGangInventory: two nodes with one GPU each, a Windows one and a Linux
 // one, both on the fabric and routing (where a gang's members may go), the
@@ -28,7 +28,7 @@ func setupGangInventory(t *testing.T, store *Store) {
 		if err := store.UpsertNode(ctx, Node{ID: n.node, Name: n.node, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := store.SyncFabric(ctx, n.node, FabricPlan{Prefix: "10.209.0.0/16"}, FabricSelf{PublicKey: fabricKey(byte('a' + i)), ListenPort: 51820, Routing: true}); err != nil {
+		if _, err := store.SyncFabric(ctx, n.node, FabricPlan{Prefix: "10.66.0.0/16"}, FabricSelf{PublicKey: fabricKey(byte('a' + i)), ListenPort: 51820, Routing: true}); err != nil {
 			t.Fatal(err)
 		}
 		if err := store.UpsertExecutor(ctx, Executor{ID: n.executor, NodeID: n.node, Kind: "local", Attributes: json.RawMessage(n.attrs), Enabled: true}); err != nil {
@@ -182,13 +182,13 @@ func TestGangPlacesRanksOnDistinctNodesAndLaunchesThemTogether(t *testing.T) {
 	ctx := context.Background()
 	rank0, rank1 := launchGang(t, store)
 	a, b := rank0.launch, rank1.launch
-	if a.Gang.MasterAddr != "10.210.0.1" || a.Gang.MasterPort != GangDefaultPort || b.Gang.MasterAddr != a.Gang.MasterAddr || a.Gang.Size != 2 {
+	if a.Gang.MasterAddr != "10.67.0.1" || a.Gang.MasterPort != GangDefaultPort || b.Gang.MasterAddr != a.Gang.MasterAddr || a.Gang.Size != 2 {
 		t.Fatalf("rendezvous: %+v / %+v", a.Gang, b.Gang)
 	}
 	// the generation's segment: a VNI of its own, an address each, on both
 	// nodes
-	if a.Gang.VNI != firstGangVNI || b.Gang.VNI != a.Gang.VNI || a.Gang.Subnet != "10.210.0.0/24" || a.Gang.MTU != DefaultSegmentMTU ||
-		a.Gang.Address != "10.210.0.1/24" || b.Gang.Address != "10.210.0.2/24" || strings.Join(b.Gang.Addresses, ",") != "10.210.0.1/24,10.210.0.2/24" {
+	if a.Gang.VNI != firstGangVNI || b.Gang.VNI != a.Gang.VNI || a.Gang.Subnet != "10.67.0.0/24" || a.Gang.MTU != DefaultSegmentMTU ||
+		a.Gang.Address != "10.67.0.1/24" || b.Gang.Address != "10.67.0.2/24" || strings.Join(b.Gang.Addresses, ",") != "10.67.0.1/24,10.67.0.2/24" {
 		t.Fatalf("segment: %+v / %+v", a.Gang, b.Gang)
 	}
 	segments, err := store.FabricSegments(ctx)
@@ -446,7 +446,7 @@ func TestAGangInAnImageRunsEveryMemberInAContainer(t *testing.T) {
 	spec := schedulerExecutionSpec("gang-image")
 	spec.Checkpointable, spec.Preemptible = false, false
 	spec.Image = testImagePin
-	spec.Gang = &GangSpec{Size: 2, Ranks: []GangRank{{Rank: 1, ExecutorSelector: json.RawMessage(`{"node":"pve1-t","container":false}`)}}}
+	spec.Gang = &GangSpec{Size: 2, Ranks: []GangRank{{Rank: 1, ExecutorSelector: json.RawMessage(`{"node":"node-b","container":false}`)}}}
 	leader, _, err := store.SubmitExecution(ctx, spec)
 	if err != nil {
 		t.Fatal(err)
@@ -465,7 +465,7 @@ func TestAGangInAnImageRunsEveryMemberInAContainer(t *testing.T) {
 			t.Fatal(err)
 		}
 		members++
-		if image != testImagePin || !strings.Contains(selector, `"container":true`) || (rank == 1) != strings.Contains(selector, `"node":"pve1-t"`) {
+		if image != testImagePin || !strings.Contains(selector, `"container":true`) || (rank == 1) != strings.Contains(selector, `"node":"node-b"`) {
 			t.Fatalf("member %d: selector %s, image %q", rank, selector, image)
 		}
 	}

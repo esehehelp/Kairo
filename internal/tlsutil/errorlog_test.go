@@ -16,8 +16,8 @@ func TestProbesAreLeftOutOfTheServerErrorLog(t *testing.T) {
 	log.SetFlags(0)
 	defer func() { log.SetOutput(prev); log.SetFlags(flags) }()
 	l := ServerErrorLog()
-	l.Printf("http: TLS handshake error from 10.209.0.4:16304: EOF")
-	l.Printf("http: TLS handshake error from 10.209.0.4:16305: remote error: tls: bad certificate")
+	l.Printf("http: TLS handshake error from 10.66.0.4:16304: EOF")
+	l.Printf("http: TLS handshake error from 10.66.0.4:16305: remote error: tls: bad certificate")
 	got := out.String()
 	if strings.Contains(got, ": EOF") || !strings.Contains(got, "bad certificate") {
 		t.Fatalf("logged %q", got)

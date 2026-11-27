@@ -102,9 +102,9 @@ func TestTheFabricKeepsPeersAtAnEndpointThatAnswers(t *testing.T) {
 	dir := t.TempDir()
 	keyFile := filepath.Join(dir, "fabric.key")
 	now := time.Unix(1_800_000_000, 0)
-	view := store.FabricView{Address: "10.209.0.1", Prefix: "10.209.0.0/16", Peers: []store.FabricNode{
-		{NodeID: "b", Address: "10.209.0.2", PublicKey: "KB", Endpoints: []string{"192.0.2.2:51820", "203.0.113.2:51820"}},
-		{NodeID: "c", Address: "10.209.0.3", PublicKey: "KC", Endpoints: []string{"192.0.2.3:51820"}},
+	view := store.FabricView{Address: "10.66.0.1", Prefix: "10.66.0.0/16", Peers: []store.FabricNode{
+		{NodeID: "b", Address: "10.66.0.2", PublicKey: "KB", Endpoints: []string{"192.0.2.2:51820", "203.0.113.2:51820"}},
+		{NodeID: "c", Address: "10.66.0.3", PublicKey: "KC", Endpoints: []string{"192.0.2.3:51820"}},
 	}}
 	var said store.FabricSelf
 	link := &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}}
@@ -120,7 +120,7 @@ func TestTheFabricKeepsPeersAtAnEndpointThatAnswers(t *testing.T) {
 	if fi, err := os.Stat(keyFile); err != nil || runtime.GOOS != "windows" && fi.Mode().Perm() != 0o600 {
 		t.Fatalf("key file: %v %v", fi, err)
 	}
-	if m.Address() != "10.209.0.1" || KnownAddress(keyFile) != "10.209.0.1" || link.address != "10.209.0.1" {
+	if m.Address() != "10.66.0.1" || KnownAddress(keyFile) != "10.66.0.1" || link.address != "10.66.0.1" {
 		t.Fatalf("address %q, kept %q, on the link %q", m.Address(), KnownAddress(keyFile), link.address)
 	}
 	if link.endpoints["KB"] != "192.0.2.2:51820" || link.endpoints["KC"] != "192.0.2.3:51820" {
@@ -148,7 +148,7 @@ func TestTheFabricKeepsPeersAtAnEndpointThatAnswers(t *testing.T) {
 	}
 	// d says no endpoint (it reaches out itself): still a peer, so that its
 	// handshakes are taken
-	view.Peers = append(view.Peers, store.FabricNode{NodeID: "d", Address: "10.209.0.4", PublicKey: "KD"})
+	view.Peers = append(view.Peers, store.FabricNode{NodeID: "d", Address: "10.66.0.4", PublicKey: "KD"})
 	if err := m.Once(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -178,8 +178,8 @@ func TestTheFabricKeepsPeersAtAnEndpointThatAnswers(t *testing.T) {
 // view kept beside its key), before the daemon is asked anything.
 func TestARestartedNodeIsBackOnTheFabricBeforeAskingTheDaemon(t *testing.T) {
 	keyFile := filepath.Join(t.TempDir(), "fabric.key")
-	view := store.FabricView{Address: "10.209.0.4", Prefix: "10.209.0.0/16", Peers: []store.FabricNode{
-		{NodeID: "b", Address: "10.209.0.2", PublicKey: "KB", Endpoints: []string{"192.0.2.2:51820"}},
+	view := store.FabricView{Address: "10.66.0.4", Prefix: "10.66.0.0/16", Peers: []store.FabricNode{
+		{NodeID: "b", Address: "10.66.0.2", PublicKey: "KB", Endpoints: []string{"192.0.2.2:51820"}},
 	}}
 	first := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}},
 		Sync: func(context.Context, store.FabricSelf) (store.FabricView, error) { return view, nil }}
@@ -195,7 +195,7 @@ func TestARestartedNodeIsBackOnTheFabricBeforeAskingTheDaemon(t *testing.T) {
 	if err := again.Restore(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if link.address != "10.209.0.4" || link.endpoints["KB"] != "192.0.2.2:51820" || again.Address() != "10.209.0.4" {
+	if link.address != "10.66.0.4" || link.endpoints["KB"] != "192.0.2.2:51820" || again.Address() != "10.66.0.4" {
 		t.Fatalf("restored %q %v", link.address, link.endpoints)
 	}
 	// nothing kept: nothing done
@@ -209,8 +209,8 @@ func TestARestartedNodeIsBackOnTheFabricBeforeAskingTheDaemon(t *testing.T) {
 // latest handshake; one from elsewhere is none of the fabric's.
 func TestLinksAreSaidWithWhatWasReceived(t *testing.T) {
 	keyFile := filepath.Join(t.TempDir(), "fabric.key")
-	view := store.FabricView{Address: "10.209.0.1", Prefix: "10.209.0.0/16", Peers: []store.FabricNode{
-		{NodeID: "b", Address: "10.209.0.2", PublicKey: "KB", Endpoints: []string{"192.0.2.2:51820"}},
+	view := store.FabricView{Address: "10.66.0.1", Prefix: "10.66.0.0/16", Peers: []store.FabricNode{
+		{NodeID: "b", Address: "10.66.0.2", PublicKey: "KB", Endpoints: []string{"192.0.2.2:51820"}},
 	}}
 	link := &fakeLink{handshakes: map[string]time.Time{"KB": time.Unix(1_800_000_000, 0)}, endpoints: map[string]string{}}
 	var said []store.FabricLinksReport
@@ -220,7 +220,7 @@ func TestLinksAreSaidWithWhatWasReceived(t *testing.T) {
 	if err := m.Once(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	m.Received("10.209.0.2:7485", 64<<20, 2*time.Second)
+	m.Received("10.66.0.2:7485", 64<<20, 2*time.Second)
 	m.Received("192.168.1.9:7475", 64<<20, time.Second)
 	if err := m.report(context.Background()); err != nil {
 		t.Fatal(err)
@@ -242,10 +242,10 @@ func TestLinksAreSaidWithWhatWasReceived(t *testing.T) {
 // down; a node told it routes no more has FRR taken away.
 func TestARoutingNodeIsGivenItsSegmentsAndFRR(t *testing.T) {
 	keyFile := filepath.Join(t.TempDir(), "fabric.key")
-	routing := &store.FabricRouting{ASN: 4200000000, VXLANPort: 4790, Reflectors: []string{"10.209.0.1", "10.209.0.2"}}
-	view := store.FabricView{Address: "10.209.0.4", Prefix: "10.209.0.0/16", Peers: []store.FabricNode{},
+	routing := &store.FabricRouting{ASN: 4200000000, VXLANPort: 4790, Reflectors: []string{"10.66.0.1", "10.66.0.2"}}
+	view := store.FabricView{Address: "10.66.0.4", Prefix: "10.66.0.0/16", Peers: []store.FabricNode{},
 		Routing:  routing,
-		Segments: []store.FabricSegment{{VNI: 10000, Subnet: "10.210.0.0/24", MTU: 1370}, {VNI: 10001, Subnet: "10.210.1.0/24", MTU: 1370}}}
+		Segments: []store.FabricSegment{{VNI: 10000, Subnet: "10.67.0.0/24", MTU: 1370}, {VNI: 10001, Subnet: "10.67.1.0/24", MTU: 1370}}}
 	var said store.FabricSelf
 	link := &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}}
 	m := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: link, Routing: true, NodeID: "w", RouterName: "kairo-frr",
@@ -260,12 +260,12 @@ func TestARoutingNodeIsGivenItsSegmentsAndFRR(t *testing.T) {
 	if !said.Routing {
 		t.Fatal("the node did not say it routes")
 	}
-	if link.segs[10000] != "10.209.0.4:4790 mtu 1370" || len(link.segs) != 2 {
+	if link.segs[10000] != "10.66.0.4:4790 mtu 1370" || len(link.segs) != 2 {
 		t.Fatalf("segments %v", link.segs)
 	}
 	conf := link.frr.files["frr.conf"]
-	for _, want := range []string{"router bgp 4200000000\n", " bgp router-id 10.209.0.4\n", " neighbor 10.209.0.1 peer-group fabric\n",
-		" neighbor 10.209.0.2 peer-group fabric\n", " neighbor fabric update-source 10.209.0.4\n", "  advertise-all-vni\n", " neighbor fabric bfd\n"} {
+	for _, want := range []string{"router bgp 4200000000\n", " bgp router-id 10.66.0.4\n", " neighbor 10.66.0.1 peer-group fabric\n",
+		" neighbor 10.66.0.2 peer-group fabric\n", " neighbor fabric update-source 10.66.0.4\n", "  advertise-all-vni\n", " neighbor fabric bfd\n"} {
 		if !strings.Contains(conf, want) {
 			t.Fatalf("frr.conf lacks %q:\n%s", want, conf)
 		}
@@ -273,11 +273,11 @@ func TestARoutingNodeIsGivenItsSegmentsAndFRR(t *testing.T) {
 	if strings.Contains(conf, "listen range") || strings.Contains(conf, "route-reflector-client") {
 		t.Fatalf("a client listens or reflects:\n%s", conf)
 	}
-	if !strings.Contains(link.frr.files["daemons"], "-l 10.209.0.4") {
+	if !strings.Contains(link.frr.files["daemons"], "-l 10.66.0.4") {
 		t.Fatalf("bgpd listens beyond the fabric address:\n%s", link.frr.files["daemons"])
 	}
 	// it becomes a reflector; segment 10001 is no longer its
-	routing.Reflector, routing.Reflectors = true, []string{"10.209.0.1", "10.209.0.4"}
+	routing.Reflector, routing.Reflectors = true, []string{"10.66.0.1", "10.66.0.4"}
 	view.Segments = view.Segments[:1]
 	if err := m.Once(ctx); err != nil {
 		t.Fatal(err)
@@ -286,12 +286,12 @@ func TestARoutingNodeIsGivenItsSegmentsAndFRR(t *testing.T) {
 	if _, on := link.segs[10001]; on || len(link.segs) != 1 {
 		t.Fatalf("segments %v", link.segs)
 	}
-	for _, want := range []string{" bgp listen range 10.209.0.0/16 peer-group fabric\n", "  neighbor fabric route-reflector-client\n", " neighbor 10.209.0.1 peer-group fabric\n"} {
+	for _, want := range []string{" bgp listen range 10.66.0.0/16 peer-group fabric\n", "  neighbor fabric route-reflector-client\n", " neighbor 10.66.0.1 peer-group fabric\n"} {
 		if !strings.Contains(conf, want) {
 			t.Fatalf("a reflector's frr.conf lacks %q:\n%s", want, conf)
 		}
 	}
-	if strings.Contains(conf, "neighbor 10.209.0.4 ") {
+	if strings.Contains(conf, "neighbor 10.66.0.4 ") {
 		t.Fatalf("a reflector names itself:\n%s", conf)
 	}
 	// it routes no more
@@ -309,7 +309,7 @@ func TestARoutingNodeIsGivenItsSegmentsAndFRR(t *testing.T) {
 // takes it down while a container is on it.
 func TestASegmentPutUpForALaunchIsKept(t *testing.T) {
 	keyFile := filepath.Join(t.TempDir(), "fabric.key")
-	view := store.FabricView{Address: "10.209.0.4", Prefix: "10.209.0.0/16", Peers: []store.FabricNode{},
+	view := store.FabricView{Address: "10.66.0.4", Prefix: "10.66.0.0/16", Peers: []store.FabricNode{},
 		Routing: &store.FabricRouting{ASN: 4200000000, VXLANPort: 4790}}
 	link := &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}, inUse: map[int]bool{}}
 	now := time.Date(2026, 11, 28, 2, 0, 0, 0, time.UTC)
@@ -317,15 +317,15 @@ func TestASegmentPutUpForALaunchIsKept(t *testing.T) {
 		Sync: func(context.Context, store.FabricSelf) (store.FabricView, error) { return view, nil },
 		Now:  func() time.Time { return now }}
 	ctx := context.Background()
-	if _, err := m.EnsureSegment(ctx, store.FabricSegment{VNI: 100000, Subnet: "10.210.0.0/24", MTU: 1370}); err == nil {
+	if _, err := m.EnsureSegment(ctx, store.FabricSegment{VNI: 100000, Subnet: "10.67.0.0/24", MTU: 1370}); err == nil {
 		t.Fatal("a segment on a node that does not route")
 	}
 	m.Routing = true
 	if err := m.Once(ctx); err != nil {
 		t.Fatal(err)
 	}
-	device, err := m.EnsureSegment(ctx, store.FabricSegment{VNI: 100000, Subnet: "10.210.0.0/24", MTU: 1370})
-	if err != nil || device != segmentDevice("tf", 100000) || link.segs[100000] != "10.209.0.4:4790 mtu 1370" {
+	device, err := m.EnsureSegment(ctx, store.FabricSegment{VNI: 100000, Subnet: "10.67.0.0/24", MTU: 1370})
+	if err != nil || device != segmentDevice("tf", 100000) || link.segs[100000] != "10.66.0.4:4790 mtu 1370" {
 		t.Fatalf("ensured %q %v: %v", device, err, link.segs)
 	}
 	// a sync that does not have it yet
