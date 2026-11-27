@@ -446,3 +446,14 @@ func TestANodeSendsASampleWhenItServesNone(t *testing.T) {
 		t.Fatalf("reports %+v", reports)
 	}
 }
+
+// The ingress guard drops the fabric's UDP that did not come over its
+// interface, in a table of the installation's own.
+func TestTheIngressGuardKeepsTheFabricsUDPToItsInterface(t *testing.T) {
+	rules := ingressRules("tf", "kairo-t0", 4790)
+	for _, want := range []string{"table inet tffabric {}\ndelete table inet tffabric\n", "hook input", `udp dport { 4790, 3784, 3785, 4784 } iifname != "kairo-t0" drop`, "policy accept"} {
+		if !strings.Contains(rules, want) {
+			t.Fatalf("rules lack %q:\n%s", want, rules)
+		}
+	}
+}

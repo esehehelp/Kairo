@@ -6,7 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // An Incus instance is made with a gang member's NIC on its segment's
@@ -45,8 +49,37 @@ func TestAnIncusInstanceHasTheGangNICAndTheAPIProxy(t *testing.T) {
 	if nic["type"] != "nic" || nic["nictype"] != "bridged" || nic["parent"] != "kfb100000" || nic["mtu"] != "1370" || nic["name"] != gangNIC {
 		t.Fatalf("gang NIC %v", nic)
 	}
-	proxy := made.Devices["kairo-api"]
-	if proxy["type"] != "proxy" || proxy["bind"] != "instance" || proxy["listen"] != "tcp:0.0.0.0:7474" || proxy["connect"] != "tcp:198.51.100.3:7474" {
-		t.Fatalf("API proxy %v", proxy)
+	if _, made := made.Devices["kairo-api"]; made {
+		t.Fatal("the API proxy made with the instance (before its address is on lo)")
+	}
+}
+
+// The API proxy is added once the init has put the daemon's address on lo,
+// listening at that address only.
+func TestTheAPIProxyListensAtTheDaemonsAddressOnly(t *testing.T) {
+	previous := incusCommand
+	t.Cleanup(func() { incusCommand = previous })
+	added := make(chan []string, 1)
+	incusCommand = func(_ context.Context, _ []byte, args ...string) ([]byte, error) {
+		added <- args
+		return nil, nil
+	}
+	spec := containerSpec{Instance: "kairo-t-att-1", RunDir: t.TempDir(), APIProxy: "198.51.100.3:7474"}
+	go addAPIProxy(context.Background(), spec, t.Logf)
+	select {
+	case args := <-added:
+		t.Fatalf("added before the init said its address is on lo: %v", args)
+	case <-time.After(500 * time.Millisecond):
+	}
+	if err := os.WriteFile(filepath.Join(spec.RunDir, apiReadyFile), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case args := <-added:
+		if strings.Join(args, " ") != "config device add kairo-t-att-1 kairo-api proxy bind=instance listen=tcp:198.51.100.3:7474 connect=tcp:198.51.100.3:7474" {
+			t.Fatalf("added %v", args)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("not added")
 	}
 }

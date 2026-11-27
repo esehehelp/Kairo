@@ -127,6 +127,8 @@ func gangBarrier(g *containerGang, self netip.Addr, logs io.Writer, stop <-chan 
 					mu.Lock()
 					heard[r] = true
 					mu.Unlock()
+					// the sender counts this member reached only on this
+					_, _ = io.WriteString(conn, "ok\n")
 				}
 			}()
 		}
@@ -148,8 +150,12 @@ func gangBarrier(g *containerGang, self netip.Addr, logs io.Writer, stop <-chan 
 				continue
 			}
 			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
+			// reached once it says it heard (a hello written may still be
+			// lost with the connection)
 			if _, err := io.WriteString(conn, gangHello(g.Placement, g.Rank)); err == nil {
-				reached[r] = true
+				if ack, err := bufio.NewReader(io.LimitReader(conn, 8)).ReadString('\n'); err == nil && ack == "ok\n" {
+					reached[r] = true
+				}
 			}
 			conn.Close()
 		}
@@ -271,9 +277,10 @@ func netlinkRequest(kind uint16, flags uint16, body []byte) error {
 }
 
 // apiOnLoopback puts the host of hostPort (the daemon's address on the
-// fabric) on the container's lo, so that what is sent there reaches the
-// proxy device listening on every address of the container.
-func apiOnLoopback(hostPort string) error {
+// fabric) on the container's lo, says so (ready: the runner then adds the
+// proxy device listening there), and waits, up to limit, until the proxy
+// answers.
+func apiOnLoopback(hostPort, ready string, limit time.Duration) error {
 	host, _, err := net.SplitHostPort(hostPort)
 	if err != nil {
 		return err
@@ -289,5 +296,19 @@ func apiOnLoopback(hostPort string) error {
 	if err := addAddress(lo.Index, netip.PrefixFrom(a, 32)); err != nil && !errors.Is(err, unix.EEXIST) {
 		return err
 	}
-	return setLinkUp(lo.Index)
+	if err := setLinkUp(lo.Index); err != nil {
+		return err
+	}
+	if err := os.WriteFile(ready, []byte(hostPort+"\n"), 0o644); err != nil {
+		return err
+	}
+	for deadline := time.Now().Add(limit); ; time.Sleep(200 * time.Millisecond) {
+		if c, err := net.DialTimeout("tcp", hostPort, time.Second); err == nil {
+			c.Close()
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("no proxy at %s after %s", hostPort, limit)
+		}
+	}
 }

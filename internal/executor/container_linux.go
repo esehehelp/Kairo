@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -171,14 +170,7 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 		}
 		devices["kairo-nvidia"] = map[string]string{"type": "disk", "source": driver, "path": containerNVIDIA, "readonly": "true"}
 	}
-	if spec.APIProxy != "" {
-		// the daemon's API on the fabric, through the host: listening in
-		// the container (on the port; the init puts the address on lo),
-		// connecting from the host
-		if _, port, err := net.SplitHostPort(spec.APIProxy); err == nil {
-			devices["kairo-api"] = map[string]string{"type": "proxy", "bind": "instance", "listen": "tcp:0.0.0.0:" + port, "connect": "tcp:" + spec.APIProxy}
-		}
-	}
+
 	if g := spec.Gang; g != nil {
 		// a gang member: a second NIC on its generation's segment (its
 		// init gives it its address)
@@ -224,6 +216,9 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 	}
 	if _, err := incusCommand(ctx, nil, "start", spec.Instance); err != nil {
 		return shimNotStarted, err
+	}
+	if spec.APIProxy != "" {
+		go addAPIProxy(ctx, spec, logf)
 	}
 	warned, failures := false, 0
 	for {
@@ -683,7 +678,7 @@ func containerInit(specPath string) int {
 	// the daemon's API on the fabric, at its own address, through the
 	// proxy device listening on every address of the container
 	if spec.APIProxy != "" {
-		if err := apiOnLoopback(spec.APIProxy); err != nil {
+		if err := apiOnLoopback(spec.APIProxy, filepath.Join(containerRoot, "run", apiReadyFile), apiProxyWait); err != nil {
 			fmt.Fprintln(stderr, "kairo container: the daemon's API through the host:", err)
 		}
 	}
@@ -1131,3 +1126,31 @@ const (
 	containerSweepInterval = 10 * time.Minute
 	containerSweepTimeout  = 5 * time.Minute
 )
+
+// apiProxyWait bounds how long the runner waits for the init to put the
+// daemon's address on lo, and the init for the proxy behind it.
+const apiProxyWait = time.Minute
+
+// apiReadyFile is written by the init (in /kairo/run) once the daemon's
+// address is on the container's lo.
+const apiReadyFile = "api-address"
+
+// addAPIProxy gives the running container spec.Instance the daemon's API on
+// the fabric (README: fabric), once its init has put the daemon's address
+// on lo: a proxy device listening at that address only, in the container,
+// and connecting from the host.
+func addAPIProxy(ctx context.Context, spec containerSpec, logf func(string, ...any)) {
+	for deadline := time.Now().Add(apiProxyWait); ; time.Sleep(200 * time.Millisecond) {
+		if _, err := os.Stat(filepath.Join(spec.RunDir, apiReadyFile)); err == nil {
+			break
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			logf("the init did not put %s on lo in %s: no API proxy", spec.APIProxy, apiProxyWait)
+			return
+		}
+	}
+	if _, err := incusCommand(ctx, nil, "config", "device", "add", spec.Instance, "kairo-api", "proxy",
+		"bind=instance", "listen=tcp:"+spec.APIProxy, "connect=tcp:"+spec.APIProxy); err != nil {
+		logf("the API proxy of %s: %v", spec.Instance, err)
+	}
+}

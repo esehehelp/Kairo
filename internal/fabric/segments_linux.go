@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -286,4 +287,14 @@ func (r dockerRouter) remove(ctx context.Context) error {
 
 func (r dockerRouter) show(ctx context.Context, command string) ([]byte, error) {
 	return docker(ctx, "exec", r.name, "vtysh", "-c", command)
+}
+
+// guardIngress applies ingressRules with nft (one transaction).
+func (nlLink) guardIngress(ctx context.Context, names, iface string, vxlanPort int) error {
+	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+	cmd.Stdin = strings.NewReader(ingressRules(names, iface, vxlanPort))
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("nft: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
 }

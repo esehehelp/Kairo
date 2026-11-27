@@ -92,7 +92,7 @@ func TestGangBarrierGivesUpOnAMissingMember(t *testing.T) {
 	var logs bytes.Buffer
 	g := &containerGang{Members: members, Rank: 0, Placement: "gpl_1", Address: members[0]}
 	err = gangBarrier(g, netip.MustParsePrefix(members[0]).Addr(), &logs, nil, 2*time.Second)
-	if err == nil || !strings.Contains(err.Error(), "members none not reached, members 1 not heard from") {
+	if err == nil || !strings.Contains(err.Error(), "members 1 not reached, members 1 not heard from") {
 		t.Fatalf("barrier with a stranger: %v", err)
 	}
 }

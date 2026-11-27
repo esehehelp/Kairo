@@ -100,26 +100,53 @@ func (m *Manager) Show(ctx context.Context, command string) ([]byte, error) {
 // applyRouting puts the segments of view on this node (taking down those
 // it is no longer on), then FRR as view says (none: removed).
 func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error {
-	if !m.Routing {
-		return nil
-	}
 	names := m.names()
 	r := view.Routing
-	if r == nil {
-		if m.router != nil {
-			return m.router.remove(ctx)
-		}
-		return nil
+	if !m.Routing || r == nil {
+		// a node that routes no more (or was told it does not): its FRR and
+		// segments go, as a node's left to keep advertising would
+		return m.stopRouting(ctx, names)
 	}
 	m.segMu.Lock()
 	defer m.segMu.Unlock()
 	want := map[int]bool{}
 	for _, seg := range view.Segments {
 		want[seg.VNI] = true
+	}
+	// the segments no longer wanted go first: one left (a wslc network) may
+	// stand in the way of a new one with its subnet
+	if err := m.removeSegments(ctx, names, want, true); err != nil {
+		return err
+	}
+	var failed []error
+	for _, seg := range view.Segments {
 		if err := m.link.ensureSegment(ctx, names, seg, view.Address, r.VXLANPort); err != nil {
-			return fmt.Errorf("segment %d: %w", seg.VNI, err)
+			failed = append(failed, fmt.Errorf("segment %d: %w", seg.VNI, err))
 		}
 	}
+	// VXLAN and BFD only from the fabric: a frame that did not come over
+	// WireGuard is not a peer's (ingressGuard)
+	if g, ok := m.link.(ingressGuard); ok {
+		if err := g.guardIngress(ctx, names, m.Interface, r.VXLANPort); err != nil {
+			failed = append(failed, fmt.Errorf("ingress guard: %w", err))
+		}
+	}
+	if m.router == nil {
+		m.router = m.link.router(m.RouterName, m.NodeID, m.KeyFile)
+	}
+	if m.router == nil {
+		return errors.Join(append(failed, fmt.Errorf("FRR cannot run on this node"))...)
+	}
+	if err := m.router.apply(ctx, frrFiles(m.NodeID, view)); err != nil {
+		failed = append(failed, err)
+	}
+	return errors.Join(failed...)
+}
+
+// removeSegments takes down the segments made here that want does not have
+// (but, keepLaunched, one put here for a launch lately), none while a
+// container is on it.
+func (m *Manager) removeSegments(ctx context.Context, names string, want map[int]bool, keepLaunched bool) error {
 	have, err := m.link.segments(ctx, names)
 	if err != nil {
 		return err
@@ -128,7 +155,7 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 		if want[vni] {
 			continue
 		}
-		if at, ok := m.launched[vni]; ok && m.now().Sub(at) < launchedSegmentKept {
+		if at, ok := m.launched[vni]; keepLaunched && ok && m.now().Sub(at) < launchedSegmentKept {
 			continue
 		}
 		delete(m.launched, vni)
@@ -140,13 +167,32 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 			m.logger().Warn("segment not taken down (taken down at a later sync)", "vni", vni, "error", err)
 		}
 	}
-	if m.router == nil {
+	return nil
+}
+
+// stopRouting takes FRR and the segments (those no container is on) off a
+// node that does not route.
+func (m *Manager) stopRouting(ctx context.Context, names string) error {
+	if m.link == nil {
+		return nil
+	}
+	if m.router == nil && m.RouterName != "" {
 		m.router = m.link.router(m.RouterName, m.NodeID, m.KeyFile)
 	}
-	if m.router == nil {
-		return fmt.Errorf("FRR cannot run on this node")
+	var err error
+	if m.router != nil {
+		err = m.router.remove(ctx)
 	}
-	return m.router.apply(ctx, frrFiles(m.NodeID, view))
+	m.segMu.Lock()
+	defer m.segMu.Unlock()
+	return errors.Join(err, m.removeSegments(ctx, names, nil, false))
+}
+
+// ingressGuard is a link that keeps VXLAN and BFD to what comes over the
+// fabric's interface (a host takes UDP to any of its addresses on any of
+// its interfaces).
+type ingressGuard interface {
+	guardIngress(ctx context.Context, names, iface string, vxlanPort int) error
 }
 
 // frrFiles are /etc/frr for node with view: iBGP in the fabric's ASN over
@@ -193,4 +239,20 @@ func frrFiles(node string, view store.FabricView) map[string]string {
 		"daemons":    daemons,
 		"vtysh.conf": "service integrated-vtysh-config\n",
 	}
+}
+
+// ingressRules is the nftables ruleset that keeps the fabric's UDP (VXLAN
+// on vxlanPort, BFD) to what comes in on iface: its own table (one per
+// installation: names), replaced whole each time.
+func ingressRules(names, iface string, vxlanPort int) string {
+	table := names + "fabric"
+	return fmt.Sprintf(`table inet %[1]s {}
+delete table inet %[1]s
+table inet %[1]s {
+	chain input {
+		type filter hook input priority -10; policy accept;
+		udp dport { %[3]d, 3784, 3785, 4784 } iifname != %[2]q drop
+	}
+}
+`, table, iface, vxlanPort)
 }

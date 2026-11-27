@@ -425,7 +425,8 @@ class DistributedAdapter:
         session = self.session
         member = self._gang[0]
         state: dict[str, Any] = {"member": member, "suspend": None, "checkpoint": None, "stop": False,
-                                 "terminal": None, "published": self._gang_suspend_published, "pending": False}
+                                 "terminal": None, "published": self._gang_suspend_published, "pending": False,
+                                 "refused": None}
         if progress is not None:
             session.set_progress(progress)
         if session._terminal_error is not None:
@@ -443,6 +444,9 @@ class DistributedAdapter:
             self._pending_publication = None
             if status == "ok" and kind == "suspend":
                 self._gang_suspend_published = state["published"] = True
+            elif status != "ok":
+                # refused for good: the round cannot be the gang's
+                state["refused"] = {"kind": kind, "reason": f"member {member}: its part was refused ({status})"}
             self._gang_commands.pop(kind, None)
         now = time.monotonic()
         if now - session._last_poll >= session.poll_interval_seconds:
@@ -492,6 +496,11 @@ class DistributedAdapter:
         said = {state["member"]: state for state in gathered if state is not None}
         for state in said.values():
             _raise_terminal(self.session, state["terminal"])
+        refused = [state["refused"] for state in said.values() if state["refused"]]
+        if any(r["kind"] == "suspend" for r in refused):
+            # a member's part of the suspend will never be published: the
+            # gang cannot stop as one, and every rank ends
+            raise RuntimeError("; ".join(r["reason"] for r in refused))
         if all(said[m]["published"] for m in range(members)):
             # every member's part of the suspend is published: every rank stops
             self.session.suspend_handled = True
@@ -533,7 +542,7 @@ class DistributedAdapter:
         dist.barrier()
         outcome: dict[str, Any] | None = None
         if first:
-            outcome = {"member": member, "ok": False, "no_continuation": False, "terminal": None}
+            outcome = {"member": member, "ok": False, "no_continuation": False, "terminal": None, "refused": False}
             assert result is not None
             if not result.continuation_ref:
                 self._try_ack(context.command_id, "rejected", {"reason": "no continuation_ref on the member's first process"})
@@ -550,6 +559,8 @@ class DistributedAdapter:
                     self._pending_publication = (context.command_id, kind, payload)
                 elif kind == "suspend" and outcome["ok"]:
                     self._gang_suspend_published = True
+                elif not outcome["ok"]:
+                    outcome["refused"] = True  # refused for good (gone, or a refusal)
                 if self._pending_publication is None:
                     self._gang_commands.pop(kind, None)
         outcomes: list[Any] = [None] * world
@@ -557,6 +568,13 @@ class DistributedAdapter:
         by_member = {o["member"]: o for o in outcomes if o is not None}
         for o in by_member.values():
             _raise_terminal(self.session, o["terminal"])
+        if any(o["refused"] for o in by_member.values()):
+            message = f"a member's part of the gang's {kind} was refused: the round is not the gang's"
+            if kind == "checkpoint":
+                self.session.last_checkpoint_error = RuntimeError(message)
+                _log.warning("Kairo gang checkpoint incomplete; every rank carries on")
+                return False
+            raise RuntimeError(message)
         if any(o["no_continuation"] for o in by_member.values()):
             message = f"a member's first process returned no continuation_ref for the gang's {kind}"
             if kind == "checkpoint":
