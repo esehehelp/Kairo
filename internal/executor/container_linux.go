@@ -827,6 +827,8 @@ type loaderProc struct {
 	dir      string
 	env      []string
 	logs     *os.File
+	// as is the user it runs as (the attempt's); nil: this process's
+	as       *syscall.Credential
 	pid      int
 	restarts int
 }
@@ -835,7 +837,7 @@ type loaderProc struct {
 type loaderProcs []*loaderProc
 
 func (p *loaderProc) start() error {
-	cmd := &exec.Cmd{Path: p.args[0], Args: p.args, Dir: p.dir, Env: p.env, Stdout: p.logs, Stderr: p.logs, SysProcAttr: &syscall.SysProcAttr{Setpgid: true, Credential: attemptCredential()}}
+	cmd := &exec.Cmd{Path: p.args[0], Args: p.args, Dir: p.dir, Env: p.env, Stdout: p.logs, Stderr: p.logs, SysProcAttr: &syscall.SysProcAttr{Setpgid: true, Credential: p.as}}
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -943,7 +945,7 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		if spec.RawRequests != "" {
 			args = append(args, "--raw-requests", spec.RawRequests)
 		}
-		p := &loaderProc{stream: s.Name, args: args, dir: spec.CWD, env: env, logs: logs}
+		p := &loaderProc{stream: s.Name, args: args, dir: spec.CWD, env: env, logs: logs, as: attemptCredential()}
 		if err := p.start(); err != nil {
 			return procs, env, fmt.Errorf("stream %s: start its loader: %w", s.Name, err)
 		}
