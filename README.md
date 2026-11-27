@@ -1077,7 +1077,7 @@ labels = { site = "host-w" }
 - **閉じ込めの代わりに一般ユーザーで動かす**: wslc のコンテナはマウントができない（CAP_SYS_ADMIN がない）ため、init は Incus のような読み取り専用化をしません。init は root で始まり（`--user 0:0`）、`argv` はどのランタイムとも同じ一般ユーザー（uid `1000`、[コンファインメント](#アドミッション制御とプランニング) の下を参照）で動きます。Kairo が渡す領域は書けますが、イメージのファイルは書けないので、`/kairo` の外に書いたものは黙って消えず、書いた時点で失敗します（`/tmp` だけは書けますが、`TMPDIR` は scratch を指します）。`HOME` は scratch の `home` です。実行時に root を前提とするイメージ（実行中の `pip install` など）は動きません。
 - **停止**: 他のランタイムと同じく、停止はランナーに届き、ランナーが `wslc stop` でコンテナを止め、init が `argv` のプロセスグループへ SIGTERM を渡します（30 秒後に wslc が強制終了します）。プロセスの生死は、コンテナが動いているかどうかで判断します。
 - **GPU**: `--gpus all` で WSL の GPU（`/dev/dxg` と `/usr/lib/wsl/lib`）を渡し、`CUDA_VISIBLE_DEVICES` に Lease した GPU の UUID を入れます。glibc のイメージに限ります（alpine では wslc の GPU フックが失敗します）。
-- **ネットワーク**: コンテナは wslc のブリッジから外へ出られ、デーモンにも直接届きます。
+- **ネットワーク**: コンテナは wslc のブリッジから外へ出られ、デーモンにも直接届きます。ただし、Windows ホスト自身の LAN の IP には、どのポートにも届きません（`Connection refused`）。mirrored ネットワークでは、その IP が VM 自身のものにもなるためです（`.wslconfig` の `hostAddressLoopback` はコンテナには効きません）。ホスト上のサービスを使う仕事は、そのサービスを別のホストに置くか、別のノードで走らせてください。
 - **stream**: コンテナは VM の中にあるため、raw キャッシュの窓口のソケットに届きません。Loader は窓口の横のディレクトリ（`/kairo/raw-requests`）にファイルを置いて agent に依頼し（`kairo loader serve --raw-requests`）、agent はそれを 0.1 秒ごとに見て、ソケットと同じように答えます。
 - **掃除**: ランナーが強制終了されて残ったコンテナ（`kairo-att-*` で、Attempt がもうこのノードで動いていないもの）は、掃除処理が削除します。
 
