@@ -822,11 +822,11 @@ const loaderRestarts = 5
 
 // loaderProc is a stream's loader: how it is started, and its process.
 type loaderProc struct {
-	stream   string
-	args     []string
-	dir      string
-	env      []string
-	logs     *os.File
+	stream string
+	args   []string
+	dir    string
+	env    []string
+	logs   *os.File
 	// as is the user it runs as (the attempt's); nil: this process's
 	as       *syscall.Credential
 	pid      int
