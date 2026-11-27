@@ -647,7 +647,9 @@ func (s *Store) ReregisterExecutor(ctx context.Context, executorID string, adopt
 // (executorInfo.serves) until an agent declares them again. Their live
 // leases go stale as at a restart that adopts nothing (reregisterExecutorTx).
 // Each is recorded (event executor_undeclared); the ids disabled are
-// returned.
+// returned. The data work of the node's disabled executors (these, and any
+// disabled before) goes to whoever serves their stores now
+// (handOverRetiredDataTx).
 func (s *Store) UndeclareExecutors(ctx context.Context, nodeID string, declared []string) ([]string, error) {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -669,7 +671,7 @@ func (s *Store) UndeclareExecutors(ctx context.Context, nodeID string, declared 
 		}
 		return nil
 	})
-	if err != nil || len(gone) == 0 {
+	if err != nil {
 		return nil, err
 	}
 	t := now()
@@ -684,6 +686,9 @@ func (s *Store) UndeclareExecutors(ctx context.Context, nodeID string, declared 
 		if err = appendCoordinationEventTx(ctx, tx, "executor_undeclared", nil, "executor", id, nil, map[string]any{"node_id": nodeID, "stale_leases": stale}); err != nil {
 			return nil, err
 		}
+	}
+	if _, err = handOverRetiredDataTx(ctx, tx, nodeID); err != nil {
+		return nil, err
 	}
 	return gone, tx.Commit()
 }

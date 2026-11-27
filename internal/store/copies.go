@@ -93,6 +93,7 @@ type PackRead struct {
 var ErrCopyMismatch = errors.New("the copy does not match the pack")
 
 type executorInfo struct {
+	id      string // set by storeServerTx
 	nodeID  string
 	enabled bool
 	attrs   map[string]string
@@ -143,6 +144,7 @@ func storeServerTx(ctx context.Context, q queryer, s machine.Store) (executorInf
 			return executorInfo{}, false, err
 		}
 		if x.serves(s, id) && x.attrs["pack_addr"] != "" {
+			x.id = id
 			return x, true, nil
 		}
 	}
