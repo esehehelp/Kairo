@@ -10,6 +10,7 @@ import (
 	"crypto/ecdh"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -46,7 +47,8 @@ type Manager struct {
 	Interface  string
 	ListenPort int
 	// KeyFile holds the node's private key (base64, as wg reads it); made
-	// the first time. Its address is kept beside it (KeyFile.address).
+	// the first time. Its address is kept beside it (KeyFile.address), and
+	// the last view the daemon gave (KeyFile.view: Restore).
 	KeyFile   string
 	Endpoints []string
 	// Sync says what this node is and returns its address and peers.
@@ -144,6 +146,28 @@ func key(keyFile string) (string, error) {
 	return base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()), nil
 }
 
+// Restore puts the last view this node was given (kept beside its key) on
+// the interface, before the daemon is asked anything: a node that starts
+// again (its host rebooted, its interface gone) is back on the fabric, and
+// reaches the daemon there. Nothing kept: nothing done.
+func (m *Manager) Restore(ctx context.Context) error {
+	b, err := os.ReadFile(m.KeyFile + ".view")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var view store.FabricView
+	if err := json.Unmarshal(b, &view); err != nil {
+		return fmt.Errorf("fabric view %s: %w", m.KeyFile+".view", err)
+	}
+	if _, err := key(m.KeyFile); err != nil {
+		return err
+	}
+	return m.apply(ctx, view)
+}
+
 // Once says what this node is, takes its address and peers and puts them on
 // the interface.
 func (m *Manager) Once(ctx context.Context) error {
@@ -158,6 +182,16 @@ func (m *Manager) Once(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("fabric: %w", err)
 	}
+	if b, err := json.Marshal(view); err == nil {
+		if err := os.WriteFile(m.KeyFile+".view", b, 0o600); err != nil {
+			return err
+		}
+	}
+	return m.apply(ctx, view)
+}
+
+// apply puts view on the interface: its address, then its peers.
+func (m *Manager) apply(ctx context.Context, view store.FabricView) error {
 	p, err := store.ParseFabricPrefix(view.Prefix)
 	if err != nil {
 		return err

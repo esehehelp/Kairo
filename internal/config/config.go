@@ -577,6 +577,11 @@ func LoadAgent(path string) (Agent, error) {
 		if a.Fabric.KeyFile == "" {
 			a.Fabric.KeyFile = filepath.Join(filepath.Dir(path), "fabric.key")
 		}
+		if a.Fabric.BootstrapURL != "" {
+			if err := checkNodeURL(a.Fabric.BootstrapURL, a.InsecureHTTP); err != nil {
+				return a, err
+			}
+		}
 	}
 	if a.LogDirectory == "" {
 		a.LogDirectory = "local/attempts-agent"
@@ -748,9 +753,14 @@ type DaemonFabric struct {
 // order of preference). Its transfer endpoint is then advertised at its
 // fabric address (pack_addr), unless [packs] addr says otherwise.
 type AgentFabric struct {
-	Enabled    bool     `toml:"enabled"`
-	Interface  string   `toml:"interface"`
-	ListenPort int      `toml:"listen_port"`
-	KeyFile    string   `toml:"key_file"`
-	Endpoints  []string `toml:"endpoints"`
+	Enabled bool `toml:"enabled"`
+	// BootstrapURL is the daemon as reached off the fabric (its LAN or
+	// public address): a node that is not on the fabric yet (its first
+	// start, or every peer moved) says what it is there, while server_url
+	// names the daemon's fabric address.
+	BootstrapURL string   `toml:"bootstrap_url"`
+	Interface    string   `toml:"interface"`
+	ListenPort   int      `toml:"listen_port"`
+	KeyFile      string   `toml:"key_file"`
+	Endpoints    []string `toml:"endpoints"`
 }

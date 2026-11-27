@@ -99,10 +99,26 @@ func agentCommand(args []string) error {
 	var fab *fabric.Manager
 	packAddr := cfg.Packs.Addr
 	if cfg.Fabric.Enabled {
+		// off the fabric (first start, every peer moved): the daemon at its
+		// bootstrap address
+		var bootstrap *agentclient.Client
+		if cfg.Fabric.BootstrapURL != "" {
+			bootstrap = agentclient.New(cfg.Fabric.BootstrapURL, cfg.Token, tlsConfig)
+		}
 		fab = &fabric.Manager{Interface: cfg.Fabric.Interface, ListenPort: cfg.Fabric.ListenPort, KeyFile: cfg.Fabric.KeyFile, Endpoints: cfg.Fabric.Endpoints, Logger: logger,
 			Sync: func(ctx context.Context, self store.FabricSelf) (store.FabricView, error) {
-				return client.SyncFabric(ctx, cfg.Node.ID, self)
+				view, err := client.SyncFabric(ctx, cfg.Node.ID, self)
+				if err != nil && bootstrap != nil {
+					if v, berr := bootstrap.SyncFabric(ctx, cfg.Node.ID, self); berr == nil {
+						return v, nil
+					}
+				}
+				return view, err
 			}}
+		// back on the fabric as it was last, before the daemon is asked
+		if err := fab.Restore(ctx); err != nil {
+			logger.Warn("fabric not restored", "error", err)
+		}
 		address := fabric.KnownAddress(cfg.Fabric.KeyFile)
 		if err := fab.Once(ctx); err != nil {
 			logger.Warn("fabric not set up before registration (set up after it)", "error", err)

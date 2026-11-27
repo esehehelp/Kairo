@@ -101,3 +101,33 @@ func TestTheFabricKeepsPeersAtAnEndpointThatAnswers(t *testing.T) {
 		t.Fatal("the key changed between starts")
 	}
 }
+
+// A node that starts again is put back on the fabric as it was last (the
+// view kept beside its key), before the daemon is asked anything.
+func TestARestartedNodeIsBackOnTheFabricBeforeAskingTheDaemon(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "fabric.key")
+	view := store.FabricView{Address: "10.209.0.4", Prefix: "10.209.0.0/16", Peers: []store.FabricNode{
+		{NodeID: "b", Address: "10.209.0.2", PublicKey: "KB", Endpoints: []string{"192.0.2.2:51820"}},
+	}}
+	first := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}},
+		Sync: func(context.Context, store.FabricSelf) (store.FabricView, error) { return view, nil }}
+	if err := first.Once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	link := &fakeLink{handshakes: map[string]time.Time{}, endpoints: map[string]string{}}
+	again := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: link,
+		Sync: func(context.Context, store.FabricSelf) (store.FabricView, error) {
+			t.Fatal("the daemon asked before the node was back on the fabric")
+			return store.FabricView{}, nil
+		}}
+	if err := again.Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if link.address != "10.209.0.4" || link.endpoints["KB"] != "192.0.2.2:51820" || again.Address() != "10.209.0.4" {
+		t.Fatalf("restored %q %v", link.address, link.endpoints)
+	}
+	// nothing kept: nothing done
+	if err := (&Manager{KeyFile: filepath.Join(t.TempDir(), "none.key")}).Restore(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
