@@ -132,5 +132,10 @@ func (s *Server) fabricStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"prefix": s.FabricPrefix, "nodes": nodes})
+	links, err := s.Store.FabricLinks(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"prefix": s.FabricPrefix, "nodes": nodes, "links": links})
 }

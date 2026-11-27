@@ -8,18 +8,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
 	"kairo/internal/api"
 	"kairo/internal/config"
-	"kairo/internal/fabric"
 	"kairo/internal/executor"
+	"kairo/internal/fabric"
 	"kairo/internal/hwpolicy"
 	"kairo/internal/secfile"
 	"kairo/internal/store"
@@ -138,7 +140,13 @@ func serve(args []string) error {
 		fab := &fabric.Manager{Interface: iface, ListenPort: port, KeyFile: keyFile, Endpoints: f.Endpoints, Logger: logger,
 			Sync: func(ctx context.Context, self store.FabricSelf) (store.FabricView, error) {
 				return st.SyncFabric(ctx, daemonConfig.Node.ID, f.Prefix, self)
+			},
+			Report: func(ctx context.Context, report store.FabricLinksReport) error {
+				return st.RecordFabricLinks(ctx, daemonConfig.Node.ID, report)
 			}}
+		if _, port, err := net.SplitHostPort(daemonConfig.Listen); err == nil {
+			fab.ProbePort, _ = strconv.Atoi(port)
+		}
 		go fab.Run(ctx)
 	}
 	defer stop()

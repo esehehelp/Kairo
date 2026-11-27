@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,18 +52,26 @@ type Manager struct {
 	// the last view the daemon gave (KeyFile.view: Restore).
 	KeyFile   string
 	Endpoints []string
+	// ProbePort is where peers time a TCP connect to this node (its
+	// transfer endpoint's port; 0: none).
+	ProbePort int
 	// Sync says what this node is and returns its address and peers.
-	Sync   func(ctx context.Context, self store.FabricSelf) (store.FabricView, error)
+	Sync func(ctx context.Context, self store.FabricSelf) (store.FabricView, error)
+	// Report says how this node sees its links (nil: not said).
+	Report func(ctx context.Context, report store.FabricLinksReport) error
 	Logger *slog.Logger
 	// Now is the clock (nil: time.Now).
 	Now func() time.Time
 
 	link link // the interface (fabric_linux.go)
 
-	mu      sync.Mutex
-	public  string
-	address string
-	peers   map[string]*peerState // by public key
+	mu       sync.Mutex
+	public   string
+	address  string
+	peers    map[string]*peerState // by public key
+	view     store.FabricView      // the last one applied
+	received []store.FabricReceived
+	reported time.Time
 }
 
 // peerState is which of a peer's endpoints is tried, since when.
@@ -71,14 +80,20 @@ type peerState struct {
 	since    time.Time
 }
 
+// peerSeen is a peer as the interface has it: its latest handshake (zero:
+// none) and the endpoint it is reached at now ("" when unknown).
+type peerSeen struct {
+	handshake time.Time
+	endpoint  string
+}
+
 // link is what the manager needs of the interface.
 type link interface {
 	// ensure makes the interface (if missing) with address/bits, the key
 	// file and the port, up.
 	ensure(ctx context.Context, name, address string, bits int, keyFile string, port int) error
-	// peers are the interface's peers: public key -> latest handshake
-	// (zero: none).
-	peers(ctx context.Context, name string) (map[string]time.Time, error)
+	// peers are the interface's peers, by public key.
+	peers(ctx context.Context, name string) (map[string]peerSeen, error)
 	// setPeer sets a peer: its address (/32) and the endpoint tried.
 	setPeer(ctx context.Context, name, publicKey, address, endpoint string) error
 	removePeer(ctx context.Context, name, publicKey string) error
@@ -178,7 +193,7 @@ func (m *Manager) Once(ctx context.Context) error {
 		}
 		m.public = public
 	}
-	view, err := m.Sync(ctx, store.FabricSelf{PublicKey: m.public, ListenPort: m.ListenPort, Endpoints: m.Endpoints})
+	view, err := m.Sync(ctx, store.FabricSelf{PublicKey: m.public, ListenPort: m.ListenPort, Endpoints: m.Endpoints, ProbePort: m.ProbePort})
 	if err != nil {
 		return fmt.Errorf("fabric: %w", err)
 	}
@@ -198,7 +213,7 @@ func (m *Manager) apply(ctx context.Context, view store.FabricView) error {
 	}
 	m.mu.Lock()
 	changed := m.address != view.Address
-	m.address = view.Address
+	m.address, m.view = view.Address, view
 	m.mu.Unlock()
 	if changed {
 		if KnownAddress(m.KeyFile) != view.Address {
@@ -242,8 +257,8 @@ func (m *Manager) setPeers(ctx context.Context, peers []store.FabricNode) error 
 			st = &peerState{since: t}
 			m.peers[peer.PublicKey] = st
 		}
-		hs, on := current[peer.PublicKey]
-		reached := on && !hs.IsZero() && t.Sub(hs) < handshakeFresh
+		seen, on := current[peer.PublicKey]
+		reached := on && !seen.handshake.IsZero() && t.Sub(seen.handshake) < handshakeFresh
 		if !reached && ok && t.Sub(st.since) >= endpointTrial {
 			st.endpoint, st.since = (st.endpoint+1)%len(peer.Endpoints), t
 		}
@@ -266,14 +281,107 @@ func (m *Manager) setPeers(ctx context.Context, peers []store.FabricNode) error 
 	return nil
 }
 
-// Run keeps the node on the fabric until ctx ends: Once every syncEvery
-// (a failure is logged and tried again).
+// reportEvery: how often the node says how it sees its links.
+const reportEvery = time.Minute
+
+// Received hears a transfer this node received from the transfer endpoint
+// addr ("host:port"): told with the next report as received from the peer
+// whose fabric address host is (another's is none of the fabric's).
+func (m *Manager) Received(addr string, bytes int64, took time.Duration) {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, p := range m.view.Peers {
+		if p.Address == host {
+			m.received = append(m.received, store.FabricReceived{From: p.NodeID, Bytes: bytes, Seconds: took.Seconds()})
+			if len(m.received) > 256 {
+				m.received = m.received[len(m.received)-256:]
+			}
+			return
+		}
+	}
+}
+
+// probe is the round trip to addr: the shortest of three TCP connects (nil
+// when none was made).
+func probe(ctx context.Context, addr string) *float64 {
+	var best time.Duration
+	for range 3 {
+		start := time.Now()
+		dialer := net.Dialer{Timeout: 2 * time.Second}
+		c, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			continue
+		}
+		took := time.Since(start)
+		c.Close()
+		if best == 0 || took < best {
+			best = took
+		}
+	}
+	if best == 0 {
+		return nil
+	}
+	ms := float64(best.Microseconds()) / 1000
+	return &ms
+}
+
+// report says how this node sees its peers now (the endpoint each is
+// reached at, its latest handshake, the round trip to it) and what it
+// received from them since it last said.
+func (m *Manager) report(ctx context.Context) error {
+	if m.Report == nil || m.link == nil {
+		return nil
+	}
+	current, err := m.link.peers(ctx, m.Interface)
+	if err != nil {
+		return err
+	}
+	m.mu.Lock()
+	peers := append([]store.FabricNode(nil), m.view.Peers...)
+	received := m.received
+	m.received = nil
+	m.mu.Unlock()
+	report := store.FabricLinksReport{Peers: []store.FabricPeerSeen{}, Received: received}
+	for _, p := range peers {
+		seen := current[p.PublicKey]
+		peer := store.FabricPeerSeen{Node: p.NodeID, Path: store.FabricPathDirect, Endpoint: seen.endpoint}
+		if !seen.handshake.IsZero() {
+			peer.HandshakeAt = seen.handshake.UTC().Format(time.RFC3339Nano)
+		}
+		if p.ProbePort > 0 && !seen.handshake.IsZero() {
+			peer.RTTMillis = probe(ctx, net.JoinHostPort(p.Address, fmt.Sprint(p.ProbePort)))
+		}
+		report.Peers = append(report.Peers, peer)
+	}
+	if err := m.Report(ctx, report); err != nil {
+		// told again with the next report
+		m.mu.Lock()
+		m.received = append(received, m.received...)
+		m.mu.Unlock()
+		return err
+	}
+	return nil
+}
+
+// Run keeps the node on the fabric until ctx ends: Once every syncEvery,
+// its links said every reportEvery (a failure is logged and tried again).
 func (m *Manager) Run(ctx context.Context) {
 	ticker := time.NewTicker(syncEvery)
 	defer ticker.Stop()
 	for {
 		if err := m.Once(ctx); err != nil && ctx.Err() == nil {
 			m.logger().Warn("fabric sync failed", "error", err)
+		}
+		if t := m.now(); t.Sub(m.reported) >= reportEvery {
+			if err := m.report(ctx); err != nil && ctx.Err() == nil {
+				m.logger().Warn("fabric links not said", "error", err)
+			} else {
+				m.reported = t
+			}
 		}
 		select {
 		case <-ctx.Done():

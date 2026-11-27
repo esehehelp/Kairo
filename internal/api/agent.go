@@ -478,6 +478,11 @@ func (s *Server) agentOps() []agentOp {
 				}
 				return s.Store.SyncFabric(ctx, b.NodeID, s.FabricPrefix, b.FabricSelf)
 			}),
+		handle(s, agentops.FabricLinksSaid,
+			func(_ context.Context, b agentops.FabricLinksRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.FabricLinksRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordFabricLinks(ctx, b.NodeID, b.FabricLinksReport))
+			}),
 		handle(s, agentops.AttemptStreamsSaid,
 			func(ctx context.Context, b agentops.AttemptStreams) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)

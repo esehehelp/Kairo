@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -114,7 +115,15 @@ func agentCommand(args []string) error {
 					}
 				}
 				return view, err
+			},
+			Report: func(ctx context.Context, report store.FabricLinksReport) error {
+				return client.ReportFabricLinks(ctx, cfg.Node.ID, report)
 			}}
+		if _, port, err := net.SplitHostPort(cfg.Packs.Listen); err == nil {
+			fab.ProbePort, _ = strconv.Atoi(port)
+		}
+		// what fetches from other agents took measures the links
+		executor.TransferObserved = fab.Received
 		// back on the fabric as it was last, before the daemon is asked
 		if err := fab.Restore(ctx); err != nil {
 			logger.Warn("fabric not restored", "error", err)

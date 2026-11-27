@@ -42,11 +42,13 @@ func fabricList(args []string) error {
 	var body struct {
 		Prefix string             `json:"prefix"`
 		Nodes  []store.FabricNode `json:"nodes"`
+		Links  []store.FabricLink `json:"links"`
 	}
 	if err := json.Unmarshal(payload, &body); err != nil {
 		return fmt.Errorf("decode the fabric: %w", err)
 	}
 	fmt.Print(formatFabric(body.Prefix, body.Nodes))
+	fmt.Print(formatFabricLinks(body.Links))
 	return nil
 }
 
@@ -75,6 +77,35 @@ func formatFabric(prefix string, nodes []store.FabricNode) string {
 			endpoints = "-"
 		}
 		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\t%s\n", n.NodeID, n.Address, key, n.ListenPort, endpoints, shortStamp(&n.UpdatedAt))
+	}
+	w.Flush()
+	return b.String()
+}
+
+// formatFabricLinks is a line a directed link: its path and endpoint, the
+// round trip, the bandwidth its transfers took, and when each was measured.
+func formatFabricLinks(links []store.FabricLink) string {
+	if len(links) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("\nlinks (as the first node sees its path to the second):\n")
+	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "FROM\tTO\tPATH\tENDPOINT\tHANDSHAKE\tRTT\tBANDWIDTH\tMEASURED")
+	for _, l := range links {
+		rtt, bw, measured := "-", "-", "-"
+		if l.RTTMillis != nil {
+			rtt = fmt.Sprintf("%.2f ms", *l.RTTMillis)
+		}
+		if l.BytesPerSecond != nil {
+			bw = formatSize(int64(*l.BytesPerSecond)) + "/s"
+			measured = shortStamp(l.BandwidthAt)
+		}
+		endpoint := l.Endpoint
+		if endpoint == "" {
+			endpoint = "-"
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", l.Src, l.Dst, l.Path, endpoint, shortStamp(l.HandshakeAt), rtt, bw, measured)
 	}
 	w.Flush()
 	return b.String()

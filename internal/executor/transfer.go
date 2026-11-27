@@ -592,7 +592,7 @@ func (e *storeWorker) fetchRemote(ctx context.Context, o store.CopyOrder, name s
 		giveUp()
 		return nil, 0, err
 	}
-	body := &watchedBody{ReadCloser: resp.Body, stall: stall, cancel: cancel}
+	body := &watchedBody{ReadCloser: resp.Body, stall: stall, cancel: cancel, addr: o.Source.Addr, start: time.Now()}
 	switch {
 	case resp.StatusCode == http.StatusOK:
 		return body, 0, nil
@@ -613,18 +613,28 @@ func (e *storeWorker) fetchRemote(ctx context.Context, o store.CopyOrder, name s
 	return nil, 0, fmt.Errorf("fetch %s from %s: %s: %s", name, o.Source.Addr, resp.Status, strings.TrimSpace(string(text)))
 }
 
+// TransferObserved hears what a fetch from another agent's transfer
+// endpoint (addr) took: its bytes and its time (nil: nobody listens). The
+// fabric measures its links by it (issue #47).
+var TransferObserved func(addr string, bytes int64, took time.Duration)
+
 // watchedBody is a fetched body whose request is given up once nothing has
-// arrived for stallTimeout.
+// arrived for stallTimeout; what it read, and in what time, is told to
+// TransferObserved when it is closed.
 type watchedBody struct {
 	io.ReadCloser
 	stall  *time.Timer
 	cancel context.CancelFunc
+	addr   string
+	start  time.Time
+	read   int64
 }
 
 func (w *watchedBody) Read(p []byte) (int, error) {
 	n, err := w.ReadCloser.Read(p)
 	if n > 0 {
 		w.stall.Reset(stallTimeout)
+		w.read += int64(n)
 	}
 	return n, err
 }
@@ -633,6 +643,9 @@ func (w *watchedBody) Close() error {
 	w.stall.Stop()
 	err := w.ReadCloser.Close()
 	w.cancel()
+	if observe := TransferObserved; observe != nil && w.read > 0 {
+		observe(w.addr, w.read, time.Since(w.start))
+	}
 	return err
 }
 

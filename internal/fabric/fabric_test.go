@@ -23,10 +23,10 @@ func (f *fakeLink) ensure(_ context.Context, _, address string, _ int, _ string,
 	return nil
 }
 
-func (f *fakeLink) peers(context.Context, string) (map[string]time.Time, error) {
-	out := map[string]time.Time{}
-	for k := range f.endpoints {
-		out[k] = f.handshakes[k]
+func (f *fakeLink) peers(context.Context, string) (map[string]peerSeen, error) {
+	out := map[string]peerSeen{}
+	for k, e := range f.endpoints {
+		out[k] = peerSeen{handshake: f.handshakes[k], endpoint: e}
 	}
 	return out, nil
 }
@@ -129,5 +129,36 @@ func TestARestartedNodeIsBackOnTheFabricBeforeAskingTheDaemon(t *testing.T) {
 	// nothing kept: nothing done
 	if err := (&Manager{KeyFile: filepath.Join(t.TempDir(), "none.key")}).Restore(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// A transfer received from a peer's transfer endpoint (by its fabric
+// address) is said with the next report, with each peer's endpoint and
+// latest handshake; one from elsewhere is none of the fabric's.
+func TestLinksAreSaidWithWhatWasReceived(t *testing.T) {
+	keyFile := filepath.Join(t.TempDir(), "fabric.key")
+	view := store.FabricView{Address: "10.209.0.1", Prefix: "10.209.0.0/16", Peers: []store.FabricNode{
+		{NodeID: "b", Address: "10.209.0.2", PublicKey: "KB", Endpoints: []string{"192.0.2.2:51820"}},
+	}}
+	link := &fakeLink{handshakes: map[string]time.Time{"KB": time.Unix(1_800_000_000, 0)}, endpoints: map[string]string{}}
+	var said []store.FabricLinksReport
+	m := &Manager{Interface: "kairo0", ListenPort: 51820, KeyFile: keyFile, link: link,
+		Sync:   func(context.Context, store.FabricSelf) (store.FabricView, error) { return view, nil },
+		Report: func(_ context.Context, r store.FabricLinksReport) error { said = append(said, r); return nil }}
+	if err := m.Once(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m.Received("10.209.0.2:7485", 64<<20, 2*time.Second)
+	m.Received("192.168.1.9:7475", 64<<20, time.Second)
+	if err := m.report(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if len(said) != 1 || len(said[0].Peers) != 1 || said[0].Peers[0].Node != "b" || said[0].Peers[0].Endpoint != "192.0.2.2:51820" ||
+		said[0].Peers[0].HandshakeAt == "" || len(said[0].Received) != 1 || said[0].Received[0].From != "b" || said[0].Received[0].Seconds != 2 {
+		t.Fatalf("said %+v", said)
+	}
+	// said once
+	if err := m.report(context.Background()); err != nil || len(said[1].Received) != 0 {
+		t.Fatalf("again: %+v %v", said, err)
 	}
 }

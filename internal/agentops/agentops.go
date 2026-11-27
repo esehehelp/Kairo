@@ -486,6 +486,9 @@ var (
 	// FabricSync: a node says what it is on the fabric and is told its
 	// address and peers (store/fabric.go).
 	FabricSync = Op[FabricSyncRequest, store.FabricView]{Name: "fabric", Observe: Allowed}
+	// FabricLinksSaid: a node says how it sees its paths to its peers and
+	// what it received from them (store.RecordFabricLinks).
+	FabricLinksSaid = Op[FabricLinksRequest, OK]{Name: "fabric-links", Observe: Allowed}
 )
 
 // The operations of device controllers, for the controller's own node.
@@ -512,7 +515,7 @@ var All = []Named{
 	DeletionsToMake, SettleDeletion, SourcesInUse, EvictionsToMake, SettleEviction, ScrubsToMake, RecordScrub,
 	PackRead, NetBenches, NetBenchStatus, NetBenchStart, NetBenchPoints, NetBenchKind, NetBenchFinish, NetBenchAuthorize, UnlaunchedLeases, ValidateReservation, MarkLeasePrepared, ReleaseReservation, AuthorizeLaunch,
 	ActivateLaunch, SetLogPaths, LogProblem, MarkProcessExited, RecordTerminal, QuiescenceCandidates,
-	FinalizeQuiescence, QuarantineTerms, QuarantineTerminated, ForceStopOrders, ForceStopAcked, AttemptUsed, AttemptStreamsSaid, FabricSync,
+	FinalizeQuiescence, QuarantineTerms, QuarantineTerminated, ForceStopOrders, ForceStopAcked, AttemptUsed, AttemptStreamsSaid, FabricSync, FabricLinksSaid,
 	ControllerRegister, DeviceSettings, DeviceReport, TrimsToMake, RecordTrim, DeviceSamples,
 }
 
@@ -520,4 +523,10 @@ var All = []Named{
 type FabricSyncRequest struct {
 	NodeID string `json:"node_id"`
 	store.FabricSelf
+}
+
+// FabricLinksRequest is what a node says of its links.
+type FabricLinksRequest struct {
+	NodeID string `json:"node_id"`
+	store.FabricLinksReport
 }

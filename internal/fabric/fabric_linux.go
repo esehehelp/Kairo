@@ -43,23 +43,37 @@ func (cmdLink) ensure(ctx context.Context, name, address string, bits int, keyFi
 	return err
 }
 
-// peers reads wg show NAME latest-handshakes: "key<TAB>unix seconds".
-func (cmdLink) peers(ctx context.Context, name string) (map[string]time.Time, error) {
+// peers reads wg show NAME latest-handshakes ("key<TAB>unix seconds") and
+// endpoints ("key<TAB>host:port", "(none)" when unknown).
+func (cmdLink) peers(ctx context.Context, name string) (map[string]peerSeen, error) {
 	out, err := run(ctx, "wg", "show", name, "latest-handshakes")
 	if err != nil {
 		return nil, err
 	}
-	peers := map[string]time.Time{}
+	peers := map[string]peerSeen{}
 	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
 		f := strings.Fields(line)
 		if len(f) != 2 {
 			continue
 		}
-		var at time.Time
+		var seen peerSeen
 		if s, err := strconv.ParseInt(f[1], 10, 64); err == nil && s > 0 {
-			at = time.Unix(s, 0)
+			seen.handshake = time.Unix(s, 0)
 		}
-		peers[f[0]] = at
+		peers[f[0]] = seen
+	}
+	out, err = run(ctx, "wg", "show", name, "endpoints")
+	if err != nil {
+		return nil, err
+	}
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		f := strings.Fields(line)
+		if len(f) != 2 || f[1] == "(none)" {
+			continue
+		}
+		seen := peers[f[0]]
+		seen.endpoint = f[1]
+		peers[f[0]] = seen
 	}
 	return peers, nil
 }
