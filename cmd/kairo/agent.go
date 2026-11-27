@@ -119,7 +119,9 @@ func agentCommand(args []string) error {
 			Report: func(ctx context.Context, report store.FabricLinksReport) error {
 				return client.ReportFabricLinks(ctx, cfg.Node.ID, report)
 			}}
-		if _, port, err := net.SplitHostPort(cfg.Packs.Listen); err == nil {
+		// peers time a connect to the transfer endpoint at the fabric address
+		// (not on Windows: the endpoint is off the fabric there)
+		if _, port, err := net.SplitHostPort(cfg.Packs.Listen); err == nil && fabric.HostOnFabric() {
 			fab.ProbePort, _ = strconv.Atoi(port)
 		}
 		if fab.RelayFrom, fab.RelayTo, err = config.ParseRelayPorts(cfg.Fabric.RelayPorts); err != nil {
