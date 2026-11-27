@@ -46,6 +46,22 @@ func readCPUTimes() (cpuTimes, error) {
 		return t, err
 	}
 	t.total, t.idle = filetimeSeconds(kernel)+filetimeSeconds(user), filetimeSeconds(idle)
+	known := eachSystemProcess(func(p *windows.SYSTEM_PROCESS_INFORMATION) {
+		if name := strings.ToLower(p.ImageName.String()); strings.HasPrefix(name, "vmmemwslc") {
+			t.kairo += float64(p.UserTime+p.KernelTime) / 1e7
+		}
+	})
+	if !known {
+		return t, nil // Kairo's share unknown
+	}
+	t.kairoKnown = true
+	return t, nil
+}
+
+// eachSystemProcess calls fn with each process of the system's process list
+// (NtQuerySystemInformation: a process is read there without opening it,
+// which a VM's process does not allow); false when the list cannot be read.
+func eachSystemProcess(fn func(*windows.SYSTEM_PROCESS_INFORMATION)) bool {
 	size := uint32(1 << 20)
 	var buf []byte
 	for range 8 {
@@ -56,19 +72,17 @@ func readCPUTimes() (cpuTimes, error) {
 			break
 		}
 		if err != windows.STATUS_INFO_LENGTH_MISMATCH {
-			return t, nil // Kairo's share unknown
+			return false
 		}
 		size = max(size*2, needed+64<<10)
 		buf = nil
 	}
 	if buf == nil {
-		return t, nil
+		return false
 	}
 	for offset := uint32(0); ; {
 		p := (*windows.SYSTEM_PROCESS_INFORMATION)(unsafe.Pointer(&buf[offset]))
-		if name := strings.ToLower(p.ImageName.String()); strings.HasPrefix(name, "vmmemwslc") {
-			t.kairo += float64(p.UserTime+p.KernelTime) / 1e7
-		}
+		fn(p)
 		if p.NextEntryOffset == 0 {
 			break
 		}
@@ -77,6 +91,5 @@ func readCPUTimes() (cpuTimes, error) {
 			break
 		}
 	}
-	t.kairoKnown = true
-	return t, nil
+	return true
 }

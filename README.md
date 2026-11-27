@@ -301,6 +301,7 @@ GPU 上の外部利用は次の基準で分類されます。
 - **`external_claim`**: いずれの Attempt からも起動されていない計算（compute）プロセスが GPU 上に存在する場合。
 - **`unattributed_activity`**: 説明のつく計算プロセスが存在しないにもかかわらず、1 GiB を超える GPU メモリが使用されている場合（Linux では別コンテナ上のワークロードがこの状態として観測されます）。
 - **Windows の例外**: Windows 上でグラフィックスプロセス（`nvidia-smi pmon` で `G` または `C+G` として現れるコンポジタ、ブラウザ、ディスプレイ接続 GPU のデスクトップなど）が表示されている GPU のメモリ使用量は、WDDM がプロセスごとのメモリ使用量を報告せず切り分けができないため、それらのプロセスによるものとして扱い `unattributed_activity` には計上しません。
+- **wslc の VM（Windows）**: wslc のコンテナで動く Kairo の仕事は、Windows の `nvidia-smi` にはプロセスとして一つも現れず、使っているメモリだけが GPU の使用量に出ます（GPU の準仮想化）。そこで provider は、WDDM のプロセスごとの GPU メモリ（性能カウンタ `\GPU Process Memory(*)\Dedicated Usage`、タスクマネージャーと同じ数え方）から、wslc の VM のワーカー（`vmmemwslc*` の親の `vmwp`）が持つ分を、アダプタの PCI アドレスで GPU に結び付けて、Kairo の仕事の分として差し引きます。残りを上の規則で判断します。GPU の観測の evidence に `kairo_vm_bytes` として出ます。読めないときは差し引かず、`unattributed_activity` のままにします。
 
 #### 所有者の使用（owner use）
 
