@@ -222,14 +222,27 @@ Task の `depends_on`（およびそれに伴う `task = "T"` 入力）には、
 
 デーモン自身も同じ仕組み（origin は `data_protection`）でチェックポイントを要求し、公開されたチェックポイントを保護・保持します（[実行中ジョブのチェックポイント保護](#実行中ジョブのチェックポイント保護)を参照）。
 
+ワーカー自身も、自分の Attempt のチェックポイントを要求できます（`POST /api/worker/checkpoints`、origin は `worker`。Python SDK の `checkpoint_now`。[セーフポイントの挙動と Python・Rust SDK](#セーフポイントの挙動と-pythonrust-sdk)）。
+
+- **使いどころ**: 最後のステップの後にこれを呼んでから終わると、走り切った Run の最後の状態が、stream の位置つきで Kairo の知るチェックポイントとして残ります。その Run は `kairo task rerun --from-checkpoint` で続けられます（`succeeded` の Task も。次節）。
+- **応答**: 要求への応答に `checkpoint` コマンドが入っていて、ワーカーはそれにすぐ応答します（`kairo task checkpoint` のコマンドと同じ手順で、Attempt は続きます）。
+- **進行中の要求**: すでに進行中のチェックポイント要求があれば、それが返されます。
+- **拒否される場合**: `running` でない Attempt や、チェックポイント非対応の Execution の要求は拒否されます。
+
 #### 再実行（`kairo task rerun`）と宣言の整理（`kairo project prune`）
 
 `kairo task rerun PROJECT [QUEUE] TASK` は、`failed`、`stopped`、`cancelled`、または `blocked` 状態の Task について、すべての Execution が終了した後に同一の宣言で次の Execution（理由は `rerun`）を実行します。依存先が成功しなかったことだけを理由にブロックされていた後続 Task は `pending` へ戻り、依存先が成功すれば実行されます。なお、宣言内容を変更したい場合は、引き続き新しい Task 名が必要です。
 
+`succeeded` の Task も、`--from-checkpoint` を付ければ、公開したチェックポイントから続けられます（走り切った Run の続き。最後の状態は `checkpoint_now` で残します）。
+
+- **最初からの再実行はできません**: `--from-checkpoint` を付けない再実行は拒否されます。
+- **後続 Task が走っている間は拒否されます**: その Task に依存する Task に、終わっていない Execution がある間、または計画済みの Execution がある間です。理由は、`task = "T"` の入力が読む「最新の Run」が、続きの Run に替わるためです。
+- **まだ始まっていない後続 Task**: 続きを始めた Task は `pending` に戻ります。そのため、まだ始まっていない後続 Task は、続きが成功してから実行されます。
+
 `kairo task rerun` には次のオプションを指定できます（両方を併用して、修正したコードでチェックポイントから再開することも可能です）。
 
 - `--from-checkpoint latest|COMMAND_ID`（チェックポイント対応 Task が対象）: 最初からではなく、その Task が公開したチェックポイント（`latest`、または `checkpointed` 応答済みの suspend / checkpoint コマンドの `COMMAND_ID`、`GET /api/commands/{id}` で確認可能）から再開します。新しい Execution は、チェックポイント付き中断の再開時と同様に、そのチェックポイント参照（`KAIRO_CONTINUATION_REF`）の継続（continuation）として作成されます。再実行は新しい Run なので、チェックポイントを公開した Run の output（チェックポイントは `/kairo/output` の中にあります）が pack されたあと、その中身をこの Run の output ディレクトリとして持ち込んでから起動します（[Run の output の持ち込み](#run-の-output-の持ち込み)）。配置はチェックポイントを公開した Attempt のノードへ計画され、CLI には使用されるチェックポイントが出力されます。チェックポイントを一度も公開していない Task や、該当 Task のチェックポイントではないコマンドを指定した場合は拒否されます。
-- `--source current|SNAPSHOT`（ソース上で実行する Task が対象）: 宣言時に紐づけられたスナップショットとは別の、同じソースのスナップショット上で実行します。`current` を指定すると、そのソースに対して最新の `project apply` が送信したスナップショットを使用します（コードを修正して同じファイルを再適用しても既存 Task の宣言自体は変わらないため、このオプションで修正を反映させます）。あるいはスナップショット ID を直接指定することもできます。新しい Execution には実行に使用したスナップショットが記録される一方、Task 自体は元のスナップショットに紐づいたまま維持されるため、後続 Task や入力参照は引き続き同じ Task 名を指定できます。デーモンが保持していないスナップショットや別ソースのスナップショットは拒否されます。
+- `--source current|SNAPSHOT`（ソース上で実行する Task が対象）: 宣言時に紐づけられたスナップショットとは別の、同じソースのスナップショット上で実行します。`current` を指定すると、そのソースに対して最新の `project apply` が送信したスナップショットを使用します（コードを修正して同じファイルを再適用しても既存 Task の宣言自体は変わらないため、このオプションで修正を反映させます）。あるいはスナップショット ID を直接指定することもできます。新しい Execution には実行に使用したスナップショットが記録される一方、Task 自体は元のスナップショットに紐づいたまま維持されるため、後続 Task や入力参照は引き続き同じ Task 名を指定できます。デーモンが保持していないスナップショットや別ソースのスナップショットは拒否されます。stream を読む Task を `--from-checkpoint` と一緒に指定すると、本体はこのスナップショットで動きますが、stream の stage はチェックポイントを作ったときのスナップショットで動きます（[起動、識別、位置](#起動識別位置)）。
 
 `kairo project prune [--write] FILE` は、まだ実行可能な Task とそれらが必要とする依存先 Task を報告します（`--write` を指定すると、残す各 Task のダイジェストを維持したまま `FILE` を書き換えます）。
 
@@ -500,6 +513,7 @@ key_file = "/etc/kairo/pack-key.pem"
 | `POST` | `/api/worker/heartbeat`, `/api/worker/processes` | worker |
 | `GET` | `/api/worker/commands` | worker |
 | `POST` | `/api/worker/commands/{command}/acks` | worker |
+| `POST` | `/api/worker/checkpoints` | worker |
 | `GET` | `/api/worker/bench`, `/api/worker/bench/cpu-energy` | worker（ベンチマークの Attempt） |
 | `POST` | `/api/worker/bench/settings`, `/start`, `/points`, `/kinds`, `/finish` | worker（ベンチマークの Attempt） |
 
@@ -1109,6 +1123,7 @@ Kairo が渡した領域以外に Attempt が書き込んだ内容はインス�
 | `/kairo/output` | `KAIRO_OUTPUT_DIR` |
 | `/kairo/cache` | `KAIRO_CACHE_DIR` |
 | `/kairo/src` | `KAIRO_SOURCE_DIR`、コードスナップショット（読み取り専用） |
+| `/kairo/stream-src` | stream の stage が動くスナップショット。本体と別のときだけ置きます（読み取り専用。stage の `KAIRO_SOURCE_DIR`） |
 | `/kairo/inputs/<name>` | `KAIRO_INPUT_<NAME>`（読み取り専用） |
 | `/kairo/nvidia` | ノードの NVIDIA ドライバファイル群（GPU 利用時、読み取り専用。wslc では使わない） |
 | `/kairo/raw`, `/kairo/raw-requests` | stream の raw キャッシュの窓口（読み取り専用）と、wslc での依頼の置き場 |
@@ -1855,7 +1870,11 @@ streams = ["mix"]           # → KAIRO_STREAM_MIX
 - **公開値**: Hugging Face の一覧が示す sha256 とサイズ（サイズ 0 も示された値として扱います）は、識別情報とは別にファイルの宣言に残ります。公開値と識別情報が食い違うファイルを含む stream は、始まった時点で `raw data changed` で止まります。そのファイルのレコード数を使って読み飛ばすこともしません。デーモンは、受け取った一覧のファイルがパターンに合うこと、名前順に 1 度ずつ並ぶことを確かめます。
 - **識別**: ファイルの識別情報とレコード数は、raw キャッシュの agent が計算して記録します（上記。テーブル `raw_identities`・`raw_records`）。レコード数は、その Attempt の窓口のリンクを読み、識別情報と照合しながら数えたものだけを記録します。受け付けるのは、その Executor に Lease のある Execution の stream が読むファイルのものだけです。URL ごとに最初の識別情報が残り、公開済みの値と違うもの、すでにあるものと少しでも違うもの（サイズ、sha256、チャンク）は `raw data changed` です。レコード数は、区切り・実際の圧縮・フィールドごとに残します。以後の起動では、どのチャンクもこれと照合され、長さが違えば（短くても長くても）変わったものとして扱います。
 - **位置と checkpoint**: SDK の `safe_point(..., streams=[train])`（torch の `DistributedAdapter.safe_point(..., streams=[train])` は全 rank の位置を集めます）は、checkpoint を公開するとき、各 stream について rank の数（`world`）、順番の版（`order`、いまは 1）、各 rank の位置を `checkpointed` の payload に `"streams": {NAME: {"world": W, "order": 1, "positions": [...]}}` として入れます。stream を読む Execution の checkpoint は、読むすべての stream について、`world` と `order` があり、順番の版が同じで、rank 0〜W-1 の位置がちょうど 1 つずつ（`rank`・`record`・`sub` をすべて書いたもの。負の値なし、上限内）なければ拒否されます（`safe_point` に stream を渡し忘れると、公開されません）。
-- **続き**: continuation（suspend 後、ロスト後、`rerun --from-checkpoint`）は、続けるもとの checkpoint を、その command で覚えています（`input_checkpoint_command_id`）。Loader は、その command の受理された payload が言う位置から始め、rank の数は payload の `world` に固定されます（別の数で接続した rank は拒否されます）。同じ参照で公開された別の checkpoint の位置が使われることはありません。あるレコードの途中の位置（`sub`）は、そのレコードの出力がそれより少なければ誤りとして stream を止めます（stage が変わったということなので、調整はしません）。stream を読む Task の continuation は、その checkpoint を公開した Execution と同じコードスナップショットとイメージで動きます（stage も位置の一部だからです）。そのため、そうした Task に `rerun --from-checkpoint` と `--source` を同時に指定すると拒否されます。stream を読まない Task の continuation は、前の Execution と同じスナップショットとイメージで動きます（`rerun --source` で替えた Run は、その続きもそのスナップショットです）。
+- **続き**: continuation（suspend 後、ロスト後、`rerun --from-checkpoint`）は、続けるもとの checkpoint を、その command で覚えています（`input_checkpoint_command_id`）。Loader は、その command の受理された payload が言う位置から始め、rank の数は payload の `world` に固定されます（別の数で接続した rank は拒否されます）。同じ参照で公開された別の checkpoint の位置が使われることはありません。あるレコードの途中の位置（`sub`）は、そのレコードの出力がそれより少なければ誤りとして stream を止めます（stage が変わったということなので、調整はしません）。stream を読む Task の continuation は、その checkpoint を公開した Execution と同じコードスナップショットとイメージで動きます（stage も位置の一部だからです）。
+  - **`--source` を付けたとき**: `rerun --from-checkpoint` に `--source` を付けると、本体（argv）は指定したスナップショットで動きます。stage は、checkpoint の stage が動いたスナップショットで動きます。
+  - **stage のスナップショットの置き場所**: `/kairo/stream-src` に読み取り専用で置きます。stage の作業ディレクトリは、その中の `cwd` です。stage の `KAIRO_SOURCE_DIR`・`KAIRO_SOURCE_ID` もそのスナップショットを指します。
+  - **記録と、続きの続き**: Execution は、このスナップショットを `stream_snapshot_id` に記録します。その続きの stage も同じスナップショットで動きます。
+  - **stream を読まない Task**: stream を読まない Task の continuation は、前の Execution と同じスナップショットとイメージで動きます（`rerun --source` で替えた Run は、その続きもそのスナップショットです）。
 - **ストリームの終わりと失敗**: 終わり（`end`）と失敗（`error`）は、取り逃した rank が接続し直したときにも、もう一度渡されます。失敗した stream は、巻き戻しで作り直されることはありません。stream の終わりより先の位置（そこに立ったことはありえない）は、終わりとして扱わず、stream のエラーにします。Loader のプロセスが終わったら、コンテナの init が起動し直し（5 回まで。同じセッションで）、各 rank は自分の位置で接続し直します。
 - **メモリ**: 各 rank のために先に作っておく分は、件数（4096 件）とバイト数（`memory_bytes` の 4 分の 1 を rank で分けた分、最低 1 MiB。宣言がなければ rank ごとに 64 MiB）の両方で抑えます。生データは rank の数だけ読みます（各 rank の作り手が順番全体を読むため。stage に通すのは自分の rank の分だけです）。ブロックシャッフルのブロック（`block` 件）も、各作り手は自分の rank のレコードだけを持つので、全体で 1 ブロック分です（rank が 2 つ以上のとき、stream の最後の短いブロックは、その長さで決まる並べ替えに合わせて 2 度読みます）。
 
@@ -1963,6 +1982,15 @@ SDK は、Attempt を Linux のコンテナで動くものとして扱います�
 
 - **`suspend` Command**: `accepted` と `checkpointing` を応答してチェックポイント用コールバックを実行し、得られた継続（continuation）を `checkpointed` として公開したうえで `True` を返します。
 - **`checkpoint` Command（`kairo task checkpoint`）**: `suspend` と同じコールバックを実行し（両者は `command.kind` で判別できます）、同じ手順で応答しますが、`safe_point` は `False` を返し、ワーカーはそのまま処理を継続します。
+- **`checkpoint_now`**: ワーカー自身が要求するチェックポイントです（Python SDK の `AttemptSession.checkpoint_now(checkpoint=..., streams=[...])` と、全 rank で呼ぶ `DistributedAdapter.checkpoint_now(checkpoint, progress, streams=[...])`）。
+  - **使い方**: 最後のステップの後に呼んでから終わると、走り切った Run を `kairo task rerun --from-checkpoint latest [--source current]` で続けられます。
+  - **処理**: Kairo は origin `worker` の `checkpoint` コマンドを出し、ワーカーはそれを `safe_point` と同じコールバックで処理します（コマンド ID でべき等にします）。公開するときは stream の位置も入れます。
+  - **戻り値**: 公開できたら `True` です。公開できなかったら `False` で、終わるかどうかはワーカーが決めます。`False` になるのは次の場合です。
+    - 拒否された
+    - コールバックが失敗した
+    - 取り下げられた
+    - デーモンが `wait_seconds`（既定 600 秒）のあいだ応えなかった
+  - **Rust**: Rust の SDK にはまだありません。
 - **コールバック失敗時**: コールバックが失敗した場合、または継続を返さなかった場合は `rejected` を応答します。このとき、`suspend` であればエラーが送出（raise）されますが、`checkpoint` Command であればワーカーは処理を継続します（実行の終了ではなくコピーの作成を求めているに過ぎないためです）。
 - **未知の Command**: 未知の Command 種別（command kind）はスキップされます。
 - **一時的な通信障害**: デーモンやネットワークが一時的に利用できない場合（ポーリング・ハートビート・応答における一時的エラーまたはリトライ対象エラー）は、そのセーフポイントでは Command が届いていないものとして扱われます。ワーカーは処理を継続し、エラーを `last_control_error` に保持したまま進み、Command は後から再送されます。

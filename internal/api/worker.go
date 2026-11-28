@@ -51,6 +51,26 @@ func (s *Server) workerAck(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
 }
 
+// workerCheckpoint is a worker asking for a checkpoint of its own attempt
+// now (store.RequestCheckpoint): the checkpoint command, to be handled at
+// once and acknowledged as any other.
+func (s *Server) workerCheckpoint(w http.ResponseWriter, r *http.Request) {
+	worker := workerIdentity(r)
+	var body struct {
+		Reason string `json:"reason"`
+	}
+	err := decode(r, &body)
+	var command store.Command
+	if err == nil {
+		command, err = s.Store.RequestCheckpoint(r.Context(), worker.AttemptID, worker.LeaseID, worker.Epoch, body.Reason)
+	}
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"command": command})
+}
+
 // protectCheckpoint keeps the checkpoint an attempt just published
 // (store.ProtectCheckpoint); the acknowledgement stands whatever becomes of
 // it.

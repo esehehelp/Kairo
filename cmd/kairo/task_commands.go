@@ -373,7 +373,7 @@ func taskRerun(args []string) error {
 	api := apiFlag(fs)
 	actor := fs.String("actor", defaultActor(), "audit actor")
 	requestID := fs.String("request-id", id.New("cli"), "idempotency request ID")
-	fromCheckpoint := fs.String("from-checkpoint", "", "go on from a checkpoint the task published: latest, or a checkpoint command's id")
+	fromCheckpoint := fs.String("from-checkpoint", "", "go on from a checkpoint the task published: latest, or a checkpoint command's id (a succeeded task goes on only so)")
 	source := fs.String("source", "", "run in another snapshot of the task's source: current (the latest apply's), or a snapshot id")
 	positional, err := parseFlags(fs, args)
 	if err != nil {

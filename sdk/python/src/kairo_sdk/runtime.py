@@ -187,6 +187,8 @@ class AttemptSession:
         # Waits between the tries of a ``checkpointed`` acknowledgement within
         # one safe point.
         self.publication_retry_delays: tuple[float, ...] = (1.0, 2.0)
+        # The latest command whose ``checkpointed`` acknowledgement Kairo has.
+        self._last_published: str | None = None
         self._process_identity: str | None = None
         self._process_registered = False
         self._registration_lock = threading.Lock()
@@ -485,11 +487,111 @@ class AttemptSession:
             return True
         return False
 
+    def checkpoint_now(
+        self,
+        *,
+        checkpoint: Callable[[CommandContext], SuspendResult | str | Path | None],
+        progress: Mapping[str, Any] | ProgressEnvelope | None = None,
+        streams: Sequence[Any] = (),
+        reason: str = "",
+        wait_seconds: float = 600.0,
+    ) -> bool:
+        """Publish a checkpoint now, at the worker's own asking, and carry on.
+
+        Call it after the last step, before the worker exits: a run that ran
+        to its end then has its last state as a checkpoint Kairo knows, with
+        where each of ``streams`` stands, and can be continued from it
+        (``kairo task rerun --from-checkpoint latest``, with newer code too:
+        ``--source current``). Kairo issues a ``checkpoint`` command of
+        origin ``worker`` for this attempt, and ``checkpoint`` runs for it as
+        at a safe point: the same callback, idempotent by command id (a
+        checkpoint command already in flight is the one handled).
+
+        Returns ``True`` once Kairo has the checkpoint, ``False`` when it was
+        not published: Kairo refused it (the attempt not running, or its
+        execution not checkpointable; :attr:`last_control_error`), the
+        callback failed or returned no ``continuation_ref``
+        (:attr:`last_checkpoint_error`; acknowledged ``rejected``), the
+        command was withdrawn, or Kairo stayed unavailable for
+        ``wait_seconds``. The worker decides whether to end anyway.
+
+        Raises :class:`~kairo_sdk.errors.AttemptRetired` /
+        :class:`~kairo_sdk.errors.AttemptFenced` when the attempt is over.
+        """
+        if not self.managed:
+            raise RuntimeError("checkpoint_now needs an attempt managed by Kairo")
+        if progress is not None:
+            self.set_progress(progress)
+        self._raise_if_terminal()
+        deadline = time.monotonic() + wait_seconds
+        raw = self._request_checkpoint(reason, deadline)
+        if raw is None:
+            return False
+        command_id = str(raw["id"])
+        self._streams = tuple(streams)
+        delay = 1.0
+        while True:
+            pending = self._pending_publication
+            if pending is not None and pending[0] == command_id:
+                published = self._publish(*pending)
+                status = "pending" if published is None else ("published" if published else "dropped")
+            else:
+                status = self._run_command(raw, checkpoint)
+            if status == "published":
+                return True
+            if status in ("dropped", "stop"):
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log.warning("Kairo stayed unavailable; checkpoint %s is not published", command_id)
+                return False
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 30.0)
+
+    def _request_checkpoint(self, reason: str, deadline: float) -> Mapping[str, Any] | None:
+        """Ask Kairo for a checkpoint command of this attempt (POST
+        /api/worker/checkpoints), again while it is unavailable until
+        ``deadline``; ``None`` when refused or never answered."""
+        delay = 1.0
+        while True:
+            try:
+                response = self._request("POST", "/api/worker/checkpoints", {"reason": reason})
+                command = response.get("command")
+                if not isinstance(command, Mapping) or not command.get("id"):
+                    raise RuntimeError("Kairo checkpoint response must contain a command")
+                return command
+            except (AttemptRetired, AttemptFenced):
+                raise
+            except Exception as error:
+                if not self._unavailable(error):
+                    if not isinstance(error, KairoAPIError):
+                        raise
+                    self.last_control_error = error
+                    _log.warning("Kairo refused a checkpoint of this attempt: %s", error)
+                    return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            time.sleep(min(delay, remaining))
+            delay = min(delay * 2, 30.0)
+
     def _handle_command(
         self,
         raw: Mapping[str, Any],
         checkpoint: Callable[[CommandContext], SuspendResult | str | Path | None],
     ) -> bool:
+        return self._run_command(raw, checkpoint) == "stop"
+
+    def _run_command(
+        self,
+        raw: Mapping[str, Any],
+        checkpoint: Callable[[CommandContext], SuspendResult | str | Path | None],
+    ) -> str:
+        """Handle one command: ``"stop"`` (a suspend published),
+        ``"published"`` (a checkpoint published, the worker carries on),
+        ``"pending"`` (its publication kept to be sent again),
+        ``"unavailable"`` (not acknowledged: Kairo delivers it again) or
+        ``"dropped"`` (skipped, withdrawn, or refused: carry on)."""
         context = CommandContext(
             command_id=str(raw["id"]),
             execution_id=self.execution_id,
@@ -500,13 +602,16 @@ class AttemptSession:
         )
         if context.kind not in ("suspend", "checkpoint"):
             _log.debug("skipping Kairo command %s of unknown kind %r", context.command_id, context.kind)
-            return False
+            return "dropped"
         try:
             self._ack(context.command_id, "accepted")
             self._ack(context.command_id, "checkpointing")
         except Exception as error:
-            if self._withdrawn_or_unavailable(context.command_id, error):
-                return False
+            if isinstance(error, KairoAPIError) and error.classification == errors.GONE:
+                _log.info("Kairo command %s was withdrawn: %s", context.command_id, error)
+                return "dropped"
+            if self._unavailable(error):
+                return "unavailable"
             raise
         try:
             result = normalize_suspend_result(checkpoint(context))
@@ -515,7 +620,7 @@ class AttemptSession:
             if context.kind == "checkpoint":
                 self.last_checkpoint_error = error
                 _log.warning("Kairo checkpoint %s failed; the worker carries on: %s", context.command_id, error)
-                return False
+                return "dropped"
             raise
         except BaseException as error:  # KeyboardInterrupt, SystemExit: refused, then out
             self._try_reject(context.command_id, f"{type(error).__name__}: {error}")
@@ -526,14 +631,17 @@ class AttemptSession:
             if context.kind == "checkpoint":
                 self.last_checkpoint_error = NoContinuationError(message)
                 _log.warning("Kairo checkpoint %s published nothing; the worker carries on", context.command_id)
-                return False
+                return "dropped"
             raise NoContinuationError(message)
-        if not self._publish(context.command_id, context.kind, suspend_payload(result, self._streams)):
-            return False  # withdrawn, or kept to be sent again
+        published = self._publish(context.command_id, context.kind, suspend_payload(result, self._streams))
+        if published is None:
+            return "pending"  # kept to be sent again
+        if not published:
+            return "dropped"  # withdrawn
         if context.kind == "checkpoint":
-            return False  # published; the worker carries on
+            return "published"  # the worker carries on
         self.suspend_handled = True
-        return True
+        return "stop"
 
     def _publish(self, command_id: str, kind: str, payload: dict[str, Any]) -> bool | None:
         """Send the ``checkpointed`` acknowledgement: ``True`` once Kairo has
@@ -562,6 +670,7 @@ class AttemptSession:
                 time.sleep(delay)
                 continue
             self._pending_publication = None
+            self._last_published = command_id
             return True
 
     def _unavailable(self, error: BaseException) -> bool:

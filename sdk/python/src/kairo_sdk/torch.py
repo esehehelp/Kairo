@@ -179,6 +179,62 @@ class DistributedAdapter:
             attempt_id=self.session.attempt_id,
             **raw,
         )
+        stop, _ = self._checkpoint_ranks(context, checkpoint, streams, dist, distributed, rank)
+        return stop
+
+    def checkpoint_now(
+        self,
+        checkpoint,
+        progress: dict[str, Any] | None = None,
+        streams: Any = (),
+        *,
+        reason: str = "",
+        wait_seconds: float = 600.0,
+    ) -> bool:
+        """Every rank: publish a checkpoint now, at the worker's own asking,
+        and carry on (:meth:`AttemptSession.checkpoint_now`).
+
+        Call it on every rank after the last step, before the worker exits:
+        rank 0 asks Kairo for a ``checkpoint`` command of origin ``worker``,
+        every rank runs ``checkpoint`` for it as at a safe point, and rank 0
+        publishes it with where every rank's ``streams`` stand. The run can
+        then be continued from it (``kairo task rerun --from-checkpoint
+        latest``, with newer code too: ``--source current``).
+
+        Returns ``True`` on every rank once Kairo has the checkpoint,
+        ``False`` on every rank when it was not published (refused, the
+        callback failing on a rank, withdrawn, or Kairo unavailable for
+        ``wait_seconds``). A retired or fenced attempt raises on every rank.
+        """
+        self.start()
+        dist, distributed = self._distribution()
+        rank = dist.get_rank() if distributed else 0
+        deadline = time.monotonic() + wait_seconds
+        envelope: list[Any] = [None]
+        if rank == 0:
+            envelope[0] = self._request_on_rank_zero(progress, reason, deadline)
+        if distributed:
+            dist.broadcast_object_list(envelope, src=0)
+        message = envelope[0]
+        _raise_terminal(self.session, message["terminal"])
+        raw = message["command"]
+        if raw is None:
+            return False
+        context = CommandContext(
+            execution_id=self.session.execution_id,
+            attempt_id=self.session.attempt_id,
+            **raw,
+        )
+        _, published = self._checkpoint_ranks(context, checkpoint, streams, dist, distributed, rank, deadline)
+        return published
+
+    def _checkpoint_ranks(
+        self, context: CommandContext, checkpoint, streams, dist, distributed: bool, rank: int, deadline: float | None = None
+    ) -> tuple[bool, bool]:
+        """Every rank checkpoints for ``context``; rank 0 publishes it, with
+        every rank's stream positions. Returns (stop, published): stop only
+        for a published suspend. With ``deadline``, rank 0 sends the
+        publication again while Kairo does not answer until then."""
         result = None
         local_error: str | None = None
         local_positions: dict[str, list[dict[str, int]]] = {}
@@ -211,7 +267,7 @@ class DistributedAdapter:
                 # end: refused, and every rank carries on.
                 self.session.last_checkpoint_error = RuntimeError(reason)
                 _log.warning("Kairo checkpoint %s failed; every rank carries on: %s", context.command_id, reason)
-                return False
+                return False, False
             raise RuntimeError(reason)
 
         if distributed:
@@ -225,6 +281,11 @@ class DistributedAdapter:
             else:
                 payload = suspend_payload(result, positions)
                 status = self._try_ack(context.command_id, "checkpointed", payload)
+                delay = 1.0
+                while deadline is not None and status == "failed" and self._unanswered() and time.monotonic() < deadline:
+                    time.sleep(min(delay, max(deadline - time.monotonic(), 0)))
+                    delay = min(delay * 2, 30.0)
+                    status = self._try_ack(context.command_id, "checkpointed", payload)
                 outcome["ok"] = status == "ok"
                 outcome["continuation_ref"] = result.continuation_ref
                 if status == "terminal":
@@ -244,13 +305,55 @@ class DistributedAdapter:
             if context.kind == "checkpoint":
                 self.session.last_checkpoint_error = NoContinuationError(message)
                 _log.warning("Kairo checkpoint %s published nothing; every rank carries on", context.command_id)
-                return False
+                return False, False
             raise NoContinuationError(message)
         if context.kind == "checkpoint":
-            return False  # published (or redelivered after a failed acknowledgement); every rank carries on
+            # published (or to be sent again after a failed acknowledgement); every rank carries on
+            return False, bool(outcome["ok"])
         if outcome["ok"]:
             self.session.suspend_handled = True
-        return bool(outcome["ok"])
+        return bool(outcome["ok"]), bool(outcome["ok"])
+
+    def _request_on_rank_zero(self, progress: dict[str, Any] | None, reason: str, deadline: float) -> dict[str, Any]:
+        """Ask for a checkpoint command on rank 0 and accept it; the message
+        every rank receives (``command`` None when there is none)."""
+        session = self.session
+        message: dict[str, Any] = {"command": None, "terminal": None}
+        if progress is not None:
+            session.set_progress(progress)
+        if session._terminal_error is not None:
+            message["terminal"] = _terminal_message(session)
+            return message
+        try:
+            raw = session._request_checkpoint(reason, deadline)
+        except (AttemptRetired, AttemptFenced):
+            message["terminal"] = _terminal_message(session)
+            return message
+        except BaseException as exc:
+            # every rank still reaches the broadcast
+            session.last_control_error = exc
+            _log.warning("Kairo checkpoint not requested: %s", exc)
+            return message
+        if raw is None:
+            return message
+        command_id = str(raw["id"])
+        status = self._try_ack(command_id, "accepted")
+        if status == "ok":
+            status = self._try_ack(command_id, "checkpointing")
+        if status == "terminal":
+            message["terminal"] = _terminal_message(session)
+            return message
+        if status == "gone" or (status == "failed" and not self._unanswered()):
+            return message
+        # a transient acknowledgement failure still checkpoints: the
+        # checkpointed acknowledgement decides
+        message["command"] = {
+            "command_id": command_id,
+            "kind": str(raw.get("kind") or "checkpoint"),
+            "reason": str(raw.get("reason") or ""),
+            "delivery_count": int(raw.get("delivery_count") or 0),
+        }
+        return message
 
     def _unanswered(self) -> bool:
         """Whether the last failed request of the session got no answer

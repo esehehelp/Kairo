@@ -896,6 +896,9 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 	if err != nil {
 		return nil, env, err
 	}
+	// the stages run where the checkpoint's ran when the program runs in
+	// another snapshot (containerSpec.StreamCWD)
+	stageDir, stageEnv := stagePlace(spec, env)
 	var procs loaderProcs
 	for _, s := range spec.Streams {
 		streams := path.Join(containerRoot, "run", "streams")
@@ -906,7 +909,7 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		ls := s.Spec
 		for i := range ls.Stages {
 			if ls.Stages[i].Dir == "" {
-				ls.Stages[i].Dir = spec.CWD
+				ls.Stages[i].Dir = stageDir
 			}
 		}
 		specPath, sock := path.Join(dir, "spec.json"), path.Join(dir, "socket")
@@ -945,7 +948,7 @@ func startLoaders(spec containerSpec, env []string, logs *os.File) (loaderProcs,
 		if spec.RawRequests != "" {
 			args = append(args, "--raw-requests", spec.RawRequests)
 		}
-		p := &loaderProc{stream: s.Name, args: args, dir: spec.CWD, env: env, logs: logs, as: attemptCredential()}
+		p := &loaderProc{stream: s.Name, args: args, dir: stageDir, env: stageEnv, logs: logs, as: attemptCredential()}
 		if err := p.start(); err != nil {
 			return procs, env, fmt.Errorf("stream %s: start its loader: %w", s.Name, err)
 		}

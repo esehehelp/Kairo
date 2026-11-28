@@ -121,6 +121,12 @@ type ExecutionSpec struct {
 	// continuation goes on from (its streams start where that checkpoint's
 	// payload says). Left out of the digest when empty.
 	InputCheckpointCommand string `json:"input_checkpoint_command,omitempty"`
+	// StreamSnapshot: the code snapshot its streams' stages run in, when not
+	// SourceSnapshot: a continuation run in another snapshot than the one
+	// its checkpoint was made in (task rerun --from-checkpoint --source)
+	// runs its stages where the checkpoint's ran, as they are part of where
+	// its streams stand. Left out of the digest when empty.
+	StreamSnapshot string `json:"stream_snapshot,omitempty"`
 }
 
 type ExecutionRequest struct {

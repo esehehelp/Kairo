@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"kairo/internal/id"
@@ -94,6 +95,80 @@ func (s *Store) RegisterProcess(ctx context.Context, attemptID, leaseID string, 
 		return err
 	}
 	return tx.Commit()
+}
+
+// RequestCheckpoint is a worker asking for a checkpoint of its own attempt
+// (POST /api/worker/checkpoints; the SDK's checkpoint_now): a checkpoint
+// command of origin worker, delivered in the answer, which the worker
+// handles at once as any checkpoint command (AckCommand: with its streams'
+// positions, published, the attempt carrying on). A run that ran to its end
+// publishes its last state so, to be continued from it (task rerun
+// --from-checkpoint, issue #49). An attempt with a checkpoint command in
+// flight gets that one again. Only a running attempt of a checkpointable
+// execution asks: a quiescing one is stopping, a suspend checkpointed.
+func (s *Store) RequestCheckpoint(ctx context.Context, attemptID, leaseID string, epoch int64, reason string) (Command, error) {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return Command{}, err
+	}
+	defer tx.Rollback()
+	if err = validateEpochTx(ctx, tx, attemptID, leaseID, epoch); err != nil {
+		return Command{}, err
+	}
+	var attemptState, leaseState, executionID, projectID string
+	var checkpointable bool
+	if err = tx.QueryRowContext(ctx, `SELECT a.state,l.state,e.id,e.project_scope_id,e.checkpointable FROM attempts a JOIN leases l ON l.id=$1 AND l.attempt_id=a.id
+		JOIN execution_requests e ON e.id=a.execution_id WHERE a.id=$2`, leaseID, attemptID).Scan(&attemptState, &leaseState, &executionID, &projectID, &checkpointable); err != nil {
+		return Command{}, err
+	}
+	if live, pending := workerState(attemptState, leaseState); !live && !pending {
+		return Command{}, ErrStaleEpoch
+	}
+	if attemptState != "running" || leaseState != "active" {
+		return Command{}, taskConflict{fmt.Sprintf("attempt %s is %s (lease %s): only a running attempt asks for a checkpoint", attemptID, attemptState, leaseState)}
+	}
+	if !checkpointable {
+		return Command{}, taskConflict{fmt.Sprintf("execution %s is not checkpointable", executionID)}
+	}
+	var c Command
+	var payload string
+	err = tx.QueryRowContext(ctx, `SELECT id,execution_id,attempt_id,kind,origin,reason,state,delivery_count,created_at,payload_json FROM commands
+		WHERE attempt_id=$1 AND kind='checkpoint' AND state IN('pending','accepted','checkpointing') ORDER BY created_at,id LIMIT 1`, attemptID).
+		Scan(&c.ID, &c.ExecutionID, &c.AttemptID, &c.Kind, &c.Origin, &c.Reason, &c.State, &c.DeliveryCount, &c.CreatedAt, &payload)
+	t := now()
+	switch {
+	case err == nil:
+		c.Payload = json.RawMessage(payload)
+	case errors.Is(err, sql.ErrNoRows):
+		reason = strings.TrimSpace(reason)
+		if reason == "" {
+			reason = "requested by the worker"
+		}
+		if len(reason) > 512 {
+			reason = reason[:512]
+		}
+		c = Command{ID: id.New("cmd"), ExecutionID: executionID, AttemptID: attemptID, Kind: "checkpoint", Origin: "worker", Reason: reason, State: "pending", CreatedAt: t, Payload: json.RawMessage(`{}`)}
+		if _, err = tx.ExecContext(ctx, `INSERT INTO commands(id,execution_id,attempt_id,lease_id,coordination_epoch,kind,origin,reason,state,created_at,updated_at) VALUES($1,$2,$3,$4,$5,'checkpoint','worker',$6,'pending',$7,$8)`,
+			c.ID, executionID, attemptID, leaseID, epoch, reason, t, t); err != nil {
+			return Command{}, err
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "checkpoint_requested", &projectID, "command", c.ID, &epoch, map[string]any{"execution_id": executionID, "attempt_id": attemptID, "lease_id": leaseID, "actor": "worker", "origin": "worker"}); err != nil {
+			return Command{}, err
+		}
+	default:
+		return Command{}, err
+	}
+	// delivered in the answer, as by a poll
+	c.DeliveryCount++
+	if _, err = tx.ExecContext(ctx, `UPDATE commands SET delivery_count=delivery_count+1,updated_at=$1 WHERE id=$2`, t, c.ID); err != nil {
+		return Command{}, err
+	}
+	if n := c.DeliveryCount; n <= deliveryHistory || n%deliveryHistoryEvery == 0 {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO command_deliveries(command_id,attempt_id,coordination_epoch,delivered_at) VALUES($1,$2,$3,$4)`, c.ID, attemptID, epoch, t); err != nil {
+			return Command{}, err
+		}
+	}
+	return c, tx.Commit()
 }
 
 // deliveryHistory is how many deliveries of a command are each recorded in

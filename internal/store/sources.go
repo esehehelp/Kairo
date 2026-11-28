@@ -42,6 +42,10 @@ func launchSourceTx(ctx context.Context, q queryer, executionID string) (*Launch
 	return provenance.LaunchSourceOf(ctx, q, executionID)
 }
 
+func launchStreamSourceTx(ctx context.Context, q queryer, executionID string) (*LaunchSource, error) {
+	return provenance.LaunchStreamSourceOf(ctx, q, executionID)
+}
+
 func taskSourceTx(ctx context.Context, q queryer, taskScopeID string) (string, error) {
 	return provenance.TaskSource(ctx, q, taskScopeID)
 }
@@ -59,11 +63,11 @@ func launchImageTx(ctx context.Context, q queryer, executionID string) (string, 
 }
 
 // SourcesInUse are the snapshots of executions not yet terminal: what runs,
-// or is to run, in them. An executor keeps those unpacked
+// or is to run, in them (their programs, and their streams' stages). An executor keeps those unpacked
 // (executor/source.go); every executor is told all of them, whichever asks,
 // since any of those executions may yet run on it.
 func (s *Store) SourcesInUse(ctx context.Context, _ string) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT source_snapshot_id FROM execution_requests WHERE source_snapshot_id IS NOT NULL AND state<>'terminal' ORDER BY source_snapshot_id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM (SELECT source_snapshot_id AS id FROM execution_requests WHERE state<>'terminal' UNION SELECT stream_snapshot_id FROM execution_requests WHERE state<>'terminal') s WHERE id IS NOT NULL ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}

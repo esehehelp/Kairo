@@ -547,14 +547,20 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	}
 	// and runs what its predecessor ran (a rerun in another snapshot goes on
 	// in that snapshot); one reading streams runs what made its checkpoint
-	// (its stages are part of where its streams stand)
+	// (its stages are part of where its streams stand: they stay where the
+	// checkpoint's ran when a rerun runs the program in another snapshot)
+	stages := ""
 	if len(spec.Streams) > 0 && spec.InputCheckpointCommand != "" {
-		var snapshot, image sql.NullString
-		if err := tx.QueryRowContext(ctx, `SELECT e.source_snapshot_id,e.image_ref FROM commands c JOIN execution_requests e ON e.id=c.execution_id WHERE c.id=$1`,
-			spec.InputCheckpointCommand).Scan(&snapshot, &image); err != nil {
+		var snapshot, streamSnapshot, image sql.NullString
+		if err := tx.QueryRowContext(ctx, `SELECT e.source_snapshot_id,e.stream_snapshot_id,e.image_ref FROM commands c JOIN execution_requests e ON e.id=c.execution_id WHERE c.id=$1`,
+			spec.InputCheckpointCommand).Scan(&snapshot, &streamSnapshot, &image); err != nil {
 			return plannedOrchestrationDecision{}, err
 		}
 		spec.SourceSnapshot, spec.Image = snapshot.String, image.String
+		stages = snapshot.String
+		if streamSnapshot.Valid {
+			stages = streamSnapshot.String
+		}
 	} else if pred, _ := trigger["predecessor_execution_id"].(string); pred != "" && (reason == "continuation" || reason == "loss_continuation") {
 		var snapshot, image sql.NullString
 		if err := tx.QueryRowContext(ctx, `SELECT source_snapshot_id,image_ref FROM execution_requests WHERE id=$1`, pred).Scan(&snapshot, &image); err != nil {
@@ -571,6 +577,9 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	// --source) runs in it; the execution records which
 	if id, _ := trigger["source_snapshot_id"].(string); reason == "rerun" && id != "" {
 		spec.SourceSnapshot = id
+	}
+	if stages != "" && stages != spec.SourceSnapshot {
+		spec.StreamSnapshot = stages
 	}
 	// a rerun ordered to make temporal data again goes on the node that lacks
 	// it, one from a checkpoint on the node of the checkpoint; so does a

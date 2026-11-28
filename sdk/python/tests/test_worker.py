@@ -502,3 +502,123 @@ def test_distributed_publication_without_an_answer_is_sent_again_before_anything
     published = [body for body in acks(daemon) if body["phase"] == "checkpointed"]
     assert [body["payload"]["continuation_ref"] for body in published] == ["ckpt://5", "ckpt://5"]
     assert daemon.paths("GET").count("/api/worker/commands") == 1
+
+
+# --------------------------------------------------------------------------
+# checkpoint_now (issue #49: a run that ran to its end publishes its last state)
+
+WORKER_CHECKPOINT = (201, {"command": {"id": "cmd_w", "kind": "checkpoint", "origin": "worker",
+                                       "reason": "after the last step", "delivery_count": 1}})
+REFUSED = (409, {"error": "execution exe_w is not checkpointable", "code": "conflict"})
+
+
+class _Stream:
+    name, world = "mix", 1
+
+    def __init__(self, record: int) -> None:
+        self.position = {"rank": 0, "record": record, "sub": 0}
+
+
+def test_checkpoint_now_publishes_with_the_streams_and_carries_on():
+    routes = worker_routes({"POST /api/worker/checkpoints": WORKER_CHECKPOINT,
+                            "POST /api/worker/commands/cmd_w/acks": OK})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+        seen = []
+        published = session.checkpoint_now(checkpoint=lambda c: seen.append(c) or "/kairo/output/last.pt",
+                                           streams=[_Stream(42)], reason="after the last step")
+    assert published is True
+    assert not session.suspend_handled
+    assert [(c.command_id, c.kind) for c in seen] == [("cmd_w", "checkpoint")]
+    asked = [r.body for r in daemon.requests if r.path == "/api/worker/checkpoints"]
+    assert asked == [{"reason": "after the last step"}]
+    assert [body["phase"] for body in acks(daemon)] == ["accepted", "checkpointing", "checkpointed"]
+    assert acks(daemon)[-1]["payload"] == {
+        "continuation_ref": "/kairo/output/last.pt",
+        "streams": {"mix": {"world": 1, "order": runtime.ORDER_VERSION, "positions": [{"rank": 0, "record": 42, "sub": 0}]}},
+    }
+    assert "/api/worker/commands" not in daemon.paths("GET")
+
+
+def test_checkpoint_now_refused_publishes_nothing():
+    routes = worker_routes({"POST /api/worker/checkpoints": REFUSED})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+        assert session.checkpoint_now(checkpoint=lambda _c: pytest.fail("no checkpoint")) is False
+    assert isinstance(session.last_control_error, KairoAPIError)
+    assert acks(daemon) == []
+
+
+def test_checkpoint_now_waits_for_kairo_and_publishes_once(monkeypatch):
+    monkeypatch.setattr(runtime.time, "sleep", lambda _s: None)
+    routes = worker_routes({"POST /api/worker/checkpoints": [UNAVAILABLE, WORKER_CHECKPOINT],
+                            "POST /api/worker/commands/cmd_w/acks": [OK, OK, UNAVAILABLE, OK]})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+        session.publication_retry_delays = ()
+        calls = []
+        assert session.checkpoint_now(checkpoint=lambda c: calls.append(c) or "ckpt://last") is True
+    assert len(calls) == 1
+    published = [body for body in acks(daemon) if body["phase"] == "checkpointed"]
+    assert [body["payload"]["continuation_ref"] for body in published] == ["ckpt://last", "ckpt://last"]
+    assert session._pending_publication is None
+
+
+def test_checkpoint_now_gives_up_once_kairo_stays_unavailable(monkeypatch):
+    monkeypatch.setattr(runtime.time, "sleep", lambda _s: None)
+    routes = worker_routes({"POST /api/worker/checkpoints": UNAVAILABLE})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+        assert session.checkpoint_now(checkpoint=lambda _c: pytest.fail("no checkpoint"), wait_seconds=0) is False
+    assert session.last_control_error is not None
+
+
+def test_checkpoint_now_with_a_failing_callback_is_rejected():
+    routes = worker_routes({"POST /api/worker/checkpoints": WORKER_CHECKPOINT,
+                            "POST /api/worker/commands/cmd_w/acks": OK})
+    with serve(FakeDaemon(routes)) as daemon:
+        session = session_for(daemon.url)
+
+        def checkpoint(_command):
+            raise OSError("disk full")
+
+        assert session.checkpoint_now(checkpoint=checkpoint) is False
+    assert [body["phase"] for body in acks(daemon)] == ["accepted", "checkpointing", "rejected"]
+    assert isinstance(session.last_checkpoint_error, OSError)
+
+
+def test_adapter_checkpoint_now_publishes_every_ranks_streams(single_process):
+    routes = worker_routes({"POST /api/worker/checkpoints": WORKER_CHECKPOINT,
+                            "POST /api/worker/commands/cmd_w/acks": OK})
+    with serve(FakeDaemon(routes)) as daemon:
+        adapter = DistributedAdapter(session_for(daemon.url))
+        assert adapter.checkpoint_now(lambda _c: SuspendResult("ckpt://last", {"step": 10000}), streams=[_Stream(7)]) is True
+        adapter.close()
+    assert [body["phase"] for body in acks(daemon)] == ["accepted", "checkpointing", "checkpointed"]
+    assert acks(daemon)[-1]["payload"] == {
+        "continuation_ref": "ckpt://last", "step": 10000,
+        "streams": {"mix": {"world": 1, "order": runtime.ORDER_VERSION, "positions": [{"rank": 0, "record": 7, "sub": 0}]}},
+    }
+    assert not adapter.session.suspend_handled
+
+
+def test_adapter_checkpoint_now_refused_publishes_nothing(single_process):
+    routes = worker_routes({"POST /api/worker/checkpoints": REFUSED})
+    with serve(FakeDaemon(routes)) as daemon:
+        adapter = DistributedAdapter(session_for(daemon.url))
+        assert adapter.checkpoint_now(lambda _c: pytest.fail("no checkpoint")) is False
+        adapter.close()
+    assert acks(daemon) == []
+
+
+def test_adapter_checkpoint_now_sends_an_unanswered_publication_again(single_process, monkeypatch):
+    monkeypatch.setattr(runtime.time, "sleep", lambda _s: None)
+    routes = worker_routes({"POST /api/worker/checkpoints": WORKER_CHECKPOINT,
+                            "POST /api/worker/commands/cmd_w/acks": [OK, OK, UNAVAILABLE, OK]})
+    with serve(FakeDaemon(routes)) as daemon:
+        adapter = DistributedAdapter(session_for(daemon.url))
+        assert adapter.checkpoint_now(lambda _c: "ckpt://last") is True
+        adapter.close()
+    published = [body for body in acks(daemon) if body["phase"] == "checkpointed"]
+    assert len(published) == 2
+    assert adapter._pending_publication is None

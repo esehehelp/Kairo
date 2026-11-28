@@ -177,7 +177,11 @@ func (s *Store) CancelTask(ctx context.Context, project, name, actor string, dry
 // transitive dependent blocked only because a dependency did not succeed goes
 // back to pending too (the planner blocks it again if another dependency is
 // still unsuccessful). A repeated request ID is answered with the first
-// answer and reruns nothing.
+// answer and reruns nothing. A succeeded task is rerun only from a
+// checkpoint it published (RerunOptions.FromCheckpoint: a run that ran to
+// its end goes on from its last state, issue #49), and only while no task
+// depending on it has an execution on its way (it would read the
+// continuation's run as the task's latest).
 func (s *Store) RerunTask(ctx context.Context, project, name, actor, requestID string) (RerunResult, error) {
 	return s.RerunTaskWith(ctx, project, name, actor, requestID, RerunOptions{})
 }
@@ -188,7 +192,9 @@ type RerunOptions struct {
 	// or the id of the command acknowledged checkpointed with it): the
 	// rerun's execution is a continuation of that checkpoint's reference, on
 	// the node of the attempt that published it (a path there), as after a
-	// checkpointed suspend (issue #18). Not for a gang.
+	// checkpointed suspend (issue #18). Not for a gang. With Source, the
+	// program runs in that snapshot and a stream's stages where the
+	// checkpoint's ran (orchestration.go).
 	FromCheckpoint string
 	// Source: run in another snapshot of the task's source than the one it
 	// was declared with: "current", the one the project's latest apply sent
@@ -223,8 +229,31 @@ func (s *Store) RerunTaskWith(ctx context.Context, project, name, actor, request
 	}
 	switch task.state {
 	case "failed", "stopped", "cancelled", "blocked":
+	case "succeeded":
+		// a run that ran to its end goes on from its last checkpoint
+		// (published by checkpoint_now, issue #49); it is not run again
+		if strings.TrimSpace(opts.FromCheckpoint) == "" {
+			return RerunResult{}, taskConflict{fmt.Sprintf("task %s succeeded; it is continued from a checkpoint it published (--from-checkpoint), not run again", name)}
+		}
+		// a task reading its output reads its latest run, which the
+		// continuation is: none may be on its way meanwhile
+		var dependent, execution, state string
+		err = tx.QueryRowContext(ctx, `SELECT t.name,COALESCE(e.id,''),COALESCE(e.state,'') FROM orchestration_task_dependencies d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id
+			LEFT JOIN execution_requests e ON e.task_scope_id=t.task_scope_id AND e.state<>'terminal'
+			WHERE d.dependency_task_scope_id=$1 AND (e.id IS NOT NULL OR EXISTS(SELECT 1 FROM orchestration_decisions o WHERE o.task_scope_id=t.task_scope_id AND o.state='planned'))
+			ORDER BY t.name,e.submitted_at,e.id LIMIT 1`, task.scopeID).Scan(&dependent, &execution, &state)
+		if err == nil {
+			what := "an execution is planned for it"
+			if execution != "" {
+				what = fmt.Sprintf("its execution %s is not terminal (%s)", execution, state)
+			}
+			return RerunResult{}, taskConflict{fmt.Sprintf("task %s depends on %s and %s: %s is continued once that ended", dependent, name, what, name)}
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return RerunResult{}, err
+		}
 	default:
-		return RerunResult{}, taskConflict{fmt.Sprintf("task %s is %s; only failed, stopped, cancelled or blocked tasks can be rerun", name, task.state)}
+		return RerunResult{}, taskConflict{fmt.Sprintf("task %s is %s; only failed, stopped, cancelled or blocked tasks can be rerun, and succeeded ones from a checkpoint", name, task.state)}
 	}
 	live, err := liveTaskExecutionsTx(ctx, tx, task)
 	if err != nil {
@@ -262,10 +291,6 @@ func (s *Store) RerunTaskWith(ctx context.Context, project, name, actor, request
 	// one that makes no execution Kairo runs now is declared again, not rerun
 	if template.Gang != nil {
 		return RerunResult{}, taskConflict{fmt.Sprintf("task %s: %s", name, gangsAreNoMore)}
-	}
-	// a stream goes on from a checkpoint only with the code that made it
-	if len(template.StreamDecls) > 0 && strings.TrimSpace(opts.FromCheckpoint) != "" && strings.TrimSpace(opts.Source) != "" {
-		return RerunResult{}, taskConflict{fmt.Sprintf("task %s reads streams: from a checkpoint, it goes on in the snapshot that made the checkpoint (its stages are part of where its streams stand), not in another", name)}
 	}
 	snapshot, err := rerunSnapshotTx(ctx, tx, task, template, strings.TrimSpace(opts.Source))
 	if err != nil {

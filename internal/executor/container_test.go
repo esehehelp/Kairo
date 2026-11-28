@@ -3,6 +3,7 @@ package executor
 import (
 	"io"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -132,5 +133,41 @@ func TestTheAttemptUserIsNamedInTheImage(t *testing.T) {
 		if name != tc.want || passwd != tc.wantPasswd || group != tc.wantGroup {
 			t.Errorf("%s: %q %q %q", tc.name, name, passwd, group)
 		}
+	}
+}
+
+// A continuation run in newer code than its checkpoint was made in runs its
+// streams' stages where the checkpoint's ran (issue #49): that snapshot is
+// handed to it besides its own, and its loaders run there with it as their
+// source; otherwise they run with the argv.
+func TestStreamStagesRunWhereTheCheckpointsRan(t *testing.T) {
+	program, stages := &store.LaunchSource{ID: "src_new"}, &store.LaunchSource{ID: "src_old"}
+	streams := []store.LaunchStream{{Name: "mix"}}
+	for _, c := range []struct {
+		launch store.Launch
+		want   *store.LaunchSource
+	}{
+		{store.Launch{Source: program, StreamSource: stages, Streams: streams}, stages},
+		{store.Launch{StreamSource: stages, Streams: streams}, stages},
+		{store.Launch{Source: program, StreamSource: &store.LaunchSource{ID: "src_new"}, Streams: streams}, nil},
+		{store.Launch{Source: program, StreamSource: stages}, nil},
+		{store.Launch{Source: program, Streams: streams}, nil},
+	} {
+		if got := streamSourceOf(&c.launch); got != c.want {
+			t.Fatalf("%+v: %+v, want %+v", c.launch, got, c.want)
+		}
+	}
+	env := []string{"KAIRO_SOURCE_DIR=/kairo/src", "KAIRO_SOURCE_ID=src_new", "PATH=/usr/bin"}
+	dir, got := stagePlace(containerSpec{CWD: "/kairo/src/train"}, env)
+	if dir != "/kairo/src/train" || strings.Join(got, " ") != strings.Join(env, " ") {
+		t.Fatalf("with the argv: %s %v", dir, got)
+	}
+	dir, got = stagePlace(containerSpec{CWD: "/kairo/src/train", StreamCWD: "/kairo/stream-src/train", StreamSource: "src_old"}, env)
+	if dir != "/kairo/stream-src/train" || !slices.Contains(got, "KAIRO_SOURCE_DIR=/kairo/stream-src") || !slices.Contains(got, "KAIRO_SOURCE_ID=src_old") ||
+		!slices.Contains(got, "PATH=/usr/bin") || slices.Contains(got, "KAIRO_SOURCE_DIR=/kairo/src") {
+		t.Fatalf("where the checkpoint's ran: %s %v", dir, got)
+	}
+	if env[0] != "KAIRO_SOURCE_DIR=/kairo/src" {
+		t.Fatalf("the argv's environment changed: %v", env)
 	}
 }

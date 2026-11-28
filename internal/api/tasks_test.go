@@ -226,7 +226,7 @@ func TestTaskCancelAndRerunOverTheAPI(t *testing.T) {
 		t.Fatalf("repeated rerun: %d %s, want %s", status, raw, first)
 	}
 	status, raw = d.call(t, http.MethodPost, "/api/projects/example-app/tasks/train/rerun", d.admin, map[string]any{"request_id": "r2"})
-	if e := expectError(t, "rerun of a pending task", status, raw, http.StatusConflict, "task_conflict"); e.Error != "task train is pending; only failed, stopped, cancelled or blocked tasks can be rerun" {
+	if e := expectError(t, "rerun of a pending task", status, raw, http.StatusConflict, "task_conflict"); e.Error != "task train is pending; only failed, stopped, cancelled or blocked tasks can be rerun, and succeeded ones from a checkpoint" {
 		t.Fatalf("rerun conflict: %s", e.Error)
 	}
 	if err := d.store.ReconcileProjectTasks(ctx); err != nil {

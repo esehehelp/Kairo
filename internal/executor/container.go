@@ -47,6 +47,8 @@ import (
 //	/kairo/output           KAIRO_OUTPUT_DIR
 //	/kairo/cache            KAIRO_CACHE_DIR
 //	/kairo/src              KAIRO_SOURCE_DIR, the code snapshot (read-only)
+//	/kairo/stream-src       the snapshot its streams' stages run in, when not
+//	                        /kairo/src's (read-only; their KAIRO_SOURCE_DIR)
 //	/kairo/inputs/<name>    KAIRO_INPUT_<NAME> (read-only)
 //	/kairo/nvidia           the node's NVIDIA driver files, with a GPU (read-only)
 //	/kairo/bench-disk       KAIRO_BENCH_DISK: of a storage bench, a directory
@@ -65,6 +67,9 @@ const (
 	containerStdout  = "/kairo/log/stdout"
 	containerStderr  = "/kairo/log/stderr"
 	containerNVIDIA  = "/kairo/nvidia"
+	// containerStreamSource is where the snapshot of a stream's stages is
+	// when it is not the program's (containerSpec.StreamCWD).
+	containerStreamSource = containerRoot + "/stream-src"
 	// containerShm is the size of the container's /dev/shm (a tmpfs: what
 	// is written there is memory; PyTorch's data loader workers share
 	// batches through it).
@@ -102,12 +107,40 @@ type containerSpec struct {
 	Streams     []store.LaunchStream `json:"streams,omitempty"`
 	RawDir      string               `json:"raw_dir,omitempty"`
 	RawRequests string               `json:"raw_requests,omitempty"`
+	// StreamCWD is the directory the streams' stages run from when not CWD:
+	// in the snapshot StreamSource (/kairo/stream-src), where the stages of
+	// the checkpoint the attempt goes on from ran (store.Launch.StreamSource).
+	StreamCWD    string `json:"stream_cwd,omitempty"`
+	StreamSource string `json:"stream_source,omitempty"`
 	// Runtime is the container's runtime when it matters to the init:
 	// "wslc", whose containers cannot mount (the init does not confine them:
 	// only the ordinary user the argv runs as keeps it off the image's files)
 	// and whose processes the agent cannot reach (the init passes a stop on
 	// to the argv).
 	Runtime string `json:"runtime,omitempty"`
+}
+
+// streamSourceOf is the snapshot launch's streams' stages run in when it is
+// not the one its program runs in (nil when they run in that one): a
+// continuation run in newer code than its checkpoint was made in runs its
+// stages where the checkpoint's ran (store.Launch.StreamSource).
+func streamSourceOf(launch *store.Launch) *store.LaunchSource {
+	s := launch.StreamSource
+	if s == nil || len(launch.Streams) == 0 || (launch.Source != nil && s.ID == launch.Source.ID) {
+		return nil
+	}
+	return s
+}
+
+// stagePlace is the directory and environment the streams' loaders, and
+// their stages, run with: the argv's, or (StreamCWD) the snapshot's where
+// the checkpoint's stages ran, as their KAIRO_SOURCE_DIR and
+// KAIRO_SOURCE_ID.
+func stagePlace(spec containerSpec, env []string) (string, []string) {
+	if spec.StreamCWD == "" {
+		return spec.CWD, env
+	}
+	return spec.StreamCWD, setEnv(setEnv(env, "KAIRO_SOURCE_DIR", containerStreamSource), "KAIRO_SOURCE_ID", spec.StreamSource)
 }
 
 // containerMount is a node path mounted in the container.
@@ -363,6 +396,15 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		}
 	} else if !path.IsAbs(spec.CWD) {
 		return nil, fmt.Errorf("cwd %q is no absolute path in the image", spec.CWD)
+	}
+	if s := streamSourceOf(launch); s != nil {
+		src, err := e.storeWork().ensureSource(context.Background(), s)
+		if err != nil {
+			return nil, fmt.Errorf("code snapshot %s (of its streams' stages): %w", s.ID, err)
+		}
+		spec.Mounts = append(spec.Mounts, containerMount{Source: src, Path: containerStreamSource, ReadOnly: true})
+		spec.StreamCWD = path.Join(containerStreamSource, filepath.ToSlash(launch.CWD))
+		spec.StreamSource = s.ID
 	}
 	// as a confined attempt on a host: temporary files go to the scratch
 	for _, name := range []string{"TMPDIR", "TMP", "TEMP"} {

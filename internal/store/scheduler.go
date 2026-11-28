@@ -66,6 +66,9 @@ type Launch struct {
 	// Source: the code snapshot the attempt runs in (sources.go), CWD
 	// relative to it.
 	Source *LaunchSource `json:"source,omitempty"`
+	// StreamSource: the code snapshot its streams' stages run in, CWD
+	// relative to it, when not Source (ExecutionSpec.StreamSnapshot).
+	StreamSource *LaunchSource `json:"stream_source,omitempty"`
 	// Image: the container image the attempt runs in, pinned by digest
 	// (images.go).
 	Image string `json:"image,omitempty"`
@@ -699,6 +702,9 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		if launch.Source, err = launchSourceTx(ctx, tx, executionID); err != nil {
 			return nil, err
 		}
+		if launch.StreamSource, err = launchStreamSourceTx(ctx, tx, executionID); err != nil {
+			return nil, err
+		}
 		if launch.Image, err = launchImageTx(ctx, tx, executionID); err != nil {
 			return nil, err
 		}
@@ -772,6 +778,10 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 	if err != nil {
 		return nil, err
 	}
+	streamSource, err := launchStreamSourceTx(ctx, tx, executionID)
+	if err != nil {
+		return nil, err
+	}
 	image, err := launchImageTx(ctx, tx, executionID)
 	if err != nil {
 		return nil, err
@@ -808,6 +818,7 @@ func (s *Store) AuthorizeLaunch(ctx context.Context, reservation *Reservation) (
 		Confine:              confine || s.confinesAll(time.Now()),
 		Store:                launchStore,
 		Source:               source,
+		StreamSource:         streamSource,
 		Image:                image,
 		Streams:              streams,
 		BenchDisk:            benchDisk,

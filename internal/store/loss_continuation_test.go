@@ -166,7 +166,7 @@ func TestARerunGoesOnFromACheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	_, err := store.RerunTaskWith(ctx, "orchestrated", "prepare", "tester", "", RerunOptions{FromCheckpoint: "latest"})
-	taskConflictError(t, err, "task prepare is succeeded")
+	taskConflictError(t, err, "task prepare is not a checkpointable single execution")
 	_, err = store.RerunTaskWith(ctx, "orchestrated", "train", "tester", "", RerunOptions{FromCheckpoint: "cmd_not_a_checkpoint"})
 	taskConflictError(t, err, "cmd_not_a_checkpoint is not a checkpoint task train published")
 	out, err := store.RerunTaskWith(ctx, "orchestrated", "train", "tester", "", RerunOptions{FromCheckpoint: "latest"})

@@ -180,8 +180,18 @@ func ListSourceSnapshots(ctx context.Context, q dbtx.Queryer, project string, li
 
 // LaunchSourceOf is the snapshot an execution runs in (nil for none).
 func LaunchSourceOf(ctx context.Context, q dbtx.Queryer, executionID string) (*LaunchSource, error) {
+	return launchSnapshot(ctx, q, executionID, "source_snapshot_id")
+}
+
+// LaunchStreamSourceOf is the snapshot an execution's streams' stages run
+// in when it is not the one its program runs in (nil for that one).
+func LaunchStreamSourceOf(ctx context.Context, q dbtx.Queryer, executionID string) (*LaunchSource, error) {
+	return launchSnapshot(ctx, q, executionID, "stream_snapshot_id")
+}
+
+func launchSnapshot(ctx context.Context, q dbtx.Queryer, executionID, column string) (*LaunchSource, error) {
 	var src LaunchSource
-	err := q.QueryRowContext(ctx, `SELECT s.id,s.pack_bytes,s.pack_sha256,s.list_sha256 FROM execution_requests e JOIN source_snapshots s ON s.id=e.source_snapshot_id WHERE e.id=$1`, executionID).
+	err := q.QueryRowContext(ctx, `SELECT s.id,s.pack_bytes,s.pack_sha256,s.list_sha256 FROM execution_requests e JOIN source_snapshots s ON s.id=e.`+column+` WHERE e.id=$1`, executionID).
 		Scan(&src.ID, &src.PackBytes, &src.PackSHA256, &src.ListSHA256)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
