@@ -34,14 +34,14 @@ func (m *Manager) names() string {
 // returns the device a container joins it by (segmentDevice).
 func (m *Manager) EnsureSegment(ctx context.Context, seg store.FabricSegment) (string, error) {
 	m.mu.Lock()
-	view, address := m.view, m.address
+	view, address, link := m.view, m.address, m.link
 	m.mu.Unlock()
-	if !m.Routing || view.Routing == nil || address == "" || m.link == nil {
+	if !m.Routing || view.Routing == nil || address == "" || link == nil {
 		return "", errors.New("this node carries no segments yet (not on the fabric, or not told to route)")
 	}
 	m.segMu.Lock()
 	defer m.segMu.Unlock()
-	if err := m.link.ensureSegment(ctx, m.names(), seg, address, view.Routing.VXLANPort); err != nil {
+	if err := link.ensureSegment(ctx, m.names(), seg, address, view.Routing.VXLANPort); err != nil {
 		return "", err
 	}
 	if m.launched == nil {
@@ -92,10 +92,13 @@ type router interface {
 
 // Show runs vtysh -c command in this node's FRR.
 func (m *Manager) Show(ctx context.Context, command string) ([]byte, error) {
-	if m.router == nil {
+	m.segMu.Lock()
+	r := m.router
+	m.segMu.Unlock()
+	if r == nil {
 		return nil, fmt.Errorf("no FRR on this node")
 	}
-	return m.router.show(ctx, command)
+	return r.show(ctx, command)
 }
 
 // applyRouting puts the segments of view on this node (taking down those
@@ -110,6 +113,7 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 	}
 	m.segMu.Lock()
 	defer m.segMu.Unlock()
+	link := m.linkOf()
 	want := map[int]bool{}
 	for _, seg := range view.Segments {
 		want[seg.VNI] = true
@@ -121,20 +125,20 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 	}
 	var failed []error
 	for _, seg := range view.Segments {
-		if err := m.link.ensureSegment(ctx, names, seg, view.Address, r.VXLANPort); err != nil {
+		if err := link.ensureSegment(ctx, names, seg, view.Address, r.VXLANPort); err != nil {
 			failed = append(failed, fmt.Errorf("segment %d: %w", seg.VNI, err))
 		}
 	}
 	// VXLAN, BFD and BGP only from the fabric: a frame that did not come
 	// over WireGuard is not a peer's; and nothing the host routes onto it
 	// but to Reach (ingressGuard)
-	if g, ok := m.link.(ingressGuard); ok {
-		if err := g.guardIngress(ctx, names, m.Interface, r.VXLANPort, m.Reach); err != nil {
+	if g, ok := link.(ingressGuard); ok {
+		if err := g.guardIngress(ctx, names, m.Interface, view.Address, r.VXLANPort, m.Reach); err != nil {
 			failed = append(failed, fmt.Errorf("ingress guard: %w", err))
 		}
 	}
 	if m.router == nil {
-		m.router = m.link.router(m.RouterName, m.NodeID, m.KeyFile)
+		m.router = link.router(m.RouterName, m.NodeID, m.KeyFile)
 	}
 	if m.router == nil {
 		return errors.Join(append(failed, fmt.Errorf("FRR cannot run on this node"))...)
@@ -149,7 +153,7 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 // (but, keepLaunched, one put here for a launch lately), none while a
 // container is on it.
 func (m *Manager) removeSegments(ctx context.Context, names string, want map[int]bool, keepLaunched bool) error {
-	have, err := m.link.segments(ctx, names)
+	have, err := m.linkOf().segments(ctx, names)
 	if err != nil {
 		return err
 	}
@@ -161,7 +165,7 @@ func (m *Manager) removeSegments(ctx context.Context, names string, want map[int
 			continue
 		}
 		delete(m.launched, vni)
-		err := m.link.removeSegment(ctx, names, vni)
+		err := m.linkOf().removeSegment(ctx, names, vni)
 		switch {
 		case errors.Is(err, errSegmentInUse):
 			m.logger().Debug("segment kept while a container is on it", "vni", vni)
@@ -175,18 +179,19 @@ func (m *Manager) removeSegments(ctx context.Context, names string, want map[int
 // stopRouting takes FRR and the segments (those no container is on) off a
 // node that does not route.
 func (m *Manager) stopRouting(ctx context.Context, names string) error {
-	if m.link == nil {
+	link := m.currentLink()
+	if link == nil {
 		return nil
 	}
+	m.segMu.Lock()
+	defer m.segMu.Unlock()
 	if m.router == nil && m.RouterName != "" {
-		m.router = m.link.router(m.RouterName, m.NodeID, m.KeyFile)
+		m.router = link.router(m.RouterName, m.NodeID, m.KeyFile)
 	}
 	var err error
 	if m.router != nil {
 		err = m.router.remove(ctx)
 	}
-	m.segMu.Lock()
-	defer m.segMu.Unlock()
 	return errors.Join(err, m.removeSegments(ctx, names, nil, false))
 }
 
@@ -195,7 +200,7 @@ func (m *Manager) stopRouting(ctx context.Context, names string) error {
 // its interfaces), and keeps what the host routes (its containers) off the
 // fabric but for reach (ingressRules).
 type ingressGuard interface {
-	guardIngress(ctx context.Context, names, iface string, vxlanPort int, reach []netip.AddrPort) error
+	guardIngress(ctx context.Context, names, iface, address string, vxlanPort int, reach []netip.AddrPort) error
 }
 
 // frrFiles are /etc/frr for node with view: iBGP in the fabric's ASN over
@@ -247,8 +252,10 @@ func frrFiles(node string, view store.FabricView) map[string]string {
 // ingressRules is the nftables ruleset of a node's fabric, its own table
 // (one per installation: names), replaced whole each time:
 //
-//   - in: the fabric's UDP (VXLAN on vxlanPort, BFD) and BGP only from
-//     iface; a peer's frames come over WireGuard, which says who sent them.
+//   - in: the fabric's UDP (VXLAN on vxlanPort, BFD) and BGP to the node's
+//     fabric address only from iface; a peer's frames come over WireGuard,
+//     which says who sent them. (To its address only: another
+//     installation's fabric on the host keeps its own.)
 //   - routed: nothing onto the fabric nor off it but to reach (the daemon's
 //     API, which a wslc container reaches through its VM) and its replies.
 //     A container's traffic routed (and masqueraded) by its host onto the
@@ -256,8 +263,16 @@ func frrFiles(node string, view store.FabricView) map[string]string {
 //     gang's segment, a BGP session. What the fabric carries for the host
 //     (WireGuard, FRR in its network namespace, the relay, an Incus proxy
 //     to the API) is the host's own, not routed.
-func ingressRules(names, iface string, vxlanPort int, reach []netip.AddrPort) string {
+func ingressRules(names, iface, address string, vxlanPort int, reach []netip.AddrPort) string {
 	table := names + "fabric"
+	to := ""
+	if a, err := netip.ParseAddr(address); err == nil {
+		family := "ip"
+		if a.Is6() && !a.Is4In6() {
+			family = "ip6"
+		}
+		to = fmt.Sprintf("%s daddr %s ", family, a.Unmap())
+	}
 	var allowed strings.Builder
 	for _, a := range reach {
 		family := "ip"
@@ -271,8 +286,8 @@ delete table inet %[1]s
 table inet %[1]s {
 	chain input {
 		type filter hook input priority -10; policy accept;
-		udp dport { %[3]d, 3784, 3785, 4784 } iifname != %[2]q drop
-		tcp dport 179 iifname != %[2]q drop
+		%[5]sudp dport { %[3]d, 3784, 3785, 4784 } iifname != %[2]q drop
+		%[5]stcp dport 179 iifname != %[2]q drop
 	}
 	chain forward {
 		type filter hook forward priority -10; policy accept;
@@ -281,5 +296,5 @@ table inet %[1]s {
 		iifname %[2]q drop
 	}
 }
-`, table, iface, vxlanPort, allowed.String())
+`, table, iface, vxlanPort, allowed.String(), to)
 }

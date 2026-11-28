@@ -453,9 +453,9 @@ func TestANodeSendsASampleWhenItServesNone(t *testing.T) {
 // what its containers may reach (the daemon's API) and its replies, in a
 // table of the installation's own.
 func TestTheIngressGuardKeepsTheFabricsUDPToItsInterface(t *testing.T) {
-	rules := ingressRules("tf", "kairo-t0", 4790, []netip.AddrPort{netip.MustParseAddrPort("10.99.0.1:7474"), netip.MustParseAddrPort("[fd00::1]:443")})
-	for _, want := range []string{"table inet tffabric {}\ndelete table inet tffabric\n", "hook input", `udp dport { 4790, 3784, 3785, 4784 } iifname != "kairo-t0" drop`,
-		`tcp dport 179 iifname != "kairo-t0" drop`, "hook forward", `iifname "kairo-t0" ct state established,related accept`,
+	rules := ingressRules("tf", "kairo-t0", "10.99.0.7", 4790, []netip.AddrPort{netip.MustParseAddrPort("10.99.0.1:7474"), netip.MustParseAddrPort("[fd00::1]:443")})
+	for _, want := range []string{"table inet tffabric {}\ndelete table inet tffabric\n", "hook input", `ip daddr 10.99.0.7 udp dport { 4790, 3784, 3785, 4784 } iifname != "kairo-t0" drop`,
+		`ip daddr 10.99.0.7 tcp dport 179 iifname != "kairo-t0" drop`, "hook forward", `iifname "kairo-t0" ct state established,related accept`,
 		`oifname "kairo-t0" ip daddr 10.99.0.1 tcp dport 7474 accept`, `oifname "kairo-t0" ip6 daddr fd00::1 tcp dport 443 accept`,
 		"\t\toifname \"kairo-t0\" drop\n\t\tiifname \"kairo-t0\" drop\n", "policy accept"} {
 		if !strings.Contains(rules, want) {

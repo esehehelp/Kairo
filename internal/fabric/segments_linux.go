@@ -296,9 +296,9 @@ func (r dockerRouter) show(ctx context.Context, command string) ([]byte, error) 
 }
 
 // guardIngress applies ingressRules with nft (one transaction).
-func (nlLink) guardIngress(ctx context.Context, names, iface string, vxlanPort int, reach []netip.AddrPort) error {
+func (nlLink) guardIngress(ctx context.Context, names, iface, address string, vxlanPort int, reach []netip.AddrPort) error {
 	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(ingressRules(names, iface, vxlanPort, reach))
+	cmd.Stdin = strings.NewReader(ingressRules(names, iface, address, vxlanPort, reach))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nft: %w: %s", err, strings.TrimSpace(string(out)))
 	}

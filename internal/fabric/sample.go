@@ -110,7 +110,7 @@ func (m *Manager) sampleAsked(measure []store.FabricMeasure) {
 		url := "https://" + addr + samplePath
 		go func() {
 			fetch := sampleHTTP
-			if sp, ok := m.link.(sampler); ok {
+			if sp, ok := m.currentLink().(sampler); ok {
 				fetch = sp.sampleFrom
 			}
 			bytes, took, err := fetch(context.Background(), url, s.Send)

@@ -104,6 +104,16 @@ func gangBarrier(g *containerGang, self netip.Addr, logs io.Writer, stop <-chan 
 		return fmt.Errorf("listen on the segment: %w", err)
 	}
 	defer ln.Close()
+	// each member's address on the segment: a hello is a member's only
+	// from it
+	addrs := make([]netip.Addr, len(g.Members))
+	for r, member := range g.Members {
+		p, err := netip.ParsePrefix(member)
+		if err != nil {
+			return fmt.Errorf("member %d address %q: %v", r, member, err)
+		}
+		addrs[r] = p.Addr()
+	}
 	var mu sync.Mutex
 	heard := map[int]bool{}
 	go func() {
@@ -123,7 +133,8 @@ func gangBarrier(g *containerGang, self netip.Addr, logs io.Writer, stop <-chan 
 				if len(f) != 3 || f[0] != "kairo-gang" || f[1] != g.Placement {
 					return
 				}
-				if r, err := strconv.Atoi(f[2]); err == nil && r >= 0 && r < len(g.Members) && r != g.Rank {
+				from, _ := netip.ParseAddrPort(conn.RemoteAddr().String())
+				if r, err := strconv.Atoi(f[2]); err == nil && r >= 0 && r < len(g.Members) && r != g.Rank && from.Addr().Unmap() == addrs[r] {
 					mu.Lock()
 					heard[r] = true
 					mu.Unlock()
@@ -137,28 +148,38 @@ func gangBarrier(g *containerGang, self netip.Addr, logs io.Writer, stop <-chan 
 	deadline := time.Now().Add(limit)
 	nextNote := time.Now().Add(time.Minute)
 	for {
-		for r, member := range g.Members {
+		// every member not reached at once, a few seconds at most: a round
+		// takes no longer with many members, and a stop is seen between
+		// rounds
+		var round sync.WaitGroup
+		var reachedMu sync.Mutex
+		for r := range g.Members {
 			if r == g.Rank || reached[r] {
 				continue
 			}
-			p, err := netip.ParsePrefix(member)
-			if err != nil {
-				return fmt.Errorf("member %d address %q: %v", r, member, err)
-			}
-			conn, err := net.DialTimeout("tcp", net.JoinHostPort(p.Addr().String(), strconv.Itoa(gangBarrierPort)), 2*time.Second)
-			if err != nil {
-				continue
-			}
-			_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-			// reached once it says it heard (a hello written may still be
-			// lost with the connection)
-			if _, err := io.WriteString(conn, gangHello(g.Placement, g.Rank)); err == nil {
-				if ack, err := bufio.NewReader(io.LimitReader(conn, 8)).ReadString('\n'); err == nil && ack == "ok\n" {
-					reached[r] = true
+			round.Add(1)
+			go func() {
+				defer round.Done()
+				// from this member's address: its hello is taken from it only
+				dialer := net.Dialer{Timeout: 2 * time.Second, LocalAddr: &net.TCPAddr{IP: self.AsSlice()}}
+				conn, err := dialer.Dial("tcp", net.JoinHostPort(addrs[r].String(), strconv.Itoa(gangBarrierPort)))
+				if err != nil {
+					return
 				}
-			}
-			conn.Close()
+				defer conn.Close()
+				_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+				// reached once it says it heard (a hello written may still be
+				// lost with the connection)
+				if _, err := io.WriteString(conn, gangHello(g.Placement, g.Rank)); err == nil {
+					if ack, err := bufio.NewReader(io.LimitReader(conn, 8)).ReadString('\n'); err == nil && ack == "ok\n" {
+						reachedMu.Lock()
+						reached[r] = true
+						reachedMu.Unlock()
+					}
+				}
+			}()
 		}
+		round.Wait()
 		mu.Lock()
 		var notReached, notHeard []int
 		for r := range g.Members {

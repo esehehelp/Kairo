@@ -82,3 +82,30 @@ func TestNoImagesKeepsTheDigest(t *testing.T) {
 		t.Fatalf("normalized mentions images: %s", v.Normalized)
 	}
 }
+
+// A gang rank's own cwd is held to the task's rules: in the snapshot, not
+// above it; without a source, an absolute path in the image.
+func TestAGangRanksCWDStaysInItsSnapshot(t *testing.T) {
+	gang := `[tasks.execution.gang]
+size = 2
+[[tasks.execution.gang.ranks]]
+rank = 1
+cwd = %q
+`
+	for cwd, want := range map[string]string{"../outside": "must be a directory of the snapshot", "/etc": "must be a directory of the snapshot", "sub/../..": "must be a directory of the snapshot", "sub/dir": ""} {
+		m := strings.Replace(imageManifest, "argv = [", "cwd = \".\"\nargv = [", 1) + strings.Replace(gang, "%q", `"`+cwd+`"`, 1)
+		v, err := Parse([]byte(m))
+		switch {
+		case want == "" && err != nil:
+			t.Fatalf("cwd %s: %v", cwd, err)
+		case want == "" && v.Manifest.Tasks[0].Execution.Gang.Ranks[0].CWD != "sub/dir":
+			t.Fatalf("cwd %s: %+v", cwd, v.Manifest.Tasks[0].Execution.Gang.Ranks[0])
+		case want != "" && (err == nil || !strings.Contains(err.Error(), want)):
+			t.Fatalf("cwd %s: %v", cwd, err)
+		}
+	}
+	noSource := strings.Replace(imageManifest, "source = \"code\"\n", "cwd = \"/app\"\n", 1) + strings.Replace(gang, "%q", `"relative"`, 1)
+	if _, err := Parse([]byte(noSource)); err == nil || !strings.Contains(err.Error(), "must be an absolute path in the image") {
+		t.Fatalf("a relative rank cwd without a source: %v", err)
+	}
+}

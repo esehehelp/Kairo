@@ -260,6 +260,23 @@ func (m *Manager) Once(ctx context.Context) error {
 	return m.apply(ctx, view)
 }
 
+// linkOf is the node's link, made at its first use; currentLink is it, nil
+// before (the sync's goroutine makes it, others read it: m.mu).
+func (m *Manager) linkOf() link {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.link == nil {
+		m.link = newLink()
+	}
+	return m.link
+}
+
+func (m *Manager) currentLink() link {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.link
+}
+
 // apply puts view on the interface: its address, then its peers.
 func (m *Manager) apply(ctx context.Context, view store.FabricView) error {
 	p, err := store.ParseFabricPrefix(view.Prefix)
@@ -278,10 +295,7 @@ func (m *Manager) apply(ctx context.Context, view store.FabricView) error {
 			m.logger().Info("fabric address given", "address", view.Address, "prefix", view.Prefix)
 		}
 	}
-	if m.link == nil {
-		m.link = newLink()
-	}
-	if err := m.link.ensure(ctx, m.Interface, view.Address, p.Bits(), m.KeyFile, m.ListenPort); err != nil {
+	if err := m.linkOf().ensure(ctx, m.Interface, view.Address, p.Bits(), m.KeyFile, m.ListenPort); err != nil {
 		return fmt.Errorf("fabric interface %s: %w", m.Interface, err)
 	}
 	if err := m.setPeers(ctx, view.Peers); err != nil {
@@ -316,7 +330,8 @@ func endpointsOf(peer store.FabricNode) []string {
 // setPeers puts peers on the interface, each at the endpoint tried now, and
 // takes off those no longer peers.
 func (m *Manager) setPeers(ctx context.Context, peers []store.FabricNode) error {
-	current, err := m.link.peers(ctx, m.Interface)
+	link := m.linkOf()
+	current, err := link.peers(ctx, m.Interface)
 	if err != nil {
 		return err
 	}
@@ -349,13 +364,13 @@ func (m *Manager) setPeers(ctx context.Context, peers []store.FabricNode) error 
 			endpoint = endpoints[st.endpoint%len(endpoints)]
 		}
 		m.mu.Unlock()
-		if err := m.link.setPeer(ctx, m.Interface, peer.PublicKey, peer.Address, endpoint); err != nil {
+		if err := link.setPeer(ctx, m.Interface, peer.PublicKey, peer.Address, endpoint); err != nil {
 			return err
 		}
 	}
 	for key := range current {
 		if !want[key] {
-			if err := m.link.removePeer(ctx, m.Interface, key); err != nil {
+			if err := link.removePeer(ctx, m.Interface, key); err != nil {
 				return err
 			}
 			m.mu.Lock()
@@ -418,10 +433,11 @@ func probe(ctx context.Context, addr string) *float64 {
 // reached at, its latest handshake, the round trip to it) and what it
 // received from them since it last said.
 func (m *Manager) report(ctx context.Context) error {
-	if m.Report == nil || m.link == nil {
+	link := m.currentLink()
+	if m.Report == nil || link == nil {
 		return nil
 	}
-	current, err := m.link.peers(ctx, m.Interface)
+	current, err := link.peers(ctx, m.Interface)
 	if err != nil {
 		return err
 	}
@@ -442,7 +458,7 @@ func (m *Manager) report(ctx context.Context) error {
 		}
 		if p.ProbePort > 0 && !seen.handshake.IsZero() {
 			addr := net.JoinHostPort(p.Address, fmt.Sprint(p.ProbePort))
-			if pr, ok := m.link.(prober); ok {
+			if pr, ok := link.(prober); ok {
 				peer.RTTMillis = pr.probeFrom(ctx, addr)
 			} else {
 				peer.RTTMillis = probe(ctx, addr)

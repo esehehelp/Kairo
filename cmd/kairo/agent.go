@@ -96,15 +96,23 @@ func agentCommand(args []string) error {
 		}
 		registered = append(registered, agentclient.Provider{ID: p.ID, Kind: p.Kind})
 	}
+	// this installation's containers (another's on this host are none of its);
+	// checked before anything is made with the prefix (FRR's container)
+	if cfg.ContainerPrefix != "" {
+		if err := executor.ValidContainerPrefix(cfg.ContainerPrefix); err != nil {
+			return err
+		}
+		executor.ContainerPrefix = cfg.ContainerPrefix
+	}
 	// The fabric (issue #47): the node's fixed address there, known from a
 	// run before (or from the daemon now, once the node is known to it),
 	// names its transfer endpoint unless [packs] addr says otherwise.
 	var fab *fabric.Manager
 	packAddr := cfg.Packs.Addr
+	// off the fabric (first start, every peer moved): the daemon at its
+	// bootstrap address
+	var bootstrap *agentclient.Client
 	if cfg.Fabric.Enabled {
-		// off the fabric (first start, every peer moved): the daemon at its
-		// bootstrap address
-		var bootstrap *agentclient.Client
 		if cfg.Fabric.BootstrapURL != "" {
 			bootstrap = agentclient.New(cfg.Fabric.BootstrapURL, cfg.Token, tlsConfig)
 		}
@@ -192,6 +200,21 @@ func agentCommand(args []string) error {
 	// after the agent.
 	for delay := time.Second; ; delay = min(2*delay, 30*time.Second) {
 		stale, kept, regErr := client.RegisterAdopting(ctx, node, executors, registered, executor.Adopted(records))
+		if regErr != nil && bootstrap != nil {
+			// not reached at server_url: off the fabric, which its first
+			// start cannot join before the daemon knows the node (its sync
+			// is refused until it registers); registered at the bootstrap
+			// address, it joins, and goes on at server_url
+			if s, k, err := bootstrap.RegisterAdopting(ctx, node, executors, registered, executor.Adopted(records)); err == nil {
+				logger.Info("registered at the fabric's bootstrap address", "server_url_error", regErr)
+				stale, kept, regErr = s, k, nil
+				if fab != nil {
+					if err := fab.Once(ctx); err != nil {
+						logger.Warn("fabric not set up after registration (set up later)", "error", err)
+					}
+				}
+			}
+		}
 		adopted = kept
 		if regErr == nil {
 			for id, n := range stale {
@@ -225,13 +248,6 @@ func agentCommand(args []string) error {
 	// Packs are fetched from other agents over HTTPS (HTTP/1.1), trusting the
 	// daemon's CA (executor.PackHTTPClient).
 	packClient := executor.PackHTTPClient(tlsConfig)
-	// this installation's containers (another's on this host are none of its)
-	if cfg.ContainerPrefix != "" {
-		if err := executor.ValidContainerPrefix(cfg.ContainerPrefix); err != nil {
-			return err
-		}
-		executor.ContainerPrefix = cfg.ContainerPrefix
-	}
 	var running []*executor.Local
 	for _, configured := range cfg.Executors {
 		if configured.Enabled != nil && !*configured.Enabled {

@@ -389,6 +389,27 @@ func Normalize(manifest Manifest) (Validated, error) {
 			}
 			task.Execution.CWD = cwd
 		}
+		// a rank's own cwd is held to the task's rules: a directory of the
+		// snapshot (relative, not above it), or without a source an
+		// absolute path in the image
+		if g := task.Execution.Gang; g != nil {
+			for j := range g.Ranks {
+				r := &g.Ranks[j]
+				if strings.TrimSpace(r.CWD) == "" {
+					continue
+				}
+				switch {
+				case task.Execution.Source != "":
+					cwd := path.Clean(strings.ReplaceAll(strings.TrimSpace(r.CWD), `\`, "/"))
+					if cwd == ".." || strings.HasPrefix(cwd, "../") || path.IsAbs(cwd) || strings.Contains(cwd, ":") {
+						return Validated{}, fmt.Errorf("task %q rank %d runs in source %q: its cwd %q must be a directory of the snapshot (relative)", task.Name, r.Rank, task.Execution.Source, r.CWD)
+					}
+					r.CWD = cwd
+				case task.Execution.Image != "" && !path.IsAbs(strings.TrimSpace(r.CWD)):
+					return Validated{}, fmt.Errorf("task %q rank %d runs in image %q without a source: its cwd %q must be an absolute path in the image", task.Name, r.Rank, task.Execution.Image, r.CWD)
+				}
+			}
+		}
 		task.Name = strings.TrimSpace(task.Name)
 		task.Queue = strings.TrimSpace(task.Queue)
 		task.Policy = strings.TrimSpace(task.Policy)

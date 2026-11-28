@@ -132,3 +132,27 @@ func TestAnInterfaceIsGivenItsAddressOverNetlink(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A hello is a member's only from that member's address: one saying it is
+// member 1 from another address is not member 1's.
+func TestGangBarrierTakesAHelloOnlyFromItsMember(t *testing.T) {
+	members := gangMembers(2)
+	self := netip.MustParsePrefix(members[0]).Addr()
+	done := make(chan error, 1)
+	go func() {
+		g := &containerGang{Members: members, Rank: 0, Placement: "gpl_1", Address: members[0]}
+		done <- gangBarrier(g, self, io.Discard, nil, 3*time.Second)
+	}()
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); time.Sleep(50 * time.Millisecond) {
+		dialer := net.Dialer{Timeout: time.Second, LocalAddr: &net.TCPAddr{IP: net.IPv4(127, 0, 0, 77)}}
+		conn, err := dialer.Dial("tcp", net.JoinHostPort(self.String(), strconv.Itoa(gangBarrierPort)))
+		if err != nil {
+			continue
+		}
+		io.WriteString(conn, gangHello("gpl_1", 1))
+		conn.Close()
+	}
+	if err := <-done; err == nil || !strings.Contains(err.Error(), "members 1 not heard from") {
+		t.Fatalf("a hello from another address: %v", err)
+	}
+}

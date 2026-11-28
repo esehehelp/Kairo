@@ -24,6 +24,7 @@
 #   KAIRO_TEST_ROOTFS=STORAGE:GB    (default local-lvm:8)
 #   KAIRO_TEST_FABRIC_PREFIX=a.b.c.d/n  the test fabric's network (issue #47; none: no fabric)
 #   KAIRO_TEST_FABRIC_PORT=N            the test agents' WireGuard port (default 51821)
+#   KAIRO_TEST_VXLAN_PORT=N             the test fabric's VXLAN port (default 4790: a production fabric's is 4789)
 #   KAIRO_TEST_BRIDGE=BRIDGE        (default vmbr0)
 # What the CLI needs (CA, operator token) is kept in <kairo config>/test/; the CA's key stays there and never goes to
 # the container.
@@ -38,8 +39,11 @@ tpve() { ssh -n -o BatchMode=yes "$KAIRO_TEST_PVE_HOST" "$1"; }
 inside() { tpve "pct exec $KAIRO_TEST_VMID -- bash -c $(printf '%q' "$1")"; }
 # push LOCAL PATH: a file into the test container
 push() {
-  scp -q -o BatchMode=yes "$1" "$KAIRO_TEST_PVE_HOST:/tmp/kairo-test-push"
-  tpve "pct push $KAIRO_TEST_VMID /tmp/kairo-test-push $2 && rm /tmp/kairo-test-push"
+  # through a directory of its own on the Proxmox host (a key passes this way)
+  local d
+  d=$(tpve "mktemp -d")
+  scp -q -o BatchMode=yes "$1" "$KAIRO_TEST_PVE_HOST:$d/f"
+  tpve "pct push $KAIRO_TEST_VMID $d/f $2; s=\$?; rm -rf $d; exit \$s"
 }
 address() { inside "hostname -I | awk '{print \$1}'"; }
 
@@ -92,7 +96,8 @@ labels = { site = "test" }
 confine_from = "$(date -Iseconds)"
 CONFIG
   if [ -n "${KAIRO_TEST_FABRIC_PREFIX:-}" ]; then
-    printf '\n[fabric]\nprefix = "%s"\n' "$KAIRO_TEST_FABRIC_PREFIX"
+    # VXLAN off the port a production fabric uses (4789) on the same hosts
+    printf '\n[fabric]\nprefix = "%s"\nvxlan_port = %s\n' "$KAIRO_TEST_FABRIC_PREFIX" "${KAIRO_TEST_VXLAN_PORT:-4790}"
   fi
 }
 
