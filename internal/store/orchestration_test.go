@@ -243,3 +243,92 @@ func TestTaskDeclarationIsImmutable(t *testing.T) {
 		t.Fatalf("changed task declaration error=%v", err)
 	}
 }
+
+// What is wrong with one task stays with it: a task whose execution its
+// submission would refuse (a RAM and its streams' memory adding up past what
+// is counted) is blocked with why when planned, and a plan made before plans
+// were checked so is abandoned, its task blocked; a statement refused while
+// one task is planned undoes that task's plan only. The tasks of another
+// project are planned and submitted in the same pass.
+func TestAnInvalidTaskIsBlockedNotThePass(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	for _, project := range []string{"orchestrated", "planned-before", "refused", "other"} {
+		m := strings.ReplaceAll(orchestrationManifest(), `name = "orchestrated"`, `name = "`+project+`"`)
+		if _, err := store.ApplyProject(ctx, projectSpec(t, m)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	scope := func(project, task string) string {
+		t.Helper()
+		var id string
+		if err := store.db.QueryRow(`SELECT t.task_scope_id FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id WHERE p.external_key=$1 AND t.name=$2`, project, task).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	// orchestrated's prepare: its RAM and a stream's memory past int64
+	if _, err := store.testExec(`UPDATE orchestration_tasks SET execution_template_json=jsonb_set(jsonb_set(execution_template_json::jsonb,'{capacity,ram_bytes}','9223372036854000000'),
+		'{stream_decls}','[{"name":"mix","stream":{"memory_bytes":1073741824},"files":{}}]')::text WHERE task_scope_id=$1`, scope("orchestrated", "prepare")); err != nil {
+		t.Fatal(err)
+	}
+	// planned-before's prepare: a plan of negative RAM, planned before
+	// plans were checked
+	if _, err := store.testExec(`INSERT INTO orchestration_decisions(decision_key,task_scope_id,execution_ordinal,reason,trigger_json,execution_spec_json,state,created_at)
+		VALUES('bad-plan',$1,0,'initial','{}',$2,'planned','2026-11-28T00:00:00Z')`, scope("planned-before", "prepare"),
+		`{"client_request_id":"bad-plan","scope":{"project":"planned-before","queue":"data","task":"prepare"},"argv":["python","prepare.py"],"cwd":"/work","executor_selector":{"labels":{"environment":"wsl2"}},"capacity":{"cpu_millis":0,"ram_bytes":-1073741824,"strength":"","disks":null}}`); err != nil {
+		t.Fatal(err)
+	}
+	// refused's prepare: the database refuses its plan
+	for _, query := range []string{
+		`CREATE FUNCTION refuse_plan() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'refused for the test'; END; $$`,
+		`CREATE TRIGGER refuse_plan BEFORE INSERT ON orchestration_decisions FOR EACH ROW WHEN (NEW.task_scope_id='` + scope("refused", "prepare") + `') EXECUTE FUNCTION refuse_plan()`,
+	} {
+		if _, err := store.testExec(query); err != nil {
+			t.Fatal(err)
+		}
+	}
+	err := store.ReconcileProjectTasks(ctx)
+	if err == nil || !strings.Contains(err.Error(), "refused/prepare") || !strings.Contains(err.Error(), "refused for the test") || strings.Contains(err.Error(), "orchestrated") || strings.Contains(err.Error(), "planned-before") {
+		t.Fatalf("the pass: %v", err)
+	}
+	status := func(project string) map[string]TaskStatus {
+		t.Helper()
+		got, err := store.GetProjectStatus(ctx, project)
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]TaskStatus{}
+		for _, task := range got.Tasks {
+			out[task.Name] = task
+		}
+		return out
+	}
+	if p := status("orchestrated")["prepare"]; p.State != "blocked" || !strings.Contains(string(p.Result), "add up past what is counted") || len(p.Executions) != 0 {
+		t.Fatalf("the task of too much RAM: %+v", p)
+	}
+	if p := status("planned-before")["prepare"]; p.State != "blocked" || !strings.Contains(string(p.Result), "capacity cannot be negative") || len(p.Executions) != 0 {
+		t.Fatalf("the task planned before: %+v", p)
+	}
+	var state string
+	if err := store.db.QueryRow(`SELECT state FROM orchestration_decisions WHERE decision_key='bad-plan'`).Scan(&state); err != nil || state != "abandoned" {
+		t.Fatalf("the plan made before: %s %v", state, err)
+	}
+	if p := status("refused")["prepare"]; p.State != "pending" || len(p.Executions) != 0 {
+		t.Fatalf("the task the database refused: %+v", p)
+	}
+	if p := status("other")["prepare"]; p.State != "running" || len(p.Executions) != 1 {
+		t.Fatalf("the other project's task: %+v", p)
+	}
+	// blocked, the too-big task is not met again by the next pass
+	if _, err := store.testExec(`DROP TRIGGER refuse_plan ON orchestration_decisions`); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileProjectTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if p := status("refused")["prepare"]; p.State != "running" || len(p.Executions) != 1 {
+		t.Fatalf("the task the database refused, once it does not: %+v", p)
+	}
+}

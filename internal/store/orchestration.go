@@ -70,7 +70,19 @@ type plannedOrchestrationDecision struct {
 	Ordinal     int
 	Reason      string
 	Spec        ExecutionSpec
+	// unreadable: the stored execution of the decision could not be read
+	unreadable error
 }
+
+// invalidDecision: a planned execution its submission refuses, whatever the
+// time (planned before plans were checked as their submission checks them,
+// or stored unreadable).
+type invalidDecision struct{ err error }
+
+func (e invalidDecision) Error() string {
+	return "the planned execution is not valid: " + e.err.Error()
+}
+func (e invalidDecision) Unwrap() error { return e.err }
 
 type currentTaskExecution struct {
 	Ordinal         int
@@ -245,26 +257,36 @@ func applyProjectTx(ctx context.Context, tx *sql.Tx, spec orchestration.Validate
 	return applied, nil
 }
 
+// ReconcileProjectTasks plans the executions of project tasks and submits
+// them, then orders what the data around executions needs (input fetches,
+// output landings, regenerations). Each step runs whatever another met, and
+// each planned execution is submitted on its own: a failure (the database
+// away a moment) is named and met again by the next pass, not left to stop
+// the rest; what is wrong with one task blocks that task (planProjectTask,
+// submitOrchestrationDecision).
 func (s *Store) ReconcileProjectTasks(ctx context.Context) error {
+	var errs []error
 	if err := s.planProjectTasks(ctx); err != nil {
-		return err
+		errs = append(errs, fmt.Errorf("planning tasks: %w", err))
 	}
 	decisions, err := s.pendingOrchestrationDecisions(ctx)
 	if err != nil {
-		return err
+		errs = append(errs, fmt.Errorf("reading planned executions: %w", err))
 	}
 	for _, decision := range decisions {
 		if err := s.submitOrchestrationDecision(ctx, decision); err != nil {
-			return err
+			errs = append(errs, fmt.Errorf("submitting decision %s: %w", decision.DecisionKey, err))
 		}
 	}
-	if err := s.orderInputFetches(ctx); err != nil {
-		return err
+	for _, step := range []struct {
+		name string
+		run  func(context.Context) error
+	}{{"ordering input fetches", s.orderInputFetches}, {"reconciling output landings", s.reconcileOutputLandings}, {"ordering regenerations", s.orderRegenerations}} {
+		if err := step.run(ctx); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", step.name, err))
+		}
 	}
-	if err := s.reconcileOutputLandings(ctx); err != nil {
-		return err
-	}
-	return s.orderRegenerations(ctx)
+	return errors.Join(errs...)
 }
 
 func (s *Store) planProjectTasks(ctx context.Context) error {
@@ -290,166 +312,193 @@ func (s *Store) planProjectTasks(ctx context.Context) error {
 	if err := rows.Close(); err != nil {
 		return err
 	}
+	// each task on its own: what fails one (a statement refused) is undone
+	// to before it and named, and the pass plans the others
+	var failed []error
 	for _, task := range tasks {
-		if task.policyID != "RunToCompletion" || task.policyVersion != 1 {
-			return fmt.Errorf("unsupported journaled policy %s@v%d", task.policyID, task.policyVersion)
+		if _, err := tx.ExecContext(ctx, `SAVEPOINT plan_task`); err != nil {
+			return err
 		}
-		ready, blocked, err := taskDependenciesReady(ctx, tx, task.taskScopeID)
+		err := planProjectTask(ctx, tx, task)
 		if err != nil {
-			return err
-		}
-		if blocked {
-			if err := updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]string{"reason": "dependency did not succeed"}); err != nil {
-				return err
+			if _, undo := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT plan_task`); undo != nil {
+				return errors.Join(err, undo)
 			}
-			continue
+			failed = append(failed, fmt.Errorf("task %s/%s: %w", task.project, task.name, err))
 		}
-		if !ready {
-			continue
-		}
-		current, err := loadCurrentTaskExecution(ctx, tx, task.taskScopeID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		// A rerun runs the declaration again from an ordinal past every earlier
-		// execution, which is never read as the task's outcome again.
-		if task.rerunOrdinal != nil && (err != nil || current.Ordinal < *task.rerunOrdinal) {
-			trigger, continuation, err := rerunTriggerTx(ctx, tx, task.taskScopeID, *task.rerunOrdinal)
-			if err != nil {
-				return err
-			}
-			if err := planOrBlock(ctx, tx, task, *task.rerunOrdinal, "rerun", trigger, continuation); err != nil {
-				return err
-			}
-			continue
-		}
-		if err != nil {
-			if err := planOrBlock(ctx, tx, task, 0, "initial", map[string]any{"dependencies_succeeded": true}, nil); err != nil {
-				return err
-			}
-			continue
-		}
-		if current.ExecutionState != "terminal" {
-			if err := updateTaskState(ctx, tx, task.taskScopeID, "running", nil); err != nil {
-				return err
-			}
-			continue
-		}
-		// A forced pause ended this execution: the task
-		// is stopped once nothing of it holds resources. No continuation or
-		// restart is planned, whatever the exit or checkpoint.
-		stopped, err := forceStoppedTx(ctx, tx, current.ExecutionID)
-		if err != nil {
-			return err
-		}
-		if stopped != nil && (current.AttemptState == nil || *current.AttemptState != "lost") {
-			if (current.AttemptID == nil || (current.AttemptState != nil && *current.AttemptState == "quiesced")) && (current.LeaseState == nil || *current.LeaseState == "released") {
-				if err := updateTaskState(ctx, tx, task.taskScopeID, "stopped", stopped); err != nil {
-					return err
-				}
-			}
-			continue
-		}
-		// Withdrawn before it started by an execution withdraw: the task was
-		// cancelled, it did not fail. (A task cancel sets the state itself.)
-		if current.AttemptID == nil && current.TerminalCause != nil && *current.TerminalCause == "withdrawn_before_start" {
-			if err := updateTaskState(ctx, tx, task.taskScopeID, "cancelled", map[string]any{"reason": "withdrawn before start", "execution_id": current.ExecutionID}); err != nil {
-				return err
-			}
-			continue
-		}
-		if current.AttemptID == nil {
-			if err := updateTaskState(ctx, tx, task.taskScopeID, "failed", map[string]any{"reason": "execution terminal before attempt", "execution_id": current.ExecutionID, "terminal_cause": current.TerminalCause}); err != nil {
-				return err
-			}
-			continue
-		}
-		// A lost attempt of a task declared continue_after_loss: once nothing of
-		// it can run any more (its lease released: by the daemon after a reboot
-		// or a launch cut short, or by kairo resource reconcile), the task goes
-		// on from its latest published checkpoint, on the node that published
-		// it (the reference is a path there); with none it is blocked as any.
-		if current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" {
-			var template orchestration.Execution
-			if err := json.Unmarshal([]byte(task.template), &template); err != nil {
-				return err
-			}
-			if template.ContinueAfterLoss {
-				if (current.AttemptState != nil && *current.AttemptState == "lost") || (current.LeaseState != nil && *current.LeaseState != "released") {
-					if err := updateTaskState(ctx, tx, task.taskScopeID, "running", map[string]any{"reason": "attempt identity lost: goes on from its latest checkpoint once its lease is released", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
-						return err
-					}
-					continue
-				}
-				checkpoint, found, err := taskCheckpointTx(ctx, tx, task.taskScopeID, "")
-				if err != nil {
-					return err
-				}
-				if found {
-					trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "attempt_lost", "command_id": checkpoint.commandID, "continuation_ref": checkpoint.ref, "node": checkpoint.node}
-					if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "loss_continuation", trigger, &checkpoint.ref); err != nil {
-						return err
-					}
-					continue
-				}
-				if err := updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "attempt identity lost; no checkpoint to continue from", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
-					return err
-				}
-				continue
-			}
-		}
-		// lost, or lost and reconciled before this pass saw it (no exit then)
-		if (current.AttemptState != nil && *current.AttemptState == "lost") || (current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" && current.ExitCode == nil) {
-			if err := updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "attempt identity lost", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
-				return err
-			}
-			continue
-		}
-		if current.AttemptState == nil || *current.AttemptState != "quiesced" || current.LeaseState == nil || *current.LeaseState != "released" {
-			continue
-		}
-		succeeded := current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "")
-		// A node quarantine terminated this attempt (it could not checkpoint):
-		// run the task again from the start instead of failing it.
-		terminated, err := quarantineTerminatedTx(ctx, tx, *current.AttemptID)
-		if err != nil {
-			return err
-		}
-		if terminated && !succeeded {
-			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "node_quarantine"}
-			if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, nil); err != nil {
-				return err
-			}
-			continue
-		}
-		commandID, commandOrigin, commandState, err := latestAttemptCommand(ctx, tx, *current.AttemptID)
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
-			return err
-		}
-		if err == nil && commandState == "checkpointed" && current.ContinuationRef != nil {
-			trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "command_id": commandID, "origin": commandOrigin, "continuation_ref": *current.ContinuationRef}
-			if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "continuation", trigger, current.ContinuationRef); err != nil {
-				return err
-			}
-			continue
-		}
-		if current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "") {
-			if err := updateTaskState(ctx, tx, task.taskScopeID, "succeeded", map[string]any{"reason": "exit zero", "execution_id": current.ExecutionID, "attempt_id": *current.AttemptID}); err != nil {
-				return err
-			}
-			continue
-		}
-		if err == nil {
-			if err := updateTaskState(ctx, tx, task.taskScopeID, "failed", map[string]any{"reason": "suspend did not publish a continuation", "execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "command_id": commandID, "origin": commandOrigin, "command_state": commandState}); err != nil {
-				return err
-			}
-			continue
-		}
-		if err := updateTaskState(ctx, tx, task.taskScopeID, "failed", map[string]any{"reason": "nonzero or signaled exit", "execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "exit_code": current.ExitCode, "exit_signal": current.ExitSignal}); err != nil {
+		if _, err := tx.ExecContext(ctx, `RELEASE SAVEPOINT plan_task`); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	return errors.Join(failed...)
+}
+
+// planProjectTask is the pass of planProjectTasks over one task: its state
+// from its dependencies and its current execution, and its next execution
+// planned when one is due. What is wrong with the task itself (its
+// declaration makes no execution Kairo runs) blocks it, with why.
+func planProjectTask(ctx context.Context, tx *sql.Tx, task orchestrationTaskRow) error {
+	if task.policyID != "RunToCompletion" || task.policyVersion != 1 {
+		return updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": fmt.Sprintf("unsupported journaled policy %s@v%d", task.policyID, task.policyVersion)})
+	}
+	ready, blocked, err := taskDependenciesReady(ctx, tx, task.taskScopeID)
+	if err != nil {
+		return err
+	}
+	if blocked {
+		if err := updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]string{"reason": "dependency did not succeed"}); err != nil {
+			return err
+		}
+		return nil
+	}
+	if !ready {
+		return nil
+	}
+	current, err := loadCurrentTaskExecution(ctx, tx, task.taskScopeID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	// A rerun runs the declaration again from an ordinal past every earlier
+	// execution, which is never read as the task's outcome again.
+	if task.rerunOrdinal != nil && (err != nil || current.Ordinal < *task.rerunOrdinal) {
+		trigger, continuation, err := rerunTriggerTx(ctx, tx, task.taskScopeID, *task.rerunOrdinal)
+		if err != nil {
+			return err
+		}
+		if err := planOrBlock(ctx, tx, task, *task.rerunOrdinal, "rerun", trigger, continuation); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err != nil {
+		if err := planOrBlock(ctx, tx, task, 0, "initial", map[string]any{"dependencies_succeeded": true}, nil); err != nil {
+			return err
+		}
+		return nil
+	}
+	if current.ExecutionState != "terminal" {
+		if err := updateTaskState(ctx, tx, task.taskScopeID, "running", nil); err != nil {
+			return err
+		}
+		return nil
+	}
+	// A forced pause ended this execution: the task
+	// is stopped once nothing of it holds resources. No continuation or
+	// restart is planned, whatever the exit or checkpoint.
+	stopped, err := forceStoppedTx(ctx, tx, current.ExecutionID)
+	if err != nil {
+		return err
+	}
+	if stopped != nil && (current.AttemptState == nil || *current.AttemptState != "lost") {
+		if (current.AttemptID == nil || (current.AttemptState != nil && *current.AttemptState == "quiesced")) && (current.LeaseState == nil || *current.LeaseState == "released") {
+			if err := updateTaskState(ctx, tx, task.taskScopeID, "stopped", stopped); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// Withdrawn before it started by an execution withdraw: the task was
+	// cancelled, it did not fail. (A task cancel sets the state itself.)
+	if current.AttemptID == nil && current.TerminalCause != nil && *current.TerminalCause == "withdrawn_before_start" {
+		if err := updateTaskState(ctx, tx, task.taskScopeID, "cancelled", map[string]any{"reason": "withdrawn before start", "execution_id": current.ExecutionID}); err != nil {
+			return err
+		}
+		return nil
+	}
+	if current.AttemptID == nil {
+		if err := updateTaskState(ctx, tx, task.taskScopeID, "failed", map[string]any{"reason": "execution terminal before attempt", "execution_id": current.ExecutionID, "terminal_cause": current.TerminalCause}); err != nil {
+			return err
+		}
+		return nil
+	}
+	// A lost attempt of a task declared continue_after_loss: once nothing of
+	// it can run any more (its lease released: by the daemon after a reboot
+	// or a launch cut short, or by kairo resource reconcile), the task goes
+	// on from its latest published checkpoint, on the node that published
+	// it (the reference is a path there); with none it is blocked as any.
+	if current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" {
+		var template orchestration.Execution
+		if err := json.Unmarshal([]byte(task.template), &template); err != nil {
+			return updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "the task's stored execution cannot be read: " + err.Error()})
+		}
+		if template.ContinueAfterLoss {
+			if (current.AttemptState != nil && *current.AttemptState == "lost") || (current.LeaseState != nil && *current.LeaseState != "released") {
+				if err := updateTaskState(ctx, tx, task.taskScopeID, "running", map[string]any{"reason": "attempt identity lost: goes on from its latest checkpoint once its lease is released", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
+					return err
+				}
+				return nil
+			}
+			checkpoint, found, err := taskCheckpointTx(ctx, tx, task.taskScopeID, "")
+			if err != nil {
+				return err
+			}
+			if found {
+				trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "attempt_lost", "command_id": checkpoint.commandID, "continuation_ref": checkpoint.ref, "node": checkpoint.node}
+				if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "loss_continuation", trigger, &checkpoint.ref); err != nil {
+					return err
+				}
+				return nil
+			}
+			if err := updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "attempt identity lost; no checkpoint to continue from", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+	// lost, or lost and reconciled before this pass saw it (no exit then)
+	if (current.AttemptState != nil && *current.AttemptState == "lost") || (current.TerminalCause != nil && *current.TerminalCause == "executor_identity_lost" && current.ExitCode == nil) {
+		if err := updateTaskState(ctx, tx, task.taskScopeID, "blocked", map[string]any{"reason": "attempt identity lost", "execution_id": current.ExecutionID, "attempt_id": current.AttemptID}); err != nil {
+			return err
+		}
+		return nil
+	}
+	if current.AttemptState == nil || *current.AttemptState != "quiesced" || current.LeaseState == nil || *current.LeaseState != "released" {
+		return nil
+	}
+	succeeded := current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "")
+	// A node quarantine terminated this attempt (it could not checkpoint):
+	// run the task again from the start instead of failing it.
+	terminated, err := quarantineTerminatedTx(ctx, tx, *current.AttemptID)
+	if err != nil {
+		return err
+	}
+	if terminated && !succeeded {
+		trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "origin": "node_quarantine"}
+		if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "quarantine_restart", trigger, nil); err != nil {
+			return err
+		}
+		return nil
+	}
+	commandID, commandOrigin, commandState, err := latestAttemptCommand(ctx, tx, *current.AttemptID)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if err == nil && commandState == "checkpointed" && current.ContinuationRef != nil {
+		trigger := map[string]any{"predecessor_execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "command_id": commandID, "origin": commandOrigin, "continuation_ref": *current.ContinuationRef}
+		if err := planOrBlock(ctx, tx, task, current.Ordinal+1, "continuation", trigger, current.ContinuationRef); err != nil {
+			return err
+		}
+		return nil
+	}
+	if current.ExitCode != nil && *current.ExitCode == 0 && (current.ExitSignal == nil || *current.ExitSignal == "") {
+		if err := updateTaskState(ctx, tx, task.taskScopeID, "succeeded", map[string]any{"reason": "exit zero", "execution_id": current.ExecutionID, "attempt_id": *current.AttemptID}); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err == nil {
+		if err := updateTaskState(ctx, tx, task.taskScopeID, "failed", map[string]any{"reason": "suspend did not publish a continuation", "execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "command_id": commandID, "origin": commandOrigin, "command_state": commandState}); err != nil {
+			return err
+		}
+		return nil
+	}
+	if err := updateTaskState(ctx, tx, task.taskScopeID, "failed", map[string]any{"reason": "nonzero or signaled exit", "execution_id": current.ExecutionID, "attempt_id": *current.AttemptID, "exit_code": current.ExitCode, "exit_signal": current.ExitSignal}); err != nil {
+		return err
+	}
+	return nil
 }
 
 func taskDependenciesReady(ctx context.Context, tx *sql.Tx, taskScopeID string) (bool, bool, error) {
@@ -529,7 +578,7 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	decisionKey := orchestrationDecisionKey(task.taskScopeID, ordinal, reason, string(triggerBody))
 	var template orchestration.Execution
 	if err := json.Unmarshal([]byte(task.template), &template); err != nil {
-		return plannedOrchestrationDecision{}, err
+		return plannedOrchestrationDecision{}, unrunnableTask{"the task's stored execution cannot be read: " + err.Error()}
 	}
 	spec, err := taskExecutionSpec(ScopePath{Project: task.project, Queue: task.queue, Task: task.name}, template, orchestrationClientRequestID(decisionKey), continuation)
 	if err != nil {
@@ -624,6 +673,11 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 	if err = pinInputNodeTx(ctx, tx, task.project, &spec); err != nil {
 		return plannedOrchestrationDecision{}, err
 	}
+	// checked as its submission will check it: a plan that can never be
+	// submitted is not made (the task is blocked with why)
+	if _, _, _, err = normalizeExecutionSpec(spec); err != nil {
+		return plannedOrchestrationDecision{}, unrunnableTask{"the task's execution is not valid: " + err.Error()}
+	}
 	specBody, err := json.Marshal(spec)
 	if err != nil {
 		return plannedOrchestrationDecision{}, err
@@ -633,8 +687,10 @@ func planTaskExecutionDecision(ctx context.Context, tx *sql.Tx, task orchestrati
 }
 
 // unrunnableTask: a task's declaration makes no execution Kairo runs now
-// (a gang, declared before gangs were gone). The orchestration pass blocks
-// such a task with the reason; a rerun of it is refused.
+// (a gang, declared before gangs were gone; an execution its submission
+// would refuse, whatever the time: a RAM past what is counted, a stored
+// declaration that cannot be read). The orchestration pass blocks such a
+// task with the reason; a rerun of it is refused.
 type unrunnableTask struct{ reason string }
 
 func (e unrunnableTask) Error() string { return e.reason }
@@ -685,9 +741,11 @@ func taskExecutionSpec(scope ScopePath, template orchestration.Execution, client
 		Streams:              template.StreamDecls,
 	}
 	// what each stream's loader holds is the task's too
-	for _, s := range template.StreamDecls {
-		spec.Capacity.RAMBytes += s.Stream.MemoryBytes
+	ram, err := template.RAMWithStreams()
+	if err != nil {
+		return ExecutionSpec{}, unrunnableTask{"the task's execution is not valid: " + err.Error()}
 	}
+	spec.Capacity.RAMBytes = ram
 	// A continuation goes on from where its run was suspended: it started
 	// long ago, so a start_by says nothing of it.
 	if continuation == nil {
@@ -710,7 +768,7 @@ func (s *Store) pendingOrchestrationDecisions(ctx context.Context) ([]plannedOrc
 			return nil, err
 		}
 		if err := json.Unmarshal([]byte(body), &value.Spec); err != nil {
-			return nil, err
+			value.unreadable = err
 		}
 		values = append(values, value)
 	}
@@ -721,26 +779,53 @@ func (s *Store) pendingOrchestrationDecisions(ctx context.Context) ([]plannedOrc
 // records it as the task's, in one transaction that first checks the decision
 // is still planned: a decision a cancel or rerun abandoned after it was read is
 // never submitted, and a cancel committed after the submission finds the
-// execution live and withdraws it.
+// execution live and withdraws it. One its submission refuses whatever the
+// time (invalidDecision) is abandoned instead, and its task blocked with why:
+// it is not met again by every pass.
 func (s *Store) submitOrchestrationDecision(ctx context.Context, decision plannedOrchestrationDecision) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
-	if _, _, err = submitOrchestrationDecisionTx(ctx, tx, decision); err != nil {
+	_, _, err = submitOrchestrationDecisionTx(ctx, tx, decision)
+	var invalid invalidDecision
+	if errors.As(err, &invalid) {
+		err = abandonInvalidDecisionTx(ctx, tx, decision, invalid)
+	}
+	if err != nil {
 		return err
 	}
 	return tx.Commit()
+}
+
+// abandonInvalidDecisionTx abandons a planned decision that cannot be
+// submitted and blocks its task with why, if it is still planned and its
+// task not cancelled.
+func abandonInvalidDecisionTx(ctx context.Context, tx *sql.Tx, decision plannedOrchestrationDecision, invalid invalidDecision) error {
+	var state, taskState string
+	if err := tx.QueryRowContext(ctx, `SELECT d.state,t.state FROM orchestration_decisions d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.decision_key=$1`, decision.DecisionKey).Scan(&state, &taskState); err != nil {
+		return err
+	}
+	if state != "planned" || taskState == "cancelled" {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE orchestration_decisions SET state='abandoned' WHERE decision_key=$1 AND state='planned'`, decision.DecisionKey); err != nil {
+		return err
+	}
+	return updateTaskState(ctx, tx, decision.TaskScopeID, "blocked", map[string]any{"reason": invalid.Error(), "decision_key": decision.DecisionKey})
 }
 
 // submitOrchestrationDecisionTx is submitOrchestrationDecision within tx: the
 // execution as submitted and its id ("" when the decision is no longer to be
 // submitted).
 func submitOrchestrationDecisionTx(ctx context.Context, tx *sql.Tx, decision plannedOrchestrationDecision) (ExecutionSpec, string, error) {
+	if decision.unreadable != nil {
+		return ExecutionSpec{}, "", invalidDecision{decision.unreadable}
+	}
 	spec, _, digest, err := normalizeExecutionSpec(decision.Spec)
 	if err != nil {
-		return spec, "", err
+		return spec, "", invalidDecision{err}
 	}
 	var state, taskState string
 	if err = tx.QueryRowContext(ctx, `SELECT d.state,t.state FROM orchestration_decisions d JOIN orchestration_tasks t ON t.task_scope_id=d.task_scope_id WHERE d.decision_key=$1`, decision.DecisionKey).Scan(&state, &taskState); err != nil {

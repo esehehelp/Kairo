@@ -3,6 +3,7 @@ package orchestration
 import (
 	"fmt"
 	"kairo/internal/loader"
+	"math"
 	"net/url"
 	"path"
 	"regexp"
@@ -271,6 +272,23 @@ func normalizeStreams(m *Manifest) error {
 			ex.StreamDecls = append(ex.StreamDecls, decl)
 		}
 		ex.Streams = names
+		if _, err := ex.RAMWithStreams(); err != nil {
+			return fmt.Errorf("task %q: %w", m.Tasks[i].Name, err)
+		}
 	}
 	return nil
+}
+
+// RAMWithStreams is the RAM an execution of e holds: its capacity's and what
+// each stream's loader holds (memory_bytes). Declared and planned alike, a sum
+// past what is counted is refused, not taken as negative RAM.
+func (e Execution) RAMWithStreams() (int64, error) {
+	total := e.Capacity.RAMBytes
+	for _, d := range e.StreamDecls {
+		if d.Stream.MemoryBytes < 0 || total < 0 || d.Stream.MemoryBytes > math.MaxInt64-total {
+			return 0, fmt.Errorf("its ram_bytes %d and its streams' memory_bytes add up past what is counted", e.Capacity.RAMBytes)
+		}
+		total += d.Stream.MemoryBytes
+	}
+	return total, nil
 }

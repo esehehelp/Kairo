@@ -12,11 +12,12 @@ import (
 )
 
 // A durable store below its reserve sheds copies of objects that have good
-// copies on two other nodes, the biggest first, until the shortfall is
+// copies on two other hosts, the biggest first, until the shortfall is
 // covered; what it shed counts until the next report (no round sheds the
 // same shortfall again); a copy that would leave fewer is kept, and its
-// claim refused: copies on two stores of one node are one node's, and a
-// record of a copy at a root its store no longer declares is none.
+// claim refused: copies on two stores of one node are one node's, copies on
+// two nodes of one declared host are that host's, and a record of a copy at
+// a root its store no longer declares is none.
 func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 	reserve, packBytes := 2*shedMinShort+1000, 2*shedMinShort+200
 	store := openCoordinationStore(t)
@@ -204,4 +205,19 @@ func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 		t.Fatal(err)
 	}
 	checkReplicas("obj_1,obj_4,obj_5")
+	// obj_2 has copies on e and f: on two hosts while node-e and node-f are
+	// undeclared (each its own), on one once a host holds both
+	observe(reserve - shedMinShort - 50)
+	if shed = shedOrders(); len(shed) != 1 || shed[0].ObjectID != "obj_2" {
+		t.Fatalf("shed with copies on two hosts: %+v", shed)
+	}
+	if _, err := store.testExec(`INSERT INTO machine_hosts(id,declaration_json,declared_at) VALUES('host-ef','{"id":"host-ef","nodes":["node-e","node-f"]}','2026-11-28T00:00:00Z')`); err != nil {
+		t.Fatal(err)
+	}
+	if shed = shedOrders(); len(shed) != 0 {
+		t.Fatalf("shed leaving copies on one host: %+v", shed)
+	}
+	if err := store.ClaimShed(ctx, "durable-exec", "obj_2", "c-durable"); !errors.Is(err, ErrShedRefused) || !strings.Contains(err.Error(), "hosts") {
+		t.Fatalf("a copy of obj_2 leaving one other host was claimed: %v", err)
+	}
 }

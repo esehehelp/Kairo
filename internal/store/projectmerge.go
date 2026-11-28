@@ -151,7 +151,9 @@ func (s *Store) MergeProject(ctx context.Context, req MergeRequest) (MergeResult
 	// each declaration under the new names, its own and those it names (its
 	// dependencies, its task inputs: an input names the task's latest run by
 	// name, which would be INTO's task of the old name), so that declaring
-	// it so again is the same task (its digest is its declaration's)
+	// it so again is the same task (its digest is its declaration's); and
+	// the execution its runs are planned from (execution_template_json: what
+	// a rerun or a continuation submits), as the apply stores it
 	for _, t := range tasks {
 		if len(out.Renamed) == 0 {
 			break
@@ -186,8 +188,13 @@ func (s *Store) MergeProject(ctx context.Context, req MergeRequest) (MergeResult
 		if err != nil {
 			return out, err
 		}
+		template, err := json.Marshal(declared.Execution)
+		if err != nil {
+			return out, err
+		}
 		sum := sha256.Sum256(spec)
-		if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET name=$1,spec_json=$2,spec_digest=$3 WHERE task_scope_id=$4`, declared.Name, string(spec), hex.EncodeToString(sum[:]), t.scope); err != nil {
+		if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET name=$1,spec_json=$2,spec_digest=$3,execution_template_json=$4 WHERE task_scope_id=$5`,
+			declared.Name, string(spec), hex.EncodeToString(sum[:]), string(template), t.scope); err != nil {
 			return out, err
 		}
 		if declared.Name != t.name {

@@ -76,6 +76,7 @@ func TestATaskReadsDeclaredStreams(t *testing.T) {
 		{`format = "text.bz2"`, `format = "text", field = "x"`, "a field is of jsonl, csv"},
 		{`image = "py"`, `source = "x"`, "which is no [sources.x]"},
 		{"image = \"py\"\n", "", "runs in the task's container"},
+		{`streams = ["mix"]`, "streams = [\"mix\"]\n[tasks.execution.capacity]\nram_bytes = 9223372036854000000", "add up past what is counted"},
 		{`"https://dumps.example.org/jawiki/20261101/abstract.xml.gz"`, `"https://dumps.example.org/other/jawiki-pages.xml.bz2"`, "two files named"},
 		{`urls = [`, `hf = { repo = "a/b", revision = "0123456789abcdef0123456789abcdef01234567", files = ["*"] }
 urls = [`, "urls or hf"},

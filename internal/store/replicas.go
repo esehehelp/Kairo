@@ -129,30 +129,41 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 }
 
 // durableStoreHostsTx are the durable stores as declared (not being moved)
-// and, in the same order, the host each is on: the declared host whose nodes
-// include the store's node, else the node itself.
+// and, in the same order, the host each is on (nodeHostsTx).
 func durableStoreHostsTx(ctx context.Context, q queryer, declared []machine.Store) (ids, hosts []string, err error) {
-	spec, err := declaredSpec(ctx, q)
+	hostOf, err := nodeHostsTx(ctx, q)
 	if err != nil {
 		return nil, nil, err
-	}
-	hostOf := map[string]string{}
-	for _, h := range spec.Hosts {
-		for _, n := range h.Nodes {
-			hostOf[n] = h.ID
-		}
 	}
 	for _, s := range declared {
 		if s.Class != machine.StoreDurable || s.MovedFrom != "" {
 			continue
 		}
-		host := hostOf[s.Node]
-		if host == "" {
-			host = "node:" + s.Node
-		}
-		ids, hosts = append(ids, s.ID), append(hosts, host)
+		ids, hosts = append(ids, s.ID), append(hosts, hostOf(s.Node))
 	}
 	return ids, hosts, nil
+}
+
+// nodeHostsTx is the host a node is on, as copies are counted (replicas and
+// shedding alike): the declared host whose nodes include it, else the node
+// itself ("node:" and its id).
+func nodeHostsTx(ctx context.Context, q queryer) (func(node string) string, error) {
+	spec, err := declaredSpec(ctx, q)
+	if err != nil {
+		return nil, err
+	}
+	of := map[string]string{}
+	for _, h := range spec.Hosts {
+		for _, n := range h.Nodes {
+			of[n] = h.ID
+		}
+	}
+	return func(node string) string {
+		if host := of[node]; host != "" {
+			return host
+		}
+		return "node:" + node
+	}, nil
 }
 
 // remoteCopyTx is a verified copy of objectID on a durable store as declared

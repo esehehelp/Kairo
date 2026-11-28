@@ -115,7 +115,9 @@ func TestAProjectMergesIntoAnother(t *testing.T) {
 
 // A task renamed by a merge is renamed where the other tasks of its project
 // name it too: their dependencies and task inputs (an input names a task's
-// latest run by name: under the old name it would read INTO's task).
+// latest run by name: under the old name it would read INTO's task), in
+// their declarations and in what their runs are made from: a rerun reads the
+// renamed task.
 func TestAMergeRenamesWhatNamesARenamedTask(t *testing.T) {
 	store := openCoordinationStore(t)
 	setupSchedulerInventory(t, store)
@@ -156,5 +158,30 @@ task = "shared"
 	}
 	if !strings.Contains(body, `"depends_on":["shared-from"]`) || !strings.Contains(body, `"task":"shared-from"`) || strings.Contains(body, `"shared"`) {
 		t.Fatalf("the declaration of uses: %s", body)
+	}
+	// run again, uses reads shared-from, not into's shared
+	if _, err := store.RerunTask(ctx, "into", "shared-from", "tester", "rerun-shared-from"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileProjectTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completeNextOrchestrationExecution(t, store, 0)
+	if _, err := store.RerunTask(ctx, "into", "uses", "tester", "rerun-uses"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ReconcileProjectTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := store.GetTaskDetail(ctx, "into", "uses")
+	if err != nil || len(detail.Executions) == 0 {
+		t.Fatalf("uses was not run again: %+v %v", detail.Executions, err)
+	}
+	var inputs string
+	if err := store.db.QueryRow(`SELECT inputs_json FROM execution_requests WHERE id=$1`, detail.Executions[len(detail.Executions)-1].ExecutionID).Scan(&inputs); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(inputs, `"task":"shared-from"`) || strings.Contains(inputs, `"shared"`) {
+		t.Fatalf("the rerun of uses reads %s", inputs)
 	}
 }
