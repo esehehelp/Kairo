@@ -47,8 +47,8 @@ var lifecycle = map[lifecycleRecord]map[string][]string{
 			SourceDeleted}, // deleted: found gone from its path (InputGone)
 		SourceDeleting: {SourceDeleted, SourceKept},
 		SourceEvicting: {SourceEvicted, SourcePresent},
-		SourceKept:     {SourceDeleted}, // a kept import found gone from its path
-		SourceDeleted:  {SourceKept},    // an import abandoned once its source was found gone
+		SourceKept:     {SourceDeleted, SourcePresent}, // a kept import found gone from its path; released (data_release.go)
+		SourceDeleted:  {SourceKept},                   // an import abandoned once its source was found gone
 		SourceEvicted:  {},
 	},
 	recTransfer: {

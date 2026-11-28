@@ -235,6 +235,7 @@ func init() {
 				{"fetch", "--project P --node N [--data NAME]... [OBJECT...] [--wait [--timeout D]]", "bring data objects to a node; --wait prints their paths once unpacked (exit 2 on timeout)", dataFetch},
 				{"cancel", "OBJECT...", "abandon imports not packed yet (their paths are left as they are)", dataCancel},
 				{"drop", "--project P [--match NAME_PREFIX] [--task-match TASK_PREFIX] [--reason TEXT] [--confirm] [--json] [OBJECT|NAME...]", "data made again or fetched again (a corpus, a mix, raw data): keep only its file list, delete every copy; without --confirm, say what would go", dataDrop},
+				{"release", "[--all] [--confirm] [--json] [OBJECT...]", "sources Kairo kept once copied (an output or scratch holding what its pack does not): delete them, losing that; without --confirm, say what would go", dataRelease},
 			},
 			aliases: map[string]string{"ls": "list", "show": "list", "add": "import"},
 		}},

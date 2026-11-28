@@ -105,6 +105,7 @@ var errorCodes = []struct {
 	{"stream_refused", http.StatusForbidden, store.ErrStreamReportRefused},
 	{"stream_positions", http.StatusConflict, store.ErrStreamPositions},
 	{"fabric", http.StatusConflict, store.ErrFabric},
+	{"release_refused", http.StatusConflict, store.ErrReleaseRefused},
 	{"gate_closed", http.StatusLocked, store.ErrGateClosed},
 	{"observe_only", http.StatusLocked, errObserveOnly},
 }

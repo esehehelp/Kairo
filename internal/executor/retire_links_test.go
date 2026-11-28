@@ -40,6 +40,38 @@ func retireWith(t *testing.T, before, after func(t *testing.T, dir string)) ([]s
 	return fake.settled, dir
 }
 
+// A source an operator released (kept once: its pack and file list are gone)
+// is deleted without being checked against its pack.
+func TestAReleasedSourceIsDeletedWithoutItsPack(t *testing.T) {
+	ctx := context.Background()
+	volatile := filepath.Join(t.TempDir(), "volatile")
+	res := packed(t, volatile)
+	dir := filepath.Join(volatile, outputDirName, "exe_1")
+	if err := removePack(localStoreFS{}, volatile, "obj_1"); err != nil || exists(res.packPath) || exists(res.manifestPath) {
+		t.Fatalf("pack removed: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "late.txt"), []byte("written after it was packed"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fake := &fakeRetire{fakeCopies: newFakeCopies()}
+	var logs bytes.Buffer
+	e := storesExecutor(t, fake, &logs)
+	e.storeWork().stores = []servedStore{{decl: machine.Store{ID: "c-scratch", Class: machine.StoreVolatile, Root: volatile}, fs: localStoreFS{}, usable: true}}
+	order := store.DeletionOrder{ObjectID: "obj_1", Kind: store.ObjectOutput, SourceID: "exe_1", StoreID: "c-scratch", Root: volatile}
+	fake.deletions = []store.DeletionOrder{order}
+	e.storeWork().deleteDue(ctx)
+	if len(fake.settled) != 2 || fake.settled[1].State != store.SourceKept || !exists(dir) {
+		t.Fatalf("not released: settled %+v, want kept (its file list is gone)", fake.settled)
+	}
+	order.Released = true
+	fake.deletions, fake.settled = []store.DeletionOrder{order}, nil
+	e.storeWork().deletions = round{}
+	e.storeWork().deleteDue(ctx)
+	if len(fake.settled) != 2 || fake.settled[1].State != store.SourceDeleted || exists(dir) {
+		t.Fatalf("released: settled %+v (source there: %v)", fake.settled, exists(dir))
+	}
+}
+
 // A symbolic link is packed as one, so a source holding the links it was
 // packed with is deleted once copied; one whose link points elsewhere since
 // is kept.

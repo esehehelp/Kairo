@@ -102,6 +102,74 @@ func dataCancel(args []string) error {
 	return nil
 }
 
+// dataRelease: kairo data release [--all] [--confirm] [--json] [OBJECT...].
+func dataRelease(args []string) error {
+	fs := newFlags("data release")
+	api := apiFlag(fs)
+	all := fs.Bool("all", false, "every kept run output and scratch")
+	confirm := fs.Bool("confirm", false, "release them: without it, nothing changes")
+	asJSON := fs.Bool("json", false, "print the daemon's response")
+	objects, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(objects) == 0 && !*all {
+		return usageError("data release needs the objects, or --all")
+	}
+	client, err := newAPIClient(*api)
+	if err != nil {
+		return err
+	}
+	payload, err := client.call(http.MethodPost, "/api/data/releases", store.ReleaseRequest{Objects: objects, All: *all, Confirm: *confirm})
+	if routeMissing(err) {
+		return fmt.Errorf("the daemon does not release sources: %s", olderDaemonHint())
+	}
+	if err != nil {
+		return err
+	}
+	if *asJSON {
+		_, err = os.Stdout.Write(payload)
+		return err
+	}
+	var body struct {
+		Sources []store.ReleasedSource `json:"sources"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return fmt.Errorf("decode releases: %w", err)
+	}
+	var b strings.Builder
+	w := tabwriter.NewWriter(&b, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "OBJECT\tKIND\tSTORE\tSIZE\tPATH\tKEPT BECAUSE\tSTATE")
+	var bytes int64
+	released, refused := 0, 0
+	for _, s := range body.Sources {
+		state := "to release"
+		switch {
+		case s.Refused != "":
+			state, refused = "not released: "+s.Refused, refused+1
+		case s.Gone && *confirm:
+			state = "settled deleted (its node is retired)"
+		case s.Gone:
+			state = "to settle deleted (its node is retired)"
+		case *confirm:
+			state = "released: its executor deletes it"
+		}
+		if s.Refused == "" {
+			released++
+			bytes += s.Bytes
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", s.ObjectID, s.Kind, s.StoreID, formatSize(s.Bytes), s.Path, strings.TrimPrefix(s.Kept, "not deleted: "), state)
+	}
+	w.Flush()
+	fmt.Print(b.String())
+	if *confirm {
+		fmt.Printf("%d released (%s), %d not\n", released, formatSize(bytes), refused)
+	} else {
+		fmt.Printf("%d to release (%s), %d not; nothing changed: run again with --confirm to release them (what their packs do not hold is lost)\n", released, formatSize(bytes), refused)
+	}
+	return nil
+}
+
 // dataDrop: kairo data drop --project P [--match NAME_PREFIX] [--task-match
 // TASK_PREFIX] [--reason TEXT] [--confirm] [--json] [OBJECT|NAME...].
 func dataDrop(args []string) error {

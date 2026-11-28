@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"kairo/internal/machine"
 )
@@ -38,6 +39,9 @@ type DeletionOrder struct {
 	Root         string `json:"root"`
 	Path         string `json:"path"`
 	DeleteSource bool   `json:"delete_source,omitempty"`
+	// Released: an operator released the source, kept once (kairo data
+	// release): it is removed without being checked against its pack.
+	Released bool `json:"released,omitempty"`
 }
 
 // ObjectDeletion is what an executor did with a source: claimed it
@@ -103,13 +107,15 @@ func (s *Store) DeletionsToMake(ctx context.Context, executorID string) ([]Delet
 		state, nodeID string
 	}
 	var rows []row
-	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,d.delete_source,d.source_state,x.node_id FROM data_objects d JOIN executors x ON x.id=d.executor_id
+	err = eachRow(ctx, tx, `SELECT d.id,d.kind,d.source_id,d.store_id,d.root,d.source_path,d.delete_source,d.source_state,x.node_id,COALESCE(d.source_reason,'') FROM data_objects d JOIN executors x ON x.id=d.executor_id
 		WHERE d.executor_id=$1 AND d.state='packed' AND d.source_state IN('present','deleting')
 		AND EXISTS(SELECT 1 FROM object_copies c WHERE c.object_id=d.id AND c.state='verified') ORDER BY d.packed_at,d.id`, []any{executorID}, func(r *sql.Rows) error {
 		var x row
-		if err := r.Scan(&x.order.ObjectID, &x.order.Kind, &x.order.SourceID, &x.order.StoreID, &x.order.Root, &x.order.Path, &x.order.DeleteSource, &x.state, &x.nodeID); err != nil {
+		var reason string
+		if err := r.Scan(&x.order.ObjectID, &x.order.Kind, &x.order.SourceID, &x.order.StoreID, &x.order.Root, &x.order.Path, &x.order.DeleteSource, &x.state, &x.nodeID, &reason); err != nil {
 			return err
 		}
+		x.order.Released = strings.HasPrefix(reason, releasedPrefix)
 		rows = append(rows, x)
 		return nil
 	})
@@ -222,7 +228,8 @@ func (s *Store) SettleDeletion(ctx context.Context, settled ObjectDeletion) erro
 	if err := checkTransition(recSource, state, settled.State); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET source_state=$1,source_reason=$2,source_deleted_at=$3,updated_at=$4 WHERE id=$5`,
+	// a claim keeps the reason (a released source's, which its order says)
+	if _, err = tx.ExecContext(ctx, `UPDATE data_objects SET source_state=$1,source_reason=CASE WHEN $1='deleting' THEN source_reason ELSE $2 END,source_deleted_at=$3,updated_at=$4 WHERE id=$5`,
 		settled.State, nullable(settled.Reason), deletedAt, t, settled.ObjectID); err != nil {
 		return err
 	}

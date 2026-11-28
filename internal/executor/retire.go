@@ -182,7 +182,11 @@ func (e *storeWorker) deleteDue(ctx context.Context) {
 			e.roundProblem(&e.deletions, o.ObjectID, "source not claimed for deletion", err)
 			continue
 		}
-		err := checkPacked(ctx, s.decl.Root, kind, o.SourceID, o.ObjectID)
+		var err error
+		if !o.Released {
+			// released by an operator: removed without the check
+			err = checkPacked(ctx, s.decl.Root, kind, o.SourceID, o.ObjectID)
+		}
 		if err == nil {
 			err = s.fs.RemoveKind(ctx, s.decl.Root, kind, kindPath(s.fs, s.decl.Root, kind, o.SourceID), o.SourceID, false)
 		}
