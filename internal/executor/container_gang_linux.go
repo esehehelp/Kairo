@@ -240,6 +240,11 @@ func addAddress(index int, p netip.Prefix) error {
 	msg := make([]byte, unix.SizeofIfAddrmsg)
 	msg[0] = unix.AF_INET
 	msg[1] = byte(p.Bits())
+	// a loopback address is the host's (as ip(8) gives it): the kernel
+	// refuses one of a wider scope
+	if p.Addr().IsLoopback() {
+		msg[3] = unix.RT_SCOPE_HOST
+	}
 	binary.NativeEndian.PutUint32(msg[4:], uint32(index))
 	msg = append(msg, rtattr(unix.IFA_LOCAL, a[:])...)
 	msg = append(msg, rtattr(unix.IFA_ADDRESS, a[:])...)
