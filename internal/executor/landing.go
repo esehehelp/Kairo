@@ -115,7 +115,7 @@ func (e *storeWorker) landOne(ctx context.Context, s servedStore, o store.FetchO
 	_ = dir.Remove(packName + partialSuffix)
 	_ = dir.Remove(listName + partialSuffix)
 	if len(skipped) != 0 {
-		e.Logger.Warn("output entries skipped: reserved Windows names", "object_id", o.ObjectID, "run_id", o.RunID, "paths", skipped)
+		e.Logger.Warn("output entries not made: symbolic links, reserved Windows names", "object_id", o.ObjectID, "run_id", o.RunID, "paths", skipped)
 	}
 	e.forgetOutputSize(o.RunID)
 	return made, nil

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"archive/tar"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/klauspost/compress/zstd"
 
 	"kairo/internal/machine"
 	"kairo/internal/store"
@@ -288,7 +291,7 @@ func checkPackedDir(ctx context.Context, root, dir, objectID string) error {
 	if err != nil {
 		return err
 	}
-	return checkAgainstList(ctx, sr, dir, "", listed)
+	return checkAgainstList(ctx, sr, dir, "", listed, func() (map[string]string, error) { return readPackLinks(root, objectID) })
 }
 
 // errOtherFilesystem: an imported directory not on the filesystem of the
@@ -368,7 +371,7 @@ func (e *storeWorker) inUse(kind dirKind, id string) bool {
 }
 
 // errSourceChanged: a source holds what its pack does not (written since it
-// was packed, or left out of it: a link, a special file, a mount point).
+// was packed, or left out of it: a link not packed as one, a mount point).
 var errSourceChanged = errors.New("the source holds what its pack does not")
 
 // packedFile is a file as its pack's file list has it.
@@ -377,10 +380,11 @@ type packedFile struct{ size, mtime int64 }
 // checkPacked checks that deleting the source of kind and id under root
 // loses nothing objectID's pack (in <root>/packs) does not hold: each regular
 // file there is in the pack's file list with the size and mtime it was
-// packed with (stat'ed through its handle, as when it was packed), and
-// nothing else is there but directories (links, special files and mount
-// points were not packed). A listed file gone is no matter (a deletion cut
-// short removed it), nor is a source gone.
+// packed with (stat'ed through its handle, as when it was packed), each
+// symbolic link is in the pack pointing where it points, and nothing else is
+// there but directories and what holds no data (sockets, pipes, devices):
+// mount points and other links were not packed. A listed file gone is no
+// matter (a deletion cut short removed it), nor is a source gone.
 func checkPacked(ctx context.Context, root string, kind dirKind, id, objectID string) error {
 	if !validScratchID(id) || !validScratchID(objectID) {
 		return fmt.Errorf("%w: id %q, object %q", errOutsideRoot, id, objectID)
@@ -414,13 +418,16 @@ func checkPacked(ctx context.Context, root string, kind dirKind, id, objectID st
 	if err != nil {
 		return err
 	}
-	return checkAgainstList(ctx, sr, filepath.Join(root, kind.dir, id), kind.marker, listed)
+	return checkAgainstList(ctx, sr, filepath.Join(root, kind.dir, id), kind.marker, listed, func() (map[string]string, error) { return readPackLinks(root, objectID) })
 }
 
 // checkAgainstList walks the source src (opened as sr) and checks that each
-// regular file there is in listed as packed and nothing else is there but
-// directories (the marker, if any, aside).
-func checkAgainstList(ctx context.Context, sr *os.Root, src, marker string, listed map[string]packedFile) error {
+// regular file there is in listed as packed, each symbolic link in the pack
+// pointing where it does (packLinks reads them, once, when one is found), and
+// nothing else is there but directories and what holds no data (the marker,
+// if any, aside).
+func checkAgainstList(ctx context.Context, sr *os.Root, src, marker string, listed map[string]packedFile, packLinks func() (map[string]string, error)) error {
+	var links map[string]string
 	mounts, err := mountsUnderFn(src)
 	if err != nil {
 		return err
@@ -445,7 +452,18 @@ func checkAgainstList(ctx context.Context, sr *os.Root, src, marker string, list
 			switch {
 			case marker != "" && dir == "." && info.Name() == marker:
 			case isLink(info):
-				return fmt.Errorf("%w: %s is a link (not packed)", errSourceChanged, rel)
+				target, ok := symlinkTarget(sr, rel, info)
+				if !ok {
+					return fmt.Errorf("%w: %s is a link (not packed)", errSourceChanged, rel)
+				}
+				if links == nil {
+					if links, err = packLinks(); err != nil {
+						return err
+					}
+				}
+				if packed, ok := links[rel]; !ok || packed != target {
+					return fmt.Errorf("%w: %s is a link not in its pack as it is", errSourceChanged, rel)
+				}
 			case marker != "" && dir == "." && reservedWindowsPath(rel):
 				// To keep the marker until last, deletion must address this entry by name.
 				return fmt.Errorf("%w: %s is a reserved Windows name (cannot delete through handles)", errSourceChanged, rel)
@@ -475,11 +493,41 @@ func checkAgainstList(ctx context.Context, sr *os.Root, src, marker string, list
 					return fmt.Errorf("%w: %s has changed since it was packed", errSourceChanged, rel)
 				}
 			default:
-				return fmt.Errorf("%w: %s is a special file (not packed)", errSourceChanged, rel)
+				// a socket, pipe or device: it holds no data
 			}
 		}
 	}
 	return nil
+}
+
+// readPackLinks reads the symbolic links in objectID's pack in <root>/packs:
+// where each points, by its path (none, from a pack made before links were
+// packed).
+func readPackLinks(root, objectID string) (map[string]string, error) {
+	f, err := openPackFile(root, objectID+packSuffix)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	zr, err := zstd.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	links := map[string]string{}
+	tr := tar.NewReader(zr)
+	for {
+		h, err := tr.Next()
+		if errors.Is(err, io.EOF) {
+			return links, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		if h.Typeflag == tar.TypeSymlink {
+			links[h.Name] = h.Linkname
+		}
+	}
 }
 
 // readPackList reads the file list name in <root>/packs: each file's size

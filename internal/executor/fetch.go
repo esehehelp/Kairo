@@ -171,7 +171,7 @@ func (e *storeWorker) fetchOne(ctx context.Context, s servedStore, o store.Fetch
 	_ = dir.Remove(packName + partialSuffix)
 	_ = dir.Remove(listName + partialSuffix)
 	if len(skipped) != 0 {
-		e.Logger.Warn("input entries skipped: reserved Windows names", "object_id", o.ObjectID, "paths", skipped)
+		e.Logger.Warn("input entries not made: symbolic links, reserved Windows names", "object_id", o.ObjectID, "paths", skipped)
 	}
 	return made, nil
 }
@@ -200,7 +200,8 @@ func freeOn(ctx context.Context, s servedStore) int64 {
 // executable (0755: whoever the attempt runs as, as it was where it was
 // made); with execBits (a code snapshot), so is one beginning with "#!" (a
 // pack made on Windows has no execute bits). Reserved Windows names
-// os.Root cannot create are checked but not written, and listed in skipped.
+// os.Root cannot create are checked but not written, and symbolic links not
+// made; both are listed in skipped.
 func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string, into *os.Root, execBits bool, skipped *[]string) (int64, error) {
 	listFile, err := dir.Open(listName)
 	if err != nil {
@@ -335,6 +336,10 @@ func unpackChecked(ctx context.Context, dir *os.Root, packName, listName string,
 				return total, err
 			}
 			total += n
+		case tar.TypeSymlink:
+			// a symbolic link the source had: recorded in the pack, never
+			// made where it is unpacked (it could point anywhere)
+			*skipped = append(*skipped, name)
 		default:
 			return total, fmt.Errorf("%w: %s is neither a directory nor a regular file", errInputMismatch, name)
 		}

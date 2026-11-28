@@ -345,7 +345,7 @@ func (e *storeWorker) ensureSource(ctx context.Context, src *store.LaunchSource)
 		return "", err
 	}
 	if len(skipped) != 0 {
-		e.Logger.Warn("code snapshot entries skipped: reserved Windows names", "source_id", src.ID, "paths", skipped)
+		e.Logger.Warn("code snapshot entries not made: symbolic links, reserved Windows names", "source_id", src.ID, "paths", skipped)
 	}
 	e.Logger.Info("code snapshot brought", "source_id", src.ID, "path", final)
 	return final, nil

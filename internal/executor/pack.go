@@ -73,6 +73,8 @@ type packResult struct {
 	packPath, manifestPath  string
 	packBytes, contentBytes int64
 	files, skipped          int64
+	// links: symbolic links packed as links (in the pack, not its file list)
+	links int64
 	// changing: files of an import written all the while they were read,
 	// packed as last read (packLiveFile)
 	changing                 int64
@@ -296,6 +298,20 @@ func packInto(ctx context.Context, r *os.Root, root string, sr *os.Root, src str
 	return res, nil
 }
 
+// symlinkTarget is what the symbolic link rel under src points at, as it
+// says (never resolved); false for a link of another kind (a junction or
+// other reparse point) or one that cannot be read.
+func symlinkTarget(src *os.Root, rel string, info fs.FileInfo) (string, bool) {
+	if info.Mode()&os.ModeSymlink == 0 {
+		return "", false
+	}
+	target, err := src.Readlink(filepath.FromSlash(rel))
+	if err != nil || target == "" || !utf8.ValidString(target) {
+		return "", false
+	}
+	return target, true
+}
+
 // countWriter counts the bytes written through it.
 type countWriter struct{ n int64 }
 
@@ -368,7 +384,20 @@ func writePack(ctx context.Context, src *os.Root, srcPath string, mounts []strin
 			switch {
 			case dir == "." && info.Name() == marker:
 			case isLink(info):
-				res.skipped++
+				// a symbolic link goes in as one (what it points at is
+				// recorded, never followed); another kind of link is left out
+				target, ok := symlinkTarget(src, rel, info)
+				if !ok {
+					res.skipped++
+					continue
+				}
+				if !opts.since.IsZero() && !info.ModTime().After(opts.since) {
+					continue // unchanged since the run's previous snapshot
+				}
+				if err := tw.WriteHeader(&tar.Header{Typeflag: tar.TypeSymlink, Name: rel, Linkname: target, ModTime: info.ModTime(), Format: tar.FormatPAX}); err != nil {
+					return res, err
+				}
+				res.links++
 			case info.IsDir():
 				if mounted[filepath.Join(srcPath, filepath.FromSlash(rel))] {
 					res.skipped++

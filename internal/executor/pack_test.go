@@ -47,6 +47,10 @@ func unpack(t *testing.T, packPath string) map[string]string {
 		if err != nil {
 			t.Fatal(err)
 		}
+		if h.Typeflag == tar.TypeSymlink {
+			out[h.Name] = "-> " + h.Linkname
+			continue
+		}
 		body, err := io.ReadAll(tr)
 		if err != nil {
 			t.Fatal(err)
@@ -67,8 +71,9 @@ func sha256File(t *testing.T, p string) string {
 
 // A run's output directory is packed whole into <root>/packs/<object
 // id>.tar.zst with its file list: regular files and directories, the
-// marker left out, links skipped and never followed; packing again makes the
-// same pack; a directory whose marker does not name it is refused.
+// marker left out, a symbolic link packed as one (in the pack, not its file
+// list) and never followed; packing again makes the same pack; a directory
+// whose marker does not name it is refused.
 func TestPackPacksADirectoryWithItsFileList(t *testing.T) {
 	ctx := context.Background()
 	root := filepath.Join(t.TempDir(), "store")
@@ -108,11 +113,11 @@ func TestPackPacksADirectoryWithItsFileList(t *testing.T) {
 	}
 	if want := int64(0); linked {
 		want = 1
-		if res.skipped != want {
-			t.Fatalf("skipped %d, want the link", res.skipped)
+		if res.links != want || res.skipped != 0 {
+			t.Fatalf("links %d, skipped %d, want the link packed", res.links, res.skipped)
 		}
-	} else if res.skipped != want {
-		t.Fatalf("skipped %d", res.skipped)
+	} else if res.skipped != want || res.links != 0 {
+		t.Fatalf("skipped %d, links %d", res.skipped, res.links)
 	}
 	if info, err := os.Stat(res.packPath); err != nil || info.Size() != res.packBytes {
 		t.Fatalf("pack size: %v %v, recorded %d", info, err, res.packBytes)
@@ -129,8 +134,15 @@ func TestPackPacksADirectoryWithItsFileList(t *testing.T) {
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	if strings.Join(names, ",") != "ckpt/,ckpt/empty,ckpt/step-5.pt,metrics.json" {
-		t.Fatalf("entries %v (no marker, no link)", names)
+	want := "ckpt/,ckpt/empty,ckpt/step-5.pt,metrics.json"
+	if linked {
+		want = "ckpt/,ckpt/empty,ckpt/step-5.pt,link,metrics.json"
+		if entries["link"] != "-> "+outside {
+			t.Fatalf("link packed as %q", entries["link"])
+		}
+	}
+	if strings.Join(names, ",") != want {
+		t.Fatalf("entries %v, want %s (no marker)", names, want)
 	}
 	for name, body := range files {
 		if entries[name] != body {
