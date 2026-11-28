@@ -258,7 +258,8 @@ func init() {
 		{name: "control", summary: "the control plane's own snapshot (Kairo keeps itself)", group: &commandGroup{
 			note: "The daemon declares a control-snapshot task (project kairo) every control_snapshot_minutes; its output is copied to every durable store.",
 			subs: []command{
-				{"snapshot", "[--out DIR]", "write the daemon's database dump, code snapshots, configuration and TLS as one tar (in a control-snapshot attempt: its output directory)", controlSnapshot},
+				{"snapshot", "[--out DIR]", "write the daemon's database dump, code snapshots, configuration and TLS as one tar (in a control-snapshot attempt: its output directory, what its task keeps)", controlSnapshot},
+				{"rebuild-dump", "--base FILE --delta DIR [--out FILE]", "make a database dump again from its base (a snapshot's kairo.dump) and a later snapshot's difference from it (kairo.dump.recipe, kairo.dump.new in DIR)", controlRebuildDump},
 			},
 		}},
 		{name: "node", summary: "quarantine, release or fence nodes; tell Kairo its owner uses one", group: &commandGroup{

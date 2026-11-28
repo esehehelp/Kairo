@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"kairo/internal/dumpdelta"
 	"kairo/internal/tlsutil"
 )
 
@@ -99,7 +100,8 @@ func controlSnapshot(args []string) error {
 	if err = os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	sources := resp.Header.Get("X-Kairo-Snapshot") == "sources"
+	part := resp.Header.Get("X-Kairo-Snapshot")
+	sources := part == "sources"
 	prefix := "kairo-control-"
 	if sources {
 		prefix = "kairo-sources-"
@@ -117,7 +119,7 @@ func controlSnapshot(args []string) error {
 		err = closeErr
 	}
 	if err == nil {
-		err = checkControlSnapshot(name+".partial", sources)
+		err = checkControlSnapshot(name+".partial", part)
 	}
 	if err != nil {
 		_ = os.Remove(name + ".partial")
@@ -131,9 +133,11 @@ func controlSnapshot(args []string) error {
 }
 
 // checkControlSnapshot reads the tar at p through: it must be whole and hold
-// the database's dump, or (sources) its index (written last) and every code
-// snapshot the index names, with its file list.
-func checkControlSnapshot(p string, sources bool) error {
+// the database's dump; a delta of it (part delta) its recipe, the new bytes
+// the recipe says and which base; a snapshot of the code (part sources) its
+// index (written last) and every code snapshot the index names, with its
+// file list.
+func checkControlSnapshot(p, part string) error {
 	f, err := os.Open(p)
 	if err != nil {
 		return err
@@ -144,6 +148,8 @@ func checkControlSnapshot(p string, sources bool) error {
 	var index []string
 	indexed := false
 	held := map[string]bool{}
+	var recipe *dumpdelta.Recipe
+	newBytes := int64(-1)
 	for {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -156,6 +162,14 @@ func checkControlSnapshot(p string, sources bool) error {
 		switch h.Name {
 		case "kairo.dump":
 			dump = h.Size
+		case "kairo.dump.recipe":
+			r, err := dumpdelta.ReadRecipe(io.LimitReader(tr, 64<<20))
+			if err != nil {
+				return fmt.Errorf("the snapshot's dump recipe: %w", err)
+			}
+			recipe = &r
+		case "kairo.dump.new":
+			newBytes = h.Size
 		case "sources/INDEX":
 			body, err := io.ReadAll(io.LimitReader(tr, 16<<20))
 			if err != nil {
@@ -167,7 +181,14 @@ func checkControlSnapshot(p string, sources bool) error {
 			return fmt.Errorf("the snapshot is cut short: %w", err)
 		}
 	}
-	if !sources {
+	switch part {
+	case "delta":
+		if recipe == nil || !held["kairo.dump.base"] || newBytes != recipe.NewBytes {
+			return fmt.Errorf("the snapshot's dump delta is not whole (recipe %v, base %v, %d new bytes)", recipe != nil, held["kairo.dump.base"], newBytes)
+		}
+		return nil
+	case "sources":
+	default:
 		if dump <= 0 {
 			return errors.New("the snapshot holds no database dump")
 		}
@@ -186,8 +207,10 @@ func checkControlSnapshot(p string, sources bool) error {
 	return nil
 }
 
-// pgDumpTo writes the dump of the database at dsn (pg_dump -Fc, the binary
-// pgDump) to w; the password goes in the environment, not the arguments.
+// pgDumpTo writes the dump of the database at dsn (pg_dump -Fc -Z0, the
+// binary pgDump: not compressed, so that a later dump differs from it where
+// the database did, dumpdelta; a pack compresses it) to w; the password goes
+// in the environment, not the arguments.
 func pgDumpTo(ctx context.Context, pgDump, dsn string, w io.Writer) error {
 	env := os.Environ()
 	if u, err := url.Parse(dsn); err == nil && (u.Scheme == "postgres" || u.Scheme == "postgresql") && u.User != nil {
@@ -197,12 +220,71 @@ func pgDumpTo(ctx context.Context, pgDump, dsn string, w io.Writer) error {
 			dsn = u.String()
 		}
 	}
-	cmd := exec.CommandContext(ctx, pgDump, "-Fc", "--dbname="+dsn)
+	cmd := exec.CommandContext(ctx, pgDump, "-Fc", "-Z0", "--dbname="+dsn)
 	cmd.Env, cmd.Stdout = env, w
 	var stderr strings.Builder
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("%s: %w: %s", pgDump, err, strings.TrimSpace(stderr.String()))
 	}
+	return nil
+}
+
+// controlRebuildDump: kairo control rebuild-dump --base FILE --delta DIR
+// [--out FILE]. A snapshot's dump may be the difference from a base (the
+// kairo.dump of the snapshot its kairo.dump.base names): it is made whole
+// again from the base and the recipe and new bytes in DIR, checked against
+// the sha256 of both.
+func controlRebuildDump(args []string) error {
+	fs := newFlags("control rebuild-dump")
+	basePath := fs.String("base", "", "the base dump (the kairo.dump of the snapshot kairo.dump.base names)")
+	delta := fs.String("delta", "", "the directory with the snapshot's kairo.dump.recipe and kairo.dump.new")
+	out := fs.String("out", "kairo.dump", "the dump to write")
+	positional, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(positional) != 0 || *basePath == "" || *delta == "" {
+		return usageError("control rebuild-dump --base FILE --delta DIR [--out FILE]")
+	}
+	rf, err := os.Open(filepath.Join(*delta, "kairo.dump.recipe"))
+	if err != nil {
+		return err
+	}
+	rec, err := dumpdelta.ReadRecipe(rf)
+	rf.Close()
+	if err != nil {
+		return err
+	}
+	base, err := os.Open(*basePath)
+	if err != nil {
+		return err
+	}
+	defer base.Close()
+	bi, err := base.Stat()
+	if err != nil {
+		return err
+	}
+	fresh, err := os.Open(filepath.Join(*delta, "kairo.dump.new"))
+	if err != nil {
+		return err
+	}
+	defer fresh.Close()
+	f, err := os.Create(*out + ".partial")
+	if err != nil {
+		return err
+	}
+	err = dumpdelta.Rebuild(rec, base, bi.Size(), fresh, f)
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		_ = os.Remove(*out + ".partial")
+		return err
+	}
+	if err = os.Rename(*out+".partial", *out); err != nil {
+		return err
+	}
+	fmt.Printf("%s (%d bytes, sha256 %s)\n", *out, rec.Bytes, rec.SHA256)
 	return nil
 }

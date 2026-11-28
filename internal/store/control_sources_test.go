@@ -233,3 +233,98 @@ func TestThinningKeepsWhatTheCodeNeeds(t *testing.T) {
 		t.Fatalf("dropped %v of %v (%+v)", gone, objects, dropped)
 	}
 }
+
+// keepRun makes the control run's output kept: its attempt exited 0, its
+// output packed (as object), at created.
+func keepRun(t *testing.T, store *Store, run, object string, created time.Time) {
+	t.Helper()
+	if _, err := store.testExec(`INSERT INTO attempts(id,execution_id,state,executor_id,exit_code,exited_at) VALUES($1,$2,'quiesced','node-ctr',0,$3)`, "att_"+object, run, now()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.testExec(`INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,lifecycle,created_at,updated_at)
+		SELECT $1,'output',$2,'d-scratch','node-ctr','D:/kairo','D:/kairo/out',e.project_scope_id,'packed','durable',$3,$3 FROM execution_requests e WHERE e.id=$2`,
+		object, run, created.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.testExec(`INSERT INTO object_copies(object_id,store_id,executor_id,root,month,state,path,manifest_path,created_at,updated_at,verified_at)
+		VALUES($1,'e-durable','node-ctr','D:/durable','202611','verified','p','p.files.tsv',$2,$2,$2)`, object, created.Format(time.RFC3339Nano)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// An hourly snapshot's dump is the difference from the current base: the
+// latest whose run kept it, less than a day old, whose latest delta was no
+// more than half of it; else whole. Thinning keeps the base of every
+// snapshot it keeps.
+func TestAnHourlyDumpIsTheDifferenceFromItsBase(t *testing.T) {
+	store := controlStore(t)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
+	run := func(age time.Duration) (string, time.Time) {
+		t.Helper()
+		slot := now.Add(-age)
+		name, err := store.ControlSnapshotTask(ctx, slot, time.Hour)
+		if err != nil || name == "" {
+			t.Fatalf("declared %q %v", name, err)
+		}
+		return controlExecution(t, store, name), slot
+	}
+	if b, err := store.CurrentDumpBase(ctx, now); err != nil || b != nil {
+		t.Fatalf("with no base: %+v %v", b, err)
+	}
+	base, baseAt := run(50 * time.Hour)
+	if err := store.RecordControlDump(ctx, ControlDump{ExecutionID: base, Kind: ControlDumpBase, SHA256: "bb", Bytes: 1000, Chunks: []byte{}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.testExec(`UPDATE control_dumps SET created_at=$1 WHERE execution_id=$2`, now.Add(-time.Hour).Format(time.RFC3339Nano), base); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := store.CurrentDumpBase(ctx, now); err != nil || b != nil {
+		t.Fatalf("a base no run kept yet: %+v %v", b, err)
+	}
+	keepRun(t, store, base, "obj_base", baseAt)
+	b, err := store.CurrentDumpBase(ctx, now)
+	if err != nil || b == nil || b.ExecutionID != base || b.SHA256 != "bb" || !strings.HasPrefix(b.Task, "snapshot-") {
+		t.Fatalf("the base: %+v %v", b, err)
+	}
+	if b, err := store.CurrentDumpBase(ctx, now.Add(24*time.Hour)); err != nil || b != nil {
+		t.Fatalf("a base a day old: %+v %v", b, err)
+	}
+	// a delta of more than half its base: the next dump whole
+	big, _ := run(30 * time.Minute)
+	if err := store.RecordControlDump(ctx, ControlDump{ExecutionID: big, Kind: ControlDumpDelta, BaseExecutionID: base, SHA256: "cc", Bytes: 1000, NewBytes: 600}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := store.CurrentDumpBase(ctx, now); err != nil || b != nil {
+		t.Fatalf("after a delta of 60%%: %+v %v", b, err)
+	}
+	if err := store.RecordControlDump(ctx, ControlDump{ExecutionID: big, Kind: ControlDumpDelta, BaseExecutionID: base, SHA256: "cc", Bytes: 1000, NewBytes: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if b, err := store.CurrentDumpBase(ctx, now); err != nil || b == nil {
+		t.Fatalf("after a delta of 10%%: %+v %v", b, err)
+	}
+	if err := store.RecordControlDump(ctx, ControlDump{ExecutionID: big, Kind: ControlDumpDelta, SHA256: "cc", Bytes: 1000}); err == nil {
+		t.Fatal("a delta of no base was recorded")
+	}
+	// thinning: a delta of the last day keeps its base, though a later
+	// snapshot of the base's day is that day's
+	keepRun(t, store, big, "obj_delta", now.Add(-30*time.Minute))
+	later, laterAt := run(49 * time.Hour)
+	keepRun(t, store, later, "obj_later", laterAt)
+	earlier, earlierAt := run(51 * time.Hour)
+	keepRun(t, store, earlier, "obj_earlier", earlierAt)
+	dropped, err := store.ThinControlSnapshots(ctx, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gone []string
+	for _, o := range dropped {
+		if o.Dropped {
+			gone = append(gone, o.ObjectID)
+		}
+	}
+	if strings.Join(gone, ",") != "obj_earlier" {
+		t.Fatalf("dropped %v (%+v)", gone, dropped)
+	}
+}

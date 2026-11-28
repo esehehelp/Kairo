@@ -2,12 +2,16 @@ package main
 
 import (
 	"archive/tar"
+	"bytes"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"kairo/internal/dumpdelta"
 )
 
 func controlTar(t *testing.T, files map[string]string) []byte {
@@ -102,5 +106,67 @@ func TestControlSnapshotOfTheCodeKeepsWhatItsIndexNames(t *testing.T) {
 		if c.ok != (err == nil) || c.ok != (len(kept) == 1 && strings.HasPrefix(filepath.Base(kept[0]), "kairo-sources-")) {
 			t.Fatalf("%s: %v, kept %v", c.name, err, kept)
 		}
+	}
+}
+
+// A snapshot whose dump is the difference from a base (X-Kairo-Snapshot:
+// delta) is kept only with its recipe, the new bytes it says and which base;
+// kairo control rebuild-dump makes the dump again from the base and it.
+func TestAControlSnapshotsDeltaIsKeptWholeAndRebuilt(t *testing.T) {
+	base := bytes.Repeat([]byte("the base of a dump; "), 40000)
+	next := append(append([]byte{}, base[:300000]...), append([]byte("rows added since"), base[300000:]...)...)
+	chunks, sum, n, err := dumpdelta.Base(bytes.NewReader(base), io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fresh, recipe bytes.Buffer
+	rec, err := dumpdelta.Delta(bytes.NewReader(next), chunks, sum, n, &fresh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rec.Write(&recipe); err != nil {
+		t.Fatal(err)
+	}
+	var body []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Kairo-Snapshot", "delta")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	t.Setenv("KAIRO_TOKEN", "kairo_admin_t")
+	t.Setenv("KAIRO_ATTEMPT_TOKEN", "")
+	out := t.TempDir()
+	whole := map[string]string{"SNAPSHOT.txt": "x", "kairo.dump.base": "the base", "kairo.dump.recipe": recipe.String(), "kairo.dump.new": fresh.String()}
+	for _, c := range []struct {
+		name string
+		drop string
+		ok   bool
+	}{{"whole", "", true}, {"no new bytes", "kairo.dump.new", false}, {"no recipe", "kairo.dump.recipe", false}} {
+		files := map[string]string{}
+		for k, v := range whole {
+			if k != c.drop {
+				files[k] = v
+			}
+		}
+		body = controlTar(t, files)
+		dir := filepath.Join(out, strings.ReplaceAll(c.name, " ", "-"))
+		err := run([]string{"control", "snapshot", "--api", server.URL, "--out", dir})
+		kept, _ := filepath.Glob(filepath.Join(dir, "*"))
+		if c.ok != (err == nil) || c.ok != (len(kept) == 1) {
+			t.Fatalf("%s: %v, kept %v", c.name, err, kept)
+		}
+	}
+	dir := t.TempDir()
+	for name, content := range map[string][]byte{"base.dump": base, "kairo.dump.recipe": recipe.Bytes(), "kairo.dump.new": fresh.Bytes()} {
+		if err := os.WriteFile(filepath.Join(dir, name), content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rebuilt := filepath.Join(dir, "kairo.dump")
+	if err := run([]string{"control", "rebuild-dump", "--base", filepath.Join(dir, "base.dump"), "--delta", dir, "--out", rebuilt}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(rebuilt); !bytes.Equal(got, next) {
+		t.Fatal("rebuilt another dump")
 	}
 }

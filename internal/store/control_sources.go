@@ -181,22 +181,31 @@ func controlKept(created map[string]time.Time, now time.Time) map[string]bool {
 }
 
 // ThinControlSnapshots drops the outputs of the hourly control snapshots
-// (snapshot-<slot>) that controlKept does not keep, once every code snapshot
-// is kept by a sources run (until then an older snapshot, which held all of
-// them, may be the only place one is): the objects dropped.
+// (snapshot-<slot>) that controlKept does not keep, nor is the base of the
+// dump of one it keeps (a delta is rebuilt from its base: control_dumps.go),
+// once every code snapshot is kept by a sources run (until then an older
+// snapshot, which held all of them, may be the only place one is): the
+// objects dropped.
 func (s *Store) ThinControlSnapshots(ctx context.Context, now time.Time) ([]DroppedObject, error) {
 	unkept, err := unkeptSourcesTx(ctx, s.db)
 	if err != nil || len(unkept) > 0 {
 		return nil, err
 	}
 	created := map[string]time.Time{}
-	err = eachRow(ctx, s.db, `SELECT d.id,d.created_at FROM data_objects d JOIN coordination_scopes p ON p.id=d.project_scope_id
+	// each snapshot's run, and the run of its dump's base (a delta's)
+	runOf, baseOf, objectOf := map[string]string{}, map[string]string{}, map[string]string{}
+	err = eachRow(ctx, s.db, `SELECT d.id,d.created_at,e.id,COALESCE(c.base_execution_id,'') FROM data_objects d JOIN coordination_scopes p ON p.id=d.project_scope_id
 		JOIN execution_requests e ON e.id=d.source_id JOIN coordination_scopes t ON t.id=e.task_scope_id
+		LEFT JOIN control_dumps c ON c.execution_id=e.id
 		WHERE p.kind='project' AND p.external_key=$1 AND d.kind='output' AND d.dropped_at IS NULL AND d.state='packed' AND starts_with(t.external_key,$2)`,
 		[]any{ControlProject, controlSnapshotPrefix}, func(rows *sql.Rows) error {
-			var id, at string
-			if err := rows.Scan(&id, &at); err != nil {
+			var id, at, run, base string
+			if err := rows.Scan(&id, &at, &run, &base); err != nil {
 				return err
+			}
+			runOf[id], objectOf[run] = run, id
+			if base != "" {
+				baseOf[id] = base
 			}
 			t, err := time.Parse(time.RFC3339Nano, at)
 			if err != nil {
@@ -209,6 +218,13 @@ func (s *Store) ThinControlSnapshots(ctx context.Context, now time.Time) ([]Drop
 		return nil, err
 	}
 	keep := controlKept(created, now)
+	for id := range keep {
+		if base, ok := baseOf[id]; ok {
+			if object, ok := objectOf[base]; ok {
+				keep[object] = true
+			}
+		}
+	}
 	var drop []string
 	for id := range created {
 		if !keep[id] {

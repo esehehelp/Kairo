@@ -103,7 +103,7 @@ func TestControlSnapshotPartsHoldWhatTheirTasksKeep(t *testing.T) {
 		return files, order
 	}
 	rec := httptest.NewRecorder()
-	s.controlSnapshot(rec, httptest.NewRequest(http.MethodGet, "/api/worker/control-snapshot", nil), false)
+	s.controlSnapshot(rec, httptest.NewRequest(http.MethodGet, "/api/worker/control-snapshot", nil), false, "")
 	files, _ := read(rec)
 	if rec.Header().Get("X-Kairo-Snapshot") != "snapshot" || files["kairo.dump"] != "PGDMP" || files["sources/src_a.tar.zst"] != "" {
 		t.Fatalf("the hourly part: %s %v", rec.Header().Get("X-Kairo-Snapshot"), files)
