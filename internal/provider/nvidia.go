@@ -401,7 +401,7 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 			snap.Claims = append(snap.Claims, store.ExternalClaim{ID: "claim-" + resourceID + "-unattributed", ResourceID: resourceID, ClaimKind: "unattributed_activity", Evidence: evidence})
 		}
 	}
-	if p.Owner.enabled() && processErr == nil {
+	if p.Owner.observed() && processErr == nil {
 		// each GPU's reading, with or without graphics on it: the mean over
 		// the window is the owner's use
 		present, _ := p.Owner.present()

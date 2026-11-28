@@ -330,6 +330,10 @@ Kairo が使うマシンには持ち主がいます（デスクトップの GPU 
   - **RAM**: 観測からは持ち主の使用にしません。使える量が減っても、誰が取ったのか（持ち主か、サービスか、カーネルの漏れか、Kairo 自身の仕事か）は分からないためです（issue #45）。下限の扱いは下の「RAM の下限」を見てください。RAM の持ち主の使用は、手動（`--ram`）でだけ付きます。
   - **持ち主がキーボードの前にいる**: 直近 10 分以内にキーボードかマウスの入力があれば、各しきい値を `*_present` の値（既定: GPU 50%（いないときと同じ）、CPU 25%、RAM の下限は 4 GiB とメモリの 10% の大きい方）に変えます。入力だけでは何も譲りません。Windows では、エージェントが入力を見られないセッション 0 で動くため、持ち主のセッションで `kairo input-report` を動かし、最後の入力時刻を `%LOCALAPPDATA%\kairo\input.json`（`input_file`）に書かせます（`ops/windows/install-input-report.ps1` がログオン時に動くタスク `kairo-input-report` として登録します）。2 分以上書かれていない記録は「いない」とみなします。
 - **手動**: `kairo node owner-use NODE [--gpu UUID]... [--cpu] [--ram] [--for D]` で、そのノードの全資源（または指定したもの）を持ち主が使うと伝えます。`kairo node owner-done NODE` か `--for` の期限まで続きます。
+- **Kairo を先にするノード**: エージェント設定の `[owner_use]` に `kairo_first = true` を書くと、そのノードでは Kairo の仕事を持ち主より優先します。
+  - **観測しないもの**: GPU と CPU の持ち主の使用は観測しません。譲るのは、手動（`kairo node owner-use`）で伝えたときだけです。
+  - **RAM の下限は残します**: 仕事が RAM を使い切ると、マシンごと（その仕事も一緒に）落ちるからです。持ち主がキーボードの前にいても、いないときの下限を使います。
+  - **残る claim**: Kairo の外のプロセスが GPU のメモリを持っていることを示す claim（`external_process`、`unattributed_activity`）は残ります。それらは持ち主への遠慮ではなく、置いた仕事がメモリ不足で落ちないためのものです。
 - **譲り方**: 持ち主の使用がある資源には、新しい仕事を置きません（待機理由 `owner_use`。CPU か RAM なら、そのノードに置きません）。今使われている（手動のもの、または 90 秒以内に観測されたもの）間は、その資源を持つ仕事のうち checkpoint できるもの（`checkpointable` かつ `preemptible`）にサスペンドを送ります（origin `owner_use`）。
   - GPU は、その GPU を持つ仕事すべて。
   - 観測された CPU の使用は、CPU を最も多く持つ仕事から 1 つずつ（前のサスペンドが終わってから、使用がまだ続いていれば次）。手動の CPU と RAM は、それを持つ仕事すべて。
@@ -453,7 +457,7 @@ ca_file = "/etc/kairo/ca.pem"
 # attempt_api_url = "https://192.0.2.12:7474"  # このノード上の Attempt に渡す KAIRO_API_URL
 ```
 
-`[owner_use]` は、このノードの持ち主の使用の見つけ方です（[所有者の使用](#所有者の使用owner-use)。既定で有効、`disabled = true` で無効。しきい値 `gpu_sm_percent`・`cpu_percent`・`ram_free_mib` と、持ち主がキーボードの前にいるときの `*_present`、`input_file`）。残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[bench]` は拒否されます（ベンチマークはコンテナで走り、使うプログラムは Kairo が決めます）。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
+`[owner_use]` は、このノードの持ち主の使用の見つけ方です（[所有者の使用](#所有者の使用owner-use)。既定で有効、`disabled = true` で無効、`kairo_first = true` で GPU と CPU の観測をしません。しきい値 `gpu_sm_percent`・`cpu_percent`・`ram_free_mib` と、持ち主がキーボードの前にいるときの `*_present`、`input_file`）。残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[bench]` は拒否されます（ベンチマークはコンテナで走り、使うプログラムは Kairo が決めます）。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
 
 - **Executor の実行形態**: すべての Executor は Attempt をイメージのコンテナで実行します。種別（kind）は `incus`（Linux）と `wslc`（Windows）だけです（[コンテナ実行](#コンテナ実行)を参照）。ホストで直接実行する種別（以前の `linux`・`windows` など）、Proxmox のコンテナの種別（以前の `pct`）、WSL の種別（`wsl2`）を宣言する設定は拒否されます。
 - **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。そのノードの無効な Executor が書いたデータに残っている仕事（pack、durable に写した後の元の削除、運ぶための pack、kept scratch、output の移動）は、エージェントが登録するたびに、そのストアをいま提供する Executor へ引き継がれます（イベント `data_handed_over`）。仕事は Executor ごとに探されるので、別の Executor に置き換えて退役させた Executor（コンテナへ移したホストの Executor など）のデータが、いつまでも待たないためです。

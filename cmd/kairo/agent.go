@@ -75,7 +75,7 @@ func agentCommand(args []string) error {
 	registered := make([]agentclient.Provider, 0, len(cfg.Providers))
 	// the owner's use of this node's resources (README: Owner use)
 	o := cfg.OwnerUse
-	owner := &provider.OwnerUse{Disabled: o.Disabled, GPUSMPercent: o.GPUSMPercent, GPUSMPercentPresent: o.GPUSMPercentPresent, CPUPercent: o.CPUPercent,
+	owner := &provider.OwnerUse{Disabled: o.Disabled, KairoFirst: o.KairoFirst, GPUSMPercent: o.GPUSMPercent, GPUSMPercentPresent: o.GPUSMPercentPresent, CPUPercent: o.CPUPercent,
 		CPUPercentPresent: o.CPUPercentPresent, RAMFreeBytes: o.RAMFreeMiB << 20, RAMFreeBytesPresent: o.RAMFreeMiBPresent << 20, InputFile: o.InputFile}
 	for _, p := range cfg.Providers {
 		ttl := time.Duration(p.ObservationTTLSeconds) * time.Second

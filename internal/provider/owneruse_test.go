@@ -298,6 +298,48 @@ func TestTheNodesCPUIsItsOwnersWhenTaken(t *testing.T) {
 	}
 }
 
+// A node where Kairo's work comes before its owner: a game's GPU and the
+// owner's busy cores are not their use of them, and the RAM floor is the
+// one for an owner away, even at the keyboard.
+func TestANodeWhereKairoComesFirst(t *testing.T) {
+	input := filepath.Join(t.TempDir(), "input.json")
+	c := &testClock{now: time.Now()}
+	owner := &OwnerUse{InputFile: input, Now: c.read, KairoFirst: true}
+	sm := "90"
+	if got := ownerClaims(c.readings(t, ownerGPU(owner, &sm), &sm, input, time.Minute, repeat("90", 30)...)); len(got) != 0 {
+		t.Fatalf("a game: %+v", got)
+	}
+	busy := []cpuTimes{{total: 1000, idle: 500, kairoKnown: true}, {total: 1100, idle: 505, kairoKnown: true}}
+	next := 0
+	h := &Host{ProviderID: "h", NodeID: "n", Owner: owner, Meter: noMeter{}, CPUTimes: func() (cpuTimes, error) {
+		r := busy[min(next, len(busy)-1)]
+		next++
+		return r, nil
+	}}
+	writeInput(t, input, c.now, time.Minute)
+	h.snapshot(64<<30, 32<<30)
+	c.now = c.now.Add(time.Minute)
+	writeInput(t, input, c.now, time.Minute)
+	snap := h.snapshot(64<<30, 32<<30)
+	if len(snap.Claims) != 0 {
+		t.Fatalf("the owner's cores: %+v", snap.Claims)
+	}
+	if ev := string(snap.Observations[1].Evidence); ev != `{"floor_bytes":3435973836}` {
+		t.Fatalf("the RAM's floor at the keyboard: %s", ev)
+	}
+	// the same owner, Kairo not first: theirs
+	owner.KairoFirst = false
+	h.cpuReadings.readings = nil
+	next = 0
+	h.snapshot(64<<30, 32<<30)
+	c.now = c.now.Add(time.Minute)
+	writeInput(t, input, c.now, time.Minute)
+	snap = h.snapshot(64<<30, 32<<30)
+	if len(snap.Claims) != 1 || string(snap.Observations[1].Evidence) != `{"floor_bytes":6871947673}` {
+		t.Fatalf("Kairo not first: %+v %s", snap.Claims, snap.Observations[1].Evidence)
+	}
+}
+
 type noMeter struct{}
 
 func (noMeter) Read() (cpupower.Reading, bool) { return cpupower.Reading{}, false }

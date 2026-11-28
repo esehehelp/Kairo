@@ -57,7 +57,10 @@ func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 	resources := []store.ResourceInstance{{ID: p.NodeID + "-cpu", NodeID: p.NodeID, ProviderID: p.ProviderID, Kind: "cpu", StableIdentity: "logical-cpu", Binding: empty, Attributes: empty, AdminState: "enabled"}, {ID: p.NodeID + "-ram", NodeID: p.NodeID, ProviderID: p.ProviderID, Kind: "ram", StableIdentity: "physical-memory", Binding: empty, Attributes: empty, AdminState: "enabled"}}
 	ramEvidence := empty
 	if p.Owner.enabled() && ramTotal > 0 {
-		present, _ := p.Owner.present()
+		present := false
+		if !p.Owner.KairoFirst {
+			present, _ = p.Owner.present()
+		}
 		floor := p.Owner.ramFloor(ramTotal, present)
 		evidence := map[string]any{"floor_bytes": floor}
 		p.ramMu.Lock()
@@ -90,7 +93,7 @@ func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 // available than the floor says nothing of who took it (issue #45), and is
 // told with the RAM's observation instead (snapshot).
 func (p *Host) ownerClaims(cpuID string) []store.ExternalClaim {
-	if !p.Owner.enabled() {
+	if !p.Owner.observed() {
 		return nil
 	}
 	present, _ := p.Owner.present()

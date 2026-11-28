@@ -509,9 +509,11 @@ type Agent struct {
 // zero takes its default (provider.OwnerUse). The *_present ones apply while
 // the owner is at the keyboard (input within 10 minutes, as input_file has
 // it: on Windows %LOCALAPPDATA%/kairo/input.json by default, written by
-// kairo input-report in the owner's session).
+// kairo input-report in the owner's session). KairoFirst: Kairo's work
+// comes before the owner on this node (provider.OwnerUse).
 type OwnerUse struct {
 	Disabled            bool    `toml:"disabled"`
+	KairoFirst          bool    `toml:"kairo_first"`
 	GPUSMPercent        float64 `toml:"gpu_sm_percent"`
 	GPUSMPercentPresent float64 `toml:"gpu_sm_percent_present"`
 	CPUPercent          float64 `toml:"cpu_percent"`

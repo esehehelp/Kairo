@@ -46,6 +46,12 @@ import (
 // no claim.
 type OwnerUse struct {
 	Disabled bool
+	// KairoFirst: Kairo's work comes before the owner on this node. Their
+	// use of a GPU or the CPU is not observed (only told by hand, kairo node
+	// owner-use), and the RAM floor is the one for an owner away: it stays,
+	// for the machine (work that takes all of the RAM brings it down, and
+	// itself with it).
+	KairoFirst bool
 	// GPUSMPercent and GPUSMPercentPresent: zero means 50 for both (a game
 	// or a render, not a browser or a video: they share the GPU well).
 	GPUSMPercent, GPUSMPercentPresent float64
@@ -84,6 +90,9 @@ const ownerWindowCover = time.Minute
 const ClaimOwnerUse = "owner_use"
 
 func (o *OwnerUse) enabled() bool { return o != nil && !o.Disabled }
+
+// observed reports whether the owner's use of a GPU or the CPU is observed.
+func (o *OwnerUse) observed() bool { return o.enabled() && !o.KairoFirst }
 
 func (o *OwnerUse) now() time.Time {
 	if o.Now != nil {
