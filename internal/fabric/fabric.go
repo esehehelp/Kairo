@@ -22,6 +22,7 @@ import (
 	"sync"
 	"time"
 
+	"kairo/internal/secfile"
 	"kairo/internal/store"
 )
 
@@ -197,6 +198,10 @@ func key(keyFile string) (string, error) {
 			return "", err
 		}
 		if err := os.WriteFile(keyFile, []byte(base64.StdEncoding.EncodeToString(priv.Bytes())+"\n"), 0o600); err != nil {
+			return "", err
+		}
+		// the mode says nothing on Windows: its ACL to its owner only
+		if err := secfile.Restrict(keyFile); err != nil {
 			return "", err
 		}
 		return base64.StdEncoding.EncodeToString(priv.PublicKey().Bytes()), nil
