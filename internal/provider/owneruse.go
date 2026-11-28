@@ -46,7 +46,8 @@ import (
 // no claim.
 type OwnerUse struct {
 	Disabled bool
-	// GPUSMPercent and GPUSMPercentPresent: zero means 50 and 25.
+	// GPUSMPercent and GPUSMPercentPresent: zero means 50 for both (a game
+	// or a render, not a browser or a video: they share the GPU well).
 	GPUSMPercent, GPUSMPercentPresent float64
 	// CPUPercent and CPUPercentPresent: zero means 50 and 25.
 	CPUPercent, CPUPercentPresent float64
@@ -140,7 +141,7 @@ func (o *OwnerUse) present() (bool, time.Time) {
 
 func (o *OwnerUse) gpuThreshold(present bool) float64 {
 	if present {
-		return orDefault(o.GPUSMPercentPresent, 25)
+		return orDefault(o.GPUSMPercentPresent, 50)
 	}
 	return orDefault(o.GPUSMPercent, 50)
 }

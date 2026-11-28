@@ -96,10 +96,11 @@ func writeInput(t *testing.T, path string, written time.Time, ago time.Duration)
 
 // A GPU is its owner's while graphics processes use enough of its SMs over
 // the last two minutes: their shares summed and averaged over the readings,
-// the WSL VM's (Kairo's work on Windows) and compute processes left out,
-// the threshold lower while the owner is at the keyboard. A desktop's
-// bursts (a page drawn for a second) are not its owner's use, nor is a
-// reading alone. The pmon columns are read from its header.
+// the WSL VM's (Kairo's work on Windows) and compute processes left out.
+// By default half of them, at the keyboard or not: a game, not a browser;
+// a threshold set lower for the owner at the keyboard applies while they
+// are. A desktop's bursts (a page drawn for a second) are not its owner's
+// use, nor is a reading alone. The pmon columns are read from its header.
 func TestAGPUIsItsOwnersWhileGraphicsUseItsSMs(t *testing.T) {
 	input := filepath.Join(t.TempDir(), "input.json")
 	c := &testClock{now: time.Now()}
@@ -135,9 +136,17 @@ func TestAGPUIsItsOwnersWhileGraphicsUseItsSMs(t *testing.T) {
 		t.Fatalf("two minutes after the game: %+v", got)
 	}
 
-	// 44% for minutes: not the owner's while away (50%), theirs at the
-	// keyboard (25%)
+	// 44% for minutes, a browser at the keyboard: not the owner's by default
 	p = ownerGPU(owner, &sm)
+	if got := ownerClaims(c.readings(t, p, &sm, input, time.Minute, repeat("40", 30)...)); len(got) != 0 {
+		t.Fatalf("44%% with the owner at the keyboard, by default: %+v", got)
+	}
+
+	// with gpu_sm_percent_present 25: not the owner's while away (50%),
+	// theirs at the keyboard
+	present := &OwnerUse{InputFile: input, Now: c.read, GPUSMPercentPresent: 25}
+	p = ownerGPU(present, &sm)
+	writeInput(t, input, c.now, time.Hour)
 	if got := ownerClaims(c.readings(t, p, &sm, input, 0, repeat("40", 30)...)); len(got) != 0 {
 		t.Fatalf("44%% with the owner away: %+v", got)
 	}
@@ -154,8 +163,9 @@ func TestAGPUIsItsOwnersWhileGraphicsUseItsSMs(t *testing.T) {
 	}
 
 	// a desktop at the keyboard: 94% for one reading a minute, the overlay's
-	// 4% between (the old rule took each burst for the owner's use)
-	p = ownerGPU(owner, &sm)
+	// 4% between (the old rule took each burst for the owner's use), under
+	// 25% too
+	p = ownerGPU(present, &sm)
 	bursts := []string{}
 	for i := 0; i < 36; i++ {
 		bursts = append(bursts, map[bool]string{true: "90", false: "0"}[i%12 == 0])
