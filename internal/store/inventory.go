@@ -231,6 +231,20 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 			if elsewhere > 0 {
 				continue
 			}
+			// what the wslc VM holds (Windows: none of its processes shows)
+			// is the work of the attempt running on the GPU, while one runs
+			// there; once its lease is being released, or with none, it is
+			// what was left running there, or not Kairo's
+			if vmExplains(claim.Evidence) {
+				var live bool
+				if err = tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM lease_items li JOIN leases l ON l.id=li.lease_id
+					WHERE li.resource_id=$1 AND l.state IN('active','revocation_requested'))`, claim.ResourceID).Scan(&live); err != nil {
+					return err
+				}
+				if live {
+					continue
+				}
+			}
 		}
 		if claim.ClaimKind == "external_process" && claim.ProcessIdentity != nil {
 			var holders bool
@@ -634,4 +648,13 @@ func reconcileStaleLeaseTx(ctx context.Context, tx *sql.Tx, x staleLease, confir
 	}
 	detail["execution_id"] = executionID
 	return appendCoordinationEventTx(ctx, tx, "stale_lease_reconciled", &projectID, "lease", x.lease, &x.epoch, detail)
+}
+
+// vmExplains: an unattributed_activity claim the wslc VM's memory explains
+// (its evidence's kairo_vm_explains; provider: KairoVRAM).
+func vmExplains(evidence json.RawMessage) bool {
+	var e struct {
+		Explains bool `json:"kairo_vm_explains"`
+	}
+	return json.Unmarshal(evidence, &e) == nil && e.Explains
 }

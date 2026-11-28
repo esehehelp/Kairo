@@ -95,6 +95,9 @@ type wslcRuntime struct{}
 // container in the foreground until it stops.
 func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string, ...any), starting func(string) bool) (string, int, error) {
 	logf("container %s of %s", spec.Instance, spec.Image)
+	if err := wslcGPUsWhole(ctx, spec.GPUs); err != nil {
+		return "", shimNotStarted, err
+	}
 	if _, err := wslcCommand(ctx, "pull", "--quiet", spec.Image); err != nil {
 		return "", shimNotStarted, err
 	}
@@ -105,8 +108,13 @@ func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string
 		return "", exitStoppedBeforeStart, nil
 	}
 	// wslc sometimes fails a run before it made the container (two runs
-	// started at once): made again, a few times
+	// started at once): made again, a few times, unless a stop was asked
+	// for meanwhile
 	for try := 1; ; try++ {
+		if try > 1 && !starting(spec.Instance) {
+			logf("asked to stop before %s started: not started", spec.Instance)
+			return "", exitStoppedBeforeStart, nil
+		}
 		run := exec.Command(wslcExe(), wslcRunArgs(spec)...)
 		run.Stdout, run.Stderr = io.Discard, os.Stderr
 		ownProcessGroup(run)
@@ -133,18 +141,59 @@ func (wslcRuntime) run(ctx context.Context, spec containerSpec, logf func(string
 	return spec.Instance, exit, nil
 }
 
-// wslcRunning: wslc has a container named name running.
+// wslcRunning: wslc has a container named name that may still run (an
+// error: taken as running; the caller's deadline bounds the wait).
 func wslcRunning(ctx context.Context, name string) bool {
 	list, err := wslcContainers(ctx)
 	if err != nil {
-		return false
+		return true
 	}
 	for _, c := range list {
 		if c.Names == name {
-			return c.State == "running"
+			return wslcAlive(c.State)
 		}
 	}
 	return false
+}
+
+// wslcAlive: a container in state may have processes: any state but those
+// of a container stopped or never started.
+func wslcAlive(state string) bool {
+	switch strings.ToLower(state) {
+	case "exited", "created", "dead", "stopped":
+		return false
+	}
+	return true
+}
+
+// wslcGPUs counts the host's GPUs (nvidia-smi, as the provider reads
+// them).
+var wslcGPUs = func(ctx context.Context) (int, error) {
+	out, err := exec.CommandContext(ctx, "nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader").Output()
+	if err != nil {
+		return 0, fmt.Errorf("nvidia-smi: %w", err)
+	}
+	return len(strings.Fields(string(out))), nil
+}
+
+// wslcGPUsWhole: a container that leases GPUs leases all of the host's. A
+// wslc container is given the GPUs all or none (GPU paravirtualization:
+// one /dev/dxg for every adapter), CUDA_VISIBLE_DEVICES only hides the
+// others from the attempt, which could unset it and use a GPU another
+// attempt holds; on a host with more GPUs than the attempt leases it is
+// not started.
+func wslcGPUsWhole(ctx context.Context, leased []string) error {
+	if len(leased) == 0 {
+		return nil
+	}
+	n, err := wslcGPUs(ctx)
+	if err != nil {
+		return fmt.Errorf("the host's GPUs not counted (a wslc container is given all of them): %w", err)
+	}
+	if n > len(leased) {
+		return fmt.Errorf("a wslc container is given all %d of the host's GPUs, and this attempt leases %d: lease all of them (count = %d), or run it where containers get only theirs", n, len(leased), n)
+	}
+	return nil
 }
 
 func (wslcRuntime) stop(ctx context.Context, name string) error {
@@ -218,7 +267,7 @@ func (wslcRuntime) containers(ctx context.Context) ([]ociContainer, error) {
 	var out []ociContainer
 	for _, c := range list {
 		if id, ok := attemptOfInstance(c.Names); ok {
-			out = append(out, ociContainer{attempt: id, running: c.State == "running", handle: c.Names})
+			out = append(out, ociContainer{attempt: id, running: wslcAlive(c.State), handle: c.Names})
 		}
 	}
 	return out, nil

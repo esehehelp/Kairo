@@ -379,13 +379,19 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 		// Exclusive scheduling must fail closed even while a compute process is
 		// between kernels (and therefore reports 0% utilization). Operators can
 		// explicitly allow unattributed activity in the manifest when desired.
-		// What Kairo's work holds in the wslc VM is Kairo's (KairoVRAM).
-		// Graphics processes explain a desktop's share of the rest, not more:
-		// beyond the allowance the memory is someone's work (a game, a
-		// D3D/Vulkan compute job) that pmon shows only as graphics.
-		bytes -= min(bytes, kairo[uuid])
-		explained := graphics[uuid] && p.graphicsExplainVRAM() && bytes <= p.graphicsVRAMAllowance()
-		if bytes > 1024*1024*1024 && !seenProcess[uuid] && !explained {
+		// Graphics processes explain a desktop's share, not more: beyond the
+		// allowance the memory is someone's work (a game, a D3D/Vulkan
+		// compute job) that pmon shows only as graphics. What the wslc VM
+		// holds (KairoVRAM) is Kairo's only while an attempt of Kairo's runs
+		// on the GPU, which the daemon knows, not the agent: an attempt left
+		// running in the VM after its end, its lease being released, holds
+		// it too. The claim says whether the VM's memory would explain it
+		// (kairo_vm_explains), and the daemon takes it off while the GPU's
+		// lease is live (store: unattributed activity).
+		explains := func(b int64) bool {
+			return b <= 1024*1024*1024 || graphics[uuid] && p.graphicsExplainVRAM() && b <= p.graphicsVRAMAllowance()
+		}
+		if !seenProcess[uuid] && !explains(bytes) {
 			resourceID := ""
 			for _, entry := range byIndex {
 				if entry.uuid == uuid {
@@ -396,6 +402,7 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 			detail := map[string]any{"used_memory_bytes": bytes, "gpu_uuid": uuid, "reason": "significant_vram_without_attributed_process"}
 			if kairo[uuid] > 0 {
 				detail["kairo_vm_bytes"] = kairo[uuid]
+				detail["kairo_vm_explains"] = explains(bytes - min(bytes, kairo[uuid]))
 			}
 			evidence, _ := json.Marshal(detail)
 			snap.Claims = append(snap.Claims, store.ExternalClaim{ID: "claim-" + resourceID + "-unattributed", ResourceID: resourceID, ClaimKind: "unattributed_activity", Evidence: evidence})

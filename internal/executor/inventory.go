@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"kairo/internal/machine"
@@ -42,26 +43,51 @@ func (e *storeWorker) inventoryDue(ctx context.Context) {
 		if _, isLocal := s.fs.(localStoreFS); !isLocal {
 			continue
 		}
-		listedAt := time.Now().UTC().Format(time.RFC3339Nano)
-		copies, err := listDurableCopies(ctx, s.decl.Root)
-		if err != nil {
-			e.roundProblem(&e.inventories, s.decl.ID, "durable store not listed", err)
-			continue
-		}
-		inv, err := e.Store.InventoryDurable(ctx, store.DurableListing{ExecutorID: e.ID, StoreID: s.decl.ID, Root: s.decl.Root, ListedAt: listedAt, Copies: copies})
-		if err != nil {
-			e.roundProblem(&e.inventories, s.decl.ID, "durable store's listing not taken", err)
-			continue
-		}
-		if inv.Missing > 0 {
-			e.Logger.Warn("copies recorded on a durable store are not in its directory: marked damaged", "store_id", s.decl.ID, "missing", inv.Missing)
-		}
-		adopted, refused := e.adoptCopies(ctx, s, copies, inv.Unknown)
-		if adopted > 0 || refused > 0 {
-			e.Logger.Info("copies found on a durable store adopted", "store_id", s.decl.ID, "adopted", adopted, "not adopted", refused)
-		}
-		e.roundProblem(&e.inventories, s.decl.ID, "", nil)
+		e.inventoryOne(ctx, s)
 	}
+}
+
+// inventoryOne lists durable store s, reports the listing and adopts the
+// copies it found that have no record; a shed of the store waits until it
+// is done (storeLock).
+func (e *storeWorker) inventoryOne(ctx context.Context, s servedStore) {
+	lock := storeLock(s.decl.ID)
+	lock.Lock()
+	defer lock.Unlock()
+	listedAt := time.Now().UTC().Format(time.RFC3339Nano)
+	copies, err := listDurableCopies(ctx, s.decl.Root)
+	if err != nil {
+		e.roundProblem(&e.inventories, s.decl.ID, "durable store not listed", err)
+		return
+	}
+	inv, err := e.Store.InventoryDurable(ctx, store.DurableListing{ExecutorID: e.ID, StoreID: s.decl.ID, Root: s.decl.Root, ListedAt: listedAt, Copies: copies})
+	if err != nil {
+		e.roundProblem(&e.inventories, s.decl.ID, "durable store's listing not taken", err)
+		return
+	}
+	if inv.Missing > 0 {
+		e.Logger.Warn("copies recorded on a durable store are not in its directory: marked damaged", "store_id", s.decl.ID, "missing", inv.Missing)
+	}
+	adopted, refused := e.adoptCopies(ctx, s, copies, inv.Unknown)
+	if adopted > 0 || refused > 0 {
+		e.Logger.Info("copies found on a durable store adopted", "store_id", s.decl.ID, "adopted", adopted, "not adopted", refused)
+	}
+	e.roundProblem(&e.inventories, s.decl.ID, "", nil)
+}
+
+// storeLocks are this process's locks of its durable stores, by store id
+// (storeLock).
+var storeLocks sync.Map
+
+// storeLock is the lock of durable store id in this process (whichever of
+// its executors serves it): a shed of a copy (its claim, which removes its
+// record, and the removal of its files) and an inventory (its listing and
+// the adoptions of what it found without a record) hold it, so the copy of
+// a shed is not listed before its files go and adopted after its record
+// went: a record of files no longer there, counted as a copy.
+func storeLock(id string) *sync.Mutex {
+	lock, _ := storeLocks.LoadOrStore(id, &sync.Mutex{})
+	return lock.(*sync.Mutex)
 }
 
 // checkInPlaceSources reports each path of this node inputs are read in place
@@ -132,6 +158,9 @@ func (e *storeWorker) adoptCopies(ctx context.Context, s servedStore, months map
 			break
 		}
 		desc, err := readDescription(s.decl.Root, months[id], id)
+		if err == nil {
+			err = checkFound(s.decl.Root, months[id], id, desc)
+		}
 		if err != nil {
 			refused++
 			e.roundProblem(&e.inventories, id, "copy found on a durable store not adopted", err)
@@ -180,6 +209,35 @@ func listDurableCopies(ctx context.Context, root string) (map[string]string, err
 		}
 	}
 	return out, nil
+}
+
+// checkFound reads back the copy of id made in month on the store at root,
+// found without a record: adopted, it is counted as one of the object's
+// copies, so its pack and file list must be what its description says (a
+// copy cut short, or damaged since, is not).
+func checkFound(root, month, id string, desc store.ObjectDescription) error {
+	if !machine.ValidMonth(month) || !machine.ScratchIDValid(id) {
+		return fmt.Errorf("%w: object %q, month %q", errOutsideRoot, id, month)
+	}
+	dirPath := filepath.Join(root, "objects", month)
+	dir, err := openDirPath(dirPath, false)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	listSum, _, _, err := hashUncachedFile(dir, id+packSuffix+manifestSuffix, filepath.Join(dirPath, id+packSuffix+manifestSuffix))
+	if err != nil {
+		return err
+	}
+	packSum, packBytes, _, err := hashUncachedFile(dir, id+packSuffix, filepath.Join(dirPath, id+packSuffix))
+	if err != nil {
+		return err
+	}
+	if packSum != desc.PackSHA256 || packBytes != desc.PackBytes || listSum != desc.ManifestSHA256 {
+		return fmt.Errorf("%w: the pack has %d bytes, sha256 %s (list %s); its description says %d bytes, sha256 %s (list %s)",
+			errCopyMismatch, packBytes, packSum, listSum, desc.PackBytes, desc.PackSHA256, desc.ManifestSHA256)
+	}
+	return nil
 }
 
 // readDescription reads the description beside the copy of id made in month

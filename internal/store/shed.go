@@ -14,8 +14,9 @@ import (
 // verified there since, plus the copies shed there since (a report is minutes
 // old: without these, every round would see the same shortfall again), fall
 // more than shedMinShort under its reserve_free_bytes, its executor is
-// ordered to remove copies of objects that have at least minOtherCopies
-// verified, undamaged copies on other durable stores as declared, the biggest
+// ordered to remove copies of objects that have verified, undamaged copies
+// on other durable stores, at their declared roots, on at least
+// minOtherNodes nodes (two stores of one machine are lost with it), the biggest
 // first, until what they hold covers the shortfall, shedBatch at a time; not
 // a copy a replica or a fetch is reading. It claims each (ClaimShed: the
 // record goes after rechecking the other copies and readers under the
@@ -23,9 +24,28 @@ import (
 // a failed removal is adopted again by the next inventory, and shed again.
 
 const (
-	minOtherCopies = 2
-	shedBatch      = 50
+	minOtherNodes = 2
+	shedBatch     = 50
 )
+
+// otherDurable are the durable stores of stores other than id, not being
+// moved: their ids, declared roots and nodes, as otherNodesSQL takes them.
+func otherDurable(stores []machine.Store, id string) (ids, roots, nodes []string) {
+	for _, d := range stores {
+		if d.Class == machine.StoreDurable && d.ID != id && d.MovedFrom == "" {
+			ids, roots, nodes = append(ids, d.ID), append(roots, d.Root), append(nodes, d.Node)
+		}
+	}
+	return ids, roots, nodes
+}
+
+// otherNodesSQL counts the nodes with a verified, undamaged copy of object
+// %[1]s on the stores %[2]s, %[3]s and %[4]s say (ids, declared roots,
+// nodes: otherDurable): a record of a copy at another root (one declared
+// before) is not one.
+const otherNodesSQL = `(SELECT COUNT(DISTINCT n.node) FROM object_copies o
+	JOIN unnest(%[2]s::text[],%[3]s::text[],%[4]s::text[]) AS n(store_id,root,node) ON n.store_id=o.store_id AND n.root=o.root
+	WHERE o.object_id=%[1]s AND o.state='verified' AND o.check_problem IS NULL)`
 
 // shedMinShort: a shortfall this small is left alone (a pack being made on
 // the same filesystem comes and goes).
@@ -49,18 +69,17 @@ func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID s
 		if short <= shedMinShort {
 			continue
 		}
-		var others []string
+		all := make([]machine.Store, 0, len(byID))
 		for _, d := range byID {
-			if d.Class == machine.StoreDurable && d.ID != s.ID && d.MovedFrom == "" {
-				others = append(others, d.ID)
-			}
+			all = append(all, d)
 		}
+		ids, roots, nodes := otherDurable(all, s.ID)
 		err = eachRow(ctx, tx, `SELECT c.object_id,c.month,c.root,COALESCE(d.pack_bytes,0) FROM object_copies c JOIN data_objects d ON d.id=c.object_id
 			WHERE c.store_id=$1 AND c.state='verified' AND d.dropped_at IS NULL
-			AND (SELECT COUNT(*) FROM object_copies o WHERE o.object_id=c.object_id AND o.store_id=ANY($2::text[]) AND o.state='verified' AND o.check_problem IS NULL)>=$3
+			AND `+fmt.Sprintf(otherNodesSQL, "c.object_id", "$2", "$3", "$4")+`>=$5
 			AND NOT EXISTS(SELECT 1 FROM object_copies r WHERE r.object_id=c.object_id AND r.state='copying' AND (r.source_store_id=c.store_id OR r.source_store_id IS NULL))
 			AND NOT EXISTS(SELECT 1 FROM object_placements p WHERE p.object_id=c.object_id AND p.state='fetching' AND p.source_store_id=c.store_id)
-			ORDER BY d.pack_bytes DESC,c.verified_at DESC,c.object_id LIMIT $4`, []any{s.ID, others, minOtherCopies, shedBatch}, func(rows *sql.Rows) error {
+			ORDER BY d.pack_bytes DESC,c.verified_at DESC,c.object_id LIMIT $6`, []any{s.ID, ids, roots, nodes, minOtherNodes, shedBatch}, func(rows *sql.Rows) error {
 			if short <= 0 {
 				return nil
 			}
@@ -86,9 +105,9 @@ func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID s
 var ErrShedRefused = errors.New("copy not to be shed")
 
 // ClaimShed: executorID is about to remove its copy of objectID on durable
-// store storeID; the record goes first, if the object still has
-// minOtherCopies verified, undamaged copies on other durable stores as
-// declared and no replica or fetch is reading from it (ErrShedRefused
+// store storeID; the record goes first, if the object still has verified,
+// undamaged copies on other durable stores as declared on minOtherNodes
+// nodes and no replica or fetch is reading from it (ErrShedRefused
 // otherwise: the files are not to be removed).
 func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID string) error {
 	tx, err := s.beginWrite(ctx)
@@ -104,18 +123,13 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 	if err != nil {
 		return err
 	}
-	var others []string
 	served := false
 	for _, d := range declared {
-		if d.Class != machine.StoreDurable || d.MovedFrom != "" {
-			continue
-		}
-		if d.ID == storeID {
+		if d.Class == machine.StoreDurable && d.MovedFrom == "" && d.ID == storeID {
 			served = me.serves(d, executorID)
-			continue
 		}
-		others = append(others, d.ID)
 	}
+	ids, roots, nodes := otherDurable(declared, storeID)
 	if !served {
 		return fmt.Errorf("%w: executor %s does not serve durable store %s", ErrShedRefused, executorID, storeID)
 	}
@@ -135,18 +149,17 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 	}
 	var count int
 	var reading bool
-	if err = tx.QueryRowContext(ctx, `SELECT
-		(SELECT COUNT(*) FROM object_copies WHERE object_id=$1 AND store_id=ANY($2::text[]) AND state='verified' AND check_problem IS NULL),
-		EXISTS(SELECT 1 FROM object_copies WHERE object_id=$1 AND state='copying' AND (source_store_id=$3 OR source_store_id IS NULL))
-		OR EXISTS(SELECT 1 FROM object_placements WHERE object_id=$1 AND state='fetching' AND source_store_id=$3)`,
-		objectID, others, storeID).Scan(&count, &reading); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT `+fmt.Sprintf(otherNodesSQL, "$1", "$2", "$3", "$4")+`,
+		EXISTS(SELECT 1 FROM object_copies WHERE object_id=$1 AND state='copying' AND (source_store_id=$5 OR source_store_id IS NULL))
+		OR EXISTS(SELECT 1 FROM object_placements WHERE object_id=$1 AND state='fetching' AND source_store_id=$5)`,
+		objectID, ids, roots, nodes, storeID).Scan(&count, &reading); err != nil {
 		return err
 	}
 	switch {
 	case dropped && !identityKept:
 		return fmt.Errorf("%w: %s is dropped, but its file list is not kept yet (KeepIdentity)", ErrShedRefused, objectID)
-	case !dropped && count < minOtherCopies:
-		return fmt.Errorf("%w: %s has %d other good copies, not %d", ErrShedRefused, objectID, count, minOtherCopies)
+	case !dropped && count < minOtherNodes:
+		return fmt.Errorf("%w: %s has good copies on %d other nodes, not %d", ErrShedRefused, objectID, count, minOtherNodes)
 	}
 	if reading {
 		return fmt.Errorf("%w: a replica or fetch is reading the copy of %s on %s", ErrShedRefused, objectID, storeID)
@@ -157,7 +170,7 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 	if _, err = tx.ExecContext(ctx, `DELETE FROM object_copies WHERE object_id=$1 AND store_id=$2`, objectID, storeID); err != nil {
 		return err
 	}
-	if err = appendCoordinationEventTx(ctx, tx, "copy_shed", projectID, "object", objectID, nil, map[string]any{"store_id": storeID, "executor_id": executorID, "other_copies": count, "dropped": dropped}); err != nil {
+	if err = appendCoordinationEventTx(ctx, tx, "copy_shed", projectID, "object", objectID, nil, map[string]any{"store_id": storeID, "executor_id": executorID, "other_nodes": count, "dropped": dropped}); err != nil {
 		return err
 	}
 	return tx.Commit()

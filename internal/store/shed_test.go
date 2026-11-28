@@ -11,10 +11,12 @@ import (
 	"kairo/internal/machine"
 )
 
-// A durable store below its reserve sheds copies of objects that have two
-// other good copies, the biggest first, until the shortfall is covered; what
-// it shed counts until the next report (no round sheds the same shortfall
-// again); a copy that would leave fewer is kept, and its claim refused.
+// A durable store below its reserve sheds copies of objects that have good
+// copies on two other nodes, the biggest first, until the shortfall is
+// covered; what it shed counts until the next report (no round sheds the
+// same shortfall again); a copy that would leave fewer is kept, and its
+// claim refused: copies on two stores of one node are one node's, and a
+// record of a copy at a root its store no longer declares is none.
 func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 	reserve, packBytes := 2*shedMinShort+1000, 2*shedMinShort+200
 	store := openCoordinationStore(t)
@@ -29,7 +31,15 @@ func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 		machine.Store{ID: "e-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "E:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "f-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "F:/kairo", Filesystem: "D:"},
 		machine.Store{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Executor: "durable-exec", Root: "D:/kairo", Filesystem: "D:"},
+		machine.Store{ID: "g-durable", Class: machine.StoreDurable, Node: "node", Executor: "durable-exec", Root: "G:/kairo", Filesystem: "D:"},
 	)
+	// e and f on machines of their own (as declared: the shed reads the
+	// declarations), g beside e on e's
+	for id, node := range map[string]string{"e-durable": "node-e", "f-durable": "node-f", "g-durable": "node-e"} {
+		if _, err := store.testExec(`UPDATE machine_stores SET node_id=$2,declaration_json=jsonb_set(declaration_json::jsonb,'{node}',to_jsonb($2::text))::text WHERE id=$1`, id, node); err != nil {
+			t.Fatal(err)
+		}
+	}
 	sha := strings.Repeat("aa", 32)
 	verified := func(id, storeID, root string) {
 		t.Helper()
@@ -39,14 +49,21 @@ func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// obj_1 and obj_2 everywhere (obj_2 the newer on c), obj_3 on c and e only
-	for _, id := range []string{"obj_1", "obj_2", "obj_3"} {
+	// obj_1 and obj_2 everywhere (obj_2 the newer on c), obj_3 on c and e
+	// only, obj_6 (the biggest) on c, e and g: one other node; obj_7 on c,
+	// e and f, the copy on f at a root f no longer declares
+	for _, id := range []string{"obj_1", "obj_2", "obj_3", "obj_6", "obj_7"} {
 		insertPacked(t, store, id, "executor", "d-scratch", "D:/kairo", sha)
 		verified(id, "c-durable", "C:/_kairo-durable")
 		verified(id, "e-durable", "E:/kairo")
 	}
 	verified("obj_1", "f-durable", "F:/kairo")
 	verified("obj_2", "f-durable", "F:/kairo")
+	verified("obj_6", "g-durable", "G:/kairo")
+	verified("obj_7", "f-durable", "F:/old")
+	if _, err := store.testExec(`UPDATE data_objects SET pack_bytes=$1 WHERE id IN('obj_6','obj_7')`, 2*packBytes); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.testExec(`UPDATE data_objects SET pack_bytes=$1 WHERE id='obj_1'`, packBytes); err != nil {
 		t.Fatal(err)
 	}
@@ -159,9 +176,12 @@ func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 	if shed = shedOrders(); len(shed) != 0 {
 		t.Fatalf("shed again on the same report: %+v", shed)
 	}
-	// obj_3 has one other copy: never shed
-	if err := store.ClaimShed(ctx, "durable-exec", "obj_3", "c-durable"); !errors.Is(err, ErrShedRefused) {
-		t.Fatalf("a copy leaving one other was claimed: %v", err)
+	// obj_3 has one other copy, obj_6 two on one other node, obj_7 one
+	// where f declares its root: never shed
+	for _, id := range []string{"obj_3", "obj_6", "obj_7"} {
+		if err := store.ClaimShed(ctx, "durable-exec", id, "c-durable"); !errors.Is(err, ErrShedRefused) {
+			t.Fatalf("a copy of %s leaving one other node was claimed: %v", id, err)
+		}
 	}
 	checkReplicas := func(want string) {
 		t.Helper()

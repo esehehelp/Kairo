@@ -101,11 +101,25 @@ func shim(args []string, goAhead io.Reader) int {
 	return writeShimExit(exitFile, cmd.ProcessState.ExitCode())
 }
 
-// writeShimExit writes code to path (whole or not at all) and returns it.
+// exitLimit bounds what is read of an exit file (a written one is a few
+// bytes).
+const exitLimit = 4096
+
+// writeShimExit writes code to path (whole or not at all) and returns it:
+// to a file made new beside it (not one there before, whatever that is),
+// renamed over path (an entry there, a link too, is replaced, not
+// followed).
 func writeShimExit(path string, code int) int {
 	body, _ := json.Marshal(shimExit{ExitCode: code})
 	tmp := path + ".tmp"
-	err := os.WriteFile(tmp, body, 0o644)
+	_ = os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err == nil {
+		_, err = f.Write(body)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}
 	if err == nil {
 		err = os.Rename(tmp, path)
 	}
@@ -169,9 +183,10 @@ func readExit(logDir, attemptID string) (int, bool) {
 	return readExitFile(exitPath(logDir, attemptID))
 }
 
-// readExitFile returns the exit written to path, if one was.
+// readExitFile returns the exit written to path, if one was: a regular file
+// of at most exitLimit bytes (readRegular).
 func readExitFile(path string) (int, bool) {
-	body, err := os.ReadFile(path)
+	body, err := readRegular(path, exitLimit)
 	if err != nil {
 		return 0, false
 	}

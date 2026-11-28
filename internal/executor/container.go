@@ -62,11 +62,14 @@ const (
 	containerRunArg  = "__kairo-incus-run"
 	containerInitArg = "__kairo-container-init"
 	containerRoot    = "/kairo"
-	containerSpecIn  = "/kairo/run/spec.json"
-	containerExitIn  = "/kairo/run/exit"
-	containerStdout  = "/kairo/log/stdout"
-	containerStderr  = "/kairo/log/stderr"
-	containerNVIDIA  = "/kairo/nvidia"
+	// containerRunDir is the init's: its spec and the exit it writes, the
+	// attempt's streams below (README: the container's layout)
+	containerRunDir = "/kairo/run"
+	containerSpecIn = "/kairo/run/spec.json"
+	containerExitIn = "/kairo/run/exit"
+	containerStdout = "/kairo/log/stdout"
+	containerStderr = "/kairo/log/stderr"
+	containerNVIDIA = "/kairo/nvidia"
 	// containerStreamSource is where the snapshot of a stream's stages is
 	// when it is not the program's (containerSpec.StreamCWD).
 	containerStreamSource = containerRoot + "/stream-src"
@@ -315,12 +318,12 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		RunDir:    runDir,
 		Mounts: append(append([]containerMount{
 			binMount,
-			{Source: runDir, Path: containerRoot + "/run"},
+			{Source: runDir, Path: containerRunDir},
 		}, logMounts...),
 			containerMount{Source: scratch, Path: containerRoot + "/scratch"},
 			containerMount{Source: output, Path: containerRoot + "/output"},
 		),
-		Writable: append(append([]string{containerRoot + "/run"}, writableLogs...), containerRoot+"/scratch", containerRoot+"/output"),
+		Writable: append(append([]string{containerRunDir}, writableLogs...), containerRoot+"/scratch", containerRoot+"/output"),
 		Tmp:      containerRoot + "/scratch/tmp",
 		Argv:     launch.Argv,
 		Streams:  launch.Streams,

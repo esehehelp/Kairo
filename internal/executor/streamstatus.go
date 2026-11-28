@@ -2,7 +2,6 @@ package executor
 
 import (
 	"encoding/json"
-	"io"
 	"os"
 	"path/filepath"
 
@@ -41,12 +40,8 @@ func (e *Local) streamStatuses(attemptID string) []store.AttemptStream {
 		if !d.IsDir() {
 			continue
 		}
-		f, err := os.Open(filepath.Join(dir, d.Name(), StreamStatusFile))
-		if err != nil {
-			continue
-		}
-		body, err := io.ReadAll(io.LimitReader(f, streamStatusLimit))
-		f.Close()
+		// the stream's directory is the attempt's: a regular file only
+		body, err := readRegular(filepath.Join(dir, d.Name(), StreamStatusFile), streamStatusLimit)
 		var st loader.Status
 		if err != nil || json.Unmarshal(body, &st) != nil {
 			continue

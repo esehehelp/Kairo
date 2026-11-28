@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -284,5 +285,75 @@ func TestFencingANodeMakesTheLeasesOfItsSilentExecutorsStale(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("no node_fenced event")
+	}
+}
+
+// What the wslc VM holds of a GPU (Windows: none of its processes shows) is
+// the work of the attempt running there while one runs: an unattributed
+// claim the VM's memory explains is taken off then, and only then. With
+// the attempt ended, its lease being released, it is what was left running
+// there: the GPU is not quiet until it goes.
+func TestTheWSLCVMsMemoryIsKairosOnlyWhileAnAttemptRunsOnTheGPU(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	spec := schedulerExecutionSpec("wslc-vm-memory")
+	_, _, err := store.SubmitExecution(ctx, spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation, err := store.ReserveNext(ctx, "executor")
+	if err != nil || reservation == nil {
+		t.Fatalf("reserve: %+v %v", reservation, err)
+	}
+	if err = store.MarkLeasePrepared(ctx, reservation.Lease.ID, reservation.Lease.CoordinationEpoch); err != nil {
+		t.Fatal(err)
+	}
+	launch, err := store.AuthorizeLaunch(ctx, reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	epoch := launch.Lease.CoordinationEpoch
+	if err = store.ActivateLaunch(ctx, launch.Attempt.ID, launch.Lease.ID, epoch, launch.AuthorizationToken, 100, "launcher:100"); err != nil {
+		t.Fatal(err)
+	}
+	claim := func(explains bool) ExternalClaim {
+		return ExternalClaim{ID: "claim-gpu-0-unattributed", ResourceID: "gpu-0", ClaimKind: "unattributed_activity",
+			Evidence: json.RawMessage(fmt.Sprintf(`{"used_memory_bytes":6000000000,"kairo_vm_bytes":5000000000,"kairo_vm_explains":%v}`, explains))}
+	}
+	open := func() int {
+		t.Helper()
+		var n int
+		if err := store.db.QueryRow(`SELECT COUNT(*) FROM external_claims WHERE resource_id='gpu-0' AND claim_kind='unattributed_activity' AND cleared_at IS NULL`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if err = store.ApplyObservationBatch(ctx, "gpu-provider", nil, nil, []ExternalClaim{claim(true)}); err != nil {
+		t.Fatal(err)
+	}
+	if n := open(); n != 0 {
+		t.Fatalf("the running attempt's memory in the VM was taken for unattributed activity (%d)", n)
+	}
+	if err = store.ApplyObservationBatch(ctx, "gpu-provider", nil, nil, []ExternalClaim{claim(false)}); err != nil {
+		t.Fatal(err)
+	}
+	if n := open(); n != 1 {
+		t.Fatalf("memory beyond the VM's was taken off (%d)", n)
+	}
+	if err = store.ClearClaim(ctx, "claim-gpu-0-unattributed"); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.RecordTerminal(ctx, launch.Attempt.ID, launch.Lease.ID, epoch, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.ApplyObservationBatch(ctx, "gpu-provider", nil, nil, []ExternalClaim{claim(true)}); err != nil {
+		t.Fatal(err)
+	}
+	if n := open(); n != 1 {
+		t.Fatalf("the VM's memory after the attempt ended was taken off (%d)", n)
+	}
+	if err = store.FinalizeQuiescence(ctx, launch.Attempt.ID, launch.Lease.ID, epoch); err == nil {
+		t.Fatal("the lease was released while the VM still held the GPU's memory")
 	}
 }

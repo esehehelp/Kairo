@@ -1,6 +1,8 @@
 package executor
 
 import (
+	"context"
+	"errors"
 	"reflect"
 	"testing"
 )
@@ -24,6 +26,35 @@ func TestWSLCRunsTheInitAsRoot(t *testing.T) {
 	for _, other := range []string{"kokoro-verify", "kairo-att-", "kairo-att-a-b"} {
 		if _, ok := attemptOfInstance(other); ok {
 			t.Fatalf("%s taken as an attempt's", other)
+		}
+	}
+}
+
+// A wslc container is given the host's GPUs all or none: an attempt that
+// leases fewer than the host has is not started (it could use another's),
+// nor one where they cannot be counted. A container is taken for having
+// processes in any state but those of one stopped or never started.
+func TestAWSLCContainerLeasesAllOfTheHostsGPUs(t *testing.T) {
+	saved := wslcGPUs
+	defer func() { wslcGPUs = saved }()
+	ctx := context.Background()
+	wslcGPUs = func(context.Context) (int, error) { return 2, nil }
+	if err := wslcGPUsWhole(ctx, nil); err != nil {
+		t.Fatalf("no GPU leased: %v", err)
+	}
+	if err := wslcGPUsWhole(ctx, []string{"GPU-a"}); err == nil {
+		t.Fatal("one of two GPUs leased, started")
+	}
+	if err := wslcGPUsWhole(ctx, []string{"GPU-a", "GPU-b"}); err != nil {
+		t.Fatalf("both leased: %v", err)
+	}
+	wslcGPUs = func(context.Context) (int, error) { return 0, errors.New("no nvidia-smi") }
+	if err := wslcGPUsWhole(ctx, []string{"GPU-a"}); err == nil {
+		t.Fatal("GPUs not counted, started")
+	}
+	for state, alive := range map[string]bool{"running": true, "paused": true, "restarting": true, "removing": true, "exited": false, "created": false, "dead": false} {
+		if wslcAlive(state) != alive {
+			t.Fatalf("%s: alive %v", state, !alive)
 		}
 	}
 }

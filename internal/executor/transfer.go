@@ -152,8 +152,9 @@ const descriptionSuffix = ".object.json"
 // (store/shed.go), or of a dropped object (store/data_drop.go: the file list
 // beside it sent first when the daemon has not kept it yet): claimed first,
 // so a copy the daemon no longer lets go is left alone; its files then
-// removed through the store's handles. Files a failed removal leaves are
-// adopted again by the next inventory.
+// removed through the store's handles, an inventory of the store waiting
+// meanwhile (storeLock). Files a failed removal leaves are adopted again by
+// the next inventory.
 func (e *storeWorker) shedCopy(ctx context.Context, s servedStore, o store.CopyOrder) {
 	if _, isLocal := s.fs.(localStoreFS); !isLocal {
 		return
@@ -168,11 +169,17 @@ func (e *storeWorker) shedCopy(ctx context.Context, s servedStore, o store.CopyO
 			return
 		}
 	}
-	if err := e.Store.ClaimShed(ctx, e.ID, o.ObjectID, o.StoreID); err != nil {
+	lock := storeLock(o.StoreID)
+	lock.Lock()
+	err := e.Store.ClaimShed(ctx, e.ID, o.ObjectID, o.StoreID)
+	if err != nil {
+		lock.Unlock()
 		e.copyProblem(o.ObjectID, "copy not shed", err)
 		return
 	}
-	if err := removeObjectCopy(s.decl.Root, o.Month, o.ObjectID); err != nil {
+	err = removeObjectCopy(s.decl.Root, o.Month, o.ObjectID)
+	lock.Unlock()
+	if err != nil {
 		e.copyProblem(o.ObjectID, "shed copy's files not removed", err)
 		return
 	}

@@ -197,7 +197,13 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 		}
 		for _, m := range spec.Mounts {
 			if !m.ReadOnly {
-				if err := chownTree(m.Source, ids.toAttemptUser); err != nil {
+				// /kairo/run is the init's (the container's root), the rest
+				// the attempt's user's
+				to := ids.toAttemptUser
+				if m.Path == containerRunDir {
+					to = ids.toContainerRoot
+				}
+				if err := chownTree(m.Source, to); err != nil {
 					return shimNotStarted, fmt.Errorf("hand %s to the container: %w", m.Source, err)
 				}
 			}
@@ -402,6 +408,32 @@ func (m idMap) toAttemptUser(st unix.Stat_t) (int, int) {
 
 // toAttemptUserHere gives the attempt user all of it, in a container whose
 // runner hands it nothing (wslc, or one nested in a Proxmox container).
+// toRootHere gives the container's root what it does not own (inside the
+// container: the ids are its own).
+func toRootHere(st unix.Stat_t) (int, int) {
+	uid, gid := -1, -1
+	if st.Uid != 0 {
+		uid = 0
+	}
+	if st.Gid != 0 {
+		gid = 0
+	}
+	return uid, gid
+}
+
+// toContainerRoot gives the container's root (its ids on the host, by the
+// map) what it does not own.
+func (m idMap) toContainerRoot(st unix.Stat_t) (int, int) {
+	uid, gid := -1, -1
+	if st.Uid != m.uid {
+		uid = int(m.uid)
+	}
+	if st.Gid != m.gid {
+		gid = int(m.gid)
+	}
+	return uid, gid
+}
+
 func toAttemptUserHere(st unix.Stat_t) (int, int) {
 	uid, gid := -1, -1
 	if st.Uid != containerUID {
@@ -629,11 +661,12 @@ func devName(soname string) string {
 // containerInit runs under Incus's init, the container's first process, as
 // the container's root: it names the attempt's user (containerUID) in the
 // image, confines the container, hands the user what Kairo lets the attempt
-// write, starts the attempt's argv as that user in its own process group,
-// reaps whatever ends in the container and, once the argv has exited,
-// writes its exit and exits with it (which stops the container and ends
-// whatever still runs there). A signal that stops the attempt reaches the
-// argv directly (runInstance); the init outlives it.
+// write (not /kairo/run: the init's, where it writes the exit), starts the
+// attempt's argv as that user in its own process group, reaps whatever ends
+// in the container and, once the argv has exited and the rest of the
+// attempt is ended, writes its exit and exits with it (which stops the
+// container). A signal that stops the attempt reaches the argv directly
+// (runInstance); the init outlives it.
 func containerInit(specPath string) int {
 	spec, err := readContainerSpec(specPath)
 	if err != nil {
@@ -655,6 +688,16 @@ func containerInit(specPath string) int {
 	// on a host (runInstance); here, where it could not (wslc, or nested in
 	// a Proxmox container)
 	for _, p := range spec.Writable {
+		if p == containerRunDir {
+			// the init's: the attempt reaches its streams below it, and
+			// writes nothing there
+			if err := chownTree(p, toRootHere); err == nil {
+				err = os.Chmod(p, 0o755)
+			} else {
+				fmt.Fprintf(stderr, "kairo container: keep %s the init's: %v\n", p, err)
+			}
+			continue
+		}
 		var st unix.Stat_t
 		if unix.Stat(p, &st) == nil && st.Uid == containerUID && st.Gid == containerGID {
 			continue
@@ -677,13 +720,17 @@ func containerInit(specPath string) int {
 	}
 	// each stream's loader, its socket ready before the argv starts
 	loaders, env, err := startLoaders(spec, env, stderr)
-	if err != nil {
+	// the exit is written once nothing the attempt started is left to
+	// write over it
+	finish := func(code int) int {
 		stopLoaders(loaders)
-		fmt.Fprintln(stderr, "kairo container:", err)
-		return writeShimExit(containerExitIn, shimNotStarted)
+		endTheRest()
+		return writeShimExit(containerExitIn, code)
 	}
-	defer endTheRest()
-	defer stopLoaders(loaders)
+	if err != nil {
+		fmt.Fprintln(stderr, "kairo container:", err)
+		return finish(shimNotStarted)
+	}
 	cmd := &exec.Cmd{Path: argv0, Args: spec.Argv, Dir: spec.CWD, Env: env, Stdout: stdout, Stderr: stderr,
 		SysProcAttr: &syscall.SysProcAttr{Setpgid: true, Credential: attemptCredential()}}
 	// caught, not ignored: the argv starts with the default dispositions.
@@ -694,7 +741,7 @@ func containerInit(specPath string) int {
 	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGPWR)
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(stderr, "kairo container: start:", err)
-		return writeShimExit(containerExitIn, shimNotStarted)
+		return finish(shimNotStarted)
 	}
 	// once the container is being stopped, a loader that ends (the stop
 	// reached it too) is not started again
@@ -713,7 +760,7 @@ func containerInit(specPath string) int {
 	if sig != 0 {
 		fmt.Fprintf(stderr, "kairo container: %s ended by signal %d (%v)\n", spec.Argv[0], int(sig), sig)
 	}
-	return writeShimExit(containerExitIn, exit)
+	return finish(exit)
 }
 
 // attemptCredential is the attempt user's: its uid and gid, no other group.

@@ -2,8 +2,12 @@ package provider
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
+
+	"kairo/internal/store"
 )
 
 // Graphics processes explain a desktop's share of GPU memory only: beyond the
@@ -48,21 +52,24 @@ func TestNVIDIAGraphicsExplainOnlyTheDesktopsShareOfVRAM(t *testing.T) {
 }
 
 // What Kairo's work holds in the wslc VM (KairoVRAM, by PCI address) is
-// Kairo's: on Windows nvidia-smi shows none of the VM's processes, only the
-// memory they hold. The rest is weighed as before; memory Kairo's work
-// cannot be told to hold (no reading, another GPU) stays unattributed.
+// Kairo's only while an attempt of Kairo's runs on the GPU, which the
+// daemon knows: on Windows nvidia-smi shows none of the VM's processes, only
+// the memory they hold. The memory is reported unattributed, and the claim
+// says whether the VM's memory explains it (kairo_vm_explains): the daemon
+// takes it off while the GPU's lease is live. Memory Kairo's work cannot
+// be told to hold (no reading, another GPU) is not explained by it.
 func TestNVIDIAMemoryKairosWSLCVMHoldsIsNotUnattributed(t *testing.T) {
 	explain := true
 	for _, tc := range []struct {
-		name      string
-		held      map[string]int64
-		err       error
-		wantClaim bool
+		name     string
+		held     map[string]int64
+		err      error
+		explains string // the claim's kairo_vm_explains ("" for none)
 	}{
-		{"the VM holds it", map[string]int64{"2b:00.0": 5 << 30}, nil, false},
-		{"another GPU's", map[string]int64{"01:00.0": 5 << 30}, nil, true},
-		{"not read", nil, errors.New("no counter"), true},
-		{"the VM holds part", map[string]int64{"2b:00.0": 1 << 30}, nil, true},
+		{"the VM holds it", map[string]int64{"2b:00.0": 5 << 30}, nil, "true"},
+		{"another GPU's", map[string]int64{"01:00.0": 5 << 30}, nil, ""},
+		{"not read", nil, errors.New("no counter"), ""},
+		{"the VM holds part", map[string]int64{"2b:00.0": 1 << 30}, nil, "false"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := &NVIDIA{ProviderID: "p", NodeID: "n", GraphicsExplainVRAM: &explain,
@@ -79,14 +86,25 @@ func TestNVIDIAMemoryKairosWSLCVMHoldsIsNotUnattributed(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			got := false
+			var claims []store.ExternalClaim
 			for _, c := range snap.Claims {
 				if c.ClaimKind == "unattributed_activity" {
-					got = true
+					claims = append(claims, c)
 				}
 			}
-			if got != tc.wantClaim {
-				t.Fatalf("unattributed claim = %v, want %v: %+v", got, tc.wantClaim, snap.Claims)
+			if len(claims) != 1 {
+				t.Fatalf("unattributed claims %+v", snap.Claims)
+			}
+			var evidence map[string]any
+			if err := json.Unmarshal(claims[0].Evidence, &evidence); err != nil {
+				t.Fatal(err)
+			}
+			got := ""
+			if v, ok := evidence["kairo_vm_explains"]; ok {
+				got = fmt.Sprint(v)
+			}
+			if got != tc.explains || evidence["used_memory_bytes"] == nil {
+				t.Fatalf("evidence %s, want kairo_vm_explains %q", claims[0].Evidence, tc.explains)
 			}
 			if tc.name == "the VM holds it" && string(snap.Observations[0].Evidence) != `{"kairo_vm_bytes":5368709120,"source":"nvidia-smi"}` {
 				t.Fatalf("evidence %s", snap.Observations[0].Evidence)
