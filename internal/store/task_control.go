@@ -288,10 +288,6 @@ func (s *Store) RerunTaskWith(ctx context.Context, project, name, actor, request
 	if err = json.Unmarshal([]byte(templateBody), &template); err != nil {
 		return RerunResult{}, err
 	}
-	// one that makes no execution Kairo runs now is declared again, not rerun
-	if template.Gang != nil {
-		return RerunResult{}, taskConflict{fmt.Sprintf("task %s: %s", name, gangsAreNoMore)}
-	}
 	snapshot, err := rerunSnapshotTx(ctx, tx, task, template, strings.TrimSpace(opts.Source))
 	if err != nil {
 		return RerunResult{}, err
@@ -300,6 +296,11 @@ func (s *Store) RerunTaskWith(ctx context.Context, project, name, actor, request
 	if from := strings.TrimSpace(opts.FromCheckpoint); from != "" {
 		if !template.Checkpointable {
 			return RerunResult{}, taskConflict{fmt.Sprintf("task %s is not a checkpointable single execution; it is not rerun from a checkpoint", name)}
+		}
+		// a gang's checkpoint is a round every member published its part
+		// of, each member going on from its own: not one reference for all
+		if template.Gang != nil {
+			return RerunResult{}, taskConflict{fmt.Sprintf("task %s is a gang: it is not rerun from a checkpoint (a gang goes on from one when it is suspended, or lost a member with continue_after_loss)", name)}
 		}
 		commandID := from
 		if from == "latest" {

@@ -78,6 +78,10 @@ type ExecutionSpec struct {
 	InputContinuationRef *string            `json:"input_continuation_ref,omitempty"`
 	Exclusive            []ExclusiveRequest `json:"exclusive"`
 	Capacity             CapacityRequest    `json:"capacity"`
+	// Gang runs the execution as Size processes, one per node, started together
+	// (see gang.go). The submitted execution is rank 0 (the leader); ranks
+	// 1..Size-1 are member executions created with it.
+	Gang *GangSpec `json:"gang,omitempty"`
 	// Env is added to the attempt's environment (envspec.Validate); it never
 	// overrides what Kairo sets. Left out of the digest when empty.
 	Env map[string]string `json:"env,omitempty"`
@@ -127,6 +131,63 @@ type ExecutionSpec struct {
 	// runs its stages where the checkpoint's ran, as they are part of where
 	// its streams stand. Left out of the digest when empty.
 	StreamSnapshot string `json:"stream_snapshot,omitempty"`
+}
+
+// GangSpec describes a multi-node execution. Every rank asks for the
+// execution's resources on its own node unless it gives its own; Ranks
+// overrides argv, cwd, the executor selector, exclusive or capacity of single
+// ranks (a Windows rank and a Linux rank need different paths, a two-GPU
+// node and a one-GPU node different requests) and merges a rank's env over the
+// execution's.
+type GangSpec struct {
+	Size int `json:"size"`
+	// Port is the rendezvous port on member 0's address on the generation's
+	// segment; 0: GangDefaultPort.
+	Port  int        `json:"port,omitempty"`
+	Ranks []GangRank `json:"ranks,omitempty"`
+	// What the members' links must be (fabric_evidence.go): a round trip of
+	// at most MaxRTTMillis, at least MinMiBPerSecond each way (0: either
+	// way, any), and none metered unless Metered. Absent from the JSON when
+	// unset, so gang digests do not change.
+	MaxRTTMillis    float64 `json:"max_rtt_ms,omitempty"`
+	MinMiBPerSecond float64 `json:"min_mib_per_second,omitempty"`
+	Metered         bool    `json:"metered,omitempty"`
+}
+
+type GangRank struct {
+	Rank             int               `json:"rank"`
+	Argv             []string          `json:"argv,omitempty"`
+	CWD              string            `json:"cwd,omitempty"`
+	ExecutorSelector json.RawMessage   `json:"executor_selector,omitempty"`
+	Env              map[string]string `json:"env,omitempty"`
+	// Exclusive and Capacity, when set, replace the execution's for this rank
+	// (an empty Exclusive asks for no GPU). Absent from the JSON when unset, so
+	// existing gang digests do not change.
+	Exclusive *[]ExclusiveRequest `json:"exclusive,omitempty"`
+	Capacity  *CapacityRequest    `json:"capacity,omitempty"`
+	// InputContinuationRef and InputCheckpointCommand: of a gang's
+	// continuation, the checkpoint this member goes on from (its own, of the
+	// round the whole gang published: gangcheckpoint.go).
+	InputContinuationRef   *string `json:"input_continuation_ref,omitempty"`
+	InputCheckpointCommand string  `json:"input_checkpoint_command,omitempty"`
+}
+
+// GangLaunch is what one rank of a placed gang is told at launch: its rank and
+// where rank 0 listens. It is read from the placement, never from the caller.
+type GangLaunch struct {
+	GangID      string `json:"gang_id"`
+	PlacementID string `json:"placement_id"`
+	Rank        int    `json:"rank"`
+	Size        int    `json:"size"`
+	MasterAddr  string `json:"master_addr"`
+	MasterPort  int    `json:"master_port"`
+	// The generation's segment (fabric): its VNI, subnet and MTU, this
+	// member's address on it (CIDR) and every member's, in rank order.
+	VNI       int      `json:"vni,omitempty"`
+	Subnet    string   `json:"subnet,omitempty"`
+	MTU       int      `json:"mtu,omitempty"`
+	Address   string   `json:"address,omitempty"`
+	Addresses []string `json:"addresses,omitempty"`
 }
 
 type ExecutionRequest struct {

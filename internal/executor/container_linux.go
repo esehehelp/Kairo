@@ -170,6 +170,12 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 		}
 		devices["kairo-nvidia"] = map[string]string{"type": "disk", "source": driver, "path": containerNVIDIA, "readonly": "true"}
 	}
+
+	if g := spec.Gang; g != nil {
+		// a gang member: a second NIC on its generation's segment (its
+		// init gives it its address)
+		devices["kairo-gang"] = map[string]string{"type": "nic", "nictype": "bridged", "parent": g.Device, "mtu": strconv.Itoa(g.MTU), "name": gangNIC}
+	}
 	body, err := json.Marshal(map[string]any{
 		"config": map[string]string{
 			"security.privileged": strconv.FormatBool(nested),
@@ -216,6 +222,9 @@ func runInstance(ctx context.Context, spec containerSpec, logf func(string, ...a
 	}
 	if _, err := incusCommand(ctx, nil, "start", spec.Instance); err != nil {
 		return shimNotStarted, err
+	}
+	if spec.APIProxy != "" {
+		go addAPIProxy(ctx, spec, logf)
 	}
 	warned, failures := false, 0
 	for {
@@ -709,8 +718,39 @@ func containerInit(specPath string) int {
 	if !waitForNetwork("/sys/class/net", "/proc/net/route", "/proc/net/ipv6_route", networkWait) {
 		fmt.Fprintln(stderr, "kairo container: no default route after", networkWait, "(starting without one)")
 	}
+	// the daemon's API on the fabric, at its own address, through the
+	// proxy device listening on every address of the container
+	if spec.APIProxy != "" {
+		if err := apiOnLoopback(spec.APIProxy, filepath.Join(containerRoot, "run", apiReadyFile), apiProxyWait); err != nil {
+			fmt.Fprintln(stderr, "kairo container: the daemon's API through the host:", err)
+		}
+	}
+	// caught, not ignored: the argv starts with the default dispositions.
+	// A stop of the container comes to this init (its runtime stops it: the
+	// runner asks it to), which passes it on to the argv's group; lxc's halt
+	// signal (SIGPWR: pct, Incus) is passed on as SIGTERM. One that comes
+	// before the argv starts (at a gang's barrier) ends the init.
+	sigs := make(chan os.Signal, 8)
+	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGPWR)
+	// a gang member: on its generation's segment, every other member
+	// reached, both ways (container_gang.go)
+	gangIface := ""
+	if spec.Gang != nil {
+		iface, err := gangJoin(spec.Gang, stderr, sigs)
+		if err != nil {
+			fmt.Fprintln(stderr, "kairo container: gang:", err)
+			if errors.Is(err, errStoppedAtBarrier) {
+				return writeShimExit(containerExitIn, exitStoppedBeforeStart)
+			}
+			return writeShimExit(containerExitIn, shimGangUnmet)
+		}
+		gangIface = iface
+	}
 	env := containerEnv(os.Environ(), spec.Env, len(spec.GPUs) > 0)
 	env = replaceEnv(replaceEnv(env, "USER", user), "LOGNAME", user)
+	if gangIface != "" {
+		env = replaceEnv(replaceEnv(env, "NCCL_SOCKET_IFNAME", gangIface), "GLOO_SOCKET_IFNAME", gangIface)
+	}
 	// argv[0] is looked up on the attempt's PATH
 	_ = os.Setenv("PATH", containerEnvValue(env, "PATH"))
 	argv0, err := exec.LookPath(spec.Argv[0])
@@ -741,12 +781,6 @@ func containerInit(specPath string) int {
 	}
 	cmd := &exec.Cmd{Path: argv0, Args: spec.Argv, Dir: spec.CWD, Env: env, Stdout: stdout, Stderr: stderr,
 		SysProcAttr: &syscall.SysProcAttr{Setpgid: true, Credential: attemptCredential()}}
-	// caught, not ignored: the argv starts with the default dispositions.
-	// A stop of the container comes to this init (its runtime stops it: the
-	// runner asks it to), which passes it on to the argv's group; lxc's halt
-	// signal (SIGPWR: pct, Incus) is passed on as SIGTERM.
-	sigs := make(chan os.Signal, 8)
-	signal.Notify(sigs, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP, syscall.SIGPWR)
 	if err := cmd.Start(); err != nil {
 		fmt.Fprintln(stderr, "kairo container: start:", err)
 		return finish(shimNotStarted)
@@ -1150,3 +1184,31 @@ const (
 	containerSweepInterval = 10 * time.Minute
 	containerSweepTimeout  = 5 * time.Minute
 )
+
+// apiProxyWait bounds how long the runner waits for the init to put the
+// daemon's address on lo, and the init for the proxy behind it.
+const apiProxyWait = time.Minute
+
+// apiReadyFile is written by the init (in /kairo/run) once the daemon's
+// address is on the container's lo.
+const apiReadyFile = "api-address"
+
+// addAPIProxy gives the running container spec.Instance the daemon's API on
+// the fabric (README: fabric), once its init has put the daemon's address
+// on lo: a proxy device listening at that address only, in the container,
+// and connecting from the host.
+func addAPIProxy(ctx context.Context, spec containerSpec, logf func(string, ...any)) {
+	for deadline := time.Now().Add(apiProxyWait); ; time.Sleep(200 * time.Millisecond) {
+		if _, err := os.Stat(filepath.Join(spec.RunDir, apiReadyFile)); err == nil {
+			break
+		}
+		if time.Now().After(deadline) || ctx.Err() != nil {
+			logf("the init did not put %s on lo in %s: no API proxy", spec.APIProxy, apiProxyWait)
+			return
+		}
+	}
+	if _, err := incusCommand(ctx, nil, "config", "device", "add", spec.Instance, "kairo-api", "proxy",
+		"bind=instance", "listen=tcp:"+spec.APIProxy, "connect=tcp:"+spec.APIProxy); err != nil {
+		logf("the API proxy of %s: %v", spec.Instance, err)
+	}
+}

@@ -470,6 +470,19 @@ func (s *Server) agentOps() []agentOp {
 			func(ctx context.Context, b agentops.AttemptUsage) (agentops.OK, error) {
 				return recorded(s.Store.RecordAttemptUsage(ctx, b.AttemptID, b.RAMBytes, b.DiskWrittenBytes))
 			}),
+		handle(s, agentops.FabricSync,
+			func(_ context.Context, b agentops.FabricSyncRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.FabricSyncRequest) (store.FabricView, error) {
+				if s.FabricPrefix == "" {
+					return store.FabricView{}, fmt.Errorf("%w: the daemon has no [fabric] prefix", store.ErrFabric)
+				}
+				return s.Store.SyncFabric(ctx, b.NodeID, store.FabricPlan{Prefix: s.FabricPrefix, ASN: s.FabricASN, VXLANPort: s.FabricVXLANPort}, b.FabricSelf)
+			}),
+		handle(s, agentops.FabricLinksSaid,
+			func(_ context.Context, b agentops.FabricLinksRequest) (string, error) { return b.NodeID, nil },
+			func(ctx context.Context, b agentops.FabricLinksRequest) (agentops.OK, error) {
+				return recorded(s.Store.RecordFabricLinks(ctx, b.NodeID, b.FabricLinksReport))
+			}),
 		handle(s, agentops.AttemptStreamsSaid,
 			func(ctx context.Context, b agentops.AttemptStreams) (string, error) {
 				return s.Store.AttemptNode(ctx, b.AttemptID)

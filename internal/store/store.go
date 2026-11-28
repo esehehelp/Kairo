@@ -36,6 +36,12 @@ var (
 	ErrNoSchema = errors.New("the database holds no Kairo schema")
 	// ErrForeignDatabase: the database has tables but no Kairo schema.
 	ErrForeignDatabase = errors.New("the database is not empty and holds no Kairo schema; use an empty database")
+	// ErrGangNotReady: a gang rank is prepared but not every rank is yet; the
+	// executor keeps its prepared reservation and asks again.
+	ErrGangNotReady = errors.New("gang placement is not prepared on every rank yet")
+	// ErrGangAborted: the gang placement was given up; the executor must clean
+	// up and release its reservation.
+	ErrGangAborted = errors.New("gang placement was aborted")
 )
 
 // LockStatement makes a transaction writable and takes the decision lock

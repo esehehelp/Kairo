@@ -7,15 +7,20 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
 	"kairo/internal/agentclient"
 	"kairo/internal/config"
 	"kairo/internal/executor"
+	"kairo/internal/fabric"
 	"kairo/internal/provider"
 	"kairo/internal/store"
 	"kairo/internal/tlsutil"
@@ -91,6 +96,79 @@ func agentCommand(args []string) error {
 		}
 		registered = append(registered, agentclient.Provider{ID: p.ID, Kind: p.Kind})
 	}
+	// this installation's containers (another's on this host are none of its);
+	// checked before anything is made with the prefix (FRR's container)
+	if cfg.ContainerPrefix != "" {
+		if err := executor.ValidContainerPrefix(cfg.ContainerPrefix); err != nil {
+			return err
+		}
+		executor.ContainerPrefix = cfg.ContainerPrefix
+	}
+	// The fabric (issue #47): the node's fixed address there, known from a
+	// run before (or from the daemon now, once the node is known to it),
+	// names its transfer endpoint unless [packs] addr says otherwise.
+	var fab *fabric.Manager
+	packAddr := cfg.Packs.Addr
+	// off the fabric (first start, every peer moved): the daemon at its
+	// bootstrap address
+	var bootstrap *agentclient.Client
+	if cfg.Fabric.Enabled {
+		if cfg.Fabric.BootstrapURL != "" {
+			bootstrap = agentclient.New(cfg.Fabric.BootstrapURL, cfg.Token, tlsConfig)
+		}
+		fab = &fabric.Manager{Interface: cfg.Fabric.Interface, ListenPort: cfg.Fabric.ListenPort, KeyFile: cfg.Fabric.KeyFile, Endpoints: cfg.Fabric.Endpoints, Logger: logger,
+			Sync: func(ctx context.Context, self store.FabricSelf) (store.FabricView, error) {
+				view, err := client.SyncFabric(ctx, cfg.Node.ID, self)
+				if err != nil && bootstrap != nil {
+					if v, berr := bootstrap.SyncFabric(ctx, cfg.Node.ID, self); berr == nil {
+						return v, nil
+					}
+				}
+				return view, err
+			},
+			Report: func(ctx context.Context, report store.FabricLinksReport) error {
+				return client.ReportFabricLinks(ctx, cfg.Node.ID, report)
+			}}
+		// peers time a connect to the transfer endpoint at the fabric address
+		// (not on Windows: the endpoint is off the fabric there)
+		if _, port, err := net.SplitHostPort(cfg.Packs.Listen); err == nil && fabric.HostOnFabric() {
+			fab.ProbePort, _ = strconv.Atoi(port)
+		}
+		if fab.RelayFrom, fab.RelayTo, err = config.ParseRelayPorts(cfg.Fabric.RelayPorts); err != nil {
+			return err
+		}
+		// FRR and the segments (issue #47 phase 2), FRR's container named as
+		// this installation's containers are
+		prefix := cfg.ContainerPrefix
+		if prefix == "" {
+			prefix = executor.DefaultContainerPrefix
+		}
+		fab.Routing, fab.NodeID, fab.Names, fab.RouterName = cfg.Fabric.FabricRouting(), cfg.Node.ID, cfg.Fabric.Names, prefix+"frr"
+		fab.Metered = cfg.Fabric.Metered
+		// the daemon's API is what this node routes onto the fabric for its
+		// containers (a wslc container's way to it at a fabric address);
+		// nothing else it routes goes there
+		fab.Reach = apiReach(ctx, cfg.AttemptAPIURL)
+		// what fetches from other agents took measures the links
+		executor.TransferObserved = fab.Received
+		// back on the fabric as it was last, before the daemon is asked
+		if err := fab.Restore(ctx); err != nil {
+			logger.Warn("fabric not restored", "error", err)
+		}
+		address := fabric.KnownAddress(cfg.Fabric.KeyFile)
+		if err := fab.Once(ctx); err != nil {
+			logger.Warn("fabric not set up before registration (set up after it)", "error", err)
+		} else {
+			address = fab.Address()
+		}
+		// on Windows the fabric is in the wslc VM: the agent's transfer
+		// endpoint is off it ([packs] addr)
+		if packAddr == "" && address != "" && cfg.Packs.Listen != "" && fabric.HostOnFabric() {
+			if _, port, err := net.SplitHostPort(cfg.Packs.Listen); err == nil {
+				packAddr = net.JoinHostPort(address, port)
+			}
+		}
+	}
 	executors := make([]store.Executor, 0, len(cfg.Executors))
 	for _, e := range cfg.Executors {
 		labels, err := e.Attributes()
@@ -99,9 +177,9 @@ func agentCommand(args []string) error {
 		}
 		// Executors advertise this agent's pack server: other agents fetch
 		// from it the packs they make.
-		if cfg.Packs.Addr != "" {
+		if packAddr != "" {
 			if _, ok := labels["pack_addr"]; !ok {
-				labels["pack_addr"] = cfg.Packs.Addr
+				labels["pack_addr"] = packAddr
 			}
 		}
 		attrs, _ := json.Marshal(labels)
@@ -122,6 +200,21 @@ func agentCommand(args []string) error {
 	// after the agent.
 	for delay := time.Second; ; delay = min(2*delay, 30*time.Second) {
 		stale, kept, regErr := client.RegisterAdopting(ctx, node, executors, registered, executor.Adopted(records))
+		if regErr != nil && bootstrap != nil {
+			// not reached at server_url: off the fabric, which its first
+			// start cannot join before the daemon knows the node (its sync
+			// is refused until it registers); registered at the bootstrap
+			// address, it joins, and goes on at server_url
+			if s, k, err := bootstrap.RegisterAdopting(ctx, node, executors, registered, executor.Adopted(records)); err == nil {
+				logger.Info("registered at the fabric's bootstrap address", "server_url_error", regErr)
+				stale, kept, regErr = s, k, nil
+				if fab != nil {
+					if err := fab.Once(ctx); err != nil {
+						logger.Warn("fabric not set up after registration (set up later)", "error", err)
+					}
+				}
+			}
+		}
 		adopted = kept
 		if regErr == nil {
 			for id, n := range stale {
@@ -139,6 +232,11 @@ func agentCommand(args []string) error {
 		}
 	}
 	logger.Info("agent registered", "node_id", cfg.Node.ID, "server", cfg.ServerURL, "executors", len(executors))
+	if fab != nil {
+		// kept on the fabric from now on (its address, if given only now,
+		// names the transfer endpoint from the next start)
+		go fab.Run(ctx)
+	}
 
 	errCh := make(chan error, 2+len(cfg.Executors))
 	shipper := &agentclient.LogShipper{Client: client, Dir: cfg.LogDirectory}
@@ -168,6 +266,19 @@ func agentCommand(args []string) error {
 		exec.MinLogFreeBytes = int64(cfg.LogMinFreeMiB) << 20
 		exec.FlushLogs = shipper.ShipAttempt
 		exec.Providers = providerSet
+		if fab != nil && fab.Routing {
+			// a gang member's container is on its generation's segment
+			exec.Segments = fab.EnsureSegment
+		}
+		// the daemon's API at a fabric address: containers reach it through
+		// their host (one bridged onto the LAN has no route into the fabric)
+		if u, err := url.Parse(cfg.AttemptAPIURL); err == nil && fab != nil && fabric.HostOnFabric() && fab.OnFabric(u.Hostname()) {
+			port := u.Port()
+			if port == "" {
+				port = "443"
+			}
+			exec.APIProxy = net.JoinHostPort(u.Hostname(), port)
+		}
 		exec.Adopt(records, adopted)
 		go func() {
 			if err := exec.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
@@ -180,7 +291,12 @@ func agentCommand(args []string) error {
 		if err != nil {
 			return fmt.Errorf("packs certificate: %w", err)
 		}
-		server := executor.PackHTTPServer(cfg.Packs.Listen, cert, &executor.PackServer{Store: client, NodeID: cfg.Node.ID, Executors: running, Logger: logger, NoBench: cfg.ObserveOnly})
+		packs := &executor.PackServer{Store: client, NodeID: cfg.Node.ID, Executors: running, Logger: logger, NoBench: cfg.ObserveOnly}
+		if fab != nil {
+			// a peer on the fabric may time the link from this node
+			packs.FabricPeer = fab.OnFabric
+		}
+		server := executor.PackHTTPServer(cfg.Packs.Listen, cert, packs)
 		go func() {
 			if err := server.ListenAndServeTLS("", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				errCh <- fmt.Errorf("pack server: %w", err)
@@ -207,4 +323,32 @@ func agentCommand(args []string) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// apiReach is where the API URL u is: its address (or its name's) and
+// port, for a fabric's Reach.
+func apiReach(ctx context.Context, u string) []netip.AddrPort {
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Hostname() == "" {
+		return nil
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = "443"
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return nil
+	}
+	addrs := []netip.Addr{}
+	if a, err := netip.ParseAddr(parsed.Hostname()); err == nil {
+		addrs = append(addrs, a)
+	} else if found, err := net.DefaultResolver.LookupNetIP(ctx, "ip", parsed.Hostname()); err == nil {
+		addrs = found
+	}
+	var out []netip.AddrPort
+	for _, a := range addrs {
+		out = append(out, netip.AddrPortFrom(a.Unmap(), uint16(n)))
+	}
+	return out
 }

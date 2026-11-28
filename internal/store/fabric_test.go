@@ -1,0 +1,310 @@
+package store
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"slices"
+	"strings"
+	"testing"
+	"time"
+)
+
+func fabricKey(b byte) string {
+	return base64.StdEncoding.EncodeToString([]byte(strings.Repeat(string(rune(b)), 32)))
+}
+
+// A node is given the lowest free address of the fabric's prefix once, and
+// keeps it whatever it says of itself later; it is told the other nodes
+// that have a key, never itself. A malformed key or endpoint, or a prefix
+// that no longer holds its address, is refused.
+func TestANodesFabricAddressIsGivenOnceAndKept(t *testing.T) {
+	store := openCoordinationStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"a", "b"} {
+		if err := store.UpsertNode(ctx, Node{ID: id, Name: id, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const prefix = "10.66.0.0/16"
+	a, err := store.SyncFabric(ctx, "a", FabricPlan{Prefix: prefix}, FabricSelf{PublicKey: fabricKey('a'), ListenPort: 51820, Endpoints: []string{"192.0.2.1:51820"}})
+	if err != nil || a.Address != "10.66.0.1" || a.Prefix != prefix || len(a.Peers) != 0 {
+		t.Fatalf("a: %+v %v", a, err)
+	}
+	b, err := store.SyncFabric(ctx, "b", FabricPlan{Prefix: prefix}, FabricSelf{PublicKey: fabricKey('b'), ListenPort: 51820, Endpoints: []string{"192.0.2.2:51820", "203.0.113.2:51820"}})
+	if err != nil || b.Address != "10.66.0.2" || len(b.Peers) != 1 || b.Peers[0].NodeID != "a" || b.Peers[0].Address != "10.66.0.1" {
+		t.Fatalf("b: %+v %v", b, err)
+	}
+	// a says it is elsewhere now: same address, b's endpoints in its view
+	a, err = store.SyncFabric(ctx, "a", FabricPlan{Prefix: prefix}, FabricSelf{PublicKey: fabricKey('a'), ListenPort: 51821, Endpoints: []string{"198.51.100.1:51821"}})
+	if err != nil || a.Address != "10.66.0.1" || len(a.Peers) != 1 || len(a.Peers[0].Endpoints) != 2 {
+		t.Fatalf("a again: %+v %v", a, err)
+	}
+	nodes, err := store.FabricNodes(ctx)
+	if err != nil || len(nodes) != 2 || nodes[0].ListenPort != 51821 || nodes[0].Endpoints[0] != "198.51.100.1:51821" {
+		t.Fatalf("nodes: %+v %v", nodes, err)
+	}
+	for _, bad := range []FabricSelf{
+		{PublicKey: "short", ListenPort: 51820},
+		{PublicKey: fabricKey('a'), ListenPort: 0},
+		{PublicKey: fabricKey('a'), ListenPort: 51820, Endpoints: []string{"no-port"}},
+	} {
+		if _, err := store.SyncFabric(ctx, "a", FabricPlan{Prefix: prefix}, bad); !errors.Is(err, ErrFabric) {
+			t.Fatalf("%+v: %v", bad, err)
+		}
+	}
+	if _, err := store.SyncFabric(ctx, "a", FabricPlan{Prefix: "10.67.0.0/16"}, FabricSelf{PublicKey: fabricKey('a'), ListenPort: 51820}); !errors.Is(err, ErrFabric) {
+		t.Fatalf("a prefix without a's address: %v", err)
+	}
+	if _, err := ParseFabricPrefix("10.66.0.1/16"); err == nil {
+		t.Fatal("a prefix that is no network address")
+	}
+}
+
+// A node's links are recorded as it sees them; a large transfer it received
+// moves the link from the sender halfway (a small one is not counted); a
+// path that changes forgets the bandwidth over the old one. The planner
+// takes a transfer's speed from the link that way, before any bench.
+func TestDirectedLinksAreMeasuredByTransfersAndForgottenWithTheirPath(t *testing.T) {
+	store := openCoordinationStore(t)
+	ctx := context.Background()
+	for _, id := range []string{"a", "b"} {
+		if err := store.UpsertNode(ctx, Node{ID: id, Name: id, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.SyncFabric(ctx, id, FabricPlan{Prefix: "10.66.0.0/16"}, FabricSelf{PublicKey: fabricKey(id[0]), ListenPort: 51820, ProbePort: 7475}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rtt := 0.6
+	// a sees b directly; b received 64 MiB from a in 2 s, and 1 MiB (not counted)
+	if err := store.RecordFabricLinks(ctx, "a", FabricLinksReport{Peers: []FabricPeerSeen{{Node: "b", Path: FabricPathDirect, Endpoint: "192.0.2.2:51820", RTTMillis: &rtt}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordFabricLinks(ctx, "b", FabricLinksReport{Peers: []FabricPeerSeen{{Node: "a", Path: FabricPathDirect, Endpoint: "192.0.2.1:51820"}},
+		Received: []FabricReceived{{From: "a", Bytes: 64 << 20, Seconds: 2}, {From: "a", Bytes: 1 << 20, Seconds: 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	links, err := store.FabricLinks(ctx)
+	if err != nil || len(links) != 2 || links[0].Src != "a" || links[0].RTTMillis == nil || *links[0].RTTMillis != 0.6 ||
+		links[0].BytesPerSecond == nil || *links[0].BytesPerSecond != 32<<20 || links[1].BytesPerSecond != nil {
+		t.Fatalf("links %+v %v", links, err)
+	}
+	perf, err := loadNodePerf(ctx, store.db)
+	if err != nil || perf.link("a", "b") != 32<<20 || perf.link("b", "a") != defaultLinkBytesPerSecond {
+		t.Fatalf("a->b %v, b->a %v, %v", perf.link("a", "b"), perf.link("b", "a"), err)
+	}
+	// a's path to b goes through a relay now: what was measured is forgotten
+	if err := store.RecordFabricLinks(ctx, "a", FabricLinksReport{Peers: []FabricPeerSeen{{Node: "b", Path: FabricPathRelay, Endpoint: "198.51.100.9:41000"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if links, err = store.FabricLinks(ctx); err != nil || links[0].BytesPerSecond != nil || links[0].Path != FabricPathRelay || links[0].RTTMillis == nil {
+		t.Fatalf("after the path changed: %+v %v", links, err)
+	}
+	if err := store.RecordFabricLinks(ctx, "a", FabricLinksReport{Peers: []FabricPeerSeen{{Node: "b", Path: "sideways"}}}); !errors.Is(err, ErrFabric) {
+		t.Fatalf("an unknown path: %v", err)
+	}
+}
+
+// A pair whose link has had no fresh handshake two reports running is
+// given a relay: a node offering relay ports that has fresh handshakes with
+// both. Each side then reaches the other at the relay's endpoint and its
+// own side's port, tried after its endpoints; the relay is told the pair
+// with the hosts it sees each side at. A node is also handed the endpoints
+// its other peers see a peer at.
+func TestAPairWithNoPathIsGivenARelay(t *testing.T) {
+	store := openCoordinationStore(t)
+	ctx := context.Background()
+	const prefix = "10.66.0.0/16"
+	selves := map[string]FabricSelf{
+		"a": {PublicKey: fabricKey('a'), ListenPort: 51820},
+		"b": {PublicKey: fabricKey('b'), ListenPort: 51820},
+		"r": {PublicKey: fabricKey('r'), ListenPort: 51820, Endpoints: []string{"203.0.113.9:51820"}, RelayFrom: 41000, RelayTo: 41010},
+	}
+	for _, id := range []string{"a", "b", "r"} {
+		if err := store.UpsertNode(ctx, Node{ID: id, Name: id, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.SyncFabric(ctx, id, FabricPlan{Prefix: prefix}, selves[id]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fresh := time.Now().UTC().Format(time.RFC3339Nano)
+	// r reaches both (seeing them at their NAT mappings)
+	if err := store.RecordFabricLinks(ctx, "r", FabricLinksReport{Peers: []FabricPeerSeen{
+		{Node: "a", Path: FabricPathDirect, Endpoint: "198.51.100.1:3001", HandshakeAt: fresh},
+		{Node: "b", Path: FabricPathDirect, Endpoint: "198.51.100.2:3002", HandshakeAt: fresh},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	// a reaches b on no path, twice
+	for range 2 {
+		if err := store.RecordFabricLinks(ctx, "a", FabricLinksReport{Peers: []FabricPeerSeen{{Node: "b", Path: FabricPathDirect}}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view := func(node string) FabricView {
+		t.Helper()
+		v, err := store.SyncFabric(ctx, node, FabricPlan{Prefix: prefix}, selves[node])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	peer := func(v FabricView, id string) FabricNode {
+		for _, p := range v.Peers {
+			if p.NodeID == id {
+				return p
+			}
+		}
+		t.Fatalf("no peer %s in %+v", id, v)
+		return FabricNode{}
+	}
+	a, b, r := view("a"), view("b"), view("r")
+	if pb := peer(a, "b"); pb.RelayEndpoint != "203.0.113.9:41000" || len(pb.Endpoints) != 1 || pb.Endpoints[0] != "198.51.100.2:3002" {
+		t.Fatalf("a's view of b: %+v", pb)
+	}
+	if pa := peer(b, "a"); pa.RelayEndpoint != "203.0.113.9:41001" {
+		t.Fatalf("b's view of a: %+v", pa)
+	}
+	if len(r.Relays) != 1 || r.Relays[0].PortA != 41000 || r.Relays[0].PortB != 41001 || r.Relays[0].HostA != "198.51.100.1" || r.Relays[0].HostB != "198.51.100.2" {
+		t.Fatalf("r's relays: %+v", r.Relays)
+	}
+	if pr := peer(a, "r"); pr.RelayEndpoint != "" {
+		t.Fatalf("a's view of r: %+v", pr)
+	}
+	// b is elsewhere now: its pairs try a direct path again
+	selves["b"] = FabricSelf{PublicKey: fabricKey('b'), ListenPort: 51820, Endpoints: []string{"192.0.2.77:51820"}}
+	view("b")
+	if pb := peer(view("a"), "b"); pb.RelayEndpoint != "" {
+		t.Fatalf("still relayed after b moved: %+v", pb)
+	}
+	if r = view("r"); len(r.Relays) != 0 {
+		t.Fatalf("r still relays: %+v", r.Relays)
+	}
+}
+
+// A node that runs FRR is told the fabric's ASN, VXLAN port and route
+// reflectors: the first nodes that run FRR and report their links, those
+// with endpoints first; a node that runs none is told no routing. Segments
+// are made on nodes that run FRR, each its own VNI and /24, and each node is
+// told the ones it is on.
+func TestRoutingNodesAreToldTheReflectorsAndTheirSegments(t *testing.T) {
+	store := openCoordinationStore(t)
+	ctx := context.Background()
+	plan := FabricPlan{Prefix: "10.66.0.0/16", VXLANPort: 4790}
+	selves := map[string]FabricSelf{
+		"a": {PublicKey: fabricKey('a'), ListenPort: 51820, Endpoints: []string{"192.0.2.1:51820"}, Routing: true},
+		"b": {PublicKey: fabricKey('b'), ListenPort: 51820, Routing: true},
+		"c": {PublicKey: fabricKey('c'), ListenPort: 51820, Routing: true},
+		"d": {PublicKey: fabricKey('d'), ListenPort: 51820, Endpoints: []string{"192.0.2.4:51820"}},
+	}
+	ids := []string{"a", "b", "c", "d"}
+	for _, id := range ids {
+		if err := store.UpsertNode(ctx, Node{ID: id, Name: id, OS: "linux", Architecture: "amd64", Enabled: true}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.SyncFabric(ctx, id, plan, selves[id]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	view := func(id string) FabricView {
+		t.Helper()
+		v, err := store.SyncFabric(ctx, id, plan, selves[id])
+		if err != nil {
+			t.Fatal(err)
+		}
+		return v
+	}
+	address := map[string]string{}
+	for _, id := range ids {
+		address[id] = view(id).Address
+	}
+	// no node reported yet: no reflector
+	if r := view("b").Routing; r == nil || len(r.Reflectors) != 0 || r.ASN != DefaultFabricASN || r.VXLANPort != 4790 {
+		t.Fatalf("before any report: %+v", r)
+	}
+	for _, id := range ids {
+		var peers []FabricPeerSeen
+		for _, other := range ids {
+			if other != id {
+				peers = append(peers, FabricPeerSeen{Node: other, Path: FabricPathDirect})
+			}
+		}
+		if err := store.RecordFabricLinks(ctx, id, FabricLinksReport{Peers: peers}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	b, c := view("b"), view("c")
+	if r := b.Routing; r == nil || !r.Reflector || !slices.Equal(r.Reflectors, []string{address["a"], address["b"]}) {
+		t.Fatalf("b's routing: %+v", r)
+	}
+	if r := c.Routing; r == nil || r.Reflector || !slices.Equal(r.Reflectors, []string{address["a"], address["b"]}) {
+		t.Fatalf("c's routing: %+v", r)
+	}
+	if view("d").Routing != nil {
+		t.Fatal("a node without FRR was told routing")
+	}
+	// segments
+	if _, err := store.CreateFabricSegment(ctx, "10.67.0.0/16", []string{"b", "d"}, 0); !errors.Is(err, ErrFabric) {
+		t.Fatalf("a segment on a node without FRR: %v", err)
+	}
+	s1, err := store.CreateFabricSegment(ctx, "10.67.0.0/16", []string{"c", "b"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2, err := store.CreateFabricSegment(ctx, "10.67.0.0/16", []string{"c"}, 1400)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s1.VNI != 10000 || s1.Subnet != "10.67.0.0/24" || s1.MTU != DefaultSegmentMTU || s2.VNI != 10001 || s2.Subnet != "10.67.1.0/24" || s2.MTU != 1400 {
+		t.Fatalf("segments %+v %+v", s1, s2)
+	}
+	if segs := view("c").Segments; len(segs) != 2 || segs[0].VNI != 10000 || segs[1].VNI != 10001 {
+		t.Fatalf("c's segments: %+v", segs)
+	}
+	if segs := view("a").Segments; len(segs) != 0 {
+		t.Fatalf("a's segments: %+v", segs)
+	}
+	if err := store.DeleteFabricSegment(ctx, 10000); err != nil {
+		t.Fatal(err)
+	}
+	if segs := view("b").Segments; len(segs) != 0 {
+		t.Fatalf("b's segments after the removal: %+v", segs)
+	}
+	listed, err := store.FabricSegments(ctx)
+	if err != nil || len(listed) != 1 || listed[0].VNI != 10001 || !slices.Equal(listed[0].Nodes, []string{"c"}) {
+		t.Fatalf("listed %+v %v", listed, err)
+	}
+	// the freed VNI and subnet are given again
+	s3, err := store.CreateFabricSegment(ctx, "10.67.0.0/16", []string{"b"}, 0)
+	if err != nil || s3.VNI != 10000 || s3.Subnet != "10.67.0.0/24" {
+		t.Fatalf("again: %+v %v", s3, err)
+	}
+}
+
+// What no node sees of a link is refused, the report whole: a handshake
+// time that is not one or is ahead of the daemon's clock (it would keep the
+// link up for good, and every view comparing it fail), an endpoint that is
+// not an address and port, a round trip or a transfer that is no measure.
+func TestALinkReportThatIsNoMeasureIsRefused(t *testing.T) {
+	now := time.Now()
+	ok := func(p FabricPeerSeen) FabricLinksReport { return FabricLinksReport{Peers: []FabricPeerSeen{p}} }
+	big := 1e9
+	for name, r := range map[string]FabricLinksReport{
+		"handshake not a time": ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, HandshakeAt: "yesterday"}),
+		"handshake ahead":      ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, HandshakeAt: now.Add(time.Hour).UTC().Format(time.RFC3339Nano)}),
+		"endpoint not one":     ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, Endpoint: "example.org:51820"}),
+		"round trip":           ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, RTTMillis: &big}),
+		"transfer":             {Peers: []FabricPeerSeen{}, Received: []FabricReceived{{From: "b", Bytes: 8 << 20, Seconds: -1}}},
+	} {
+		if err := r.check(now); !errors.Is(err, ErrFabric) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	rtt := 0.8
+	good := ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, Endpoint: "[2001:db8::2]:51820", HandshakeAt: now.Add(time.Minute).UTC().Format(time.RFC3339Nano), RTTMillis: &rtt})
+	if err := good.check(now); err != nil {
+		t.Fatalf("a report as an agent makes it: %v", err)
+	}
+}

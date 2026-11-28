@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -28,6 +29,9 @@ type Config struct {
 	// SourceDirectory keeps the code snapshots kairo project apply sends
 	// (api/sources.go; default: sources beside log_directory).
 	SourceDirectory string `toml:"source_directory"`
+	// Fabric is the network every node is on (issue #47; store/fabric.go):
+	// without a prefix there is none.
+	Fabric DaemonFabric `toml:"fabric"`
 	// ControlSnapshotMinutes: how often the control plane is snapshotted
 	// into the durable store (README: Kairo keeps itself); 0: every 60,
 	// negative: never.
@@ -503,6 +507,12 @@ type Agent struct {
 	// OwnerUse: how this node's providers tell its owner's use of a
 	// resource (README: Owner use).
 	OwnerUse OwnerUse `toml:"owner_use"`
+	// ContainerPrefix begins the names of the containers this agent makes
+	// for attempts (default kairo-): another installation's agent on the
+	// same host takes another (executor.ContainerPrefix).
+	ContainerPrefix string `toml:"container_prefix"`
+	// Fabric puts this node on the fabric (issue #47).
+	Fabric AgentFabric `toml:"fabric"`
 }
 
 // OwnerUse is an agent's [owner_use]: on unless disabled; a threshold left
@@ -560,6 +570,25 @@ func LoadAgent(path string) (Agent, error) {
 			return a, err
 		}
 	}
+	if a.Fabric.Enabled {
+		if a.Fabric.Interface == "" {
+			a.Fabric.Interface = "kairo0"
+		}
+		if a.Fabric.ListenPort == 0 {
+			a.Fabric.ListenPort = 51820
+		}
+		if a.Fabric.KeyFile == "" {
+			a.Fabric.KeyFile = filepath.Join(filepath.Dir(path), "fabric.key")
+		}
+		if a.Fabric.BootstrapURL != "" {
+			if err := checkNodeURL(a.Fabric.BootstrapURL, a.InsecureHTTP); err != nil {
+				return a, err
+			}
+		}
+		if n := a.Fabric.Names; n != "" && !validFabricNames(n) {
+			return a, fmt.Errorf("fabric.names %q: 1 to 5 lowercase letters or digits, a letter first", n)
+		}
+	}
 	if a.LogDirectory == "" {
 		a.LogDirectory = "local/attempts-agent"
 	}
@@ -578,11 +607,21 @@ func LoadAgent(path string) (Agent, error) {
 		return a, errors.New("owner_use: thresholds are percentages (0-100) and MiB, not negative")
 	}
 	if p := a.Packs; p.Listen != "" || p.Addr != "" || p.CertFile != "" || p.KeyFile != "" {
-		if p.Listen == "" || p.Addr == "" || p.CertFile == "" || p.KeyFile == "" {
-			return a, errors.New("packs needs listen, addr, cert_file and key_file together")
+		// on the fabric, addr may be left out: the node's fabric address
+		// names the endpoint (issue #47)
+		// (not on Windows: the fabric is in the wslc VM, not the agent's)
+		if p.Listen == "" || p.Addr == "" && (!a.Fabric.Enabled || runtime.GOOS == "windows") || p.CertFile == "" || p.KeyFile == "" {
+			return a, errors.New("packs needs listen, addr, cert_file and key_file together (addr may be left out on the fabric, but for Windows)")
 		}
-		if _, port, err := net.SplitHostPort(p.Addr); err != nil || port == "" {
-			return a, fmt.Errorf("packs.addr %q is not host:port", p.Addr)
+		if p.Addr != "" {
+			if _, port, err := net.SplitHostPort(p.Addr); err != nil || port == "" {
+				return a, fmt.Errorf("packs.addr %q is not host:port", p.Addr)
+			}
+		}
+		if p.Addr == "" {
+			if _, port, err := net.SplitHostPort(p.Listen); err != nil || port == "" {
+				return a, fmt.Errorf("packs.listen %q is not host:port (its port names the endpoint at the fabric address)", p.Listen)
+			}
 		}
 	}
 	if a.Node.OS == "" {
@@ -698,3 +737,89 @@ func LoadController(path string) (Controller, error) {
 	}
 	return c, nil
 }
+
+// DaemonFabric is the daemon's [fabric]: Prefix is the IPv4 network the
+// nodes' fabric addresses are given from (each node's once, for good).
+// With Join the daemon's own node is on the fabric too, as an agent's is
+// (the other fields as AgentFabric's), so that nodes reach the daemon at
+// its fabric address.
+type DaemonFabric struct {
+	Prefix string `toml:"prefix"`
+	// ASN and VXLANPort are how the fabric's routing runs (0: a private
+	// 4-byte ASN, 4789); SegmentPrefix is where segments' /24 subnets are
+	// taken from ("": no segments). Issue #47, phase 2.
+	ASN           uint32   `toml:"asn"`
+	VXLANPort     int      `toml:"vxlan_port"`
+	SegmentPrefix string   `toml:"segment_prefix"`
+	Join          bool     `toml:"join"`
+	RelayPorts    string   `toml:"relay_ports"`
+	Interface     string   `toml:"interface"`
+	ListenPort    int      `toml:"listen_port"`
+	KeyFile       string   `toml:"key_file"`
+	Endpoints     []string `toml:"endpoints"`
+}
+
+// AgentFabric is an agent's [fabric] (issue #47): when Enabled, the agent
+// puts its node on the fabric, a WireGuard interface (Interface, default
+// kairo0) listening on ListenPort (default 51820), with its key in KeyFile
+// (default fabric.key beside the agent's configuration; made the first
+// time), and says its peers may reach it at Endpoints ("host:port", in its
+// order of preference). Its transfer endpoint is then advertised at its
+// fabric address (pack_addr), unless [packs] addr says otherwise.
+type AgentFabric struct {
+	Enabled bool `toml:"enabled"`
+	// BootstrapURL is the daemon as reached off the fabric (its LAN or
+	// public address): a node that is not on the fabric yet (its first
+	// start, or every peer moved) says what it is there, while server_url
+	// names the daemon's fabric address.
+	BootstrapURL string `toml:"bootstrap_url"`
+	// RelayPorts ("FROM-TO") are the UDP ports this node offers to relay
+	// other nodes' WireGuard datagrams when they reach each other on no
+	// direct path (a node with a public endpoint; "": it relays none).
+	RelayPorts string `toml:"relay_ports"`
+	// Routing (default true) runs FRR on the node and carries segments
+	// (issue #47 phase 2); Names prefixes the segments' devices (default
+	// "kf": kfb10000, kfv10000; another installation on the same host needs
+	// its own).
+	Routing *bool  `toml:"routing"`
+	Names   string `toml:"names"`
+	// Metered says the node's uplink is paid by the byte (a mobile line): a
+	// gang spans its links only when it says it may (issue #47 phase 5).
+	Metered    bool     `toml:"metered"`
+	Interface  string   `toml:"interface"`
+	ListenPort int      `toml:"listen_port"`
+	KeyFile    string   `toml:"key_file"`
+	Endpoints  []string `toml:"endpoints"`
+}
+
+// ParseRelayPorts reads relay_ports ("FROM-TO", two or more ports from
+// 1024): (0, 0) for "".
+func ParseRelayPorts(s string) (int, int, error) {
+	if s == "" {
+		return 0, 0, nil
+	}
+	from, to, ok := strings.Cut(s, "-")
+	a, err1 := strconv.Atoi(strings.TrimSpace(from))
+	b, err2 := strconv.Atoi(strings.TrimSpace(to))
+	if !ok || err1 != nil || err2 != nil || a < 1024 || b > 65535 || a+1 > b {
+		return 0, 0, fmt.Errorf("relay_ports %q: FROM-TO, two or more ports from 1024", s)
+	}
+	return a, b, nil
+}
+
+// validFabricNames: a segment's devices are named NAMES + "b"/"v" + its VNI
+// (up to 8 digits), within an interface name's 15 characters.
+func validFabricNames(n string) bool {
+	if len(n) < 1 || len(n) > 5 || n[0] < 'a' || n[0] > 'z' {
+		return false
+	}
+	for _, c := range n {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
+}
+
+// FabricRouting says whether an agent on the fabric runs FRR (default yes).
+func (f AgentFabric) FabricRouting() bool { return f.Routing == nil || *f.Routing }

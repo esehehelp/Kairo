@@ -25,6 +25,7 @@ func testLaunch() *store.Launch {
 		CWD:                  "/work",
 		Resources:            []store.ResourceInstance{{ID: "gpu-0", Binding: json.RawMessage(`{"cuda_index":"0"}`)}, {ID: "gpu-1", Binding: json.RawMessage(`{"cuda_index":"1"}`)}},
 		InputContinuationRef: &ref,
+		Gang:                 &store.GangLaunch{GangID: "gang_1", Rank: 1, Size: 2, MasterAddr: "10.0.0.1", MasterPort: 29500},
 	}
 }
 
@@ -111,7 +112,7 @@ func TestDeclaredEnvOverridesTheParentButNotKairo(t *testing.T) {
 		}
 		return out
 	}
-	for name, want := range map[string]string{"PYTHONUTF8": "1", "RANK": "7", "CUDA_VISIBLE_DEVICES": "0,1", "Alpha": "a"} {
+	for name, want := range map[string]string{"PYTHONUTF8": "1", "RANK": "1", "CUDA_VISIBLE_DEVICES": "0,1", "Alpha": "a"} {
 		if got := values(name); len(got) != 1 || got[0] != want {
 			t.Fatalf("%s = %q", name, got)
 		}

@@ -50,7 +50,7 @@ Task は永続的な論理オブジェクトであり、一連のイミュータ
   - [ノード隔離](#ノード隔離)
   - [ノードフェンス](#ノードフェンス)
   - [強制停止](#強制停止)
-  - [Gang（廃止）](#gang廃止)
+  - [Gang](#gang)
 - [Loader（ストリーム）](#loaderストリーム)
 - [Worker SDK](#worker-sdk)
   - [管理対象 Attempt に渡される環境変数](#管理対象-attempt-に渡される環境変数)
@@ -371,6 +371,49 @@ Kairo が使うマシンには持ち主がいます（デスクトップの GPU 
 
 行指向の `wait` と `watch` はバックグラウンド監視に適しており、1 行が 1 イベントとして即座にフラッシュされます。`project status PROJECT` は引き続き JSON を出力し、`--task NAME`（複数回指定可）、`--match`、`--state`、`--live`、`--since` を受け付けます。`project apply` は宣言された Task を出力し（レスポンス全体を得るには `--json`）、競合時には異なる内容で既に宣言されていたすべての Task 名を示します。`project validate` は 1 行のサマリを出力します（展開後の Task を得るには `--json`）。なお、CLI がデーモンより新しく、デーモンが認識できないコマンドを実行した場合は、その旨が通知されます。
 
+## fabric（全ノードの網、作成中：issue #47）
+
+LAN の外（クラウドの VM、別の拠点、持ち歩く端末）のノードも含めて、全ノードを 1 つの WireGuard の網に載せ、その上に BGP EVPN と VXLAN の L2 のセグメントを張ります。WAN の側で DDP や gang を動かすための土台で、いまは第 5 段階の一部（gang：世代ごとのセグメント、メンバーの NIC、起動の関門、分断をまたがない配置、gang 全体の checkpoint、回線の実測にもとづく配置）までできています。ブランチ `feat/wan-fabric` で作り、試験用のインストールで試しています。
+
+- **アドレス**: 各ノードには、デーモンの `[fabric] prefix`（IPv4 のネットワーク）から、最初に名乗ったときに 1 つのアドレスを与えます（その時点で空いている最も小さいもの）。以後は、回線や場所が変わっても変えません（テーブル `fabric_nodes`、イベント `fabric_joined`）。prefix を変えて既存のノードのアドレスが外れると、そのノードは拒否されます。
+- **鍵**: 各ノードは自分の WireGuard の鍵を作って持ちます（`key_file`、既定は agent の設定の横の `fabric.key`。0600）。秘密鍵はノードの外に出ません。デーモンが持つのは、公開鍵、待ち受けのポート、ノードが「ここで届く」と言うエンドポイント（`host:port`、優先順）だけです。
+- **エージェント**: `[fabric]` を `enabled = true` にすると、エージェントは 30 秒ごとにデーモンへ自分を名乗り（エージェント操作 `fabric`）、自分のアドレスと相手の一覧を受け取ります。WireGuard のインターフェース（`interface`、既定 `kairo0`。MTU 1420）を作り、`listen_port`（既定 51820）で待ち受け、相手を設定します。
+  - **最初の起動**: デーモンがまだ知らないノードは fabric に入れないので、`server_url` が fabric のアドレスならデーモンに届きません。そのときエージェントは、`[fabric] bootstrap_url`（fabric の外から届くデーモンの URL）で名乗り、登録します。これでノードがデーモンに知られ、fabric に入り、以後は `server_url` を使います。
+  - 相手に届くエンドポイントはエージェントが選びます。相手の言う順に試し、30 秒たっても握手のない（3 分以内の握手がない）相手は、次のエンドポイントに移ります。握手のある相手は、WireGuard がいま聞いている所（NAT の外側の対応、中継）のままにします。
+  - エンドポイントを言わないノードは、外から届かない（NAT の内側の）ノードとして、自分からつなぎに行きます（25 秒ごとの keepalive）。相手は、エンドポイントがなくても peer として置くので、その握手を受け付けます。
+  - Linux では `ip`（iproute2）と WireGuard の netlink（wgctrl）を使います。`wg`（wireguard-tools）は要りません。
+- **Windows のノード**: 仕事は wslc のコンテナで動くので、fabric のインターフェースは wslc のセッションの VM の中に作ります。エージェントは、横にある `kairo-linux` を VM に写し、`wslc system session run` で VM の root として動かします（隠しコマンド `__kairo-fabric-link`）。
+  - VM の eth0 の MTU は、同じアドレスを持つ Windows のアダプタの MTU に合わせます（VM は 1280 と言い、それを超える相手のフレームが届かないため）。
+  - VM は外からの UDP を受け取れず（Hyper-V のファイアウォール）、出ていく UDP は送り元のポートが付け替えられます。そのため Windows のノードは、エンドポイントを言わない（NAT の内側の）ノードとして設定します（`endpoints = []`）。往復の時間は VM の中から測ります。
+  - エージェント自身の通信（API、転送の口）は fabric に載りません。Windows では `[packs] addr` が要ります。
+- **転送の口**: `[packs] addr` を書かないと、エージェントは転送の口（`pack_addr`）を fabric のアドレスと `listen` のポートで広告します。アドレスはエージェントの設定の横（`key_file` に `.address` を付けたファイル）に覚えておくので、2 回目からの起動では、登録の時点で使えます。転送の口の証明書には、fabric のアドレスも入れておきます。
+- **回線の報告の確かめ**: 握手の時刻として読めないもの、デーモンの時計より 5 分以上先のもの、アドレスとポートでないエンドポイント、範囲外の往復の時間や転送は、報告ごと拒否します（`400`）。握手は、5 分以内なら新しいとみなします（keepalive だけの回線は 2 分と keepalive 1 回ごとに握手し直し、エージェントは 30〜90 秒ごとに報告するので、つながっている回線の握手は報告の時点で 4 分前のことがあります）。
+- **向きのある回線**: 各ノードは 1 分ごとに、相手ごとの経路（直結か中継か、WireGuard が使っているエンドポイント、最新の握手）と往復の時間（相手の転送の口への TCP の接続、3 回の最短。デーモンは API のポート）を報告します（エージェント操作 `fabric-links`、テーブル `fabric_links`）。ほかのエージェントの転送の口から取り寄せたもの（4 MiB 以上）は、受け取った側が報告し、送り手から受け手への向きの帯域を、その実測との中間に寄せます。経路やエンドポイントが変わったら、それまでの帯域は捨てます。planner の運ぶ時間の見積もりは、その向きの値を使い、なければベンチマークの値（向きなし）、それもなければ既定値（100 MB/s）です。
+- **NAT 越え**: 相手の側で握手が成立しているエンドポイント（NAT の内側のノードなら、その外側の対応）を、そのノードのほかの相手にも渡します。双方がそこへ送れば穴が開きます。
+- **中継**: 2 回続けて報告された回線に新しい握手がない組には、中継を割り当てます（テーブル `fabric_relays`、イベント `fabric_relayed`）。中継になるのは、`[fabric] relay_ports`（`"FROM-TO"`）でポートを出しているノードのうち、両方と新しい握手のあるもの（公開のエンドポイントを持つノード）です。各側は、中継のエンドポイントと自分の側のポートを、相手のエンドポイントの後に試します。中継のノードは、各側の WireGuard のデータグラムを、もう一方が最後に送ってきた所へそのまま渡します。暗号化は端から端までのままで、中継には中身が見えません。各側のデータグラムは、中継がその側を fabric で見ているホストからのものだけを受け付けます。両側のホストが分かるまでは（中継のノード自身が両側と握手するまで）、中継を始めません。どちらかのホストが変わったら、古い中継を止めてから、同じポートで始め直します。
+- **見る**: `kairo fabric list [--json]`（`GET /api/fabric`）が、prefix と、各ノードのアドレス・公開鍵・ポート・エンドポイント、向きのある回線を出します。
+- **中継から直結へ**: 中継を外すのは、組のどちらかが名乗るエンドポイントかポートを変えたとき（別の回線へ移った、など）と、割り当てから 24 時間たったときです（イベント `fabric_unrelayed`）。組はまた直結を試し、だめなら中継が割り当て直されます（その間の数分は届きません）。片側だけ直結を試しても、相手が中継から送り続ける限り WireGuard が宛先を中継に戻すので、ふだんは試しません。
+- **FRR（BGP EVPN）**: エージェントは各ノードで FRR（`quay.io/frrouting/frr:10.7.1`、digest で固定）を動かし続けます（`[fabric] routing`、既定 true）。
+  - Linux では、特権の Incus の OCI コンテナで、ホストのネットワーク名前空間を共有します（`lxc.namespace.share.net`、NIC なし）。Windows では VM の中の docker のコンテナです（host のネットワーク、特権）。名前は、そのインストールのコンテナの頭（`container_prefix`）に `frr` を付けたものです。
+  - ホスト名はノードの ID です（FRR は BGP でホスト名を名乗り、空のホスト名は相手に拒まれます）。イメージかホスト名が変わったら、コンテナを作り直します。
+  - ホストの `frr` のサービスが動いていると、そこには立てません。
+  - 設定（`frr.conf`、`daemons`）はエージェントが作り、変わったら FRR を再起動します。fabric の 1 つの ASN（`[fabric] asn`、既定 4200000000）で、fabric の上の iBGP、BFD、全部のローカルの VNI の EVPN（`advertise-all-vni`）です。bgpd は fabric のアドレスでだけ待ち受けます。
+  - ルートリフレクタは、FRR を動かし、最近 10 分以内にリンクを報告したノードのうち、エンドポイントを言うノードを先に、ノードの ID の順に 2 つです（全ノードが同じものを教わります）。リフレクタは fabric の prefix 全体からの接続を受け、ほかのノードはリフレクタにつなぎます。
+- **セグメント**: VXLAN の上の L2 の網です（テーブル `fabric_segments`、`fabric_segment_members`）。VNI（10000 から空いている最小のもの）、デーモンの `[fabric] segment_prefix` の中の /24（各セグメントで別）、MTU（既定 1370、fabric の 1420 から VXLAN の 50 を引いたもの。1280 以上）を持ちます。
+  - エージェントは、自分のセグメントごとに、ブリッジと VXLAN のデバイスを作ります（名前は `[fabric] names`（既定 `kf`）＋ `b`／`v` ＋ VNI）。VXLAN は fabric のアドレスから、`[fabric] vxlan_port`（デーモン、既定 4789）で出します。学習はせず（どこに MAC があるかは EVPN が言う）、ARP も EVPN の情報から答えます。ブリッジと VXLAN には IPv6 を付けないので、セグメントからホストには届きません。セグメントから外れたノードは、デバイスを外します。
+  - **ノードの守り（nftables、インストールごとの表 `<names>fabric`）**:
+    - 入り: ノードの fabric のアドレス宛ての VXLAN・BFD（UDP 3784・3785・4784）・BGP（TCP 179）は、fabric のインターフェースから来たものだけを受けます。相手のフレームは WireGuard を通ってくるので、送り手が確かです。宛先を自分のアドレスに限るので、同じホストの別のインストールの fabric の通信は捨てません。
+    - 転送: ホストは、fabric のインターフェースへも、そこからも、転送しません。例外は、デーモンの API（`attempt_api_url` が指すアドレスとポート。wslc のコンテナは VM を通ってそこへ行きます）とその返りだけです。ホストがコンテナの通信を fabric へ転送（とマスカレード）すると、相手には、そのホストからの VXLAN（ほかの gang のセグメントへのフレーム）や BGP の接続に見えてしまうためです。WireGuard、ホストの名前空間で動く FRR、中継、Incus の API へのプロキシは、ホスト自身の通信なので転送ではありません。
+  - Windows では、セグメントのブリッジは wslc のネットワーク（`<names>-seg-<VNI>`、`--internal`、ブリッジにアドレスなし）のものです。コンテナは、そのネットワークに入ることでセグメントに載ります。
+  - 同じホストに別のインストールのエージェントがあるときは、`names` と `vxlan_port` を別にします。
+  - 手でも作れます: `kairo fabric segment-add [--mtu N] NODE...`、`kairo fabric segment-remove VNI...`（`POST /api/fabric/segments`、`DELETE /api/fabric/segments/{vni}`、admin）。gang は世代ごとに自分のセグメントを持ちます（[Gang](#gang)。VNI は 100000 から、手では消せません）。`kairo fabric list` がセグメントも出します。
+  - gang のメンバーの起動のときは、エージェントが同期を待たずにセグメントをノードに作ります。同期で教わったセグメントにないものは外しますが、起動のために作ったものは 10 分残し、コンテナが載っている（ブリッジに VXLAN 以外のポートがある）ものは外しません。
+  - Windows のセグメントのネットワークは、ゲートウェイをサブネットの最後のホストにします（docker は、ゲートウェイのアドレスをコンテナに渡さないため。gang のメンバーは最初のホストから使います）。
+- **コンテナからデーモンへ**: Attempt に渡す API の URL（`attempt_api_url`、既定は `server_url`）が fabric のアドレスなら、Incus のコンテナには、その API へのプロキシのデバイスを付けます。コンテナの中で API のポートを待ち受け、ホストから fabric を通ってつなぎます。コンテナの init は、デーモンの fabric のアドレスを lo に付けるので、URL も TLS の名前もそのままです。コンテナを LAN に直接つなぐホスト（Incus の NIC を LAN のブリッジに置く Proxmox など）では、コンテナから fabric への経路がなく、ホストに転送を許すと、ほかの網にも通じてしまうためです。wslc のコンテナは VM を通って届きます。
+- **回線の実測**: リンクの帯域を測ってほしいと言われたノード（デーモンの `FabricView` の `measure`。[Gang](#gang) の配置が実測を待つとき）は、相手の転送の口から 32 MiB の試料を fabric 越しに取り寄せて時間を測り、受け取った転送として報告します（`GET /fabric/sample`。fabric のアドレスから来た相手にだけ返します）。転送の口が fabric にないノード（Windows）は、相手に試料を送って（`POST`）自分から相手への向きも測ります。Windows では、どちらも wslc の VM の中で行います。
+- **従量課金の回線**: エージェントの `[fabric] metered = true` は、そのノードの上り回線が量で課金されることを言います。gang は、そう言わない限り、そのノードの回線をまたぎません。
+- **これから**: ノードの出入り（spot、持ち歩く端末）、サイトごとの複製の方針（issue #47 の段階 5 の残り）。
+
 ## 認証と TLS
 
 すべてのリクエストには `Authorization: Bearer <token>` が必要です。ループバックからの接続も例外ではなく、認証なしで呼び出せるのは `GET /health` のみです。トークンが未指定・不明・失効済みの場合は `401`、トークンのロールがそのルートを許可していない場合は `403` を返します。トークンはランダムな 256 ビットの値で、SHA-256 ハッシュのみが保存されます。失効（revoke）は即座に反映されます。
@@ -464,6 +507,8 @@ ca_file = "/etc/kairo/ca.pem"
 ```
 
 `[owner_use]` は、このノードの持ち主の使用の見つけ方です（[所有者の使用](#所有者の使用owner-use)。既定で有効、`disabled = true` で無効、`kairo_first = true` で GPU と CPU の観測をしません。しきい値 `gpu_sm_percent`・`cpu_percent`・`ram_free_mib` と、持ち主がキーボードの前にいるときの `*_present`、`input_file`）。残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[bench]` は拒否されます（ベンチマークはコンテナで走り、使うプログラムは Kairo が決めます）。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
+
+`container_prefix`（既定 `kairo-`）は、このエージェントが Attempt のために作るコンテナ（Incus のインスタンス、wslc のコンテナ）の名前の頭です。同じホストに別のインストール（試験用など）のエージェントを置くときは、別の頭（`kairo-t-` など）にします。エージェントは、自分の頭で始まるコンテナだけを自分の Attempt のものとして引き継ぎ、残り物として消します。`kairo-` で始めておけば、どのインストールの Provider も、それを Kairo の仕事として数えます。`[owner_use]` は、このノードの持ち主の使用の見つけ方です（[所有者の使用](#所有者の使用owner-use)。既定で有効、`disabled = true` で無効。しきい値 `gpu_sm_percent`・`cpu_percent`・`ram_free_mib` と、持ち主がキーボードの前にいるときの `*_present`、`input_file`）。残りの設定項目（`log_directory`、`log_min_free_mib`、`observe_only`、`observation_interval_seconds`、`[node]`）は、デーモン設定（`examples/kairo.toml`）と同じ形式です。`[bench]` は拒否されます（ベンチマークはコンテナで走り、使うプログラムは Kairo が決めます）。`[[executors]]` と `[[providers]]` はエージェントだけが持ちます（デーモンはジョブを走らせないため、デーモンの設定に書くと拒否されます）。
 
 - **Executor の実行形態**: すべての Executor は Attempt をイメージのコンテナで実行します。種別（kind）は `incus`（Linux）と `wslc`（Windows）だけです（[コンテナ実行](#コンテナ実行)を参照）。ホストで直接実行する種別（以前の `linux`・`windows` など）、Proxmox のコンテナの種別（以前の `pct`）、WSL の種別（`wsl2`）を宣言する設定は拒否されます。
 - **未宣言 Executor の無効化**: エージェントが登録を行う際、そのノードに属していて現在は宣言されなくなった Executor は無効化されます（イベント `executor_undeclared`）。再起動時に何も引き継がなかった場合と同様にその Lease は `stale` になり、エージェントが再び宣言するまで、新たな配置もストアの提供も行われなくなります。そのノードの無効な Executor が書いたデータに残っている仕事（pack、durable に写した後の元の削除、運ぶための pack、kept scratch、output の移動）は、エージェントが登録するたびに、そのストアをいま提供する Executor へ引き継がれます（イベント `data_handed_over`）。仕事は Executor ごとに探されるので、別の Executor に置き換えて退役させた Executor（コンテナへ移したホストの Executor など）のデータが、いつまでも待たないためです。
@@ -787,7 +832,7 @@ Run の output ディレクトリ（[`output` ディレクトリ](#output-ディ
 
 待機理由コードは以下のとおりです。
 
-`no_executor` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `owner_use` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
+`no_executor` / `no_fabric` / `fabric_partitioned` / `fabric_unmeasured` / `fabric_links_short` / `not_before` / `inputs_not_ready` / `store_moving` / `output_moving` / `output_elsewhere` / `output_unavailable` / `owner_use` / `awaiting_executor` / `gpu_leased` / `held_for_higher_priority` / `gpu_memory_low` / `insufficient_gpu` / `insufficient_cpu` / `insufficient_ram` / `insufficient_disk` / `external_claim` / `unattributed_activity` / `stale_observation` / `disk_low_watermark` / `preempting`
 
 ### 実行時間の推定
 
@@ -1262,7 +1307,7 @@ Kairo はこのディレクトリを削除せず、現時点では専用クラ�
 
 Run が保持すべき出力データは、scratch が作成されるストアと同じストア上の output ディレクトリ `<root>/outputs/<run id>` に保存されます。このディレクトリには Run ID を記したマーカーファイル `.kairo-output` が置かれ、環境変数 `KAIRO_OUTPUT_DIR` で渡されます。
 
-ここで **Run** とは、ある Execution とそれに続く継続（continuation）のまとまりを指します。具体的には、継続ではない Task の Execution（初回実行、rerun、ノード隔離後の再スタート）とそれに連なる継続群（サスペンド後の継続と、ノードが落ちた後の継続。Run ID は起点となる Execution の ID）、あるいは直接実行（direct execution）が 1 つの Run になります。（以前の Gang の rank 0 以外の rank では、Run ID は `<leader's run>-rank<r>` でした。）
+ここで **Run** とは、ある Execution とそれに続く継続（continuation）のまとまりを指します。具体的には、継続ではない Task の Execution（初回実行、rerun、ノード隔離後の再スタート）とそれに連なる継続群（サスペンド後の継続と、ノードが落ちた後の継続。Run ID は起点となる Execution の ID）、あるいは直接実行（direct execution）が 1 つの Run になります。（[Gang](#gang) の rank 0 以外のメンバーでは、Run ID は `<leader's run>-rank<r>` です。各メンバーは自分の output を持ちます。）
 
 そのストア上で起動される同一 Run のすべての Attempt には同じディレクトリが割り当てられます。最初の Attempt がディレクトリを作成し、継続（continuation）は前の Attempt がそこに書き込んだ内容（チェックポイントなど）をそのまま見つけることができます。一方、再実行（rerun）や別 Task には別のディレクトリが割り当てられるため、ある Run のファイルが別の Run と衝突することはありません。別ノードで動く継続には、先にディレクトリを持ち込みます（[Run の output の持ち込み](#run-の-output-の持ち込み)）。Attempt の scratch・output・cache は、その Run の output ディレクトリがあるそのノードのストアに置かれます（Execution がストアを指定していればそのストア）。
 
@@ -1496,7 +1541,7 @@ durable store が保管するのは、作り直せないもの（学習の結果
 
 - **表示内容**: 種別（kind）、プロジェクト、名前、ノード、状態（`packing`、`packed`、`abandoned`）、ファイル数、コンテンツおよび pack のバイト数、検証済みコピー数（およびそのうち 1 つのパス）、ソースの状態（`present`、`deleting`、`deleted`、`kept`、`evicting`、`evicted` とその理由）。
 - **`--task`（クエリパラメータ `task`）**: 指定した Task 名の全 Run の output を選択します。特定プロジェクトに絞るには `--project` を併用します。
-- **`--execution`（クエリパラメータ `execution`）**: 指定した Execution が属する Run の output を選択します。継続（continuation）の Execution であってもその Run 全体が対象になります（以前の Gang の leader を指定した場合は、各 rank の output も含まれます）。
+- **`--execution`（クエリパラメータ `execution`）**: 指定した Execution が属する Run の output を選択します。継続（continuation）の Execution であってもその Run 全体が対象になります（Gang の leader を指定した場合は、各メンバーの output も含まれます）。
 - これらのフィルタは `--json` 指定時にも適用されます。
 
 #### Run スナップショット
@@ -1831,9 +1876,38 @@ GPU クロック、電力上限、プロセッサ設定の変更には、デー�
 - `force_stop_not_picked_up`: Executor はポーリングしているにもかかわらず強制停止指示を取得していない状態（対象ノードのエージェントログを確認してください）。
 - `executor_unreachable`: Executor との通信が確認できていない状態。
 
-### Gang（廃止）
+### Gang
 
-複数のノードにまたがって 1 つの Task を rank ごとに走らせる Gang（`[tasks.execution.gang]`）は、なくなりました（2026-11、すべての実行をコンテナ 1 つにそろえたため）。Gang を宣言する Task は `kairo project apply` で理由つきで拒否されます。過去の Gang の実行の記録はデータベースに残りますが、rank ごとの表示（`task show` の `gang`、`task logs --rank`）はありません。
+1 つの Task を、別々のノードの複数のコンテナ（メンバー）で一緒に走らせます（複数ノードの DDP など）。メンバーは fabric のセグメントの上で互いに届きます（[fabric](#fabric全ノードの網作成中issue-47)）。ブランチ `feat/wan-fabric` の機能です（issue #47 の第 3 段階）。
+
+```toml
+[tasks.execution.gang]
+size = 2                         # メンバーの数（2〜253）。メンバーごとに Execution 1 つ、コンテナ 1 つ
+port = 29500                     # 省略可: メンバー 0 のランデブーのポート（既定 29500）
+max_rtt_ms = 5                   # 省略可: メンバーのノードの間の往復の上限
+min_mib_per_second = 50          # 省略可: メンバーのノードの間の帯域の下限（向きごと）
+metered = false                  # 省略可: 従量課金の回線をまたいでよいか（既定 false）
+[[tasks.execution.gang.ranks]]   # 省略可: メンバーごとの上書き（argv、cwd、executor、env、exclusive、capacity）
+rank = 1
+executor = { node = "node-b" }
+```
+
+- **上書きの `cwd`**: メンバーごとの `cwd` も Task のものと同じ規則で確かめます（ソースがあればスナップショットの中の相対パスで、上へ出られません。ソースがなければイメージの中の絶対パス）。
+- **確保**: メンバー（rank 0〜size−1）は、fabric で経路を持つ（FRR を動かす）別々のノードに、1 つのトランザクションでまとめて置かれます（全部か、何もなしか）。置くのは、互いに fabric で届くノードの組だけです（どの 2 つも、直近 5 分以内の握手を双方向に報告している）。分断があって、置ける組がそれをまたぐしかなければ、待ちます（待機理由 `fabric_partitioned`）。
+- **回線の条件**: `max_rtt_ms`・`min_mib_per_second`・`metered` を書いた gang は、どの 2 つのメンバーのノードの間も、実測がそれを満たすときだけ置かれます（往復はプローブの値で 10 分以内のもの、どちらの向きでも。帯域は転送か試料の値で、向きごとに）。実測がなければ推測せずに待ち（`fabric_unmeasured`）、その回線の実測を頼みます（[fabric](#fabric全ノードの網作成中issue-47) の「回線の実測」）。実測が満たさなければ待ちます（`fabric_links_short`）。デーモンに `[fabric] segment_prefix` がなければ置かれません（待機理由 `no_fabric`）。各メンバーの Lease は、そのノードの Executor が次にポーリングしたときに渡されます。
+- **世代のセグメント**: 置くたびに（世代ごとに）、メンバーのノードだけのセグメントを作ります。VNI は 100000 からの通し番号で、前の世代のものは二度と使いません（遅れて戻った古い世代のメンバーは、新しい世代に届きません）。サブネットは `segment_prefix` の /24 で、VNI の示す所から順に空いているものを選びます（終わった世代のサブネットは、ほかが埋まるまで使いません）。メンバー r のアドレスは、その r+1 番目のホストです。世代が終わる（すべての Lease が解放される、または置いたのを取りやめる）とセグメントを消し、各ノードはコンテナがいなくなってからデバイスを外します。
+- **起動の関門**: すべてのメンバーの Lease が準備できるまで、どのメンバーも起動しません（2 分以内にそろわなければ、置いたのを取りやめ、新しい世代として置き直します）。起動のとき、エージェントはセグメントをノードに作り、コンテナに 2 つめの NIC を付けます（Incus: セグメントのブリッジにつないだ `gang0`、wslc: セグメントのネットワークにアドレスつきでつなぐ）。コンテナの init は、その NIC にアドレスを付け（rtnetlink。Attempt に特権は渡さず、イメージに `ip` は要りません）、ほかのすべてのメンバーに届き、ほかのすべてのメンバーから届くまで待ってから（最長 30 分。各メンバーのイメージの取得の差もここで吸収します）、argv を起動します。待ちきれなかったメンバーは exit 124 で終わります。
+- **起動のそろえ方**: 各メンバーのコンテナの init は、セグメントの上で、ほかのすべてのメンバーに挨拶を送って応答を受け、ほかのすべてのメンバーから挨拶を受けてから、本体を起動します（TCP 29399）。挨拶は、そのメンバーのセグメントのアドレスから来たものだけを数えます。まだ届かないメンバーには、まとめて同時に挨拶し直すので、メンバーが多くても待ちは長くならず、止める合図にもすぐ応えます。
+- **環境変数**: `MASTER_ADDR`（メンバー 0 のアドレス）、`MASTER_PORT`、`RANK`・`WORLD_SIZE`・`NODE_RANK`（メンバーの数え方。1 メンバー 1 プロセスのとき用）、torchrun の `PET_NNODES`・`PET_NODE_RANK`・`PET_MASTER_ADDR`・`PET_MASTER_PORT`、`NCCL_SOCKET_IFNAME`・`GLOO_SOCKET_IFNAME`（セグメントの NIC）、`KAIRO_GANG_ID`・`KAIRO_GANG_RANK`・`KAIRO_GANG_SIZE`・`KAIRO_GANG_ADDRESS`。`python -m torch.distributed.run --nproc-per-node N train.py` は、そのままで全メンバーにまたがります（`RANK` などは torchrun がワーカーごとに付け直します）。
+- **一蓮托生**: 起動したメンバーの 1 つが 0 以外で終わる（かロストする）と、走っているほかのメンバーを止めます。Task が成功するのは、すべてのメンバーが 0 で終わったときだけです。あるメンバーの起動が失敗した（ほかは起動していた）ときは、最初から走らせ直します（続けて 3 回まで。その次は失敗）。
+- **gang 全体の checkpoint**: gang は `checkpointable`（と `continue_after_loss`）にできます。checkpoint は、すべてのメンバーが同じステップで作ったときだけ gang のものです。
+  - Python SDK の `DistributedAdapter` は、gang の中では、各メンバーの最初のプロセス（`LOCAL_RANK` 0）が自分のメンバーのプロセスを登録し、自分の Attempt をポーリングします。suspend か checkpoint を、すべてのメンバーが受け取ってから、全 rank がそろって checkpoint を作ります（各 safe point で全 rank が状態を集めます）。各メンバーは自分の部分（最初のプロセスの `continuation_ref`。自分のコンテナの中のパスなので、各メンバーの最初のプロセスで保存します）を、ラウンドを添えて公開します（payload の `"gang": {"round", "rank", "size"}`）。suspend は、すべてのメンバーの部分が公開されてから全 rank で終わります。
+  - デーモンは、あるメンバーが受け取ったコマンド（suspend、`kairo task checkpoint`、データ保護の checkpoint）を、走っているほかのメンバーにも渡します。
+  - suspend した gang は、すべてのメンバーが部分を公開したラウンドから続きます。各メンバーは自分の部分から、自分の Run の output ディレクトリのあるノードで続きます（gang の output は動かしません）。suspend の部分がそろわなかったときは、すべてのメンバーがそろえた最新のラウンド（なければ、その世代が始まったラウンド）から続き、それもなければ失敗です。
+  - `continue_after_loss` の gang は、メンバーがロストしたら、すべての Lease が解放されてから、そろった最新のラウンドから続きます。なければブロックされます。
+- **まだないもの**: stream、`store`、`regenerable`。
+- **見る**: `kairo task show` が各メンバーのノード・アドレス・セグメントを、`kairo task logs --rank R` がメンバー R のログを出します。
+- **試験（2026-11-28、試験用のインストール）**: wslc（Windows）と Incus（Linux）の 2 メンバーで、TCP の 64 MiB が 1.03 秒、往復 0.98 ms（1 GbE の LAN）。wslc と 2 台の Incus の 3 メンバー × 2 プロセスの DDP（gloo、6 rank）で、全 rank のパラメータが一致。メンバー 0 の exit 3 で Windows のメンバーが止められ、Task は失敗（exit 3）。checkpointable な gang（wslc と Incus、各 2 プロセス、SDK）で、`kairo task checkpoint` が両メンバーとも同じステップ（12）で公開され、`kairo task pause` で両メンバーが同じステップ（41）で止まり、`resume` の後、各メンバーが自分の checkpoint からステップ 42 で続いて、最後に全 rank のパラメータが一致。Linux のメンバーをロストさせると（shim を exit なしで落とし、コンテナを消す）、Lease の解放の後、そろった最新のラウンド（ステップ 7）から両メンバーが続き、最後まで走った。`max_rtt_ms = 5`・`min_mib_per_second = 20` の gang は、Windows との回線に帯域の実測がない間は `fabric_unmeasured` で待ち、Windows のノードが VM から試料を取り寄せ（68 MiB/s）、送って（103 MiB/s）両向きが測れたところで置かれた。
 
 ## Loader（ストリーム）
 
@@ -1993,8 +2067,9 @@ Kairo が管理する Attempt には、以下の環境変数が渡されます�
 - **配置・リソース割り当て**: `KAIRO_NODE_ID`、`KAIRO_EXECUTOR_ID`、`KAIRO_RESOURCE_IDS`、`KAIRO_RESOURCE_BINDINGS`、および `CUDA_VISIBLE_DEVICES`（Lease された GPU の UUID が設定され、インデックス番号は決して使用されません）
 - **再開時**: `KAIRO_CONTINUATION_REF`
 - **volatile store**: Executor がvolatile store（[データストア](#データストア)を参照）を提供している場合は `KAIRO_SCRATCH` と `KAIRO_OUTPUT_DIR`
+- **gang のメンバー**: `MASTER_ADDR`、`MASTER_PORT`、`NODE_RANK`、`PET_*`、`NCCL_SOCKET_IFNAME`、`GLOO_SOCKET_IFNAME`、`KAIRO_GANG_*` など（[Gang](#gang)）
 
-SDK は、Attempt を Linux のコンテナで動くものとして扱います（プロセスの身元は `/proc/<pid>/stat` から読みます）。Python SDK の `DistributedAdapter` は、1 つの Attempt の中の torch の分散（1 つのコンテナの中の DDP）を協調させます。rank 0 だけがポーリングと応答を行い、チェックポイントは全 rank がそろって作ります。`local_continuation` は、Kairo が渡した継続の参照をそのまま返します（全 rank が同じコンテナのファイルを見るため、別ノードへの受け渡しはありません。相対パスは各 rank の作業ディレクトリから読まれるので、rank ごとに作業ディレクトリを変えるなら絶対パスで公開します）。Gang 用の補助（`GangContext`、rank ごとの Attempt）はなくなりました。
+SDK は、Attempt を Linux のコンテナで動くものとして扱います（プロセスの身元は `/proc/<pid>/stat` から読みます）。Python SDK の `DistributedAdapter` は、1 つの Attempt の中の torch の分散（1 つのコンテナの中の DDP）を協調させます。rank 0 だけがポーリングと応答を行い、チェックポイントは全 rank がそろって作ります。`local_continuation` は、Kairo が渡した継続の参照をそのまま返します（全 rank が同じコンテナのファイルを見るため、別ノードへの受け渡しはありません。相対パスは各 rank の作業ディレクトリから読まれるので、rank ごとに作業ディレクトリを変えるなら絶対パスで公開します）。[Gang](#gang) では、メンバーごとに別の Attempt で、`DistributedAdapter` は gang 全体で checkpoint をそろえます（[Gang](#gang) の「gang 全体の checkpoint」）。`DistributedAdapter` は torch の object の集団通信を使うので、numpy が要ります。
 
 ### セーフポイントの挙動と Python・Rust SDK
 
@@ -2070,7 +2145,7 @@ controller.run_forever()
 4. プロジェクトが選択した短時間・高優先度の Execution によって協調的プリエンプション（cooperative preemption）を発動できること。オーケストレーション対象のジョブを再開するかどうかはバージョン管理された Task ポリシーが決定し、Execution API を直接利用するユーザーにはプロジェクト管理コントローラの選択肢が残されていること。
 5. 同一 Command が再送されても、チェックポイントの公開処理が破損しないこと。
 6. 静的な Task DAG では、すべての依存先が成功した後にのみ対象ノード（Task）が投入され、リプレイを行っても 1 つのポリシー判定に対して重複した Execution が作成されないこと。
-7. （廃止）2 GPU の DDP Execution は all-or-nothing の Gang Lease を取得し、Lease 解放前にすべての rank が静止（`quiesced`）すること。Gang はなくなりました（[Gang（廃止）](#gang廃止)）。
+7. 複数ノードの DDP（[Gang](#gang)）は、メンバーの Execution をまとめて（all-or-nothing で）確保し、すべてのメンバーが互いに届いてから起動し、1 つが失敗したら残りも止めること。
 
 クラウドのプロビジョニング、上記 4 種類以外のロール、サービスの監視・常駐管理（service supervision）、cron / フェアシェアスケジューリング、および CPU / RAM の厳格な強制制限（hard enforcement）は、このパイロットの対象外です。
 
@@ -2354,6 +2429,7 @@ CREATE DATABASE kairo OWNER kairo TEMPLATE template0 ENCODING 'UTF8' LOCALE 'C';
 - `bash ops/build.sh`: クリーンなチェックアウトの `HEAD` を Windows 向け・Linux 向けにビルドし、`builds/kairo-<sha>.exe` および `kairo-<sha>-linux` を生成します。
 - `bash ops/deploy-daemon.sh SHA NAME`: まず `pg_dump` を実行し、続いてデーモンバイナリを置き換えて（旧バイナリは `kairo.before-NAME` として退避）再起動したのち、`PATH` 上の CLI を更新します。
 - `[ADOPT=1] bash ops/replace-linux-agents.sh SHA NODE...`: 各 Linux ノードのエージェントを入れ替えます（旧バイナリは `bin/kairo.before-SHA` として退避）。Lease を保持しているノードは `ADOPT=1` を指定しない限り拒否されます。各ノードは 2 分以内に報告を返す必要があります。
+- `bash ops/test-instance.sh create | deploy SHA | env`: 本番とは別の試験用のインストール（issue #47 の WAN のファブリックは、ブランチの版をここで試します）。Proxmox のホストに専用のコンテナを作り（DHCP）、PostgreSQL、データベース、試験用の CA とデーモンの証明書、設定、systemd のユニットを用意します（`create`）。`deploy` はビルドを置いてデーモンを起動し直し、初回は operator のトークンを作ります。`env` は、CLI をその試験用のデーモンへ向ける環境変数を出します（`eval "$(bash ops/test-instance.sh env)"`）。CA の鍵とトークンは `<kairo config>/test/` に置き、コンテナには CA の鍵を置きません。場所は `site.env` の `KAIRO_TEST_PVE_HOST`・`KAIRO_TEST_VMID`・`KAIRO_TEST_TEMPLATE`（`KAIRO_TEST_ROOTFS`・`KAIRO_TEST_BRIDGE`）です。
 - **Windows（管理者権限）エージェント導入・更新**: `ops/windows/install-agent.ps1 -New BUILD` は、エージェントを `%LOCALAPPDATA%\Programs\kairo\kairo-agent.exe` に、監視用スクリプト `supervise-agent.ps1` と並べてインストールし（ログは `<state>/logs`、設定は `%APPDATA%\kairo\agent.toml`）、起動時に実行される S4U タスク `kairo-agent` を登録します（ノードが Lease を保持している間は拒否されます。異なるログディレクトリで起動されたエージェントは既存の Attempt を引き継げないためです）。既存エージェントの差し替えには `ops/windows/replace-agent.ps1 -New BUILD [-Adopting]` を使用します。エージェントは対象ユーザー権限で動作するため（Attempt もそのユーザーとして実行されます）、関連ファイルもすべてユーザー所有になります。
 - **Windows（管理者権限）コントローラ導入**: `ops/windows/install-controller.ps1 -New BUILD [-Config TOML] [-State JSON] [-CA PEM]` は、`SYSTEM` 権限で動作するデバイスコントローラを `%ProgramFiles%\Kairo\kairo-controller.exe` にインストールします。設定・状態・CA 証明書は `%ProgramData%\Kairo` に配置され（設定ファイルにトークンが含まれるため、`SYSTEM` と `Administrators` のみ読み取り可能）、タスク `kairo-controller` が登録されます。
 

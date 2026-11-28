@@ -99,6 +99,25 @@ func TestObserveOnlyRecordsExternalActivityWithoutAllocating(t *testing.T) {
 	}
 }
 
+// A gang member is told its place: torch.distributed's names, torchrun's
+// (PET_*), Kairo's, and its address on the segment.
+func TestGangEnvTellsTheMemberItsPlace(t *testing.T) {
+	e := &Local{}
+	if env := e.gangEnv(nil); env != nil {
+		t.Fatalf("non-gang env: %v", env)
+	}
+	env := e.gangEnv(&store.GangLaunch{GangID: "gng_1", Rank: 1, Size: 2, MasterAddr: "10.67.0.1", MasterPort: 29500, Address: "10.67.0.2/24"})
+	want := map[string]bool{"RANK=1": true, "WORLD_SIZE=2": true, "NODE_RANK=1": true, "MASTER_ADDR=10.67.0.1": true, "MASTER_PORT=29500": true,
+		"PET_NNODES=2": true, "PET_NODE_RANK=1": true, "PET_MASTER_ADDR=10.67.0.1": true, "PET_MASTER_PORT=29500": true,
+		"KAIRO_GANG_RANK=1": true, "KAIRO_GANG_SIZE=2": true, "KAIRO_GANG_ADDRESS=10.67.0.2": true}
+	for _, v := range env {
+		delete(want, v)
+	}
+	if len(want) != 0 {
+		t.Fatalf("missing %v in %v", want, env)
+	}
+}
+
 // syncBuffer collects log lines written by the step watcher's goroutine.
 type syncBuffer struct {
 	mu  sync.Mutex

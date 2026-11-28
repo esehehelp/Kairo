@@ -8,16 +8,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
 	"kairo/internal/api"
 	"kairo/internal/config"
 	"kairo/internal/executor"
+	"kairo/internal/fabric"
 	"kairo/internal/hwpolicy"
 	"kairo/internal/secfile"
 	"kairo/internal/store"
@@ -27,6 +31,14 @@ import (
 func main() {
 	// A Windows force stop runs this binary as a short-lived CTRL_BREAK helper.
 	executor.RunHelper(os.Args)
+	// The Windows agent's fabric work in its wslc VM (fabric_windows.go).
+	if len(os.Args) > 1 && os.Args[1] == fabric.LinkArg {
+		if err := fabric.LinkCommand(context.Background(), os.Args[2:], os.Stdout); err != nil {
+			fmt.Fprintln(os.Stderr, "kairo:", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	if err := run(os.Args[1:]); err != nil {
 		reportError(os.Stderr, err)
 		os.Exit(exitCode(err))
@@ -96,9 +108,14 @@ func serve(args []string) error {
 		return fmt.Errorf("open the database: %w", err)
 	}
 	defer st.Close()
+	policy := st.SchedulingPolicy()
 	if daemonConfig.Scheduler.DiskMinFreeBytes != nil {
-		st.SetSchedulingPolicy(store.SchedulingPolicy{DiskMinFreeBytes: *daemonConfig.Scheduler.DiskMinFreeBytes})
+		policy.DiskMinFreeBytes = *daemonConfig.Scheduler.DiskMinFreeBytes
 	}
+	// gangs' generations take their segments' subnets there (none: no gang
+	// is placed)
+	policy.GangSegmentPrefix = daemonConfig.Fabric.SegmentPrefix
+	st.SetSchedulingPolicy(policy)
 	scrubEvery, err := daemonConfig.Data.ScrubEvery()
 	if err != nil {
 		return err
@@ -113,13 +130,41 @@ func serve(args []string) error {
 	}
 	st.SetDataPolicy(store.DataPolicy{ScrubInterval: scrubEvery, ScrubBytesPerDay: daemonConfig.Data.ScrubBytesPerDay, ConfineFrom: confineFrom, RunSnapshotInterval: runSnapshotEvery})
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	// The external-command helper (internal/extcmd) logs through the default.
+	// The external-command helper (internal/extcmd) and the gang reconciler log through the default.
 	slog.SetDefault(logger)
 	attributes, _ := json.Marshal(config.NodeAttributes(daemonConfig.Node.Labels))
 	if err := st.UpsertNode(context.Background(), store.Node{ID: daemonConfig.Node.ID, Name: daemonConfig.Node.Name, OS: daemonConfig.Node.OS, Architecture: daemonConfig.Node.Architecture, Attributes: attributes, Enabled: true}); err != nil {
 		return err
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	// the daemon's own node on the fabric (issue #47), synced with the
+	// store itself
+	if f := daemonConfig.Fabric; f.Prefix != "" && f.Join {
+		keyFile, iface, port := f.KeyFile, f.Interface, f.ListenPort
+		if keyFile == "" {
+			keyFile = filepath.Join(filepath.Dir(*configPath), "fabric.key")
+		}
+		if iface == "" {
+			iface = fabric.DefaultInterface
+		}
+		if port == 0 {
+			port = fabric.DefaultListenPort
+		}
+		fab := &fabric.Manager{Interface: iface, ListenPort: port, KeyFile: keyFile, Endpoints: f.Endpoints, Logger: logger,
+			Sync: func(ctx context.Context, self store.FabricSelf) (store.FabricView, error) {
+				return st.SyncFabric(ctx, daemonConfig.Node.ID, store.FabricPlan{Prefix: f.Prefix, ASN: f.ASN, VXLANPort: f.VXLANPort}, self)
+			},
+			Report: func(ctx context.Context, report store.FabricLinksReport) error {
+				return st.RecordFabricLinks(ctx, daemonConfig.Node.ID, report)
+			}}
+		if _, port, err := net.SplitHostPort(daemonConfig.Listen); err == nil {
+			fab.ProbePort, _ = strconv.Atoi(port)
+		}
+		if fab.RelayFrom, fab.RelayTo, err = config.ParseRelayPorts(f.RelayPorts); err != nil {
+			return err
+		}
+		go fab.Run(ctx)
+	}
 	defer stop()
 	pgDump := daemonConfig.PGDump
 	if pgDump == "" {
@@ -135,12 +180,20 @@ func serve(args []string) error {
 	} else {
 		controlFiles = append([]string{*configPath}, controlFiles...)
 	}
+	if daemonConfig.Fabric.Prefix != "" {
+		if _, err := store.ParseFabricPrefix(daemonConfig.Fabric.Prefix); err != nil {
+			return err
+		}
+	}
 	handler := (&api.Server{Store: st, ObserveOnly: daemonConfig.ObserveOnly, LogDirectory: daemonConfig.LogDirectory, SourceDirectory: daemonConfig.SourceDirectory, Logger: logger,
-		DumpDatabase: func(ctx context.Context, w io.Writer) error { return pgDumpTo(ctx, pgDump, dsn, w) }, ControlFiles: controlFiles}).Handler()
+		FabricPrefix: daemonConfig.Fabric.Prefix, FabricASN: daemonConfig.Fabric.ASN, FabricVXLANPort: daemonConfig.Fabric.VXLANPort,
+		FabricSegmentPrefix: daemonConfig.Fabric.SegmentPrefix,
+		DumpDatabase:        func(ctx context.Context, w io.Writer) error { return pgDumpTo(ctx, pgDump, dsn, w) }, ControlFiles: controlFiles}).Handler()
 	server := &http.Server{
 		Addr:              daemonConfig.Listen,
 		Handler:           handler,
 		ReadHeaderTimeout: 5 * time.Second,
+		ErrorLog:          tlsutil.ServerErrorLog(),
 	}
 	// With TLS the CA must be one attempts can be given (KAIRO_API_CA, by
 	// their agents) to verify the daemon they report to.
@@ -323,6 +376,12 @@ func serve(args []string) error {
 					logger.Error("memory pressure reconciliation failed", "error", err)
 				} else if n > 0 {
 					logger.Info("work suspended for its node's memory pressure", "suspends", n)
+				}
+				// gangs: a placement not prepared in time is given up, the
+				// members of a launched one share one fate, and the segment
+				// of a generation that ended is taken away
+				if err := st.ReconcileGangs(ctx); err != nil && ctx.Err() == nil {
+					logger.Error("gang reconciliation failed", "error", err)
 				}
 				select {
 				case <-ctx.Done():

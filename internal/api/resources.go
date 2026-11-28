@@ -1,7 +1,9 @@
 package api
 
 import (
+	"fmt"
 	"net/http"
+	"strconv"
 
 	"kairo/internal/machine"
 	"kairo/internal/store"
@@ -123,4 +125,69 @@ func (s *Server) reconcileResource(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+}
+
+// fabricStatus is GET /api/fabric: the fabric's prefix and its nodes.
+func (s *Server) fabricStatus(w http.ResponseWriter, r *http.Request) {
+	nodes, err := s.Store.FabricNodes(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	links, err := s.Store.FabricLinks(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	segments, err := s.Store.FabricSegments(r.Context())
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"prefix": s.FabricPrefix, "nodes": nodes, "links": links, "segments": segments})
+}
+
+// createFabricSegment is POST /api/fabric/segments {"nodes", "mtu"}: a
+// segment made by hand (gangs get their own).
+func (s *Server) createFabricSegment(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Nodes []string `json:"nodes"`
+		MTU   int      `json:"mtu"`
+	}
+	if s.ObserveOnly {
+		writeError(w, errObserveOnly)
+		return
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, err)
+		return
+	}
+	if s.FabricSegmentPrefix == "" {
+		writeError(w, fmt.Errorf("%w: the daemon has no [fabric] segment_prefix", store.ErrFabric))
+		return
+	}
+	seg, err := s.Store.CreateFabricSegment(r.Context(), s.FabricSegmentPrefix, body.Nodes, body.MTU)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, seg)
+}
+
+// deleteFabricSegment is DELETE /api/fabric/segments/{vni}.
+func (s *Server) deleteFabricSegment(w http.ResponseWriter, r *http.Request) {
+	if s.ObserveOnly {
+		writeError(w, errObserveOnly)
+		return
+	}
+	vni, err := strconv.Atoi(r.PathValue("vni"))
+	if err != nil {
+		writeError(w, fmt.Errorf("%w: segment %q", store.ErrNotFound, r.PathValue("vni")))
+		return
+	}
+	if err := s.Store.DeleteFabricSegment(r.Context(), vni); err != nil {
+		writeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

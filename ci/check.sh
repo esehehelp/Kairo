@@ -108,8 +108,8 @@ linux-race)
   ;;
 linux-root)
   [ "$(id -u)" = 0 ] || { echo "linux-root runs as root" >&2; exit 2; }
-  step "go test as root (executor, process identity, provider)"
-  go test -count=1 ./internal/executor/ ./internal/processidentity/ ./internal/provider/
+  step "go test as root (executor, process identity, provider, fabric)"
+  go test -count=1 ./internal/executor/ ./internal/processidentity/ ./internal/provider/ ./internal/fabric/
   ;;
 windows)
   step "go vet"

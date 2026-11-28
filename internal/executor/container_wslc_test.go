@@ -58,3 +58,29 @@ func TestAWSLCContainerLeasesAllOfTheHostsGPUs(t *testing.T) {
 		}
 	}
 }
+
+// Another installation's containers on the host (another prefix) are none of
+// this agent's: never taken for its attempts' leftovers, nor adopted.
+func TestAContainerOfAnotherInstallationIsNoneOfThisAgents(t *testing.T) {
+	defer func(p string) { ContainerPrefix = p }(ContainerPrefix)
+	production := containerInstance("att_0123abcd")
+	ContainerPrefix = "kairo-t-"
+	if err := ValidContainerPrefix(ContainerPrefix); err != nil {
+		t.Fatal(err)
+	}
+	test := containerInstance("att_0123abcd")
+	if test != "kairo-t-att-0123abcd" {
+		t.Fatalf("named %s", test)
+	}
+	if id, ok := attemptOfInstance(test); !ok || id != "att_0123abcd" {
+		t.Fatalf("its own: %q %v", id, ok)
+	}
+	if _, ok := attemptOfInstance(production); ok {
+		t.Fatalf("%s taken for this installation's", production)
+	}
+	for _, bad := range []string{"", "Kairo-", "kairo", "-kairo-", "kairo_t-"} {
+		if ValidContainerPrefix(bad) == nil {
+			t.Fatalf("prefix %q accepted", bad)
+		}
+	}
+}

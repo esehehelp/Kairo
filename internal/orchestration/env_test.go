@@ -5,6 +5,31 @@ import (
 	"testing"
 )
 
+// gangDigestManifest is a gang task without env.
+const gangDigestManifest = `schema_version = 1
+[project]
+name = "gangs"
+[[tasks]]
+name = "ddp"
+queue = "training"
+depends_on = []
+policy = "RunToCompletion@v1"
+[tasks.execution]
+schema_version = 2
+argv = ["wsl-train"]
+cwd = "/mnt/d/work"
+[[tasks.execution.exclusive]]
+kind = "gpu"
+count = 1
+[tasks.execution.gang]
+size = 2
+[[tasks.execution.gang.ranks]]
+rank = 1
+argv = ["linux-train"]
+cwd = "/srv/work"
+executor = { labels = { environment = "linux" } }
+`
+
 // The digests were computed before env existed: a spec without env must keep
 // them, or every applied project would conflict with its own declaration.
 func TestSpecWithoutEnvKeepsItsDigests(t *testing.T) {
@@ -15,6 +40,9 @@ func TestSpecWithoutEnvKeepsItsDigests(t *testing.T) {
 		{validManifest(), "8ea36af8d36273cd6767b0c7945a21e2a7d7b20229b7629ea8e54a271374060f", map[string]string{
 			"prepare": "f6e3762d094af3352ddcfc328ee1a3ed44b8aa40a26bdd3e7956f1cfc0d0758c",
 			"train":   "794c8579601a0394b28e12aaf6c723cd3052cb72bad4a73f875d12d2b672b12f",
+		}},
+		{gangDigestManifest, "744ec6b2855b6948ba8f0af2884c5fb6d09743824eea47aeb47f6f42ab9784f1", map[string]string{
+			"ddp": "39142e7adf75450e94bd2de8e5253bf4d28509a1fc07112c3ae496c370dbfd26",
 		}},
 	} {
 		parsed, err := Parse([]byte(c.source))
@@ -32,7 +60,7 @@ func TestSpecWithoutEnvKeepsItsDigests(t *testing.T) {
 	}
 }
 
-func TestParseEnvMergesDefaultsKeyByKey(t *testing.T) {
+func TestParseEnvMergesDefaultsKeyByKeyAndRankEnv(t *testing.T) {
 	source := `schema_version = 1
 [project]
 name = "p"
@@ -52,6 +80,11 @@ name = "a"
 [tasks.execution.env]
 HF_HOME = "/srv/hf"
 OMP_NUM_THREADS = "4"
+[tasks.execution.gang]
+size = 2
+[[tasks.execution.gang.ranks]]
+rank = 1
+env = { OMP_NUM_THREADS = "8" }
 
 [[tasks]]
 name = "b"
@@ -67,27 +100,11 @@ name = "b"
 	if len(b.Env) != 2 || b.Env["HF_HOME"] != "D:/hf" {
 		t.Fatalf("task b env: %v", b.Env)
 	}
-}
-
-// There are no gangs any more: a declaration with one is refused, saying so.
-func TestAGangIsRefused(t *testing.T) {
-	source := `schema_version = 1
-[project]
-name = "p"
-[[tasks]]
-name = "ddp"
-queue = "q"
-depends_on = []
-policy = "RunToCompletion@v1"
-[tasks.execution]
-schema_version = 2
-argv = ["train"]
-cwd = "/work"
-[tasks.execution.gang]
-size = 2
-`
-	if _, err := Parse([]byte(source)); err == nil || !strings.Contains(err.Error(), "gangs are no more") {
-		t.Fatalf("a gang: %v", err)
+	if rank := a.Gang.Ranks[0]; rank.Env["OMP_NUM_THREADS"] != "8" || len(rank.Env) != 1 {
+		t.Fatalf("rank env: %v", rank.Env)
+	}
+	if !strings.Contains(string(parsed.Normalized), `"env":{"OMP_NUM_THREADS":"8"}`) {
+		t.Fatalf("rank env missing from the normalized spec: %s", parsed.Normalized)
 	}
 }
 
@@ -118,6 +135,7 @@ cwd = "/work"
 		"[tasks.execution.env]\n\" A\" = \"x\"\n",
 		"[tasks.execution.env]\n\"\" = \"x\"\n",
 		"[tasks.execution.env]\nA = 1\n",
+		"[tasks.execution.gang]\nsize = 2\n[[tasks.execution.gang.ranks]]\nrank = 1\nenv = { KAIRO_GANG_RANK = \"0\" }\n",
 	} {
 		if _, err := Parse([]byte(task(false, env))); err == nil {
 			t.Fatalf("accepted env %q", env)

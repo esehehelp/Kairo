@@ -97,12 +97,15 @@ func TestAbandonedLaunchPastReleaseIsEndedThroughItsAttempt(t *testing.T) {
 }
 
 // A lease the store holds for this executor that it does not know (a
-// reservation whose answer was lost) is released.
+// reservation whose answer was lost) is released; one held at the gang
+// barrier is not.
 func TestUnlaunchedLeasesNobodyHoldsAreReleased(t *testing.T) {
 	fake := &fakeReleases{unlaunched: []store.UnlaunchedLease{
 		{Lease: store.Lease{ID: "lea_orphan", CoordinationEpoch: 1, State: "reserved"}},
+		{Lease: store.Lease{ID: "lea_gang", CoordinationEpoch: 1, State: "prepared"}},
 	}}
 	e := quietExecutor(fake)
+	e.pendingGang = map[string]pendingGangRank{"lea_gang": {}}
 	e.sweepUnlaunched(context.Background())
 	if got := fake.released(); len(got) != 1 || got[0] != "lea_orphan" {
 		t.Fatalf("released %v", got)

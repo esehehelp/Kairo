@@ -1,0 +1,837 @@
+package store
+
+// Gang executions: one logical execution run as Size containers on distinct
+// nodes (multi-node training, a pipeline-parallel inference server), which
+// meet on a segment of the fabric (issue #47, phase 3).
+//
+// A gang is Size ordinary execution requests, one per rank (a member: one
+// container, in which torchrun may start several processes), created
+// together by SubmitExecution; rank 0 (the leader) is the one orchestration
+// tracks. The coordination added on top of the one-execution machinery is:
+//
+//   - placement: when an executor considers the leader, every rank is placed on
+//     a distinct node that routes on the fabric, in one transaction (all
+//     leases or none), with the generation's segment: a VNI no generation had
+//     before, a subnet, an address per member. A rank's lease for another
+//     executor waits in gang_placement_leases until that executor asks
+//     ReserveNext, which hands it over before reserving anything else.
+//   - launch barrier: AuthorizeLaunch issues no rank's launch until every
+//     rank's lease is prepared (ErrGangNotReady); the executor keeps its
+//     prepared reservation meanwhile. A placement that is not prepared in time,
+//     or loses a lease before launch, is aborted (ErrGangAborted) and every rank
+//     goes back to waiting.
+//   - rendezvous: each rank is launched with its rank, the gang size, its
+//     address on the segment and rank 0's, and the port (GangLaunch). Its
+//     container is on the segment, and its init starts the argv only once it
+//     reached every other member there and every other member reached it.
+//   - one fate: when a launched rank stops other than by a clean exit or a
+//     checkpoint, the ranks still running are terminated; a suspend command to
+//     one rank is sent to every rank (ReconcileGangs).
+//   - outcome: orchestration reads the gang as a whole (gangAggregateTx).
+//   - the segment goes when its generation has ended (ReconcileGangs).
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/netip"
+	"strings"
+	"time"
+
+	"kairo/internal/id"
+	"kairo/internal/store/dbtx"
+)
+
+// GangPrepareTimeout is how long a placement may wait for every rank to be
+// prepared before it is aborted (its members' inputs may come over a WAN).
+const GangPrepareTimeout = 10 * time.Minute
+
+// GangDefaultPort is the rendezvous port on member 0's address unless the
+// gang names one (each generation has a segment of its own: nothing else
+// listens there).
+const GangDefaultPort = 29500
+
+// MaxGangSize: the members' addresses are hosts 1 on of the segment's /24,
+// the last host left out (a wslc network's gateway).
+const MaxGangSize = 253
+
+type gangMember struct {
+	rank      int
+	candidate executionCandidate
+}
+
+// gangOfExecutionTx returns the gang an execution belongs to ("" if none), its
+// rank and the gang's leader.
+func gangOfExecutionTx(ctx context.Context, q queryer, executionID string) (gangID string, rank int, leaderID string, err error) {
+	err = q.QueryRowContext(ctx, `SELECT m.gang_id,m.rank,g.leader_execution_id FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id WHERE m.execution_id=$1`, executionID).Scan(&gangID, &rank, &leaderID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", 0, "", nil
+	}
+	return gangID, rank, leaderID, err
+}
+
+type queryer = dbtx.Queryer
+
+// candidateColumns reads an executionCandidate (scanCandidate) from
+// execution_requests e.
+const candidateColumns = `e.id,e.project_scope_id,e.queue_scope_id,e.task_scope_id,e.client_request_id,e.spec_digest,e.state,e.argv_json,e.cwd,e.executor_selector_json,e.priority,e.checkpointable,e.preemptible,e.input_continuation_ref,e.terminal_cause,e.submitted_at,e.authorized_at,e.started_at,e.terminal_at,e.not_before,e.start_by,e.finish_by`
+
+// scanCandidate scans candidateColumns into c, then the extra columns.
+func scanCandidate(row interface{ Scan(...any) error }, c *executionCandidate, extra ...any) error {
+	return row.Scan(append([]any{&c.execution.ID, &c.execution.ProjectScopeID, &c.execution.QueueScopeID, &c.execution.TaskScopeID, &c.execution.ClientRequestID, &c.execution.SpecDigest, &c.execution.State, &c.argvJSON, &c.execution.CWD, &c.selectorJSON, &c.execution.Priority, &c.execution.Checkpointable, &c.execution.Preemptible, &c.execution.InputContinuationRef, &c.execution.TerminalCause, &c.execution.SubmittedAt, &c.execution.AuthorizedAt, &c.execution.StartedAt, &c.execution.TerminalAt, &c.execution.NotBefore, &c.execution.StartBy, &c.execution.FinishBy}, extra...)...)
+}
+
+func loadCandidateTx(ctx context.Context, tx *sql.Tx, executionID string) (executionCandidate, error) {
+	var c executionCandidate
+	err := scanCandidate(tx.QueryRowContext(ctx, `SELECT `+candidateColumns+` FROM execution_requests e WHERE e.id=$1`, executionID), &c)
+	return c, err
+}
+
+func gangMembersTx(ctx context.Context, tx *sql.Tx, gangID string) ([]gangMember, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT rank,execution_id FROM gang_members WHERE gang_id=$1 ORDER BY rank`, gangID)
+	if err != nil {
+		return nil, err
+	}
+	type ref struct {
+		rank int
+		id   string
+	}
+	var refs []ref
+	for rows.Next() {
+		var r ref
+		if err = rows.Scan(&r.rank, &r.id); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		refs = append(refs, r)
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	members := make([]gangMember, 0, len(refs))
+	for _, r := range refs {
+		c, err := loadCandidateTx(ctx, tx, r.id)
+		if err != nil {
+			return nil, err
+		}
+		members = append(members, gangMember{rank: r.rank, candidate: c})
+	}
+	return members, nil
+}
+
+// placeGangTx reserves every member of the gang on the executor the
+// planning pass chose for it, all or none (a savepoint is rolled back when a
+// member cannot be reserved), and makes the generation's segment on their
+// nodes: a new VNI and subnet, an address for each member (rank r the
+// subnet's host r+1). Member 0's address is the rendezvous (MASTER_ADDR).
+// It reports whether the gang was placed.
+func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlot, segmentPrefix string) (bool, error) {
+	var size, port int
+	if err := tx.QueryRowContext(ctx, `SELECT size,port FROM execution_gangs WHERE id=$1`, gangID).Scan(&size, &port); err != nil {
+		return false, err
+	}
+	if port == 0 {
+		port = GangDefaultPort
+	}
+	members, err := gangMembersTx(ctx, tx, gangID)
+	if err != nil {
+		return false, err
+	}
+	if len(members) != size || len(slots) != size {
+		// it waits; the pass goes on with the others
+		slog.Default().Warn("gang not placed: its ranks are not all there", "gang_id", gangID, "members", len(members), "slots", len(slots), "size", size)
+		return false, nil
+	}
+	for _, m := range members {
+		var live int
+		if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM leases WHERE execution_id=$1 AND state!='released'`, m.candidate.execution.ID).Scan(&live); err != nil {
+			return false, err
+		}
+		if m.candidate.execution.State != "waiting" || live != 0 {
+			return false, nil
+		}
+	}
+	byRank := make(map[int]planSlot, len(slots))
+	for _, s := range slots {
+		byRank[s.rank] = s
+	}
+
+	if _, err = tx.ExecContext(ctx, `SAVEPOINT gang_place`); err != nil {
+		return false, err
+	}
+	abandon := func() (bool, error) {
+		if _, err := tx.ExecContext(ctx, `ROLLBACK TO gang_place`); err != nil {
+			return false, err
+		}
+		_, err := tx.ExecContext(ctx, `RELEASE gang_place`)
+		return false, err
+	}
+	// one gang's placement failing leaves it waiting, not the pass (and every
+	// execution after it): what it wrote is rolled back; only a transaction
+	// that cannot be rolled back that far fails the pass
+	skip := func(err error) (bool, error) {
+		slog.Default().Warn("gang not placed", "gang_id", gangID, "error", err)
+		return abandon()
+	}
+	type assignment struct {
+		rank                 int
+		leaseID, executionID string
+		executor             planExecutor
+	}
+	var placed []assignment
+	nodes := make([]string, 0, len(members))
+	for _, m := range members {
+		slot := byRank[m.rank]
+		reservation, err := writeReservationTx(ctx, tx, slot.executor.id, m.candidate, slot.fit)
+		if err != nil {
+			return skip(err)
+		}
+		if reservation == nil {
+			return abandon()
+		}
+		placed = append(placed, assignment{rank: m.rank, leaseID: reservation.Lease.ID, executionID: m.candidate.execution.ID, executor: slot.executor})
+		nodes = append(nodes, slot.executor.nodeID)
+	}
+	seg, err := createSegmentTx(ctx, tx, segmentPrefix, nodes, 0, "gang")
+	if errors.Is(err, ErrFabric) {
+		// no segment for it now (every subnet taken, a node off the
+		// fabric since the pass read it): it waits, the pass goes on
+		slog.Default().Warn("gang not placed: no segment for its generation", "gang_id", gangID, "error", err)
+		return abandon()
+	}
+	if err != nil {
+		return skip(err)
+	}
+	subnet := netip.MustParsePrefix(seg.Subnet)
+	address := func(rank int) netip.Prefix {
+		a := subnet.Addr().As4()
+		a[3] += byte(rank + 1)
+		return netip.PrefixFrom(netip.AddrFrom4(a), subnet.Bits())
+	}
+	master := address(0).Addr().String()
+	placementID, stamp := id.New("gpl"), now()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placements(id,gang_id,state,master_addr,master_port,master_node_id,vni,subnet,mtu,created_at,updated_at) VALUES($1,$2,'placed',$3,$4,$5,$6,$7,$8,$9,$10)`,
+		placementID, gangID, master, port, placed[0].executor.nodeID, seg.VNI, seg.Subnet, seg.MTU, stamp, stamp); err != nil {
+		return skip(err)
+	}
+	for _, a := range placed {
+		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placement_leases(placement_id,rank,lease_id,execution_id,executor_id,node_id,address) VALUES($1,$2,$3,$4,$5,$6,$7)`,
+			placementID, a.rank, a.leaseID, a.executionID, a.executor.id, a.executor.nodeID, address(a.rank).String()); err != nil {
+			return skip(err)
+		}
+	}
+	leader := members[0].candidate.execution
+	if err = appendCoordinationEventTx(ctx, tx, "gang_placed", &leader.ProjectScopeID, "gang", gangID, nil, map[string]any{"placement_id": placementID, "master_addr": master, "master_port": port, "vni": seg.VNI, "subnet": seg.Subnet}); err != nil {
+		return skip(err)
+	}
+	if _, err = tx.ExecContext(ctx, `RELEASE gang_place`); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// gangLaunchTx is the gang information of a placed lease (nil for a lease that
+// is not a gang rank's).
+func gangLaunchTx(ctx context.Context, q queryer, leaseID string) (*GangLaunch, string, error) {
+	var g GangLaunch
+	var state string
+	var vni sql.NullInt64
+	err := q.QueryRowContext(ctx, `SELECT gp.gang_id,gp.id,gpl.rank,eg.size,gp.master_addr,gp.master_port,gp.state,gp.vni,gp.subnet,gp.mtu,gpl.address
+		FROM gang_placement_leases gpl JOIN gang_placements gp ON gp.id=gpl.placement_id JOIN execution_gangs eg ON eg.id=gp.gang_id
+		WHERE gpl.lease_id=$1`, leaseID).Scan(&g.GangID, &g.PlacementID, &g.Rank, &g.Size, &g.MasterAddr, &g.MasterPort, &state, &vni, &g.Subnet, &g.MTU, &g.Address)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, "", nil
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	g.VNI = int(vni.Int64)
+	err = eachRow(ctx, q, `SELECT address FROM gang_placement_leases WHERE placement_id=$1 ORDER BY rank`, []any{g.PlacementID}, func(rows *sql.Rows) error {
+		var a string
+		if err := rows.Scan(&a); err != nil {
+			return err
+		}
+		g.Addresses = append(g.Addresses, a)
+		return nil
+	})
+	return &g, state, err
+}
+
+// deliverGangLease hands executorID the oldest gang rank lease placed for it
+// that it has not received yet, as an ordinary reservation.
+func (s *Store) deliverGangLease(ctx context.Context, executorID string) (*Reservation, error) {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	var leaseID, executionID string
+	err = tx.QueryRowContext(ctx, `SELECT gpl.lease_id,gpl.execution_id FROM gang_placement_leases gpl
+		JOIN gang_placements gp ON gp.id=gpl.placement_id JOIN leases l ON l.id=gpl.lease_id
+		WHERE gpl.executor_id=$1 AND gpl.delivered_at IS NULL AND gp.state='placed' AND l.state='reserved'
+		ORDER BY gp.created_at,gpl.rank LIMIT 1`, executorID).Scan(&leaseID, &executionID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	candidate, err := loadCandidateTx(ctx, tx, executionID)
+	if err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal([]byte(candidate.argvJSON), &candidate.execution.Argv); err != nil {
+		return nil, err
+	}
+	candidate.execution.ExecutorSelector = json.RawMessage(candidate.selectorJSON)
+	var lease Lease
+	var expires sql.NullString
+	if err = tx.QueryRowContext(ctx, `SELECT id,execution_id,executor_id,coordination_epoch,state,created_at,expires_at FROM leases WHERE id=$1`, leaseID).Scan(&lease.ID, &lease.ExecutionID, &lease.ExecutorID, &lease.CoordinationEpoch, &lease.State, &lease.CreatedAt, &expires); err != nil {
+		return nil, err
+	}
+	if expires.Valid {
+		lease.ExpiresAt = &expires.String
+	}
+	resources, err := leaseResourcesTx(ctx, tx, leaseID)
+	if err != nil {
+		return nil, err
+	}
+	gates := map[string]int64{}
+	rows, err := tx.QueryContext(ctx, `SELECT scope_id,generation FROM lease_gate_snapshots WHERE lease_id=$1`, leaseID)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var scope string
+		var generation int64
+		if err = rows.Scan(&scope, &generation); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		gates[scope] = generation
+	}
+	if err = rows.Close(); err != nil {
+		return nil, err
+	}
+	gang, _, err := gangLaunchTx(ctx, tx, leaseID)
+	if err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE gang_placement_leases SET delivered_at=$1 WHERE lease_id=$2`, now(), leaseID); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	return &Reservation{Lease: lease, Execution: candidate.execution, Argv: candidate.execution.Argv, CWD: candidate.execution.CWD, Resources: resources, GateGenerations: gates, Gang: gang}, nil
+}
+
+func leaseResourcesTx(ctx context.Context, q queryer, leaseID string) ([]ResourceInstance, error) {
+	rows, err := q.QueryContext(ctx, `SELECT r.id,r.node_id,r.provider_id,r.kind,r.stable_identity,r.binding_json,r.attributes_json,r.admin_state,r.quarantine_reason
+		FROM lease_items li JOIN resource_instances r ON r.id=li.resource_id WHERE li.lease_id=$1 AND li.kind='gpu' ORDER BY r.id`, leaseID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ResourceInstance
+	for rows.Next() {
+		var resource ResourceInstance
+		var binding, attributes string
+		if err = rows.Scan(&resource.ID, &resource.NodeID, &resource.ProviderID, &resource.Kind, &resource.StableIdentity, &binding, &attributes, &resource.AdminState, &resource.QuarantineReason); err != nil {
+			return nil, err
+		}
+		resource.Binding = json.RawMessage(binding)
+		resource.Attributes = json.RawMessage(attributes)
+		out = append(out, resource)
+	}
+	return out, rows.Err()
+}
+
+// gangLaunchGateTx is the launch barrier: a gang rank is authorized only once
+// every rank of its placement is prepared. It returns the rank's GangLaunch
+// (nil for a non-gang lease) and marks the placement launched.
+func gangLaunchGateTx(ctx context.Context, tx *sql.Tx, leaseID string) (*GangLaunch, error) {
+	gang, state, err := gangLaunchTx(ctx, tx, leaseID)
+	if err != nil || gang == nil {
+		return nil, err
+	}
+	if state == "aborted" {
+		return nil, ErrGangAborted
+	}
+	var total, prepared, lost int
+	if err = tx.QueryRowContext(ctx, `SELECT COUNT(*),
+		COUNT(*) FILTER (WHERE l.state IN('prepared','active','releasing')),
+		COUNT(*) FILTER (WHERE l.state IN('released','stale','revocation_requested'))
+		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=$1`, gang.PlacementID).Scan(&total, &prepared, &lost); err != nil {
+		return nil, err
+	}
+	if lost != 0 && state == "placed" {
+		return nil, ErrGangAborted
+	}
+	if state == "placed" && prepared != total {
+		return nil, ErrGangNotReady
+	}
+	if state == "placed" {
+		if _, err = tx.ExecContext(ctx, `UPDATE gang_placements SET state='launched',updated_at=$1 WHERE id=$2 AND state='placed'`, now(), gang.PlacementID); err != nil {
+			return nil, err
+		}
+	}
+	return gang, nil
+}
+
+// ReconcileGangs keeps each gang to one fate. Before launch it aborts a
+// placement that lost a lease or was not prepared within GangPrepareTimeout;
+// after launch it terminates the running ranks of a gang one of whose ranks
+// stopped abnormally, and sends a suspend command given to one rank to all.
+func (s *Store) ReconcileGangs(ctx context.Context) error {
+	if err := s.abortStalePlacements(ctx); err != nil {
+		return err
+	}
+	if err := s.reconcileLaunchedGangs(ctx); err != nil {
+		return err
+	}
+	if err := s.propagateGangCheckpoints(ctx); err != nil {
+		return err
+	}
+	return s.removeEndedGangSegments(ctx)
+}
+
+// endedGangSegments selects the segments of generations that ended: no
+// placement still placed or launched with a lease not released has the VNI.
+const endedGangSegments = `SELECT s.vni FROM fabric_segments s WHERE s.purpose='gang' AND NOT EXISTS(
+	SELECT 1 FROM gang_placements gp WHERE gp.vni=s.vni AND gp.state IN('placed','launched')
+	AND EXISTS(SELECT 1 FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=gp.id AND l.state!='released'))`
+
+// removeEndedGangSegments takes away the segments of generations that
+// ended: their nodes take the devices down at their next sync (once no
+// container is on them).
+func (s *Store) removeEndedGangSegments(ctx context.Context) error {
+	var found bool
+	if err := s.db.QueryRowContext(ctx, `SELECT EXISTS(`+endedGangSegments+`)`).Scan(&found); err != nil || !found {
+		return err
+	}
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	var vnis []int
+	if err := eachRow(ctx, tx, endedGangSegments, nil, func(rows *sql.Rows) error {
+		var vni int
+		if err := rows.Scan(&vni); err != nil {
+			return err
+		}
+		vnis = append(vnis, vni)
+		return nil
+	}); err != nil {
+		return err
+	}
+	for _, vni := range vnis {
+		if err := deleteSegmentTx(ctx, tx, vni); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) abortStalePlacements(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT gp.id,gp.created_at,
+		(SELECT COUNT(*) FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=gp.id AND l.state IN('released','stale','revocation_requested'))
+		FROM gang_placements gp WHERE gp.state='placed'`)
+	if err != nil {
+		return err
+	}
+	type pending struct {
+		id, reason string
+	}
+	var aborts []pending
+	var unprepared []string
+	for rows.Next() {
+		var placementID, created string
+		var lost int
+		if err = rows.Scan(&placementID, &created, &lost); err != nil {
+			rows.Close()
+			return err
+		}
+		createdAt, _ := time.Parse(time.RFC3339Nano, created)
+		switch {
+		case lost != 0:
+			aborts = append(aborts, pending{placementID, "a rank lost its lease before launch"})
+		case time.Since(createdAt) > GangPrepareTimeout:
+			unprepared = append(unprepared, placementID)
+		}
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, placementID := range unprepared {
+		ranks, err := s.gangRankDetail(ctx, placementID)
+		if err != nil {
+			return err
+		}
+		aborts = append(aborts, pending{placementID, fmt.Sprintf("not every rank was prepared within %s: %s", GangPrepareTimeout, ranks)})
+	}
+	for _, a := range aborts {
+		aborted, err := s.abortPlacement(ctx, a.id, a.reason)
+		if err != nil {
+			return err
+		}
+		if aborted {
+			slog.Default().Warn("gang placement aborted", "placement_id", a.id, "reason", a.reason)
+		}
+	}
+	return nil
+}
+
+// gangRankDetail says where each rank of a placement waits: its executor,
+// whether that executor received the rank's lease, and when the executor last
+// polled. It is what shows why a rank was never prepared.
+func (s *Store) gangRankDetail(ctx context.Context, placementID string) (string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT gpl.rank,gpl.executor_id,l.state,gpl.delivered_at IS NOT NULL,x.last_seen_at
+		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id LEFT JOIN executors x ON x.id=gpl.executor_id
+		WHERE gpl.placement_id=$1 ORDER BY gpl.rank`, placementID)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	var ranks []string
+	for rows.Next() {
+		var rank int
+		var executorID, leaseState string
+		var delivered bool
+		var lastSeen sql.NullString
+		if err = rows.Scan(&rank, &executorID, &leaseState, &delivered, &lastSeen); err != nil {
+			return "", err
+		}
+		seen := "none"
+		if lastSeen.Valid {
+			seen = lastSeen.String
+		}
+		ranks = append(ranks, fmt.Sprintf("rank %d on executor %s: lease %s, delivered=%t, executor last_seen_at=%s", rank, executorID, leaseState, delivered, seen))
+	}
+	if err = rows.Err(); err != nil {
+		return "", err
+	}
+	return strings.Join(ranks, "; "), nil
+}
+
+// abortPlacement gives a placement up. Leases no executor has received yet are
+// released here (nothing was prepared for them); a received lease is released
+// by its executor, which learns of the abort from AuthorizeLaunch. It reports
+// whether the placement was still placed, and so was aborted now.
+func (s *Store) abortPlacement(ctx context.Context, placementID, reason string) (bool, error) {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	stamp := now()
+	res, err := tx.ExecContext(ctx, `UPDATE gang_placements SET state='aborted',abort_reason=$1,updated_at=$2 WHERE id=$3 AND state='placed'`, reason, stamp, placementID)
+	if err != nil {
+		return false, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false, tx.Commit()
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE leases SET state='released',released_at=$1 WHERE state IN('reserved','revocation_requested') AND id IN(
+		SELECT lease_id FROM gang_placement_leases WHERE placement_id=$2 AND delivered_at IS NULL)`, stamp, placementID); err != nil {
+		return false, err
+	}
+	var gangID, projectID string
+	if err = tx.QueryRowContext(ctx, `SELECT gp.gang_id,e.project_scope_id FROM gang_placements gp JOIN execution_gangs g ON g.id=gp.gang_id JOIN execution_requests e ON e.id=g.leader_execution_id WHERE gp.id=$1`, placementID).Scan(&gangID, &projectID); err != nil {
+		return false, err
+	}
+	if err = appendCoordinationEventTx(ctx, tx, "gang_placement_aborted", &projectID, "gang", gangID, nil, map[string]any{"placement_id": placementID, "reason": reason}); err != nil {
+		return false, err
+	}
+	if err = clearReleasedLeaseSettingsTx(ctx, tx); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+type gangRankState struct {
+	rank                    int
+	executionID, executorID string
+	leaseState              string
+	attemptID               sql.NullString
+	attemptState            sql.NullString
+	exitCode                sql.NullInt64
+	checkpointable          bool
+	command                 sql.NullString // origin of the rank's live or checkpointed suspend
+	commandReason           sql.NullString
+	commandState            sql.NullString // and its state: checkpointed when the rank published its part
+	terminated              bool
+	executionState          string
+}
+
+func (s *Store) reconcileLaunchedGangs(ctx context.Context) error {
+	rows, err := s.db.QueryContext(ctx, `SELECT gp.id,gp.gang_id FROM gang_placements gp WHERE gp.state='launched'
+		AND EXISTS(SELECT 1 FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id WHERE gpl.placement_id=gp.id AND l.state!='released')`)
+	if err != nil {
+		return err
+	}
+	type placement struct{ id, gangID string }
+	var live []placement
+	for rows.Next() {
+		var p placement
+		if err = rows.Scan(&p.id, &p.gangID); err != nil {
+			rows.Close()
+			return err
+		}
+		live = append(live, p)
+	}
+	if err = rows.Close(); err != nil {
+		return err
+	}
+	for _, p := range live {
+		ranks, err := s.gangRankStates(ctx, p.id)
+		if err != nil {
+			return err
+		}
+		stopped := ""
+		var origin, reason string
+		for _, r := range ranks {
+			if r.command.Valid && origin == "" {
+				origin, reason = r.command.String, fmt.Sprintf("gang rank %d: %s", r.rank, r.commandReason.String)
+			}
+			if stopped != "" {
+				continue
+			}
+			published := r.commandState.String == "checkpointed"
+			switch {
+			case !r.attemptID.Valid:
+				// between the barrier and its own launch, unless its lease is gone:
+				// then it never runs in this generation, which ends (the gang is
+				// restarted as a launch that failed: gang_restart)
+				if r.leaseState == "released" || r.leaseState == "stale" || r.leaseState == "revocation_requested" {
+					stopped = fmt.Sprintf("rank %d lost its lease before launch", r.rank)
+					if err := s.abortUnlaunchedMember(ctx, r, stopped); err != nil {
+						return err
+					}
+				}
+			case r.attemptState.String == "lost":
+				stopped = fmt.Sprintf("rank %d lost its executor", r.rank)
+			case (r.attemptState.String == "exited" || r.attemptState.String == "quiesced") && !published && (!r.exitCode.Valid || r.exitCode.Int64 != 0):
+				// (a rank that took a suspend and ended without publishing its
+				// part stopped as much as one that took none)
+				stopped = fmt.Sprintf("rank %d stopped (exit %v)", r.rank, nullableInt(r.exitCode))
+			}
+		}
+		for _, r := range ranks {
+			running := r.attemptID.Valid && (r.attemptState.String == "running" || r.attemptState.String == "quiescing")
+			if !running {
+				continue
+			}
+			switch {
+			// a rank that published its part of a suspend ends by itself; one
+			// that only took the suspend may wait for a peer that is gone
+			case stopped != "" && !r.terminated && r.commandState.String != "checkpointed":
+				if err := s.requestGangTermination(ctx, r, p.gangID, stopped); err != nil {
+					return err
+				}
+			case stopped == "" && origin != "" && !r.command.Valid && r.checkpointable && r.attemptState.String == "running":
+				if _, err := s.EnqueueSuspend(ctx, r.attemptID.String, origin, reason); err != nil && !errors.Is(err, ErrNotFound) {
+					return fmt.Errorf("suspend gang rank %d: %w", r.rank, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// abortUnlaunchedMember ends, as a launch that failed, the execution of a
+// member of a launched generation that lost its lease before it was
+// launched: it is never placed alone, and the gang, once every member has
+// ended, is restarted (gang_restart, bounded).
+func (s *Store) abortUnlaunchedMember(ctx context.Context, r gangRankState, reason string) error {
+	if r.executionState != "waiting" {
+		return nil
+	}
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	stamp := now()
+	res, err := tx.ExecContext(ctx, `UPDATE execution_requests SET state='terminal',terminal_cause=$1,terminal_at=$2 WHERE id=$3 AND state='waiting'`,
+		"launch_aborted: "+reason, stamp, r.executionID)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		projectID, err := executionProjectIDTx(ctx, tx, r.executionID)
+		if err != nil {
+			return err
+		}
+		if err := appendCoordinationEventTx(ctx, tx, "execution_terminal", &projectID, "execution", r.executionID, nil, map[string]string{"cause": "launch_aborted: " + reason}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func nullableInt(v sql.NullInt64) any {
+	if v.Valid {
+		return v.Int64
+	}
+	return nil
+}
+
+func (s *Store) gangRankStates(ctx context.Context, placementID string) ([]gangRankState, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT gpl.rank,gpl.execution_id,gpl.executor_id,l.state,a.id,a.state,a.exit_code,e.checkpointable,e.state,
+		(SELECT c.origin FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
+		(SELECT c.reason FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
+		(SELECT c.state FROM commands c WHERE c.attempt_id=a.id AND c.kind='suspend' AND c.state!='rejected' ORDER BY c.created_at DESC LIMIT 1),
+		EXISTS(SELECT 1 FROM gang_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id) OR EXISTS(SELECT 1 FROM force_stops t WHERE t.attempt_id=a.id)
+		FROM gang_placement_leases gpl JOIN leases l ON l.id=gpl.lease_id JOIN execution_requests e ON e.id=gpl.execution_id
+		LEFT JOIN attempts a ON a.id=l.attempt_id
+		WHERE gpl.placement_id=$1 ORDER BY gpl.rank`, placementID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []gangRankState
+	for rows.Next() {
+		var r gangRankState
+		if err = rows.Scan(&r.rank, &r.executionID, &r.executorID, &r.leaseState, &r.attemptID, &r.attemptState, &r.exitCode, &r.checkpointable, &r.executionState, &r.command, &r.commandReason, &r.commandState, &r.terminated); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+func (s *Store) requestGangTermination(ctx context.Context, r gangRankState, gangID, reason string) error {
+	tx, err := s.beginWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `INSERT INTO gang_terminations(attempt_id,execution_id,executor_id,gang_id,reason,state,requested_at) VALUES($1,$2,$3,$4,$5,'pending',$6) ON CONFLICT(attempt_id) DO NOTHING`, r.attemptID.String, r.executionID, r.executorID, gangID, reason, now())
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		projectID, err := executionProjectIDTx(ctx, tx, r.executionID)
+		if err != nil {
+			return err
+		}
+		if err = appendCoordinationEventTx(ctx, tx, "gang_termination_requested", &projectID, "attempt", r.attemptID.String, nil, map[string]any{"execution_id": r.executionID, "gang_id": gangID, "rank": r.rank, "reason": reason}); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// gangOutcome is what orchestration needs to know about a gang beyond its
+// aggregated execution state.
+type gangOutcome struct {
+	gang bool
+	// a rank was terminated by a node quarantine: run the task again
+	quarantined bool
+	// a rank failed to launch after others had started: run the gang again
+	launchAborted bool
+}
+
+// gangAggregateTx folds the ranks of the gang led by current's execution into
+// current, so the orchestration policy reads the gang like one execution:
+// terminal when every rank is terminal, quiesced and released when every rank
+// is, exit 0 only when every rank exited 0, lost when any rank was lost. The
+// leader's attempt keeps deciding checkpoint continuation.
+func gangAggregateTx(ctx context.Context, tx *sql.Tx, current *currentTaskExecution) (gangOutcome, error) {
+	gangID, _, leaderID, err := gangOfExecutionTx(ctx, tx, current.ExecutionID)
+	if err != nil || gangID == "" || leaderID != current.ExecutionID {
+		return gangOutcome{}, err
+	}
+	out := gangOutcome{gang: true}
+	rows, err := tx.QueryContext(ctx, `SELECT e.state,e.terminal_cause,a.id,a.state,a.exit_code,a.exit_signal,
+		(SELECT l.state FROM leases l WHERE l.execution_id=e.id ORDER BY l.created_at DESC LIMIT 1),
+		EXISTS(SELECT 1 FROM quarantine_terminations t WHERE t.attempt_id=a.id AND `+terminationBeforeExit+`)
+		FROM gang_members m JOIN execution_requests e ON e.id=m.execution_id LEFT JOIN attempts a ON a.execution_id=e.id
+		WHERE m.gang_id=$1 ORDER BY m.rank`, gangID)
+	if err != nil {
+		return out, err
+	}
+	defer rows.Close()
+	allTerminal, allQuiesced, allReleased, allZero, anyLost, anyNoAttempt := true, true, true, true, false, false
+	var firstNonZero *int
+	for rows.Next() {
+		var state string
+		var cause, attemptID, attemptState, signal, leaseState sql.NullString
+		var exit sql.NullInt64
+		var quarantined bool
+		if err = rows.Scan(&state, &cause, &attemptID, &attemptState, &exit, &signal, &leaseState, &quarantined); err != nil {
+			return out, err
+		}
+		allTerminal = allTerminal && state == "terminal"
+		if !attemptID.Valid {
+			// a member that ended without an attempt (its launch aborted,
+			// withdrawn) has nothing running: as quiesced
+			anyNoAttempt = true
+			allQuiesced = allQuiesced && state == "terminal"
+		} else {
+			allQuiesced = allQuiesced && attemptState.String == "quiesced"
+			anyLost = anyLost || attemptState.String == "lost"
+		}
+		// a member never given a lease (stopped or withdrawn before the
+		// gang was placed) holds nothing
+		allReleased = allReleased && (!leaseState.Valid || leaseState.String == "released")
+		if !exit.Valid || exit.Int64 != 0 || (signal.Valid && signal.String != "") {
+			allZero = false
+			if exit.Valid && exit.Int64 != 0 && firstNonZero == nil {
+				v := int(exit.Int64)
+				firstNonZero = &v
+			}
+		}
+		out.quarantined = out.quarantined || quarantined
+		out.launchAborted = out.launchAborted || (cause.Valid && len(cause.String) >= len("launch_aborted") && cause.String[:len("launch_aborted")] == "launch_aborted")
+	}
+	if err = rows.Err(); err != nil {
+		return out, err
+	}
+	if !allTerminal {
+		current.ExecutionState = "started"
+		return out, nil
+	}
+	if anyNoAttempt && current.AttemptID != nil && !out.launchAborted {
+		current.AttemptID = nil
+	}
+	lost := "lost"
+	quiesced := "quiesced"
+	released := "released"
+	switch {
+	case anyLost:
+		current.AttemptState = &lost
+	case allQuiesced:
+		current.AttemptState = &quiesced
+	default:
+		other := "exited"
+		current.AttemptState = &other
+	}
+	if allReleased {
+		current.LeaseState = &released
+	} else {
+		other := "releasing"
+		current.LeaseState = &other
+	}
+	switch {
+	case allZero:
+		zero := 0
+		current.ExitCode, current.ExitSignal = &zero, nil
+	case firstNonZero != nil:
+		current.ExitCode = firstNonZero
+	default:
+		// Not every rank exited 0, yet none with another code: a rank has no
+		// exit (it never launched) or was signalled. The leader's 0 is not
+		// the gang's.
+		current.ExitCode = nil
+	}
+	return out, nil
+}

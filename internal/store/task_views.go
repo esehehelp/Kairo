@@ -248,7 +248,7 @@ func (s *Store) taskStatuses(ctx context.Context, projectID string, filter TaskF
 }
 
 // TaskDetail is one task with its declaration, its neighbours in the DAG, its
-// admission gates and every execution with its attempts and what
+// admission gates and every execution with its attempts, gang ranks and what
 // it waits for.
 type TaskDetail struct {
 	TaskStatus
@@ -278,6 +278,7 @@ type TaskGate struct {
 type TaskExecutionDetail struct {
 	TaskExecution
 	Attempts []AttemptDetail `json:"attempts"`
+	Gang     []TaskGangRank  `json:"gang,omitempty"`
 	Outputs  []TaskOutput    `json:"outputs,omitempty"`
 	// Waiting says why an execution that has not started waits, besides its
 	// dependencies.
@@ -336,6 +337,19 @@ type AttemptDetail struct {
 	Streams []AttemptStream `json:"streams,omitempty"`
 }
 
+type TaskGangRank struct {
+	Rank        int     `json:"rank"`
+	ExecutionID string  `json:"execution_id"`
+	State       string  `json:"state"`
+	AttemptID   *string `json:"attempt_id,omitempty"`
+	ExecutorID  *string `json:"executor_id,omitempty"`
+	NodeID      *string `json:"node_id,omitempty"`
+	// Address is the member's on its latest placement's segment (CIDR),
+	// VNI that segment's.
+	Address string `json:"address,omitempty"`
+	VNI     *int   `json:"vni,omitempty"`
+}
+
 // WaitReason is an admission block of the execution, or a closed admission
 // gate of one of its scopes (reason_code scope_gate_closed).
 type WaitReason struct {
@@ -346,7 +360,7 @@ type WaitReason struct {
 }
 
 // GetTaskDetail reads one task in a fixed number of queries: the attempts,
-// outputs and admission blocks of all its executions are read at once.
+// outputs, gang ranks and admission blocks of all its executions are read at once.
 func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDetail, error) {
 	task, err := loadTaskTx(ctx, s.db, project, name)
 	if err != nil {
@@ -383,6 +397,10 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 		return TaskDetail{}, err
 	}
 	attempts, err := s.taskAttemptDetails(ctx, task.scopeID)
+	if err != nil {
+		return TaskDetail{}, err
+	}
+	gangs, err := s.taskGangRanks(ctx, task.scopeID)
 	if err != nil {
 		return TaskDetail{}, err
 	}
@@ -433,7 +451,7 @@ func (s *Store) GetTaskDetail(ctx context.Context, project, name string) (TaskDe
 		return TaskDetail{}, err
 	}
 	for _, execution := range detail.TaskStatus.Executions {
-		item := TaskExecutionDetail{TaskExecution: execution, Attempts: attempts[execution.ExecutionID], Outputs: outputs[execution.ExecutionID]}
+		item := TaskExecutionDetail{TaskExecution: execution, Attempts: attempts[execution.ExecutionID], Gang: gangs[execution.ExecutionID], Outputs: outputs[execution.ExecutionID]}
 		if item.Attempts == nil {
 			item.Attempts = []AttemptDetail{}
 		}
@@ -538,6 +556,28 @@ func (s *Store) taskAttemptDetails(ctx context.Context, taskScopeID string) (map
 			return err
 		}
 		out[v.ExecutionID] = append(out[v.ExecutionID], AttemptDetail{AttemptView: v, NodeID: nodeID, RAMPeakBytes: ram})
+		return nil
+	})
+	return out, err
+}
+
+// taskGangRanks lists the ranks of the gangs a task's executions lead, by
+// leader.
+func (s *Store) taskGangRanks(ctx context.Context, taskScopeID string) (map[string][]TaskGangRank, error) {
+	out := map[string][]TaskGangRank{}
+	err := eachRow(ctx, s.db, `SELECT g.leader_execution_id,m.rank,m.execution_id,e.state,a.id,COALESCE(a.executor_id,l.executor_id),x.node_id,
+		COALESCE(p.address,''),p.vni
+		FROM orchestration_task_executions te JOIN execution_gangs g ON g.leader_execution_id=te.execution_id JOIN gang_members m ON m.gang_id=g.id JOIN execution_requests e ON e.id=m.execution_id LEFT JOIN attempts a ON a.execution_id=e.id`+latestLeaseJoin+`
+		LEFT JOIN executors x ON x.id=COALESCE(a.executor_id,l.executor_id)
+		LEFT JOIN LATERAL (SELECT gpl.address,gp.vni FROM gang_placement_leases gpl JOIN gang_placements gp ON gp.id=gpl.placement_id
+			WHERE gpl.execution_id=e.id ORDER BY gp.created_at DESC LIMIT 1) p ON true
+		WHERE te.task_scope_id=$1 ORDER BY m.rank`, []any{taskScopeID}, func(rows *sql.Rows) error {
+		var leaderID string
+		var r TaskGangRank
+		if err := rows.Scan(&leaderID, &r.Rank, &r.ExecutionID, &r.State, &r.AttemptID, &r.ExecutorID, &r.NodeID, &r.Address, &r.VNI); err != nil {
+			return err
+		}
+		out[leaderID] = append(out[leaderID], r)
 		return nil
 	})
 	return out, err

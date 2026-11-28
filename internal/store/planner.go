@@ -49,7 +49,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"kairo/internal/store/dbtx"
 	"math"
 	"slices"
 	"sort"
@@ -69,6 +68,10 @@ type SchedulingPolicy struct {
 	// capped at 5% of its size: a node with a filesystem under it admits
 	// nothing, and no admission may take a filesystem under it. 0 disables it.
 	DiskMinFreeBytes int64
+	// GangSegmentPrefix is where the segments of gangs' generations take
+	// their subnets (the daemon's [fabric] segment_prefix): without it no
+	// gang is placed (its members meet on a segment of the fabric).
+	GangSegmentPrefix string
 }
 
 // DefaultDiskMinFreeBytes is the default filesystem watermark (5 GiB).
@@ -76,6 +79,9 @@ const DefaultDiskMinFreeBytes = 5 << 30
 
 // SetSchedulingPolicy replaces the admission settings.
 func (s *Store) SetSchedulingPolicy(p SchedulingPolicy) { s.policy = p }
+
+// SchedulingPolicy is the admission settings in force.
+func (s *Store) SchedulingPolicy() SchedulingPolicy { return s.policy }
 
 const (
 	// executorLiveWindow: an executor not seen for this long gets no
@@ -121,6 +127,7 @@ type planLease struct {
 	id, executionID, attemptID, executorID, nodeID, projectID, label string
 	epoch                                                            int64
 	priority                                                         int
+	gang                                                             bool
 	startedAt                                                        time.Time
 	// victim: a running cooperative attempt that priority preemption may
 	// suspend; suspending: it already has a live suspend command.
@@ -165,8 +172,12 @@ type planRank struct {
 
 type planCandidate struct {
 	executionCandidate
-	label     string
-	demand    planDemand
+	label  string
+	demand planDemand
+	gangID string
+	ranks  []planRank
+	// links: what the gang says its members' links must be (nil: any)
+	links     *gangLinks
 	submitted time.Time
 	// inputsWait: why it is not admitted yet for its inputs (inputs.go);
 	// empty when it has none, or each is where it is planned.
@@ -205,6 +216,15 @@ type planModel struct {
 	// owners are the nodes whose CPU or RAM their owner uses: the kinds
 	// (owneruse.go)
 	owners map[string][]string
+	// routing: the nodes that route on the fabric (run FRR); reach: the
+	// pairs of them that reach each other now (each reported a handshake
+	// with the other within handshakeFresh: fabricPair)
+	routing map[string]bool
+	reach   map[[2]string]bool
+	// links: what was measured of each directed link between them;
+	// metered: the nodes whose uplink is (fabric_evidence.go)
+	links   map[[2]string]linkEvidence
+	metered map[string]bool
 }
 
 // planOverlay is what the pass has handed out so far: devices placed on or
@@ -344,7 +364,43 @@ func (m *planModel) loadExecutors(ctx context.Context, tx *sql.Tx, callerID stri
 		}
 		m.executors = append(m.executors, e)
 	}
-	return rows.Err()
+	if err = rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	// the nodes that route on the fabric: a gang's members go there only,
+	// and only to ones that reach each other
+	m.routing, m.reach = map[string]bool{}, map[[2]string]bool{}
+	if err := eachRow(ctx, tx, `SELECT node_id FROM fabric_nodes WHERE routing`, nil, func(rows *sql.Rows) error {
+		var node string
+		if err := rows.Scan(&node); err != nil {
+			return err
+		}
+		m.routing[node] = true
+		return nil
+	}); err != nil {
+		return err
+	}
+	ways := map[[2]string]int{}
+	err = eachRow(ctx, tx, `SELECT l.src_node,l.dst_node,l.handshake_at FROM fabric_links l
+		JOIN fabric_nodes a ON a.node_id=l.src_node AND a.routing JOIN fabric_nodes b ON b.node_id=l.dst_node AND b.routing
+		WHERE l.handshake_at IS NOT NULL`, nil, func(rows *sql.Rows) error {
+		var src, dst, at string
+		if err := rows.Scan(&src, &dst, &at); err != nil {
+			return err
+		}
+		if t, err := time.Parse(time.RFC3339Nano, at); err == nil && m.stamp.Sub(t) < handshakeFresh {
+			ways[fabricPair(src, dst)]++
+		}
+		return nil
+	})
+	for pair, n := range ways {
+		m.reach[pair] = n == 2 // both ways
+	}
+	if err != nil {
+		return err
+	}
+	return m.loadLinkEvidence(ctx, tx)
 }
 
 func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
@@ -453,6 +509,7 @@ func (m *planModel) loadResources(ctx context.Context, tx *sql.Tx) error {
 func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 	rows, err := tx.QueryContext(ctx, `SELECT l.id,l.execution_id,COALESCE(l.attempt_id,''),l.executor_id,x.node_id,x.enabled,l.state,l.coordination_epoch,COALESCE(a.state,''),
 		e.priority,e.checkpointable,e.preemptible,e.state,e.project_scope_id,COALESCE(e.task_scope_id,e.queue_scope_id,e.project_scope_id),COALESCE(e.started_at,''),
+		EXISTS(SELECT 1 FROM gang_members gm WHERE gm.execution_id=e.id),
 		COALESCE((SELECT MIN(CASE WHEN COALESCE(rr.policy_json::jsonb->>'on_unattributed_activity','wait')='allow' THEN 1 ELSE 0 END)
 			FROM resource_requests rr WHERE rr.execution_id=e.id AND rr.request_type='exclusive' AND rr.kind='gpu'),0),
 		u.ram_bytes,u.disk_written_bytes,u.observed_at,
@@ -476,7 +533,7 @@ func (m *planModel) loadLeases(ctx context.Context, tx *sql.Tx) error {
 		var leaseState, attemptState, executionState, started string
 		var u usage
 		if err = rows.Scan(&l.id, &l.executionID, &l.attemptID, &l.executorID, &l.nodeID, &executorEnabled, &leaseState, &l.epoch, &attemptState,
-			&l.priority, &checkpointable, &preemptible, &executionState, &l.projectID, &l.label, &started, &l.allowsUnattributed,
+			&l.priority, &checkpointable, &preemptible, &executionState, &l.projectID, &l.label, &started, &l.gang, &l.allowsUnattributed,
 			&u.ram, &u.disk, &u.at, &l.cpuLendable, &l.queueID, &l.taskID, &l.argvJSON, &l.attemptStarted, &l.attemptExited); err != nil {
 			rows.Close()
 			return err
@@ -949,10 +1006,52 @@ type planner struct {
 	usage   map[string]map[string]float64 // project -> kind -> held
 	// holds are what waiting executions hold (place), apart from ov.
 	holds []planHold
+	// anyReach: assign places a gang's members whether or not their nodes
+	// reach each other (to tell a partition from want of room)
+	anyReach bool
+	// want: what the gang being placed says its members' links must be;
+	// missing: the links assign found no measurement of; measure: the links
+	// to ask a sample of (fabric_evidence.go)
+	want    *gangLinks
+	missing map[[2]string]bool
+	measure map[[2]string]bool
+}
+
+// reachesAll reports whether node reaches every node of others on the
+// fabric now (a gang's members go only to nodes that all do: issue #47,
+// partitions). One node alone reaches all.
+func (p *planner) reachesAll(node string, others map[string]bool) bool {
+	if p.anyReach {
+		return true
+	}
+	for other := range others {
+		if !p.m.reach[fabricPair(node, other)] {
+			return false
+		}
+		if p.want != nil {
+			if v := p.m.linkMeets(node, other, p.want); !v.met {
+				for _, l := range v.missing {
+					if p.missing != nil {
+						p.missing[l] = true
+					}
+				}
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// fabricPair is the key of the pair a, b in planModel.reach.
+func fabricPair(a, b string) [2]string {
+	if b < a {
+		a, b = b, a
+	}
+	return [2]string{a, b}
 }
 
 func newPlanner(m *planModel, preempt bool) *planner {
-	p := &planner{m: m, ov: newOverlay(), preempt: preempt, victims: map[string]bool{}, usage: map[string]map[string]float64{}}
+	p := &planner{m: m, ov: newOverlay(), preempt: preempt, victims: map[string]bool{}, usage: map[string]map[string]float64{}, measure: map[[2]string]bool{}}
 	for _, l := range m.leases {
 		p.account(l.projectID, "gpu", float64(len(l.devices)))
 		for key, quantity := range l.capacity {
@@ -1042,12 +1141,17 @@ func (p *planner) order(candidates []*planCandidate, visit func(*planCandidate) 
 	return nil
 }
 
-// slotsFor lists, per node, the executor a demand would run on there.
-func (p *planner) slotsFor(selector string) []planExecutor {
+// slotsFor lists, per node, the executor a demand would run on there (a
+// gang member's: only on a node that routes on the fabric, where its
+// generation's segment can be).
+func (p *planner) slotsFor(selector string, gang bool) []planExecutor {
 	var slots []planExecutor
 	seen := map[string]bool{}
 	for _, e := range p.m.executors {
 		if seen[e.nodeID] || !selectorMatches(selector, e.nodeID, e.attributes) {
+			continue
+		}
+		if gang && !p.m.routing[e.nodeID] {
 			continue
 		}
 		seen[e.nodeID] = true
@@ -1069,12 +1173,25 @@ func (p *planner) place(c *planCandidate) planPlacement {
 // decide is place without the deadline note; start is when the candidate is
 // expected to start when it waits (zero: not known).
 func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
-	ranks := []planRank{{rank: 0, candidate: c.executionCandidate, demand: c.demand}}
+	// a gang's members' links must be what it says (fabric_evidence.go)
+	p.want = c.links
+	defer func() { p.want = nil }()
+	ranks := c.ranks
+	if c.gangID == "" {
+		ranks = []planRank{{rank: 0, candidate: c.executionCandidate, demand: c.demand}}
+	}
+	if c.gangID != "" && p.m.policy.GangSegmentPrefix == "" {
+		return planPlacement{wait: planWait{reason: "no_fabric", message: "a gang's members meet on a segment of the fabric: the daemon has no [fabric] segment_prefix"}}, time.Time{}
+	}
 	options := make([][]planExecutor, len(ranks))
 	for i, r := range ranks {
-		options[i] = p.slotsFor(r.candidate.selectorJSON)
+		options[i] = p.slotsFor(r.candidate.selectorJSON, c.gangID != "")
 		if len(options[i]) == 0 {
-			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + "no live executor matches the executor labels"}}, time.Time{}
+			message := "no live executor matches the executor labels"
+			if c.gangID != "" {
+				message = "no live executor on a node that routes on the fabric (runs FRR) matches the executor labels"
+			}
+			return planPlacement{wait: planWait{reason: "no_executor", message: rankPrefix(c, r) + message}}, time.Time{}
 		}
 	}
 	// Where its run's output directory is (outputhome.go): it waits for it,
@@ -1098,9 +1215,9 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 		p.commit(c, slots)
 		return planPlacement{slots: slots}, time.Time{}
 	}
-	// Nowhere to go now. An execution whose every node refuses it by its own
-	// policy ends here.
-	{
+	// Nowhere to go now. A single execution whose every node refuses it by
+	// its own policy ends here.
+	if c.gangID == "" {
 		terminal, reason := true, ""
 		for _, e := range options[0] {
 			f := p.m.fit(e.nodeID, ranks[0].demand, ov, noneFreed)
@@ -1112,7 +1229,35 @@ func (p *planner) decide(c *planCandidate) (planPlacement, time.Time) {
 		}
 	}
 	// Where it would go once the leases in its way end, if anywhere.
+	p.missing = map[[2]string]bool{}
 	target, transient := p.assign(ranks, options, newOverlay(), allFreed)
+	if !transient && len(ranks) > 1 && p.want != nil {
+		// would it fit on nodes that reach each other but for what it says
+		// its links must be: the measurements are missing, or short of it
+		missing, want := p.missing, p.want
+		p.want = nil
+		_, fits := p.assign(ranks, options, newOverlay(), allFreed)
+		p.want = want
+		if fits {
+			if len(missing) > 0 {
+				for l := range missing {
+					p.measure[l] = true
+				}
+				return planPlacement{wait: planWait{reason: "fabric_unmeasured", message: "no measurement yet says the links between the nodes that could hold its members are " + want.describe() + "; samples of them are asked for"}}, time.Time{}
+			}
+			return planPlacement{wait: planWait{reason: "fabric_links_short", message: "the links between the nodes that could hold its members are measured short of " + want.describe()}}, time.Time{}
+		}
+	}
+	if !transient && len(ranks) > 1 {
+		// members that would fit but on nodes that do not all reach each
+		// other on the fabric now (a partition): it waits, placed across none
+		p.anyReach = true
+		_, fits := p.assign(ranks, options, newOverlay(), allFreed)
+		p.anyReach = false
+		if fits {
+			return planPlacement{wait: planWait{reason: "fabric_partitioned", message: "the nodes that could hold its members do not all reach each other on the fabric now (no fresh handshake both ways)"}}, time.Time{}
+		}
+	}
 	if !transient {
 		f := p.m.fit(options[0][0].nodeID, ranks[0].demand, ov, noneFreed)
 		if f.ok || f.reason == "held_for_higher_priority" || f.reason == "gpu_leased" {
@@ -1412,9 +1557,15 @@ func formatAbout(d time.Duration) string {
 	return fmt.Sprintf("%dh%02dm", minutes/60, minutes%60)
 }
 
-func rankPrefix(*planCandidate, planRank) string {
-	return ""
+func rankPrefix(c *planCandidate, r planRank) string {
+	if c.gangID == "" {
+		return ""
+	}
+	return fmt.Sprintf("rank %d: ", r.rank)
 }
+
+// assignBudget bounds the nodes assign tries for one placement.
+const assignBudget = 20000
 
 // assign puts every rank on a distinct node (all or nothing), each on the
 // best node left for it, trying the most constrained rank first.
@@ -1425,6 +1576,19 @@ func (p *planner) assign(ranks []planRank, options [][]planExecutor, ov planOver
 	}
 	sort.SliceStable(order, func(a, b int) bool { return len(options[order[a]]) < len(options[order[b]]) })
 	slots := make([]planSlot, len(ranks))
+	// every rank on a node of its own: not when the nodes are fewer
+	nodes := map[string]bool{}
+	for _, opts := range options {
+		for _, e := range opts {
+			nodes[e.nodeID] = true
+		}
+	}
+	if len(nodes) < len(ranks) {
+		return slots, false
+	}
+	// the search is bounded (it runs under the decision lock): a gang it
+	// gives up on waits, as one that does not fit
+	budget := assignBudget
 	used := map[string]bool{}
 	var walk func(int, planOverlay) bool
 	walk = func(depth int, ov planOverlay) bool {
@@ -1434,7 +1598,10 @@ func (p *planner) assign(ranks []planRank, options [][]planExecutor, ov planOver
 		i := order[depth]
 		var fits []planSlot
 		for _, e := range options[i] {
-			if used[e.nodeID] {
+			if budget--; budget < 0 {
+				return false
+			}
+			if used[e.nodeID] || !p.reachesAll(e.nodeID, used) {
 				continue
 			}
 			if f := p.m.fit(e.nodeID, ranks[i].demand, ov, freed); f.ok {
@@ -1484,6 +1651,9 @@ func (p *planner) makeRoom(c *planCandidate, ranks []planRank, target []planSlot
 		}
 		if x.priority != y.priority {
 			return x.priority < y.priority
+		}
+		if x.gang != y.gang {
+			return !x.gang // a gang victim stops every rank
 		}
 		if !x.startedAt.Equal(y.startedAt) {
 			return x.startedAt.After(y.startedAt)
@@ -1615,28 +1785,71 @@ func (p *planner) reaches(l *planLease, nodes map[string]bool) bool {
 //
 // It costs a fixed number of queries whatever the number of candidates (one
 // round trip each, which matters with the database across a network): the
-// candidates, and the resource requests of all of them.
+// candidates with their gangs, the members of those gangs, and the resource
+// requests of all of them.
 func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planCandidate, error) {
 	var candidates []*planCandidate
-	err := eachRow(ctx, tx, `SELECT `+candidateColumns+`
-		FROM execution_requests e
+	var gangIDs []string
+	err := eachRow(ctx, tx, `SELECT `+candidateColumns+`,COALESCE(gm.gang_id,'')
+		FROM execution_requests e LEFT JOIN gang_members gm ON gm.execution_id=e.id
 		WHERE e.state='waiting'
 		AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.execution_id=e.id AND l.state!='released')
 		AND NOT EXISTS (
 			SELECT 1 FROM admission_gates g
 			WHERE g.scope_id IN(e.project_scope_id,e.queue_scope_id,e.task_scope_id) AND g.state!='open'
 		)
+		AND (gm.rank IS NULL OR gm.rank=0)
 		ORDER BY e.priority DESC,e.submitted_at,e.id`, nil, func(rows *sql.Rows) error {
 		c := &planCandidate{}
-		if err := scanCandidate(rows, &c.executionCandidate); err != nil {
+		if err := scanCandidate(rows, &c.executionCandidate, &c.gangID); err != nil {
 			return err
 		}
 		c.submitted, _ = time.Parse(time.RFC3339Nano, c.execution.SubmittedAt)
+		if c.gangID != "" {
+			gangIDs = append(gangIDs, c.gangID)
+		}
 		candidates = append(candidates, c)
 		return nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	members := map[string][]gangMember{}
+	if len(gangIDs) > 0 {
+		err = eachRow(ctx, tx, `SELECT `+candidateColumns+`,gm.gang_id,gm.rank FROM gang_members gm JOIN execution_requests e ON e.id=gm.execution_id
+			WHERE gm.gang_id=ANY($1::text[]) ORDER BY gm.gang_id,gm.rank`, []any{gangIDs}, func(rows *sql.Rows) error {
+			var member gangMember
+			var gangID string
+			if err := scanCandidate(rows, &member.candidate, &gangID, &member.rank); err != nil {
+				return err
+			}
+			members[gangID] = append(members[gangID], member)
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	// what each gang says its members' links must be (fabric_evidence.go)
+	links := map[string]*gangLinks{}
+	if len(gangIDs) > 0 {
+		err = eachRow(ctx, tx, `SELECT id,COALESCE(max_rtt_ms,0),COALESCE(min_bytes_per_second,0),metered FROM execution_gangs WHERE id=ANY($1::text[])`, []any{gangIDs}, func(rows *sql.Rows) error {
+			var id string
+			var l gangLinks
+			if err := rows.Scan(&id, &l.maxRTT, &l.minBytes, &l.metered); err != nil {
+				return err
+			}
+			if !l.any() {
+				links[id] = &l
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, c := range candidates {
+		c.links = links[c.gangID]
 	}
 	ids := make([]string, 0, len(candidates))
 	for _, c := range candidates {
@@ -1650,6 +1863,11 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 	}
 	if err = loadCandidateOutputs(ctx, tx, m, candidates, ids); err != nil {
 		return nil, err
+	}
+	for _, gang := range members {
+		for _, member := range gang {
+			ids = append(ids, member.candidate.execution.ID)
+		}
 	}
 	demands, err := loadDemandsTx(ctx, tx, ids)
 	if err != nil {
@@ -1673,6 +1891,11 @@ func loadPlanCandidates(ctx context.Context, tx *sql.Tx, m *planModel) ([]*planC
 		c.label = m.labels[c.execution.ProjectScopeID] + "/" + m.labels[task]
 		c.demand = demands[c.execution.ID]
 		c.demand.priority = c.execution.Priority
+		for _, member := range members[c.gangID] {
+			demand := demands[member.candidate.execution.ID]
+			demand.priority = c.execution.Priority
+			c.ranks = append(c.ranks, planRank{rank: member.rank, candidate: member.candidate, demand: demand})
+		}
 	}
 	return candidates, nil
 }
@@ -1914,14 +2137,3 @@ func unique(values []string) []string {
 	}
 	return out
 }
-
-// scanCandidate reads an execution's candidate columns (and extra ones).
-func scanCandidate(row interface{ Scan(...any) error }, c *executionCandidate, extra ...any) error {
-	return row.Scan(append([]any{&c.execution.ID, &c.execution.ProjectScopeID, &c.execution.QueueScopeID, &c.execution.TaskScopeID, &c.execution.ClientRequestID, &c.execution.SpecDigest, &c.execution.State, &c.argvJSON, &c.execution.CWD, &c.selectorJSON, &c.execution.Priority, &c.execution.Checkpointable, &c.execution.Preemptible, &c.execution.InputContinuationRef, &c.execution.TerminalCause, &c.execution.SubmittedAt, &c.execution.AuthorizedAt, &c.execution.StartedAt, &c.execution.TerminalAt, &c.execution.NotBefore, &c.execution.StartBy, &c.execution.FinishBy}, extra...)...)
-}
-
-// queryer runs queries in a transaction or on the database.
-type queryer = dbtx.Queryer
-
-// candidateColumns are the execution columns scanCandidate reads.
-const candidateColumns = `e.id,e.project_scope_id,e.queue_scope_id,e.task_scope_id,e.client_request_id,e.spec_digest,e.state,e.argv_json,e.cwd,e.executor_selector_json,e.priority,e.checkpointable,e.preemptible,e.input_continuation_ref,e.terminal_cause,e.submitted_at,e.authorized_at,e.started_at,e.terminal_at,e.not_before,e.start_by,e.finish_by`

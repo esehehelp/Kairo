@@ -788,3 +788,14 @@ func (c *Client) FetchSource(ctx context.Context, id, file string, w io.Writer) 
 	_, err = io.Copy(w, resp.Body)
 	return err
 }
+
+// SyncFabric says what node is on the fabric and returns its address and
+// peers (agentops.FabricSync).
+func (c *Client) SyncFabric(ctx context.Context, nodeID string, self store.FabricSelf) (store.FabricView, error) {
+	return do(ctx, c, agentops.FabricSync, agentops.FabricSyncRequest{NodeID: nodeID, FabricSelf: self})
+}
+
+// ReportFabricLinks says how node sees its links (agentops.FabricLinksSaid).
+func (c *Client) ReportFabricLinks(ctx context.Context, nodeID string, report store.FabricLinksReport) error {
+	return done(ctx, c, agentops.FabricLinksSaid, agentops.FabricLinksRequest{NodeID: nodeID, FabricLinksReport: report})
+}

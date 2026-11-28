@@ -149,7 +149,7 @@ func init() {
 			subs: []command{
 				{"list", "PROJECT [--state S,..] [--match PREFIX] [--live] [--since D] [--all] [--json]", "tasks as a table (default: live and updated in the last 24h)", taskList},
 				{"show", "PROJECT [QUEUE] TASK [--json]", "one task: spec, dependencies, executions, attempts, log paths and output objects", taskShow},
-				{"logs", "PROJECT [QUEUE] TASK [--tail N] [-f] [--stream S] [--attempt A]", "print or follow attempt logs", taskLogs},
+				{"logs", "PROJECT [QUEUE] TASK [--tail N] [-f] [--stream S] [--attempt A] [--rank R]", "print or follow attempt logs", taskLogs},
 				{"wait", "PROJECT [QUEUE] TASK [TASK...] | PROJECT --match PREFIX [--until terminal|started] [--timeout D]", "wait for tasks, one line per state change (exit 0 ok, 1 failed, 2 timeout, 3 error)", taskWait},
 				{"pause", "PROJECT [QUEUE] TASK [--force [--grace D] [--reason R]] [--no-wait]", "checkpoint and pause a task, or end it with --force", scope("task", "pause")},
 				{"resume", "PROJECT [QUEUE] TASK", "resume a paused task", scope("task", "resume")},
@@ -218,6 +218,14 @@ func init() {
 				{"catalogue", "ROOT [--json]", "what a durable store's directory holds, read from the descriptions beside its copies (no daemon needed)", storeCatalogue},
 			},
 			aliases: map[string]string{"show": "status", "ls": "status", "list": "status", "get": "status"},
+		}},
+		{name: "fabric", summary: "the network every node is on (issue #47): its prefix, and each node's address, key and endpoints", group: &commandGroup{
+			subs: []command{
+				{"list", "[--json]", "the fabric's prefix and its nodes: address, public key, port, endpoints; its links and segments", fabricList},
+				{"segment-add", "[--mtu N] [--json] NODE...", "a segment (an L2 network over VXLAN, EVPN) made by hand on those nodes; gangs get their own", fabricSegmentAdd},
+				{"segment-remove", "VNI...", "remove segments: their nodes take down the bridge and VXLAN device", fabricSegmentRemove},
+			},
+			aliases: map[string]string{"ls": "list", "show": "list", "status": "list"},
 		}},
 		{name: "data", summary: "what Kairo keeps: packed outputs, kept scratch and imported directories, and their durable copies", group: &commandGroup{
 			note: "An import packs directories of a node (outside every store) onto its volatile store and copies them to a durable store; with --delete-source each is deleted once its copy is verified.",
@@ -550,7 +558,7 @@ var commandNotes = map[string]string{
 	"project watch": "Prints state changes, progress (at most once a minute per task) and a summary every 10 minutes.\n" +
 		"With --exit-when-idle: exit 0 once nothing is pending or running, 1 if a task seen ending did not succeed.",
 	"task logs": "Default: the last 50 lines of stdout and stderr of the latest execution's attempt.\n" +
-		"--attempt all prints every attempt.",
+		"--attempt all prints every attempt; for a gang, --rank selects the rank (default 0).",
 	"task list":     "Columns: NAME QUEUE STATE EXEC (latest execution) STARTED ELAPSED NOTE.",
 	"project apply": "A declared task is immutable: to change one give it a new name; `kairo task rerun` runs it again.",
 	"machine apply": "FILE is the whole declaration: [[nodes]] with id and gpus (UUIDs as nvidia-smi -L prints them),\n" +

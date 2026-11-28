@@ -8,9 +8,11 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -44,6 +46,18 @@ type Local struct {
 	StallThreshold      time.Duration
 	Providers           map[string]provider.Provider
 	lastObservation     time.Time
+	// Segments puts a segment of the fabric on this node (its bridge and
+	// VXLAN device; on Windows, in the wslc VM, its network too) and names
+	// the device a container joins it by: a gang member's container is on
+	// its generation's segment. Nil: this node carries none (not on the
+	// fabric, or it does not route), and a gang member fails to launch here.
+	Segments func(ctx context.Context, seg store.FabricSegment) (string, error)
+	// APIProxy is the daemon's API on the fabric (host:port of APIURL) when
+	// APIURL names a fabric address: an Incus container reaches it through
+	// a proxy device its host connects from (a container bridged onto the
+	// LAN has no route into the fabric), at the same address, so its URL and
+	// TLS name stay. "" for none.
+	APIProxy string
 
 	// Attempt logs (logspace.go): the free space the log directory's
 	// filesystem must have for a launch (zero: DefaultMinLogFreeBytes), how
@@ -70,6 +84,9 @@ type Local struct {
 	// of each one's shim.
 	running map[string]int
 
+	// Prepared gang ranks waiting at the launch barrier, by lease ID.
+	pendingGang map[string]pendingGangRank
+
 	// Reservations given up whose lease could not be released yet, by lease
 	// ID (cleanup.go): retried at every tick, never forgotten. When the store
 	// was last asked for leases this instance does not hold, and whether that
@@ -84,7 +101,7 @@ type Local struct {
 	// arrive is made again (zero: 1 s; it doubles).
 	RetryDelay time.Duration
 
-	// Terminations of node quarantines being carried out: when the
+	// Terminations of node quarantines and gangs being carried out: when the
 	// graceful stop was sent, by attempt.
 	terminating map[string]time.Time
 	// When an exited attempt whose lease is held for what it left running
@@ -129,6 +146,11 @@ type Local struct {
 	step        string
 	stepStart   time.Time
 	stepStalled bool
+}
+
+type pendingGangRank struct {
+	reservation *store.Reservation
+	prepared    []store.ResourceInstance
 }
 
 func NewLocal(id string, st Coordinator, logDir string, logger *slog.Logger) *Local {
@@ -199,6 +221,9 @@ func (e *Local) tick(ctx context.Context) error {
 	e.beginStep("log-space")
 	e.watchLogSpace(ctx)
 	e.endStep()
+	if err := e.inStep("gang-retry", func() error { return e.retryPendingGangRanks(ctx) }); err != nil {
+		return err
+	}
 	e.beginStep("cleanup-retry")
 	e.retryCleanups(ctx)
 	e.sweepUnlaunched(ctx)
@@ -300,6 +325,11 @@ func (e *Local) prepareReservation(ctx context.Context, reservation *store.Reser
 		return false, nil
 	}
 	launch, err := e.authorize(ctx, reservation)
+	if errors.Is(err, store.ErrGangNotReady) {
+		// Hold the prepared rank at the barrier until every rank is prepared.
+		e.holdGangRank(reservation, prepared)
+		return true, nil
+	}
 	if err != nil {
 		e.Logger.Warn("launch not authorized", "lease_id", reservation.Lease.ID, "error", err)
 		e.abandonReservation(reservation.Lease, prepared, err.Error(), "", nil)
@@ -451,6 +481,75 @@ func (e *Local) launchAuthorized(launch *store.Launch) {
 	}
 }
 
+func (e *Local) holdGangRank(reservation *store.Reservation, prepared []store.ResourceInstance) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pendingGang == nil {
+		e.pendingGang = map[string]pendingGangRank{}
+	}
+	e.pendingGang[reservation.Lease.ID] = pendingGangRank{reservation: reservation, prepared: prepared}
+	e.Logger.Info("gang rank prepared; waiting for the other ranks", "lease_id", reservation.Lease.ID, "gang", reservation.Gang)
+}
+
+// retryPendingGangRanks asks again for the launch of every gang rank held at
+// the barrier: it launches once all ranks are prepared, and is cleaned up and
+// released when the placement was aborted (or any other refusal).
+func (e *Local) retryPendingGangRanks(ctx context.Context) error {
+	e.mu.Lock()
+	pending := make([]pendingGangRank, 0, len(e.pendingGang))
+	for _, p := range e.pendingGang {
+		pending = append(pending, p)
+	}
+	e.mu.Unlock()
+	for _, p := range pending {
+		launch, err := e.authorize(ctx, p.reservation)
+		if errors.Is(err, store.ErrGangNotReady) {
+			continue
+		}
+		if err != nil {
+			e.Logger.Warn("gang rank not launched", "lease_id", p.reservation.Lease.ID, "error", err)
+			// Into the cleanups before leaving the barrier, so that the
+			// unlaunched-lease sweep never sees it held by nobody.
+			e.abandonReservation(p.reservation.Lease, p.prepared, err.Error(), "", nil)
+		}
+		e.mu.Lock()
+		delete(e.pendingGang, p.reservation.Lease.ID)
+		e.mu.Unlock()
+		if err == nil {
+			e.launchAuthorized(launch)
+		}
+	}
+	return nil
+}
+
+// gangEnv tells a gang member where it stands: Kairo's names, and the ones
+// torch.distributed and torchrun read (PET_*: torchrun's --nnodes,
+// --node-rank, --master-addr and --master-port, so that `torchrun
+// --nproc-per-node N train.py` needs no more). RANK and WORLD_SIZE count
+// members, for one process each (torchrun sets its workers' own). The
+// container's init adds NCCL_SOCKET_IFNAME and GLOO_SOCKET_IFNAME, the
+// interface on the segment.
+func (e *Local) gangEnv(gang *store.GangLaunch) []string {
+	if gang == nil {
+		return nil
+	}
+	rank, size := strconv.Itoa(gang.Rank), strconv.Itoa(gang.Size)
+	port := strconv.Itoa(gang.MasterPort)
+	env := []string{
+		"KAIRO_GANG_ID=" + gang.GangID, "KAIRO_GANG_RANK=" + rank, "KAIRO_GANG_SIZE=" + size,
+		"KAIRO_GANG_MASTER_ADDR=" + gang.MasterAddr, "KAIRO_GANG_MASTER_PORT=" + port,
+		"RANK=" + rank, "WORLD_SIZE=" + size, "LOCAL_RANK=0", "LOCAL_WORLD_SIZE=1", "NODE_RANK=" + rank,
+		"MASTER_ADDR=" + gang.MasterAddr, "MASTER_PORT=" + port,
+		"PET_NNODES=" + size, "PET_NODE_RANK=" + rank, "PET_MASTER_ADDR=" + gang.MasterAddr, "PET_MASTER_PORT=" + port,
+	}
+	if gang.Address != "" {
+		if p, err := netip.ParsePrefix(gang.Address); err == nil {
+			env = append(env, "KAIRO_GANG_ADDRESS="+p.Addr().String())
+		}
+	}
+	return env
+}
+
 // cleanupReservation returns provider-side preparation before releasing the
 // database lease. If physical cleanup or its confirming observation fails,
 // the lease remains non-released and therefore cannot be allocated again.
@@ -554,7 +653,7 @@ func (e *Local) reconcileQuiescence(ctx context.Context) error {
 	return nil
 }
 
-// terminationGrace is how long a terminated attempt (node quarantine)
+// terminationGrace is how long a terminated attempt (node quarantine, gang)
 // gets between the graceful stop and the kill of what is left.
 const terminationGrace = 10 * time.Second
 
@@ -653,6 +752,7 @@ func (e *Local) launchEnv(launch *store.Launch) []string {
 	if launch.InputContinuationRef != nil {
 		env = append(env, "KAIRO_CONTINUATION_REF="+*launch.InputContinuationRef)
 	}
+	env = append(env, e.gangEnv(launch.Gang)...)
 	if len(bindings) > 0 {
 		env = append(env, "CUDA_VISIBLE_DEVICES="+strings.Join(bindings, ","))
 	}

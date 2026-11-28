@@ -14,7 +14,7 @@ package store
 //     quiescence proof (registered processes absent, fresh provider
 //     observation), never because the kill was sent.
 //
-// A task whose current execution was force stopped or
+// A task whose current execution (any rank of a gang) was force stopped or
 // withdrawn by a force stop ends in task state 'stopped'; its dependants are
 // blocked as for a failed task. No continuation or restart is planned, even
 // for a checkpointable task.
@@ -268,16 +268,17 @@ func (s *Store) ListForceStops(ctx context.Context, operationID string) ([]Force
 	return out, rows.Err()
 }
 
-// forceStoppedTx reports whether a force stop ended the execution: terminal
-// cause force_stopped, or withdrawn by a force stop. It returns what the task
-// result records.
+// forceStoppedTx reports whether a force stop ended the execution or, for a
+// gang leader, any rank of its gang: terminal cause force_stopped, or
+// withdrawn by a force stop. It returns what the task result records.
 func forceStoppedTx(ctx context.Context, tx *sql.Tx, executionID string) (map[string]any, error) {
 	var stopped, operationID, actor, reason string
 	err := tx.QueryRowContext(ctx, `SELECT e.id,f.operation_id,p.actor,COALESCE(o.reason,'')
 		FROM execution_requests e JOIN force_stops f ON f.execution_id=e.id
 		JOIN pause_operations p ON p.id=f.operation_id LEFT JOIN force_stop_operations o ON o.operation_id=f.operation_id
-		WHERE e.id=$1 AND (e.terminal_cause='force_stopped' OR f.state='withdrawn')
-		ORDER BY e.id LIMIT 1`, executionID).Scan(&stopped, &operationID, &actor, &reason)
+		WHERE (e.id=$1 OR e.id IN(SELECT m.execution_id FROM gang_members m JOIN execution_gangs g ON g.id=m.gang_id WHERE g.leader_execution_id=$2))
+		AND (e.terminal_cause='force_stopped' OR f.state='withdrawn')
+		ORDER BY e.id LIMIT 1`, executionID, executionID).Scan(&stopped, &operationID, &actor, &reason)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}

@@ -19,6 +19,9 @@ type nodePerf struct {
 	gpu   map[string]float64    // work per second, by GPU UUID
 	cpu   map[string]float64    // work per second, by node
 	links map[[2]string]float64 // bytes per second, by the two nodes (sorted)
+	// directed: bytes per second from the first node to the second, as the
+	// fabric's transfers measured it (fabric_links, issue #47)
+	directed map[[2]string]float64
 }
 
 // perfReload: benches are measured rarely; the planner reads them again
@@ -54,7 +57,19 @@ func (s *Store) nodePerf(ctx context.Context) *nodePerf {
 }
 
 func loadNodePerf(ctx context.Context, q queryer) (*nodePerf, error) {
-	p := &nodePerf{gpu: map[string]float64{}, cpu: map[string]float64{}, links: map[[2]string]float64{}}
+	p := &nodePerf{gpu: map[string]float64{}, cpu: map[string]float64{}, links: map[[2]string]float64{}, directed: map[[2]string]float64{}}
+	// what the fabric's transfers measured, each way
+	if err := eachRow(ctx, q, `SELECT src_node,dst_node,bytes_per_second FROM fabric_links WHERE bytes_per_second IS NOT NULL AND bytes_per_second>0`, nil, func(rows *sql.Rows) error {
+		var src, dst string
+		var bps float64
+		if err := rows.Scan(&src, &dst, &bps); err != nil {
+			return err
+		}
+		p.directed[[2]string{src, dst}] = bps
+		return nil
+	}); err != nil {
+		return nil, err
+	}
 	// the latest valid point of each kind of each finished run, newest run first
 	err := eachRow(ctx, q, `SELECT DISTINCT ON (r.class,r.device_id,r.node_id,COALESCE(r.peer_node_id,''),p.kind) r.class,r.device_id,r.node_id,COALESCE(r.peer_node_id,''),p.kind,p.metrics_json
 		FROM bench_points p JOIN bench_runs r ON r.id=p.run_id
@@ -102,10 +117,14 @@ func linkKey(a, b string) [2]string {
 // less what TLS and the protocol take.
 const defaultLinkBytesPerSecond = 100e6
 
-// link is the measured bytes per second between two nodes' agents, or
-// defaultLinkBytesPerSecond.
+// link is the bytes per second from node a's agent to node b's: what the
+// fabric's transfers measured that way, else what a bench measured between
+// them (either way), else defaultLinkBytesPerSecond.
 func (p *nodePerf) link(a, b string) float64 {
 	if p != nil {
+		if v, ok := p.directed[[2]string{a, b}]; ok {
+			return v
+		}
 		if v, ok := p.links[linkKey(a, b)]; ok {
 			return v
 		}

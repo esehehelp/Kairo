@@ -144,12 +144,29 @@ count = 1
 	if run, err := runIDTx(ctx, store.db, direct.ID); err != nil || run != direct.ID {
 		t.Fatalf("a direct execution's run: %q %v", run, err)
 	}
+	ganged := schedulerExecutionSpec("ganged")
+	ganged.Gang = &GangSpec{Size: 2, Ranks: []GangRank{{Rank: 1, Argv: []string{"x"}}}}
+	leader, _, err := store.SubmitExecution(ctx, ganged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var member string
+	if err = store.db.QueryRow(`SELECT gm.execution_id FROM gang_members gm JOIN execution_gangs g ON g.id=gm.gang_id WHERE g.leader_execution_id=$1 AND gm.rank=1`, leader.ID).Scan(&member); err != nil {
+		t.Fatal(err)
+	}
+	if run, err := runIDTx(ctx, store.db, leader.ID); err != nil || run != leader.ID {
+		t.Fatalf("a gang leader's run: %q %v", run, err)
+	}
+	if run, err := runIDTx(ctx, store.db, member); err != nil || run != leader.ID+"-rank1" || !machine.ScratchIDValid(run) {
+		t.Fatalf("rank 1's run: %q %v", run, err)
+	}
 
 	// Output objects are found by their run, not by the path or the attempt.
 	for _, row := range []struct{ id, kind, source, execution string }{
 		{"obj_first", "output", first.RunID, first.Execution.ID},
 		{"obj_rerun", "output", rerun.RunID, rerun.Execution.ID},
 		{"obj_direct", "output", direct.ID, direct.ID},
+		{"obj_rank", "output", leader.ID + "-rank1", member},
 		{"obj_snapshot", "run-snapshot", first.RunID + "~1", first.Execution.ID},
 	} {
 		if _, err := store.testExec(`INSERT INTO data_objects(id,kind,source_id,store_id,executor_id,root,source_path,project_scope_id,state,created_at,updated_at)
@@ -190,6 +207,8 @@ count = 1
 		{DataObjectFilter{Project: "elsewhere", Task: "train"}, ""},
 		{DataObjectFilter{Task: "missing", Execution: continued.Execution.ID}, ""},
 		{DataObjectFilter{Execution: direct.ID}, "obj_direct"},
+		{DataObjectFilter{Execution: leader.ID}, "obj_rank"},
+		{DataObjectFilter{Execution: member}, "obj_rank"},
 	} {
 		objects, err := store.DataObjects(ctx, tc.filter)
 		var ids []string

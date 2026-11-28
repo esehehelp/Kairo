@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -121,6 +122,28 @@ type containerSpec struct {
 	// and whose processes the agent cannot reach (the init passes a stop on
 	// to the argv).
 	Runtime string `json:"runtime,omitempty"`
+	// Gang: of a gang member, its generation's segment (container_gang.go).
+	Gang *containerGang `json:"gang,omitempty"`
+	// APIProxy: the daemon's API on the fabric (ip:port), which the
+	// container reaches through its runtime's proxy at that very address
+	// (Incus: a proxy device listening in the container, connecting from
+	// the host; the init puts the address on lo).
+	APIProxy string `json:"api_proxy,omitempty"`
+}
+
+// containerGang is a gang member's place on its generation's segment: the
+// node's device the container's second NIC is on (Incus: the segment's
+// bridge, its NIC gangNIC; wslc: the segment's network, which the runner
+// connects the container to with Address), the segment's MTU, this
+// member's address and every member's (CIDR, in rank order), its rank and
+// the placement (what members say to each other at the barrier).
+type containerGang struct {
+	Device    string   `json:"device"`
+	MTU       int      `json:"mtu"`
+	Address   string   `json:"address"`
+	Members   []string `json:"members"`
+	Rank      int      `json:"rank"`
+	Placement string   `json:"placement"`
 }
 
 // streamSourceOf is the snapshot launch's streams' stages run in when it is
@@ -213,10 +236,33 @@ func attemptAccount(passwd, group string) (name, passwdLine, groupLine string) {
 	return name, passwdLine, groupLine
 }
 
-// containerInstance is the Incus instance name of an attempt (letters,
-// digits and dashes).
+// DefaultContainerPrefix begins the name of an attempt's container unless
+// the agent's configuration says otherwise (container_prefix).
+const DefaultContainerPrefix = "kairo-"
+
+// ContainerPrefix begins the name of every container this agent makes for an
+// attempt (set once, as the agent starts): an installation's own, so that
+// two installations' agents on one host (production and a test one) never
+// take each other's containers for leftovers to remove, or adopt them. A
+// prefix beginning kairo- keeps the containers counted as Kairo's work by
+// any installation's providers (their cgroups, lxc.payload.kairo-*).
+var ContainerPrefix = DefaultContainerPrefix
+
+var containerPrefixPattern = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}-$`)
+
+// ValidContainerPrefix says why p cannot begin containers' names (nil: it
+// can): lower-case letters, digits and dashes, a letter first, a dash last.
+func ValidContainerPrefix(p string) error {
+	if !containerPrefixPattern.MatchString(p) {
+		return fmt.Errorf("container prefix %q: a lower-case letter, then letters, digits or dashes, ending in a dash (32 at most)", p)
+	}
+	return nil
+}
+
+// containerInstance is the name of an attempt's container (Incus instance,
+// wslc container): letters, digits and dashes.
 func containerInstance(attemptID string) string {
-	return "kairo-" + strings.ReplaceAll(attemptID, "_", "-")
+	return ContainerPrefix + strings.ReplaceAll(attemptID, "_", "-")
 }
 
 // containerDir is where the executor keeps what an attempt's container is
@@ -329,6 +375,22 @@ func (e *Local) containerCommand(launch *store.Launch, opts containerOptions) (*
 		Streams:  launch.Streams,
 	}
 	spec.Runtime = opts.runtime
+	if e.APIProxy != "" && opts.runtime == "incus" {
+		spec.APIProxy = e.APIProxy
+	}
+	if g := launch.Gang; g != nil {
+		// its generation's segment on this node, before the container joins it
+		if e.Segments == nil || g.VNI == 0 {
+			return nil, fmt.Errorf("a gang member: node %s carries no fabric segments (an agent on the fabric that routes)", e.NodeID)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), segmentWait)
+		device, err := e.Segments(ctx, store.FabricSegment{VNI: g.VNI, Subnet: g.Subnet, MTU: g.MTU})
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("the gang's segment %d on this node: %w", g.VNI, err)
+		}
+		spec.Gang = &containerGang{Device: device, MTU: g.MTU, Address: g.Address, Members: g.Addresses, Rank: g.Rank, Placement: g.PlacementID}
+	}
 	// the ordinary user it runs as (containerUID) has no home in the image:
 	// one in the scratch, unless the execution declares its own
 	if _, declared := launch.Env["HOME"]; !declared {
