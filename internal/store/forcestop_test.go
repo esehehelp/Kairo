@@ -421,3 +421,26 @@ func TestForcePauseOfAPlacedGangReleasesEveryLease(t *testing.T) {
 		t.Fatalf("gang task: %+v", task)
 	}
 }
+
+// A forced pause of a gang not placed yet withdraws every member, and the
+// task stops: a member never given a lease holds nothing (the task was left
+// running, its members' leases taken for still being released).
+func TestForcePauseOfAGangNotPlacedStopsIt(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupGangInventory(t, store)
+	gangProject(t, store, false)
+	ctx := context.Background()
+	scope := taskScopeID(t, store, "gangs", "training", "ddp")
+	op, err := store.ForcePauseScope(ctx, scope, "tester", "force-gang", ForceStopSpec{GraceSeconds: 30})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcilePauses(t, store)
+	if stops, _ := store.ListForceStops(ctx, op.ID); len(stops) != 2 {
+		t.Fatalf("force stops: %+v", stops)
+	}
+	gangTaskState(t, store)
+	if task := gangTaskState(t, store); task.State != "stopped" {
+		t.Fatalf("task: %+v", task)
+	}
+}

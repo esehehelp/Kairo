@@ -69,6 +69,11 @@ type Manager struct {
 	// Metered: this node's uplink is paid by the byte (a gang spans its
 	// links only when it says it may).
 	Metered bool
+	// Reach is what this node's containers may reach over the fabric
+	// through it, routed (the daemon's API at a fabric address: a wslc
+	// container's way to it); nothing else it routes goes onto the fabric
+	// (ingressRules).
+	Reach []netip.AddrPort
 	// Sync says what this node is and returns its address and peers.
 	Sync func(ctx context.Context, self store.FabricSelf) (store.FabricView, error)
 	// Report says how this node sees its links (nil: not said).

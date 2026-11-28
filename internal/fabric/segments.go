@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"slices"
 	"strconv"
 	"strings"
@@ -124,10 +125,11 @@ func (m *Manager) applyRouting(ctx context.Context, view store.FabricView) error
 			failed = append(failed, fmt.Errorf("segment %d: %w", seg.VNI, err))
 		}
 	}
-	// VXLAN and BFD only from the fabric: a frame that did not come over
-	// WireGuard is not a peer's (ingressGuard)
+	// VXLAN, BFD and BGP only from the fabric: a frame that did not come
+	// over WireGuard is not a peer's; and nothing the host routes onto it
+	// but to Reach (ingressGuard)
 	if g, ok := m.link.(ingressGuard); ok {
-		if err := g.guardIngress(ctx, names, m.Interface, r.VXLANPort); err != nil {
+		if err := g.guardIngress(ctx, names, m.Interface, r.VXLANPort, m.Reach); err != nil {
 			failed = append(failed, fmt.Errorf("ingress guard: %w", err))
 		}
 	}
@@ -188,11 +190,12 @@ func (m *Manager) stopRouting(ctx context.Context, names string) error {
 	return errors.Join(err, m.removeSegments(ctx, names, nil, false))
 }
 
-// ingressGuard is a link that keeps VXLAN and BFD to what comes over the
-// fabric's interface (a host takes UDP to any of its addresses on any of
-// its interfaces).
+// ingressGuard is a link that keeps VXLAN, BFD and BGP to what comes over
+// the fabric's interface (a host takes UDP to any of its addresses on any of
+// its interfaces), and keeps what the host routes (its containers) off the
+// fabric but for reach (ingressRules).
 type ingressGuard interface {
-	guardIngress(ctx context.Context, names, iface string, vxlanPort int) error
+	guardIngress(ctx context.Context, names, iface string, vxlanPort int, reach []netip.AddrPort) error
 }
 
 // frrFiles are /etc/frr for node with view: iBGP in the fabric's ASN over
@@ -241,18 +244,42 @@ func frrFiles(node string, view store.FabricView) map[string]string {
 	}
 }
 
-// ingressRules is the nftables ruleset that keeps the fabric's UDP (VXLAN
-// on vxlanPort, BFD) to what comes in on iface: its own table (one per
-// installation: names), replaced whole each time.
-func ingressRules(names, iface string, vxlanPort int) string {
+// ingressRules is the nftables ruleset of a node's fabric, its own table
+// (one per installation: names), replaced whole each time:
+//
+//   - in: the fabric's UDP (VXLAN on vxlanPort, BFD) and BGP only from
+//     iface; a peer's frames come over WireGuard, which says who sent them.
+//   - routed: nothing onto the fabric nor off it but to reach (the daemon's
+//     API, which a wslc container reaches through its VM) and its replies.
+//     A container's traffic routed (and masqueraded) by its host onto the
+//     fabric would come in at a peer as the host's: VXLAN into another
+//     gang's segment, a BGP session. What the fabric carries for the host
+//     (WireGuard, FRR in its network namespace, the relay, an Incus proxy
+//     to the API) is the host's own, not routed.
+func ingressRules(names, iface string, vxlanPort int, reach []netip.AddrPort) string {
 	table := names + "fabric"
+	var allowed strings.Builder
+	for _, a := range reach {
+		family := "ip"
+		if a.Addr().Is6() && !a.Addr().Is4In6() {
+			family = "ip6"
+		}
+		fmt.Fprintf(&allowed, "\t\toifname %q %s daddr %s tcp dport %d accept\n", iface, family, a.Addr().Unmap(), a.Port())
+	}
 	return fmt.Sprintf(`table inet %[1]s {}
 delete table inet %[1]s
 table inet %[1]s {
 	chain input {
 		type filter hook input priority -10; policy accept;
 		udp dport { %[3]d, 3784, 3785, 4784 } iifname != %[2]q drop
+		tcp dport 179 iifname != %[2]q drop
+	}
+	chain forward {
+		type filter hook forward priority -10; policy accept;
+		iifname %[2]q ct state established,related accept
+%[4]s		oifname %[2]q drop
+		iifname %[2]q drop
 	}
 }
-`, table, iface, vxlanPort)
+`, table, iface, vxlanPort, allowed.String())
 }

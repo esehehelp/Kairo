@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/netip"
 	"strconv"
@@ -421,6 +422,42 @@ type FabricLinksReport struct {
 	Received []FabricReceived `json:"received,omitempty"`
 }
 
+// fabricClockSkew is how far ahead of the daemon's clock a node's may be.
+const fabricClockSkew = 5 * time.Minute
+
+// check refuses what no node sees of a link (ErrFabric): a handshake time
+// that is not one, or later than now by more than a clock's skew (it would
+// keep a link up for good, and every view that compares it fail), an
+// endpoint that is not an address and port (every peer would be given it),
+// a round trip or a transfer that is not a measure.
+func (r FabricLinksReport) check(now time.Time) error {
+	for _, p := range r.Peers {
+		if p.HandshakeAt != "" {
+			at, err := time.Parse(time.RFC3339Nano, p.HandshakeAt)
+			if err != nil {
+				return fmt.Errorf("%w: handshake_at %q to %s: %v", ErrFabric, p.HandshakeAt, p.Node, err)
+			}
+			if at.After(now.Add(fabricClockSkew)) {
+				return fmt.Errorf("%w: handshake_at %s to %s is ahead of the daemon's clock", ErrFabric, p.HandshakeAt, p.Node)
+			}
+		}
+		if p.Endpoint != "" {
+			if _, err := netip.ParseAddrPort(p.Endpoint); err != nil {
+				return fmt.Errorf("%w: endpoint %q to %s: %v", ErrFabric, p.Endpoint, p.Node, err)
+			}
+		}
+		if p.RTTMillis != nil && (math.IsNaN(*p.RTTMillis) || math.IsInf(*p.RTTMillis, 0) || *p.RTTMillis > 60_000) {
+			return fmt.Errorf("%w: rtt_ms %v to %s", ErrFabric, *p.RTTMillis, p.Node)
+		}
+	}
+	for _, x := range append(append([]FabricReceived{}, r.Received...), r.Sent...) {
+		if x.Bytes < 0 || math.IsNaN(x.Seconds) || math.IsInf(x.Seconds, 0) || x.Seconds < 0 || x.Seconds > 86400 {
+			return fmt.Errorf("%w: a transfer of %d bytes in %v s with %s", ErrFabric, x.Bytes, x.Seconds, x.From)
+		}
+	}
+	return nil
+}
+
 // FabricLink is a directed link.
 type FabricLink struct {
 	Src            string   `json:"src"`
@@ -445,6 +482,9 @@ func (s *Store) RecordFabricLinks(ctx context.Context, nodeID string, report Fab
 		return err
 	}
 	defer tx.Rollback()
+	if err := report.check(time.Now()); err != nil {
+		return err
+	}
 	t := now()
 	// a relay given a day ago is given up: its pair tries a direct path again
 	// (a firewall opened since), and is relayed again if it fails
@@ -544,8 +584,11 @@ func (s *Store) FabricLinks(ctx context.Context) ([]FabricLink, error) {
 	return out, err
 }
 
-// handshakeFresh: a link whose latest handshake is this recent is up.
-const handshakeFresh = 3 * time.Minute
+// handshakeFresh: a link whose latest handshake is this recent is up. A
+// link carrying only keepalives renews its handshake every 2 minutes and
+// up to a keepalive (25 s) more; its agent reports it every 30 to 90 s:
+// a handshake of a link that is up can be 4 minutes old by then.
+const handshakeFresh = 5 * time.Minute
 
 func freshHandshake(at string) bool {
 	t, err := time.Parse(time.RFC3339Nano, at)

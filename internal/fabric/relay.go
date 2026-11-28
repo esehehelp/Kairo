@@ -15,7 +15,9 @@ import (
 // to one side's port goes out of the other's to where that side was last
 // heard from. The datagrams stay encrypted end to end: the relay sees no
 // more than their sizes. A side's datagrams are taken only from the host it
-// is seen at on the fabric (store.FabricRelay HostA, HostB), when known.
+// is seen at on the fabric (store.FabricRelay HostA, HostB): a relay waits
+// until both are known (the relay node's own links to them), so that no one
+// else takes a side's place.
 
 // relayKey names a relayed pair.
 func relayKey(r store.FabricRelay) string {
@@ -25,7 +27,7 @@ func relayKey(r store.FabricRelay) string {
 // forwarder relays one pair.
 type forwarder struct {
 	a, b   *net.UDPConn
-	hostA  netip.Addr // the only host side A is taken from (invalid: any)
+	hostA  netip.Addr // the only host side A is taken from
 	hostB  netip.Addr
 	mu     sync.Mutex
 	peerA  netip.AddrPort // where A was last heard from
@@ -39,6 +41,11 @@ func listenRelay(port int) (*net.UDPConn, error) {
 }
 
 func newForwarder(ctx context.Context, r store.FabricRelay) (*forwarder, error) {
+	hostA, errA := netip.ParseAddr(r.HostA)
+	hostB, errB := netip.ParseAddr(r.HostB)
+	if errA != nil || errB != nil {
+		return nil, fmt.Errorf("where its sides are is not known yet (a: %q, b: %q)", r.HostA, r.HostB)
+	}
 	a, err := listenRelay(r.PortA)
 	if err != nil {
 		return nil, err
@@ -48,9 +55,7 @@ func newForwarder(ctx context.Context, r store.FabricRelay) (*forwarder, error) 
 		a.Close()
 		return nil, err
 	}
-	f := &forwarder{a: a, b: b}
-	f.hostA, _ = netip.ParseAddr(r.HostA)
-	f.hostB, _ = netip.ParseAddr(r.HostB)
+	f := &forwarder{a: a, b: b, hostA: hostA.Unmap(), hostB: hostB.Unmap()}
 	ctx, f.cancel = context.WithCancel(ctx)
 	f.done.Add(2)
 	go f.pump(ctx, a, b, true)
@@ -79,13 +84,13 @@ func (f *forwarder) pump(ctx context.Context, from, to *net.UDPConn, fromA bool)
 		f.mu.Lock()
 		var dst netip.AddrPort
 		if fromA {
-			if f.hostA.IsValid() && src.Addr().Unmap() != f.hostA {
+			if src.Addr().Unmap() != f.hostA {
 				f.mu.Unlock()
 				continue
 			}
 			f.peerA, dst = src, f.peerB
 		} else {
-			if f.hostB.IsValid() && src.Addr().Unmap() != f.hostB {
+			if src.Addr().Unmap() != f.hostB {
 				f.mu.Unlock()
 				continue
 			}
@@ -110,18 +115,28 @@ type relays struct {
 	on  map[string]*forwarder
 }
 
-// set starts the forwarders of want not running and stops those running not
-// in want (a pair seen at other hosts is started again).
+// set stops the forwarders running not in want, then starts those of want
+// not running (a pair seen at other hosts is started again, on the same
+// ports: its old forwarder goes first).
 func (rs *relays) set(want []store.FabricRelay, logf func(msg string, args ...any)) {
 	rs.mu.Lock()
 	defer rs.mu.Unlock()
 	if rs.on == nil {
 		rs.on = map[string]*forwarder{}
 	}
+	keyOf := func(r store.FabricRelay) string { return relayKey(r) + "|" + r.HostA + "|" + r.HostB }
 	keep := map[string]bool{}
 	for _, r := range want {
-		key := relayKey(r) + "|" + r.HostA + "|" + r.HostB
-		keep[key] = true
+		keep[keyOf(r)] = true
+	}
+	for key, f := range rs.on {
+		if !keep[key] {
+			f.stop()
+			delete(rs.on, key)
+		}
+	}
+	for _, r := range want {
+		key := keyOf(r)
 		if _, ok := rs.on[key]; ok {
 			continue
 		}
@@ -132,11 +147,5 @@ func (rs *relays) set(want []store.FabricRelay, logf func(msg string, args ...an
 		}
 		rs.on[key] = f
 		logf("fabric relay started", "a", r.A, "b", r.B, "port_a", r.PortA, "port_b", r.PortB)
-	}
-	for key, f := range rs.on {
-		if !keep[key] {
-			f.stop()
-			delete(rs.on, key)
-		}
 	}
 }

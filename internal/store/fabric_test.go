@@ -282,3 +282,29 @@ func TestRoutingNodesAreToldTheReflectorsAndTheirSegments(t *testing.T) {
 		t.Fatalf("again: %+v %v", s3, err)
 	}
 }
+
+// What no node sees of a link is refused, the report whole: a handshake
+// time that is not one or is ahead of the daemon's clock (it would keep the
+// link up for good, and every view comparing it fail), an endpoint that is
+// not an address and port, a round trip or a transfer that is no measure.
+func TestALinkReportThatIsNoMeasureIsRefused(t *testing.T) {
+	now := time.Now()
+	ok := func(p FabricPeerSeen) FabricLinksReport { return FabricLinksReport{Peers: []FabricPeerSeen{p}} }
+	big := 1e9
+	for name, r := range map[string]FabricLinksReport{
+		"handshake not a time": ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, HandshakeAt: "yesterday"}),
+		"handshake ahead":      ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, HandshakeAt: now.Add(time.Hour).UTC().Format(time.RFC3339Nano)}),
+		"endpoint not one":     ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, Endpoint: "example.org:51820"}),
+		"round trip":           ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, RTTMillis: &big}),
+		"transfer":             {Peers: []FabricPeerSeen{}, Received: []FabricReceived{{From: "b", Bytes: 8 << 20, Seconds: -1}}},
+	} {
+		if err := r.check(now); !errors.Is(err, ErrFabric) {
+			t.Fatalf("%s: %v", name, err)
+		}
+	}
+	rtt := 0.8
+	good := ok(FabricPeerSeen{Node: "b", Path: FabricPathDirect, Endpoint: "[2001:db8::2]:51820", HandshakeAt: now.Add(time.Minute).UTC().Format(time.RFC3339Nano), RTTMillis: &rtt})
+	if err := good.check(now); err != nil {
+		t.Fatalf("a report as an agent makes it: %v", err)
+	}
+}

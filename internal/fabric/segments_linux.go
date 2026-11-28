@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -191,6 +192,7 @@ func (r incusRouter) apply(ctx context.Context, files map[string]string) error {
 		return err
 	}
 	if state != "" {
+		// (its spec not read: taken as another's, and made again)
 		if spec, _ := incus(ctx, "config", "get", r.name, "user.kairo.spec"); strings.TrimSpace(string(spec)) != routerSpec(r.hostname) {
 			if _, err := incus(ctx, "delete", "--force", r.name); err != nil {
 				return err
@@ -206,15 +208,19 @@ func (r incusRouter) apply(ctx context.Context, files map[string]string) error {
 			}
 		}
 		image := frrRemote + ":" + strings.TrimPrefix(FRRRepository, "quay.io/") + "@" + FRRDigest
+		// its spec goes last, once it is whole: one made only in part has
+		// none, and is made again
 		if _, err := incus(ctx, "init", image, r.name, "--quiet", "-c", "security.privileged=true",
-			"-c", "raw.lxc=lxc.namespace.share.net=1\nlxc.uts.name="+r.hostname, "-c", "boot.autostart=true",
-			"-c", "user.kairo.spec="+routerSpec(r.hostname)); err != nil {
+			"-c", "raw.lxc=lxc.namespace.share.net=1\nlxc.uts.name="+r.hostname, "-c", "boot.autostart=true"); err != nil {
 			return err
 		}
 		if _, err := incus(ctx, "config", "device", "add", r.name, "eth0", "none"); err != nil {
 			return err
 		}
 		if _, err := incus(ctx, "config", "device", "add", r.name, "frr", "disk", "source="+r.dir, "path=/etc/frr"); err != nil {
+			return err
+		}
+		if _, err := incus(ctx, "config", "set", r.name, "user.kairo.spec", routerSpec(r.hostname)); err != nil {
 			return err
 		}
 		_, err = incus(ctx, "start", r.name)
@@ -290,9 +296,9 @@ func (r dockerRouter) show(ctx context.Context, command string) ([]byte, error) 
 }
 
 // guardIngress applies ingressRules with nft (one transaction).
-func (nlLink) guardIngress(ctx context.Context, names, iface string, vxlanPort int) error {
+func (nlLink) guardIngress(ctx context.Context, names, iface string, vxlanPort int, reach []netip.AddrPort) error {
 	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
-	cmd.Stdin = strings.NewReader(ingressRules(names, iface, vxlanPort))
+	cmd.Stdin = strings.NewReader(ingressRules(names, iface, vxlanPort, reach))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("nft: %w: %s", err, strings.TrimSpace(string(out)))
 	}

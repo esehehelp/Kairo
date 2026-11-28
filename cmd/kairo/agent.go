@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"os"
 	"os/signal"
@@ -136,6 +137,10 @@ func agentCommand(args []string) error {
 		}
 		fab.Routing, fab.NodeID, fab.Names, fab.RouterName = cfg.Fabric.FabricRouting(), cfg.Node.ID, cfg.Fabric.Names, prefix+"frr"
 		fab.Metered = cfg.Fabric.Metered
+		// the daemon's API is what this node routes onto the fabric for its
+		// containers (a wslc container's way to it at a fabric address);
+		// nothing else it routes goes there
+		fab.Reach = apiReach(ctx, cfg.AttemptAPIURL)
 		// what fetches from other agents took measures the links
 		executor.TransferObserved = fab.Received
 		// back on the fabric as it was last, before the daemon is asked
@@ -302,4 +307,32 @@ func agentCommand(args []string) error {
 	case err := <-errCh:
 		return err
 	}
+}
+
+// apiReach is where the API URL u is: its address (or its name's) and
+// port, for a fabric's Reach.
+func apiReach(ctx context.Context, u string) []netip.AddrPort {
+	parsed, err := url.Parse(u)
+	if err != nil || parsed.Hostname() == "" {
+		return nil
+	}
+	port := parsed.Port()
+	if port == "" {
+		port = "443"
+	}
+	n, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return nil
+	}
+	addrs := []netip.Addr{}
+	if a, err := netip.ParseAddr(parsed.Hostname()); err == nil {
+		addrs = append(addrs, a)
+	} else if found, err := net.DefaultResolver.LookupNetIP(ctx, "ip", parsed.Hostname()); err == nil {
+		addrs = found
+	}
+	var out []netip.AddrPort
+	for _, a := range addrs {
+		out = append(out, netip.AddrPortFrom(a.Unmap(), uint16(n)))
+	}
+	return out
 }

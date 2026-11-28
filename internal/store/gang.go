@@ -141,7 +141,9 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 		return false, err
 	}
 	if len(members) != size || len(slots) != size {
-		return false, fmt.Errorf("gang %s has %d of %d ranks", gangID, len(members), size)
+		// it waits; the pass goes on with the others
+		slog.Default().Warn("gang not placed: its ranks are not all there", "gang_id", gangID, "members", len(members), "slots", len(slots), "size", size)
+		return false, nil
 	}
 	for _, m := range members {
 		var live int
@@ -167,6 +169,13 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 		_, err := tx.ExecContext(ctx, `RELEASE gang_place`)
 		return false, err
 	}
+	// one gang's placement failing leaves it waiting, not the pass (and every
+	// execution after it): what it wrote is rolled back; only a transaction
+	// that cannot be rolled back that far fails the pass
+	skip := func(err error) (bool, error) {
+		slog.Default().Warn("gang not placed", "gang_id", gangID, "error", err)
+		return abandon()
+	}
 	type assignment struct {
 		rank                 int
 		leaseID, executionID string
@@ -178,8 +187,7 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 		slot := byRank[m.rank]
 		reservation, err := writeReservationTx(ctx, tx, slot.executor.id, m.candidate, slot.fit)
 		if err != nil {
-			_, _ = abandon()
-			return false, err
+			return skip(err)
 		}
 		if reservation == nil {
 			return abandon()
@@ -195,8 +203,7 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 		return abandon()
 	}
 	if err != nil {
-		_, _ = abandon()
-		return false, err
+		return skip(err)
 	}
 	subnet := netip.MustParsePrefix(seg.Subnet)
 	address := func(rank int) netip.Prefix {
@@ -208,20 +215,17 @@ func placeGangTx(ctx context.Context, tx *sql.Tx, gangID string, slots []planSlo
 	placementID, stamp := id.New("gpl"), now()
 	if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placements(id,gang_id,state,master_addr,master_port,master_node_id,vni,subnet,mtu,created_at,updated_at) VALUES($1,$2,'placed',$3,$4,$5,$6,$7,$8,$9,$10)`,
 		placementID, gangID, master, port, placed[0].executor.nodeID, seg.VNI, seg.Subnet, seg.MTU, stamp, stamp); err != nil {
-		_, _ = abandon()
-		return false, err
+		return skip(err)
 	}
 	for _, a := range placed {
 		if _, err = tx.ExecContext(ctx, `INSERT INTO gang_placement_leases(placement_id,rank,lease_id,execution_id,executor_id,node_id,address) VALUES($1,$2,$3,$4,$5,$6,$7)`,
 			placementID, a.rank, a.leaseID, a.executionID, a.executor.id, a.executor.nodeID, address(a.rank).String()); err != nil {
-			_, _ = abandon()
-			return false, err
+			return skip(err)
 		}
 	}
 	leader := members[0].candidate.execution
 	if err = appendCoordinationEventTx(ctx, tx, "gang_placed", &leader.ProjectScopeID, "gang", gangID, nil, map[string]any{"placement_id": placementID, "master_addr": master, "master_port": port, "vni": seg.VNI, "subnet": seg.Subnet}); err != nil {
-		_, _ = abandon()
-		return false, err
+		return skip(err)
 	}
 	if _, err = tx.ExecContext(ctx, `RELEASE gang_place`); err != nil {
 		return false, err
@@ -776,7 +780,9 @@ func gangAggregateTx(ctx context.Context, tx *sql.Tx, current *currentTaskExecut
 			allQuiesced = allQuiesced && attemptState.String == "quiesced"
 			anyLost = anyLost || attemptState.String == "lost"
 		}
-		allReleased = allReleased && leaseState.Valid && leaseState.String == "released"
+		// a member never given a lease (stopped or withdrawn before the
+		// gang was placed) holds nothing
+		allReleased = allReleased && (!leaseState.Valid || leaseState.String == "released")
 		if !exit.Valid || exit.Int64 != 0 || (signal.Valid && signal.String != "") {
 			allZero = false
 			if exit.Valid && exit.Int64 != 0 && firstNonZero == nil {
