@@ -216,6 +216,9 @@ func TestThinningKeepsWhatTheCodeNeeds(t *testing.T) {
 	if _, err := store.testExec(`DELETE FROM source_snapshots WHERE id='src_a'`); err != nil {
 		t.Fatal(err)
 	}
+	// one made after the last snapshot that held the code is in none of them:
+	// no reason to wait (CI and applies make them all the time)
+	addSourceSnapshot(t, store, "src_late", now.Add(-30*time.Minute).Format(time.RFC3339Nano))
 	dropped, err := store.ThinControlSnapshots(ctx, now)
 	if err != nil {
 		t.Fatal(err)

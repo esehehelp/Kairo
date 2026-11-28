@@ -42,8 +42,15 @@ const keptSourcesSQL = `SELECT r.source_id FROM control_source_runs r JOIN execu
 // unkeptSourcesTx are the code snapshots no sources run keeps yet, oldest
 // first.
 func unkeptSourcesTx(ctx context.Context, q queryer) ([]string, error) {
+	return unkeptSourcesBeforeTx(ctx, q, "")
+}
+
+// unkeptSourcesBeforeTx are those of unkeptSourcesTx made before (RFC 3339;
+// "": whenever).
+func unkeptSourcesBeforeTx(ctx context.Context, q queryer, before string) ([]string, error) {
 	var out []string
-	err := eachRow(ctx, q, `SELECT id FROM source_snapshots WHERE id NOT IN(`+keptSourcesSQL+`) ORDER BY created_at,id`, nil, func(rows *sql.Rows) error {
+	err := eachRow(ctx, q, `SELECT id FROM source_snapshots WHERE id NOT IN(`+keptSourcesSQL+`)
+		AND ($1='' OR created_at::timestamptz<$1::timestamptz) ORDER BY created_at,id`, []any{before}, func(rows *sql.Rows) error {
 		var id string
 		if err := rows.Scan(&id); err != nil {
 			return err
@@ -183,18 +190,27 @@ func controlKept(created map[string]time.Time, now time.Time) map[string]bool {
 // ThinControlSnapshots drops the outputs of the hourly control snapshots
 // (snapshot-<slot>) that controlKept does not keep, nor is the base of the
 // dump of one it keeps (a delta is rebuilt from its base: control_dumps.go),
-// once every code snapshot is kept by a sources run (until then an older
-// snapshot, which held all of them, may be the only place one is): the
-// objects dropped.
+// once every code snapshot an hourly snapshot from before (one that held the
+// code: no dump recorded for it) may hold is kept by a sources run: until
+// then it may be the only place one is. The objects dropped.
 func (s *Store) ThinControlSnapshots(ctx context.Context, now time.Time) ([]DroppedObject, error) {
-	unkept, err := unkeptSourcesTx(ctx, s.db)
-	if err != nil || len(unkept) > 0 {
+	var lastWithCode sql.NullString
+	if err := s.db.QueryRowContext(ctx, `SELECT MAX(d.created_at) FROM data_objects d JOIN coordination_scopes p ON p.id=d.project_scope_id
+		JOIN execution_requests e ON e.id=d.source_id JOIN coordination_scopes t ON t.id=e.task_scope_id
+		WHERE p.kind='project' AND p.external_key=$1 AND d.kind='output' AND d.dropped_at IS NULL AND starts_with(t.external_key,$2)
+		AND NOT EXISTS(SELECT 1 FROM control_dumps c WHERE c.execution_id=e.id)`, ControlProject, controlSnapshotPrefix).Scan(&lastWithCode); err != nil {
 		return nil, err
+	}
+	if lastWithCode.Valid {
+		unkept, err := unkeptSourcesBeforeTx(ctx, s.db, lastWithCode.String)
+		if err != nil || len(unkept) > 0 {
+			return nil, err
+		}
 	}
 	created := map[string]time.Time{}
 	// each snapshot's run, and the run of its dump's base (a delta's)
 	runOf, baseOf, objectOf := map[string]string{}, map[string]string{}, map[string]string{}
-	err = eachRow(ctx, s.db, `SELECT d.id,d.created_at,e.id,COALESCE(c.base_execution_id,'') FROM data_objects d JOIN coordination_scopes p ON p.id=d.project_scope_id
+	err := eachRow(ctx, s.db, `SELECT d.id,d.created_at,e.id,COALESCE(c.base_execution_id,'') FROM data_objects d JOIN coordination_scopes p ON p.id=d.project_scope_id
 		JOIN execution_requests e ON e.id=d.source_id JOIN coordination_scopes t ON t.id=e.task_scope_id
 		LEFT JOIN control_dumps c ON c.execution_id=e.id
 		WHERE p.kind='project' AND p.external_key=$1 AND d.kind='output' AND d.dropped_at IS NULL AND d.state='packed' AND starts_with(t.external_key,$2)`,
