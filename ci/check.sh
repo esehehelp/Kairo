@@ -79,7 +79,8 @@ need_pg() {
     exit 2
   fi
 }
-step "kairo-ci $check on $(hostname) ($(go version | cut -d' ' -f3-))"
+# (the SDK checks' containers have no Go)
+step "kairo-ci $check on $(hostname) ($( (go version 2>/dev/null || echo no-go) | cut -d' ' -f3-))"
 case "$check" in
 start-pg)
   start_pg
@@ -124,6 +125,8 @@ sdk-python)
 sdk-rust)
   step "cargo test (Rust SDK)"
   cargo test --manifest-path sdk/rust/Cargo.toml
+  # the optional features too (signals: the SDK's one unsafe block)
+  cargo test --manifest-path sdk/rust/Cargo.toml --all-features
   ;;
 *)
   echo "unknown check $check" >&2

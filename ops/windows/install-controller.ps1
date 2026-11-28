@@ -15,6 +15,7 @@ $cfg = Join-Path $data 'controller.toml'
 New-Item -ItemType Directory -Force $bin, $data | Out-Null
 # only SYSTEM and Administrators: the configuration holds a token
 & icacls $data /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' | Out-Null
+if ($LASTEXITCODE -ne 0) { throw "icacls $data failed (exit $LASTEXITCODE): the token would not be kept to SYSTEM and Administrators" }
 $log = Join-Path $data 'install-controller.log'
 function Log($m) { "$(Get-Date -Format o) $m" | Tee-Object -FilePath $log -Append }
 $version = (& $New version 2>$null | Select-Object -First 1)

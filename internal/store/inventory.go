@@ -222,10 +222,13 @@ func (s *Store) ApplyObservationBatch(ctx context.Context, providerID string, re
 			return err
 		}
 		if claim.ClaimKind == "unattributed_activity" {
+			// memory on a GPU another node of the machine leases is that
+			// lease's work while it may run; once the lease is being released
+			// (or stale), what still holds the memory is not explained by it
 			var elsewhere int
 			if err = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM resource_instances self JOIN resource_instances sib ON sib.kind='gpu' AND sib.stable_identity=self.stable_identity AND sib.id<>self.id
 				JOIN lease_items li ON li.resource_id=sib.id JOIN leases l ON l.id=li.lease_id
-				WHERE self.id=$1 AND self.kind='gpu' AND l.state IN('reserved','prepared','active','releasing','stale','revocation_requested')`, claim.ResourceID).Scan(&elsewhere); err != nil {
+				WHERE self.id=$1 AND self.kind='gpu' AND l.state IN('reserved','prepared','active','revocation_requested')`, claim.ResourceID).Scan(&elsewhere); err != nil {
 				return err
 			}
 			if elsewhere > 0 {

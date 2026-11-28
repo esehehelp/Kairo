@@ -518,7 +518,8 @@ func (s *Server) agentRegister(ctx context.Context, b agentops.RegisterRequest) 
 			return none, err
 		}
 		declared = append(declared, e.ID)
-		if e.Enabled {
+		// observing only, the daemon records the node and changes no lease
+		if e.Enabled && !s.ObserveOnly {
 			// A (re)starting agent vouches only for the attempts it adopts;
 			// every other lease its previous incarnation held goes stale
 			// until quiescence is proven.
@@ -531,6 +532,13 @@ func (s *Server) agentRegister(ctx context.Context, b agentops.RegisterRequest) 
 		}
 	}
 	// An executor of the node the agent no longer declares is no longer run.
+	if s.ObserveOnly {
+		// the agent goes on watching what it runs (nothing is placed now)
+		for _, a := range b.Adopt {
+			adopted = append(adopted, a.AttemptID)
+		}
+		return agentops.RegisterAnswer{StaleLeases: stale, Adopted: adopted}, nil
+	}
 	if _, err := s.Store.UndeclareExecutors(ctx, b.Node.ID, declared); err != nil {
 		return none, err
 	}
@@ -621,6 +629,10 @@ func (s *Server) agentLogAppend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	size := info.Size()
+	if b.Offset < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "offset must not be negative", "code": "bad_request"})
+		return
+	}
 	if b.Offset > size {
 		// A gap: the agent must resend from the daemon's current size.
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "log gap", "code": "log_gap", "size": size})

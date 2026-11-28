@@ -183,7 +183,20 @@ func TestActivityTheOtherNodeCannotSeeIsTheLeaseHolders(t *testing.T) {
 	if claims := openClaims(t, store); len(claims) != 1 || claims[0].ResourceID != "gpu-GPU-S" {
 		t.Fatalf("claims on a's own lease: %+v", claims)
 	}
-	_ = launch
+	for _, c := range openClaims(t, store) {
+		if err := store.ClearClaim(ctx, c.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// a's attempt ended, its lease being released: what b still sees is
+	// not explained by it
+	if err := store.RecordTerminal(ctx, launch.Attempt.ID, launch.Lease.ID, launch.Lease.CoordinationEpoch, 0, ""); err != nil {
+		t.Fatal(err)
+	}
+	pollShared(t, store, false, true)
+	if claims := openClaims(t, store); len(claims) != 1 || claims[0].ResourceID != "gpu-GPU-S@b" {
+		t.Fatalf("activity b sees while a's lease is released: %+v", claims)
+	}
 }
 
 // startPrepared: the waiting execution reserved on executor, prepared, authorized and active

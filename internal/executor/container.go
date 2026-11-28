@@ -533,9 +533,14 @@ func translatePaths(env []string, paths map[string]string) []string {
 func containerEnv(image, attempt []string, gpu bool) []string {
 	var out []string
 	index := map[string]int{}
-	for _, list := range [][]string{image, attempt} {
+	for which, list := range [][]string{image, attempt} {
 		for _, kv := range list {
 			name := envName(kv)
+			if which == 0 && strings.HasPrefix(name, "KAIRO_") {
+				// Kairo's names are Kairo's: one the image sets and Kairo does
+				// not (a stream, an input not declared) is not the attempt's
+				continue
+			}
 			if i, ok := index[name]; ok {
 				out[i] = kv
 				continue

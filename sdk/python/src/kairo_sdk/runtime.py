@@ -68,8 +68,11 @@ _stop_signal = threading.Event()
 
 
 def _on_stop_signal(signum, _frame) -> None:
+    # nothing but the flag: the handler runs between two bytecodes of
+    # whatever the main thread does, a write to stderr too, and logging from
+    # here could reenter it (RuntimeError: reentrant call); the safe point
+    # that sees the flag says so
     _stop_signal.set()
-    _log.info("stop signal %s received; stopping at the next safe point", signum)
 
 
 def install_stop_signals() -> None:
@@ -482,6 +485,7 @@ class AttemptSession:
                     return True
         if stop_requested():
             if not self._stop_signal_handled:
+                _log.info("stop signal received; stopping at this safe point")
                 checkpoint(_stop_signal_context(self))
                 self._stop_signal_handled = True
             return True

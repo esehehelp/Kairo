@@ -562,7 +562,8 @@ func (d *Driver) seconds(kind store.BenchKind, w workload, points int) int {
 	if w.untilEnd {
 		return 3600
 	}
-	if kind.Sweep == "" {
+	// one point (runKind): a kind without a sweep, or without a grid
+	if kind.Sweep == "" || points == 0 {
 		return int(t.ShortSettle+t.ApplyTimeout+t.Measure) + 60
 	}
 	return int(t.SteadyMax+float64(points+3)*(t.ApplyTimeout+t.Settle+t.Measure+5)) + 120
@@ -628,7 +629,11 @@ func (d *Driver) runKind(ctx context.Context, name string) (store.BenchReference
 	if err = d.start(ctx, store.BenchStart{DriverVersion: device.DriverVersion, Device: k.s.start.Device}); err != nil {
 		return store.BenchReference{}, err
 	}
-	if kind.Sweep == "" {
+	// a kind without a sweep, or one whose settings this device cannot be
+	// set to (a CPU without frequency ranges, a GPU without clock control):
+	// one point at its own settings (a sweep of none would lack its middle
+	// reference, and be invalid)
+	if kind.Sweep == "" || len(grid) == 0 {
 		p, err := k.point(ctx, store.PhaseMeasure, store.DeviceSettings{}, d.Timing.ShortSettle, nil)
 		if p == nil {
 			return store.BenchReference{}, err

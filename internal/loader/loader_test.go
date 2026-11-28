@@ -1039,7 +1039,7 @@ func TestEachRankHasItsShareOfTheOneOrder(t *testing.T) {
 	o := newOrderer(in, spec.Block, spec.Seed)
 	o.keep = func(g int64) bool { return g%2 == 1 }
 	for _, g := range []int64{0, 96} { // a whole block, the short last one
-		if err := o.seek(context.Background(), g); err != nil {
+		if err := o.seek(context.Background(), g, 0); err != nil {
 			t.Fatal(err)
 		}
 		held, want := 0, 0
@@ -1054,5 +1054,57 @@ func TestEachRankHasItsShareOfTheOneOrder(t *testing.T) {
 		if held != want || len(o.recs) == 0 {
 			t.Fatalf("block of %d from %d: %d records held, want %d", len(o.recs), g, held, want)
 		}
+	}
+}
+
+// A finite stream read to its end by ranks of W starts again from their
+// positions at its end: a rank that took its last record is next at up to
+// W-1 past the stream's end (38 records, 2 ranks: rank 1 at 39), and ends
+// there, holding no rank up (a stream continued after its run ended: issue
+// #49).
+func TestRanksAtAFiniteStreamsEndStartThereAgain(t *testing.T) {
+	spec, dir := testData(t)
+	spec.Sources = spec.Sources[:1]
+	spec.Epochs = 1 // 38 records
+	serve := func(positions []Position) (context.CancelFunc, string) {
+		ctx, cancel := context.WithCancel(context.Background())
+		ln, _ := net.Listen("tcp", "127.0.0.1:0")
+		go (&Server{Loader: &Loader{Spec: spec, Fetch: &Fetcher{Origin: DirOrigin{dir}}}, Positions: positions, World: 2}).Serve(ctx, ln)
+		return cancel, ln.Addr().String()
+	}
+	cancel, addr := serve(nil)
+	positions := make([]Position, 2)
+	total := 0
+	for r := range 2 {
+		c, err := Dial(context.Background(), "tcp", addr, r, 2, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for {
+			if _, err := c.Next(); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Fatalf("rank %d: %v", r, err)
+			}
+			total++
+		}
+		positions[r] = c.Resume().Position
+		c.Close()
+	}
+	cancel()
+	if total != 38 || positions[0].Record != 19 || positions[1].Record != 19 {
+		t.Fatalf("%d records, positions %+v", total, positions)
+	}
+	cancel, addr = serve(positions)
+	defer cancel()
+	for r := range 2 {
+		c, err := Dial(context.Background(), "tcp", addr, r, 2, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.Next(); err != io.EOF {
+			t.Fatalf("rank %d at the end, started again: %v", r, err)
+		}
+		c.Close()
 	}
 }

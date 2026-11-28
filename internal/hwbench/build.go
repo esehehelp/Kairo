@@ -14,11 +14,12 @@ import (
 	gpubench "kairo/bench/gpu"
 )
 
-// gpuNVCCFlags are bench/gpu/Makefile's (CUBLAS_STATIC=1): sm_86 SASS for
-// Ampere plus compute_86 PTX for newer GPUs; cudart and cuBLAS static, NVML
-// opened at run time (the driver's, which the container is handed).
+// gpuNVCCFlags are bench/gpu/Makefile's (CUBLAS_STATIC=1): sm_80 SASS for
+// the A100, sm_86 SASS for Ampere plus compute_86 PTX for newer GPUs;
+// cudart and cuBLAS static, NVML opened at run time (the driver's, which
+// the container is handed).
 var gpuNVCCFlags = []string{"-O3", "-std=c++17",
-	"-gencode", "arch=compute_86,code=sm_86", "-gencode", "arch=compute_86,code=compute_86",
+	"-gencode", "arch=compute_80,code=sm_80", "-gencode", "arch=compute_86,code=sm_86", "-gencode", "arch=compute_86,code=compute_86",
 	"-Xcompiler", "-Wall,-Wextra"}
 
 // BuildGPU builds kairo-bench-gpu from the source Kairo carries with the

@@ -69,10 +69,10 @@ if defined DIRTY set "BUILD_REV=%BUILD_REV%-dirty"
 echo build-windows: build %BUILD_REV%
 
 rem ---- compile ---------------------------------------------------------------
-rem sm_86 SASS for Ampere (RTX 3080/3060) plus compute_86 PTX for newer GPUs.
+rem sm_80 SASS for the A100, sm_86 SASS for Ampere (RTX 3080/3060) plus compute_86 PTX for newer GPUs.
 pushd "%HERE%"
 "%NVCC%" -O3 -std=c++17 ^
-  -gencode arch=compute_86,code=sm_86 -gencode arch=compute_86,code=compute_86 ^
+  -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_86,code=compute_86 ^
   -Xcompiler "/W4 /EHsc /MT /utf-8" ^
   -DKAIRO_BENCH_BUILD=\"%BUILD_REV%\" ^
   -o kairo-bench-gpu.exe kairo-bench-gpu.cu ^

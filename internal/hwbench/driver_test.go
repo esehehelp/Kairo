@@ -263,3 +263,20 @@ func TestReferenceSpreadDecidesValidity(t *testing.T) {
 		t.Fatalf("invalid reference: %+v", ref)
 	}
 }
+
+// A device whose settings cannot be set (no clock control, a CPU without
+// frequency ranges) has no grid: a kind with a sweep is measured at its own
+// settings, one point, valid (a sweep of none lacked its middle reference).
+func TestAKindWithoutAGridIsMeasuredAtItsOwnSettings(t *testing.T) {
+	d := newFakeDaemon(gpuRun("gemm"), &store.DeviceCapabilities{})
+	r := &fakeRunner{d: d}
+	if err := testDriver(d, r).Run(context.Background(), "bnc-1"); err != nil {
+		t.Fatal(err)
+	}
+	if d.finish == nil || !d.finish.Valid || !d.finish.References["gemm"].Valid {
+		t.Fatalf("finish: %+v", d.finish)
+	}
+	if points := d.sortedPoints(); len(points) != 1 || points[0].Phase != store.PhaseMeasure {
+		t.Fatalf("points: %+v", points)
+	}
+}

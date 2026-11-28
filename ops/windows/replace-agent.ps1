@@ -19,8 +19,19 @@ $node = if ((Get-Content $cfg -Raw) -match '(?ms)^\[node\]\s*\r?\n.*?^id\s*=\s*"
 New-Item -ItemType File -Force $hold | Out-Null
 # Checked right before the stop, with the hold file in place: an attempt that starts between an earlier check and
 # the stop would be lost. Anything this node holds is a live attempt.
-$held = @((& kairo resource status --json | ConvertFrom-Json).resources | Where-Object { $_.node_id -eq $node -and $_.derived_state -in 'leased', 'reserved' })
-if ($held.Count -and $Adopting) {
+# Not read (the daemon down, a token refused) is not none held: refused, unless adopting (which takes over whatever
+# runs here either way).
+$status = & kairo resource status --json
+$resources = if ($LASTEXITCODE -eq 0 -and $status) { ($status | Out-String | ConvertFrom-Json).resources } else { $null }
+if ($null -eq $resources -and -not $Adopting) {
+  Remove-Item $hold -Force
+  Log "refused: the leases of $node not read (kairo resource status: exit $LASTEXITCODE)"
+  exit 1
+}
+$held = @($resources | Where-Object { $_.node_id -eq $node -and $_.derived_state -in 'leased', 'reserved' })
+if ($null -eq $resources) {
+  Log "the leases of $node not read (kairo resource status: exit $LASTEXITCODE); the new agent adopts whatever runs here"
+} elseif ($held.Count -and $Adopting) {
   Log "$node holds leases ($(($held | ForEach-Object { $_.stable_identity }) -join ', ')); the new agent adopts their attempts"
 } elseif ($held.Count) {
   Remove-Item $hold -Force

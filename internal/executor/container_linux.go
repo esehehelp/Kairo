@@ -718,6 +718,14 @@ func containerInit(specPath string) int {
 		fmt.Fprintln(stderr, "kairo container:", err)
 		return writeShimExit(containerExitIn, shimNotStarted)
 	}
+	// nothing the attempt starts gains privileges by exec (a setuid or
+	// file-capability program the image has: sudo, su), so its user cannot
+	// become the container's root and write what is the init's; inherited,
+	// and never undone
+	if err := unix.Prctl(unix.PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0); err != nil {
+		fmt.Fprintln(stderr, "kairo container: no new privileges:", err)
+		return writeShimExit(containerExitIn, shimNotConfined)
+	}
 	// each stream's loader, its socket ready before the argv starts
 	loaders, env, err := startLoaders(spec, env, stderr)
 	// the exit is written once nothing the attempt started is left to

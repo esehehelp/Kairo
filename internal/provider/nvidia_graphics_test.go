@@ -121,3 +121,19 @@ func TestNVIDIAPCIAddressIsTheBusDeviceAndFunction(t *testing.T) {
 		}
 	}
 }
+
+// Without the process list a GPU's claims are unknown: pmon failing, in
+// time or not, fails the observation rather than record the GPU unclaimed.
+func TestNVIDIAWithoutTheProcessListObservesNothing(t *testing.T) {
+	p := &NVIDIA{ProviderID: "p", NodeID: "n",
+		KairoVRAM: func() (map[string]int64, error) { return nil, nil },
+		Command: func(_ context.Context, args ...string) ([]byte, error) {
+			if args[0] == "pmon" {
+				return nil, errors.New("exit status 15: driver not loaded")
+			}
+			return queryAnswer(args, inventory("GPU-a, 0, 10240, 9000, 83, 70")), nil
+		}}
+	if _, err := p.Observe(context.Background()); err == nil {
+		t.Fatal("observed without the process list")
+	}
+}

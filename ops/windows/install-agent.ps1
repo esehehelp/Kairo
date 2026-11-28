@@ -18,7 +18,11 @@ if (-not (Test-Path $cfg)) { Log "refused: $cfg is missing"; exit 1 }
 $version = (& $New version 2>$null | Select-Object -First 1)
 if ($version -notmatch '^kairo cli [0-9a-f]{12}$') { Log "refused: unexpected build $version"; exit 1 }
 $node = if ((Get-Content $cfg -Raw) -match '(?ms)^\[node\]\s*\r?\n.*?^id\s*=\s*"([^"]+)"') { $Matches[1] } else { throw "no [node] id in $cfg" }
-$held = @((& kairo resource status --json | ConvertFrom-Json).resources | Where-Object { $_.node_id -eq $node -and $_.derived_state -in 'leased', 'reserved' })
+# not read (the daemon down, a token refused) is not none held: refused
+$status = & kairo resource status --json
+$resources = if ($LASTEXITCODE -eq 0 -and $status) { ($status | Out-String | ConvertFrom-Json).resources } else { $null }
+if ($null -eq $resources) { Log "refused: the leases of $node not read (kairo resource status: exit $LASTEXITCODE)"; exit 1 }
+$held = @($resources | Where-Object { $_.node_id -eq $node -and $_.derived_state -in 'leased', 'reserved' })
 if ($held.Count) { Log "refused: $node holds leases ($(($held | ForEach-Object { $_.stable_identity }) -join ', ')); install when nothing runs here"; exit 1 }
 
 # the supervisor first (it would start the agent again), then the agent: not its attempts' shims

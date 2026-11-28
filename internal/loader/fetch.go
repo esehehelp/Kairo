@@ -193,19 +193,29 @@ func (c *checkedReader) fill() error {
 		}
 		if err == nil {
 			sum := sha256.Sum256(data)
-			if data != nil && hex.EncodeToString(sum[:]) == c.f.Chunks[c.chunk] && (c.chunk+1 < len(c.f.Chunks) || c.atEnd()) {
+			matches := data != nil && hex.EncodeToString(sum[:]) == c.f.Chunks[c.chunk]
+			end := true
+			if matches && c.chunk+1 == len(c.f.Chunks) {
+				// a read failing there tells nothing of the length: read again
+				if end, err = c.atEnd(); err != nil {
+					err = fmt.Errorf("%s past its last chunk from %s: %w", c.f.Name, c.x.Origin, err)
+				}
+			}
+			if err == nil && matches && end {
 				if failed && c.x.Problem != nil {
 					c.x.Problem(c.f, nil)
 				}
 				c.buf, c.chunk, c.mismatch = data, c.chunk+1, 0
 				return nil
 			}
-			c.closeBody()
-			if c.mismatch == c.chunk+1 {
-				return fmt.Errorf("%w: %s chunk %d from %s is not what was identified (its bytes or the file's length)", ErrChanged, c.f.Name, c.chunk, c.x.Origin)
+			if err == nil {
+				c.closeBody()
+				if c.mismatch == c.chunk+1 {
+					return fmt.Errorf("%w: %s chunk %d from %s is not what was identified (its bytes or the file's length)", ErrChanged, c.f.Name, c.chunk, c.x.Origin)
+				}
+				c.mismatch = c.chunk + 1
+				err = fmt.Errorf("%s chunk %d from %s does not match its sha256: reading it again", c.f.Name, c.chunk, c.x.Origin)
 			}
-			c.mismatch = c.chunk + 1
-			err = fmt.Errorf("%s chunk %d from %s does not match its sha256: reading it again", c.f.Name, c.chunk, c.x.Origin)
 		}
 		c.closeBody()
 		if !failed {
@@ -273,14 +283,21 @@ func (c *checkedReader) readChunk() ([]byte, error) {
 	return data, nil
 }
 
-// atEnd reports whether the body has nothing past the file's last chunk.
-func (c *checkedReader) atEnd() bool {
+// atEnd reports whether the body has nothing past the file's last chunk:
+// its end read (io.EOF), not a read failing (err).
+func (c *checkedReader) atEnd() (bool, error) {
 	var one [1]byte
-	n, err := c.body.Read(one[:])
-	for n == 0 && err == nil {
-		n, err = c.body.Read(one[:])
+	for {
+		n, err := c.body.Read(one[:])
+		switch {
+		case n > 0:
+			return false, nil
+		case errors.Is(err, io.EOF):
+			return true, nil
+		case err != nil:
+			return false, err
+		}
 	}
-	return n == 0
 }
 
 // errLength: what was read is not as long as the file was identified.

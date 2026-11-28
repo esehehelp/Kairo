@@ -112,3 +112,49 @@ func TestAProjectMergesIntoAnother(t *testing.T) {
 		t.Fatalf("declared again: %+v %v", again, err)
 	}
 }
+
+// A task renamed by a merge is renamed where the other tasks of its project
+// name it too: their dependencies and task inputs (an input names a task's
+// latest run by name: under the old name it would read INTO's task).
+func TestAMergeRenamesWhatNamesARenamedTask(t *testing.T) {
+	store := openCoordinationStore(t)
+	setupSchedulerInventory(t, store)
+	ctx := context.Background()
+	uses := mergeManifest("from", [2]string{"shared", "data"}) + `[[tasks]]
+name = "uses"
+queue = "data"
+depends_on = ["shared"]
+policy = "RunToCompletion@v1"
+[tasks.execution]
+schema_version = 2
+argv = ["true"]
+cwd = "/work"
+[tasks.execution.executor]
+labels = { environment = "wsl2" }
+[[tasks.execution.inputs]]
+name = "made"
+task = "shared"
+`
+	for _, m := range []string{uses, mergeManifest("into", [2]string{"shared", "data"})} {
+		if _, err := store.ApplyProject(ctx, projectSpec(t, m)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, p := range []string{"from", "into"} {
+		for _, task := range []string{"shared", "uses"} {
+			if _, err := store.CancelTask(ctx, p, task, "tester", false); err != nil && !errors.Is(err, ErrNotFound) {
+				t.Fatal(err)
+			}
+		}
+	}
+	if _, err := store.MergeProject(ctx, MergeRequest{From: "from", Into: "into", Renames: map[string]string{"shared": "shared-from"}, Actor: "tester"}); err != nil {
+		t.Fatal(err)
+	}
+	var body string
+	if err := store.db.QueryRow(`SELECT t.spec_json FROM orchestration_tasks t JOIN coordination_scopes p ON p.id=t.project_scope_id WHERE p.external_key='into' AND t.name='uses'`).Scan(&body); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(body, `"depends_on":["shared-from"]`) || !strings.Contains(body, `"task":"shared-from"`) || strings.Contains(body, `"shared"`) {
+		t.Fatalf("the declaration of uses: %s", body)
+	}
+}

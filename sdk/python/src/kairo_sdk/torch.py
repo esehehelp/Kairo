@@ -76,7 +76,7 @@ class DistributedAdapter:
                         pid=item["pid"],
                         process_identity=item["identity"],
                     )
-            except BaseException as exc:
+            except Exception as exc:
                 self.session.last_control_error = exc
                 error = f"Kairo process registration failed: {exc}"
         status = [error]
@@ -121,7 +121,7 @@ class DistributedAdapter:
         except KairoAPIError as exc:
             self.session.last_control_error = exc
             return "gone" if exc.classification == errors.GONE else "failed"
-        except BaseException as exc:
+        except Exception as exc:
             self.session.last_control_error = exc
             return "failed"
         self.session.last_control_error = None
@@ -149,7 +149,8 @@ class DistributedAdapter:
         :class:`~kairo_sdk.errors.AttemptRetired` /
         :class:`~kairo_sdk.errors.AttemptFenced` on every rank. Transient
         control-plane failures are reported as "no command" so a temporary
-        outage cannot strand peer ranks in a collective.
+        outage cannot strand peer ranks in a collective; a lasting one (a
+        token refused) raises on every rank.
         """
         self.start()
         dist, distributed = self._distribution()
@@ -162,6 +163,8 @@ class DistributedAdapter:
             dist.broadcast_object_list(envelope, src=0)
         message = envelope[0]
         _raise_terminal(self.session, message["terminal"])
+        if message.get("error"):
+            raise RuntimeError(message["error"])
         published = message.get("published")
         if published is not None:
             # Rank 0 got the answer of an earlier publication only now.
@@ -241,7 +244,7 @@ class DistributedAdapter:
         try:
             result = normalize_suspend_result(checkpoint(context))
             local_positions = stream_positions(tuple(streams))
-        except BaseException as exc:
+        except Exception as exc:
             local_error = f"rank {rank} checkpoint failed: {type(exc).__name__}: {exc}"
 
         # each rank's failure, and where each of its streams stands
@@ -329,7 +332,7 @@ class DistributedAdapter:
         except (AttemptRetired, AttemptFenced):
             message["terminal"] = _terminal_message(session)
             return message
-        except BaseException as exc:
+        except Exception as exc:
             # every rank still reaches the broadcast
             session.last_control_error = exc
             _log.warning("Kairo checkpoint not requested: %s", exc)
@@ -371,7 +374,7 @@ class DistributedAdapter:
             local_error: str | None = None
             try:
                 checkpoint(_stop_signal_context(self.session))
-            except BaseException as exc:
+            except Exception as exc:
                 local_error = f"rank {rank} checkpoint failed: {type(exc).__name__}: {exc}"
             errors_by_rank: list[Any] = [None] * (dist.get_world_size() if distributed else 1)
             if distributed:
@@ -415,10 +418,16 @@ class DistributedAdapter:
             except (AttemptRetired, AttemptFenced):
                 message["terminal"] = _terminal_message(session)
                 return message
-            except BaseException as exc:
+            except Exception as exc:
                 # Every rank still reaches the broadcast. A temporary
-                # control-plane outage must not deadlock the process group.
-                session.last_control_error = exc
+                # control-plane outage must not deadlock the process group;
+                # a lasting failure (a token refused, a certificate not
+                # trusted) is raised on every rank after it, as
+                # AttemptSession.safe_point raises it.
+                if not session._unavailable(exc):
+                    session.last_control_error = exc
+                    message["error"] = f"Kairo commands not read: {type(exc).__name__}: {exc}"
+                    return message
                 commands = []
             for raw in commands:
                 kind = str(raw.get("kind") or "")

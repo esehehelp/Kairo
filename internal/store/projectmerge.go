@@ -148,28 +148,50 @@ func (s *Store) MergeProject(ctx context.Context, req MergeRequest) (MergeResult
 			return out, fmt.Errorf("%w: %s is no task of %s that %s has too", ErrMergeRefused, name, req.From, req.Into)
 		}
 	}
+	// each declaration under the new names, its own and those it names (its
+	// dependencies, its task inputs: an input names the task's latest run by
+	// name, which would be INTO's task of the old name), so that declaring
+	// it so again is the same task (its digest is its declaration's)
 	for _, t := range tasks {
-		if renamed, ok := out.Renamed[t.name]; ok {
-			// its declaration under its new name, so that declaring it so
-			// again is the same task (its digest is its declaration's)
-			var body string
-			if err = tx.QueryRowContext(ctx, `SELECT spec_json FROM orchestration_tasks WHERE task_scope_id=$1`, t.scope).Scan(&body); err != nil {
-				return out, err
+		if len(out.Renamed) == 0 {
+			break
+		}
+		var body string
+		if err = tx.QueryRowContext(ctx, `SELECT spec_json FROM orchestration_tasks WHERE task_scope_id=$1`, t.scope).Scan(&body); err != nil {
+			return out, err
+		}
+		var declared orchestration.Task
+		if err = json.Unmarshal([]byte(body), &declared); err != nil {
+			return out, fmt.Errorf("task %s: its declaration: %w", t.name, err)
+		}
+		changed := false
+		rename := func(name *string) {
+			if renamed, ok := out.Renamed[*name]; ok {
+				*name, changed = renamed, true
 			}
-			var declared orchestration.Task
-			if err = json.Unmarshal([]byte(body), &declared); err != nil {
-				return out, fmt.Errorf("task %s: its declaration: %w", t.name, err)
+		}
+		rename(&declared.Name)
+		for i := range declared.DependsOn {
+			rename(&declared.DependsOn[i])
+		}
+		for i := range declared.Execution.Inputs {
+			if declared.Execution.Inputs[i].Task != "" {
+				rename(&declared.Execution.Inputs[i].Task)
 			}
-			declared.Name = renamed
-			spec, err := json.Marshal(declared)
-			if err != nil {
-				return out, err
-			}
-			sum := sha256.Sum256(spec)
-			if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET name=$1,spec_json=$2,spec_digest=$3 WHERE task_scope_id=$4`, renamed, string(spec), hex.EncodeToString(sum[:]), t.scope); err != nil {
-				return out, err
-			}
-			if _, err = tx.ExecContext(ctx, `UPDATE coordination_scopes SET external_key=$1,updated_at=$2 WHERE id=$3`, renamed, now(), t.scope); err != nil {
+		}
+		if !changed {
+			continue
+		}
+		spec, err := json.Marshal(declared)
+		if err != nil {
+			return out, err
+		}
+		sum := sha256.Sum256(spec)
+		if _, err = tx.ExecContext(ctx, `UPDATE orchestration_tasks SET name=$1,spec_json=$2,spec_digest=$3 WHERE task_scope_id=$4`, declared.Name, string(spec), hex.EncodeToString(sum[:]), t.scope); err != nil {
+			return out, err
+		}
+		if declared.Name != t.name {
+			if _, err = tx.ExecContext(ctx, `UPDATE coordination_scopes SET external_key=$1,updated_at=$2 WHERE id=$3`, declared.Name, now(), t.scope); err != nil {
 				return out, err
 			}
 		}

@@ -146,7 +146,8 @@ class Stream:
                 return
             except StreamError:
                 raise
-            except OSError as err:
+            except (OSError, EOFError) as err:
+                # a loader starting again can close a connection mid-handshake
                 if time.monotonic() > deadline:
                     raise StreamError(f"stream {self.name}: the loader went ({cause}) and did not come back: {err}") from err
             time.sleep(pause)

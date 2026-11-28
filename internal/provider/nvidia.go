@@ -300,9 +300,10 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 	// include ordinary desktop graphics clients, which must not claim a GPU.
 	// -s um: each process's SM share (its owner's use, owneruse.go) and memory
 	processes, processErr := p.run(ctx, "pmon", "-c", "1", "-s", "um")
-	if errors.Is(processErr, context.DeadlineExceeded) {
-		// Without the process list the GPUs' claims are unknown: fail the
-		// observation rather than record them as unclaimed.
+	if processErr != nil {
+		// Without the process list the GPUs' claims are unknown (a driver
+		// that does not answer in time, or fails): fail the observation
+		// rather than record them as unclaimed.
 		return Snapshot{}, fmt.Errorf("nvidia-smi pmon: %w", processErr)
 	}
 	seenProcess := map[string]bool{}
@@ -310,7 +311,7 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 	graphics := map[string]bool{}
 	// owner: the graphics processes using each GPU's SMs (owneruse.go)
 	owner := map[string][]ownerProcess{}
-	if processErr == nil {
+	{
 		cols := pmonColumns{gpu: 0, pid: 1, kind: 2, sm: -1, fb: 3, command: 4}
 		header := false
 		for _, line := range strings.Split(string(processes), "\n") {
@@ -408,7 +409,7 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 			snap.Claims = append(snap.Claims, store.ExternalClaim{ID: "claim-" + resourceID + "-unattributed", ResourceID: resourceID, ClaimKind: "unattributed_activity", Evidence: evidence})
 		}
 	}
-	if p.Owner.observed() && processErr == nil {
+	if p.Owner.observed() {
 		// each GPU's reading, with or without graphics on it: the mean over
 		// the window is the owner's use
 		present, _ := p.Owner.present()

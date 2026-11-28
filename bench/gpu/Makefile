@@ -24,8 +24,9 @@ BUILD_REV := $(shell r=$$(git -C '$(HERE)' rev-parse --short=12 HEAD 2>/dev/null
     echo "$$r"; } || echo unknown)
 endif
 
-# sm_86 SASS for Ampere (RTX 3080/3060) plus compute_86 PTX for newer GPUs.
-GENCODE := -gencode arch=compute_86,code=sm_86 -gencode arch=compute_86,code=compute_86
+# sm_80 SASS for the A100, sm_86 SASS for Ampere (RTX 3080/3060) plus compute_86 PTX for newer GPUs
+# (PTX is compiled only forward: compute_86 alone runs on no sm_80).
+GENCODE := -gencode arch=compute_80,code=sm_80 -gencode arch=compute_86,code=sm_86 -gencode arch=compute_86,code=compute_86
 NVCCFLAGS := -O3 -std=c++17 $(GENCODE) -Xcompiler -Wall,-Wextra
 
 ifeq ($(CUBLAS_STATIC),1)

@@ -259,7 +259,7 @@ func (l *Loader) produceRank(ctx context.Context, gen *generation, r int, positi
 		// is read twice: its order is of its length)
 		order.keep = func(g int64) bool { return int(g%world) == r }
 	}
-	if err := order.seek(ctx, pos.Record*world+int64(r)); err != nil {
+	if err := order.seek(ctx, pos.Record*world+int64(r), world-1); err != nil {
 		return err
 	}
 	errs := make(chan error, len(l.Spec.Stages)+1)

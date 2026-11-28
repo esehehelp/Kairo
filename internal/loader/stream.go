@@ -171,8 +171,11 @@ func newOrderer(in *inputs, block int, seed uint64) *orderer {
 	return &orderer{in: in, block: int64(block), seed: seed, j: -1}
 }
 
-// seek puts the order before output g.
-func (o *orderer) seek(ctx context.Context, g int64) error {
+// seek puts the order before output g. Past the stream's end by up to
+// slack it is at its end: a rank of W that took its last record is next at
+// up to W-1 past it (slack W-1); further, the position is not of this
+// stream.
+func (o *orderer) seek(ctx context.Context, g, slack int64) error {
 	o.j, o.recs, o.perm, o.ended = g/o.block, nil, nil, false
 	if err := o.in.seek(ctx, o.j*o.block); err != nil {
 		return err
@@ -182,7 +185,11 @@ func (o *orderer) seek(ctx context.Context, g int64) error {
 	}
 	o.t, o.g = int(g%o.block), g
 	if o.t > len(o.recs) {
-		return fmt.Errorf("output %d is past the stream's end (%d)", g, o.j*o.block+int64(len(o.recs)))
+		end := o.j*o.block + int64(len(o.recs))
+		if g-end > slack {
+			return fmt.Errorf("output %d is past the stream's end (%d)", g, end)
+		}
+		o.ended = true
 	}
 	return nil
 }
