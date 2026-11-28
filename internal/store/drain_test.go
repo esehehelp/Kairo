@@ -147,6 +147,27 @@ func TestADrainedStoreHandsItsCopiesOverAndEmpties(t *testing.T) {
 		t.Fatalf("shed from a store not drained, without replicas: %+v", shed)
 	}
 
+	// an executor that serves no durable store but a drained one sheds too
+	if err := store.UpsertExecutor(ctx, Executor{ID: "old-exec", NodeID: "node", Kind: "windows", Attributes: json.RawMessage(`{"environment":"windows"}`), Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	stores = append(stores, machine.Store{ID: "b-old", Class: machine.StoreDurable, Node: "node", Executor: "old-exec", Root: "D:/_kairo-durable", Filesystem: "D:", Drain: true})
+	declareTestStore(t, store, stores...)
+	verified("obj_e", "b-old", "D:/_kairo-durable")
+	out, err := store.CopiesToMake(ctx, "old-exec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var shedOld []CopyOrder
+	for _, o := range out {
+		if o.Shed {
+			shedOld = append(shedOld, o)
+		}
+	}
+	if len(shedOld) != 1 || shedOld[0].ObjectID != "obj_e" || shedOld[0].StoreID != "b-old" {
+		t.Fatalf("orders of an executor serving only a drained store %+v, want obj_e shed off b-old", out)
+	}
+
 	// only a durable store is drained, and not one being moved
 	for _, bad := range []machine.Store{
 		{ID: "d-scratch", Class: machine.StoreVolatile, Node: "node", Root: "D:/kairo", Filesystem: "D:", Drain: true},

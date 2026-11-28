@@ -227,9 +227,12 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 	if err != nil {
 		return nil, err
 	}
-	served := false
+	served, drains := false, false
 	for _, target := range targets {
 		served = served || me.serves(target, executorID)
+	}
+	for _, d := range declared {
+		drains = drains || d.Class == machine.StoreDurable && d.Drain && me.serves(d, executorID)
 	}
 	// Both copy and shed orders use the same room estimate for each store.
 	room := map[string]int64{}
@@ -428,7 +431,8 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 		return nil, err
 	}
 	out = append(out, describe...)
-	if served {
+	if served || drains {
+		// a store drained sheds whether or not its executor serves another
 		shed, err := shedOrdersTx(ctx, tx, me, executorID, targets, byID, room, s.dataPolicy().ScrubInterval)
 		if err != nil {
 			return nil, err
