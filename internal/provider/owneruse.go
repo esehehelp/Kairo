@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"sync"
 	"time"
 
 	"kairo/internal/store"
@@ -29,6 +30,11 @@ import (
 //     Incus instances kairo-*, on Windows the wslc VM's vmmemwslc*
 //     processes) at least CPUPercent. Not reported where Kairo's share
 //     cannot be read (it would be taken for its owner's).
+//
+// Both are means over the last ownerWindow, not one reading: a desktop uses
+// a GPU or the cores in bursts of a second or two (a page drawn, a window
+// moved, a build step), and what work gives way to lasts minutes (a game, a
+// render, a long build).
 //   - RAM: no claim. The floor (RAMFreeBytes) is kept free: admission
 //     leaves it free, and while less is available for a while the daemon
 //     suspends work on the node (memory pressure, issue #45), whatever
@@ -40,7 +46,7 @@ import (
 // no claim.
 type OwnerUse struct {
 	Disabled bool
-	// GPUSMPercent and GPUSMPercentPresent: zero means 30 and 10.
+	// GPUSMPercent and GPUSMPercentPresent: zero means 50 and 25.
 	GPUSMPercent, GPUSMPercentPresent float64
 	// CPUPercent and CPUPercentPresent: zero means 50 and 25.
 	CPUPercent, CPUPercentPresent float64
@@ -64,6 +70,14 @@ const inputStale = 2 * time.Minute
 // ownerCPUBusy: below this share of the cores busy, the owner's processes
 // wait for nothing.
 const ownerCPUBusy = 0.9
+
+// ownerWindow: the owner's use of a GPU or the CPU is their mean use over
+// this long.
+const ownerWindow = 2 * time.Minute
+
+// ownerWindowCover: readings over less than this tell nothing yet (an agent
+// just started; a claim it made before is held by the daemon meanwhile).
+const ownerWindowCover = time.Minute
 
 // ClaimOwnerUse is the kind of the claims OwnerUse makes.
 const ClaimOwnerUse = "owner_use"
@@ -126,9 +140,9 @@ func (o *OwnerUse) present() (bool, time.Time) {
 
 func (o *OwnerUse) gpuThreshold(present bool) float64 {
 	if present {
-		return orDefault(o.GPUSMPercentPresent, 10)
+		return orDefault(o.GPUSMPercentPresent, 25)
 	}
-	return orDefault(o.GPUSMPercent, 30)
+	return orDefault(o.GPUSMPercent, 50)
 }
 
 func (o *OwnerUse) cpuThreshold(present bool) float64 {
@@ -180,12 +194,102 @@ func topProcesses(ps []ownerProcess) []ownerProcess {
 	return ps
 }
 
+// gpuReading is one reading of the graphics processes using a GPU's SMs.
+type gpuReading struct {
+	at        time.Time
+	processes []ownerProcess
+}
+
+// gpuOwnerReadings are each GPU's readings over the last ownerWindow.
+type gpuOwnerReadings struct {
+	mu       sync.Mutex
+	readings map[string][]gpuReading
+}
+
+// add records a reading of a GPU at now and returns the mean SM share of its
+// graphics processes over the window (a reading without them counts as
+// none), with each process's mean (the most first, at most five); ok is
+// false while the readings cover less than ownerWindowCover.
+func (r *gpuOwnerReadings) add(uuid string, now time.Time, processes []ownerProcess) (sum float64, top []ownerProcess, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.readings == nil {
+		r.readings = map[string][]gpuReading{}
+	}
+	kept := []gpuReading{}
+	for _, reading := range r.readings[uuid] {
+		// older than the window, or after now (the clock went back)
+		if now.Sub(reading.at) < ownerWindow && !reading.at.After(now) {
+			kept = append(kept, reading)
+		}
+	}
+	kept = append(kept, gpuReading{at: now, processes: processes})
+	r.readings[uuid] = kept
+	if now.Sub(kept[0].at) < ownerWindowCover {
+		return 0, nil, false
+	}
+	type key struct {
+		pid  int
+		name string
+	}
+	byProcess := map[key]float64{}
+	for _, reading := range kept {
+		for _, p := range reading.processes {
+			byProcess[key{p.PID, p.Name}] += p.SM
+		}
+	}
+	n := float64(len(kept))
+	for k, total := range byProcess {
+		top = append(top, ownerProcess{PID: k.pid, Name: k.name, SM: total / n})
+		sum += total / n
+	}
+	sort.Slice(top, func(i, j int) bool { return top[i].PID < top[j].PID })
+	return sum, topProcesses(top), true
+}
+
 // cpuTimes is a reading of the node's CPU time, all cores together: total,
 // idle, and Kairo's (its containers'), in one unit; kairoKnown is false
 // when Kairo's could not be read.
 type cpuTimes struct {
 	total, idle, kairo float64
 	kairoKnown         bool
+}
+
+// cpuReading is a reading of the node's CPU time and when it was read.
+type cpuReading struct {
+	at    time.Time
+	times cpuTimes
+}
+
+// cpuOwnerReadings are the node's readings of its CPU time over the last
+// ownerWindow.
+type cpuOwnerReadings struct {
+	mu       sync.Mutex
+	readings []cpuReading
+}
+
+// add records a reading at now and returns the readings to tell the owner's
+// use by: the first in the window and this one; ok is false while they cover
+// less than ownerWindowCover. A counter that went back (the wslc VM started
+// again) starts the window over.
+func (r *cpuOwnerReadings) add(now time.Time, cur cpuTimes) (base cpuTimes, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := []cpuReading{}
+	for _, reading := range r.readings {
+		if now.Sub(reading.at) < ownerWindow && !reading.at.After(now) && reading.times.kairoKnown == cur.kairoKnown {
+			kept = append(kept, reading)
+		}
+	}
+	if n := len(kept); n > 0 && (cur.total < kept[n-1].times.total || cur.idle < kept[n-1].times.idle || cur.kairo < kept[n-1].times.kairo) {
+		kept = nil
+	}
+	r.readings = append(kept, cpuReading{at: now, times: cur})
+	first := r.readings[0]
+	if now.Sub(first.at) < ownerWindowCover {
+		return cpuTimes{}, false
+	}
+	return first.times, true
 }
 
 // cpuOwnerUse is the owner's share of the cores between two readings: busy

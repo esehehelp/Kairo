@@ -58,6 +58,9 @@ type NVIDIA struct {
 
 	query atomic.Int32 // the index in nvidiaQueries of the query this driver accepts
 	vm    wslcVRAM
+	// owned are the readings of each GPU its owner's use is told by
+	// (owneruse.go)
+	owned gpuOwnerReadings
 }
 
 func (p *NVIDIA) ID() string { return p.ProviderID }
@@ -398,17 +401,17 @@ func (p *NVIDIA) Observe(ctx context.Context) (Snapshot, error) {
 			snap.Claims = append(snap.Claims, store.ExternalClaim{ID: "claim-" + resourceID + "-unattributed", ResourceID: resourceID, ClaimKind: "unattributed_activity", Evidence: evidence})
 		}
 	}
-	if p.Owner.enabled() && len(owner) > 0 {
+	if p.Owner.enabled() && processErr == nil {
+		// each GPU's reading, with or without graphics on it: the mean over
+		// the window is the owner's use
 		present, _ := p.Owner.present()
 		threshold := p.Owner.gpuThreshold(present)
+		now := p.Owner.now()
 		for _, entry := range byIndex {
-			var sum float64
-			for _, o := range owner[entry.uuid] {
-				sum += o.SM
-			}
-			if sum >= threshold {
+			sum, top, ok := p.owned.add(entry.uuid, now, owner[entry.uuid])
+			if ok && sum >= threshold {
 				snap.Claims = append(snap.Claims, ownerClaim(entry.resource, map[string]any{"source": "observed", "gpu_uuid": entry.uuid, "sm_percent": sum,
-					"threshold_percent": threshold, "owner_present": present, "processes": topProcesses(owner[entry.uuid])}))
+					"threshold_percent": threshold, "owner_present": present, "window_seconds": ownerWindow.Seconds(), "processes": top}))
 			}
 		}
 	}

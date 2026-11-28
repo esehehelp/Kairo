@@ -26,21 +26,52 @@ const pmonUM = `# gpu         pid   type     sm    mem    enc    dec    jpg    o
     0       9000     C     55     10      -      -      -      -   4000      0    python
 `
 
-func ownerNVIDIA(t *testing.T, sm string, owner *OwnerUse) Snapshot {
-	t.Helper()
-	p := &NVIDIA{ProviderID: "p", NodeID: "n", Owner: owner,
+// ownerGPU is an NVIDIA provider whose pmon shows Game.exe using the share
+// of the SMs *sm holds (beside NVIDIA Overlay. at 4%, the WSL VM, and a
+// compute process).
+func ownerGPU(owner *OwnerUse, sm *string) *NVIDIA {
+	return &NVIDIA{ProviderID: "p", NodeID: "n", Owner: owner,
 		ProcessIdentity: func(pid int) (string, error) { return "pid:9000:start:x", nil },
 		Command: func(_ context.Context, args ...string) ([]byte, error) {
 			if args[0] == "pmon" {
-				return []byte(strings.Replace(pmonUM, "%s", sm, 1)), nil
+				return []byte(strings.Replace(pmonUM, "%s", *sm, 1)), nil
 			}
 			return queryAnswer(args, inventory("GPU-a, 0, 10240, 4000, 90, 60")), nil
 		}}
-	snap, err := p.Observe(context.Background())
-	if err != nil {
-		t.Fatal(err)
+}
+
+// testClock is a test's clock (OwnerUse.Now).
+type testClock struct{ now time.Time }
+
+func (c *testClock) read() time.Time { return c.now }
+
+// readings reads p every 5 s on c, Game.exe at each of shares in turn, and
+// returns the last snapshot. With ago, the owner's last input was that long
+// before each reading (the input reporter's record written then).
+func (c *testClock) readings(t *testing.T, p *NVIDIA, sm *string, input string, ago time.Duration, shares ...string) Snapshot {
+	t.Helper()
+	var snap Snapshot
+	for _, share := range shares {
+		c.now = c.now.Add(5 * time.Second)
+		if ago > 0 {
+			writeInput(t, input, c.now, ago)
+		}
+		*sm = share
+		var err error
+		if snap, err = p.Observe(context.Background()); err != nil {
+			t.Fatal(err)
+		}
 	}
 	return snap
+}
+
+// repeat is share n times.
+func repeat(share string, n int) []string {
+	out := make([]string, n)
+	for i := range out {
+		out[i] = share
+	}
+	return out
 }
 
 func ownerClaims(snap Snapshot) []store.ExternalClaim {
@@ -53,118 +84,178 @@ func ownerClaims(snap Snapshot) []store.ExternalClaim {
 	return out
 }
 
-// writeInput writes the input reporter's record: the last input that long
-// ago, written now.
-func writeInput(t *testing.T, path string, ago time.Duration) {
+// writeInput writes the input reporter's record: written then, the last
+// input that long before.
+func writeInput(t *testing.T, path string, written time.Time, ago time.Duration) {
 	t.Helper()
-	body, _ := json.Marshal(InputRecord{LastInput: time.Now().Add(-ago).UTC().Format(time.RFC3339Nano), Written: time.Now().UTC().Format(time.RFC3339Nano)})
+	body, _ := json.Marshal(InputRecord{LastInput: written.Add(-ago).UTC().Format(time.RFC3339Nano), Written: written.UTC().Format(time.RFC3339Nano)})
 	if err := os.WriteFile(path, body, 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// A GPU is its owner's while graphics processes use enough of its SMs:
-// their shares summed, the WSL VM's (Kairo's work on Windows) and compute
-// processes left out, the threshold lower while the owner is at the
-// keyboard. The pmon columns are read from its header.
+// A GPU is its owner's while graphics processes use enough of its SMs over
+// the last two minutes: their shares summed and averaged over the readings,
+// the WSL VM's (Kairo's work on Windows) and compute processes left out,
+// the threshold lower while the owner is at the keyboard. A desktop's
+// bursts (a page drawn for a second) are not its owner's use, nor is a
+// reading alone. The pmon columns are read from its header.
 func TestAGPUIsItsOwnersWhileGraphicsUseItsSMs(t *testing.T) {
 	input := filepath.Join(t.TempDir(), "input.json")
-	owner := &OwnerUse{InputFile: input}
-	if got := ownerClaims(ownerNVIDIA(t, "20", owner)); len(got) != 0 {
-		t.Fatalf("24%% with the owner away (threshold 30): %+v", got)
+	c := &testClock{now: time.Now()}
+	owner := &OwnerUse{InputFile: input, Now: c.read}
+	sm := "0"
+
+	// a game at 90% (94% with the overlay), the owner away: one reading
+	// tells nothing, a minute of them does
+	p := ownerGPU(owner, &sm)
+	if got := ownerClaims(c.readings(t, p, &sm, input, 0, "90")); len(got) != 0 {
+		t.Fatalf("one reading: %+v", got)
 	}
-	got := ownerClaims(ownerNVIDIA(t, "40", owner))
+	if got := ownerClaims(c.readings(t, p, &sm, input, 0, repeat("90", 11)...)); len(got) != 0 {
+		t.Fatalf("55 seconds of readings: %+v", got)
+	}
+	got := ownerClaims(c.readings(t, p, &sm, input, 0, "90"))
 	if len(got) != 1 || got[0].ID != "owner-gpu-a" || got[0].ResourceID != "gpu-a" {
-		t.Fatalf("44%%: %+v", got)
+		t.Fatalf("a minute at 94%%: %+v", got)
 	}
 	var evidence struct {
 		SM        float64 `json:"sm_percent"`
+		Threshold float64 `json:"threshold_percent"`
 		Present   bool    `json:"owner_present"`
+		Window    float64 `json:"window_seconds"`
 		Processes []ownerProcess
 	}
-	if err := json.Unmarshal(got[0].Evidence, &evidence); err != nil || evidence.SM != 44 || evidence.Present || len(evidence.Processes) != 2 ||
-		evidence.Processes[0].Name != "Game.exe" || evidence.Processes[1].Name != "NVIDIA Overlay." {
+	if err := json.Unmarshal(got[0].Evidence, &evidence); err != nil || evidence.SM != 94 || evidence.Threshold != 50 || evidence.Present || evidence.Window != 120 ||
+		len(evidence.Processes) != 2 || evidence.Processes[0].Name != "Game.exe" || evidence.Processes[0].SM != 90 || evidence.Processes[1].Name != "NVIDIA Overlay." {
 		t.Fatalf("evidence %s %v", got[0].Evidence, err)
 	}
-	// at the keyboard: 10%
-	writeInput(t, input, time.Minute)
-	if got := ownerClaims(ownerNVIDIA(t, "8", owner)); len(got) != 1 {
-		t.Fatalf("12%% with the owner at the keyboard: %+v", got)
+	// the game ended: once the window holds its readings no more, nothing
+	if got := ownerClaims(c.readings(t, p, &sm, input, 0, repeat("0", 24)...)); len(got) != 0 {
+		t.Fatalf("two minutes after the game: %+v", got)
 	}
-	// input long ago, or a record its reporter stopped writing: away
-	writeInput(t, input, time.Hour)
-	if got := ownerClaims(ownerNVIDIA(t, "8", owner)); len(got) != 0 {
-		t.Fatalf("12%% with the owner away an hour: %+v", got)
+
+	// 44% for minutes: not the owner's while away (50%), theirs at the
+	// keyboard (25%)
+	p = ownerGPU(owner, &sm)
+	if got := ownerClaims(c.readings(t, p, &sm, input, 0, repeat("40", 30)...)); len(got) != 0 {
+		t.Fatalf("44%% with the owner away: %+v", got)
 	}
-	writeInput(t, input, time.Minute)
-	old := time.Now().Add(-time.Hour)
-	if err := os.Chtimes(input, old, old); err != nil {
-		t.Fatal(err)
+	if got := ownerClaims(c.readings(t, p, &sm, input, time.Minute, "40")); len(got) != 1 {
+		t.Fatalf("44%% with the owner at the keyboard: %+v", got)
 	}
-	stale := &OwnerUse{InputFile: input, Now: func() time.Time { return time.Now().Add(time.Hour) }}
-	if got := ownerClaims(ownerNVIDIA(t, "8", stale)); len(got) != 0 {
+	// input an hour ago, or a record its reporter stopped writing: away
+	if got := ownerClaims(c.readings(t, p, &sm, input, time.Hour, "40")); len(got) != 0 {
+		t.Fatalf("44%% with the owner away an hour: %+v", got)
+	}
+	writeInput(t, input, c.now.Add(-3*time.Minute), time.Second)
+	if got := ownerClaims(c.readings(t, p, &sm, input, 0, "40")); len(got) != 0 {
 		t.Fatalf("a stale record kept the owner at the keyboard: %+v", got)
 	}
+
+	// a desktop at the keyboard: 94% for one reading a minute, the overlay's
+	// 4% between (the old rule took each burst for the owner's use)
+	p = ownerGPU(owner, &sm)
+	bursts := []string{}
+	for i := 0; i < 36; i++ {
+		bursts = append(bursts, map[bool]string{true: "90", false: "0"}[i%12 == 0])
+	}
+	if got := ownerClaims(c.readings(t, p, &sm, input, time.Minute, bursts...)); len(got) != 0 {
+		t.Fatalf("a desktop's bursts: %+v", got)
+	}
+
 	// off: nothing
-	if got := ownerClaims(ownerNVIDIA(t, "90", &OwnerUse{Disabled: true})); len(got) != 0 {
+	off := &OwnerUse{Disabled: true, Now: c.read}
+	p = ownerGPU(off, &sm)
+	if got := ownerClaims(c.readings(t, p, &sm, input, 0, repeat("90", 30)...)); len(got) != 0 {
 		t.Fatalf("disabled: %+v", got)
 	}
-	if got := ownerClaims(ownerNVIDIA(t, "90", nil)); len(got) != 0 {
+	p = ownerGPU(nil, &sm)
+	if got := ownerClaims(c.readings(t, p, &sm, input, 0, repeat("90", 30)...)); len(got) != 0 {
 		t.Fatalf("no owner settings: %+v", got)
 	}
 	// the compute process is still a claim of its own
-	snap := ownerNVIDIA(t, "0", nil)
+	snap := c.readings(t, p, &sm, input, 0, "0")
 	if len(snap.Claims) != 1 || snap.Claims[0].ClaimKind != "external_process" {
 		t.Fatalf("claims %+v", snap.Claims)
 	}
 }
 
-// The node's CPU is its owner's when its cores are busy and what keeps them
-// so is not Kairo's: busy less Kairo's containers' share at least the
-// threshold, and the cores at least 90% busy. Without Kairo's share the CPU
-// is never its owner's (Kairo's own work would be taken for it). The RAM is
-// never its owner's (who took it is not known): its observation tells the
-// floor and since when less than it is available.
+// The node's CPU is its owner's when its cores are busy over the last two
+// minutes and what keeps them so is not Kairo's: busy less Kairo's
+// containers' share at least the threshold, and the cores at least 90%
+// busy. Readings over less than a minute tell nothing, a burst of seconds
+// is not its owner's use, and a counter that went back starts the window
+// over. Without Kairo's share the CPU is never its owner's (Kairo's own
+// work would be taken for it). The RAM is never its owner's (who took it is
+// not known): its observation tells the floor and since when less than it
+// is available.
 func TestTheNodesCPUIsItsOwnersWhenTaken(t *testing.T) {
 	readings := []cpuTimes{}
 	next := 0
-	h := &Host{ProviderID: "h", NodeID: "n", Owner: &OwnerUse{}, Meter: noMeter{}, CPUTimes: func() (cpuTimes, error) {
+	c := &testClock{now: time.Now()}
+	h := &Host{ProviderID: "h", NodeID: "n", Owner: &OwnerUse{Now: c.read, InputFile: filepath.Join(t.TempDir(), "input.json")}, Meter: noMeter{}, CPUTimes: func() (cpuTimes, error) {
 		r := readings[next]
 		next++
 		return r, nil
 	}}
-	claimsOf := func(prev, cur cpuTimes, free int64) []store.ExternalClaim {
+	// claimsOf reads each of rs, after each the time in steps (none before
+	// the first), and returns the last reading's claims
+	claimsOf := func(steps []time.Duration, free int64, rs ...cpuTimes) []store.ExternalClaim {
 		t.Helper()
-		readings, next = []cpuTimes{prev, cur}, 0
-		h.cpuHave = false
-		h.snapshot(64<<30, free)
-		return h.snapshot(64<<30, free).Claims
+		readings, next = rs, 0
+		h.cpuReadings.readings = nil
+		var claims []store.ExternalClaim
+		for i := range rs {
+			if i > 0 {
+				c.now = c.now.Add(steps[i-1])
+			}
+			claims = h.snapshot(64<<30, free).Claims
+		}
+		return claims
 	}
+	minute := []time.Duration{time.Minute, time.Minute}
 	base := cpuTimes{total: 1000, idle: 500, kairo: 100, kairoKnown: true}
 	at := func(total, idle, kairo float64) cpuTimes {
 		return cpuTimes{total: base.total + total, idle: base.idle + idle, kairo: base.kairo + kairo, kairoKnown: true}
 	}
 	// 95% busy, Kairo 30%: its owner 65%
-	if got := claimsOf(base, at(100, 5, 30), 32<<30); len(got) != 1 || got[0].ResourceID != "n-cpu" {
+	if got := claimsOf(minute, 32<<30, base, at(100, 5, 30)); len(got) != 1 || got[0].ResourceID != "n-cpu" {
 		t.Fatalf("owner at 65%%: %+v", got)
 	}
+	// the same over 5 seconds only: nothing yet
+	if got := claimsOf([]time.Duration{5 * time.Second}, 32<<30, base, at(100, 5, 30)); len(got) != 0 {
+		t.Fatalf("5 seconds: %+v", got)
+	}
+	// 5% busy for 55 seconds, then 95% for 5: a burst, 12.5% over the minute
+	if got := claimsOf([]time.Duration{55 * time.Second, 5 * time.Second}, 32<<30, base, at(1100, 1045, 0), at(1200, 1050, 0)); len(got) != 0 {
+		t.Fatalf("a burst: %+v", got)
+	}
+	// Kairo's counter went back (its VM started again): the window starts
+	// over at that reading
+	if got := claimsOf(minute, 32<<30, base, at(100, 5, -50)); len(got) != 0 {
+		t.Fatalf("a counter that went back: %+v", got)
+	}
+	if got := claimsOf(minute, 32<<30, base, at(100, 5, -50), at(200, 10, -50)); len(got) != 1 {
+		t.Fatalf("a minute after the counter went back: %+v", got)
+	}
 	// 95% busy, Kairo 80%: its owner 15%
-	if got := claimsOf(base, at(100, 5, 80), 32<<30); len(got) != 0 {
+	if got := claimsOf(minute, 32<<30, base, at(100, 5, 80)); len(got) != 0 {
 		t.Fatalf("Kairo's own work: %+v", got)
 	}
 	// its owner 60%, the cores 70% busy: nothing waits
-	if got := claimsOf(base, at(100, 30, 10), 32<<30); len(got) != 0 {
+	if got := claimsOf(minute, 32<<30, base, at(100, 30, 10)); len(got) != 0 {
 		t.Fatalf("cores not short: %+v", got)
 	}
 	// Kairo's share unknown
 	unknown := at(100, 5, 0)
 	unknown.kairoKnown = false
-	if got := claimsOf(base, unknown, 32<<30); len(got) != 0 {
+	if got := claimsOf(minute, 32<<30, base, unknown); len(got) != 0 {
 		t.Fatalf("Kairo's share unknown: %+v", got)
 	}
 	// RAM: the floor of 64 GiB is the larger of 2 GiB and 5%: 3.2 GiB; under
 	// it, no claim
-	if got := claimsOf(base, at(100, 50, 0), 3<<30); len(got) != 0 {
+	if got := claimsOf(minute, 3<<30, base, at(100, 50, 0)); len(got) != 0 {
 		t.Fatalf("3 GiB available: %+v", got)
 	}
 	// the floor goes with the RAM's observation (admission leaves it free),

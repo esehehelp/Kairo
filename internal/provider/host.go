@@ -29,9 +29,10 @@ type Host struct {
 	CPUTimes func() (cpuTimes, error)
 
 	meterOnce sync.Once
-	cpuMu     sync.Mutex
-	cpuPrev   cpuTimes
-	cpuHave   bool
+	// cpuReadings are the readings of the CPU time its owner's use is told
+	// by (owneruse.go)
+	cpuReadings cpuOwnerReadings
+	ramMu       sync.Mutex
 	// ramUnder is when the RAM available went under the floor (zero: it is
 	// not under it)
 	ramUnder time.Time
@@ -59,7 +60,7 @@ func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 		present, _ := p.Owner.present()
 		floor := p.Owner.ramFloor(ramTotal, present)
 		evidence := map[string]any{"floor_bytes": floor}
-		p.cpuMu.Lock()
+		p.ramMu.Lock()
 		if ramFree >= floor {
 			p.ramUnder = time.Time{}
 		} else {
@@ -68,7 +69,7 @@ func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 			}
 			evidence["under_floor_since"] = p.ramUnder.Format(time.RFC3339Nano)
 		}
-		p.cpuMu.Unlock()
+		p.ramMu.Unlock()
 		ramEvidence, _ = json.Marshal(evidence)
 	}
 	observations := []store.Observation{{ResourceID: resources[0].ID, ObservedAt: stamp, ValidUntil: valid, TotalBytes: &cpuTotal, FreeBytes: &cpuTotal, Evidence: empty}, {ResourceID: resources[1].ID, ObservedAt: stamp, ValidUntil: valid, TotalBytes: &ramTotal, FreeBytes: &ramFree, Evidence: ramEvidence}}
@@ -85,7 +86,7 @@ func (p *Host) snapshot(ramTotal, ramFree int64) Snapshot {
 }
 
 // ownerClaims are the owner_use claims of the node's CPU (owneruse.go),
-// from this reading of its CPU time and the last. Its RAM has none: less
+// from its CPU time over the last ownerWindow. Its RAM has none: less
 // available than the floor says nothing of who took it (issue #45), and is
 // told with the RAM's observation instead (snapshot).
 func (p *Host) ownerClaims(cpuID string) []store.ExternalClaim {
@@ -99,15 +100,12 @@ func (p *Host) ownerClaims(cpuID string) []store.ExternalClaim {
 		read = readCPUTimes
 	}
 	if cur, err := read(); err == nil {
-		p.cpuMu.Lock()
-		prev, have := p.cpuPrev, p.cpuHave
-		p.cpuPrev, p.cpuHave = cur, true
-		p.cpuMu.Unlock()
-		if busy, kairo, owner, ok := cpuOwnerUse(prev, cur); have && ok {
+		base, have := p.cpuReadings.add(p.Owner.now(), cur)
+		if busy, kairo, owner, ok := cpuOwnerUse(base, cur); have && ok {
 			threshold := p.Owner.cpuThreshold(present)
 			if busy >= ownerCPUBusy && owner*100 >= threshold {
 				claims = append(claims, ownerClaim(cpuID, map[string]any{"source": "observed", "busy_percent": busy * 100, "kairo_percent": kairo * 100,
-					"owner_percent": owner * 100, "threshold_percent": threshold, "owner_present": present}))
+					"owner_percent": owner * 100, "threshold_percent": threshold, "owner_present": present, "window_seconds": ownerWindow.Seconds()}))
 			}
 		}
 	}
