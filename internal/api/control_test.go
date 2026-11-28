@@ -71,3 +71,48 @@ func TestControlSnapshotHoldsTheDumpSourcesAndControlFiles(t *testing.T) {
 		t.Fatalf("a read token took it: %d", status)
 	}
 }
+
+// An hourly snapshot's attempt is handed the dump and the control files, no
+// code; a sources task's attempt the code snapshots it takes, each with its
+// file list, and their index last; each says its part in X-Kairo-Snapshot.
+func TestControlSnapshotPartsHoldWhatTheirTasksKeep(t *testing.T) {
+	sources := t.TempDir()
+	for _, name := range []string{"src_a.tar.zst", "src_a.tar.zst.files.tsv", "src_b.tar.zst", "src_b.tar.zst.files.tsv"} {
+		if err := os.WriteFile(filepath.Join(sources, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := &Server{SourceDirectory: sources, DumpDatabase: func(_ context.Context, w io.Writer) error { _, err := io.WriteString(w, "PGDMP"); return err }}
+	read := func(rec *httptest.ResponseRecorder) (map[string]string, []string) {
+		t.Helper()
+		files := map[string]string{}
+		var order []string
+		tr := tar.NewReader(bytes.NewReader(rec.Body.Bytes()))
+		for {
+			h, err := tr.Next()
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			content, _ := io.ReadAll(tr)
+			files[h.Name] = string(content)
+			order = append(order, h.Name)
+		}
+		return files, order
+	}
+	rec := httptest.NewRecorder()
+	s.controlSnapshot(rec, httptest.NewRequest(http.MethodGet, "/api/worker/control-snapshot", nil), false)
+	files, _ := read(rec)
+	if rec.Header().Get("X-Kairo-Snapshot") != "snapshot" || files["kairo.dump"] != "PGDMP" || files["sources/src_a.tar.zst"] != "" {
+		t.Fatalf("the hourly part: %s %v", rec.Header().Get("X-Kairo-Snapshot"), files)
+	}
+	rec = httptest.NewRecorder()
+	s.sourcesSnapshot(rec, []string{"src_b"})
+	files, order := read(rec)
+	if rec.Header().Get("X-Kairo-Snapshot") != "sources" || files["sources/src_b.tar.zst"] != "src_b.tar.zst" || files["sources/src_b.tar.zst.files.tsv"] == "" ||
+		files["sources/src_a.tar.zst"] != "" || files["kairo.dump"] != "" || files["sources/INDEX"] != "src_b\n" || order[len(order)-1] != "sources/INDEX" {
+		t.Fatalf("the code's part: %s %v %v", rec.Header().Get("X-Kairo-Snapshot"), order, files)
+	}
+}

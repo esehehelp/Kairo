@@ -257,16 +257,41 @@ func serve(args []string) error {
 	}
 	if every := daemonConfig.ControlSnapshotEvery(); every > 0 && !daemonConfig.ObserveOnly {
 		// Kairo keeps itself: a control-snapshot task every interval, its
-		// output copied to every durable store like any other.
+		// output copied to every durable store like any other; its code
+		// snapshots once each, by a sources task; the hourly ones thinned
+		// (store/control_sources.go).
 		go func() {
 			ticker := time.NewTicker(time.Minute)
 			defer ticker.Stop()
+			var thinned time.Time
 			for {
 				name, err := st.ControlSnapshotTask(ctx, time.Now(), every)
 				if err != nil && ctx.Err() == nil {
 					logger.Error("control snapshot not declared", "error", err)
 				} else if name != "" {
 					logger.Info("control snapshot declared", "project", store.ControlProject, "task", name)
+				}
+				name, err = st.ControlSourcesTask(ctx, time.Now(), every)
+				if err != nil && ctx.Err() == nil {
+					logger.Error("control snapshot of the code not declared", "error", err)
+				} else if name != "" {
+					logger.Info("control snapshot of the code declared", "project", store.ControlProject, "task", name)
+				}
+				if time.Since(thinned) >= time.Hour {
+					thinned = time.Now()
+					dropped, err := st.ThinControlSnapshots(ctx, time.Now())
+					if err != nil && ctx.Err() == nil {
+						logger.Error("control snapshots not thinned", "error", err)
+					}
+					n := 0
+					for _, o := range dropped {
+						if o.Dropped {
+							n++
+						}
+					}
+					if n > 0 {
+						logger.Info("control snapshots thinned", "dropped", n)
+					}
 				}
 				select {
 				case <-ctx.Done():

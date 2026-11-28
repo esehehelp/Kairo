@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"kairo/internal/buildinfo"
@@ -18,14 +19,18 @@ import (
 )
 
 // The control plane snapshot (store/control_snapshot.go): a tar of
-//   SNAPSHOT.txt   when, which daemon
+//   SNAPSHOT.txt   when, which daemon, what part
 //   kairo.dump     the database (DumpDatabase: pg_dump -Fc)
 //   sources/...    the code snapshots (SourceDirectory)
+//   sources/INDEX  the code snapshots it holds, one id a line (a sources part)
 //   config/...     ControlFiles (the daemon's configuration and TLS
 //                  certificates; never its key or the database password), by base name
 // handed to an attempt of project kairo, queue control-snapshot (`kairo
 // control snapshot`, GET /api/worker/control-snapshot) or an admin (GET
-// /api/control/snapshot).
+// /api/control/snapshot). An attempt of an hourly task (snapshot-<slot>)
+// is handed the dump and configuration, one of a sources task (sources-<slot>)
+// the code snapshots no run keeps yet (store/control_sources.go); an admin
+// all of it. Its part is said in the header X-Kairo-Snapshot.
 
 // workerControlSnapshot: an attempt's, only one of a control-snapshot task.
 func (s *Server) workerControlSnapshot(w http.ResponseWriter, r *http.Request) {
@@ -44,10 +49,83 @@ func (s *Server) workerControlSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("%w: only an attempt of %s/%s takes the control snapshot", store.ErrNotFound, store.ControlProject, store.ControlQueue))
 		return
 	}
-	s.controlSnapshot(w, r)
+	part, executionID, err := s.Store.ControlPartOf(r.Context(), p.Worker.AttemptID)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	if part == store.ControlPartSources {
+		ids, err := s.Store.ControlSourcesToCarry(r.Context(), executionID)
+		if err != nil {
+			writeError(w, err)
+			return
+		}
+		s.sourcesSnapshot(w, ids)
+		return
+	}
+	s.controlSnapshot(w, r, false)
 }
 
-func (s *Server) controlSnapshot(w http.ResponseWriter, r *http.Request) {
+// controlPartHeader says what part of the control plane a snapshot is.
+const controlPartHeader = "X-Kairo-Snapshot"
+
+// sourcesSnapshot writes the code snapshots ids (and their file lists) with
+// their index.
+func (s *Server) sourcesSnapshot(w http.ResponseWriter, ids []string) {
+	if s.SourceDirectory == "" {
+		writeError(w, errors.New("this daemon keeps no code snapshots (no source_directory)"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set(controlPartHeader, store.ControlPartSources)
+	tw := tar.NewWriter(w)
+	now := time.Now().UTC()
+	note := fmt.Sprintf("kairo control snapshot 1\ntaken %s\ndaemon %s\npart %s\n", now.Format(time.RFC3339), buildinfo.Version(), store.ControlPartSources)
+	index := strings.Join(ids, "\n")
+	if index != "" {
+		index += "\n"
+	}
+	err := tw.WriteHeader(&tar.Header{Name: "SNAPSHOT.txt", Mode: 0o644, Size: int64(len(note)), ModTime: now, Format: tar.FormatPAX})
+	if err == nil {
+		_, err = io.WriteString(tw, note)
+	}
+	for _, id := range ids {
+		for _, name := range []string{id + ".tar.zst", id + ".tar.zst.files.tsv"} {
+			if err == nil {
+				err = addTarFile(tw, filepath.Join(s.SourceDirectory, name), "sources/"+name)
+			}
+		}
+	}
+	// the index last: a snapshot that has it was written whole
+	if err == nil {
+		if err = tw.WriteHeader(&tar.Header{Name: "sources/INDEX", Mode: 0o644, Size: int64(len(index)), ModTime: now, Format: tar.FormatPAX}); err == nil {
+			_, err = io.WriteString(tw, index)
+		}
+	}
+	if err == nil {
+		err = tw.Close()
+	}
+	if err != nil {
+		s.logger().Warn("control snapshot of the code not sent whole", "error", err)
+	}
+}
+
+func (s *Server) logger() *slog.Logger {
+	if s.Logger != nil {
+		return s.Logger
+	}
+	return slog.Default()
+}
+
+// fullControlSnapshot is an admin's: the dump, every code snapshot and the
+// configuration.
+func (s *Server) fullControlSnapshot(w http.ResponseWriter, r *http.Request) {
+	s.controlSnapshot(w, r, true)
+}
+
+// controlSnapshot writes the database's dump and the configuration, and with
+// sources every code snapshot.
+func (s *Server) controlSnapshot(w http.ResponseWriter, r *http.Request, sources bool) {
 	if s.DumpDatabase == nil {
 		writeError(w, errors.New("this daemon cannot dump its database (no pg_dump configured)"))
 		return
@@ -67,17 +145,22 @@ func (s *Server) controlSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, fmt.Errorf("dump the database: %w", err))
 		return
 	}
+	part := store.ControlPartSnapshot
+	if sources {
+		part = "full"
+	}
 	w.Header().Set("Content-Type", "application/x-tar")
+	w.Header().Set(controlPartHeader, part)
 	tw := tar.NewWriter(w)
 	now := time.Now().UTC()
-	note := fmt.Sprintf("kairo control snapshot 1\ntaken %s\ndaemon %s\n", now.Format(time.RFC3339), buildinfo.Version())
+	note := fmt.Sprintf("kairo control snapshot 1\ntaken %s\ndaemon %s\npart %s\n", now.Format(time.RFC3339), buildinfo.Version(), part)
 	if err = tw.WriteHeader(&tar.Header{Name: "SNAPSHOT.txt", Mode: 0o644, Size: int64(len(note)), ModTime: now, Format: tar.FormatPAX}); err == nil {
 		_, err = io.WriteString(tw, note)
 	}
 	if err == nil {
 		err = addTarFile(tw, dump.Name(), "kairo.dump")
 	}
-	if err == nil && s.SourceDirectory != "" {
+	if err == nil && sources && s.SourceDirectory != "" {
 		err = filepath.WalkDir(s.SourceDirectory, func(p string, d fs.DirEntry, err error) error {
 			if err != nil || !d.Type().IsRegular() {
 				return err
@@ -102,11 +185,7 @@ func (s *Server) controlSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		// the status is sent: the client finds the tar cut short
-		logger := s.Logger
-		if logger == nil {
-			logger = slog.Default()
-		}
-		logger.Warn("control snapshot not sent whole", "error", err)
+		s.logger().Warn("control snapshot not sent whole", "error", err)
 	}
 }
 

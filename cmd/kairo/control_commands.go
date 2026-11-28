@@ -23,7 +23,9 @@ import (
 // and writes it to the run's output directory, which Kairo packs and copies
 // to every durable store; an operator takes one with an admin token. The tar
 // written (kairo-control-<time>.tar) must hold the database's dump, or the
-// command fails.
+// command fails; one of the code snapshots a sources task is handed
+// (kairo-sources-<time>.tar, said by the header X-Kairo-Snapshot) must hold
+// every one its index names.
 func controlSnapshot(args []string) error {
 	fs := newFlags("control snapshot")
 	api := apiFlag(fs)
@@ -97,7 +99,12 @@ func controlSnapshot(args []string) error {
 	if err = os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	name := filepath.Join(dir, "kairo-control-"+time.Now().UTC().Format("20060102T150405Z")+".tar")
+	sources := resp.Header.Get("X-Kairo-Snapshot") == "sources"
+	prefix := "kairo-control-"
+	if sources {
+		prefix = "kairo-sources-"
+	}
+	name := filepath.Join(dir, prefix+time.Now().UTC().Format("20060102T150405Z")+".tar")
 	f, err := os.Create(name + ".partial")
 	if err != nil {
 		return err
@@ -110,7 +117,7 @@ func controlSnapshot(args []string) error {
 		err = closeErr
 	}
 	if err == nil {
-		err = checkControlSnapshot(name + ".partial")
+		err = checkControlSnapshot(name+".partial", sources)
 	}
 	if err != nil {
 		_ = os.Remove(name + ".partial")
@@ -124,8 +131,9 @@ func controlSnapshot(args []string) error {
 }
 
 // checkControlSnapshot reads the tar at p through: it must be whole and hold
-// the database's dump.
-func checkControlSnapshot(p string) error {
+// the database's dump, or (sources) its index (written last) and every code
+// snapshot the index names, with its file list.
+func checkControlSnapshot(p string, sources bool) error {
 	f, err := os.Open(p)
 	if err != nil {
 		return err
@@ -133,6 +141,9 @@ func checkControlSnapshot(p string) error {
 	defer f.Close()
 	tr := tar.NewReader(f)
 	dump := int64(-1)
+	var index []string
+	indexed := false
+	held := map[string]bool{}
 	for {
 		h, err := tr.Next()
 		if errors.Is(err, io.EOF) {
@@ -141,15 +152,36 @@ func checkControlSnapshot(p string) error {
 		if err != nil {
 			return fmt.Errorf("the snapshot is cut short or damaged: %w", err)
 		}
-		if h.Name == "kairo.dump" {
+		held[h.Name] = true
+		switch h.Name {
+		case "kairo.dump":
 			dump = h.Size
+		case "sources/INDEX":
+			body, err := io.ReadAll(io.LimitReader(tr, 16<<20))
+			if err != nil {
+				return fmt.Errorf("the snapshot is cut short: %w", err)
+			}
+			index, indexed = strings.Fields(string(body)), true
 		}
 		if _, err = io.Copy(io.Discard, tr); err != nil {
 			return fmt.Errorf("the snapshot is cut short: %w", err)
 		}
 	}
-	if dump <= 0 {
-		return errors.New("the snapshot holds no database dump")
+	if !sources {
+		if dump <= 0 {
+			return errors.New("the snapshot holds no database dump")
+		}
+		return nil
+	}
+	if !indexed {
+		return errors.New("the snapshot of the code holds no index (sources/INDEX): it was not written whole")
+	}
+	for _, id := range index {
+		for _, name := range []string{"sources/" + id + ".tar.zst", "sources/" + id + ".tar.zst.files.tsv"} {
+			if !held[name] {
+				return fmt.Errorf("the snapshot of the code lacks %s, which its index names", name)
+			}
+		}
 	}
 	return nil
 }

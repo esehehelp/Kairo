@@ -16,8 +16,9 @@ import (
 // control-snapshot, in a container (ControlImage) on the node of the first
 // durable store that has a container executor: `kairo control snapshot`
 // (the agent's binary, mounted in every container at /kairo/bin/kairo),
-// which writes what the daemon hands it (its database dump, code snapshots,
-// configuration and TLS: api/control.go) into the run's output directory.
+// which writes what the daemon hands it (its database dump, configuration
+// and TLS: api/control.go; the code snapshots, once each, a sources task's:
+// control_sources.go) into the run's output directory.
 // Like any output, that is packed when the run ends and copied to every
 // durable store, so the control plane can be rebuilt from a durable store
 // alone.
@@ -43,7 +44,14 @@ func (s *Store) ControlSnapshotTask(ctx context.Context, at time.Time, every tim
 	if every <= 0 {
 		return "", errors.New("a control snapshot interval must be positive")
 	}
-	name := "snapshot-" + at.UTC().Truncate(every).Format("20060102T1504Z")
+	return s.declareControlTask(ctx, controlSnapshotPrefix+at.UTC().Truncate(every).Format("20060102T1504Z"))
+}
+
+// declareControlTask declares the control-snapshot task name (snapshot-* or
+// sources-*: what its attempt is handed goes by its name, ControlPartOf),
+// unless declared already: its name, or "" when it was declared before or no
+// node can run it.
+func (s *Store) declareControlTask(ctx context.Context, name string) (string, error) {
 	tx, err := s.beginRead(ctx)
 	if err != nil {
 		return "", err

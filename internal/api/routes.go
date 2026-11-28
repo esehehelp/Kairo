@@ -19,7 +19,7 @@ func (s *Server) routes() []route {
 
 		{"POST", "/api/projects", roleAdmin, s.applyProject},
 		{"POST", "/api/sources", roleAdmin, s.uploadSource},
-		{"GET", "/api/control/snapshot", roleAdmin, s.controlSnapshot},
+		{"GET", "/api/control/snapshot", roleAdmin, s.fullControlSnapshot},
 		{"GET", "/api/sources", roleRead, s.listSources},
 		{"GET", "/api/sources/{id}", roleRead, s.getSource},
 		{"GET", "/api/projects/{project}", roleRead, s.getProject},

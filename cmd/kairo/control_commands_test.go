@@ -71,3 +71,36 @@ func TestControlSnapshotKeepsOnlyAWholeSnapshotWithItsDump(t *testing.T) {
 		t.Fatal("written here")
 	}
 }
+
+// A snapshot of the code (X-Kairo-Snapshot: sources) is kept as
+// kairo-sources-<time>.tar only with its index and every code snapshot the
+// index names, with its file list; it holds no dump.
+func TestControlSnapshotOfTheCodeKeepsWhatItsIndexNames(t *testing.T) {
+	var body []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Kairo-Snapshot", "sources")
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+	t.Setenv("KAIRO_TOKEN", "kairo_admin_t")
+	t.Setenv("KAIRO_ATTEMPT_TOKEN", "")
+	out := t.TempDir()
+	for _, c := range []struct {
+		name  string
+		files map[string]string
+		ok    bool
+	}{
+		{"whole", map[string]string{"SNAPSHOT.txt": "x", "sources/src_a.tar.zst": "p", "sources/src_a.tar.zst.files.tsv": "l", "sources/INDEX": "src_a\n"}, true},
+		{"nothing to keep", map[string]string{"SNAPSHOT.txt": "x", "sources/INDEX": ""}, true},
+		{"no index", map[string]string{"SNAPSHOT.txt": "x", "sources/src_a.tar.zst": "p", "sources/src_a.tar.zst.files.tsv": "l"}, false},
+		{"a list missing", map[string]string{"SNAPSHOT.txt": "x", "sources/src_a.tar.zst": "p", "sources/INDEX": "src_a\n"}, false},
+	} {
+		body = controlTar(t, c.files)
+		dir := filepath.Join(out, strings.ReplaceAll(c.name, " ", "-"))
+		err := run([]string{"control", "snapshot", "--api", server.URL, "--out", dir})
+		kept, _ := filepath.Glob(filepath.Join(dir, "*"))
+		if c.ok != (err == nil) || c.ok != (len(kept) == 1 && strings.HasPrefix(filepath.Base(kept[0]), "kairo-sources-")) {
+			t.Fatalf("%s: %v, kept %v", c.name, err, kept)
+		}
+	}
+}
