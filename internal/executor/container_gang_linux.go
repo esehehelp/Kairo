@@ -151,12 +151,16 @@ func gangBarrier(g *containerGang, self netip.Addr, logs io.Writer, stop <-chan 
 		// every member not reached at once, a few seconds at most: a round
 		// takes no longer with many members, and a stop is seen between
 		// rounds
-		var round sync.WaitGroup
-		var reachedMu sync.Mutex
+		var targets []int
 		for r := range g.Members {
-			if r == g.Rank || reached[r] {
-				continue
+			if r != g.Rank && !reached[r] {
+				targets = append(targets, r)
 			}
+		}
+		// each dial says its own result; reached is this goroutine's
+		ok := make([]bool, len(targets))
+		var round sync.WaitGroup
+		for i, r := range targets {
 			round.Add(1)
 			go func() {
 				defer round.Done()
@@ -172,14 +176,17 @@ func gangBarrier(g *containerGang, self netip.Addr, logs io.Writer, stop <-chan 
 				// lost with the connection)
 				if _, err := io.WriteString(conn, gangHello(g.Placement, g.Rank)); err == nil {
 					if ack, err := bufio.NewReader(io.LimitReader(conn, 8)).ReadString('\n'); err == nil && ack == "ok\n" {
-						reachedMu.Lock()
-						reached[r] = true
-						reachedMu.Unlock()
+						ok[i] = true
 					}
 				}
 			}()
 		}
 		round.Wait()
+		for i, r := range targets {
+			if ok[i] {
+				reached[r] = true
+			}
+		}
 		mu.Lock()
 		var notReached, notHeard []int
 		for r := range g.Members {
