@@ -454,6 +454,16 @@ func (s *Store) ListStoreStatus(ctx context.Context) ([]StoreStatus, error) {
 	if err != nil {
 		return nil, err
 	}
+	// a drained store, usable: draining while it holds copies, then drained
+	// (it can be undeclared)
+	for i := range out {
+		if out[i].Drain && out[i].State == "ready" {
+			out[i].State = "draining"
+			if out[i].Copies == 0 {
+				out[i].State = "drained"
+			}
+		}
+	}
 	sort.SliceStable(out, func(i, j int) bool {
 		if (out[i].State == "undeclared") != (out[j].State == "undeclared") {
 			return out[j].State == "undeclared"

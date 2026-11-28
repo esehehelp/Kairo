@@ -8,15 +8,19 @@ import (
 	"kairo/internal/machine"
 )
 
-// Replicas: a durable object is kept on every durable store, not on one
-// only, so that losing a store (a disk deleted or failed) loses none of what
-// Kairo keeps. Once an object has its first verified copy, each other
-// durable store without a copy of it takes one if it has room above the
-// reserve and shedding margin and has not shed that object in the last
-// 24 hours. Room is short, so the objects least protected go first: those
-// whose copies are on the fewest hosts (machine.Host: a disk's host failing,
-// or being wiped, loses every copy on it), then those with the fewest copies,
-// then the smallest, a few at a time (replicaBatch).
+// Replicas (DataPolicy.Replicas): a durable object is kept on every durable
+// store, not on one only, so that losing a store (a disk deleted or failed)
+// loses none of what Kairo keeps. Once an object has its first verified
+// copy, each other durable store without a copy of it takes one if it has
+// room above the reserve and shedding margin and has not shed that object in
+// the last 24 hours. Room is short, so the objects least protected go first:
+// those whose copies are on the fewest hosts (machine.Host: a disk's host
+// failing, or being wiped, loses every copy on it), then those with the
+// fewest copies, then the smallest, a few at a time (replicaBatch).
+// Without replicas, an object keeps one durable copy; the only copies made
+// of a verified one are of an object whose good copies are all on drained
+// stores (machine.Store.Drain), onto one store not drained, before those go.
+// Copies on drained stores count for neither.
 // An object nowhere durable yet goes before any replica (CopiesToMake).
 // A replica is read from a durable copy on the node of the executor making
 // it (the pack may be gone by then), else from one on another node, through
@@ -27,11 +31,12 @@ import (
 const replicaBatch = 50
 
 // orderReplicasTx orders, for executor me, replicas of objects with a
-// verified copy on a durable store it serves onto the durable stores it serves
-// without a copy of them (targets in order, room as copyRoomTx says, less
-// the shedding margin and what it orders), the least protected first (copies
-// counted on the durable stores as declared).
-func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets, declared []machine.Store, room map[string]int64, t string) error {
+// verified copy onto the durable stores it serves without a copy of them
+// (targets in order, room as copyRoomTx says, less the shedding margin and
+// what it orders), the least protected first (copies counted on the durable
+// stores as declared, not drained); with replicas off, only a copy onto one
+// of them of each object whose good copies are all on drained stores.
+func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets, declared []machine.Store, room map[string]int64, t string, replicas bool) error {
 	var eligible []machine.Store
 	var eligibleIDs []string
 	for _, s := range targets {
@@ -46,7 +51,7 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 	if len(eligible) == 0 {
 		return nil // nowhere here to replicate to
 	}
-	durableIDs, durableHosts, err := durableStoreHostsTx(ctx, tx, declared)
+	durableIDs, durableRoots, durableHosts, err := durableStoreHostsTx(ctx, tx, declared)
 	if err != nil {
 		return err
 	}
@@ -65,12 +70,13 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 				AND e.payload_json::jsonb->>'store_id'=ANY($1::text[]) AND e.created_at::timestamptz>$3::text::timestamptz-INTERVAL '24 hours'
 			) blocked
 		) b CROSS JOIN LATERAL (
-			SELECT COUNT(DISTINCT h.host) AS hosts, COUNT(*) AS copies FROM object_copies v JOIN unnest($4::text[],$5::text[]) AS h(store_id,host) ON h.store_id=v.store_id
+			SELECT COUNT(DISTINCT h.host) AS hosts, COUNT(*) AS copies FROM object_copies v JOIN unnest($4::text[],$5::text[],$7::text[]) AS h(store_id,host,root) ON h.store_id=v.store_id AND h.root=v.root
 			WHERE v.object_id=d.id AND v.state='verified' AND v.check_problem IS NULL
 		) p
 		WHERE d.state='packed' AND d.lifecycle='durable' AND b.n<$2
 		AND EXISTS(SELECT 1 FROM object_copies v WHERE v.object_id=d.id AND v.state='verified' AND v.check_problem IS NULL)
-		ORDER BY p.hosts,p.copies,d.pack_bytes,d.id LIMIT 2000`, []any{eligibleIDs, len(eligible), t, durableIDs, durableHosts}, func(rows *sql.Rows) error {
+		AND ($6 OR p.copies=0 AND NOT EXISTS(SELECT 1 FROM object_copies m WHERE m.object_id=d.id AND m.state='copying' AND m.store_id=ANY($4::text[])))
+		ORDER BY p.hosts,p.copies,d.pack_bytes,d.id LIMIT 2000`, []any{eligibleIDs, len(eligible), t, durableIDs, durableHosts, replicas, durableRoots}, func(rows *sql.Rows) error {
 		var c candidate
 		var blocked string
 		if err := rows.Scan(&c.id, &c.created, &c.projectID, &c.bytes, &blocked); err != nil {
@@ -123,25 +129,29 @@ func orderReplicasTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorI
 				return err
 			}
 			ordered++
+			if !replicas {
+				break // one copy, off the drained stores
+			}
 		}
 	}
 	return nil
 }
 
-// durableStoreHostsTx are the durable stores as declared (not being moved)
-// and, in the same order, the host each is on (nodeHostsTx).
-func durableStoreHostsTx(ctx context.Context, q queryer, declared []machine.Store) (ids, hosts []string, err error) {
+// durableStoreHostsTx are the durable stores as declared (neither being moved
+// nor drained) and, in the same order, their declared roots (a copy recorded
+// at another root is none of theirs) and the host each is on (nodeHostsTx).
+func durableStoreHostsTx(ctx context.Context, q queryer, declared []machine.Store) (ids, roots, hosts []string, err error) {
 	hostOf, err := nodeHostsTx(ctx, q)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	for _, s := range declared {
-		if s.Class != machine.StoreDurable || s.MovedFrom != "" {
+		if s.Class != machine.StoreDurable || s.MovedFrom != "" || s.Drain {
 			continue
 		}
-		ids, hosts = append(ids, s.ID), append(hosts, hostOf(s.Node))
+		ids, roots, hosts = append(ids, s.ID), append(roots, s.Root), append(hosts, hostOf(s.Node))
 	}
-	return ids, hosts, nil
+	return ids, roots, hosts, nil
 }
 
 // nodeHostsTx is the host a node is on, as copies are counted (replicas and

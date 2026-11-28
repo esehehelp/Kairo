@@ -109,7 +109,11 @@ func formatApply(verb string, result store.MachineApplyResult) string {
 	for _, c := range result.StoreChanges {
 		switch {
 		case c.From == nil:
-			fmt.Fprintf(&b, "  + store %s  %s\n", c.Store, strings.Join(storeFields(*c.To), "; "))
+			fields := storeFields(*c.To)
+			if !c.To.Drain {
+				fields = fields[:len(fields)-1] // drain false goes unsaid
+			}
+			fmt.Fprintf(&b, "  + store %s  %s\n", c.Store, strings.Join(fields, "; "))
 		case c.To == nil:
 			fmt.Fprintf(&b, "  - store %s\n", c.Store)
 		default:
@@ -132,7 +136,7 @@ func formatApply(verb string, result store.MachineApplyResult) string {
 }
 
 // storeFields are a store's declaration as "name value" texts, always the
-// same fields in the same order.
+// same fields in the same order (drain last).
 func storeFields(s machine.Store) []string {
 	s = s.Normalized()
 	return []string{
@@ -143,6 +147,7 @@ func storeFields(s machine.Store) []string {
 		"filesystem " + s.Filesystem,
 		"backend " + s.Backend,
 		"reserve_free_bytes " + fmt.Sprint(s.ReserveFreeBytes),
+		"drain " + fmt.Sprint(s.Drain),
 	}
 }
 

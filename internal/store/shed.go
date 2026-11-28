@@ -5,6 +5,9 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
+	"time"
 
 	"kairo/internal/machine"
 )
@@ -23,22 +26,27 @@ import (
 // rechecking the other copies and readers, the same way, under the daemon's
 // write lock) before it removes the files; one whose files outlive a failed
 // removal is adopted again by the next inventory, and shed again.
+//
+// A drained store (machine.Store.Drain) sheds, whatever its room, each copy
+// whose object has a verified, undamaged copy on a durable store not drained
+// (one is copied there first for an object that has none: orderReplicasTx);
+// copies on drained stores count for no other store's shedding.
 
 const (
 	minOtherHosts = 2
 	shedBatch     = 50
 )
 
-// otherDurableTx are the durable stores of declared other than id, not being
-// moved: their ids, declared roots and hosts (durableStoreHostsTx), as
-// otherHostsSQL takes them.
+// otherDurableTx are the durable stores of declared other than id, neither
+// being moved nor drained: their ids, declared roots and hosts
+// (durableStoreHostsTx), as otherHostsSQL takes them.
 func otherDurableTx(ctx context.Context, q queryer, declared []machine.Store, id string) (ids, roots, hosts []string, err error) {
 	hostOf, err := nodeHostsTx(ctx, q)
 	if err != nil {
 		return nil, nil, nil, err
 	}
 	for _, d := range declared {
-		if d.Class == machine.StoreDurable && d.ID != id && d.MovedFrom == "" {
+		if d.Class == machine.StoreDurable && d.ID != id && d.MovedFrom == "" && !d.Drain {
 			ids, roots, hosts = append(ids, d.ID), append(roots, d.Root), append(hosts, hostOf(d.Node))
 		}
 	}
@@ -47,48 +55,51 @@ func otherDurableTx(ctx context.Context, q queryer, declared []machine.Store, id
 
 // otherHostsSQL counts the hosts with a verified, undamaged copy of object
 // %[1]s on the stores %[2]s, %[3]s and %[4]s say (ids, declared roots,
-// hosts: otherDurableTx): a record of a copy at another root (one declared
+// hosts: otherDurableTx), verified or read back since %[5]s (a timestamp;
+// -infinity: whenever): a record of a copy at another root (one declared
 // before) is not one.
 const otherHostsSQL = `(SELECT COUNT(DISTINCT n.host) FROM object_copies o
 	JOIN unnest(%[2]s::text[],%[3]s::text[],%[4]s::text[]) AS n(store_id,root,host) ON n.store_id=o.store_id AND n.root=o.root
-	WHERE o.object_id=%[1]s AND o.state='verified' AND o.check_problem IS NULL)`
+	WHERE o.object_id=%[1]s AND o.state='verified' AND o.check_problem IS NULL
+	AND COALESCE(o.checked_at,o.verified_at)::timestamptz>%[5]s::timestamptz)`
+
+// anyTime: a copy counts however long ago it was last read (otherHostsSQL).
+const anyTime = "-infinity"
+
+// drainFresh is since when the copy a drained store's copy leaves in its
+// place must have been verified or read back: within a scrub interval, so
+// the copy kept is not one a read would find damaged.
+func drainFresh(scrub time.Duration) string {
+	return time.Now().UTC().Add(-scrub).Format(time.RFC3339Nano)
+}
 
 // shedMinShort: a shortfall this small is left alone (a pack being made on
 // the same filesystem comes and goes).
 var shedMinShort int64 = 1 << 30
 
 // shedOrdersTx are the copies executor me is to remove from the durable
-// stores it serves that are below their reserve.
-func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets []machine.Store, byID map[string]machine.Store, room map[string]int64) ([]CopyOrder, error) {
+// stores it serves that are below their reserve (targets) or drained.
+func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID string, targets []machine.Store, byID map[string]machine.Store, room map[string]int64, scrub time.Duration) ([]CopyOrder, error) {
+	all := make([]machine.Store, 0, len(byID))
+	for _, d := range byID {
+		all = append(all, d)
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].ID < all[j].ID })
 	var out []CopyOrder
-	for _, s := range targets {
-		if !me.serves(s, executorID) {
-			continue
-		}
-		// copies of dropped objects go whatever room there is
-		dropped, err := dropShedOrdersTx(ctx, tx, s)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, dropped...)
-		short := -room[s.ID]
-		if short <= shedMinShort {
-			continue
-		}
-		all := make([]machine.Store, 0, len(byID))
-		for _, d := range byID {
-			all = append(all, d)
-		}
+	// shed orders copies of store s whose objects have good copies (read
+	// since since) on need hosts of the other stores, the biggest first,
+	// until they cover short
+	shed := func(s machine.Store, need int, short int64, since string) error {
 		ids, roots, hosts, err := otherDurableTx(ctx, tx, all, s.ID)
 		if err != nil {
-			return nil, err
+			return err
 		}
-		err = eachRow(ctx, tx, `SELECT c.object_id,c.month,c.root,COALESCE(d.pack_bytes,0) FROM object_copies c JOIN data_objects d ON d.id=c.object_id
+		return eachRow(ctx, tx, `SELECT c.object_id,c.month,c.root,COALESCE(d.pack_bytes,0) FROM object_copies c JOIN data_objects d ON d.id=c.object_id
 			WHERE c.store_id=$1 AND c.state='verified' AND d.dropped_at IS NULL
-			AND `+fmt.Sprintf(otherHostsSQL, "c.object_id", "$2", "$3", "$4")+`>=$5
+			AND `+fmt.Sprintf(otherHostsSQL, "c.object_id", "$2", "$3", "$4", "$7")+`>=$5
 			AND NOT EXISTS(SELECT 1 FROM object_copies r WHERE r.object_id=c.object_id AND r.state='copying' AND (r.source_store_id=c.store_id OR r.source_store_id IS NULL))
 			AND NOT EXISTS(SELECT 1 FROM object_placements p WHERE p.object_id=c.object_id AND p.state='fetching' AND p.source_store_id=c.store_id)
-			ORDER BY d.pack_bytes DESC,c.verified_at DESC,c.object_id LIMIT $6`, []any{s.ID, ids, roots, hosts, minOtherHosts, shedBatch}, func(rows *sql.Rows) error {
+			ORDER BY d.pack_bytes DESC,c.verified_at DESC,c.object_id LIMIT $6`, []any{s.ID, ids, roots, hosts, need, shedBatch, since}, func(rows *sql.Rows) error {
 			if short <= 0 {
 				return nil
 			}
@@ -103,7 +114,35 @@ func shedOrdersTx(ctx context.Context, tx *sql.Tx, me executorInfo, executorID s
 			short -= o.PackBytes
 			return nil
 		})
+	}
+	for _, s := range targets {
+		if !me.serves(s, executorID) {
+			continue
+		}
+		// copies of dropped objects go whatever room there is
+		dropped, err := dropShedOrdersTx(ctx, tx, s)
 		if err != nil {
+			return nil, err
+		}
+		out = append(out, dropped...)
+		if short := -room[s.ID]; short > shedMinShort {
+			if err := shed(s, minOtherHosts, short, anyTime); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for _, s := range all {
+		if s.Class != machine.StoreDurable || !s.Drain || !me.serves(s, executorID) {
+			continue
+		}
+		dropped, err := dropShedOrdersTx(ctx, tx, s)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, dropped...)
+		// every copy whose object has a good one, read lately, on a store not
+		// drained
+		if err := shed(s, 1, math.MaxInt64, drainFresh(scrub)); err != nil {
 			return nil, err
 		}
 	}
@@ -115,9 +154,10 @@ var ErrShedRefused = errors.New("copy not to be shed")
 
 // ClaimShed: executorID is about to remove its copy of objectID on durable
 // store storeID; the record goes first, if the object still has verified,
-// undamaged copies on other durable stores as declared on minOtherHosts
-// hosts and no replica or fetch is reading from it (ErrShedRefused
-// otherwise: the files are not to be removed).
+// undamaged copies on other durable stores as declared, not drained, on
+// minOtherHosts hosts (when storeID is drained, one, verified or read back
+// within a scrub interval) and no replica or fetch is reading from it
+// (ErrShedRefused otherwise: the files are not to be removed).
 func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID string) error {
 	tx, err := s.beginWrite(ctx)
 	if err != nil {
@@ -132,10 +172,13 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 	if err != nil {
 		return err
 	}
-	served := false
+	served, need, since := false, minOtherHosts, anyTime
 	for _, d := range declared {
 		if d.Class == machine.StoreDurable && d.MovedFrom == "" && d.ID == storeID {
 			served = me.serves(d, executorID)
+			if d.Drain {
+				need, since = 1, drainFresh(s.dataPolicy().ScrubInterval)
+			}
 		}
 	}
 	ids, roots, hosts, err := otherDurableTx(ctx, tx, declared, storeID)
@@ -161,17 +204,17 @@ func (s *Store) ClaimShed(ctx context.Context, executorID, objectID, storeID str
 	}
 	var count int
 	var reading bool
-	if err = tx.QueryRowContext(ctx, `SELECT `+fmt.Sprintf(otherHostsSQL, "$1", "$2", "$3", "$4")+`,
+	if err = tx.QueryRowContext(ctx, `SELECT `+fmt.Sprintf(otherHostsSQL, "$1", "$2", "$3", "$4", "$6")+`,
 		EXISTS(SELECT 1 FROM object_copies WHERE object_id=$1 AND state='copying' AND (source_store_id=$5 OR source_store_id IS NULL))
 		OR EXISTS(SELECT 1 FROM object_placements WHERE object_id=$1 AND state='fetching' AND source_store_id=$5)`,
-		objectID, ids, roots, hosts, storeID).Scan(&count, &reading); err != nil {
+		objectID, ids, roots, hosts, storeID, since).Scan(&count, &reading); err != nil {
 		return err
 	}
 	switch {
 	case dropped && !identityKept:
 		return fmt.Errorf("%w: %s is dropped, but its file list is not kept yet (KeepIdentity)", ErrShedRefused, objectID)
-	case !dropped && count < minOtherHosts:
-		return fmt.Errorf("%w: %s has good copies on %d hosts besides this one, not %d", ErrShedRefused, objectID, count, minOtherHosts)
+	case !dropped && count < need:
+		return fmt.Errorf("%w: %s has good copies on %d hosts besides this one, not %d", ErrShedRefused, objectID, count, need)
 	}
 	if reading {
 		return fmt.Errorf("%w: a replica or fetch is reading the copy of %s on %s", ErrShedRefused, objectID, storeID)

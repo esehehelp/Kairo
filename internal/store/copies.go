@@ -152,12 +152,12 @@ func storeServerTx(ctx context.Context, q queryer, s machine.Store) (executorInf
 }
 
 // copyTargetsTx are the durable stores objects are copied to, in the order
-// they are taken: the declared durable stores by id but those being moved
-// and those naming an executor that is gone or disabled.
+// they are taken: the declared durable stores by id but those being moved or
+// drained and those naming an executor that is gone or disabled.
 func copyTargetsTx(ctx context.Context, q queryer, declared []machine.Store) ([]machine.Store, error) {
 	var durable []machine.Store
 	for _, s := range declared {
-		if s.Class == machine.StoreDurable && s.MovedFrom == "" {
+		if s.Class == machine.StoreDurable && s.MovedFrom == "" && !s.Drain {
 			durable = append(durable, s)
 		}
 	}
@@ -304,7 +304,7 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 				return nil, err
 			}
 		}
-		if err = orderReplicasTx(ctx, tx, me, executorID, targets, declared, room, t); err != nil {
+		if err = orderReplicasTx(ctx, tx, me, executorID, targets, declared, room, t, s.dataPolicy().Replicas); err != nil {
 			return nil, err
 		}
 	}
@@ -338,10 +338,11 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 	expires := time.Now().UTC().Add(copyTokenLife).Format(time.RFC3339Nano)
 	out := []CopyOrder{}
 	for _, x := range rows {
-		// Copied only to the store as it is still declared, and served here;
-		// a copy taken for a store no longer so is given up (nothing of it was
-		// verified), so the object is copied where the declaration says now.
-		if d, ok := byID[x.order.StoreID]; !ok || d.Class != machine.StoreDurable || d.Root != x.order.Root || !me.serves(d, executorID) {
+		// Copied only to the store as it is still declared, not drained, and
+		// served here; a copy taken for a store no longer so is given up
+		// (nothing of it was verified), so the object is copied where the
+		// declaration says now.
+		if d, ok := byID[x.order.StoreID]; !ok || d.Class != machine.StoreDurable || d.Root != x.order.Root || d.Drain || !me.serves(d, executorID) {
 			if err := checkTransition(recCopy, "copying", noRecord); err != nil {
 				return nil, err
 			}
@@ -428,7 +429,7 @@ func (s *Store) CopiesToMake(ctx context.Context, executorID string) ([]CopyOrde
 	}
 	out = append(out, describe...)
 	if served {
-		shed, err := shedOrdersTx(ctx, tx, me, executorID, targets, byID, room)
+		shed, err := shedOrdersTx(ctx, tx, me, executorID, targets, byID, room, s.dataPolicy().ScrubInterval)
 		if err != nil {
 			return nil, err
 		}

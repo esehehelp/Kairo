@@ -14,6 +14,7 @@ import (
 // the fewest copies, then the smallest.
 func TestReplicasGoToTheObjectsOnTheFewestHostsFirst(t *testing.T) {
 	store := openCoordinationStore(t)
+	store.SetDataPolicy(DataPolicy{Replicas: true})
 	setupSchedulerInventory(t, store)
 	addTestDisk(t, store, "node", "D:")
 	ctx := context.Background()

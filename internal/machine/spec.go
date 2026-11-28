@@ -73,6 +73,11 @@ type Store struct {
 	// Data stores, moving a store). Left in the declaration once moved, it
 	// says nothing more.
 	MovedFrom string `toml:"moved_from" json:"moved_from,omitempty"`
+	// Drain: a durable store being emptied (Data stores, draining a
+	// store): it takes no copy, and its copies go once the object has a
+	// good copy on a durable store not drained (one is made there first
+	// for an object that has none). Drained, the store can be undeclared.
+	Drain bool `toml:"drain" json:"drain,omitempty"`
 	// MoveWait is never declared: what a node is told of a store being moved
 	// (NodeStores) while the move must wait (what still uses the store where
 	// it is), empty once its executor may move it.
@@ -132,6 +137,10 @@ func (s Spec) validateStores() error {
 			return fmt.Errorf("store %s needs a filesystem (the identity of the node's disk it is on)", store.ID)
 		case store.ReserveFreeBytes < 0:
 			return fmt.Errorf("store %s: reserve_free_bytes is negative", store.ID)
+		case store.Drain && store.Class != StoreDurable:
+			return fmt.Errorf("store %s: only a durable store is drained", store.ID)
+		case store.Drain && store.MovedFrom != "":
+			return fmt.Errorf("store %s: a store being moved is not drained", store.ID)
 		}
 		if store.MovedFrom != "" {
 			if err := checkStoreRoot(store.MovedFrom); err != nil {

@@ -223,6 +223,10 @@ type Data struct {
 	// often a running run's output directory is snapshotted, and after each
 	// checkpoint it publishes (README: Data stores, run snapshots).
 	RunSnapshotInterval string `toml:"run_snapshot_interval"`
+	// Replicas: an object with a durable copy is copied to every other
+	// durable store too, as room allows (README: Data stores, replicas).
+	// Off, each object has one durable copy.
+	Replicas bool `toml:"replicas"`
 }
 
 // RunSnapshotEvery is RunSnapshotInterval parsed (0: never).

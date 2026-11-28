@@ -275,6 +275,7 @@ func TestDurableCopiesAreDescribed(t *testing.T) {
 // object nowhere durable yet; a store without room for it takes none.
 func TestADurableObjectIsReplicatedToEveryDurableStore(t *testing.T) {
 	store := openCoordinationStore(t)
+	store.SetDataPolicy(DataPolicy{Replicas: true})
 	setupSchedulerInventory(t, store)
 	addTestDisk(t, store, "node", "D:")
 	ctx := context.Background()
@@ -316,6 +317,7 @@ func TestADurableObjectIsReplicatedToEveryDurableStore(t *testing.T) {
 // agent that made it, with a token only that agent's node can use.
 func TestAReplicaIsReadFromADurableCopyOnAnotherNode(t *testing.T) {
 	store := openCoordinationStore(t)
+	store.SetDataPolicy(DataPolicy{Replicas: true})
 	setupSchedulerInventory(t, store)
 	addTestDisk(t, store, "node", "D:")
 	ctx := context.Background()

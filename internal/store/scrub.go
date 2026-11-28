@@ -32,6 +32,9 @@ type DataPolicy struct {
 	// RunSnapshotInterval: how often a running run's output directory is
 	// snapshotted, and after each checkpoint (runsnapshots.go); zero, never.
 	RunSnapshotInterval time.Duration
+	// Replicas: an object with a durable copy is copied to every other
+	// durable store too (replicas.go). Without, it has one durable copy.
+	Replicas bool
 }
 
 // confinesAll reports whether every launch at t is confined.

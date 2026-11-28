@@ -21,6 +21,7 @@ import (
 func TestADurableStoreBelowItsReserveShedsCopiesKeptElsewhere(t *testing.T) {
 	reserve, packBytes := 2*shedMinShort+1000, 2*shedMinShort+200
 	store := openCoordinationStore(t)
+	store.SetDataPolicy(DataPolicy{Replicas: true})
 	setupSchedulerInventory(t, store)
 	addTestDisk(t, store, "node", "D:")
 	ctx := context.Background()
