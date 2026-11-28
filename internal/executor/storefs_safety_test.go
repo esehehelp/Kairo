@@ -183,3 +183,25 @@ func TestARootWithALinkOnItsPathIsRefused(t *testing.T) {
 	}
 	checkKept(t, files)
 }
+
+// A root Kairo cannot write in (its disk failing or gone: here a directory
+// where the probe file goes) is not used; one it can is, the probe left
+// nowhere.
+func TestARootThatCannotBeWrittenIsNotUsed(t *testing.T) {
+	ctx := context.Background()
+	fs := localStoreFS{}
+	base := t.TempDir()
+	root := filepath.Join(base, "store")
+	if err := fs.Ensure(ctx, root, testFilesystem(base), true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(root, probeName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("probe left: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(root, probeName), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Ensure(ctx, root, testFilesystem(base), true); err == nil {
+		t.Fatal("a root that cannot be written taken")
+	}
+}

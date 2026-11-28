@@ -197,6 +197,38 @@ func (localStoreFS) Ensure(_ context.Context, root, filesystem string, create bo
 	if !on {
 		return fmt.Errorf("root %s is not on filesystem %s", root, filesystem)
 	}
+	return probeWrite(root)
+}
+
+// probeName is the file probeWrite writes and removes in a store's root.
+const probeName = ".kairo-probe"
+
+// probeWrite writes a byte to a file in root, syncs and removes it: a disk
+// gone from under its filesystem (one that dropped off its bus) can still
+// answer for its free space and the directories it cached, but writes
+// nothing, and the store is not to be used.
+func probeWrite(root string) error {
+	r, err := openDirPath(root, false)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	f, err := r.OpenFile(probeName, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err == nil {
+		_, err = f.Write([]byte{0})
+		if err == nil {
+			err = f.Sync()
+		}
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if err == nil {
+		err = r.Remove(probeName)
+	}
+	if err != nil {
+		return fmt.Errorf("root %s cannot be written (its disk may be failing or gone): %w", root, err)
+	}
 	return nil
 }
 
